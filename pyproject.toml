@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openclaw-price-monitor"
+version = "0.1.0"
+description = "Reusable price-monitoring core with a separate OpenClaw adapter and first-phase TCG support."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "beautifulsoup4>=4.14,<5",
+  "truststore>=0.10,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=9,<10",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.package-data]
+openclaw_adapter = ["dashboard_assets/*.html", "dashboard_assets/*.css", "dashboard_assets/*.js"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

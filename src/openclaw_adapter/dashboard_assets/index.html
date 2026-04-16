@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OpenClaw Dashboard</title>
+    <link rel="stylesheet" href="/assets/dashboard.css?v=20260416a" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="hero">
+        <div class="hero__copy">
+          <p class="eyebrow">OpenClaw Assistant</p>
+          <h1>本地檢視台</h1>
+          <p class="hero__lede">
+            這是目前專案的即時檢視介面。你可以直接看到 assistant tools、參考資料來源、範例 watchlist，
+            也能在這裡手動查卡價。
+          </p>
+          <div class="hero__actions">
+            <button id="refresh-dashboard" class="button button--primary" type="button">重新整理資料</button>
+            <a class="button button--ghost" href="/api/dashboard" target="_blank" rel="noreferrer">看 JSON</a>
+          </div>
+        </div>
+        <div class="hero__panel">
+          <div class="metric">
+            <span class="metric__label">Tracked Items</span>
+            <strong id="stat-tracked-items">0</strong>
+          </div>
+          <div class="metric">
+            <span class="metric__label">Watch Rules</span>
+            <strong id="stat-watch-rules">0</strong>
+          </div>
+          <div class="metric">
+            <span class="metric__label">Offers</span>
+            <strong id="stat-source-offers">0</strong>
+          </div>
+          <div class="metric">
+            <span class="metric__label">Snapshots</span>
+            <strong id="stat-price-snapshots">0</strong>
+          </div>
+        </div>
+      </header>
+
+      <section class="hot-zone">
+        <article class="hot-board">
+          <div class="card__heading">
+            <p class="eyebrow">Liquidity Board</p>
+            <h2>Pokemon 高流動性前十</h2>
+          </div>
+          <p id="hot-pokemon-methodology" class="hot-board__methodology"></p>
+          <div id="hot-pokemon-list" class="hot-list"></div>
+        </article>
+
+        <article class="hot-board">
+          <div class="card__heading">
+            <p class="eyebrow">Liquidity Board</p>
+            <h2>WS 高流動性前十</h2>
+          </div>
+          <p id="hot-ws-methodology" class="hot-board__methodology"></p>
+          <div id="hot-ws-list" class="hot-list"></div>
+        </article>
+      </section>
+
+      <main class="dashboard-grid">
+        <section class="card card--lookup">
+          <div class="card__heading">
+            <p class="eyebrow">Lookup</p>
+            <h2>手動查卡價</h2>
+          </div>
+          <form id="lookup-form" class="lookup-form">
+            <div class="field-row field-row--compact">
+              <label class="field">
+                <span>Game</span>
+                <select name="game">
+                  <option value="pokemon">Pokemon</option>
+                  <option value="ws">Weiss Schwarz</option>
+                </select>
+              </label>
+              <label class="field field--grow">
+                <span>Card Name</span>
+                <input name="name" type="text" placeholder="例如: ピカチュウex" required />
+              </label>
+            </div>
+            <div class="field-row">
+              <label class="field">
+                <span>Card Number</span>
+                <input name="card_number" type="text" placeholder="132/106" />
+              </label>
+              <label class="field">
+                <span>Rarity</span>
+                <input name="rarity" type="text" placeholder="SAR / SSP" />
+              </label>
+            </div>
+            <div class="field-row">
+              <label class="field">
+                <span>Set Code</span>
+                <input name="set_code" type="text" placeholder="sv08" />
+              </label>
+              <label class="field">
+                <span>Set Name</span>
+                <input name="set_name" type="text" placeholder="超電ブレイカー" />
+              </label>
+            </div>
+            <button class="button button--primary" type="submit">查詢</button>
+          </form>
+          <div id="lookup-status" class="status-pill">等待查詢</div>
+          <div id="lookup-result" class="lookup-result empty-state">
+            送出查詢後，這裡會顯示參考價、命中 offer 與資料來源。
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="card__heading">
+            <p class="eyebrow">Runtime</p>
+            <h2>Assistant 狀態</h2>
+          </div>
+          <dl id="assistant-meta" class="meta-grid"></dl>
+        </section>
+
+        <section class="card">
+          <div class="card__heading">
+            <p class="eyebrow">Tracked Data</p>
+            <h2>目前資料庫摘要</h2>
+          </div>
+          <div id="tracked-items" class="stack"></div>
+        </section>
+
+        <section class="card">
+          <div class="card__heading">
+            <p class="eyebrow">Tooling</p>
+            <h2>已註冊 Assistant Tools</h2>
+          </div>
+          <div id="tools-list" class="stack"></div>
+        </section>
+
+        <section class="card card--wide">
+          <div class="card__heading">
+            <p class="eyebrow">Reference Sources</p>
+            <h2>估價與監控來源</h2>
+          </div>
+          <div id="source-list" class="source-grid"></div>
+        </section>
+
+        <section class="card card--wide">
+          <div class="card__heading">
+            <p class="eyebrow">Seed Data</p>
+            <h2>範例 Watchlist</h2>
+          </div>
+          <div id="watchlist-list" class="source-grid"></div>
+        </section>
+      </main>
+    </div>
+
+    <script src="/assets/dashboard.js?v=20260416a"></script>
+  </body>
+</html>

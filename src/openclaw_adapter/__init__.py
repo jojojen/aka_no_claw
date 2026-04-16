@@ -1,0 +1,1 @@
+"""OpenClaw-facing adapter layer."""
