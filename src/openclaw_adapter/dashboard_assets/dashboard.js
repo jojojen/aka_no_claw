@@ -1,5 +1,9 @@
 const state = {
   dashboard: null,
+  hotDisplayLimits: {
+    pokemon: 10,
+    ws: 10,
+  },
 };
 
 async function loadDashboard() {
@@ -154,24 +158,38 @@ function renderHotBoards(boards, errorMessage) {
 
 function renderHotBoard(game, board, errorMessage) {
   const methodology = document.getElementById(`hot-${game}-methodology`);
+  const summary = document.getElementById(`hot-${game}-summary`);
   const list = document.getElementById(`hot-${game}-list`);
+  const limitSelect = document.getElementById(`hot-${game}-limit`);
 
   if (!board) {
     methodology.textContent = errorMessage || "流動性榜目前無法載入。";
+    summary.textContent = "";
     list.innerHTML = `<div class="hot-item empty-state">目前沒有可顯示的高流動性資料。</div>`;
+    configureHotBoardLimit(limitSelect, [], 0, game);
     return;
   }
 
-  methodology.textContent = board.methodology;
-  list.innerHTML = "";
   const items = Array.isArray(board.items) ? board.items : [];
+  const allowedLimits = Array.isArray(board.allowed_display_limits) ? board.allowed_display_limits : [];
+  const defaultLimit = Number(board.default_display_limit || 0);
+  configureHotBoardLimit(limitSelect, allowedLimits, defaultLimit, game);
+
+  methodology.textContent = board.methodology;
 
   if (!items.length) {
+    summary.textContent = "目前來源有回應，但沒有可顯示的高流動性項目。";
     list.innerHTML = `<div class="hot-item empty-state">目前來源有回應，但沒有可顯示的高流動性項目。</div>`;
     return;
   }
 
-  for (const item of items) {
+  const selectedLimit = Math.min(state.hotDisplayLimits[game] || defaultLimit || items.length, items.length);
+  const generatedAt = formatDateTime(board.generated_at);
+  summary.textContent = `目前顯示前 ${selectedLimit} / ${items.length} 名。資料更新時間 ${generatedAt}。`;
+
+  list.innerHTML = "";
+
+  for (const item of items.slice(0, selectedLimit)) {
     const cardInfo = [item.card_number, item.rarity, item.set_code].filter(Boolean);
     const references = Array.isArray(item.references) ? item.references : [];
     const notesList = Array.isArray(item.notes) ? item.notes : [];
@@ -181,14 +199,20 @@ function renderHotBoard(game, board, errorMessage) {
           `<a class="source-link" href="${escapeHtml(reference.url)}" target="_blank" rel="noreferrer">${escapeHtml(reference.label)}</a>`,
       )
       .join("");
-    const notes = notesList
-      .map((note) => `<div class="hot-note">${escapeHtml(note)}</div>`)
-      .join("");
+    const notes = notesList.map((note) => `<div class="hot-note">${escapeHtml(note)}</div>`).join("");
     const priceLabel = item.price_jpy == null ? "price n/a" : `¥${Number(item.price_jpy).toLocaleString()}`;
+    const thumbnailMarkup = item.thumbnail_url
+      ? `
+          <a class="hot-thumb" href="${escapeHtml(firstReferenceUrl(references) || "#")}" target="_blank" rel="noreferrer">
+            <img src="${escapeHtml(item.thumbnail_url)}" alt="${escapeHtml(item.title)}" loading="lazy" />
+          </a>
+        `
+      : `<div class="hot-thumb hot-thumb--empty">No image</div>`;
 
     const article = document.createElement("article");
     article.className = "hot-item";
     article.innerHTML = `
+      ${thumbnailMarkup}
       <div class="hot-item__topline">
         <span class="hot-rank">#${escapeHtml(item.rank)}</span>
         <div class="hot-price">${escapeHtml(priceLabel)}</div>
@@ -205,6 +229,34 @@ function renderHotBoard(game, board, errorMessage) {
     `;
     list.appendChild(article);
   }
+}
+
+function configureHotBoardLimit(select, allowedLimits, defaultLimit, game) {
+  select.innerHTML = "";
+
+  if (!allowedLimits.length) {
+    select.disabled = true;
+    const option = document.createElement("option");
+    option.value = "0";
+    option.textContent = "0";
+    select.appendChild(option);
+    state.hotDisplayLimits[game] = 0;
+    return;
+  }
+
+  const nextValue = allowedLimits.includes(state.hotDisplayLimits[game])
+    ? state.hotDisplayLimits[game]
+    : defaultLimit || allowedLimits[allowedLimits.length - 1];
+  state.hotDisplayLimits[game] = nextValue;
+
+  for (const limit of allowedLimits) {
+    const option = document.createElement("option");
+    option.value = String(limit);
+    option.textContent = String(limit);
+    option.selected = limit === nextValue;
+    select.appendChild(option);
+  }
+  select.disabled = false;
 }
 
 async function submitLookup(event) {
@@ -241,6 +293,40 @@ async function submitLookup(event) {
   }
 }
 
+function handleHotLimitChange(event) {
+  const select = event.currentTarget;
+  const game = select.dataset.game;
+  state.hotDisplayLimits[game] = Number(select.value);
+  if (state.dashboard) {
+    renderHotBoards(state.dashboard.hot_cards, state.dashboard.hot_cards_error);
+  }
+}
+
+function firstReferenceUrl(references) {
+  if (!Array.isArray(references) || !references.length) {
+    return null;
+  }
+  return references[references.length - 1]?.url || references[0]?.url || null;
+}
+
+function formatDateTime(value) {
+  if (!value) {
+    return "n/a";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "n/a";
+  }
+  return new Intl.DateTimeFormat("zh-Hant-TW", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(date);
+}
+
 function escapeHtml(value) {
   return String(value)
     .replaceAll("&", "&amp;")
@@ -258,6 +344,8 @@ document.getElementById("lookup-form").addEventListener("submit", submitLookup);
 document.getElementById("refresh-dashboard").addEventListener("click", () => {
   loadDashboard().catch(renderFatalError);
 });
+document.getElementById("hot-pokemon-limit").addEventListener("change", handleHotLimitChange);
+document.getElementById("hot-ws-limit").addEventListener("change", handleHotLimitChange);
 
 loadDashboard().catch(renderFatalError);
 

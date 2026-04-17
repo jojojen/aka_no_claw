@@ -1,4 +1,3 @@
-# test
 # OpenClaw Personal Assistant Workspace
 
 這個專案把 OpenClaw 當成個人助理入口，價格追蹤只是其中一組工具，不是整個系統本體。
@@ -98,19 +97,20 @@ python -m openclaw_adapter serve-dashboard --open-browser
 
 如果不自動開瀏覽器，也可以手動打開 `http://127.0.0.1:8765`。
 
-Dashboard 上方目前會顯示兩塊高流動性榜：
+Dashboard 上方目前會顯示兩塊高流動性榜，並支援切換要顯示前幾名：
 
-- Pokemon 高流動性前十
-- Weiss Schwarz 高流動性前十
+- Pokemon 高流動性榜
+- Weiss Schwarz 高流動性榜
 
-目前的判斷方式是流動性優先，而不是單純話題熱度：
+目前的判斷方式重新調整成「流動性 proxy」優先，而不是單純話題熱度：
 
-- Pokemon 目前以 Card Rush Pokemon 高稀有單卡頁面的可見庫存深度為主，賣場排序只當次要 tie-breaker，並把同卡不同品況合併。
-- WS 目前以 magi 的 Weiss Schwarz 商品頁 active 出品數為主，頁面排序只當次要 tie-breaker，並把同卡不同 grade 版本合併。
-- 0 active listing / 0 在庫的項目不會再被當成高流動性主訊號，只會在資料不足時作為 fallback。
-- graded 卡會被視為比 raw copy 更低流動性，因此同深度下會往後排。
-- 每張卡都會附上排行榜來源頁與商品頁連結，方便直接回原站核對。
-- `listing_count` 會當成主要流動性訊號，另外搭配來源頁排序與是否 graded 做輔助判斷。
+- Pokemon 目前以 Card Rush Pokemon 的可立即購買在庫深度為主。
+- WS 目前以 magi 的 active 出品數為主。
+- 計分權重是：深度 65%、來源頁可見度 25%、可替代性 / 流通性 10%。
+- 同卡不同品況或不同 grade 會先合併，避免同一張卡占掉多個名次。
+- graded 卡會被視為比 raw copy 更低流動性，因此會吃到可替代性扣分。
+- 0 active listing / 0 在庫的項目不再混進榜單，因為那比較像「曾經熱門」而不是「現在容易成交」。
+- 每張卡都會附上排行榜來源頁、商品頁連結和卡圖縮圖，方便直接回原站核對。
 
 如果你想直接雙擊或用一行命令啟動，也可以用 repo 根目錄的批次檔：
 
@@ -153,6 +153,36 @@ python -m openclaw_adapter telegram-poll --notify-startup
 /liquidity pokemon
 /liquidity ws 5
 ```
+
+### Telegram Token Rotation
+
+如果你懷疑 bot token 外流，或只是想定期換新 token，可以在 Telegram 的 `@BotFather` 完成：
+
+1. 打開 `@BotFather`
+2. 輸入 `/mybots`
+3. 選你的 bot
+4. 進入 `API Token` 或 `Bot Settings`
+5. 選 `Revoke current token`
+6. 確認後取得新的 token
+7. 把新的 token 更新到本機 `.env`
+
+`.env` 只需要更新這一行：
+
+```dotenv
+OPENCLAW_TELEGRAM_BOT_TOKEN=你的新token
+```
+
+更新後重啟 bot：
+
+```powershell
+.\start-telegram-bot.bat --notify-startup
+```
+
+注意：
+
+- 舊 token 一旦 revoke，舊 bot 進程就不能再發訊息。
+- 不要把真實 token 放進 `.env.example`。
+- 這個專案會讀 `.env`，不是 `.env.example`。
 
 查卡價：
 

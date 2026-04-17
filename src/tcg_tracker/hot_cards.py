@@ -8,6 +8,7 @@ from typing import Iterable
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
+from bs4.element import Tag
 
 from market_monitor.http import HttpClient
 from market_monitor.normalize import normalize_card_number, normalize_text
@@ -16,6 +17,7 @@ from .catalog import TcgCardSpec
 
 CARDRUSH_POKEMON_RANKING_URL = "https://www.cardrush-pokemon.jp/product-group/22?sort=rank&num=100"
 MAGI_WS_RANKING_URL = "https://magi.camp/series/7/products"
+DEFAULT_BOARD_LIMIT = 20
 
 CARDRUSH_BROWSER_HEADERS = {
     "User-Agent": (
@@ -63,6 +65,7 @@ class HotCardEntry:
     rank: int
     title: str
     price_jpy: int | None
+    thumbnail_url: str | None
     card_number: str | None
     rarity: str | None
     set_code: str | None
@@ -98,6 +101,7 @@ class TcgLookupHint:
 class _ParsedHotItem:
     title: str
     price_jpy: int | None
+    thumbnail_url: str | None
     card_number: str | None
     rarity: str | None
     set_code: str | None
@@ -113,13 +117,13 @@ class TcgHotCardService:
     def __init__(self, http_client: HttpClient | None = None) -> None:
         self.http_client = http_client or HttpClient()
 
-    def load_boards(self) -> tuple[HotCardBoard, ...]:
+    def load_boards(self, *, limit: int = DEFAULT_BOARD_LIMIT) -> tuple[HotCardBoard, ...]:
         return (
-            self.load_pokemon_board(),
-            self.load_ws_board(),
+            self.load_pokemon_board(limit=limit),
+            self.load_ws_board(limit=limit),
         )
 
-    def load_pokemon_board(self, *, limit: int = 10) -> HotCardBoard:
+    def load_pokemon_board(self, *, limit: int = DEFAULT_BOARD_LIMIT) -> HotCardBoard:
         html = self.http_client.get_text(
             CARDRUSH_POKEMON_RANKING_URL,
             headers=CARDRUSH_BROWSER_HEADERS,
@@ -131,17 +135,18 @@ class TcgHotCardService:
         )
         return HotCardBoard(
             game="pokemon",
-            label="Pokemon Liquidity Top 10",
+            label="Pokemon Liquidity Board",
             methodology=(
-                "Ranks Pokemon cards by observed Cardrush stock depth first, then uses the source's "
-                "best-seller order as a secondary tie-breaker. Duplicates across condition variants are merged, "
-                "and zero-stock entries are treated as lower-liquidity fallbacks."
+                "Liquidity ranking is weighted toward immediately purchasable depth, not generic hype. "
+                "Score weights are depth 65%, page visibility 25%, and fungibility 10%. Entries with "
+                "zero visible stock are excluded from the board, while duplicate condition variants are merged "
+                "under the same card."
             ),
             generated_at=datetime.now(timezone.utc),
             items=items,
         )
 
-    def load_ws_board(self, *, limit: int = 10) -> HotCardBoard:
+    def load_ws_board(self, *, limit: int = DEFAULT_BOARD_LIMIT) -> HotCardBoard:
         html = self.http_client.get_text(MAGI_WS_RANKING_URL)
         items = self._build_ranked_entries(
             game="ws",
@@ -150,11 +155,12 @@ class TcgHotCardService:
         )
         return HotCardBoard(
             game="ws",
-            label="WS Liquidity Top 10",
+            label="WS Liquidity Board",
             methodology=(
-                "Ranks Weiss Schwarz cards by active Magi listing count first, then uses the source page order "
-                "as a secondary tie-breaker. Grade variants are merged under the same card, raw listings are "
-                "preferred over graded copies, and zero-listing entries are treated as lower-liquidity fallbacks."
+                "Liquidity ranking is weighted toward active listing depth, not social buzz. "
+                "Score weights are depth 65%, page visibility 25%, and fungibility 10%. Entries with "
+                "zero visible listings are excluded from the board, and graded copies are penalized because they "
+                "are less fungible than raw copies."
             ),
             generated_at=datetime.now(timezone.utc),
             items=items,
@@ -253,7 +259,11 @@ class TcgHotCardService:
                 entry["best_item"] = item
 
         ranked = sorted(
-            aggregates.values(),
+            (
+                aggregate
+                for aggregate in aggregates.values()
+                if int(aggregate["total_count"]) > 0
+            ),
             key=lambda value: self._liquidity_sort_key(
                 best_item=value["best_item"],  # type: ignore[arg-type]
                 best_rank=int(value["best_rank"]),
@@ -266,21 +276,18 @@ class TcgHotCardService:
             best_item: _ParsedHotItem = aggregate["best_item"]  # type: ignore[assignment]
             best_rank = int(aggregate["best_rank"])
             total_count = int(aggregate["total_count"])
+            liquidity_score = self._hot_score(best_rank, total_count, best_item.is_graded)
             notes = [
                 best_item.note,
+                (
+                    f"Liquidity signal: {total_count} active listing(s) / stock unit(s) "
+                    f"observed after merging duplicate variants."
+                ),
+                f"Demand proxy: source visibility rank #{best_rank}.",
+                "Score weights: depth 65%, visibility 25%, fungibility 10%.",
             ]
-            if total_count > 0:
-                notes.append(
-                    f"Primary liquidity signal: {total_count} active listing(s) / stock unit(s) observed."
-                )
-                notes.append(f"Secondary tie-breaker: source visibility rank #{best_rank}.")
-            else:
-                notes.append(
-                    "No active listing count is currently visible on the source; this entry is a lower-confidence fallback."
-                )
-                notes.append(f"Fallback visibility signal: source rank #{best_rank}.")
             if best_item.is_graded:
-                notes.append("Graded copies are treated as less fungible than raw copies for liquidity ranking.")
+                notes.append("Penalty applied: graded copies are treated as less fungible than raw copies.")
 
             items.append(
                 HotCardEntry(
@@ -288,11 +295,12 @@ class TcgHotCardService:
                     rank=display_rank,
                     title=best_item.title,
                     price_jpy=best_item.price_jpy,
+                    thumbnail_url=best_item.thumbnail_url,
                     card_number=best_item.card_number,
                     rarity=best_item.rarity,
                     set_code=best_item.set_code,
                     listing_count=total_count or None,
-                    hot_score=self._hot_score(best_rank, total_count, best_item.is_graded),
+                    hot_score=liquidity_score,
                     notes=tuple(notes),
                     is_graded=best_item.is_graded,
                     references=(
@@ -334,8 +342,9 @@ class TcgHotCardService:
         best_rank: int,
         total_count: int,
     ) -> tuple[object, ...]:
+        liquidity_score = TcgHotCardService._hot_score(best_rank, total_count, best_item.is_graded)
         return (
-            0 if total_count > 0 else 1,
+            -liquidity_score,
             -total_count,
             1 if best_item.is_graded else 0,
             best_rank,
@@ -344,14 +353,15 @@ class TcgHotCardService:
 
     @staticmethod
     def _hot_score(best_rank: int, total_count: int, is_graded: bool) -> float:
-        depth_component = math.log1p(max(total_count, 0)) * 32.0
-        visibility_component = max(0.0, 14.0 - best_rank * 0.35)
-        fungibility_component = -8.0 if is_graded else 5.0
-        inactivity_penalty = -18.0 if total_count <= 0 else 0.0
-        return round(
-            max(0.0, depth_component + visibility_component + fungibility_component + inactivity_penalty),
-            2,
-        )
+        if total_count <= 0:
+            return 0.0
+
+        depth_ratio = min(1.0, math.log1p(total_count) / math.log1p(50))
+        visibility_ratio = max(0.0, 1.0 - ((best_rank - 1) / 39.0))
+        fungibility_ratio = 0.55 if is_graded else 1.0
+
+        score = (depth_ratio * 65.0) + (visibility_ratio * 25.0) + (fungibility_ratio * 10.0)
+        return round(score, 2)
 
     @staticmethod
     def _hint_score(spec: TcgCardSpec, item: _ParsedHotItem) -> float:
@@ -410,8 +420,9 @@ class TcgHotCardService:
                 continue
             parsed = _parse_cardrush_text(
                 text,
-                detail_url=anchor["href"],
+                detail_url=urljoin("https://www.cardrush-pokemon.jp", anchor["href"]),
                 board_url=CARDRUSH_POKEMON_RANKING_URL,
+                thumbnail_url=_extract_cardrush_thumbnail_url(anchor),
             )
             if parsed is not None:
                 items.append(parsed)
@@ -428,13 +439,20 @@ class TcgHotCardService:
                 text,
                 detail_url=urljoin("https://magi.camp", anchor["href"]),
                 board_url=MAGI_WS_RANKING_URL,
+                thumbnail_url=_extract_magi_thumbnail_url(anchor),
             )
             if parsed is not None:
                 items.append(parsed)
         return items
 
 
-def _parse_cardrush_text(text: str, *, detail_url: str, board_url: str) -> _ParsedHotItem | None:
+def _parse_cardrush_text(
+    text: str,
+    *,
+    detail_url: str,
+    board_url: str,
+    thumbnail_url: str | None = None,
+) -> _ParsedHotItem | None:
     condition = None
     working = text
     condition_match = CARDRUSH_STATE_RE.match(working)
@@ -463,6 +481,7 @@ def _parse_cardrush_text(text: str, *, detail_url: str, board_url: str) -> _Pars
     return _ParsedHotItem(
         title=title,
         price_jpy=price_jpy,
+        thumbnail_url=thumbnail_url,
         card_number=card_number,
         rarity=rarity,
         set_code=set_code,
@@ -475,7 +494,13 @@ def _parse_cardrush_text(text: str, *, detail_url: str, board_url: str) -> _Pars
     )
 
 
-def _parse_magi_text(text: str, *, detail_url: str, board_url: str) -> _ParsedHotItem | None:
+def _parse_magi_text(
+    text: str,
+    *,
+    detail_url: str,
+    board_url: str,
+    thumbnail_url: str | None = None,
+) -> _ParsedHotItem | None:
     grading_match = GRADING_RE.match(text)
     is_graded = grading_match is not None
     working = text[grading_match.end():].strip() if grading_match is not None else text
@@ -515,6 +540,7 @@ def _parse_magi_text(text: str, *, detail_url: str, board_url: str) -> _ParsedHo
     return _ParsedHotItem(
         title=title,
         price_jpy=price_jpy,
+        thumbnail_url=thumbnail_url,
         card_number=card_number,
         rarity=rarity,
         set_code=set_code,
@@ -561,3 +587,28 @@ def _title_key(game: str, title: str, *, drop_game_suffixes: bool = False) -> st
     if game == "pokemon" and drop_game_suffixes:
         normalized = normalized.removesuffix("ex")
     return normalized
+
+
+def _extract_cardrush_thumbnail_url(anchor: Tag) -> str | None:
+    image = anchor.select_one("img")
+    if image is None:
+        return None
+    return _pick_image_url(image, attribute_names=("data-x2", "src"))
+
+
+def _extract_magi_thumbnail_url(anchor: Tag) -> str | None:
+    image = anchor.select_one("img")
+    if image is None:
+        return None
+    url = _pick_image_url(image, attribute_names=("data-src", "src"))
+    if not url:
+        return None
+    return urljoin("https://magi.camp", url)
+
+
+def _pick_image_url(image: Tag, *, attribute_names: tuple[str, ...]) -> str | None:
+    for attribute_name in attribute_names:
+        candidate = image.get(attribute_name)
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None

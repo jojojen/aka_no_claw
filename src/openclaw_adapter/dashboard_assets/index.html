@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>OpenClaw Dashboard</title>
-    <link rel="stylesheet" href="/assets/dashboard.css?v=20260416a" />
+    <link rel="stylesheet" href="/assets/dashboard.css?v=20260417a" />
   </head>
   <body>
     <div class="page-shell">
@@ -43,19 +43,33 @@
 
       <section class="hot-zone">
         <article class="hot-board">
-          <div class="card__heading">
-            <p class="eyebrow">Liquidity Board</p>
-            <h2>Pokemon 高流動性前十</h2>
+          <div class="hot-board__toolbar">
+            <div class="card__heading">
+              <p class="eyebrow">Liquidity Board</p>
+              <h2>Pokemon 高流動性榜</h2>
+            </div>
+            <label class="hot-control" for="hot-pokemon-limit">
+              <span>顯示前</span>
+              <select id="hot-pokemon-limit" data-game="pokemon"></select>
+            </label>
           </div>
+          <p id="hot-pokemon-summary" class="hot-board__summary"></p>
           <p id="hot-pokemon-methodology" class="hot-board__methodology"></p>
           <div id="hot-pokemon-list" class="hot-list"></div>
         </article>
 
         <article class="hot-board">
-          <div class="card__heading">
-            <p class="eyebrow">Liquidity Board</p>
-            <h2>WS 高流動性前十</h2>
+          <div class="hot-board__toolbar">
+            <div class="card__heading">
+              <p class="eyebrow">Liquidity Board</p>
+              <h2>WS 高流動性榜</h2>
+            </div>
+            <label class="hot-control" for="hot-ws-limit">
+              <span>顯示前</span>
+              <select id="hot-ws-limit" data-game="ws"></select>
+            </label>
           </div>
+          <p id="hot-ws-summary" class="hot-board__summary"></p>
           <p id="hot-ws-methodology" class="hot-board__methodology"></p>
           <div id="hot-ws-list" class="hot-list"></div>
         </article>
@@ -151,6 +165,6 @@
       </main>
     </div>
 
-    <script src="/assets/dashboard.js?v=20260416a"></script>
+    <script src="/assets/dashboard.js?v=20260417a"></script>
   </body>
 </html>

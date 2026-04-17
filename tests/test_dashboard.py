@@ -15,7 +15,7 @@ class StubHotCardService:
         return (
             HotCardBoard(
                 game="pokemon",
-                label="Pokemon Liquidity Top 10",
+                label="Pokemon Liquidity Board",
                 methodology="stub methodology",
                 generated_at=datetime.now(timezone.utc),
                 items=(
@@ -24,6 +24,7 @@ class StubHotCardService:
                         rank=1,
                         title="ピカチュウex",
                         price_jpy=99800,
+                        thumbnail_url="https://example.com/pikachu.jpg",
                         card_number="132/106",
                         rarity="SAR",
                         set_code="sv08",
@@ -104,3 +105,6 @@ def test_dashboard_payload_includes_runtime_data(tmp_path) -> None:
     assert payload["hot_cards"][0]["game"] == "pokemon"
     assert payload["hot_cards"][0]["items"][0]["title"] == "ピカチュウex"
     assert payload["hot_cards"][0]["items"][0]["liquidity_score"] == 99.0
+    assert payload["hot_cards"][0]["items"][0]["thumbnail_url"] == "https://example.com/pikachu.jpg"
+    assert payload["hot_cards"][0]["default_display_limit"] == 1
+    assert payload["hot_cards"][0]["allowed_display_limits"] == [1]

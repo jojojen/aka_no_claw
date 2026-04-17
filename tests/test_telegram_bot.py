@@ -16,7 +16,7 @@ from openclaw_adapter.telegram_bot import (
 def _stub_board() -> HotCardBoard:
     return HotCardBoard(
         game="pokemon",
-        label="Pokemon Liquidity Top 10",
+        label="Pokemon Liquidity Board",
         methodology="stub methodology",
         generated_at=datetime.now(timezone.utc),
         items=(
@@ -25,6 +25,7 @@ def _stub_board() -> HotCardBoard:
                 rank=1,
                 title="ピカチュウex",
                 price_jpy=99800,
+                thumbnail_url="https://example.com/pikachu.jpg",
                 card_number="132/106",
                 rarity="SAR",
                 set_code="sv08",
@@ -84,7 +85,7 @@ def test_command_processor_handles_lookup_and_liquidity() -> None:
     liquidity_reply = processor.build_reply(chat_id="123", text="/liquidity pokemon")
 
     assert lookup_reply == "pokemon:ピカチュウex:132/106"
-    assert "Pokemon Liquidity Top 10" in liquidity_reply
+    assert "Pokemon Liquidity Board" in liquidity_reply
     assert "active 5" in liquidity_reply
 
 

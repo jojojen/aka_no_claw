@@ -14,6 +14,7 @@ def test_parse_cardrush_text_extracts_core_fields() -> None:
         "〔状態A-〕ピカチュウex【SAR】{234/193} [ [状態A-]M2a ] 59,800円 (税込) 在庫数 5枚",
         detail_url="https://www.cardrush-pokemon.jp/product/123",
         board_url="https://www.cardrush-pokemon.jp/product-group/22?sort=rank&num=100",
+        thumbnail_url="https://www.cardrush-pokemon.jp/image.jpg",
     )
 
     assert parsed is not None
@@ -24,6 +25,7 @@ def test_parse_cardrush_text_extracts_core_fields() -> None:
     assert parsed.price_jpy == 59800
     assert parsed.listing_count == 5
     assert parsed.condition == "状態A-"
+    assert parsed.thumbnail_url == "https://www.cardrush-pokemon.jp/image.jpg"
 
 
 def test_parse_magi_text_extracts_ws_card_fields() -> None:
@@ -31,6 +33,7 @@ def test_parse_magi_text_extracts_ws_card_fields() -> None:
         "“夏の思い出”蒼(サイン入り) SP SMP/W60-051SP ¥ 22,800 ~ 出品数 1",
         detail_url="https://magi.camp/products/123",
         board_url="https://magi.camp/series/7/products",
+        thumbnail_url="https://magi.camp/image.jpg",
     )
 
     assert parsed is not None
@@ -41,6 +44,7 @@ def test_parse_magi_text_extracts_ws_card_fields() -> None:
     assert parsed.price_jpy == 22800
     assert parsed.listing_count == 1
     assert parsed.is_graded is False
+    assert parsed.thumbnail_url == "https://magi.camp/image.jpg"
 
 
 def test_parse_magi_text_handles_codes_with_letter_prefix_after_hyphen() -> None:
@@ -96,6 +100,7 @@ def test_hot_card_service_prioritizes_active_depth_over_source_rank() -> None:
             _ParsedHotItem(
                 title="rank_only_card",
                 price_jpy=30000,
+                thumbnail_url=None,
                 card_number="AAA/W11-001SP",
                 rarity="SP",
                 set_code="aaa",
@@ -109,6 +114,7 @@ def test_hot_card_service_prioritizes_active_depth_over_source_rank() -> None:
             _ParsedHotItem(
                 title="active_card",
                 price_jpy=28000,
+                thumbnail_url=None,
                 card_number="AAA/W11-002SP",
                 rarity="SP",
                 set_code="aaa",
@@ -123,9 +129,9 @@ def test_hot_card_service_prioritizes_active_depth_over_source_rank() -> None:
         limit=10,
     )
 
+    assert len(entries) == 1
     assert entries[0].title == "active_card"
-    assert entries[1].title == "rank_only_card"
-    assert entries[0].hot_score > entries[1].hot_score
+    assert entries[0].hot_score > 0
 
 
 def test_hot_card_service_prefers_raw_copies_when_depth_is_equal() -> None:
@@ -136,6 +142,7 @@ def test_hot_card_service_prefers_raw_copies_when_depth_is_equal() -> None:
             _ParsedHotItem(
                 title="graded_card",
                 price_jpy=50000,
+                thumbnail_url=None,
                 card_number="BBB/W22-001SSP",
                 rarity="SSP",
                 set_code="bbb",
@@ -149,6 +156,7 @@ def test_hot_card_service_prefers_raw_copies_when_depth_is_equal() -> None:
             _ParsedHotItem(
                 title="raw_card",
                 price_jpy=45000,
+                thumbnail_url=None,
                 card_number="BBB/W22-002SSP",
                 rarity="SSP",
                 set_code="bbb",
@@ -175,6 +183,7 @@ def test_resolve_lookup_spec_uses_hot_card_metadata_for_precise_variant() -> Non
                 _ParsedHotItem(
                     title="メガシビルドンex",
                     price_jpy=780,
+                    thumbnail_url=None,
                     card_number="225/193",
                     rarity="MA",
                     set_code="m2a",
@@ -188,6 +197,7 @@ def test_resolve_lookup_spec_uses_hot_card_metadata_for_precise_variant() -> Non
                 _ParsedHotItem(
                     title="メガシビルドンex",
                     price_jpy=1280,
+                    thumbnail_url=None,
                     card_number="235/193",
                     rarity="SAR",
                     set_code="m2a",
@@ -210,3 +220,65 @@ def test_resolve_lookup_spec_uses_hot_card_metadata_for_precise_variant() -> Non
     assert resolved.card_number == "235/193"
     assert resolved.rarity == "SAR"
     assert resolved.set_code == "m2a"
+
+
+def test_parse_cardrush_pokemon_items_extracts_thumbnail_url() -> None:
+    html = """
+    <ul class="item_list">
+      <li class="list_item_cell">
+        <div class="item_data">
+          <a href="/product/777">
+            <div class="global_photo">
+              <img
+                src="https://cdn.example.com/thumb-160.jpg"
+                data-x2="https://cdn.example.com/thumb-320.jpg"
+                alt="メガシビルドンex【SAR】{235/193}"
+              />
+            </div>
+            <p class="item_name">
+              <span class="goods_name">メガシビルドンex【SAR】{235/193}</span>
+            </p>
+            <div class="item_info">
+              <p class="selling_price"><span class="figure">12,800円</span></p>
+              <p class="stock">在庫数 14枚</p>
+            </div>
+          </a>
+        </div>
+      </li>
+    </ul>
+    """
+
+    service = TcgHotCardService()
+    items = service._parse_cardrush_pokemon_items(html)  # type: ignore[attr-defined]
+
+    assert len(items) == 1
+    assert items[0].thumbnail_url == "https://cdn.example.com/thumb-320.jpg"
+    assert items[0].detail_url == "https://www.cardrush-pokemon.jp/product/777"
+
+
+def test_parse_magi_ws_items_extracts_thumbnail_url() -> None:
+    html = """
+    <div class="product-list__box">
+      <a href="/products/999">
+        <figure class="product-list__thumbnail">
+          <img
+            src="/assets/fallback.jpg"
+            data-src="https://magi.camp/cdn/ws-thumb.jpg"
+            alt="初音ミク SSP"
+          />
+        </figure>
+        <div class="product-list__product-name">ワンダーランドのセカイ 初音ミク SSP PJS/S91-T51</div>
+        <ul class="product-list__price-box">
+          <li class="product-list__price-box-price">¥ 1,280 ~</li>
+        </ul>
+        <div class="product-list__item-count">出品数 4</div>
+      </a>
+    </div>
+    """
+
+    service = TcgHotCardService()
+    items = service._parse_magi_ws_items(html)  # type: ignore[attr-defined]
+
+    assert len(items) == 1
+    assert items[0].thumbnail_url == "https://magi.camp/cdn/ws-thumb.jpg"
+    assert items[0].detail_url == "https://magi.camp/products/999"

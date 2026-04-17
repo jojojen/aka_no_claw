@@ -305,12 +305,16 @@ def _hot_card_boards_payload(boards: tuple[HotCardBoard, ...]) -> list[dict[str,
             "label": board.label,
             "methodology": board.methodology,
             "generated_at": board.generated_at.isoformat(),
+            "available_item_count": len(board.items),
+            "default_display_limit": _default_display_limit(len(board.items)),
+            "allowed_display_limits": _allowed_display_limits(len(board.items)),
             "items": [
                 {
                     "rank": item.rank,
                     "game": item.game,
                     "title": item.title,
                     "price_jpy": item.price_jpy,
+                    "thumbnail_url": item.thumbnail_url,
                     "card_number": item.card_number,
                     "rarity": item.rarity,
                     "set_code": item.set_code,
@@ -332,3 +336,18 @@ def _hot_card_boards_payload(boards: tuple[HotCardBoard, ...]) -> list[dict[str,
         }
         for board in boards
     ]
+
+
+def _allowed_display_limits(item_count: int) -> list[int]:
+    if item_count <= 0:
+        return []
+    options = [count for count in (3, 5, 10, 20) if count <= item_count]
+    if item_count not in options:
+        options.append(item_count)
+    return sorted(set(options))
+
+
+def _default_display_limit(item_count: int) -> int:
+    if item_count <= 0:
+        return 0
+    return 10 if item_count >= 10 else item_count
