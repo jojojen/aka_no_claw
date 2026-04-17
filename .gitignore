@@ -25,6 +25,8 @@ data/*.db
 data/*.log
 !data/.gitkeep
 logs/
+.openclaw_tmp/
+.openclaw_ocr/
 
 # OS / editor noise
 .DS_Store

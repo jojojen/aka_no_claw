@@ -1,65 +1,124 @@
-# Liquidity Methodology
+# Liquidity / Trend Methodology
 
 Last updated: 2026-04-17
 
-This file explains how the dashboard's `Pokemon Liquidity Board` and `WS Liquidity Board` are ranked.
+這份文件說明 dashboard 上 `Pokemon Liquidity Board` 與 `WS Liquidity Board` 目前怎麼排序，以及為什麼這次把邏輯從「單一店家買盤 proxy」改成「近期交易熱度 + 買方承接 + SNS 注意力」的混合模型。
 
-## 1. What We Mean By Liquidity
+## 1. 先講結論
 
-In this project, liquidity means:
+目前榜單不再把 `listing_count` / `在庫数` / `出品数` 當主分數。
 
-- a card can be bought or sold quickly
-- the gap between sell-side and buy-side quotes is not too wide
-- there is credible evidence that somebody wants to buy now, not just list now
+原因很直接：
 
-We intentionally do **not** treat listing count as the liquidity score.
+- 供給很多，不代表真的好賣
+- 很多掛單可能只是價格偏離、長時間沒成交、或不同品況重複上架
+- 如果榜上完全沒有 `ピカチュウ` 或 `リザードン` 這類明顯有持續交易熱度的卡，代表模型太偏單一店家觀點
 
-## 2. Why Listing Count Was Removed
+所以現在的排序改成三層：
 
-`active listings`, `在庫数`, and `出品数` are supply-side snapshots.
+1. `recent market activity`
+2. `buy-side support`
+3. `SNS attention`
 
-They can be useful as context, but they do not reliably answer:
+## 2. 為什麼要改
 
-- how much traded recently
-- how fast a holder can exit
-- whether buyers are actually waiting near the current ask
+前一版最大的問題有兩個：
 
-A card can have many listings because it is:
+1. 候選池太窄  
+Pokemon 候選主要來自單一店家的高稀有單卡頁，容易偏向當期或特定分類。
 
-- overpriced
-- stale
-- duplicated across condition variants
-- being flipped repeatedly without clearing
+2. 分數太依賴單一店家的買盤  
+如果只看某一家店的 bid / ask，很容易把「店家很好收」誤當成「全市場最熱」。
 
-That makes listing count a weak primary liquidity metric.
+這會導致：
 
-## 3. Current Scoring Model
+- 一些最近實際交易很活躍的卡沒進前列
+- `ピカチュウ`、`リザードン` 這種跨期、跨系列都長期有需求的卡被低估
 
-The current implementation prefers a cross-game signal we can observe consistently on public pages: **buy-side support**.
+## 3. 現行資料來源
 
-### 3.1 Candidate Discovery
+### 3.1 Pokemon
 
-Source pages are only used to discover candidate cards.
+Pokemon 現在會同時看：
 
-- Pokemon:
-  - primary candidate page: Cardrush Pokemon high-rarity singles
-  - fallback candidate page: magi Pokemon page
-- WS:
-  - primary candidate page: magi Weiss Schwarz page
+- SNKRDUNK 月交易數排名  
+  `https://snkrdunk.com/articles/31649/`
+- SNKRDUNK UR 類別交易排名  
+  `https://snkrdunk.com/articles/31962/`
+- SNKRDUNK SA 類別交易排名  
+  `https://snkrdunk.com/articles/31708/`
+- Cardrush Pokemon 類別頁  
+  `https://www.cardrush-pokemon.jp/product-group/22?sort=rank&num=100`
+- magi Pokemon 頁面  
+  `https://magi.camp/brands/3/items`
+- 遊々亭賣價 / 買取頁
+- Yahoo!リアルタイム検索
 
-These pages help us find what to evaluate, but their listing counts do **not** drive the ranking.
+### 3.2 WS
 
-### 3.2 Primary Liquidity Signal: Buy-Side Support
+WS 目前資料條件比 Pokemon 差，因為還沒有找到跟 Pokemon 一樣新鮮、穩定、又容易解析的「近期廣域交易排行榜」。
 
-For each candidate card, we look up matching quotes on 遊々亭 and derive:
+所以 WS 現在主要看：
 
-- whether a credible buylist quote exists
-- the best visible ask quote
-- the best visible bid quote
-- the `bid / ask` ratio
-- whether the store explicitly shows the buy quote was raised
+- magi Weiss Schwarz 頁面  
+  `https://magi.camp/series/7/products`
+- 遊々亭賣價 / 買取頁
+- Yahoo!リアルタイム検索
 
-The `buy_support_ratio` is:
+這代表：
+
+- Pokemon 榜單現在更偏向「最近真實交易熱度 + 流動性」
+- WS 榜單目前仍偏向「買盤承接 + 社群 / 頁面注意力」
+
+## 4. 候選池怎麼建立
+
+### 4.1 Pokemon
+
+Pokemon 候選池會把下列來源合併後再去重：
+
+- SNKRDUNK 月交易數榜單
+- SNKRDUNK 類別交易榜單
+- Cardrush 類別頁
+- magi 頁面
+
+這一步的目的是先回答：
+
+- 最近市場上哪些卡真的有人交易
+- 哪些卡不是只有某單一頁面短暫冒出來
+
+### 4.2 WS
+
+WS 目前候選池仍以 magi 為主，再用遊々亭與 SNS 補信號。
+
+## 5. 三層分數
+
+### 5.1 Recent Market Activity
+
+這是現在最重要的一層。
+
+Pokemon 會把近期交易榜單視為高可信度信號：
+
+- 月交易數榜單權重最高
+- 類別交易榜單次之
+- 店家頁順序只算低權重輔助
+
+同一張卡如果同時出現在多個獨立來源，會得到 `source diversity bonus`。
+
+這層想回答的是：
+
+- 最近是不是很多人真的在交易這張卡
+- 它是不是不只出現在單一來源
+
+### 5.2 Buy-Side Support
+
+這層主要看遊々亭：
+
+- 有沒有可見買取價
+- 最佳賣價和最佳買取價有多接近
+- `bid / ask` 比例
+- 是否有 `priceup` 之類的明確加價訊號
+
+`buy_support_ratio` 目前仍然沿用舊公式：
 
 ```text
 0.35 if a bid exists
@@ -68,111 +127,101 @@ The `buy_support_ratio` is:
 + small momentum boost when the store explicitly marks the bid as raised
 ```
 
-So the strongest cards are the ones where:
+這層想回答的是：
 
-- a buy quote exists
-- the buy quote is close to the visible ask
-- the market looks two-sided instead of one-sided
-- the store is visibly increasing its buy price, which is a stronger signal than generic marketing copy
+- 如果今天要賣，有沒有像樣的承接
+- 市場是不是只剩賣方，還是買方也在
 
-### 3.2.1 Explicit Store-Side Buy-Up Signal
+### 5.3 SNS Attention
 
-If a store page exposes something stronger than a slogan, we use it.
+這層目前用：
 
-Current example:
+- Yahoo!リアルタイム検索 的匹配貼文數
+- 可見互動量
 
-- 遊々亭 buy pages sometimes mark a card block with `priceup`
-- the same block also shows the previous buy price in a struck-through `<del>` price
+SNS 只當輔助，不允許單獨主導排序。
 
-When that happens, we treat it as a real store-side buy-pressure signal because:
+原因是：
 
-- it is attached to a concrete card
-- it is tied to an actual numeric buy quote
-- we can compare old bid vs current bid directly
+- 社群聲量常常有雜訊
+- 話題很大不代表成交也很大
 
-This is treated as an auxiliary reference signal only.
-It gets only a modest boost, helps break close calls, and does not overpower the core bid / ask relationship.
+## 6. 最終分數
 
-### 3.3 Liquidity Score
-
-The board's `liquidity_score` is:
+目前最終 `hot_score` 是：
 
 ```text
-liquidity_score = buy_support_ratio * 90 + fungibility_ratio * 10
+hot_score =
+  market_activity_score * 0.50
++ buy_support_score   * 0.45
++ attention_score     * 0.05
++ small raw-card fungibility bonus
 ```
 
-Where:
+幾個重點：
 
-- `fungibility_ratio = 1.0` for raw copies
-- `fungibility_ratio = 0.7` for graded copies
+- `market_activity_score` 現在權重最高
+- `buy_support_score` 很高，但不再單獨主導整個榜
+- `attention_score` 只剩 5%，避免 SNS 把結果帶偏
+- raw 卡會有小幅加分，graded 不會
 
-Graded cards are penalized slightly because they are usually less interchangeable than raw copies.
+## 7. 排序順序
 
-### 3.4 Attention Score
+目前實作上的排序優先順序是：
 
-`attention_score` is not the liquidity score.
+1. `hot_score`
+2. `market_activity_score`
+3. `buy_support_score`
+4. `attention_score`
+5. raw 優先於 graded
+6. 來源內原始排名作為最後 tie-breaker
 
-It is a side channel used after liquidity to break ties and add demand context.
+## 8. 這樣修正後，為什麼會更合理
 
-Right now it uses:
+這次改動的核心是：
 
-- Yahoo!リアルタイム検索 matched public posts
-- visible engagement on matched posts
+- 不再把「單一店家很好收」誤當成「全市場最熱」
+- 把「最近真有交易」拉回主分數
+- 保留買盤承接，避免排行榜只剩純話題卡
+- 把 SNS 壓到輔助層，避免社群雜訊主導
 
-If social signal is missing, the attention score drops to zero. That does not automatically remove a card from the board if buy-side support is strong.
+以 2026-04-17 的 live 檢查為例，新榜單前十已經重新出現：
 
-## 4. Ranking Order
+- `ピカチュウex SAR [M2a 234/193]`
+- `メガリザードンXex MA [M2a 223/193]`
+- `メガリザードンXex SAR [M2 110/080]`
 
-Current board ordering is:
+這比前一版完全看不到 `ピカチュウ` / `リザードン` 明顯合理得多。
 
-1. `liquidity_score`
-2. `buy_support_score`
-3. `attention_score`
-4. raw before graded
-5. candidate-page rank as a late tie-breaker
+## 9. 目前限制
 
-`listing_count` is kept only as background context in notes. It is not part of the score.
+還是有幾個限制要誠實寫清楚：
 
-## 5. Why This Is More Reasonable
+- WS 目前缺少像 Pokemon 那樣強的近期交易榜資料
+- SNKRDUNK 文章頁不是正式 API，HTML 結構未來可能變
+- 遊々亭買盤仍然只代表單一店家的買方需求
+- Yahoo!リアルタイム検索 只能當注意力 proxy，不是成交證據
 
-This model is closer to practical liquidity because it asks:
+## 10. 下一步最值得做的事
 
-- is there an actual buyer quote
-- how close is that buyer quote to the seller quote
-- can we see two-sided market support right now
+如果之後要再把合理性往上推，優先順序會是：
 
-That is more actionable than simply counting how many offers are visible.
+1. 接更多公開且穩定的 `recent sold` / `recent trades` 來源
+2. 把多來源交易訊號做時間衰減
+3. 對 Pokemon / WS 分別做更專門的權重，而不是共用同一套
+4. 讓 dashboard 顯示每張卡命中的交易來源摘要
 
-Conceptually this aligns better with standard liquidity dimensions such as immediacy and tightness than a raw listing counter alone.
+## 11. 本次參考來源
 
-## 6. Current Limits
-
-This is better than listing count, but it is still a proxy.
-
-Current limits:
-
-- recent one-month transaction counts are not exposed uniformly for both Pokemon and WS on stable public pages we can reuse right now
-- 遊々亭 buylist quotes reflect dealer demand, not the entire market
-- explicit store-side buy-up labels are useful, but they still reflect one venue's demand rather than the whole market
-- Yahoo!リアルタイム検索 is useful for attention context, but social chatter can be noisy
-- candidate discovery still begins from ranking / listing pages, even though those pages no longer define the score itself
-
-## 7. Planned Upgrades
-
-The next better version would add one or more of these:
-
-- recent monthly transaction count feeds where a stable public source exists
-- sold-history data from marketplaces with reliable public access
-- cross-source buy-side support instead of relying on one store's buylist
-- source-diversity bonuses when multiple credible venues agree
-
-## 8. Source References
-
-- 遊々亭 buy guide:
-  - https://img.yuyu-tei.jp/sp/info/buy_10.php
-- Yahoo!リアルタイム検索:
-  - https://search.yahoo.co.jp/realtime
-- IMF discussion of liquidity measurement:
-  - https://www.imf.org/en/Publications/WP/Issues/2016/12/30/Measuring-Liquidity-in-Financial-Markets-16211
-- Example of recent-month transaction ranking pages on SNKRDUNK that may become future inputs:
-  - https://snkrdunk.com/articles/31649/
+- SNKRDUNK 月交易數榜單  
+  https://snkrdunk.com/articles/31649/
+- SNKRDUNK UR 交易榜單  
+  https://snkrdunk.com/articles/31962/
+- SNKRDUNK SA 交易榜單  
+  https://snkrdunk.com/articles/31708/
+- 遊々亭買取說明  
+  https://img.yuyu-tei.jp/sp/info/buy_10.php
+- Yahoo!リアルタイム検索  
+  https://search.yahoo.co.jp/realtime
+- IMF liquidity measurement discussion  
+  https://www.imf.org/en/Publications/WP/Issues/2016/12/30/Measuring-Liquidity-in-Financial-Markets-16211

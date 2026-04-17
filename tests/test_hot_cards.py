@@ -8,6 +8,7 @@ from tcg_tracker.hot_cards import (
     _ParsedHotItem,
     _parse_cardrush_text,
     _parse_magi_text,
+    _parse_snkrdunk_text,
     _parse_yahoo_realtime_signal,
 )
 from tcg_tracker.catalog import TcgCardSpec
@@ -123,6 +124,28 @@ def test_parse_magi_text_handles_codes_with_letter_prefix_after_hyphen() -> None
     assert parsed.card_number == "HOL/W91-T108SP"
     assert parsed.listing_count == 0
     assert parsed.is_graded is True
+
+
+def test_parse_snkrdunk_text_extracts_core_fields() -> None:
+    parsed = _parse_snkrdunk_text(
+        "???圯x SAR [M2a 234/193](?舀?喳?摨舫??MEGA?脩?ex)",
+        detail_url="https://snkrdunk.com/apparels/730956?slide=right",
+        board_url="https://snkrdunk.com/articles/31649/",
+        thumbnail_url="https://cdn.snkrdunk.com/example.webp",
+        note="trend",
+        source_label="SNKRDUNK monthly trades",
+        source_rank=5,
+        demand_ratio=0.92,
+    )
+
+    assert parsed is not None
+    assert parsed.title == "???圯x"
+    assert parsed.rarity == "SAR"
+    assert parsed.card_number == "234/193"
+    assert parsed.set_code == "m2a"
+    assert parsed.source_label == "SNKRDUNK monthly trades"
+    assert parsed.source_rank == 5
+    assert parsed.demand_ratio == 0.92
 
 
 def test_hot_card_service_merges_duplicate_variants() -> None:
@@ -357,6 +380,59 @@ def test_hot_card_service_boosts_explicit_store_side_buy_up_signal() -> None:
     assert entries[0].buy_signal_label == "priceup"
     assert entries[0].momentum_boost_score > 0
     assert any("Store-side buy pressure signal" in note for note in entries[0].notes)
+
+
+def test_hot_card_service_prioritizes_recent_trade_activity_signal() -> None:
+    service = StubHotCardService(
+        buy_signals={
+            "AAA/001": _buy_signal(bid=18000, ask=28000),
+            "BBB/001": _buy_signal(bid=34000, ask=35000),
+        }
+    )
+    entries = service._build_ranked_entries(  # type: ignore[attr-defined]
+        game="pokemon",
+        parsed_items=[
+            _ParsedHotItem(
+                title="iconic_trade_card",
+                price_jpy=28000,
+                thumbnail_url=None,
+                card_number="AAA/001",
+                rarity="SAR",
+                set_code="aaa",
+                listing_count=1,
+                is_graded=False,
+                condition=None,
+                detail_url="https://example.com/iconic",
+                board_url="https://example.com/monthly-trades",
+                note="monthly trades",
+                source_label="SNKRDUNK monthly trades",
+                source_rank=4,
+                demand_ratio=0.95,
+            ),
+            _ParsedHotItem(
+                title="obscure_bid_card",
+                price_jpy=35000,
+                thumbnail_url=None,
+                card_number="BBB/001",
+                rarity="SAR",
+                set_code="bbb",
+                listing_count=1,
+                is_graded=False,
+                condition=None,
+                detail_url="https://example.com/obscure",
+                board_url="https://example.com/cardrush",
+                note="cardrush",
+                source_label="Cardrush category rank",
+                source_rank=1,
+                demand_ratio=0.08,
+            ),
+        ],
+        limit=10,
+    )
+
+    assert entries[0].title == "iconic_trade_card"
+    assert entries[0].hot_score > entries[1].hot_score
+    assert any("Recent market activity signal" in note for note in entries[0].notes)
 
 
 def test_resolve_lookup_spec_uses_hot_card_metadata_for_precise_variant() -> None:

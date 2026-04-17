@@ -13,6 +13,8 @@ class AssistantSettings:
     yuyutei_user_agent: str = "OpenClawPriceMonitor/0.1 (+https://local-dev)"
     openclaw_telegram_chat_id: str | None = None
     openclaw_telegram_bot_token: str | None = None
+    openclaw_tesseract_path: str | None = None
+    openclaw_tessdata_dir: str | None = None
     openclaw_ca_bundle_path: str | None = None
     openclaw_tls_insecure_skip_verify: bool = False
     monitor_env: str = "development"
@@ -47,6 +49,12 @@ def get_settings() -> AssistantSettings:
         ),
         openclaw_telegram_bot_token=_none_if_empty(
             _getenv_any("OPENCLAW_TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN")
+        ),
+        openclaw_tesseract_path=_none_if_empty(
+            _getenv_any("OPENCLAW_TESSERACT_PATH", "TESSERACT_PATH")
+        ),
+        openclaw_tessdata_dir=_none_if_empty(
+            _getenv_any("OPENCLAW_TESSDATA_DIR", "TESSDATA_DIR")
         ),
         openclaw_ca_bundle_path=_none_if_empty(os.getenv("OPENCLAW_CA_BUNDLE_PATH")),
         openclaw_tls_insecure_skip_verify=_as_bool(os.getenv("OPENCLAW_TLS_INSECURE_SKIP_VERIFY")),

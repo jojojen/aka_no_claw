@@ -23,11 +23,14 @@ from .yuyutei import YuyuteiClient
 CARDRUSH_POKEMON_RANKING_URL = "https://www.cardrush-pokemon.jp/product-group/22?sort=rank&num=100"
 MAGI_WS_RANKING_URL = "https://magi.camp/series/7/products"
 MAGI_POKEMON_LIST_URL = "https://magi.camp/brands/3/items"
+SNKRDUNK_POKEMON_MONTHLY_TRADES_URL = "https://snkrdunk.com/articles/31649/"
+SNKRDUNK_POKEMON_UR_TRADES_URL = "https://snkrdunk.com/articles/31962/"
+SNKRDUNK_POKEMON_SA_TRADES_URL = "https://snkrdunk.com/articles/31708/"
 YAHOO_REALTIME_SEARCH_URL = "https://search.yahoo.co.jp/realtime/search"
 DEFAULT_BOARD_LIMIT = 10
 SOCIAL_QUERY_CANDIDATE_LIMIT = 4
 SOCIAL_CACHE_TTL_SECONDS = 15 * 60
-BUY_SIGNAL_CANDIDATE_LIMIT = 12
+BUY_SIGNAL_CANDIDATE_LIMIT = 24
 BUY_SIGNAL_CACHE_TTL_SECONDS = 30 * 60
 
 CARDRUSH_BROWSER_HEADERS = {
@@ -74,6 +77,8 @@ SOCIAL_RETWEET_RE = re.compile(r"retweet:(?P<count>\d+)")
 SOCIAL_LIKE_RE = re.compile(r"like:(?P<count>\d+)")
 SOCIAL_QUOTE_RE = re.compile(r"quote:(?P<count>\d+)")
 SOCIAL_TWEET_SELECTOR = "div#sr div[class*='Tweet_TweetContainer']"
+SNKRDUNK_CODE_BLOCK_RE = re.compile(r"\[(?P<code>[^\]]+)\]")
+SNKRDUNK_PRICE_RE = re.compile(r"¥\s*(?P<price>\d[\d,]*)")
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +174,9 @@ class _ParsedHotItem:
     detail_url: str
     board_url: str
     note: str
+    source_label: str = "Source"
+    source_rank: int | None = None
+    demand_ratio: float = 0.0
 
 
 class TcgHotCardService:
@@ -210,11 +218,10 @@ class TcgHotCardService:
             game="ws",
             label="WS Liquidity Board",
             methodology=(
-                "候選卡先來自 magi Weiss Schwarz 頁面，但主排序不看出品數。"
-                " 目前以遊々亭買取價是否存在、買取價相對賣價的接近程度，"
-                "再加上 raw / graded 的可替代性來估計流動性。"
-                " 如果店家明確顯示買取價上調，也會給小幅加成。"
-                " SNS 只做注意力輔助，來源頁出品數只保留為背景資訊。"
+                "WS 榜單目前仍以遊々亭的買方承接與 Yahoo!リアルタイム検索 的注意力為主，"
+                " 再用 magi 的推薦 / 列表順序提供低權重候選與需求背景。"
+                " 和 Pokemon 不同，WS 目前沒有同等新鮮且可穩定解析的廣域交易數排行榜，"
+                " 所以市場活動分數的來源會更保守。"
             ),
             generated_at=datetime.now(timezone.utc),
             items=items,
@@ -305,17 +312,51 @@ class TcgHotCardService:
                     "best_rank": source_rank,
                     "best_item": item,
                     "total_count": item.listing_count or 0,
+                    "activity_ratio": item.demand_ratio,
+                    "activity_sources": set() if item.demand_ratio <= 0 else {item.source_label},
+                    "activity_best_ranks": (
+                        {}
+                        if item.demand_ratio <= 0 or item.source_rank is None
+                        else {item.source_label: item.source_rank}
+                    ),
+                    "activity_references": (
+                        []
+                        if item.demand_ratio <= 0
+                        else [HotCardReference(label=item.source_label, url=item.board_url)]
+                    ),
                 }
                 continue
 
             entry["best_rank"] = min(int(entry["best_rank"]), source_rank)
             entry["total_count"] = int(entry["total_count"]) + (item.listing_count or 0)
+            if item.demand_ratio > 0:
+                activity_sources: set[str] = entry["activity_sources"]  # type: ignore[assignment]
+                is_new_source = item.source_label not in activity_sources
+                entry["activity_ratio"] = self._merge_activity_ratio(
+                    existing=float(entry["activity_ratio"]),
+                    incoming=item.demand_ratio,
+                    is_new_source=is_new_source,
+                )
+                activity_sources.add(item.source_label)
+                if item.source_rank is not None:
+                    activity_best_ranks: dict[str, int] = entry["activity_best_ranks"]  # type: ignore[assignment]
+                    current_rank = activity_best_ranks.get(item.source_label)
+                    if current_rank is None or item.source_rank < current_rank:
+                        activity_best_ranks[item.source_label] = item.source_rank
+                reference = HotCardReference(label=item.source_label, url=item.board_url)
+                activity_references: list[HotCardReference] = entry["activity_references"]  # type: ignore[assignment]
+                if reference not in activity_references:
+                    activity_references.append(reference)
             if self._prefer_item(item, entry["best_item"]):  # type: ignore[arg-type]
                 entry["best_item"] = item
 
         ranked = sorted(
             aggregates.values(),
             key=lambda value: (
+                -self._market_activity_score(
+                    activity_ratio=float(value["activity_ratio"]),
+                    source_count=len(value["activity_sources"]),  # type: ignore[arg-type]
+                ),
                 int(value["best_rank"]),
                 1 if value["best_item"].is_graded else 0,  # type: ignore[attr-defined]
                 normalize_text(value["best_item"].title),  # type: ignore[attr-defined]
@@ -339,6 +380,8 @@ class TcgHotCardService:
             key=lambda value: self._base_liquidity_sort_key(
                 best_item=value["best_item"],  # type: ignore[arg-type]
                 buy_signal=value.get("buy_signal"),  # type: ignore[arg-type]
+                market_activity_ratio=float(value["activity_ratio"]),
+                activity_source_count=len(value["activity_sources"]),  # type: ignore[arg-type]
             )
         )
 
@@ -352,6 +395,8 @@ class TcgHotCardService:
                 best_item=value["best_item"],  # type: ignore[arg-type]
                 best_rank=int(value["best_rank"]),
                 buy_signal=value.get("buy_signal"),  # type: ignore[arg-type]
+                market_activity_ratio=float(value["activity_ratio"]),
+                activity_source_count=len(value["activity_sources"]),  # type: ignore[arg-type]
                 social_signal=social_signals.get(str(value["key"])),
             )
         )
@@ -361,13 +406,39 @@ class TcgHotCardService:
             best_item: _ParsedHotItem = aggregate["best_item"]  # type: ignore[assignment]
             best_rank = int(aggregate["best_rank"])
             total_count = int(aggregate["total_count"])
+            market_activity_ratio = float(aggregate["activity_ratio"])
+            activity_source_count = len(aggregate["activity_sources"])  # type: ignore[arg-type]
+            activity_best_ranks: dict[str, int] = aggregate["activity_best_ranks"]  # type: ignore[assignment]
+            activity_references: list[HotCardReference] = aggregate["activity_references"]  # type: ignore[assignment]
             buy_signal: HotCardBuySignal | None = aggregate.get("buy_signal")  # type: ignore[assignment]
             social_signal = social_signals.get(str(aggregate["key"]))
-            liquidity_score = self._hot_score(buy_signal=buy_signal, is_graded=best_item.is_graded)
+            liquidity_score = self._hot_score(
+                buy_signal=buy_signal,
+                is_graded=best_item.is_graded,
+                market_activity_ratio=market_activity_ratio,
+                activity_source_count=activity_source_count,
+                social_signal=social_signal,
+            )
+            market_activity_score = self._market_activity_score(
+                activity_ratio=market_activity_ratio,
+                source_count=activity_source_count,
+            )
             buy_support_score = round((buy_signal.buy_support_ratio if buy_signal is not None else 0.0) * 100.0, 2)
             momentum_boost_score = round((buy_signal.momentum_boost_ratio if buy_signal is not None else 0.0) * 100.0, 2)
             attention_score = self._attention_score(social_signal=social_signal)
             notes = [best_item.note]
+            if activity_best_ranks:
+                ranked_activity_sources = ", ".join(
+                    f"{label} #{rank}"
+                    for label, rank in sorted(activity_best_ranks.items(), key=lambda item: item[1])[:4]
+                )
+                notes.append(
+                    f"Recent market activity signal: {ranked_activity_sources}."
+                )
+            else:
+                notes.append(
+                    "Recent market activity signal: no recent transaction-ranking evidence was found on the current external trend pages, so this entry is relying more heavily on buy-side support and SNS context."
+                )
             if buy_signal is None or buy_signal.best_bid_jpy is None:
                 notes.append(
                     "Primary liquidity signal: no credible buylist quote was found on 遊々亭, so this entry is treated as a low-confidence fallback."
@@ -388,7 +459,7 @@ class TcgHotCardService:
                     f"遊々亭 marked this buy quote as raised from ¥{buy_signal.previous_bid_jpy:,} to ¥{buy_signal.best_bid_jpy:,}."
                 )
             notes.append(
-                "Liquidity score weights: buy-side support 90%, fungibility 10%. Explicit store-side buy-up signals can raise buy-side support modestly. Source-page depth is display-only and does not affect ranking."
+                f"Composite board score: recent market activity {market_activity_score:.2f}, buy-side support {buy_support_score:.2f}, SNS attention {attention_score:.2f}. Final weighting is market activity 50%, buy-side support 45%, SNS attention 5%, with a small raw-card fungibility bonus."
             )
             if total_count > 0:
                 notes.append(
@@ -401,6 +472,7 @@ class TcgHotCardService:
                 HotCardReference(label="Ranking Source", url=best_item.board_url),
                 HotCardReference(label="Item Page", url=best_item.detail_url),
             ]
+            references.extend(reference for reference in activity_references if reference not in references)
             if buy_signal is not None:
                 references.extend(reference for reference in buy_signal.references if reference not in references)
             if social_signal is not None:
@@ -452,36 +524,69 @@ class TcgHotCardService:
         return []
 
     def _load_pokemon_board_items(self) -> tuple[list[_ParsedHotItem], str]:
+        parsed_items: list[_ParsedHotItem] = []
+        methodology_parts = [
+            "Pokemon 榜單現在先整合近期交易排名、類別交易排名與店家頁候選，再做綜合排序。",
+            " 單一店家的在庫 / 出品順序不再主導熱門判斷；近期實際交易活躍度會先決定市場熱度骨架。",
+            " 遊々亭的 bid / ask 與 priceup 仍保留，因為它們能補足買方承接力。",
+            " Yahoo!リアルタイム検索 只做 SNS 注意力輔助，不會單獨把卡推上前列。",
+        ]
+
+        pokemon_trend_sources = (
+            (
+                SNKRDUNK_POKEMON_MONTHLY_TRADES_URL,
+                "SNKRDUNK monthly trades",
+                50,
+                1.0,
+                "Signal source: SNKRDUNK recent monthly transaction ranking.",
+            ),
+            (
+                SNKRDUNK_POKEMON_UR_TRADES_URL,
+                "SNKRDUNK UR trades",
+                30,
+                0.78,
+                "Signal source: SNKRDUNK UR-category transaction ranking.",
+            ),
+            (
+                SNKRDUNK_POKEMON_SA_TRADES_URL,
+                "SNKRDUNK SA trades",
+                50,
+                0.72,
+                "Signal source: SNKRDUNK SA-category transaction ranking.",
+            ),
+        )
+        for board_url, source_label, max_rank, source_weight, note in pokemon_trend_sources:
+            try:
+                html = self.http_client.get_text(board_url)
+                parsed_items.extend(
+                    self._parse_snkrdunk_ranking_items(
+                        html,
+                        board_url=board_url,
+                        source_label=source_label,
+                        max_rank=max_rank,
+                        source_weight=source_weight,
+                        note=note,
+                    )
+                )
+            except Exception as exc:  # pragma: no cover - network-dependent.
+                logger.warning("Pokemon trend source failed url=%s error=%s", board_url, exc)
+
         try:
             html = self.http_client.get_text(
                 CARDRUSH_POKEMON_RANKING_URL,
                 headers=CARDRUSH_BROWSER_HEADERS,
             )
-            parsed_items = self._parse_cardrush_pokemon_items(html)
-            if parsed_items:
-                return (
-                    parsed_items,
-                    (
-                        "候選卡先來自 Cardrush 高稀有單卡頁，但主排序不看在庫數。"
-                        " 目前以遊々亭買取價是否存在、買取價相對賣價的接近程度，"
-                        "再加上 raw / graded 的可替代性來估計流動性。"
-                        " 如果店家明確顯示買取價上調，也會給小幅加成。"
-                        " SNS 只做注意力輔助，來源頁在庫數只保留為背景資訊。"
-                    ),
-                )
-            logger.warning("Cardrush Pokemon ranking returned no parsable items; falling back to magi brand page.")
+            parsed_items.extend(self._parse_cardrush_pokemon_items(html))
         except Exception as exc:  # pragma: no cover - network-dependent.
-            logger.warning("Cardrush Pokemon ranking failed; falling back to magi brand page. error=%s", exc)
+            logger.warning("Cardrush Pokemon ranking failed; continuing without it. error=%s", exc)
 
-        html = self.http_client.get_text(MAGI_POKEMON_LIST_URL)
-        return (
-            self._parse_magi_pokemon_items(html),
-            (
-                "Cardrush 在目前環境下不可用，因此暫時改用 magi Pokemon 頁面來提供候選卡。"
-                " 主排序仍然不看出品數，而是看遊々亭買方承接與 bid / ask 接近程度；"
-                " 如果店家明確顯示買取價上調，也會給小幅加成。出品數只保留為背景資訊。"
-            ),
-        )
+        try:
+            html = self.http_client.get_text(MAGI_POKEMON_LIST_URL)
+            parsed_items.extend(self._parse_magi_pokemon_items(html))
+        except Exception as exc:  # pragma: no cover - network-dependent.
+            logger.warning("Magi Pokemon listing page failed; continuing without it. error=%s", exc)
+
+        return (parsed_items, "".join(methodology_parts))
 
     def _load_social_signals(
         self,
@@ -664,11 +769,20 @@ class TcgHotCardService:
         *,
         best_item: _ParsedHotItem,
         buy_signal: HotCardBuySignal | None,
+        market_activity_ratio: float,
+        activity_source_count: int,
     ) -> tuple[object, ...]:
-        liquidity_score = TcgHotCardService._hot_score(buy_signal=buy_signal, is_graded=best_item.is_graded)
+        market_activity_score = TcgHotCardService._market_activity_score(
+            activity_ratio=market_activity_ratio,
+            source_count=activity_source_count,
+        )
         buy_support_score = 0.0 if buy_signal is None else buy_signal.buy_support_ratio
+        preliminary_score = (market_activity_score * 0.6) + (buy_support_score * 40.0)
+        if not best_item.is_graded:
+            preliminary_score += 5.0
         return (
-            -liquidity_score,
+            -round(preliminary_score, 2),
+            -market_activity_score,
             -buy_support_score,
             1 if best_item.is_graded else 0,
             normalize_text(best_item.title),
@@ -680,13 +794,26 @@ class TcgHotCardService:
         best_item: _ParsedHotItem,
         best_rank: int,
         buy_signal: HotCardBuySignal | None,
+        market_activity_ratio: float,
+        activity_source_count: int,
         social_signal: HotCardSocialSignal | None,
     ) -> tuple[object, ...]:
-        liquidity_score = TcgHotCardService._hot_score(buy_signal=buy_signal, is_graded=best_item.is_graded)
+        liquidity_score = TcgHotCardService._hot_score(
+            buy_signal=buy_signal,
+            is_graded=best_item.is_graded,
+            market_activity_ratio=market_activity_ratio,
+            activity_source_count=activity_source_count,
+            social_signal=social_signal,
+        )
+        market_activity_score = TcgHotCardService._market_activity_score(
+            activity_ratio=market_activity_ratio,
+            source_count=activity_source_count,
+        )
         buy_support_score = 0.0 if buy_signal is None else buy_signal.buy_support_ratio
         attention_score = TcgHotCardService._attention_score(social_signal=social_signal)
         return (
             -liquidity_score,
+            -market_activity_score,
             -buy_support_score,
             -attention_score,
             1 if best_item.is_graded else 0,
@@ -695,13 +822,43 @@ class TcgHotCardService:
         )
 
     @staticmethod
-    def _hot_score(*, buy_signal: HotCardBuySignal | None, is_graded: bool) -> float:
-        if buy_signal is None or buy_signal.buy_support_ratio <= 0:
-            return 0.0
-
-        fungibility_ratio = 0.7 if is_graded else 1.0
-        score = (buy_signal.buy_support_ratio * 90.0) + (fungibility_ratio * 10.0)
+    def _hot_score(
+        *,
+        buy_signal: HotCardBuySignal | None,
+        is_graded: bool,
+        market_activity_ratio: float,
+        activity_source_count: int,
+        social_signal: HotCardSocialSignal | None,
+    ) -> float:
+        market_activity_score = TcgHotCardService._market_activity_score(
+            activity_ratio=market_activity_ratio,
+            source_count=activity_source_count,
+        )
+        buy_support_score = 0.0 if buy_signal is None else buy_signal.buy_support_ratio * 100.0
+        attention_score = TcgHotCardService._attention_score(social_signal=social_signal)
+        fungibility_bonus = 0.0 if is_graded else 5.0
+        score = (
+            (market_activity_score * 0.50)
+            + (buy_support_score * 0.45)
+            + (attention_score * 0.05)
+            + fungibility_bonus
+        )
         return round(score, 2)
+
+    @staticmethod
+    def _market_activity_score(*, activity_ratio: float, source_count: int) -> float:
+        clamped_ratio = min(1.0, max(0.0, activity_ratio))
+        diversity_bonus = min(10.0, max(0, source_count - 1) * 3.5)
+        return round(min(100.0, (clamped_ratio * 100.0) + diversity_bonus), 2)
+
+    @staticmethod
+    def _merge_activity_ratio(*, existing: float, incoming: float, is_new_source: bool) -> float:
+        if incoming <= 0:
+            return round(max(0.0, existing), 4)
+        if existing <= 0:
+            return round(min(1.0, incoming), 4)
+        multiplier = 0.45 if is_new_source else 0.20
+        return round(min(1.0, existing + (incoming * multiplier)), 4)
 
     @staticmethod
     def _buy_momentum_boost(*, current_bid: int, previous_bid: int | None, signal_label: str | None) -> float:
@@ -771,7 +928,7 @@ class TcgHotCardService:
     def _parse_cardrush_pokemon_items(self, html: str) -> list[_ParsedHotItem]:
         soup = BeautifulSoup(html, "html.parser")
         items: list[_ParsedHotItem] = []
-        for anchor in soup.select("ul.item_list li.list_item_cell div.item_data a[href]"):
+        for source_rank, anchor in enumerate(soup.select("ul.item_list li.list_item_cell div.item_data a[href]"), start=1):
             text = " ".join(anchor.get_text(" ", strip=True).split())
             if not text:
                 continue
@@ -780,6 +937,9 @@ class TcgHotCardService:
                 detail_url=urljoin("https://www.cardrush-pokemon.jp", anchor["href"]),
                 board_url=CARDRUSH_POKEMON_RANKING_URL,
                 thumbnail_url=_extract_cardrush_thumbnail_url(anchor),
+                source_rank=source_rank,
+                source_label="Cardrush category rank",
+                demand_ratio=_rank_signal_ratio(rank=source_rank, max_rank=100, source_weight=0.22, floor=0.08),
             )
             if parsed is not None:
                 items.append(parsed)
@@ -788,7 +948,7 @@ class TcgHotCardService:
     def _parse_magi_ws_items(self, html: str) -> list[_ParsedHotItem]:
         soup = BeautifulSoup(html, "html.parser")
         items: list[_ParsedHotItem] = []
-        for anchor in soup.select("div.product-list__box a[href^='/products/']"):
+        for source_rank, anchor in enumerate(soup.select("div.product-list__box a[href^='/products/']"), start=1):
             text = " ".join(anchor.get_text(" ", strip=True).split())
             if not text:
                 continue
@@ -798,6 +958,9 @@ class TcgHotCardService:
                 board_url=MAGI_WS_RANKING_URL,
                 thumbnail_url=_extract_magi_thumbnail_url(anchor),
                 note="Signal source: Magi popular/recommended Weiss Schwarz page order.",
+                source_rank=source_rank,
+                source_label="Magi recommendation rank",
+                demand_ratio=_rank_signal_ratio(rank=source_rank, max_rank=100, source_weight=0.18, floor=0.06),
             )
             if parsed is not None:
                 items.append(parsed)
@@ -806,7 +969,7 @@ class TcgHotCardService:
     def _parse_magi_pokemon_items(self, html: str) -> list[_ParsedHotItem]:
         soup = BeautifulSoup(html, "html.parser")
         items: list[_ParsedHotItem] = []
-        for anchor in soup.select("a[href^='/items/'], a[href^='/products/']"):
+        for source_rank, anchor in enumerate(soup.select("a[href^='/items/'], a[href^='/products/']"), start=1):
             text = " ".join(anchor.get_text(" ", strip=True).split())
             if not text:
                 continue
@@ -819,9 +982,75 @@ class TcgHotCardService:
                 board_url=MAGI_POKEMON_LIST_URL,
                 thumbnail_url=_extract_magi_thumbnail_url(anchor),
                 note="Signal source: Magi Pokemon card listing page order.",
+                source_rank=source_rank,
+                source_label="Magi listing order",
+                demand_ratio=_rank_signal_ratio(rank=source_rank, max_rank=100, source_weight=0.16, floor=0.06),
             )
             if parsed is not None:
                 items.append(parsed)
+        return items
+
+    def _parse_snkrdunk_ranking_items(
+        self,
+        html: str,
+        *,
+        board_url: str,
+        source_label: str,
+        max_rank: int,
+        source_weight: float,
+        note: str,
+    ) -> list[_ParsedHotItem]:
+        soup = BeautifulSoup(html, "html.parser")
+        items: list[_ParsedHotItem] = []
+        seen_urls: set[str] = set()
+        for anchor in soup.select("a[href*='/apparels/']"):
+            href = anchor.get("href")
+            if not isinstance(href, str) or not href:
+                continue
+            detail_url = urljoin("https://snkrdunk.com", href)
+            if detail_url in seen_urls:
+                continue
+
+            rank_tag = anchor.select_one("span")
+            image = anchor.select_one("img[alt]")
+            if rank_tag is None or image is None:
+                continue
+
+            rank_text = rank_tag.get_text(strip=True)
+            if not rank_text.isdigit():
+                continue
+            source_rank = int(rank_text)
+            if source_rank <= 0 or source_rank > max_rank:
+                continue
+
+            title_text = image.get("alt")
+            if not isinstance(title_text, str) or not title_text.strip():
+                continue
+
+            parsed = _parse_snkrdunk_text(
+                title_text,
+                detail_url=detail_url,
+                board_url=board_url,
+                thumbnail_url=_pick_image_url(image, attribute_names=("src", "data-src")),
+                note=note,
+                source_label=source_label,
+                source_rank=source_rank,
+                demand_ratio=_rank_signal_ratio(
+                    rank=source_rank,
+                    max_rank=max_rank,
+                    source_weight=source_weight,
+                    floor=0.18,
+                ),
+            )
+            if parsed is None:
+                continue
+
+            price_match = SNKRDUNK_PRICE_RE.search(anchor.get_text(" ", strip=True))
+            if price_match is not None:
+                parsed = replace(parsed, price_jpy=int(price_match.group("price").replace(",", "")))
+
+            items.append(parsed)
+            seen_urls.add(detail_url)
         return items
 
 
@@ -831,6 +1060,9 @@ def _parse_cardrush_text(
     detail_url: str,
     board_url: str,
     thumbnail_url: str | None = None,
+    source_rank: int | None = None,
+    source_label: str = "Cardrush category rank",
+    demand_ratio: float = 0.0,
 ) -> _ParsedHotItem | None:
     condition = None
     working = text
@@ -870,6 +1102,9 @@ def _parse_cardrush_text(
         detail_url=detail_url,
         board_url=board_url,
         note="Signal source: Cardrush best-seller order within the current high-rarity singles category.",
+        source_label=source_label,
+        source_rank=source_rank,
+        demand_ratio=demand_ratio,
     )
 
 
@@ -880,6 +1115,9 @@ def _parse_magi_text(
     board_url: str,
     thumbnail_url: str | None = None,
     note: str = "Signal source: Magi popular/recommended Weiss Schwarz page order.",
+    source_rank: int | None = None,
+    source_label: str = "Magi recommendation rank",
+    demand_ratio: float = 0.0,
 ) -> _ParsedHotItem | None:
     grading_match = GRADING_RE.match(text)
     is_graded = grading_match is not None
@@ -930,6 +1168,66 @@ def _parse_magi_text(
         detail_url=detail_url,
         board_url=board_url,
         note=note,
+        source_label=source_label,
+        source_rank=source_rank,
+        demand_ratio=demand_ratio,
+    )
+
+
+def _parse_snkrdunk_text(
+    text: str,
+    *,
+    detail_url: str,
+    board_url: str,
+    thumbnail_url: str | None = None,
+    note: str,
+    source_label: str,
+    source_rank: int,
+    demand_ratio: float,
+) -> _ParsedHotItem | None:
+    working = " ".join(text.split())
+    code_match = SNKRDUNK_CODE_BLOCK_RE.search(working)
+    code_block = None if code_match is None else code_match.group("code").strip()
+    prefix = working[: code_match.start()].strip() if code_match is not None else working
+    title, rarity = _split_title_and_rarity(prefix)
+
+    card_number = None
+    set_code = None
+    if code_block:
+        if " " in code_block:
+            left, right = code_block.split(" ", 1)
+            left = left.strip()
+            right = right.strip()
+            if re.fullmatch(r"[A-Za-z0-9-]+", left):
+                set_code = left.lower()
+                card_number = right
+            else:
+                card_number = code_block
+        else:
+            card_number = code_block
+            ws_code_match = WS_CODE_RE.fullmatch(code_block)
+            if ws_code_match is not None:
+                set_code = ws_code_match.group("code").split("/", 1)[0].lower()
+
+    if not title:
+        return None
+
+    return _ParsedHotItem(
+        title=title,
+        price_jpy=None,
+        thumbnail_url=thumbnail_url,
+        card_number=card_number,
+        rarity=rarity,
+        set_code=set_code,
+        listing_count=None,
+        is_graded=False,
+        condition=None,
+        detail_url=detail_url,
+        board_url=board_url,
+        note=note,
+        source_label=source_label,
+        source_rank=source_rank,
+        demand_ratio=demand_ratio,
     )
 
 
@@ -984,6 +1282,22 @@ def _split_title_and_rarity(prefix: str) -> tuple[str, str | None]:
     if len(parts) == 2 and _looks_like_rarity(parts[1]):
         return parts[0].strip(), parts[1].strip()
     return prefix.strip(), None
+
+
+def _rank_signal_ratio(
+    *,
+    rank: int,
+    max_rank: int,
+    source_weight: float,
+    floor: float = 0.0,
+) -> float:
+    if rank <= 0 or max_rank <= 0 or source_weight <= 0:
+        return 0.0
+    bounded_rank = min(rank, max_rank)
+    span = max(max_rank - 1, 1)
+    position_ratio = (max_rank - bounded_rank) / span
+    scaled_ratio = floor + ((1.0 - floor) * position_ratio)
+    return round(min(1.0, max(0.0, scaled_ratio * source_weight)), 4)
 
 
 def _looks_like_rarity(token: str) -> bool:
