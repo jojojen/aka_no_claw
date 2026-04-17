@@ -30,7 +30,17 @@ def _stub_board() -> HotCardBoard:
                 rarity="SAR",
                 set_code="sv08",
                 listing_count=5,
+                best_ask_jpy=99800,
+                best_bid_jpy=80000,
+                previous_bid_jpy=50000,
+                bid_ask_ratio=0.8016,
+                buy_support_score=90.08,
+                momentum_boost_score=6.0,
+                buy_signal_label="priceup",
                 hot_score=88.2,
+                attention_score=41.7,
+                social_post_count=3,
+                social_engagement_count=120,
                 notes=("stub note",),
                 is_graded=False,
                 references=(HotCardReference(label="Ranking Source", url="https://example.com/rank"),),
@@ -86,11 +96,16 @@ def test_command_processor_handles_lookup_and_liquidity() -> None:
 
     assert lookup_reply == "pokemon:ピカチュウex:132/106"
     assert "Pokemon Liquidity Board" in liquidity_reply
-    assert "active 5" in liquidity_reply
+    assert "bid ¥80,000" in liquidity_reply
+    assert "ask ¥99,800" in liquidity_reply
+    assert "boost 6.00" in liquidity_reply
 
 
 def test_format_liquidity_board_includes_reference_url() -> None:
     text = format_liquidity_board(_stub_board(), limit=1)
 
     assert "https://example.com/rank" in text
-    assert "score 88.20" in text
+    assert "liq 88.20" in text
+    assert "attn 41.70" in text
+    assert "support 90.08" in text
+    assert "buy-up" in text

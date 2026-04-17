@@ -14,16 +14,43 @@ async function loadDashboard() {
 
   state.dashboard = await response.json();
   renderDashboard(state.dashboard);
+  await loadHotBoards();
+}
+
+async function loadHotBoards() {
+  renderHotBoardsLoading();
+  const response = await fetch("/api/hot-cards", { cache: "no-store" });
+  if (!response.ok) {
+    throw new Error(`Hot board request failed: ${response.status}`);
+  }
+  const payload = await response.json();
+  if (state.dashboard) {
+    state.dashboard.hot_cards = payload.hot_cards;
+    state.dashboard.hot_cards_error = payload.hot_cards_error;
+  }
+  renderHotBoards(payload.hot_cards, payload.hot_cards_error);
 }
 
 function renderDashboard(payload) {
   renderAssistantMeta(payload.assistant);
   renderStats(payload.stats);
-  renderHotBoards(payload.hot_cards, payload.hot_cards_error);
   renderTools(payload.tools);
   renderSources(payload.reference_sources);
   renderWatchlist(payload.example_watchlist);
   renderTrackedItems(payload.tracked_items);
+}
+
+function renderHotBoardsLoading() {
+  for (const game of ["pokemon", "ws"]) {
+    const methodology = document.getElementById(`hot-${game}-methodology`);
+    const summary = document.getElementById(`hot-${game}-summary`);
+    const list = document.getElementById(`hot-${game}-list`);
+    const limitSelect = document.getElementById(`hot-${game}-limit`);
+    methodology.textContent = "正在載入高流動性資料…";
+    summary.textContent = "";
+    list.innerHTML = `<div class="hot-item empty-state">正在整理最新的高流動性資料，請稍候。</div>`;
+    configureHotBoardLimit(limitSelect, [], 0, game);
+  }
 }
 
 function renderStats(stats) {
@@ -220,8 +247,15 @@ function renderHotBoard(game, board, errorMessage) {
       <h3 class="hot-item__title">${escapeHtml(item.title)}</h3>
       <div class="hot-meta">
         ${cardInfo.map((value) => `<span class="tag">${escapeHtml(value)}</span>`).join("")}
-        ${item.listing_count == null ? "" : `<span class="alias">active ${escapeHtml(item.listing_count)}</span>`}
-        ${item.liquidity_score == null ? "" : `<span class="alias">score ${escapeHtml(formatDecimal(item.liquidity_score))}</span>`}
+        ${item.best_bid_jpy == null ? "" : `<span class="alias">bid ¥${escapeHtml(Number(item.best_bid_jpy).toLocaleString())}</span>`}
+        ${item.buy_signal_label === "priceup" ? `<span class="alias">buy up</span>` : ""}
+        ${item.best_ask_jpy == null ? "" : `<span class="alias">ask ¥${escapeHtml(Number(item.best_ask_jpy).toLocaleString())}</span>`}
+        ${item.bid_ask_ratio == null ? "" : `<span class="alias">bid/ask ${escapeHtml(formatPercent(item.bid_ask_ratio))}</span>`}
+        ${item.buy_support_score == null ? "" : `<span class="alias">support ${escapeHtml(formatDecimal(item.buy_support_score))}</span>`}
+        ${item.momentum_boost_score == null || item.momentum_boost_score <= 0 ? "" : `<span class="alias">boost ${escapeHtml(formatDecimal(item.momentum_boost_score))}</span>`}
+        ${item.liquidity_score == null ? "" : `<span class="alias">liq ${escapeHtml(formatDecimal(item.liquidity_score))}</span>`}
+        ${item.attention_score == null ? "" : `<span class="alias">attn ${escapeHtml(formatDecimal(item.attention_score))}</span>`}
+        ${item.social_post_count == null ? "" : `<span class="alias">sns ${escapeHtml(item.social_post_count)} posts</span>`}
         ${item.is_graded ? `<span class="alias">graded</span>` : ""}
       </div>
       <div class="hot-notes">${notes}</div>
@@ -327,6 +361,10 @@ function formatDateTime(value) {
   }).format(date);
 }
 
+function formatPercent(value) {
+  return `${(Number(value) * 100).toFixed(0)}%`;
+}
+
 function escapeHtml(value) {
   return String(value)
     .replaceAll("&", "&amp;")
@@ -354,4 +392,5 @@ function renderFatalError(error) {
   result.classList.remove("empty-state");
   result.innerHTML = `<pre>${escapeHtml(error.message)}</pre>`;
   document.getElementById("lookup-status").textContent = "載入失敗";
+  renderHotBoards([], `載入失敗: ${error.message}`);
 }

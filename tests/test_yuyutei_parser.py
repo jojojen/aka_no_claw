@@ -41,6 +41,9 @@ def test_pokemon_lookup_matches_exact_card_number_and_rarity() -> None:
     assert offers[0].attributes["rarity"] == "SAR"
     assert any(offer.price_kind == "ask" and offer.price_jpy == 99800 for offer in offers)
     assert any(offer.price_kind == "bid" and offer.price_jpy == 80000 for offer in offers)
+    bid_offer = next(offer for offer in offers if offer.price_kind == "bid" and offer.price_jpy == 80000)
+    assert bid_offer.attributes["price_change_direction"] == "up"
+    assert bid_offer.attributes["compare_price_jpy"] == "35000"
 
 
 def test_ws_lookup_matches_signed_card() -> None:
@@ -67,6 +70,8 @@ def test_ws_lookup_matches_signed_card() -> None:
     assert offers[0].attributes["rarity"] == "SSP"
     assert any(offer.price_kind == "ask" and offer.price_jpy == 24800 for offer in offers)
     assert any(offer.price_kind == "bid" and offer.price_jpy == 15000 for offer in offers)
+    bid_offer = next(offer for offer in offers if offer.price_kind == "bid" and offer.price_jpy == 15000)
+    assert bid_offer.attributes["price_change_direction"] == "up"
 
 
 def test_name_only_lookup_returns_candidate_variants() -> None:

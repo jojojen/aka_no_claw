@@ -1,23 +1,34 @@
 from __future__ import annotations
 
+import logging
 import math
 import re
+import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Iterable
-from urllib.parse import urljoin
+from urllib.parse import urlencode, urljoin
 
 from bs4 import BeautifulSoup
 from bs4.element import Tag
 
 from market_monitor.http import HttpClient
+from market_monitor.models import MarketOffer
 from market_monitor.normalize import normalize_card_number, normalize_text
 
 from .catalog import TcgCardSpec
+from .matching import minimum_match_score, score_tcg_offer
+from .yuyutei import YuyuteiClient
 
 CARDRUSH_POKEMON_RANKING_URL = "https://www.cardrush-pokemon.jp/product-group/22?sort=rank&num=100"
 MAGI_WS_RANKING_URL = "https://magi.camp/series/7/products"
-DEFAULT_BOARD_LIMIT = 20
+MAGI_POKEMON_LIST_URL = "https://magi.camp/brands/3/items"
+YAHOO_REALTIME_SEARCH_URL = "https://search.yahoo.co.jp/realtime/search"
+DEFAULT_BOARD_LIMIT = 10
+SOCIAL_QUERY_CANDIDATE_LIMIT = 4
+SOCIAL_CACHE_TTL_SECONDS = 15 * 60
+BUY_SIGNAL_CANDIDATE_LIMIT = 12
+BUY_SIGNAL_CACHE_TTL_SECONDS = 30 * 60
 
 CARDRUSH_BROWSER_HEADERS = {
     "User-Agent": (
@@ -40,6 +51,12 @@ CARDRUSH_BROWSER_HEADERS = {
     "Sec-CH-UA-Mobile": "?0",
     "Sec-CH-UA-Platform": '"Windows"',
 }
+YAHOO_BROWSER_HEADERS = {
+    "User-Agent": CARDRUSH_BROWSER_HEADERS["User-Agent"],
+    "Accept": CARDRUSH_BROWSER_HEADERS["Accept"],
+    "Accept-Language": CARDRUSH_BROWSER_HEADERS["Accept-Language"],
+    "Cache-Control": "no-cache",
+}
 
 JPY_PRICE_RE = re.compile(r"(?P<price>\d[\d,]*)円")
 MAGI_PRICE_RE = re.compile(r"¥\s*(?P<price>\d[\d,]*)")
@@ -51,12 +68,43 @@ CARDRUSH_SET_CODE_RE = re.compile(r"\[\s*(?:\[[^\]]+\]\s*)?(?P<code>[A-Za-z0-9]+
 WS_CODE_RE = re.compile(r"(?P<code>[A-Z0-9]+/[A-Z0-9-]+-[A-Z0-9]+)$")
 POKEMON_CODE_RE = re.compile(r"\{(?P<code>[^}]+)\}")
 POKEMON_INLINE_CODE_RE = re.compile(r"(?P<code>\d{1,3}/\d{1,3})$")
+SOCIAL_COUNT_RE = re.compile(r"(?:reply|retweet|like|quote):(?P<count>\d+)")
+SOCIAL_REPLY_RE = re.compile(r"reply:(?P<count>\d+)")
+SOCIAL_RETWEET_RE = re.compile(r"retweet:(?P<count>\d+)")
+SOCIAL_LIKE_RE = re.compile(r"like:(?P<count>\d+)")
+SOCIAL_QUOTE_RE = re.compile(r"quote:(?P<count>\d+)")
+SOCIAL_TWEET_SELECTOR = "div#sr div[class*='Tweet_TweetContainer']"
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
 class HotCardReference:
     label: str
     url: str
+
+
+@dataclass(frozen=True, slots=True)
+class HotCardSocialSignal:
+    query: str
+    search_url: str
+    matched_post_count: int
+    engagement_count: int
+    score_ratio: float
+
+
+@dataclass(frozen=True, slots=True)
+class HotCardBuySignal:
+    best_ask_jpy: int | None
+    best_bid_jpy: int | None
+    previous_bid_jpy: int | None
+    ask_count: int
+    bid_count: int
+    bid_ask_ratio: float | None
+    buy_support_ratio: float
+    momentum_boost_ratio: float
+    buy_signal_label: str | None
+    references: tuple[HotCardReference, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,7 +118,17 @@ class HotCardEntry:
     rarity: str | None
     set_code: str | None
     listing_count: int | None
+    best_ask_jpy: int | None
+    best_bid_jpy: int | None
+    previous_bid_jpy: int | None
+    bid_ask_ratio: float | None
+    buy_support_score: float
+    momentum_boost_score: float
+    buy_signal_label: str | None
     hot_score: float
+    attention_score: float
+    social_post_count: int | None
+    social_engagement_count: int | None
     notes: tuple[str, ...]
     is_graded: bool
     references: tuple[HotCardReference, ...]
@@ -116,6 +174,9 @@ class _ParsedHotItem:
 class TcgHotCardService:
     def __init__(self, http_client: HttpClient | None = None) -> None:
         self.http_client = http_client or HttpClient()
+        self._yuyutei_client = YuyuteiClient(self.http_client)
+        self._social_signal_cache: dict[str, tuple[float, HotCardSocialSignal | None]] = {}
+        self._buy_signal_cache: dict[str, tuple[float, HotCardBuySignal | None]] = {}
 
     def load_boards(self, *, limit: int = DEFAULT_BOARD_LIMIT) -> tuple[HotCardBoard, ...]:
         return (
@@ -124,24 +185,16 @@ class TcgHotCardService:
         )
 
     def load_pokemon_board(self, *, limit: int = DEFAULT_BOARD_LIMIT) -> HotCardBoard:
-        html = self.http_client.get_text(
-            CARDRUSH_POKEMON_RANKING_URL,
-            headers=CARDRUSH_BROWSER_HEADERS,
-        )
+        parsed_items, methodology = self._load_pokemon_board_items()
         items = self._build_ranked_entries(
             game="pokemon",
-            parsed_items=self._parse_cardrush_pokemon_items(html),
+            parsed_items=parsed_items,
             limit=limit,
         )
         return HotCardBoard(
             game="pokemon",
             label="Pokemon Liquidity Board",
-            methodology=(
-                "Liquidity ranking is weighted toward immediately purchasable depth, not generic hype. "
-                "Score weights are depth 65%, page visibility 25%, and fungibility 10%. Entries with "
-                "zero visible stock are excluded from the board, while duplicate condition variants are merged "
-                "under the same card."
-            ),
+            methodology=methodology,
             generated_at=datetime.now(timezone.utc),
             items=items,
         )
@@ -157,10 +210,11 @@ class TcgHotCardService:
             game="ws",
             label="WS Liquidity Board",
             methodology=(
-                "Liquidity ranking is weighted toward active listing depth, not social buzz. "
-                "Score weights are depth 65%, page visibility 25%, and fungibility 10%. Entries with "
-                "zero visible listings are excluded from the board, and graded copies are penalized because they "
-                "are less fungible than raw copies."
+                "候選卡先來自 magi Weiss Schwarz 頁面，但主排序不看出品數。"
+                " 目前以遊々亭買取價是否存在、買取價相對賣價的接近程度，"
+                "再加上 raw / graded 的可替代性來估計流動性。"
+                " 如果店家明確顯示買取價上調，也會給小幅加成。"
+                " SNS 只做注意力輔助，來源頁出品數只保留為背景資訊。"
             ),
             generated_at=datetime.now(timezone.utc),
             items=items,
@@ -247,6 +301,7 @@ class TcgHotCardService:
             entry = aggregates.get(key)
             if entry is None:
                 aggregates[key] = {
+                    "key": key,
                     "best_rank": source_rank,
                     "best_item": item,
                     "total_count": item.listing_count or 0,
@@ -259,16 +314,46 @@ class TcgHotCardService:
                 entry["best_item"] = item
 
         ranked = sorted(
-            (
-                aggregate
-                for aggregate in aggregates.values()
-                if int(aggregate["total_count"]) > 0
+            aggregates.values(),
+            key=lambda value: (
+                int(value["best_rank"]),
+                1 if value["best_item"].is_graded else 0,  # type: ignore[attr-defined]
+                normalize_text(value["best_item"].title),  # type: ignore[attr-defined]
             ),
-            key=lambda value: self._liquidity_sort_key(
+        )
+        candidate_limit = min(len(ranked), max(limit + 2, BUY_SIGNAL_CANDIDATE_LIMIT))
+        ranked = ranked[:candidate_limit]
+        for aggregate in ranked:
+            best_item: _ParsedHotItem = aggregate["best_item"]  # type: ignore[assignment]
+            aggregate["buy_signal"] = self._lookup_buy_signal(
+                self._spec_from_hot_item(game=game, item=best_item),
+                reference_ask_jpy=best_item.price_jpy,
+            )
+
+        ranked = [
+            aggregate
+            for aggregate in ranked
+            if aggregate.get("buy_signal") is not None
+        ]
+        ranked.sort(
+            key=lambda value: self._base_liquidity_sort_key(
+                best_item=value["best_item"],  # type: ignore[arg-type]
+                buy_signal=value.get("buy_signal"),  # type: ignore[arg-type]
+            )
+        )
+
+        social_signals = self._load_social_signals(
+            game=game,
+            ranked=ranked,
+            limit=limit,
+        )
+        ranked.sort(
+            key=lambda value: self._final_liquidity_sort_key(
                 best_item=value["best_item"],  # type: ignore[arg-type]
                 best_rank=int(value["best_rank"]),
-                total_count=int(value["total_count"]),
-            ),
+                buy_signal=value.get("buy_signal"),  # type: ignore[arg-type]
+                social_signal=social_signals.get(str(value["key"])),
+            )
         )
 
         items: list[HotCardEntry] = []
@@ -276,16 +361,55 @@ class TcgHotCardService:
             best_item: _ParsedHotItem = aggregate["best_item"]  # type: ignore[assignment]
             best_rank = int(aggregate["best_rank"])
             total_count = int(aggregate["total_count"])
-            liquidity_score = self._hot_score(best_rank, total_count, best_item.is_graded)
-            notes = [
-                best_item.note,
-                (
-                    f"Liquidity signal: {total_count} active listing(s) / stock unit(s) "
-                    f"observed after merging duplicate variants."
-                ),
-                f"Demand proxy: source visibility rank #{best_rank}.",
-                "Score weights: depth 65%, visibility 25%, fungibility 10%.",
+            buy_signal: HotCardBuySignal | None = aggregate.get("buy_signal")  # type: ignore[assignment]
+            social_signal = social_signals.get(str(aggregate["key"]))
+            liquidity_score = self._hot_score(buy_signal=buy_signal, is_graded=best_item.is_graded)
+            buy_support_score = round((buy_signal.buy_support_ratio if buy_signal is not None else 0.0) * 100.0, 2)
+            momentum_boost_score = round((buy_signal.momentum_boost_ratio if buy_signal is not None else 0.0) * 100.0, 2)
+            attention_score = self._attention_score(social_signal=social_signal)
+            notes = [best_item.note]
+            if buy_signal is None or buy_signal.best_bid_jpy is None:
+                notes.append(
+                    "Primary liquidity signal: no credible buylist quote was found on 遊々亭, so this entry is treated as a low-confidence fallback."
+                )
+            elif buy_signal.best_ask_jpy is None or buy_signal.bid_ask_ratio is None:
+                notes.append(
+                    f"Primary liquidity signal: 遊々亭 buylist bid ¥{buy_signal.best_bid_jpy:,} is available."
+                )
+            else:
+                notes.append(
+                    "Primary liquidity signal: "
+                    f"遊々亭 buylist bid ¥{buy_signal.best_bid_jpy:,} versus best ask ¥{buy_signal.best_ask_jpy:,} "
+                    f"(bid/ask {buy_signal.bid_ask_ratio:.0%})."
+                )
+            if buy_signal is not None and buy_signal.buy_signal_label == "priceup" and buy_signal.previous_bid_jpy is not None:
+                notes.append(
+                    "Store-side buy pressure signal: "
+                    f"遊々亭 marked this buy quote as raised from ¥{buy_signal.previous_bid_jpy:,} to ¥{buy_signal.best_bid_jpy:,}."
+                )
+            notes.append(
+                "Liquidity score weights: buy-side support 90%, fungibility 10%. Explicit store-side buy-up signals can raise buy-side support modestly. Source-page depth is display-only and does not affect ranking."
+            )
+            if total_count > 0:
+                notes.append(
+                    f"Source-page depth context only: {total_count} merged listing / stock unit(s) were observed."
+                )
+            notes.append(
+                f"Candidate discovery context: source-page rank #{best_rank}; this is only used as a late tie-breaker."
+            )
+            references = [
+                HotCardReference(label="Ranking Source", url=best_item.board_url),
+                HotCardReference(label="Item Page", url=best_item.detail_url),
             ]
+            if buy_signal is not None:
+                references.extend(reference for reference in buy_signal.references if reference not in references)
+            if social_signal is not None:
+                notes.append(
+                    "SNS attention side channel: "
+                    f"{social_signal.matched_post_count} matched post(s), "
+                    f"{social_signal.engagement_count} combined engagement via Yahoo!リアルタイム検索."
+                )
+                references.append(HotCardReference(label="SNS Search", url=social_signal.search_url))
             if best_item.is_graded:
                 notes.append("Penalty applied: graded copies are treated as less fungible than raw copies.")
 
@@ -300,28 +424,228 @@ class TcgHotCardService:
                     rarity=best_item.rarity,
                     set_code=best_item.set_code,
                     listing_count=total_count or None,
+                    best_ask_jpy=None if buy_signal is None else buy_signal.best_ask_jpy,
+                    best_bid_jpy=None if buy_signal is None else buy_signal.best_bid_jpy,
+                    previous_bid_jpy=None if buy_signal is None else buy_signal.previous_bid_jpy,
+                    bid_ask_ratio=None if buy_signal is None else buy_signal.bid_ask_ratio,
+                    buy_support_score=buy_support_score,
+                    momentum_boost_score=momentum_boost_score,
+                    buy_signal_label=None if buy_signal is None else buy_signal.buy_signal_label,
                     hot_score=liquidity_score,
+                    attention_score=attention_score,
+                    social_post_count=None if social_signal is None else social_signal.matched_post_count,
+                    social_engagement_count=None if social_signal is None else social_signal.engagement_count,
                     notes=tuple(notes),
                     is_graded=best_item.is_graded,
-                    references=(
-                        HotCardReference(label="Ranking Source", url=best_item.board_url),
-                        HotCardReference(label="Item Page", url=best_item.detail_url),
-                    ),
+                    references=tuple(references),
                 )
             )
         return tuple(items)
 
     def _load_source_items(self, game: str) -> list[_ParsedHotItem]:
         if game == "pokemon":
-            html = self.http_client.get_text(
-                CARDRUSH_POKEMON_RANKING_URL,
-                headers=CARDRUSH_BROWSER_HEADERS,
-            )
-            return self._parse_cardrush_pokemon_items(html)
+            parsed_items, _ = self._load_pokemon_board_items()
+            return parsed_items
         if game == "ws":
             html = self.http_client.get_text(MAGI_WS_RANKING_URL)
             return self._parse_magi_ws_items(html)
         return []
+
+    def _load_pokemon_board_items(self) -> tuple[list[_ParsedHotItem], str]:
+        try:
+            html = self.http_client.get_text(
+                CARDRUSH_POKEMON_RANKING_URL,
+                headers=CARDRUSH_BROWSER_HEADERS,
+            )
+            parsed_items = self._parse_cardrush_pokemon_items(html)
+            if parsed_items:
+                return (
+                    parsed_items,
+                    (
+                        "候選卡先來自 Cardrush 高稀有單卡頁，但主排序不看在庫數。"
+                        " 目前以遊々亭買取價是否存在、買取價相對賣價的接近程度，"
+                        "再加上 raw / graded 的可替代性來估計流動性。"
+                        " 如果店家明確顯示買取價上調，也會給小幅加成。"
+                        " SNS 只做注意力輔助，來源頁在庫數只保留為背景資訊。"
+                    ),
+                )
+            logger.warning("Cardrush Pokemon ranking returned no parsable items; falling back to magi brand page.")
+        except Exception as exc:  # pragma: no cover - network-dependent.
+            logger.warning("Cardrush Pokemon ranking failed; falling back to magi brand page. error=%s", exc)
+
+        html = self.http_client.get_text(MAGI_POKEMON_LIST_URL)
+        return (
+            self._parse_magi_pokemon_items(html),
+            (
+                "Cardrush 在目前環境下不可用，因此暫時改用 magi Pokemon 頁面來提供候選卡。"
+                " 主排序仍然不看出品數，而是看遊々亭買方承接與 bid / ask 接近程度；"
+                " 如果店家明確顯示買取價上調，也會給小幅加成。出品數只保留為背景資訊。"
+            ),
+        )
+
+    def _load_social_signals(
+        self,
+        *,
+        game: str,
+        ranked: list[dict[str, object]],
+        limit: int,
+    ) -> dict[str, HotCardSocialSignal]:
+        if not ranked:
+            return {}
+
+        candidate_limit = min(len(ranked), max(min(limit, 4), SOCIAL_QUERY_CANDIDATE_LIMIT))
+        signals: dict[str, HotCardSocialSignal] = {}
+        for aggregate in ranked[:candidate_limit]:
+            best_item: _ParsedHotItem = aggregate["best_item"]  # type: ignore[assignment]
+            signal = self._lookup_social_signal(game=game, item=best_item)
+            if signal is None:
+                continue
+            signals[str(aggregate["key"])] = signal
+        return signals
+
+    def _lookup_social_signal(self, *, game: str, item: _ParsedHotItem) -> HotCardSocialSignal | None:
+        query = _build_social_query(game=game, item=item)
+        if not query:
+            return None
+
+        now = time.time()
+        cached = self._social_signal_cache.get(query)
+        if cached is not None and now - cached[0] < SOCIAL_CACHE_TTL_SECONDS:
+            return cached[1]
+
+        search_url = f"{YAHOO_REALTIME_SEARCH_URL}?{urlencode({'p': query})}"
+        try:
+            html = self.http_client.get_text(search_url, headers=YAHOO_BROWSER_HEADERS)
+            signal = _parse_yahoo_realtime_signal(html=html, query=query, search_url=search_url)
+        except Exception as exc:  # pragma: no cover - network-dependent.
+            logger.warning("Social signal lookup failed query=%s error=%s", query, exc)
+            signal = None
+
+        self._social_signal_cache[query] = (now, signal)
+        return signal
+
+    def _lookup_buy_signal(self, spec: TcgCardSpec, *, reference_ask_jpy: int | None = None) -> HotCardBuySignal | None:
+        cache_key = "|".join(
+            [
+                spec.game,
+                spec.title,
+                spec.card_number or "",
+                spec.rarity or "",
+                spec.set_code or "",
+                str(reference_ask_jpy or ""),
+            ]
+        )
+        now = time.time()
+        cached = self._buy_signal_cache.get(cache_key)
+        if cached is not None and now - cached[0] < BUY_SIGNAL_CACHE_TTL_SECONDS:
+            return cached[1]
+
+        minimum_score = minimum_match_score(spec)
+        exact_search_word = spec.card_number or spec.title
+        exact_matches = self._match_buy_signal_candidates(
+            spec=spec,
+            search_word=exact_search_word,
+            minimum_score=minimum_score,
+        )
+        if exact_matches:
+            signal = self._build_buy_signal(exact_matches, reference_ask_jpy=reference_ask_jpy)
+        else:
+            fallback_matches = self._yuyutei_client.lookup(spec, minimum_score=minimum_score)
+            signal = self._build_buy_signal(fallback_matches or exact_matches, reference_ask_jpy=reference_ask_jpy)
+
+        self._buy_signal_cache[cache_key] = (now, signal)
+        return signal
+
+    def _match_buy_signal_candidates(
+        self,
+        *,
+        spec: TcgCardSpec,
+        search_word: str,
+        minimum_score: float,
+    ) -> list[MarketOffer]:
+        offers = self._yuyutei_client.search_buy(spec, search_word=search_word)
+        matched: list[MarketOffer] = []
+        for offer in offers:
+            score = score_tcg_offer(spec, offer)
+            if score >= minimum_score:
+                matched.append(replace(offer, score=score))
+        return matched
+
+    @staticmethod
+    def _build_buy_signal(
+        offers: Iterable[MarketOffer],
+        *,
+        reference_ask_jpy: int | None = None,
+    ) -> HotCardBuySignal | None:
+        ask_offers = sorted(
+            (offer for offer in offers if offer.price_kind == "ask"),
+            key=lambda offer: offer.price_jpy,
+        )
+        bid_offers = sorted(
+            (offer for offer in offers if offer.price_kind == "bid"),
+            key=lambda offer: offer.price_jpy,
+            reverse=True,
+        )
+        best_ask = ask_offers[0] if ask_offers else None
+        best_bid = bid_offers[0] if bid_offers else None
+        effective_ask_jpy = reference_ask_jpy if reference_ask_jpy is not None else None if best_ask is None else best_ask.price_jpy
+        if effective_ask_jpy is None and best_bid is None:
+            return None
+
+        previous_bid = None
+        buy_signal_label = None
+        momentum_boost_ratio = 0.0
+        if best_bid is not None:
+            previous_bid = _parse_optional_int(best_bid.attributes.get("compare_price_jpy"))
+            buy_signal_label = _buy_signal_label(best_bid)
+            momentum_boost_ratio = TcgHotCardService._buy_momentum_boost(
+                current_bid=best_bid.price_jpy,
+                previous_bid=previous_bid,
+                signal_label=buy_signal_label,
+            )
+
+        bid_ask_ratio = None
+        if effective_ask_jpy is not None and best_bid is not None and effective_ask_jpy > 0:
+            bid_ask_ratio = round(min(1.0, best_bid.price_jpy / effective_ask_jpy), 4)
+
+        buy_support_ratio = 0.0
+        if best_bid is not None:
+            buy_support_ratio += 0.35
+        if bid_ask_ratio is not None:
+            buy_support_ratio += bid_ask_ratio * 0.50
+        if best_bid is not None and effective_ask_jpy is not None:
+            buy_support_ratio += 0.15
+        buy_support_ratio += momentum_boost_ratio
+        buy_support_ratio = round(min(1.0, buy_support_ratio), 4)
+
+        references: list[HotCardReference] = []
+        if best_bid is not None:
+            references.append(HotCardReference(label="Yuyutei Buylist", url=best_bid.url))
+        if best_ask is not None:
+            references.append(HotCardReference(label="Yuyutei Ask", url=best_ask.url))
+
+        return HotCardBuySignal(
+            best_ask_jpy=effective_ask_jpy,
+            best_bid_jpy=None if best_bid is None else best_bid.price_jpy,
+            previous_bid_jpy=previous_bid,
+            ask_count=len(ask_offers),
+            bid_count=len(bid_offers),
+            bid_ask_ratio=bid_ask_ratio,
+            buy_support_ratio=buy_support_ratio,
+            momentum_boost_ratio=momentum_boost_ratio,
+            buy_signal_label=buy_signal_label,
+            references=tuple(references),
+        )
+
+    @staticmethod
+    def _spec_from_hot_item(*, game: str, item: _ParsedHotItem) -> TcgCardSpec:
+        return TcgCardSpec(
+            game=game,
+            title=item.title,
+            card_number=item.card_number,
+            rarity=item.rarity,
+            set_code=item.set_code,
+        )
 
     @staticmethod
     def _prefer_item(candidate: _ParsedHotItem, current: _ParsedHotItem) -> bool:
@@ -336,32 +660,65 @@ class TcgHotCardService:
         return candidate.price_jpy < current.price_jpy
 
     @staticmethod
-    def _liquidity_sort_key(
+    def _base_liquidity_sort_key(
+        *,
+        best_item: _ParsedHotItem,
+        buy_signal: HotCardBuySignal | None,
+    ) -> tuple[object, ...]:
+        liquidity_score = TcgHotCardService._hot_score(buy_signal=buy_signal, is_graded=best_item.is_graded)
+        buy_support_score = 0.0 if buy_signal is None else buy_signal.buy_support_ratio
+        return (
+            -liquidity_score,
+            -buy_support_score,
+            1 if best_item.is_graded else 0,
+            normalize_text(best_item.title),
+        )
+
+    @staticmethod
+    def _final_liquidity_sort_key(
         *,
         best_item: _ParsedHotItem,
         best_rank: int,
-        total_count: int,
+        buy_signal: HotCardBuySignal | None,
+        social_signal: HotCardSocialSignal | None,
     ) -> tuple[object, ...]:
-        liquidity_score = TcgHotCardService._hot_score(best_rank, total_count, best_item.is_graded)
+        liquidity_score = TcgHotCardService._hot_score(buy_signal=buy_signal, is_graded=best_item.is_graded)
+        buy_support_score = 0.0 if buy_signal is None else buy_signal.buy_support_ratio
+        attention_score = TcgHotCardService._attention_score(social_signal=social_signal)
         return (
             -liquidity_score,
-            -total_count,
+            -buy_support_score,
+            -attention_score,
             1 if best_item.is_graded else 0,
             best_rank,
             normalize_text(best_item.title),
         )
 
     @staticmethod
-    def _hot_score(best_rank: int, total_count: int, is_graded: bool) -> float:
-        if total_count <= 0:
+    def _hot_score(*, buy_signal: HotCardBuySignal | None, is_graded: bool) -> float:
+        if buy_signal is None or buy_signal.buy_support_ratio <= 0:
             return 0.0
 
-        depth_ratio = min(1.0, math.log1p(total_count) / math.log1p(50))
-        visibility_ratio = max(0.0, 1.0 - ((best_rank - 1) / 39.0))
-        fungibility_ratio = 0.55 if is_graded else 1.0
-
-        score = (depth_ratio * 65.0) + (visibility_ratio * 25.0) + (fungibility_ratio * 10.0)
+        fungibility_ratio = 0.7 if is_graded else 1.0
+        score = (buy_signal.buy_support_ratio * 90.0) + (fungibility_ratio * 10.0)
         return round(score, 2)
+
+    @staticmethod
+    def _buy_momentum_boost(*, current_bid: int, previous_bid: int | None, signal_label: str | None) -> float:
+        if signal_label != "priceup":
+            return 0.0
+        if previous_bid is None or previous_bid <= 0 or current_bid <= previous_bid:
+            return 0.03
+        increase_ratio = max(0.0, (current_bid - previous_bid) / previous_bid)
+        return round(min(0.06, 0.03 + (increase_ratio * 0.03)), 4)
+
+    @staticmethod
+    def _attention_score(
+        *,
+        social_signal: HotCardSocialSignal | None,
+    ) -> float:
+        social_ratio = 0.0 if social_signal is None else social_signal.score_ratio
+        return round(social_ratio * 100.0, 2)
 
     @staticmethod
     def _hint_score(spec: TcgCardSpec, item: _ParsedHotItem) -> float:
@@ -440,6 +797,28 @@ class TcgHotCardService:
                 detail_url=urljoin("https://magi.camp", anchor["href"]),
                 board_url=MAGI_WS_RANKING_URL,
                 thumbnail_url=_extract_magi_thumbnail_url(anchor),
+                note="Signal source: Magi popular/recommended Weiss Schwarz page order.",
+            )
+            if parsed is not None:
+                items.append(parsed)
+        return items
+
+    def _parse_magi_pokemon_items(self, html: str) -> list[_ParsedHotItem]:
+        soup = BeautifulSoup(html, "html.parser")
+        items: list[_ParsedHotItem] = []
+        for anchor in soup.select("a[href^='/items/'], a[href^='/products/']"):
+            text = " ".join(anchor.get_text(" ", strip=True).split())
+            if not text:
+                continue
+            href = anchor.get("href")
+            if not isinstance(href, str) or not href:
+                continue
+            parsed = _parse_magi_text(
+                text,
+                detail_url=urljoin("https://magi.camp", href),
+                board_url=MAGI_POKEMON_LIST_URL,
+                thumbnail_url=_extract_magi_thumbnail_url(anchor),
+                note="Signal source: Magi Pokemon card listing page order.",
             )
             if parsed is not None:
                 items.append(parsed)
@@ -500,6 +879,7 @@ def _parse_magi_text(
     detail_url: str,
     board_url: str,
     thumbnail_url: str | None = None,
+    note: str = "Signal source: Magi popular/recommended Weiss Schwarz page order.",
 ) -> _ParsedHotItem | None:
     grading_match = GRADING_RE.match(text)
     is_graded = grading_match is not None
@@ -549,7 +929,53 @@ def _parse_magi_text(
         condition=None,
         detail_url=detail_url,
         board_url=board_url,
-        note="Signal source: Magi popular/recommended Weiss Schwarz page order.",
+        note=note,
+    )
+
+
+def _parse_yahoo_realtime_signal(
+    *,
+    html: str,
+    query: str,
+    search_url: str,
+) -> HotCardSocialSignal | None:
+    soup = BeautifulSoup(html, "html.parser")
+    tweet_cards = soup.select(SOCIAL_TWEET_SELECTOR)
+    if not tweet_cards:
+        return None
+
+    matched_post_count = 0
+    engagement_count = 0
+    normalized_query = normalize_text(query)
+
+    for tweet_card in tweet_cards[:10]:
+        body_node = tweet_card.select_one("p[class*='Tweet_body__']")
+        if body_node is None:
+            continue
+
+        body_text = " ".join(body_node.get_text(" ", strip=True).split())
+        if not body_text:
+            continue
+        if not _social_body_matches_query(normalized_query, body_text):
+            continue
+
+        params = ""
+        menu_link = tweet_card.select_one("a[data-cl-params*='reply:'][data-cl-params*='retweet:'][data-cl-params*='like:']")
+        if isinstance(menu_link, Tag):
+            params = str(menu_link.get("data-cl-params", ""))
+
+        matched_post_count += 1
+        engagement_count += _social_engagement_from_params(params)
+
+    if matched_post_count <= 0:
+        return None
+
+    return HotCardSocialSignal(
+        query=query,
+        search_url=search_url,
+        matched_post_count=matched_post_count,
+        engagement_count=engagement_count,
+        score_ratio=_social_score_ratio(matched_post_count=matched_post_count, engagement_count=engagement_count),
     )
 
 
@@ -587,6 +1013,80 @@ def _title_key(game: str, title: str, *, drop_game_suffixes: bool = False) -> st
     if game == "pokemon" and drop_game_suffixes:
         normalized = normalized.removesuffix("ex")
     return normalized
+
+
+def _build_social_query(*, game: str, item: _ParsedHotItem) -> str:
+    query_parts = [item.title]
+    if game == "pokemon":
+        query_parts.append("ポケカ")
+    elif game == "ws":
+        query_parts.append("ヴァイス")
+
+    if item.rarity and _looks_like_rarity(item.rarity):
+        query_parts.append(item.rarity.upper())
+
+    return " ".join(part.strip() for part in query_parts if part and part.strip())
+
+
+def _parse_optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _buy_signal_label(offer: MarketOffer) -> str | None:
+    direction = normalize_text(offer.attributes.get("price_change_direction", ""))
+    if direction == "up":
+        return "priceup"
+    if direction == "down":
+        return "pricedown"
+    return None
+
+
+def _social_body_matches_query(normalized_query: str, body_text: str) -> bool:
+    normalized_body = normalize_text(body_text)
+    query_tokens = [token for token in normalized_query.split() if token]
+    if not query_tokens:
+        return bool(normalized_body)
+
+    relevant_tokens = [
+        token
+        for token in query_tokens
+        if token not in {"ポケカ", "ヴァイス"}
+    ]
+    if not relevant_tokens:
+        relevant_tokens = query_tokens
+
+    matched_tokens = sum(1 for token in relevant_tokens if token in normalized_body)
+    required_matches = 1 if len(relevant_tokens) <= 2 else 2
+    return matched_tokens >= required_matches
+
+
+def _social_engagement_from_params(params: str) -> int:
+    if not params:
+        return 0
+
+    reply_count = _extract_social_count(SOCIAL_REPLY_RE, params)
+    retweet_count = _extract_social_count(SOCIAL_RETWEET_RE, params)
+    like_count = _extract_social_count(SOCIAL_LIKE_RE, params)
+    quote_count = _extract_social_count(SOCIAL_QUOTE_RE, params)
+    return like_count + retweet_count + reply_count + quote_count
+
+
+def _extract_social_count(pattern: re.Pattern[str], params: str) -> int:
+    match = pattern.search(params)
+    if match is None:
+        return 0
+    return int(match.group("count"))
+
+
+def _social_score_ratio(*, matched_post_count: int, engagement_count: int) -> float:
+    post_ratio = min(1.0, math.log1p(matched_post_count) / math.log1p(8))
+    engagement_ratio = min(1.0, math.log1p(max(engagement_count, 0)) / math.log1p(5000))
+    return round((post_ratio * 0.45) + (engagement_ratio * 0.55), 4)
 
 
 def _extract_cardrush_thumbnail_url(anchor: Tag) -> str | None:

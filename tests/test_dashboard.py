@@ -29,7 +29,17 @@ class StubHotCardService:
                         rarity="SAR",
                         set_code="sv08",
                         listing_count=5,
+                        best_ask_jpy=99800,
+                        best_bid_jpy=80000,
+                        previous_bid_jpy=50000,
+                        bid_ask_ratio=0.8016,
+                        buy_support_score=90.08,
+                        momentum_boost_score=6.0,
+                        buy_signal_label="priceup",
                         hot_score=99.0,
+                        attention_score=62.5,
+                        social_post_count=4,
+                        social_engagement_count=180,
                         notes=("stub note",),
                         is_graded=False,
                         references=(HotCardReference(label="Stub", url="https://example.com/pikachu"),),
@@ -104,7 +114,10 @@ def test_dashboard_payload_includes_runtime_data(tmp_path) -> None:
     assert any(source["id"] == "yuyutei" for source in payload["reference_sources"])
     assert payload["hot_cards"][0]["game"] == "pokemon"
     assert payload["hot_cards"][0]["items"][0]["title"] == "ピカチュウex"
+    assert payload["hot_cards"][0]["items"][0]["best_bid_jpy"] == 80000
+    assert payload["hot_cards"][0]["items"][0]["buy_signal_label"] == "priceup"
     assert payload["hot_cards"][0]["items"][0]["liquidity_score"] == 99.0
+    assert payload["hot_cards"][0]["items"][0]["attention_score"] == 62.5
     assert payload["hot_cards"][0]["items"][0]["thumbnail_url"] == "https://example.com/pikachu.jpg"
     assert payload["hot_cards"][0]["default_display_limit"] == 1
     assert payload["hot_cards"][0]["allowed_display_limits"] == [1]

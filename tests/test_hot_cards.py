@@ -1,12 +1,75 @@
 from __future__ import annotations
 
 from tcg_tracker.hot_cards import (
+    HotCardBuySignal,
+    HotCardReference,
+    HotCardSocialSignal,
     TcgHotCardService,
     _ParsedHotItem,
     _parse_cardrush_text,
     _parse_magi_text,
+    _parse_yahoo_realtime_signal,
 )
 from tcg_tracker.catalog import TcgCardSpec
+
+
+def _buy_signal(
+    *,
+    bid: int | None,
+    ask: int | None,
+    previous_bid: int | None = None,
+    signal_label: str | None = None,
+) -> HotCardBuySignal:
+    ratio = None if bid is None or ask is None or ask <= 0 else round(min(1.0, bid / ask), 4)
+    support_ratio = 0.0
+    if bid is not None:
+        support_ratio += 0.35
+    if ratio is not None:
+        support_ratio += ratio * 0.50
+    if bid is not None and ask is not None:
+        support_ratio += 0.15
+    momentum_boost = 0.0
+    if signal_label == "priceup":
+        if previous_bid is None or previous_bid <= 0 or bid is None or bid <= previous_bid:
+            momentum_boost = 0.03
+        else:
+            momentum_boost = min(0.06, 0.03 + (((bid - previous_bid) / previous_bid) * 0.03))
+    support_ratio += momentum_boost
+    return HotCardBuySignal(
+        best_ask_jpy=ask,
+        best_bid_jpy=bid,
+        previous_bid_jpy=previous_bid,
+        ask_count=0 if ask is None else 1,
+        bid_count=0 if bid is None else 1,
+        bid_ask_ratio=ratio,
+        buy_support_ratio=round(min(1.0, support_ratio), 4),
+        momentum_boost_ratio=round(momentum_boost, 4),
+        buy_signal_label=signal_label,
+        references=(HotCardReference(label="stub", url="https://example.com/buy-signal"),),
+    )
+
+
+class StubHotCardService(TcgHotCardService):
+    def __init__(
+        self,
+        *,
+        buy_signals: dict[str, HotCardBuySignal] | None = None,
+        social_signals: dict[str, HotCardSocialSignal] | None = None,
+    ) -> None:
+        super().__init__()
+        self._buy_signals = buy_signals or {}
+        self._social_signals = social_signals or {}
+
+    def _lookup_buy_signal(  # type: ignore[override]
+        self,
+        spec: TcgCardSpec,
+        *,
+        reference_ask_jpy: int | None = None,
+    ) -> HotCardBuySignal | None:
+        return self._buy_signals.get(spec.card_number or spec.title)
+
+    def _lookup_social_signal(self, *, game: str, item: _ParsedHotItem) -> HotCardSocialSignal | None:  # type: ignore[override]
+        return self._social_signals.get(item.title)
 
 
 def test_parse_cardrush_text_extracts_core_fields() -> None:
@@ -63,7 +126,12 @@ def test_parse_magi_text_handles_codes_with_letter_prefix_after_hyphen() -> None
 
 
 def test_hot_card_service_merges_duplicate_variants() -> None:
-    service = TcgHotCardService()
+    service = StubHotCardService(
+        buy_signals={
+            "234/193": _buy_signal(bid=48000, ask=59800),
+            "237/193": _buy_signal(bid=20000, ask=34800),
+        }
+    )
     entries = service._build_ranked_entries(  # type: ignore[attr-defined]
         game="pokemon",
         parsed_items=[
@@ -89,11 +157,17 @@ def test_hot_card_service_merges_duplicate_variants() -> None:
     assert len(entries) == 2
     assert entries[0].title == "ピカチュウex"
     assert entries[0].listing_count == 7
+    assert entries[0].best_bid_jpy == 48000
     assert entries[0].references[1].url == "https://www.cardrush-pokemon.jp/product/124"
 
 
-def test_hot_card_service_prioritizes_active_depth_over_source_rank() -> None:
-    service = TcgHotCardService()
+def test_hot_card_service_prioritizes_buy_support_over_source_rank() -> None:
+    service = StubHotCardService(
+        buy_signals={
+            "AAA/W11-001SP": _buy_signal(bid=5000, ask=30000),
+            "AAA/W11-002SP": _buy_signal(bid=25000, ask=28000),
+        }
+    )
     entries = service._build_ranked_entries(  # type: ignore[attr-defined]
         game="ws",
         parsed_items=[
@@ -129,13 +203,18 @@ def test_hot_card_service_prioritizes_active_depth_over_source_rank() -> None:
         limit=10,
     )
 
-    assert len(entries) == 1
+    assert len(entries) == 2
     assert entries[0].title == "active_card"
     assert entries[0].hot_score > 0
 
 
 def test_hot_card_service_prefers_raw_copies_when_depth_is_equal() -> None:
-    service = TcgHotCardService()
+    service = StubHotCardService(
+        buy_signals={
+            "BBB/W22-001SSP": _buy_signal(bid=32000, ask=40000),
+            "BBB/W22-002SSP": _buy_signal(bid=32000, ask=40000),
+        }
+    )
     entries = service._build_ranked_entries(  # type: ignore[attr-defined]
         game="ws",
         parsed_items=[
@@ -174,6 +253,110 @@ def test_hot_card_service_prefers_raw_copies_when_depth_is_equal() -> None:
     assert entries[0].title == "raw_card"
     assert entries[1].title == "graded_card"
     assert entries[0].hot_score > entries[1].hot_score
+
+
+def test_hot_card_service_uses_attention_only_as_secondary_signal() -> None:
+    service = StubHotCardService(
+        buy_signals={
+            "001/001": _buy_signal(bid=12000, ask=15000),
+            "002/001": _buy_signal(bid=7000, ask=12000),
+        },
+        social_signals={
+            "attention_card": HotCardSocialSignal(
+                query="attention card",
+                search_url="https://example.com/social",
+                matched_post_count=8,
+                engagement_count=2200,
+                score_ratio=0.95,
+            ),
+        },
+    )
+    entries = service._build_ranked_entries(  # type: ignore[attr-defined]
+        game="pokemon",
+        parsed_items=[
+            _ParsedHotItem(
+                title="deep_card",
+                price_jpy=15000,
+                thumbnail_url=None,
+                card_number="001/001",
+                rarity="SAR",
+                set_code="aaa",
+                listing_count=6,
+                is_graded=False,
+                condition=None,
+                detail_url="https://example.com/deep",
+                board_url="https://example.com/board",
+                note="deep",
+            ),
+            _ParsedHotItem(
+                title="attention_card",
+                price_jpy=12000,
+                thumbnail_url=None,
+                card_number="002/001",
+                rarity="SAR",
+                set_code="aaa",
+                listing_count=2,
+                is_graded=False,
+                condition=None,
+                detail_url="https://example.com/attention",
+                board_url="https://example.com/board",
+                note="attention",
+            ),
+        ],
+        limit=10,
+    )
+
+    assert entries[0].title == "deep_card"
+    assert entries[1].title == "attention_card"
+    assert entries[1].attention_score > entries[0].attention_score
+
+
+def test_hot_card_service_boosts_explicit_store_side_buy_up_signal() -> None:
+    service = StubHotCardService(
+        buy_signals={
+            "AAA/001": _buy_signal(bid=25000, ask=30000, previous_bid=12000, signal_label="priceup"),
+            "BBB/001": _buy_signal(bid=24000, ask=29000),
+        }
+    )
+    entries = service._build_ranked_entries(  # type: ignore[attr-defined]
+        game="pokemon",
+        parsed_items=[
+            _ParsedHotItem(
+                title="buy_up_card",
+                price_jpy=30000,
+                thumbnail_url=None,
+                card_number="AAA/001",
+                rarity="SAR",
+                set_code="aaa",
+                listing_count=1,
+                is_graded=False,
+                condition=None,
+                detail_url="https://example.com/buy-up",
+                board_url="https://example.com/board",
+                note="buy-up",
+            ),
+            _ParsedHotItem(
+                title="plain_card",
+                price_jpy=29000,
+                thumbnail_url=None,
+                card_number="BBB/001",
+                rarity="SAR",
+                set_code="aaa",
+                listing_count=9,
+                is_graded=False,
+                condition=None,
+                detail_url="https://example.com/plain",
+                board_url="https://example.com/board",
+                note="plain",
+            ),
+        ],
+        limit=10,
+    )
+
+    assert entries[0].title == "buy_up_card"
+    assert entries[0].buy_signal_label == "priceup"
+    assert entries[0].momentum_boost_score > 0
+    assert any("Store-side buy pressure signal" in note for note in entries[0].notes)
 
 
 def test_resolve_lookup_spec_uses_hot_card_metadata_for_precise_variant() -> None:
@@ -282,3 +465,37 @@ def test_parse_magi_ws_items_extracts_thumbnail_url() -> None:
     assert len(items) == 1
     assert items[0].thumbnail_url == "https://magi.camp/cdn/ws-thumb.jpg"
     assert items[0].detail_url == "https://magi.camp/products/999"
+
+
+def test_parse_yahoo_realtime_signal_extracts_matched_posts_and_engagement() -> None:
+    html = """
+    <div id="sr">
+      <div>
+        <div class="Tweet_TweetContainer__abc">
+          <a
+            class="Tweet_TweetMenu__abc"
+            data-cl-params="_cl_link:menu;reply:5;retweet:12;like:140;quote:3"
+          >menu</a>
+          <p class="Tweet_body__abc">メガシビルドンex ポケカ SAR を買った。価格の動きが気になる。</p>
+        </div>
+        <div class="Tweet_TweetContainer__abc">
+          <a
+            class="Tweet_TweetMenu__abc"
+            data-cl-params="_cl_link:menu;reply:1;retweet:8;like:52;quote:0"
+          >menu</a>
+          <p class="Tweet_body__abc">メガシビルドンex SAR が高流動性で追いやすい。</p>
+        </div>
+      </div>
+    </div>
+    """
+
+    signal = _parse_yahoo_realtime_signal(
+        html=html,
+        query="メガシビルドンex ポケカ SAR",
+        search_url="https://search.yahoo.co.jp/realtime/search?p=%E3%83%A1%E3%82%AC%E3%82%B7%E3%83%93%E3%83%AB%E3%83%89%E3%83%B3ex+%E3%83%9D%E3%82%B1%E3%82%AB+SAR",
+    )
+
+    assert signal is not None
+    assert signal.matched_post_count == 2
+    assert signal.engagement_count == 221
+    assert signal.score_ratio > 0

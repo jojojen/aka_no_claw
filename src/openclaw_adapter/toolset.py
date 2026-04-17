@@ -214,7 +214,7 @@ def _handle_telegram_poll(
     return run_telegram_polling(
         settings=settings,
         lookup_renderer=default_lookup_renderer(settings),
-        board_loader=default_board_loader,
+        board_loader=lambda: default_board_loader(settings),
         catalog_renderer=lambda: render_tool_catalog(registry),
         poll_timeout=args.poll_timeout,
         notify_startup=args.notify_startup,

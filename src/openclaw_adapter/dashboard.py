@@ -10,9 +10,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from assistant_runtime import AssistantSettings, ToolRegistry
+from assistant_runtime import AssistantSettings, ToolRegistry, build_ssl_context
 from assistant_runtime.logging_utils import trim_for_log
 from market_monitor import load_reference_sources
+from market_monitor.http import HttpClient
 from tcg_tracker.hot_cards import HotCardBoard, TcgHotCardService
 
 from .commands import lookup_card
@@ -34,18 +35,25 @@ def build_dashboard_payload(
     reference_config_path: str | Path = "config/reference_sources.json",
     example_watchlist_path: str | Path = "config/example_watchlist.json",
     hot_card_service: TcgHotCardService | None = None,
+    include_hot_cards: bool = True,
 ) -> dict[str, object]:
     reference_sources = load_reference_sources(reference_config_path)
     example_watchlist = _load_json_file(example_watchlist_path, default=[])
     runtime_stats = _load_runtime_stats(Path(settings.monitor_db_path))
-    hot_card_service = hot_card_service or TcgHotCardService()
+    hot_card_service = hot_card_service or TcgHotCardService(
+        http_client=HttpClient(
+            user_agent=settings.yuyutei_user_agent,
+            ssl_context=build_ssl_context(settings),
+        )
+    )
 
     hot_cards_error: str | None = None
     hot_card_boards: tuple[HotCardBoard, ...] = ()
-    try:
-        hot_card_boards = hot_card_service.load_boards()
-    except Exception as exc:  # pragma: no cover - remote-source failures are environment-dependent.
-        hot_cards_error = str(exc)
+    if include_hot_cards:
+        try:
+            hot_card_boards = hot_card_service.load_boards()
+        except Exception as exc:  # pragma: no cover - remote-source failures are environment-dependent.
+            hot_cards_error = str(exc)
 
     return {
         "assistant": {
@@ -69,6 +77,22 @@ def build_dashboard_payload(
         ],
         "reference_sources": reference_sources_payload(reference_sources),
         "example_watchlist": example_watchlist,
+        "hot_cards": _hot_card_boards_payload(hot_card_boards),
+        "hot_cards_error": hot_cards_error,
+    }
+
+
+def build_hot_cards_payload(
+    *,
+    hot_card_service: TcgHotCardService,
+) -> dict[str, object]:
+    hot_cards_error: str | None = None
+    hot_card_boards: tuple[HotCardBoard, ...] = ()
+    try:
+        hot_card_boards = hot_card_service.load_boards()
+    except Exception as exc:  # pragma: no cover - remote-source failures are environment-dependent.
+        hot_cards_error = str(exc)
+    return {
         "hot_cards": _hot_card_boards_payload(hot_card_boards),
         "hot_cards_error": hot_cards_error,
     }
@@ -99,6 +123,13 @@ def serve_dashboard(
 
 
 def _build_handler(*, settings: AssistantSettings, registry: ToolRegistry) -> type[BaseHTTPRequestHandler]:
+    shared_hot_card_service = TcgHotCardService(
+        http_client=HttpClient(
+            user_agent=settings.yuyutei_user_agent,
+            ssl_context=build_ssl_context(settings),
+        )
+    )
+
     class DashboardHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
@@ -111,7 +142,21 @@ def _build_handler(*, settings: AssistantSettings, registry: ToolRegistry) -> ty
                 self._serve_asset(parsed.path.removeprefix("/assets/"))
                 return
             if parsed.path == "/api/dashboard":
-                self._write_json(build_dashboard_payload(settings=settings, registry=registry))
+                self._write_json(
+                    build_dashboard_payload(
+                        settings=settings,
+                        registry=registry,
+                        hot_card_service=shared_hot_card_service,
+                        include_hot_cards=False,
+                    )
+                )
+                return
+            if parsed.path == "/api/hot-cards":
+                self._write_json(
+                    build_hot_cards_payload(
+                        hot_card_service=shared_hot_card_service,
+                    )
+                )
                 return
             if parsed.path == "/api/tcg/lookup":
                 self._handle_lookup(parsed.query)
@@ -319,8 +364,18 @@ def _hot_card_boards_payload(boards: tuple[HotCardBoard, ...]) -> list[dict[str,
                     "rarity": item.rarity,
                     "set_code": item.set_code,
                     "listing_count": item.listing_count,
+                    "best_ask_jpy": item.best_ask_jpy,
+                    "best_bid_jpy": item.best_bid_jpy,
+                    "previous_bid_jpy": item.previous_bid_jpy,
+                    "bid_ask_ratio": item.bid_ask_ratio,
+                    "buy_support_score": item.buy_support_score,
+                    "momentum_boost_score": item.momentum_boost_score,
+                    "buy_signal_label": item.buy_signal_label,
                     "liquidity_score": item.hot_score,
                     "hot_score": item.hot_score,
+                    "attention_score": item.attention_score,
+                    "social_post_count": item.social_post_count,
+                    "social_engagement_count": item.social_engagement_count,
                     "notes": list(item.notes),
                     "is_graded": item.is_graded,
                     "references": [

@@ -8,10 +8,9 @@ from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-import truststore
-
-from assistant_runtime import AssistantSettings
+from assistant_runtime import AssistantSettings, build_ssl_context
 from assistant_runtime.logging_utils import mask_identifier, trim_for_log
+from market_monitor.http import HttpClient
 from tcg_tracker.hot_cards import HotCardBoard, TcgHotCardService
 
 from .commands import lookup_card
@@ -256,20 +255,32 @@ def format_liquidity_board(board: HotCardBoard, *, limit: int = 5) -> str:
     lines = [board.label, board.methodology]
     for item in board.items[:limit]:
         price_text = "price n/a" if item.price_jpy is None else format_jpy(item.price_jpy)
-        count_text = "active n/a" if item.listing_count is None else f"active {item.listing_count}"
-        score_text = f"score {item.hot_score:.2f}"
+        bid_text = "bid n/a" if item.best_bid_jpy is None else f"bid {format_jpy(item.best_bid_jpy)}"
+        ask_text = "ask n/a" if item.best_ask_jpy is None else f"ask {format_jpy(item.best_ask_jpy)}"
+        ratio_text = "ratio n/a" if item.bid_ask_ratio is None else f"ratio {item.bid_ask_ratio:.0%}"
+        score_text = f"liq {item.hot_score:.2f}"
+        attention_text = f"attn {item.attention_score:.2f}"
+        momentum_text = (
+            ""
+            if item.momentum_boost_score <= 0
+            else f" | boost {item.momentum_boost_score:.2f}"
+        )
         meta = " / ".join(
             value
             for value in (
                 item.card_number or "",
                 item.rarity or "",
                 item.set_code or "",
+                "buy-up" if item.buy_signal_label == "priceup" else "",
                 "graded" if item.is_graded else "",
             )
             if value
         )
         lines.append(f"{item.rank}. {item.title}")
-        lines.append(f"   {price_text} | {count_text} | {score_text}")
+        lines.append(f"   {price_text} | {bid_text} | {ask_text} | {ratio_text}")
+        lines.append(f"   support {item.buy_support_score:.2f}{momentum_text} | {score_text} | {attention_text}")
+        if item.social_post_count is not None:
+            lines.append(f"   sns {item.social_post_count} posts / {item.social_engagement_count or 0} engagement")
         if meta:
             lines.append(f"   {meta}")
         if item.references:
@@ -401,21 +412,11 @@ def require_telegram_chat_id(settings: AssistantSettings) -> str:
     return chat_id
 
 
-def default_board_loader() -> tuple[HotCardBoard, ...]:
-    return TcgHotCardService().load_boards()
-
-
-def build_ssl_context(settings: AssistantSettings) -> ssl.SSLContext:
-    if settings.openclaw_tls_insecure_skip_verify:
-        context = ssl._create_unverified_context()
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
-        return context
-
-    if settings.openclaw_ca_bundle_path:
-        return ssl.create_default_context(cafile=settings.openclaw_ca_bundle_path)
-
-    return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+def default_board_loader(settings: AssistantSettings | None = None) -> tuple[HotCardBoard, ...]:
+    client = HttpClient(
+        ssl_context=build_ssl_context(settings),
+    )
+    return TcgHotCardService(http_client=client).load_boards()
 
 
 def _value_or_none(parts: list[str], index: int) -> str | None:

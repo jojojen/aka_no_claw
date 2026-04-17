@@ -179,6 +179,12 @@ class YuyuteiClient:
         compare_element = card.find("del")
         if compare_element is not None:
             compare_price = parse_jpy(compare_element.get_text(" ", strip=True))
+        card_classes = set(card.get("class", []))
+        price_change_direction = None
+        if "priceup" in card_classes:
+            price_change_direction = "up"
+        elif "pricedown" in card_classes:
+            price_change_direction = "down"
 
         availability = None
         availability_element = card.select_one("label.cart_sell_zaiko")
@@ -194,6 +200,8 @@ class YuyuteiClient:
         }
         if compare_price is not None:
             attributes["compare_price_jpy"] = str(compare_price)
+        if price_change_direction is not None:
+            attributes["price_change_direction"] = price_change_direction
 
         return MarketOffer(
             source="yuyutei",
