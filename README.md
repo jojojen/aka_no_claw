@@ -1,3 +1,4 @@
+# test
 # OpenClaw Personal Assistant Workspace
 
 這個專案把 OpenClaw 當成個人助理入口，價格追蹤只是其中一組工具，不是整個系統本體。
