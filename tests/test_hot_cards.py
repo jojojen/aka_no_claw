@@ -148,6 +148,98 @@ def test_parse_snkrdunk_text_extracts_core_fields() -> None:
     assert parsed.demand_ratio == 0.92
 
 
+def test_parse_snkrdunk_text_handles_ws_code_with_redundant_rarity_token() -> None:
+    parsed = _parse_snkrdunk_text(
+        'Steamboat Mickey OR[Dds/S104-100OR OR](Booster Pack Disney100)',
+        detail_url="https://snkrdunk.com/apparels/120130?slide=right",
+        board_url="https://snkrdunk.com/articles/26509/",
+        note="annual sales",
+        source_label="SNKRDUNK annual sales ranking",
+        source_rank=1,
+        demand_ratio=0.8,
+    )
+
+    assert parsed is not None
+    assert parsed.title == "Steamboat Mickey"
+    assert parsed.rarity == "OR"
+    assert parsed.card_number == "Dds/S104-100OR"
+    assert parsed.set_code == "dds"
+
+
+def test_parse_snkrdunk_article_apparel_items_extracts_ws_singles() -> None:
+    html = """
+    <article-content
+      :apparels='[
+        {
+          "id": 778223,
+          "localizedName": "Weiss Schwarz Booster Pack Summer Pockets Box",
+          "displayPrice": "¥13,000",
+          "totalListingCount": 1,
+          "primaryMedia": {"imageUrl": "https://cdn.example.com/box.webp"}
+        },
+        {
+          "id": 798318,
+          "localizedName": "\\"A Girl Gazing at the Sea\\" Shiroha SSP [SMP/W137-038SSP](Booster Pack Summer Pockets)",
+          "displayPrice": "¥80,000",
+          "totalListingCount": 3,
+          "primaryMedia": {"imageUrl": "https://cdn.example.com/shiroha.webp"}
+        }
+      ]'
+    ></article-content>
+    """
+
+    service = TcgHotCardService()
+    items = service._parse_snkrdunk_article_apparel_items(  # type: ignore[attr-defined]
+        html,
+        board_url="https://snkrdunk.com/articles/31956/",
+        source_label="SNKRDUNK Summer Pockets initial market",
+        source_weight=0.48,
+        note="initial market",
+    )
+
+    assert len(items) == 1
+    assert items[0].title == '"A Girl Gazing at the Sea" Shiroha'
+    assert items[0].card_number == "SMP/W137-038SSP"
+    assert items[0].rarity == "SSP"
+    assert items[0].price_jpy == 80000
+    assert items[0].listing_count == 3
+    assert items[0].thumbnail_url == "https://cdn.example.com/shiroha.webp"
+    assert items[0].source_rank == 1
+    assert items[0].demand_ratio > 0
+
+
+def test_parse_snkrdunk_heading_ranking_items_skips_box_like_entries() -> None:
+    html = """
+    <div class="article-content">
+      <h3>■第1位 Steamboat Mickey OR[Dds/S104-100OR OR](Booster Pack Disney100)</h3>
+      <a href="/apparels/120130?ref=articles_hobby&amp;slide=right">
+        <img src="https://cdn.example.com/mickey.webp" />
+        <div>¥2,000,000〜</div>
+      </a>
+      <h3>■第2位 Weiss Schwarz Booster Pack Disney100 Box</h3>
+      <a href="/apparels/122977?ref=articles_hobby&amp;slide=right">
+        <img src="https://cdn.example.com/box.webp" />
+        <div>¥45,000〜</div>
+      </a>
+    </div>
+    """
+
+    service = TcgHotCardService()
+    items = service._parse_snkrdunk_heading_ranking_items(  # type: ignore[attr-defined]
+        html,
+        board_url="https://snkrdunk.com/articles/26509/",
+        source_label="SNKRDUNK annual sales ranking",
+        source_weight=0.54,
+        note="annual sales",
+    )
+
+    assert len(items) == 1
+    assert items[0].title == "Steamboat Mickey"
+    assert items[0].card_number == "Dds/S104-100OR"
+    assert items[0].price_jpy == 2000000
+    assert items[0].source_rank == 1
+
+
 def test_hot_card_service_merges_duplicate_variants() -> None:
     service = StubHotCardService(
         buy_signals={

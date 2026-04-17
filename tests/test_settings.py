@@ -60,3 +60,17 @@ def test_configure_logging_creates_log_file(tmp_path) -> None:
 
     assert log_path.exists()
     assert "logging smoke test" in log_path.read_text(encoding="utf-8")
+
+
+def test_get_settings_reads_local_vision_environment_keys(monkeypatch) -> None:
+    monkeypatch.setenv("OPENCLAW_LOCAL_VISION_BACKEND", "ollama")
+    monkeypatch.setenv("OPENCLAW_LOCAL_VISION_ENDPOINT", "http://127.0.0.1:11434")
+    monkeypatch.setenv("OPENCLAW_LOCAL_VISION_MODEL", "qwen2.5vl:3b")
+    monkeypatch.setenv("OPENCLAW_LOCAL_VISION_TIMEOUT_SECONDS", "120")
+
+    settings = get_settings()
+
+    assert settings.openclaw_local_vision_backend == "ollama"
+    assert settings.openclaw_local_vision_endpoint == "http://127.0.0.1:11434"
+    assert settings.openclaw_local_vision_model == "qwen2.5vl:3b"
+    assert settings.openclaw_local_vision_timeout_seconds == 120

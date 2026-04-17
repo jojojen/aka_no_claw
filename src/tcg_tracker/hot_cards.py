@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import math
 import re
@@ -26,6 +27,9 @@ MAGI_POKEMON_LIST_URL = "https://magi.camp/brands/3/items"
 SNKRDUNK_POKEMON_MONTHLY_TRADES_URL = "https://snkrdunk.com/articles/31649/"
 SNKRDUNK_POKEMON_UR_TRADES_URL = "https://snkrdunk.com/articles/31962/"
 SNKRDUNK_POKEMON_SA_TRADES_URL = "https://snkrdunk.com/articles/31708/"
+SNKRDUNK_WS_ANNUAL_SALES_URL = "https://snkrdunk.com/articles/26509/"
+SNKRDUNK_WS_SUMMER_POCKETS_INITIAL_MARKET_URL = "https://snkrdunk.com/articles/31956/"
+SNKRDUNK_WS_AOBUTA_INITIAL_MARKET_URL = "https://snkrdunk.com/articles/31830/"
 YAHOO_REALTIME_SEARCH_URL = "https://search.yahoo.co.jp/realtime/search"
 DEFAULT_BOARD_LIMIT = 10
 SOCIAL_QUERY_CANDIDATE_LIMIT = 4
@@ -79,6 +83,7 @@ SOCIAL_QUOTE_RE = re.compile(r"quote:(?P<count>\d+)")
 SOCIAL_TWEET_SELECTOR = "div#sr div[class*='Tweet_TweetContainer']"
 SNKRDUNK_CODE_BLOCK_RE = re.compile(r"\[(?P<code>[^\]]+)\]")
 SNKRDUNK_PRICE_RE = re.compile(r"¥\s*(?P<price>\d[\d,]*)")
+SNKRDUNK_HEADING_RANK_RE = re.compile(r"^(?:■\s*)?第?(?P<rank>\d+)位[:：]?\s*(?P<title>.+)$")
 
 logger = logging.getLogger(__name__)
 
@@ -208,21 +213,16 @@ class TcgHotCardService:
         )
 
     def load_ws_board(self, *, limit: int = DEFAULT_BOARD_LIMIT) -> HotCardBoard:
-        html = self.http_client.get_text(MAGI_WS_RANKING_URL)
+        parsed_items, methodology = self._load_ws_board_items()
         items = self._build_ranked_entries(
             game="ws",
-            parsed_items=self._parse_magi_ws_items(html),
+            parsed_items=parsed_items,
             limit=limit,
         )
         return HotCardBoard(
             game="ws",
             label="WS Liquidity Board",
-            methodology=(
-                "WS 榜單目前仍以遊々亭的買方承接與 Yahoo!リアルタイム検索 的注意力為主，"
-                " 再用 magi 的推薦 / 列表順序提供低權重候選與需求背景。"
-                " 和 Pokemon 不同，WS 目前沒有同等新鮮且可穩定解析的廣域交易數排行榜，"
-                " 所以市場活動分數的來源會更保守。"
-            ),
+            methodology=methodology,
             generated_at=datetime.now(timezone.utc),
             items=items,
         )
@@ -519,8 +519,8 @@ class TcgHotCardService:
             parsed_items, _ = self._load_pokemon_board_items()
             return parsed_items
         if game == "ws":
-            html = self.http_client.get_text(MAGI_WS_RANKING_URL)
-            return self._parse_magi_ws_items(html)
+            parsed_items, _ = self._load_ws_board_items()
+            return parsed_items
         return []
 
     def _load_pokemon_board_items(self) -> tuple[list[_ParsedHotItem], str]:
@@ -585,6 +585,60 @@ class TcgHotCardService:
             parsed_items.extend(self._parse_magi_pokemon_items(html))
         except Exception as exc:  # pragma: no cover - network-dependent.
             logger.warning("Magi Pokemon listing page failed; continuing without it. error=%s", exc)
+
+        return (parsed_items, "".join(methodology_parts))
+
+    def _load_ws_board_items(self) -> tuple[list[_ParsedHotItem], str]:
+        parsed_items: list[_ParsedHotItem] = []
+        methodology_parts = [
+            "WS 現在會先把外部市場活動頁面的熱度信號拉進來，再和遊々亭買盤與 Yahoo!リアルタイム検索 一起做綜合排序。",
+            " 除了 magi 頁面順序之外，WS 目前也會吃 SNKRDUNK 的年度賣上排行與近期初動相場文章，讓市場活動層不再只靠單一頁面候選。",
+            " 這讓 WS 比原本更接近 Pokemon 現在的多來源 activity model，但仍保留買盤與 SNS 只作輔助驗證的保守框架。",
+        ]
+
+        ws_trend_sources = (
+            (
+                SNKRDUNK_WS_ANNUAL_SALES_URL,
+                "SNKRDUNK annual sales ranking",
+                0.54,
+                self._parse_snkrdunk_heading_ranking_items,
+                "Signal source: SNKRDUNK annual Weiss Schwarz sales ranking.",
+            ),
+            (
+                SNKRDUNK_WS_SUMMER_POCKETS_INITIAL_MARKET_URL,
+                "SNKRDUNK Summer Pockets initial market",
+                0.48,
+                self._parse_snkrdunk_article_apparel_items,
+                "Signal source: SNKRDUNK initial-market article for Summer Pockets.",
+            ),
+            (
+                SNKRDUNK_WS_AOBUTA_INITIAL_MARKET_URL,
+                "SNKRDUNK Aobuta initial market",
+                0.48,
+                self._parse_snkrdunk_article_apparel_items,
+                "Signal source: SNKRDUNK initial-market article for Rascal Does Not Dream of Santa Claus.",
+            ),
+        )
+        for board_url, source_label, source_weight, parser, note in ws_trend_sources:
+            try:
+                html = self.http_client.get_text(board_url)
+                parsed_items.extend(
+                    parser(
+                        html,
+                        board_url=board_url,
+                        source_label=source_label,
+                        source_weight=source_weight,
+                        note=note,
+                    )
+                )
+            except Exception as exc:  # pragma: no cover - network-dependent.
+                logger.warning("WS trend source failed url=%s error=%s", board_url, exc)
+
+        try:
+            html = self.http_client.get_text(MAGI_WS_RANKING_URL)
+            parsed_items.extend(self._parse_magi_ws_items(html))
+        except Exception as exc:  # pragma: no cover - network-dependent.
+            logger.warning("Magi WS listing page failed; continuing without it. error=%s", exc)
 
         return (parsed_items, "".join(methodology_parts))
 
@@ -945,6 +999,145 @@ class TcgHotCardService:
                 items.append(parsed)
         return items
 
+    def _parse_snkrdunk_article_apparel_items(
+        self,
+        html: str,
+        *,
+        board_url: str,
+        source_label: str,
+        source_weight: float,
+        note: str,
+    ) -> list[_ParsedHotItem]:
+        soup = BeautifulSoup(html, "html.parser")
+        article_content = soup.select_one("article-content")
+        if article_content is None:
+            return []
+
+        raw_apparels = article_content.get(":apparels")
+        if not isinstance(raw_apparels, str) or not raw_apparels.strip():
+            return []
+
+        try:
+            apparel_items = json.loads(raw_apparels)
+        except json.JSONDecodeError as exc:
+            logger.warning("Failed to decode SNKRDUNK article apparel payload url=%s error=%s", board_url, exc)
+            return []
+
+        parsed_candidates: list[_ParsedHotItem] = []
+        for apparel in apparel_items:
+            if not isinstance(apparel, dict):
+                continue
+
+            apparel_id = _parse_optional_int(apparel.get("id"))
+            title_text = _first_populated_text(apparel.get("localizedName"), apparel.get("name"))
+            if apparel_id is None or title_text is None:
+                continue
+
+            parsed = _parse_snkrdunk_text(
+                title_text,
+                detail_url=f"https://snkrdunk.com/apparels/{apparel_id}?slide=right",
+                board_url=board_url,
+                thumbnail_url=_extract_snkrdunk_primary_image_url(apparel),
+                note=note,
+                source_label=source_label,
+                source_rank=1,
+                demand_ratio=0.0,
+            )
+            if parsed is None or parsed.card_number is None:
+                continue
+
+            parsed_candidates.append(
+                replace(
+                    parsed,
+                    price_jpy=_parse_jpy_price_text(apparel.get("displayPrice")),
+                    listing_count=_parse_optional_int(apparel.get("totalListingCount")),
+                )
+            )
+
+        max_rank = len(parsed_candidates)
+        if max_rank <= 0:
+            return []
+
+        return [
+            replace(
+                parsed,
+                source_rank=source_rank,
+                demand_ratio=_rank_signal_ratio(
+                    rank=source_rank,
+                    max_rank=max_rank,
+                    source_weight=source_weight,
+                    floor=0.18,
+                ),
+            )
+            for source_rank, parsed in enumerate(parsed_candidates, start=1)
+        ]
+
+    def _parse_snkrdunk_heading_ranking_items(
+        self,
+        html: str,
+        *,
+        board_url: str,
+        source_label: str,
+        source_weight: float,
+        note: str,
+    ) -> list[_ParsedHotItem]:
+        soup = BeautifulSoup(html, "html.parser")
+        ranked_candidates: list[tuple[int, _ParsedHotItem]] = []
+        for heading in soup.find_all("h3"):
+            heading_text = " ".join(heading.get_text(" ", strip=True).split())
+            ranked_heading = _parse_snkrdunk_heading_rank(heading_text)
+            if ranked_heading is None:
+                continue
+
+            source_rank, title_text = ranked_heading
+            anchor = _find_next_snkrdunk_apparel_anchor(heading)
+            if anchor is None:
+                continue
+
+            href = anchor.get("href")
+            if not isinstance(href, str) or not href:
+                continue
+
+            image = anchor.select_one("img")
+            price_text = " ".join(anchor.get_text(" ", strip=True).split())
+            parsed = _parse_snkrdunk_text(
+                title_text,
+                detail_url=urljoin("https://snkrdunk.com", href),
+                board_url=board_url,
+                thumbnail_url=_pick_image_url(image, attribute_names=("src", "data-src")),
+                note=note,
+                source_label=source_label,
+                source_rank=source_rank,
+                demand_ratio=0.0,
+            )
+            if parsed is None or parsed.card_number is None:
+                continue
+
+            ranked_candidates.append(
+                (
+                    source_rank,
+                    replace(parsed, price_jpy=_parse_jpy_price_text(price_text)),
+                )
+            )
+
+        if not ranked_candidates:
+            return []
+
+        max_rank = max(source_rank for source_rank, _ in ranked_candidates)
+        return [
+            replace(
+                parsed,
+                source_rank=source_rank,
+                demand_ratio=_rank_signal_ratio(
+                    rank=source_rank,
+                    max_rank=max_rank,
+                    source_weight=source_weight,
+                    floor=0.18,
+                ),
+            )
+            for source_rank, parsed in ranked_candidates
+        ]
+
     def _parse_magi_ws_items(self, html: str) -> list[_ParsedHotItem]:
         soup = BeautifulSoup(html, "html.parser")
         items: list[_ParsedHotItem] = []
@@ -1198,14 +1391,19 @@ def _parse_snkrdunk_text(
             left, right = code_block.split(" ", 1)
             left = left.strip()
             right = right.strip()
-            if re.fullmatch(r"[A-Za-z0-9-]+", left):
+            if re.fullmatch(r"[A-Za-z0-9]+/[A-Za-z0-9-]+-[A-Za-z0-9]+", left):
+                card_number = left
+                set_code = left.split("/", 1)[0].lower()
+                if rarity is None and _looks_like_rarity(right):
+                    rarity = right
+            elif re.fullmatch(r"[A-Za-z0-9-]+", left):
                 set_code = left.lower()
                 card_number = right
             else:
                 card_number = code_block
         else:
             card_number = code_block
-            ws_code_match = WS_CODE_RE.fullmatch(code_block)
+            ws_code_match = re.fullmatch(r"(?P<code>[A-Za-z0-9]+/[A-Za-z0-9-]+-[A-Za-z0-9]+)", code_block)
             if ws_code_match is not None:
                 set_code = ws_code_match.group("code").split("/", 1)[0].lower()
 
@@ -1275,6 +1473,62 @@ def _parse_yahoo_realtime_signal(
         engagement_count=engagement_count,
         score_ratio=_social_score_ratio(matched_post_count=matched_post_count, engagement_count=engagement_count),
     )
+
+
+def _parse_snkrdunk_heading_rank(text: str) -> tuple[int, str] | None:
+    match = SNKRDUNK_HEADING_RANK_RE.match(" ".join(text.split()))
+    if match is None:
+        return None
+
+    rank = int(match.group("rank"))
+    title = match.group("title").strip()
+    if rank <= 0 or not title:
+        return None
+    return (rank, title)
+
+
+def _find_next_snkrdunk_apparel_anchor(node: Tag) -> Tag | None:
+    sibling = node.next_sibling
+    while sibling is not None:
+        if isinstance(sibling, Tag):
+            if sibling.name == "h3":
+                return None
+            if sibling.name == "a" and isinstance(sibling.get("href"), str) and "/apparels/" in sibling["href"]:
+                return sibling
+            nested_anchor = sibling.select_one("a[href*='/apparels/']")
+            if nested_anchor is not None:
+                return nested_anchor
+        sibling = sibling.next_sibling
+    return None
+
+
+def _extract_snkrdunk_primary_image_url(item: dict[str, object]) -> str | None:
+    primary_media = item.get("primaryMedia")
+    if not isinstance(primary_media, dict):
+        return None
+    image_url = primary_media.get("imageUrl")
+    if not isinstance(image_url, str) or not image_url:
+        return None
+    return image_url
+
+
+def _first_populated_text(*values: object) -> str | None:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _parse_jpy_price_text(value: object) -> int | None:
+    if value is None:
+        return None
+    normalized = str(value).replace("￥", "¥")
+    price_match = JPY_PRICE_RE.search(normalized)
+    if price_match is None:
+        price_match = re.search(r"(?P<price>\d[\d,]*)", normalized)
+    if price_match is None:
+        return None
+    return int(price_match.group("price").replace(",", ""))
 
 
 def _split_title_and_rarity(prefix: str) -> tuple[str, str | None]:

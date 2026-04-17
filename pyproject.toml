@@ -18,6 +18,9 @@ dependencies = [
 dev = [
   "pytest>=9,<10",
 ]
+ocr = [
+  "easyocr>=1.7,<2",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
