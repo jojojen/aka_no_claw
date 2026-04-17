@@ -200,6 +200,7 @@ body {
   gap: 10px;
   padding: 16px;
   padding-right: 116px;
+  overflow: visible;
   border-radius: 18px;
   border: 1px solid rgba(24, 33, 38, 0.08);
   background: rgba(255, 252, 246, 0.92);
@@ -212,18 +213,87 @@ body {
   display: block;
   width: 84px;
   height: 84px;
-  overflow: hidden;
+  overflow: visible;
   border-radius: 16px;
   border: 1px solid rgba(24, 33, 38, 0.08);
   background: rgba(255, 255, 255, 0.9);
   box-shadow: 0 12px 24px rgba(24, 33, 38, 0.08);
+  isolation: isolate;
+  z-index: 4;
+  transition: transform 160ms ease, box-shadow 160ms ease, border-color 160ms ease;
 }
 
-.hot-thumb img {
+.hot-thumb:hover,
+.hot-thumb:focus-visible {
+  transform: translateY(-1px);
+  box-shadow: 0 16px 28px rgba(24, 33, 38, 0.14);
+  border-color: rgba(191, 77, 40, 0.32);
+}
+
+.hot-thumb:focus-visible {
+  outline: 2px solid rgba(191, 77, 40, 0.26);
+  outline-offset: 2px;
+}
+
+.hot-thumb__image {
   display: block;
   width: 100%;
   height: 100%;
   object-fit: cover;
+  border-radius: inherit;
+}
+
+.hot-thumb__preview {
+  position: absolute;
+  top: 50%;
+  right: calc(100% + 14px);
+  display: grid;
+  place-items: center;
+  width: 252px;
+  height: 352px;
+  padding: 0;
+  overflow: hidden;
+  border-radius: 20px;
+  border: 1px solid rgba(24, 33, 38, 0.12);
+  background: rgba(255, 252, 246, 0.98);
+  box-shadow: 0 24px 50px rgba(24, 33, 38, 0.2);
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(-50%) scale(0.96);
+  transform-origin: center right;
+  pointer-events: none;
+  transition: opacity 160ms ease, transform 160ms ease, visibility 160ms ease;
+  z-index: 3;
+}
+
+.hot-thumb__preview::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  right: -8px;
+  width: 16px;
+  height: 16px;
+  border-top: 1px solid rgba(24, 33, 38, 0.12);
+  border-right: 1px solid rgba(24, 33, 38, 0.12);
+  background: rgba(255, 252, 246, 0.98);
+  transform: translateY(-50%) rotate(45deg);
+}
+
+.hot-thumb__preview-image {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: center;
+  border-radius: 0;
+}
+
+.hot-thumb:hover .hot-thumb__preview,
+.hot-thumb:focus-visible .hot-thumb__preview,
+.hot-thumb:focus-within .hot-thumb__preview {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(-50%) scale(1);
 }
 
 .hot-thumb--empty {
@@ -579,6 +649,10 @@ select:focus {
   .hot-thumb {
     left: 16px;
     right: auto;
+  }
+
+  .hot-thumb__preview {
+    display: none;
   }
 
   .hero__panel,

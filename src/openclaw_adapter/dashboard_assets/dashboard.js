@@ -231,7 +231,10 @@ function renderHotBoard(game, board, errorMessage) {
     const thumbnailMarkup = item.thumbnail_url
       ? `
           <a class="hot-thumb" href="${escapeHtml(firstReferenceUrl(references) || "#")}" target="_blank" rel="noreferrer">
-            <img src="${escapeHtml(item.thumbnail_url)}" alt="${escapeHtml(item.title)}" loading="lazy" />
+            <img class="hot-thumb__image" src="${escapeHtml(item.thumbnail_url)}" alt="${escapeHtml(item.title)}" loading="lazy" />
+            <span class="hot-thumb__preview" aria-hidden="true">
+              <img class="hot-thumb__preview-image" src="${escapeHtml(item.thumbnail_url)}" alt="" loading="lazy" />
+            </span>
           </a>
         `
       : `<div class="hot-thumb hot-thumb--empty">No image</div>`;
