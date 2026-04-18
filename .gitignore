@@ -27,6 +27,7 @@ data/*.log
 logs/
 .openclaw_tmp/
 .openclaw_ocr/
+reports/
 
 # OS / editor noise
 .DS_Store

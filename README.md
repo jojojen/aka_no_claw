@@ -326,20 +326,21 @@ Environment variables:
 ```dotenv
 OPENCLAW_LOCAL_VISION_BACKEND=ollama
 OPENCLAW_LOCAL_VISION_ENDPOINT=http://127.0.0.1:11434
-OPENCLAW_LOCAL_VISION_MODEL=qwen2.5vl:3b,gemma3:4b
-OPENCLAW_LOCAL_VISION_TIMEOUT_SECONDS=120
+OPENCLAW_LOCAL_VISION_MODEL=qwen2.5vl:7b,gemma3:12b
+OPENCLAW_LOCAL_VISION_TIMEOUT_SECONDS=180
 ```
 
 Suggested starting points for a 16 GB RAM machine:
 
-- `qwen2.5vl:3b` as the first local vision pass
-- `gemma3:4b` as the slower rescue pass when the first model still misses card number / rarity / set code
+- `qwen2.5vl:7b` as the main local vision pass
+- `gemma3:12b` as the slower rescue pass when the first model still misses card number / rarity / set code
+- Avoid `mistral-small3.2:24b` on this machine even though it is newer, because the official Ollama build is `15GB` and leaves too little RAM headroom on a 16GB Windows host
 
 Example setup:
 
 ```powershell
-ollama pull qwen2.5vl:3b
-ollama pull gemma3:4b
+ollama pull qwen2.5vl:7b
+ollama pull gemma3:12b
 python scripts/run_image_lookup_smoke.py
 ```
 

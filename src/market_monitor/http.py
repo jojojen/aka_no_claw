@@ -86,7 +86,7 @@ class HttpClient:
         if curl_path is None:
             return None
 
-        command = [curl_path, "-L", "-sS", "--compressed"]
+        command = [curl_path, "-L", "-sS", "--compressed", "-f"]
         if self.ssl_context.verify_mode == ssl.CERT_NONE:
             command.append("-k")
         for key, value in headers.items():

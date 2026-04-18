@@ -10,13 +10,16 @@ from tcg_tracker.catalog import TcgCardSpec
 from tcg_tracker.image_lookup import (
     ParsedCardImage,
     TcgImagePriceService,
+    _merge_local_vision_candidate,
     parse_image_caption_hints,
     parse_tcg_ocr_text,
 )
-from tcg_tracker.local_vision import LocalVisionCardCandidate
+from tcg_tracker.hot_cards import TcgLookupHint
+from tcg_tracker.local_vision import LocalVisionCardCandidate, OllamaLocalVisionClient
 from tcg_tracker.service import TcgLookupResult
 
 CHARIZARD_JP = "\u30ea\u30b6\u30fc\u30c9\u30f3ex"
+PIKACHU_EX_JP = "\u30d4\u30ab\u30c1\u30e5\u30a6ex"
 RIRIE_JP = "\u30ea\u30fc\u30ea\u30a8\u306e\u30d4\u30c3\u30d4ex"
 
 
@@ -48,6 +51,77 @@ def test_parse_tcg_ocr_text_extracts_charizard_reference_fields() -> None:
     assert "MEGA CHARIZARD X ex" in parsed.aliases
 
 
+def test_parse_tcg_ocr_text_preserves_zero_padded_pokemon_card_numbers() -> None:
+    raw_text = "\n".join(
+        [
+            "2025 POKEMON M2 JP",
+            "MEGA CHARIZARD X ex",
+            "SPECIAL ART RARE",
+            "110/080 SAR",
+        ]
+    )
+
+    parsed = parse_tcg_ocr_text(raw_text)
+
+    assert parsed.card_number == "110/080"
+    assert parsed.rarity == "SAR"
+    assert parsed.set_code == "m2"
+
+
+def test_parse_tcg_ocr_text_rejects_zero_denominator_card_number_noise() -> None:
+    raw_text = "\n".join(
+        [
+            "2025 POKEMON M2 JP",
+            "MEGA CHARIZARD X ex",
+            "SPECIAL ART RARE",
+            "110/0 A",
+        ]
+    )
+
+    parsed = parse_tcg_ocr_text(raw_text)
+
+    assert parsed.card_number is None
+    assert parsed.rarity == "SAR"
+
+
+def test_parse_tcg_ocr_text_prefers_valid_zero_padded_number_over_slab_noise() -> None:
+    raw_text = "\n".join(
+        [
+            "2025 POKEMON M2 JP",
+            "MEGA CHARIZARD X ex",
+            "SPECIAL ART RARE",
+            "#110",
+            "110/0 A",
+            "メガリザードンXex",
+            "110/080",
+        ]
+    )
+
+    parsed = parse_tcg_ocr_text(raw_text)
+
+    assert parsed.card_number == "110/080"
+    assert parsed.rarity == "SAR"
+
+
+def test_parse_tcg_ocr_text_recovers_slab_set_and_rarity_from_noisy_header() -> None:
+    raw_text = "\n".join(
+        [
+            "2025 POKEMONMZ JP",
+            "#110",
+            "MEGA CHARIZARD X ex",
+            "SS",
+            "SPECIAL AATAARE",
+        ]
+    )
+
+    parsed = parse_tcg_ocr_text(raw_text, game_hint="pokemon")
+
+    assert parsed.title == "MEGA CHARIZARD X ex"
+    assert parsed.card_number is None
+    assert parsed.rarity == "SAR"
+    assert parsed.set_code == "m2"
+
+
 def test_parse_tcg_ocr_text_extracts_ririe_reference_fields() -> None:
     raw_text = "\n".join(
         [
@@ -67,6 +141,42 @@ def test_parse_tcg_ocr_text_extracts_ririe_reference_fields() -> None:
     assert parsed.card_number == "126/100"
     assert parsed.rarity == "SAR"
     assert parsed.set_code == "sv9"
+
+
+def test_parse_tcg_ocr_text_extracts_pokemon_promo_footer_codes() -> None:
+    raw_text = "\n".join(
+        [
+            "2023 POKEMON SVP EN",
+            "Pikachu with Grey Felt Hat",
+            "SVP EN 085",
+        ]
+    )
+
+    parsed = parse_tcg_ocr_text(raw_text, game_hint="pokemon")
+
+    assert parsed.status == "success"
+    assert parsed.game == "pokemon"
+    assert parsed.title == "Pikachu with Grey Felt Hat"
+    assert parsed.card_number == "085/SV-P"
+    assert parsed.set_code == "svp"
+
+
+def test_parse_tcg_ocr_text_accepts_special_collection_number() -> None:
+    raw_text = "\n".join(
+        [
+            "2025 POKEMON MC JP",
+            PIKACHU_EX_JP,
+            "764/742",
+        ]
+    )
+
+    parsed = parse_tcg_ocr_text(raw_text, game_hint="pokemon")
+
+    assert parsed.status == "success"
+    assert parsed.game == "pokemon"
+    assert parsed.title == PIKACHU_EX_JP
+    assert parsed.card_number == "764/742"
+    assert parsed.set_code == "mc"
 
 
 def test_parse_tcg_ocr_text_rejects_copyright_noise_as_title() -> None:
@@ -101,6 +211,64 @@ def test_parse_tcg_ocr_text_accepts_easyocr_style_japanese_title() -> None:
     assert parsed.game == "pokemon"
     assert parsed.title == CHARIZARD_JP
     assert parsed.card_number == "201/165"
+
+
+def test_parse_tcg_ocr_text_rejects_vowel_heavy_gibberish_title() -> None:
+    raw_text = "\n".join(
+        [
+            "oon eee ante ee",
+            "9/30",
+        ]
+    )
+
+    parsed = parse_tcg_ocr_text(raw_text)
+
+    assert parsed.title is None
+    assert parsed.card_number == "9/30"
+
+
+def test_parse_tcg_ocr_text_keeps_legit_english_title() -> None:
+    raw_text = "\n".join(
+        [
+            "Pikachu with Grey Felt Hat",
+            "085/SV-P",
+        ]
+    )
+
+    parsed = parse_tcg_ocr_text(raw_text, game_hint="pokemon")
+
+    assert parsed.title == "Pikachu with Grey Felt Hat"
+    assert parsed.card_number == "085/SV-P"
+
+
+def test_parse_tcg_ocr_text_prefers_ws_when_weiss_signals_and_ws_code_are_present() -> None:
+    raw_text = "\n".join(
+        [
+            "ヴァイスシュヴァルツ",
+            "未来の花嫁 タミコ",
+            "CS/S114-043",
+            "153/165",
+        ]
+    )
+
+    parsed = parse_tcg_ocr_text(raw_text)
+
+    assert parsed.game == "ws"
+    assert parsed.card_number == "CS/S114-043"
+    assert parsed.title == "未来の花嫁 タミコ"
+
+
+def test_local_vision_prompt_requires_exactly_one_identifiable_card() -> None:
+    client = OllamaLocalVisionClient(
+        endpoint="http://127.0.0.1:11434",
+        model="qwen2.5vl:7b",
+        timeout_seconds=30,
+    )
+
+    prompt = client._build_prompt(game_hint=None, title_hint=None)
+
+    assert "exactly one identifiable trading card" in prompt
+    assert "Do not merge multiple cards" in prompt
 
 
 def test_image_service_reports_unavailable_when_tesseract_is_missing() -> None:
@@ -206,6 +374,78 @@ def test_lookup_image_uses_card_number_placeholder_to_recover_title(monkeypatch,
     assert any("Resolved the card title from OCR metadata fallback" in warning for warning in outcome.warnings)
     assert calls[0].title == "201/165"
     assert calls[-1].title == CHARIZARD_JP
+
+
+def test_lookup_image_trusts_card_number_recovery_when_title_is_unusable(monkeypatch, tmp_path) -> None:
+    class StubService:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def lookup(self, spec: TcgCardSpec, *, persist: bool = True) -> TcgLookupResult:
+            if spec.title == "201/165":
+                offer = MarketOffer(
+                    source="magi",
+                    listing_id="sv2a-201-165",
+                    url="https://example.com/charizard",
+                    title=CHARIZARD_JP,
+                    price_jpy=60800,
+                    price_kind="market",
+                    captured_at=datetime.now(timezone.utc),
+                    source_category="marketplace",
+                    attributes={"card_number": "201/165", "rarity": "SAR", "version_code": "sv2a"},
+                )
+                item = TrackedItem(
+                    item_id="tcg-charizard",
+                    item_type="tcg_card",
+                    category="tcg",
+                    title=spec.title,
+                    attributes={"game": "pokemon", "card_number": "201/165", "rarity": "SAR", "set_code": "sv2a"},
+                )
+                fair_value = FairValueEstimate(
+                    item_id="tcg-charizard",
+                    amount_jpy=60800,
+                    confidence=0.82,
+                    sample_count=1,
+                    reasoning=("stub",),
+                )
+                return TcgLookupResult(spec=spec, item=item, offers=(offer,), fair_value=fair_value, notes=())
+
+            item = TrackedItem(
+                item_id="tcg-empty",
+                item_type="tcg_card",
+                category="tcg",
+                title=spec.title,
+                attributes={"game": spec.game},
+            )
+            return TcgLookupResult(spec=spec, item=item, offers=(), fair_value=None, notes=("No matching offers were found.",))
+
+    monkeypatch.setattr("tcg_tracker.image_lookup.TcgPriceService", StubService)
+
+    service = TcgImagePriceService(
+        db_path=tmp_path / "monitor.sqlite3",
+        settings=AssistantSettings(monitor_db_path=str(tmp_path / "monitor.sqlite3")),
+    )
+    parsed = ParsedCardImage(
+        status="success",
+        game="pokemon",
+        title="exルー川",
+        aliases=(),
+        card_number="201/165",
+        rarity="SS",
+        set_code="s2",
+        raw_text="201/165\nexルー川",
+        extracted_lines=("201/165", "exルー川"),
+        warnings=(),
+    )
+
+    resolved_parsed, spec = service._prepare_lookup_spec(parsed)
+
+    assert spec is not None
+    assert spec.title == CHARIZARD_JP
+    assert spec.card_number == "201/165"
+    assert spec.rarity == "SAR"
+    assert spec.set_code == "sv2a"
+    assert resolved_parsed.title == CHARIZARD_JP
 
 
 def test_parse_image_uses_local_vision_when_tesseract_is_missing(tmp_path) -> None:
@@ -320,3 +560,162 @@ def test_parse_image_escalates_to_second_local_vision_model_when_first_is_incomp
     assert parsed.rarity == "SAR"
     assert parsed.set_code == "sv2a"
     assert any("Applied local vision fallback via ollama:gemma3:4b." in warning for warning in parsed.warnings)
+
+
+def test_parse_image_escalates_when_first_local_vision_candidate_looks_slab_derived(tmp_path) -> None:
+    image_path = tmp_path / "telegram-upload-pikachu.jpg"
+    image_path.write_bytes(b"fake-image")
+
+    settings = AssistantSettings(
+        monitor_db_path=str(tmp_path / "monitor.sqlite3"),
+        openclaw_tesseract_path="C:/missing/tesseract.exe",
+        openclaw_local_vision_model="qwen2.5vl:7b,gemma3:12b",
+    )
+    service = TcgImagePriceService(db_path=settings.monitor_db_path, settings=settings)
+
+    class FastButSlabDerivedClient:
+        descriptor = "ollama:qwen2.5vl:7b"
+
+        def analyze_card_image(
+            self,
+            image_path: Path,
+            *,
+            game_hint: str | None = None,
+            title_hint: str | None = None,
+        ) -> LocalVisionCardCandidate:
+            return LocalVisionCardCandidate(
+                backend="ollama",
+                model="qwen2.5vl:7b",
+                game="pokemon",
+                title="PIKACHU ex",
+                aliases=(PIKACHU_EX_JP,),
+                card_number="764",
+                rarity="GEM MT",
+                set_code="MC JP",
+                confidence=0.98,
+            )
+
+    class SlowerCollectorNumberClient:
+        descriptor = "ollama:gemma3:12b"
+
+        def analyze_card_image(
+            self,
+            image_path: Path,
+            *,
+            game_hint: str | None = None,
+            title_hint: str | None = None,
+        ) -> LocalVisionCardCandidate:
+            return LocalVisionCardCandidate(
+                backend="ollama",
+                model="gemma3:12b",
+                game="pokemon",
+                title=PIKACHU_EX_JP,
+                aliases=("PIKACHU ex",),
+                card_number="764/742",
+                rarity=None,
+                set_code="MC",
+                confidence=0.93,
+            )
+
+    service._local_vision_clients = (FastButSlabDerivedClient(), SlowerCollectorNumberClient())
+
+    parsed = service.parse_image(image_path)
+
+    assert parsed.status == "success"
+    assert parsed.title == PIKACHU_EX_JP
+    assert parsed.card_number == "764/742"
+    assert parsed.rarity is None
+    assert parsed.set_code == "mc"
+    assert any("Applied local vision fallback via ollama:gemma3:12b." in warning for warning in parsed.warnings)
+
+
+def test_merge_local_vision_candidate_ignores_conflicting_metadata_when_titles_disagree() -> None:
+    parsed = ParsedCardImage(
+        status="success",
+        game="pokemon",
+        title="MEGA CHARIZARD X ex",
+        aliases=("paypay charizard psa",),
+        card_number=None,
+        rarity="SAR",
+        set_code="m2",
+        raw_text="2025 POKEMONMZ JP\n#110\nMEGA CHARIZARD X ex\nSPECIAL AATAARE",
+        extracted_lines=("2025 POKEMONMZ JP", "#110", "MEGA CHARIZARD X ex", "SPECIAL AATAARE"),
+        warnings=(),
+    )
+    candidate = LocalVisionCardCandidate(
+        backend="ollama",
+        model="gemma3:12b",
+        game="pokemon",
+        title="リザードン",
+        aliases=("Charizard",),
+        card_number="165/165",
+        rarity="H",
+        set_code="sov",
+        confidence=0.81,
+    )
+
+    merged = _merge_local_vision_candidate(parsed, candidate)
+
+    assert merged.title == "MEGA CHARIZARD X ex"
+    assert merged.card_number is None
+    assert merged.rarity == "SAR"
+    assert merged.set_code == "m2"
+    assert any("ignored conflicting card metadata" in warning for warning in merged.warnings)
+
+
+def test_prepare_lookup_spec_uses_slab_number_to_recover_full_card_number(monkeypatch, tmp_path) -> None:
+    class StubHotCardService:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def search_lookup_hints(self, spec: TcgCardSpec, *, limit: int = 5) -> tuple[TcgLookupHint, ...]:
+            return (
+                TcgLookupHint(
+                    game="pokemon",
+                    title="メガリザードンXex",
+                    card_number="110/080",
+                    rarity="SAR",
+                    set_code="m2",
+                    listing_count=12,
+                    confidence=26.0,
+                    references=(),
+                ),
+                TcgLookupHint(
+                    game="pokemon",
+                    title="オドリドリex",
+                    card_number="111/080",
+                    rarity="SAR",
+                    set_code="m2",
+                    listing_count=7,
+                    confidence=26.0,
+                    references=(),
+                ),
+            )
+
+    monkeypatch.setattr("tcg_tracker.image_lookup.TcgHotCardService", StubHotCardService)
+
+    service = TcgImagePriceService(
+        db_path=tmp_path / "monitor.sqlite3",
+        settings=AssistantSettings(monitor_db_path=str(tmp_path / "monitor.sqlite3")),
+    )
+    parsed = ParsedCardImage(
+        status="success",
+        game="pokemon",
+        title="MEGA CHARIZARD X ex",
+        aliases=(),
+        card_number=None,
+        rarity="SAR",
+        set_code="m2",
+        raw_text="2025 POKEMON M2 JP\n#110\nMEGA CHARIZARD X ex",
+        extracted_lines=("2025 POKEMON M2 JP", "#110", "MEGA CHARIZARD X ex"),
+        warnings=(),
+    )
+
+    resolved_parsed, spec = service._prepare_lookup_spec(parsed)
+
+    assert spec is not None
+    assert spec.title == "メガリザードンXex"
+    assert spec.card_number == "110/080"
+    assert spec.rarity == "SAR"
+    assert spec.set_code == "m2"
+    assert resolved_parsed.card_number == "110/080"

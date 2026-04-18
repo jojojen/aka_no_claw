@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timezone
 import logging
+import time
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
@@ -22,11 +23,17 @@ logger = logging.getLogger(__name__)
 
 
 class CardrushPokemonClient:
+    _cooldown_seconds = 600.0
+    _disabled_until_monotonic = 0.0
+
     def __init__(self, http_client: HttpClient | None = None) -> None:
         self.http_client = http_client or HttpClient()
 
     def lookup(self, spec: TcgCardSpec, *, minimum_score: float | None = None) -> list[MarketOffer]:
         if spec.game != "pokemon":
+            return []
+        if self._is_temporarily_disabled():
+            logger.debug("Cardrush lookup skipped because the source is temporarily disabled.")
             return []
 
         resolved_minimum_score = minimum_score if minimum_score is not None else minimum_match_score(spec)
@@ -58,11 +65,21 @@ class CardrushPokemonClient:
         seen: set[str] = set()
         for search_word in build_lookup_terms(spec):
             logger.debug("Cardrush search term=%s", search_word)
-            html = self.http_client.get_text(
-                CARDRUSH_PRODUCT_LIST_URL,
-                params={"keyword": search_word},
-                headers=CARDRUSH_BROWSER_HEADERS,
-            )
+            try:
+                html = self.http_client.get_text(
+                    CARDRUSH_PRODUCT_LIST_URL,
+                    params={"keyword": search_word},
+                    headers=CARDRUSH_BROWSER_HEADERS,
+                )
+            except Exception as exc:
+                self._temporarily_disable()
+                logger.warning(
+                    "Cardrush search failed term=%s; temporarily disabling the source for %.0f seconds. error=%s",
+                    search_word,
+                    self._cooldown_seconds,
+                    exc,
+                )
+                break
             raw_offers = self._parse_search_page(html)
             logger.debug(
                 "Cardrush raw candidates term=%s count=%s offers=%s",
@@ -76,6 +93,18 @@ class CardrushPokemonClient:
                 seen.add(offer.url)
                 offers.append(offer)
         return offers
+
+    @classmethod
+    def reset_temporary_disable(cls) -> None:
+        cls._disabled_until_monotonic = 0.0
+
+    @classmethod
+    def _temporarily_disable(cls) -> None:
+        cls._disabled_until_monotonic = time.monotonic() + cls._cooldown_seconds
+
+    @classmethod
+    def _is_temporarily_disabled(cls) -> bool:
+        return time.monotonic() < cls._disabled_until_monotonic
 
     def _parse_search_page(self, html: str) -> list[MarketOffer]:
         soup = BeautifulSoup(html, "html.parser")

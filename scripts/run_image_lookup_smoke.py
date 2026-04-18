@@ -23,12 +23,21 @@ class SmokeExpectation:
 
 EXPECTATIONS = (
     SmokeExpectation("fwdspecptcg/charizard.jpg", expected_status="success", expected_game="pokemon", expected_card_number="223/193"),
+    SmokeExpectation("fwdspecptcg/PICKACHU2.jpg", expected_status="success", expected_game="pokemon", expected_card_number="020/M-P"),
+    SmokeExpectation("fwdspecptcg/PICKACHU3.jpg", expected_status="success", expected_game="pokemon", expected_card_number="764/742"),
+    SmokeExpectation("fwdspecptcg/pikachu.jpg", expected_status="success", expected_game="pokemon", expected_card_number="085/SV-P"),
     SmokeExpectation("fwdspecptcg/ririe.jpg", expected_status="success", expected_game="pokemon", expected_card_number="126/100"),
     SmokeExpectation(
-        ".openclaw_tmp/telegram-upload-charizard_sv2a_official.jpg",
+        "tests/fixtures/image_lookup/telegram-upload-charizard_sv2a_official.jpg",
         expected_status="success",
         expected_game="pokemon",
         expected_card_number="201/165",
+    ),
+    SmokeExpectation(
+        "tests/fixtures/image_lookup/paypay_charizard_psa.jpg",
+        expected_status="success",
+        expected_game="pokemon",
+        expected_card_number="110/080",
     ),
 )
 
@@ -38,7 +47,8 @@ SAMPLE_PATHS = (
     "fwdspecptcg/PICKACHU3.jpg",
     "fwdspecptcg/pikachu.jpg",
     "fwdspecptcg/ririe.jpg",
-    ".openclaw_tmp/telegram-upload-charizard_sv2a_official.jpg",
+    "tests/fixtures/image_lookup/telegram-upload-charizard_sv2a_official.jpg",
+    "tests/fixtures/image_lookup/paypay_charizard_psa.jpg",
 )
 
 

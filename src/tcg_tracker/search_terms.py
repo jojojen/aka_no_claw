@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from .catalog import TcgCardSpec
 
 
@@ -7,6 +9,8 @@ def build_lookup_terms(spec: TcgCardSpec) -> tuple[str, ...]:
     terms: list[str] = []
     if spec.card_number:
         terms.append(spec.card_number)
+        if spec.game == "pokemon":
+            terms.extend(_pokemon_card_number_variants(spec.card_number))
 
     for keyword in spec.keywords():
         if keyword:
@@ -39,3 +43,23 @@ def _pokemon_title_variants(title: str) -> tuple[str, ...]:
         base = cleaned[:-2].strip()
         return tuple(value for value in (cleaned, base) if value)
     return cleaned, f"{cleaned}ex"
+
+
+def _pokemon_card_number_variants(card_number: str) -> tuple[str, ...]:
+    match = re.fullmatch(r"(?P<numerator>\d{1,3})/(?P<denominator>\d{1,3})", card_number.strip())
+    if match is None:
+        return ()
+
+    numerator = int(match.group("numerator"))
+    denominator = int(match.group("denominator"))
+    if numerator <= 0 or denominator <= 0:
+        return ()
+
+    original = card_number.strip()
+    compact = f"{numerator}/{denominator}"
+    padded = f"{numerator:03d}/{denominator:03d}"
+    return tuple(
+        value
+        for value in (compact, padded)
+        if value and value != original
+    )

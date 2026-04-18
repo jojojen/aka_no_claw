@@ -22,16 +22,52 @@ from .service import TcgLookupResult, TcgPriceService
 logger = logging.getLogger(__name__)
 
 POKEMON_NUMBER_RE = re.compile(r"(?P<number>\d{1,3}/\d{1,3})(?:\s*(?P<rarity>[A-Z]{1,5}))?", re.IGNORECASE)
+POKEMON_PROMO_NUMBER_RE = re.compile(
+    r"(?P<number>\d{1,3})\s*/\s*(?P<set_code>(?:SVP(?:\s*EN)?|SV-P|M-P|SM-P|S-P|XY-P|BW-P))\b",
+    re.IGNORECASE,
+)
+POKEMON_PREFIX_PROMO_NUMBER_RE = re.compile(
+    r"\b(?P<set_code>(?:SVP(?:\s*EN)?|SV-P|M-P|SM-P|S-P|XY-P|BW-P))\s*#?(?P<number>\d{1,3})\b",
+    re.IGNORECASE,
+)
 POKEMON_NOISY_NUMBER_RE = re.compile(
     r"(?<!\d)(?P<number>\d{1,3})\s*(?P<separator>[/\\|)\]}>-]?)\s*(?P<denominator>\d{2,3})(?!\d)(?:\s*[/\\|)\]}>-]?\s*(?P<rarity>[A-Z]{1,5}))?",
     re.IGNORECASE,
 )
 WS_NUMBER_RE = re.compile(r"(?P<number>[A-Z0-9]{2,6}/[A-Z0-9]{1,6}-\d{2,3}[A-Z]{0,4})", re.IGNORECASE)
-SET_CODE_RE = re.compile(r"\b(SVP|SV\d{1,2}[A-Z]?|M\d{1,2}[A-Z]?|SM\d{1,2}[A-Z]?|S\d{1,2}[A-Z]?|PJS|SMP|KMS)\b", re.IGNORECASE)
+SET_CODE_RE = re.compile(
+    r"\b(SVP(?:\s*EN)?|SV-P|MC(?:\s*JP)?|M-P|SM-P|S-P|XY-P|BW-P|SV\d{1,2}[A-Z]?|M\d{1,2}[A-Z]?|SM\d{1,2}[A-Z]?|S\d{1,2}[A-Z]?|PJS|SMP|KMS)\b",
+    re.IGNORECASE,
+)
 RARITY_RE = re.compile(
     r"\b(SSP|SEC\+|SEC|SAR|CSR|CHR|UR|SR|AR|RRR|RR|PR\+|PR|SP|OFR|SSP|SPM|SS|R|U|C|MA|MUR)\b",
     re.IGNORECASE,
 )
+POKEMON_SPECIAL_DENOMINATORS = {742}
+SLAB_RARITY_TOKENS = {
+    "BGS",
+    "BGS10",
+    "BGS95",
+    "BLACKLABEL",
+    "CGC",
+    "CGC10",
+    "CGC95",
+    "GEM",
+    "GEMMT",
+    "MINT",
+    "PRISTINE",
+    "PSA",
+    "PSA10",
+    "PSA9",
+}
+PROMO_SET_CODE_SUFFIXES = {
+    "bw-p": "BW-P",
+    "m-p": "M-P",
+    "s-p": "S-P",
+    "sm-p": "SM-P",
+    "svp": "SV-P",
+    "xy-p": "XY-P",
+}
 
 FULL_TEXT_RARITY_MAP = {
     "SPECIAL ART RARE": "SAR",
@@ -215,7 +251,7 @@ class TcgImagePriceService:
         if self._should_try_local_vision(parsed):
             vision_candidate, vision_warnings = self._run_local_vision_fallback(
                 resolved_path,
-                game_hint=resolved_game_hint,
+                game_hint=parsed.game or resolved_game_hint,
                 title_hint=resolved_title_hint,
             )
             warnings.extend(vision_warnings)
@@ -277,6 +313,7 @@ class TcgImagePriceService:
                 warnings.append(f"Local vision fallback via {client.descriptor} did not return a usable candidate.")
                 continue
 
+            candidate = _sanitize_local_vision_candidate(candidate)
             candidates.append(candidate)
             warnings.extend(candidate.warnings)
             if _local_vision_candidate_is_complete(candidate):
@@ -559,7 +596,7 @@ class TcgImagePriceService:
                 initial = TcgPriceService(db_path=self._db_path).lookup(direct_spec, persist=False)
                 if initial.offers:
                     inferred_spec = _infer_spec_from_offers(direct_spec, initial.offers)
-                    if inferred_spec is not None:
+                    if inferred_spec is not None and _inferred_spec_is_compatible_with_parsed(parsed, inferred_spec):
                         return inferred_spec
 
         candidate_title = (
@@ -575,6 +612,11 @@ class TcgImagePriceService:
             set_code=parsed.set_code,
             aliases=parsed.aliases,
         )
+        slab_number = _extract_slab_label_metadata(list(parsed.extracted_lines))[2]
+        if candidate_spec.game == "pokemon" and candidate_spec.card_number is None and slab_number is not None:
+            resolved_from_slab = _resolve_spec_from_slab_lookup_hints(candidate_spec, slab_number)
+            if resolved_from_slab is not None:
+                return resolved_from_slab
         return self._resolve_spec_from_lookup_hints(candidate_spec)
 
     def _resolve_spec_from_lookup_hints(self, spec: TcgCardSpec) -> TcgCardSpec | None:
@@ -648,6 +690,7 @@ def parse_tcg_ocr_text(
     lines = _split_ocr_lines(normalized_text)
     warnings: list[str] = []
     slab_title = _extract_slab_title(lines)
+    slab_set_code, slab_rarity, _ = _extract_slab_label_metadata(lines)
     english_name = _pick_best_title(lines, prefer_japanese=False)
     preferred_name = _pick_best_title(lines, prefer_japanese=True)
     title = (
@@ -659,9 +702,10 @@ def parse_tcg_ocr_text(
         title = title_hint
 
     card_number, number_rarity = _extract_card_number_and_rarity(lines)
-    rarity = number_rarity or _extract_rarity(normalized_text)
-    set_code = _extract_set_code(normalized_text)
     game = _detect_game(normalized_text, lines, game_hint=game_hint, card_number=card_number)
+    extracted_rarity = number_rarity or _extract_rarity(normalized_text)
+    rarity = _coalesce_rarity(game, extracted_rarity, slab_rarity)
+    set_code = _extract_set_code(normalized_text) or slab_set_code
 
     aliases = tuple(
         alias
@@ -716,6 +760,7 @@ def _resolve_tessdata_dir(configured_path: str | None) -> Path | None:
 
 
 def _extract_card_number_and_rarity(lines: list[str]) -> tuple[str | None, str | None]:
+    promo_candidates: list[tuple[str, str | None, int]] = []
     exact_candidates: list[tuple[str, str | None, int]] = []
     noisy_candidates: list[tuple[str, str | None, int]] = []
     for line in lines:
@@ -723,6 +768,7 @@ def _extract_card_number_and_rarity(lines: list[str]) -> tuple[str | None, str |
         if ws_match:
             return ws_match.group("number").upper(), None
 
+        promo_candidates.extend(_extract_pokemon_promo_candidates(line))
         for pokemon_match in POKEMON_NUMBER_RE.finditer(line.upper()):
             card_number, rarity = _normalize_pokemon_number_candidate(
                 pokemon_match.group("number"),
@@ -739,6 +785,9 @@ def _extract_card_number_and_rarity(lines: list[str]) -> tuple[str | None, str |
 
         noisy_candidates.extend(_extract_noisy_pokemon_candidates(line))
 
+    if promo_candidates:
+        card_number, rarity, _ = max(promo_candidates, key=lambda item: item[2])
+        return card_number, rarity
     if exact_candidates:
         card_number, rarity, _ = max(exact_candidates, key=lambda item: item[2])
         return card_number, rarity
@@ -763,7 +812,85 @@ def _extract_set_code(text: str) -> str | None:
     match = SET_CODE_RE.search(text.upper())
     if not match:
         return None
-    return match.group(1).lower()
+    return _canonicalize_pokemon_set_code(match.group(1))
+
+
+def _extract_slab_label_metadata(lines: list[str]) -> tuple[str | None, str | None, str | None]:
+    set_code = None
+    rarity = None
+    slab_number = None
+    for index, line in enumerate(lines):
+        upper_line = line.upper()
+        if set_code is None and index < 12:
+            set_code = _extract_slab_set_code(upper_line)
+        if rarity is None:
+            rarity = _extract_slab_label_rarity(upper_line)
+        if slab_number is None and index < 12:
+            match = re.search(r"#\s*(\d{1,3})\b", upper_line)
+            if match:
+                slab_number = str(int(match.group(1)))
+        if set_code is not None and rarity is not None and slab_number is not None:
+            break
+    return set_code, rarity, slab_number
+
+
+def _extract_slab_set_code(text: str) -> str | None:
+    compact_text = re.sub(r"\s+", "", unicodedata.normalize("NFKC", text.upper()))
+    match = re.search(r"POKEMON([A-Z0-9-]{1,6})JP\b", compact_text)
+    if not match:
+        return None
+    normalized_token = _normalize_slab_set_code_token(match.group(1))
+    return _canonicalize_pokemon_set_code(normalized_token)
+
+
+def _normalize_slab_set_code_token(value: str) -> str:
+    token = "".join(character for character in value.upper() if character.isalnum() or character == "-")
+    if not token:
+        return ""
+    if token.startswith("SV"):
+        suffix = token[2:].translate(str.maketrans({"O": "0", "Q": "0", "I": "1", "L": "1", "Z": "2", "S": "5"}))
+        return f"SV{suffix}"
+    if token.startswith("M"):
+        suffix = token[1:].translate(str.maketrans({"O": "0", "Q": "0", "I": "1", "L": "1", "Z": "2", "S": "5"}))
+        return f"M{suffix}"
+    return token
+
+
+def _extract_slab_label_rarity(text: str) -> str | None:
+    upper_text = unicodedata.normalize("NFKC", text.upper())
+    if "SPECIAL" in upper_text and any(token in upper_text for token in ("ART", "RARE", "AARE", "ATAARE")):
+        return "SAR"
+    if any(token in upper_text for token in ("ILLUSTRATION", "LLUSTRATION")) and any(
+        token in upper_text for token in ("RARE", "AARE")
+    ):
+        return "AR"
+    return None
+
+
+def _coalesce_rarity(game: str | None, extracted_rarity: str | None, slab_rarity: str | None) -> str | None:
+    if game == "pokemon" and slab_rarity is not None and extracted_rarity in {None, "SS"}:
+        return slab_rarity
+    return extracted_rarity or slab_rarity
+
+
+def _extract_pokemon_promo_candidates(line: str) -> list[tuple[str, str | None, int]]:
+    normalized_line = unicodedata.normalize("NFKC", line or "")
+    candidates: list[tuple[str, str | None, int]] = []
+    for pattern, bonus in (
+        (POKEMON_PROMO_NUMBER_RE, 24),
+        (POKEMON_PREFIX_PROMO_NUMBER_RE, 16),
+    ):
+        for match in pattern.finditer(normalized_line.upper()):
+            set_code = _canonicalize_pokemon_set_code(match.group("set_code"))
+            card_number = _build_pokemon_promo_card_number(match.group("number"), set_code)
+            if card_number is None:
+                continue
+            rarity = _extract_rarity(normalized_line)
+            score = 105 + bonus
+            if rarity is not None:
+                score += 6
+            candidates.append((card_number, rarity, score))
+    return candidates
 
 
 def _extract_noisy_pokemon_candidates(line: str) -> list[tuple[str, str | None, int]]:
@@ -815,11 +942,96 @@ def _normalize_pokemon_number_candidate(
         return None, None
 
     numerator, denominator = match.group("number").split("/", 1)
-    if int(denominator) > 300 and denominator.endswith("00"):
-        denominator = "100"
-    if int(denominator) > 300:
+    numerator_width = len(numerator)
+    denominator_width = len(denominator)
+    numerator_value = int(numerator)
+    denominator_value = int(denominator)
+    if numerator_value == 0 or denominator_value == 0:
         return None, None
-    return f"{int(numerator)}/{int(denominator)}", rarity.upper() if rarity else None
+    if denominator_value > 300 and denominator.endswith("00"):
+        denominator = "100"
+        denominator_value = 100
+    if denominator_value > 300 and denominator_value not in POKEMON_SPECIAL_DENOMINATORS:
+        return None, None
+    normalized_rarity = rarity.upper() if rarity and RARITY_RE.fullmatch(rarity.upper()) else None
+    return (
+        f"{numerator_value:0{numerator_width}d}/{denominator_value:0{len(denominator)}d}",
+        normalized_rarity,
+    )
+
+
+def _canonicalize_pokemon_set_code(value: str | None) -> str | None:
+    if value is None:
+        return None
+    collapsed = "".join(
+        character for character in unicodedata.normalize("NFKC", value).upper()
+        if character.isalnum() or character == "-"
+    )
+    if not collapsed:
+        return None
+    aliases = {
+        "BW-P": "bw-p",
+        "MC": "mc",
+        "MCJP": "mc",
+        "M-P": "m-p",
+        "S-P": "s-p",
+        "SM-P": "sm-p",
+        "SV-P": "svp",
+        "SVP": "svp",
+        "SVPEN": "svp",
+        "XY-P": "xy-p",
+    }
+    return aliases.get(collapsed, collapsed.lower())
+
+
+def _build_pokemon_promo_card_number(number: str, set_code: str | None) -> str | None:
+    if set_code is None:
+        return None
+    suffix = PROMO_SET_CODE_SUFFIXES.get(set_code)
+    if suffix is None:
+        return None
+    try:
+        value = int(number)
+    except ValueError:
+        return None
+    return f"{value:03d}/{suffix}"
+
+
+def _normalize_pokemon_card_number_value(value: str | None, *, set_code_hint: str | None = None) -> str | None:
+    normalized = unicodedata.normalize("NFKC", value or "").strip()
+    if not normalized:
+        return None
+
+    for pattern in (POKEMON_PROMO_NUMBER_RE, POKEMON_PREFIX_PROMO_NUMBER_RE):
+        match = pattern.search(normalized.upper())
+        if match:
+            card_number = _build_pokemon_promo_card_number(
+                match.group("number"),
+                _canonicalize_pokemon_set_code(match.group("set_code")),
+            )
+            if card_number is not None:
+                return card_number
+
+    collapsed = normalize_card_number(normalized).lstrip("#")
+    if not collapsed:
+        return None
+
+    if "/" in collapsed:
+        numerator, suffix = collapsed.split("/", 1)
+        promo_card_number = _build_pokemon_promo_card_number(numerator, _canonicalize_pokemon_set_code(suffix))
+        if promo_card_number is not None:
+            return promo_card_number
+        normalized_number, _ = _normalize_pokemon_number_candidate(collapsed, None)
+        if normalized_number is not None:
+            return normalized_number
+        return collapsed
+
+    if collapsed.isdigit():
+        promo_card_number = _build_pokemon_promo_card_number(collapsed, set_code_hint)
+        if promo_card_number is not None:
+            return promo_card_number
+        return str(int(collapsed))
+    return collapsed
 
 
 def _detect_game(
@@ -831,13 +1043,28 @@ def _detect_game(
 ) -> str | None:
     if game_hint in {"pokemon", "ws"}:
         return game_hint
-    if card_number and WS_NUMBER_RE.fullmatch(card_number):
-        return "ws"
     upper_text = text.upper()
-    if "POKEMON" in upper_text or any("/" in line and re.search(r"\d/\d", line) for line in lines):
-        return "pokemon"
-    if any(WS_NUMBER_RE.search(line) for line in lines):
+    has_ws_number = bool(card_number and WS_NUMBER_RE.fullmatch(card_number)) or any(WS_NUMBER_RE.search(line) for line in lines)
+    has_ws_keyword = any(token in upper_text for token in ("WEISS", "SCHWARZ", "WS/")) or any(
+        token in text for token in ("ヴァイス", "シュヴァルツ")
+    )
+    has_pokemon_keyword = "POKEMON" in upper_text or any(token in text for token in ("ポケモン", "ポケカ"))
+    has_complete_pokemon_number = bool(card_number and _pokemon_card_number_looks_complete(card_number))
+    has_pokemon_number_signal = any(
+        POKEMON_PROMO_NUMBER_RE.search(line) or POKEMON_NUMBER_RE.search(line) or POKEMON_NOISY_NUMBER_RE.search(line)
+        for line in lines
+    )
+
+    if has_ws_number or (has_ws_keyword and not has_pokemon_keyword):
         return "ws"
+    if has_pokemon_keyword:
+        return "pokemon"
+    if has_complete_pokemon_number and not has_ws_keyword:
+        return "pokemon"
+    if has_ws_keyword:
+        return "ws"
+    if has_pokemon_number_signal:
+        return "pokemon"
     return None
 
 
@@ -986,7 +1213,10 @@ def _title_looks_usable(value: str) -> bool:
 
 def _is_blocked_title_candidate_v2(value: str) -> bool:
     upper_value = value.upper()
+    normalized_value = value.strip()
     if any(pattern in upper_value for pattern in BLOCKED_NAME_PATTERNS):
+        return True
+    if normalized_value in {"ヴァイスシュヴァルツ", "ヴァイス", "ポケモンカード", "ポケモンカードゲーム", "Weiss Schwarz"}:
         return True
     if any(marker in value for marker in BLOCKED_JAPANESE_TEXT_MARKERS):
         return True
@@ -1011,6 +1241,23 @@ def _title_looks_usable_v2(value: str) -> bool:
     total = max(len(stripped), 1)
     if signal / total < 0.55:
         return False
+    if not _contains_japanese(stripped):
+        latin_words = re.findall(r"[A-Za-z']+", stripped)
+        if latin_words:
+            total_letters = sum(len(word) for word in latin_words)
+            vowel_count = sum(1 for word in latin_words for char in word.lower() if char in {"a", "e", "i", "o", "u"})
+            short_word_count = sum(1 for word in latin_words if len(word) <= 3)
+            if total_letters >= 6:
+                vowel_ratio = vowel_count / total_letters
+                if vowel_ratio > 0.72:
+                    return False
+            if len(latin_words) >= 4 and short_word_count >= len(latin_words) - 1:
+                return False
+            if len(latin_words) == 1 and "-" in stripped and not re.search(
+                r"\b(EX|GX|VMAX|VSTAR|LV\.?\d+)\b",
+                stripped.upper(),
+            ):
+                return False
     if sum(char in {"|", "\\", "="} for char in value) >= 2:
         return False
     if len(stripped) > 30:
@@ -1028,16 +1275,17 @@ def _merge_local_vision_candidate(
     parsed: ParsedCardImage,
     candidate: LocalVisionCardCandidate,
 ) -> ParsedCardImage:
+    candidate = _sanitize_local_vision_candidate(candidate)
+    metadata_compatible = _local_vision_metadata_is_compatible(parsed, candidate)
     aliases = _dedupe_preserve_order([*parsed.aliases, *candidate.aliases])
-    parsed_title_usable = bool(parsed.title and _title_looks_usable(parsed.title))
-    candidate_title_usable = bool(candidate.title and _title_looks_usable(candidate.title))
-
     title = parsed.title
-    if not parsed_title_usable and candidate_title_usable:
+    if metadata_compatible and _should_prefer_local_vision_title(parsed.title, candidate.title):
         title = candidate.title
     elif title is None and candidate.title is not None:
         title = candidate.title
 
+    parsed_title_usable = bool(parsed.title and _title_looks_usable(parsed.title))
+    candidate_title_usable = bool(candidate.title and _title_looks_usable(candidate.title))
     if parsed_title_usable and candidate_title_usable and normalize_text(parsed.title or "") != normalize_text(candidate.title or ""):
         if candidate.title not in aliases:
             aliases.append(candidate.title)
@@ -1045,17 +1293,34 @@ def _merge_local_vision_candidate(
         aliases.append(parsed.title)
 
     game = parsed.game or candidate.game
-    card_number = parsed.card_number or candidate.card_number
-    rarity = parsed.rarity or candidate.rarity
-    set_code = parsed.set_code or candidate.set_code
+    card_number = parsed.card_number
+    if metadata_compatible:
+        if _card_number_quality(game, candidate.card_number) > _card_number_quality(game, parsed.card_number):
+            card_number = candidate.card_number
+        elif card_number is None:
+            card_number = candidate.card_number
 
-    warnings = _dedupe_preserve_order(
-        [
-            *parsed.warnings,
-            *candidate.warnings,
-            f"Applied local vision fallback via {candidate.descriptor}.",
-        ]
-    )
+    rarity = parsed.rarity
+    if metadata_compatible:
+        if _rarity_quality(parsed.rarity) < _rarity_quality(candidate.rarity):
+            rarity = candidate.rarity
+        elif rarity is None:
+            rarity = candidate.rarity
+
+    set_code = parsed.set_code
+    if metadata_compatible:
+        if _set_code_quality(candidate.set_code) > _set_code_quality(parsed.set_code):
+            set_code = candidate.set_code
+        elif set_code is None:
+            set_code = candidate.set_code
+
+    applied_warning = f"Applied local vision fallback via {candidate.descriptor}."
+    if not metadata_compatible:
+        applied_warning = (
+            f"Applied local vision fallback via {candidate.descriptor}, "
+            "but ignored conflicting card metadata because the detected title did not line up."
+        )
+    warnings = _dedupe_preserve_order([*parsed.warnings, *candidate.warnings, applied_warning])
     status = "success" if game is not None and title is not None else "unresolved"
     return replace(
         parsed,
@@ -1096,13 +1361,13 @@ def _select_best_local_vision_candidate(
 
 
 def _local_vision_candidate_is_complete(candidate: LocalVisionCardCandidate) -> bool:
-    return (
-        candidate.game in {"pokemon", "ws"}
-        and candidate.card_number is not None
-        and candidate.title is not None
-        and _title_looks_usable(candidate.title)
-        and (candidate.rarity is not None or candidate.set_code is not None)
-    )
+    if candidate.game not in {"pokemon", "ws"}:
+        return False
+    if candidate.title is None or not _title_looks_usable(candidate.title):
+        return False
+    if candidate.game == "pokemon":
+        return _pokemon_card_number_looks_complete(candidate.card_number)
+    return bool(candidate.card_number and WS_NUMBER_RE.fullmatch(candidate.card_number))
 
 
 def _score_local_vision_candidate(candidate: LocalVisionCardCandidate) -> float:
@@ -1113,11 +1378,10 @@ def _score_local_vision_candidate(candidate: LocalVisionCardCandidate) -> float:
         score += 40.0
     elif candidate.title:
         score += 8.0
-    if candidate.card_number:
-        score += 35.0
-    if candidate.rarity:
+    score += _card_number_quality(candidate.game, candidate.card_number) * 10.0
+    if _rarity_quality(candidate.rarity) > 0:
         score += 10.0
-    if candidate.set_code:
+    if _set_code_quality(candidate.set_code) > 0:
         score += 8.0
     if candidate.title and _contains_japanese(candidate.title):
         score += 4.0
@@ -1145,7 +1409,7 @@ def _merge_local_vision_candidates(
 ) -> LocalVisionCardCandidate:
     aliases = _dedupe_preserve_order([*primary.aliases, *secondary.aliases])
     title = primary.title
-    if title is None or (secondary.title and _title_looks_usable(secondary.title) and not _title_looks_usable(title or "")):
+    if _should_prefer_local_vision_title(title, secondary.title):
         title = secondary.title
     elif title and secondary.title and normalize_text(title) != normalize_text(secondary.title):
         aliases.append(secondary.title)
@@ -1161,13 +1425,88 @@ def _merge_local_vision_candidates(
         game=primary.game or secondary.game,
         title=title,
         aliases=tuple(_dedupe_preserve_order(aliases)),
-        card_number=primary.card_number or secondary.card_number,
-        rarity=primary.rarity or secondary.rarity,
-        set_code=primary.set_code or secondary.set_code,
+        card_number=primary.card_number if _card_number_quality(primary.game, primary.card_number) >= _card_number_quality(primary.game, secondary.card_number) else secondary.card_number,
+        rarity=primary.rarity if _rarity_quality(primary.rarity) >= _rarity_quality(secondary.rarity) else secondary.rarity,
+        set_code=primary.set_code if _set_code_quality(primary.set_code) >= _set_code_quality(secondary.set_code) else secondary.set_code,
         confidence=confidence,
         raw_response=primary.raw_response or secondary.raw_response,
         warnings=tuple(warnings),
     )
+
+
+def _sanitize_local_vision_candidate(candidate: LocalVisionCardCandidate) -> LocalVisionCardCandidate:
+    if candidate.game != "pokemon":
+        return candidate
+    set_code = _canonicalize_pokemon_set_code(candidate.set_code)
+    card_number = _normalize_pokemon_card_number_value(candidate.card_number, set_code_hint=set_code)
+    rarity = candidate.rarity.upper() if candidate.rarity else None
+    if rarity in SLAB_RARITY_TOKENS:
+        rarity = None
+    if card_number and "/742" in card_number:
+        rarity = None
+    if card_number and _pokemon_card_number_looks_complete(card_number) and any(card_number.endswith(f"/{suffix}") for suffix in PROMO_SET_CODE_SUFFIXES.values()):
+        rarity = None if rarity in {"P", "PROMO"} else rarity
+    return replace(
+        candidate,
+        card_number=card_number,
+        rarity=rarity,
+        set_code=set_code,
+    )
+
+
+def _pokemon_card_number_looks_complete(card_number: str | None) -> bool:
+    normalized = _normalize_pokemon_card_number_value(card_number)
+    if normalized is None or "/" not in normalized:
+        return False
+    numerator, suffix = normalized.split("/", 1)
+    if not numerator.isdigit():
+        return False
+    if suffix.isdigit():
+        return _normalize_pokemon_number_candidate(normalized, None)[0] is not None
+    return any(normalized.endswith(f"/{promo_suffix}") for promo_suffix in PROMO_SET_CODE_SUFFIXES.values())
+
+
+def _card_number_quality(game: str | None, card_number: str | None) -> int:
+    if not card_number:
+        return 0
+    normalized = normalize_card_number(card_number)
+    if game == "pokemon":
+        if _pokemon_card_number_looks_complete(normalized):
+            return 4
+        if "/" in normalized:
+            return 2
+        if normalized.isdigit():
+            return 1
+        return 1
+    if game == "ws":
+        return 4 if WS_NUMBER_RE.fullmatch(normalized) else 1
+    return 1
+
+
+def _rarity_quality(rarity: str | None) -> int:
+    if rarity is None:
+        return 0
+    return 0 if rarity.upper() in SLAB_RARITY_TOKENS else 2
+
+
+def _set_code_quality(set_code: str | None) -> int:
+    if not set_code:
+        return 0
+    return 2 if len(set_code) <= 6 else 1
+
+
+def _should_prefer_local_vision_title(parsed_title: str | None, candidate_title: str | None) -> bool:
+    if candidate_title is None or not _title_looks_usable(candidate_title):
+        return False
+    if parsed_title is None or not _title_looks_usable(parsed_title):
+        return True
+    parsed_score = _score_title_candidate(parsed_title)
+    candidate_score = _score_title_candidate(candidate_title)
+    if candidate_score >= parsed_score + 8:
+        return True
+    if _contains_japanese(candidate_title) and not _contains_japanese(parsed_title) and candidate_score >= parsed_score:
+        return True
+    return False
 
 
 def _merge_path_title_hint(parsed: ParsedCardImage, path_title_hint: str) -> ParsedCardImage:
@@ -1218,6 +1557,77 @@ def _dedupe_preserve_order(values: list[str]) -> list[str]:
         if value and value not in deduped:
             deduped.append(value)
     return deduped
+
+
+def _local_vision_metadata_is_compatible(
+    parsed: ParsedCardImage,
+    candidate: LocalVisionCardCandidate,
+) -> bool:
+    if not (parsed.title and _title_looks_usable(parsed.title)):
+        return True
+    if not (candidate.title and _title_looks_usable(candidate.title)):
+        return True
+
+    parsed_name = normalize_text(parsed.title)
+    candidate_name = normalize_text(candidate.title)
+    if not parsed_name or not candidate_name:
+        return True
+    return (
+        parsed_name == candidate_name
+        or parsed_name in candidate_name
+        or candidate_name in parsed_name
+    )
+
+
+def _resolve_spec_from_slab_lookup_hints(spec: TcgCardSpec, slab_number: str) -> TcgCardSpec | None:
+    try:
+        hints = TcgHotCardService().search_lookup_hints(spec, limit=5)
+    except Exception:
+        logger.exception("Image lookup slab hint resolution failed title=%s", spec.title)
+        return None
+
+    matches = [
+        hint
+        for hint in hints
+        if _lookup_hint_matches_slab_number(hint, slab_number) and _lookup_hint_matches_spec_metadata(spec, hint)
+    ]
+    if not matches:
+        return None
+
+    best_hint = max(
+        matches,
+        key=lambda hint: (
+            hint.confidence,
+            bool(hint.card_number),
+            bool(hint.rarity),
+            bool(hint.set_code),
+        ),
+    )
+    return replace(
+        spec,
+        title=best_hint.title,
+        card_number=best_hint.card_number or spec.card_number,
+        rarity=best_hint.rarity or spec.rarity,
+        set_code=best_hint.set_code or spec.set_code,
+    )
+
+
+def _lookup_hint_matches_slab_number(hint, slab_number: str) -> bool:
+    card_number = normalize_card_number(hint.card_number or "")
+    if "/" not in card_number:
+        return False
+    numerator, _ = card_number.split("/", 1)
+    if not numerator.isdigit():
+        return False
+    return int(numerator) == int(slab_number)
+
+
+def _lookup_hint_matches_spec_metadata(spec: TcgCardSpec, hint) -> bool:
+    if spec.set_code and hint.set_code and normalize_text(spec.set_code) != normalize_text(hint.set_code):
+        return False
+    if spec.rarity and hint.rarity and normalize_text(spec.rarity) != normalize_text(hint.rarity):
+        return False
+    return True
 
 
 def _parsed_matches_spec(parsed: ParsedCardImage, spec: TcgCardSpec) -> bool:
@@ -1292,11 +1702,17 @@ def _infer_spec_from_offers(base_spec: TcgCardSpec, offers: tuple[MarketOffer, .
     )
 
 
+def _inferred_spec_is_compatible_with_parsed(parsed: ParsedCardImage, inferred_spec: TcgCardSpec) -> bool:
+    if parsed.game and inferred_spec.game and parsed.game != inferred_spec.game:
+        return False
+    return True
+
+
 def _infer_title_from_offers(offers: tuple[MarketOffer, ...] | list[MarketOffer]) -> str | None:
     scored_titles: dict[str, tuple[str, int, float]] = {}
     for offer in offers:
         title = offer.title.strip()
-        if not title or not _title_looks_usable(title):
+        if not title or not _offer_title_looks_usable(title):
             continue
         key = normalize_text(title)
         display_title, count, score_total = scored_titles.get(key, (title, 0, 0.0))
@@ -1315,6 +1731,26 @@ def _infer_title_from_offers(offers: tuple[MarketOffer, ...] | list[MarketOffer]
         key=lambda item: (item[1], item[2], -len(item[0])),
     )
     return best_title
+
+
+def _offer_title_looks_usable(value: str) -> bool:
+    if _title_looks_usable(value):
+        return True
+    stripped = value.strip()
+    if len(stripped) < 4 or len(stripped) > 72:
+        return False
+    if _is_blocked_title_candidate(value):
+        return False
+    signal = sum(
+        1
+        for char in value
+        if char.isalpha() or "\u3040" <= char <= "\u30ff" or "\u4e00" <= char <= "\u9fff"
+    )
+    if signal / max(len(stripped), 1) < 0.5:
+        return False
+    if sum(char in {"|", "\\", "="} for char in value) >= 2:
+        return False
+    return True
 
 
 def _secondary_offer_titles(

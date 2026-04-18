@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from market_monitor.models import MarketOffer
 from market_monitor.normalize import normalize_card_number, normalize_text
 
@@ -37,7 +39,7 @@ def score_tcg_offer(spec: TcgCardSpec, offer: MarketOffer) -> float:
 
     offer_number = normalize_card_number(offer.attributes.get("card_number", ""))
     if spec.card_number:
-        if offer_number == spec.normalized_card_number:
+        if _card_numbers_match(spec.normalized_card_number, offer_number):
             score += 40
         else:
             score -= 30
@@ -65,3 +67,20 @@ def score_tcg_offer(spec: TcgCardSpec, offer: MarketOffer) -> float:
             score += 8
 
     return score
+
+
+def _card_numbers_match(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    return _normalize_simple_pokemon_number(left) == _normalize_simple_pokemon_number(right) != ""
+
+
+def _normalize_simple_pokemon_number(value: str) -> str:
+    match = re.fullmatch(r"(?P<numerator>\d{1,3})/(?P<denominator>\d{1,3})", value)
+    if match is None:
+        return ""
+    numerator = int(match.group("numerator"))
+    denominator = int(match.group("denominator"))
+    if numerator <= 0 or denominator <= 0:
+        return ""
+    return f"{numerator}/{denominator}"

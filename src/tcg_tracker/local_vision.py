@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -117,8 +118,15 @@ class OllamaLocalVisionClient:
         hint_text = "\n".join(hints) if hints else "no external hints"
         return (
             "Identify the trading card in this image and return only JSON.\n"
+            "If the image does not show exactly one identifiable trading card, return null for every card field instead of guessing.\n"
             "Focus on the card name, game, card number, rarity, and set code.\n"
-            "Ignore slab grades, copyright lines, attack text, and rule text.\n"
+            "Do not merge multiple cards from the same photo into one answer.\n"
+            "Prefer the printed card face and footer over slab labels whenever they disagree.\n"
+            "Ignore slab grades, cert numbers, copyright lines, attack text, and rule text.\n"
+            "Never use slab grade text as the card rarity.\n"
+            "Pokemon collector numbers should stay in full market-friendly form when visible, such as 201/165, 020/M-P, 085/SV-P, or 764/742.\n"
+            "If a Pokemon promo card shows a set code and number separately, combine them into one card_number field like 085/SV-P.\n"
+            "For Japanese Start Deck 100 Battle Collection slab labels such as MC JP #764, return 764/742 when the image supports that collector number.\n"
             'Use game values "pokemon", "ws", or null.\n'
             "Preserve the Japanese title when visible.\n"
             "Use null for unknown values instead of guessing.\n"
@@ -129,23 +137,35 @@ class OllamaLocalVisionClient:
 
     def _post_generate(self, payload: dict[str, object]) -> str:
         target = _resolve_generate_url(self.endpoint)
-        request = Request(
-            target,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-            method="POST",
-        )
-        logger.debug("Local vision request target=%s model=%s", target, self.model)
-        try:
-            with urlopen(request, timeout=self.timeout_seconds, context=self._ssl_context) as response:
-                body = response.read().decode("utf-8", errors="replace")
-        except HTTPError as exc:
-            raise RuntimeError(f"Ollama request failed with status {exc.code}.") from exc
-        except URLError as exc:
-            raise RuntimeError(f"Ollama request failed: {exc.reason}.") from exc
+        body = None
+        for attempt in range(2):
+            request = Request(
+                target,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                method="POST",
+            )
+            logger.debug("Local vision request target=%s model=%s attempt=%s", target, self.model, attempt + 1)
+            try:
+                with urlopen(request, timeout=self.timeout_seconds, context=self._ssl_context) as response:
+                    body = response.read().decode("utf-8", errors="replace")
+                break
+            except HTTPError as exc:
+                if exc.code >= 500 and attempt == 0:
+                    time.sleep(1)
+                    continue
+                raise RuntimeError(f"Ollama request failed with status {exc.code}.") from exc
+            except URLError as exc:
+                if attempt == 0:
+                    time.sleep(1)
+                    continue
+                raise RuntimeError(f"Ollama request failed: {exc.reason}.") from exc
+
+        if body is None:
+            raise RuntimeError(f"Ollama request failed without a response body for {self.descriptor}.")
 
         payload = json.loads(body)
         response_text = payload.get("response", "")
