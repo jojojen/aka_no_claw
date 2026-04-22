@@ -12,6 +12,7 @@ from tcg_tracker.service import TcgLookupResult
 from tests.image_lookup_case_fixtures import get_image_lookup_live_case
 
 from openclaw_adapter.formatters import format_lookup_result_telegram
+from openclaw_adapter.natural_language import TelegramNaturalLanguageIntent
 from openclaw_adapter.telegram_bot import (
     TelegramCommandProcessor,
     TelegramLookupQuery,
@@ -76,6 +77,16 @@ class FakeTelegramClient:
         assert self.sample_path is not None
         assert file_path == self.sample_path.name
         return self.sample_path.read_bytes()
+
+
+class StubNaturalLanguageRouter:
+    def __init__(self, intent: TelegramNaturalLanguageIntent | None) -> None:
+        self.intent = intent
+        self.seen_texts: list[str] = []
+
+    def route(self, text: str) -> TelegramNaturalLanguageIntent | None:
+        self.seen_texts.append(text)
+        return self.intent
 
 
 def test_parse_lookup_command_supports_pipe_format() -> None:
@@ -147,6 +158,57 @@ def test_command_processor_help_lists_trend_and_scan_commands() -> None:
     assert "/trend pokemon" in help_reply
     assert "/price pokemon | Pikachu ex | 132/106 | SAR | sv08" in help_reply
     assert "Send a photo with caption: /scan pokemon" in help_reply
+
+
+def test_command_processor_handles_natural_language_lookup_via_router() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    router = StubNaturalLanguageRouter(
+        TelegramNaturalLanguageIntent(
+            intent="lookup_card",
+            game="pokemon",
+            name="Pikachu ex",
+            card_number="132/106",
+            rarity="SAR",
+            set_code="sv08",
+            confidence=0.98,
+        )
+    )
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: f"{query.game}:{query.name}:{query.card_number}:{query.rarity}:{query.set_code}",
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        natural_language_router=router,
+    )
+
+    reply = processor.build_reply(chat_id="123", text="幫我查 pokemon Pikachu ex 132/106 SAR sv08")
+
+    assert reply == "pokemon:Pikachu ex:132/106:SAR:sv08"
+    assert router.seen_texts == ["幫我查 pokemon Pikachu ex 132/106 SAR sv08"]
+
+
+def test_command_processor_handles_natural_language_trend_via_router() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    router = StubNaturalLanguageRouter(
+        TelegramNaturalLanguageIntent(
+            intent="trend_board",
+            game="pokemon",
+            limit=3,
+            confidence=0.91,
+        )
+    )
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        natural_language_router=router,
+    )
+
+    reply = processor.build_reply(chat_id="123", text="pokemon 熱門前 3")
+
+    assert "Pokemon Liquidity Board" in reply
+    assert router.seen_texts == ["pokemon 熱門前 3"]
 
 
 def test_build_processing_ack_for_heavy_actions() -> None:

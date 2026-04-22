@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from assistant_runtime.logging_utils import configure_logging
+from assistant_runtime.logging_utils import configure_logging, mask_identifier
 from assistant_runtime.settings import AssistantSettings, get_settings, load_dotenv
 
 
@@ -62,6 +62,24 @@ def test_configure_logging_creates_log_file(tmp_path) -> None:
     assert "logging smoke test" in log_path.read_text(encoding="utf-8")
 
 
+def test_mask_identifier_stays_masked_when_log_level_is_not_debug(tmp_path) -> None:
+    log_path = tmp_path / "logs" / "openclaw-info.log"
+    settings = AssistantSettings(log_file_path=str(log_path), log_level="INFO")
+
+    configure_logging(settings)
+
+    assert mask_identifier("-5123480") == "-5***80"
+
+
+def test_mask_identifier_is_unmasked_when_log_level_is_debug(tmp_path) -> None:
+    log_path = tmp_path / "logs" / "openclaw-debug.log"
+    settings = AssistantSettings(log_file_path=str(log_path), log_level="DEBUG")
+
+    configure_logging(settings)
+
+    assert mask_identifier("-5123480") == "-5123480"
+
+
 def test_get_settings_reads_local_vision_environment_keys(monkeypatch) -> None:
     monkeypatch.setenv("OPENCLAW_LOCAL_VISION_BACKEND", "ollama")
     monkeypatch.setenv("OPENCLAW_LOCAL_VISION_ENDPOINT", "http://127.0.0.1:11434")
@@ -74,3 +92,17 @@ def test_get_settings_reads_local_vision_environment_keys(monkeypatch) -> None:
     assert settings.openclaw_local_vision_endpoint == "http://127.0.0.1:11434"
     assert settings.openclaw_local_vision_model == "qwen2.5vl:3b"
     assert settings.openclaw_local_vision_timeout_seconds == 120
+
+
+def test_get_settings_reads_local_text_router_environment_keys(monkeypatch) -> None:
+    monkeypatch.setenv("OPENCLAW_LOCAL_TEXT_BACKEND", "ollama")
+    monkeypatch.setenv("OPENCLAW_LOCAL_TEXT_ENDPOINT", "http://127.0.0.1:11434")
+    monkeypatch.setenv("OPENCLAW_LOCAL_TEXT_MODEL", "gemma3:4b")
+    monkeypatch.setenv("OPENCLAW_LOCAL_TEXT_TIMEOUT_SECONDS", "30")
+
+    settings = get_settings()
+
+    assert settings.openclaw_local_text_backend == "ollama"
+    assert settings.openclaw_local_text_endpoint == "http://127.0.0.1:11434"
+    assert settings.openclaw_local_text_model == "gemma3:4b"
+    assert settings.openclaw_local_text_timeout_seconds == 30

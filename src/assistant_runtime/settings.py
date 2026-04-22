@@ -19,6 +19,10 @@ class AssistantSettings:
     openclaw_local_vision_endpoint: str = "http://127.0.0.1:11434"
     openclaw_local_vision_model: str | None = None
     openclaw_local_vision_timeout_seconds: int = 180
+    openclaw_local_text_backend: str | None = None
+    openclaw_local_text_endpoint: str = "http://127.0.0.1:11434"
+    openclaw_local_text_model: str | None = None
+    openclaw_local_text_timeout_seconds: int = 45
     openclaw_ca_bundle_path: str | None = None
     openclaw_tls_insecure_skip_verify: bool = False
     reputation_agent_server_url: str = "https://reputation-snapshot.fly.dev"
@@ -69,6 +73,13 @@ def get_settings() -> AssistantSettings:
         openclaw_local_vision_timeout_seconds=_as_int(
             os.getenv("OPENCLAW_LOCAL_VISION_TIMEOUT_SECONDS"),
             default=180,
+        ),
+        openclaw_local_text_backend=_none_if_empty(os.getenv("OPENCLAW_LOCAL_TEXT_BACKEND")),
+        openclaw_local_text_endpoint=os.getenv("OPENCLAW_LOCAL_TEXT_ENDPOINT", "http://127.0.0.1:11434"),
+        openclaw_local_text_model=_none_if_empty(os.getenv("OPENCLAW_LOCAL_TEXT_MODEL")),
+        openclaw_local_text_timeout_seconds=_as_int(
+            os.getenv("OPENCLAW_LOCAL_TEXT_TIMEOUT_SECONDS"),
+            default=45,
         ),
         openclaw_ca_bundle_path=_none_if_empty(os.getenv("OPENCLAW_CA_BUNDLE_PATH")),
         openclaw_tls_insecure_skip_verify=_as_bool(os.getenv("OPENCLAW_TLS_INSECURE_SKIP_VERIFY")),

@@ -6,10 +6,11 @@ from pathlib import Path
 from .settings import AssistantSettings
 
 _CONFIGURED_LOG_PATH: str | None = None
+_MASK_IDENTIFIERS_IN_LOGS = True
 
 
 def configure_logging(settings: AssistantSettings) -> None:
-    global _CONFIGURED_LOG_PATH
+    global _CONFIGURED_LOG_PATH, _MASK_IDENTIFIERS_IN_LOGS
 
     target_log_path = str(Path(settings.log_file_path))
     if _CONFIGURED_LOG_PATH == target_log_path:
@@ -38,12 +39,15 @@ def configure_logging(settings: AssistantSettings) -> None:
     root_logger.addHandler(console_handler)
     root_logger.addHandler(file_handler)
     _CONFIGURED_LOG_PATH = target_log_path
+    _MASK_IDENTIFIERS_IN_LOGS = settings.log_level.strip().upper() != "DEBUG"
 
 
 def mask_identifier(value: str | int | None) -> str:
     if value is None:
         return "n/a"
     text = str(value)
+    if not _MASK_IDENTIFIERS_IN_LOGS:
+        return text
     if len(text) <= 4:
         return "*" * len(text)
     return f"{text[:2]}***{text[-2:]}"

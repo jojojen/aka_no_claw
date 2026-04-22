@@ -20,6 +20,12 @@ from tcg_tracker.image_lookup import TcgImageLookupOutcome, TcgImagePriceService
 
 from .commands import lookup_card
 from .formatters import format_jpy, format_lookup_result_telegram
+from .natural_language import (
+    TelegramNaturalLanguageIntent,
+    TelegramNaturalLanguageRouter,
+    build_telegram_natural_language_router,
+    fallback_route_telegram_natural_language,
+)
 
 LookupRenderer = Callable[["TelegramLookupQuery"], str]
 PhotoLookupRenderer = Callable[["TelegramPhotoQuery"], str]
@@ -134,11 +140,13 @@ class TelegramCommandProcessor:
         lookup_renderer: LookupRenderer,
         board_loader: BoardLoader,
         catalog_renderer: CatalogRenderer,
+        natural_language_router: TelegramNaturalLanguageRouter | None = None,
     ) -> None:
         self._settings = settings
         self._lookup_renderer = lookup_renderer
         self._board_loader = board_loader
         self._catalog_renderer = catalog_renderer
+        self._natural_language_router = natural_language_router
 
     def is_allowed_chat(self, chat_id: str | int) -> bool:
         allowed_chat_id = self._settings.openclaw_telegram_chat_id
@@ -180,9 +188,13 @@ class TelegramCommandProcessor:
             return self._handle_liquidity(remainder)
         if command in PHOTO_SCAN_COMMANDS:
             return "Send a card photo with the caption /scan pokemon or /scan ws, and I will parse it and then look up the price."
+        if not content.startswith("/"):
+            natural_language_reply = self._handle_natural_language(content)
+            if natural_language_reply is not None:
+                return natural_language_reply
 
         logger.info("Telegram unknown command command=%s", command)
-        return "Unknown command. Use /help, /price, /trend, or send a photo with /scan."
+        return "Unknown command. Use /help, /price, /trend, or send a photo with /scan. You can also ask in natural language."
 
     def _handle_lookup(self, raw: str) -> str:
         try:
@@ -230,6 +242,75 @@ class TelegramCommandProcessor:
         logger.info("Telegram liquidity board loaded game=%s limit=%s items=%s", game, limit, len(board.items))
         return format_liquidity_board(board, limit=limit)
 
+    def _handle_natural_language(self, text: str) -> str | None:
+        intent = self._route_natural_language(text)
+        if intent is None:
+            return None
+        if intent.intent == "help":
+            logger.info("Telegram natural-language routed intent=help")
+            return self._help_text()
+        if intent.intent == "trend_board":
+            if intent.game not in {"pokemon", "ws"}:
+                return "I understood that you want the hot board, but I still need the game: pokemon or ws."
+            limit = 5 if intent.limit is None else max(1, min(10, intent.limit))
+            logger.info(
+                "Telegram natural-language routed intent=trend_board game=%s limit=%s confidence=%s",
+                intent.game,
+                limit,
+                intent.confidence,
+            )
+            return self._handle_liquidity(f"{intent.game} {limit}")
+        if intent.intent == "lookup_card":
+            if intent.game not in {"pokemon", "ws"}:
+                return "I understood that you want a card lookup, but I still need the game: pokemon or ws."
+            resolved_name = intent.name or intent.card_number
+            if not resolved_name:
+                return "I understood that you want a card lookup, but I still need the card name."
+            query = TelegramLookupQuery(
+                game=intent.game,
+                name=resolved_name,
+                card_number=intent.card_number,
+                rarity=intent.rarity,
+                set_code=intent.set_code,
+            )
+            logger.info(
+                "Telegram natural-language routed intent=lookup_card game=%s name=%s card_number=%s rarity=%s set_code=%s confidence=%s",
+                query.game,
+                query.name,
+                query.card_number,
+                query.rarity,
+                query.set_code,
+                intent.confidence,
+            )
+            try:
+                return self._lookup_renderer(query)
+            except Exception as exc:  # pragma: no cover - source/network-dependent.
+                logger.exception("Telegram natural-language lookup failed game=%s name=%s", query.game, query.name)
+                return f"Lookup failed: {exc}"
+        return None
+
+    def _route_natural_language(self, text: str) -> TelegramNaturalLanguageIntent | None:
+        if self._natural_language_router is not None:
+            try:
+                intent = self._natural_language_router.route(text)
+            except Exception:
+                logger.exception("Telegram natural-language router failed text=%s", trim_for_log(text, limit=240))
+            else:
+                if intent is not None and intent.intent != "unknown":
+                    return intent
+        fallback_intent = fallback_route_telegram_natural_language(text)
+        if fallback_intent is not None and fallback_intent.intent != "unknown":
+            logger.info(
+                "Telegram natural-language fallback intent=%s game=%s name=%s limit=%s confidence=%s",
+                fallback_intent.intent,
+                fallback_intent.game,
+                fallback_intent.name,
+                fallback_intent.limit,
+                fallback_intent.confidence,
+            )
+            return fallback_intent
+        return None
+
     def _status_text(self) -> str:
         allowed_chat = self._settings.openclaw_telegram_chat_id or "not restricted"
         tesseract = self._settings.openclaw_tesseract_path or "PATH lookup"
@@ -260,6 +341,8 @@ class TelegramCommandProcessor:
                 "/hot pokemon",
                 "/liquidity ws 5",
                 "Send a photo with caption: /scan pokemon",
+                "You can also ask things like: 幫我查 pokemon Pikachu ex 132/106",
+                "Or: pokemon 熱門前 5",
             ]
         )
 
@@ -471,6 +554,7 @@ def run_telegram_polling(
         lookup_renderer=lookup_renderer,
         board_loader=board_loader,
         catalog_renderer=catalog_renderer,
+        natural_language_router=build_telegram_natural_language_router(settings),
     )
     resolved_photo_renderer = photo_renderer or default_photo_renderer(settings)
 
