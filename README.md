@@ -212,6 +212,71 @@ OPENCLAW_TELEGRAM_BOT_TOKEN=你的新token
 - 不要把真實 token 放進 `.env.example`。
 - 這個專案會讀 `.env`，不是 `.env.example`。
 
+## Reputation Snapshot Agent
+
+`reputation_snapshot` 的輪詢爬蟲 agent 已整合進 OpenClaw。啟動 claw 時加上 `--with-reputation-agent` 旗標，就會自動在背景帶起這個 agent，不需要分開跑兩個終端機。
+
+### 前置設定
+
+在 `.env` 補上：
+
+```dotenv
+REPUTATION_AGENT_SERVER_URL=https://reputation-snapshot.fly.dev
+REPUTATION_AGENT_ADMIN_TOKEN=你的ADMIN_TOKEN
+REPUTATION_AGENT_POLL_SECS=5
+```
+
+`REPUTATION_AGENT_ADMIN_TOKEN` 必須和 `reputation-snapshot` server 的 `ADMIN_TOKEN` 一致。
+
+確認 `playwright` 已安裝（如果你還沒裝過）：
+
+```powershell
+pip install playwright
+playwright install chromium
+```
+
+### 伴隨 Telegram bot 一起啟動
+
+```powershell
+.\start-telegram-bot.bat --notify-startup --with-reputation-agent
+```
+
+或：
+
+```powershell
+python -m openclaw_adapter telegram-poll --notify-startup --with-reputation-agent
+```
+
+### 伴隨 Dashboard 一起啟動
+
+```powershell
+.\start-dashboard.bat --with-reputation-agent
+```
+
+或：
+
+```powershell
+python -m openclaw_adapter serve-dashboard --open-browser --with-reputation-agent
+```
+
+### 只跑 agent（不啟動 Telegram / Dashboard）
+
+```powershell
+python -m openclaw_adapter reputation-agent
+```
+
+可覆寫 server URL 或 token（無需改 `.env`）：
+
+```powershell
+python -m openclaw_adapter reputation-agent --server-url http://localhost:5000 --token my_token
+```
+
+### 注意事項
+
+- Agent 以 daemon thread 跑在背景，主進程（Telegram bot 或 dashboard）結束時 agent 也一起停掉。
+- 如果 `REPUTATION_AGENT_ADMIN_TOKEN` 未設定，claw 仍會正常啟動，只會在 console 印出警告，不會中斷。
+- `reputation_snapshot/agent_local.py` 保留原樣，`reputation_snapshot` 仍可獨立運作。
+
 查卡價：
 
 ```powershell

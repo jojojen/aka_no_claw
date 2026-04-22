@@ -5,6 +5,7 @@ import logging
 import math
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Iterable
@@ -192,10 +193,10 @@ class TcgHotCardService:
         self._buy_signal_cache: dict[str, tuple[float, HotCardBuySignal | None]] = {}
 
     def load_boards(self, *, limit: int = DEFAULT_BOARD_LIMIT) -> tuple[HotCardBoard, ...]:
-        return (
-            self.load_pokemon_board(limit=limit),
-            self.load_ws_board(limit=limit),
-        )
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            pokemon_future = executor.submit(self.load_pokemon_board, limit=limit)
+            ws_future = executor.submit(self.load_ws_board, limit=limit)
+            return (pokemon_future.result(), ws_future.result())
 
     def load_pokemon_board(self, *, limit: int = DEFAULT_BOARD_LIMIT) -> HotCardBoard:
         parsed_items, methodology = self._load_pokemon_board_items()
@@ -364,12 +365,20 @@ class TcgHotCardService:
         )
         candidate_limit = min(len(ranked), max(limit + 2, BUY_SIGNAL_CANDIDATE_LIMIT))
         ranked = ranked[:candidate_limit]
-        for aggregate in ranked:
+
+        def _fetch_buy_signal(aggregate: dict[str, object]) -> None:
             best_item: _ParsedHotItem = aggregate["best_item"]  # type: ignore[assignment]
-            aggregate["buy_signal"] = self._lookup_buy_signal(
-                self._spec_from_hot_item(game=game, item=best_item),
-                reference_ask_jpy=best_item.price_jpy,
-            )
+            try:
+                aggregate["buy_signal"] = self._lookup_buy_signal(
+                    self._spec_from_hot_item(game=game, item=best_item),
+                    reference_ask_jpy=best_item.price_jpy,
+                )
+            except Exception as exc:
+                logger.warning("Buy signal parallel lookup failed title=%s error=%s", best_item.title, exc)
+                aggregate["buy_signal"] = None
+
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            list(executor.map(_fetch_buy_signal, ranked))
 
         ranked = [
             aggregate
@@ -555,36 +564,50 @@ class TcgHotCardService:
                 "Signal source: SNKRDUNK SA-category transaction ranking.",
             ),
         )
-        for board_url, source_label, max_rank, source_weight, note in pokemon_trend_sources:
+
+        def _fetch_snkrdunk(args: tuple[str, str, int, float, str]) -> list[_ParsedHotItem]:
+            board_url, source_label, max_rank, source_weight, note = args
             try:
                 html = self.http_client.get_text(board_url)
-                parsed_items.extend(
-                    self._parse_snkrdunk_ranking_items(
-                        html,
-                        board_url=board_url,
-                        source_label=source_label,
-                        max_rank=max_rank,
-                        source_weight=source_weight,
-                        note=note,
-                    )
+                return self._parse_snkrdunk_ranking_items(
+                    html,
+                    board_url=board_url,
+                    source_label=source_label,
+                    max_rank=max_rank,
+                    source_weight=source_weight,
+                    note=note,
                 )
             except Exception as exc:  # pragma: no cover - network-dependent.
                 logger.warning("Pokemon trend source failed url=%s error=%s", board_url, exc)
+                return []
 
-        try:
-            html = self.http_client.get_text(
-                CARDRUSH_POKEMON_RANKING_URL,
-                headers=CARDRUSH_BROWSER_HEADERS,
-            )
-            parsed_items.extend(self._parse_cardrush_pokemon_items(html))
-        except Exception as exc:  # pragma: no cover - network-dependent.
-            logger.warning("Cardrush Pokemon ranking failed; continuing without it. error=%s", exc)
+        def _fetch_cardrush() -> list[_ParsedHotItem]:
+            try:
+                html = self.http_client.get_text(
+                    CARDRUSH_POKEMON_RANKING_URL,
+                    headers=CARDRUSH_BROWSER_HEADERS,
+                )
+                return self._parse_cardrush_pokemon_items(html)
+            except Exception as exc:  # pragma: no cover - network-dependent.
+                logger.warning("Cardrush Pokemon ranking failed; continuing without it. error=%s", exc)
+                return []
 
-        try:
-            html = self.http_client.get_text(MAGI_POKEMON_LIST_URL)
-            parsed_items.extend(self._parse_magi_pokemon_items(html))
-        except Exception as exc:  # pragma: no cover - network-dependent.
-            logger.warning("Magi Pokemon listing page failed; continuing without it. error=%s", exc)
+        def _fetch_magi_pokemon() -> list[_ParsedHotItem]:
+            try:
+                html = self.http_client.get_text(MAGI_POKEMON_LIST_URL)
+                return self._parse_magi_pokemon_items(html)
+            except Exception as exc:  # pragma: no cover - network-dependent.
+                logger.warning("Magi Pokemon listing page failed; continuing without it. error=%s", exc)
+                return []
+
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            snkrdunk_futures = [executor.submit(_fetch_snkrdunk, args) for args in pokemon_trend_sources]
+            cardrush_future = executor.submit(_fetch_cardrush)
+            magi_future = executor.submit(_fetch_magi_pokemon)
+            for future in snkrdunk_futures:
+                parsed_items.extend(future.result())
+            parsed_items.extend(cardrush_future.result())
+            parsed_items.extend(magi_future.result())
 
         return (parsed_items, "".join(methodology_parts))
 
@@ -619,26 +642,36 @@ class TcgHotCardService:
                 "Signal source: SNKRDUNK initial-market article for Rascal Does Not Dream of Santa Claus.",
             ),
         )
-        for board_url, source_label, source_weight, parser, note in ws_trend_sources:
+
+        def _fetch_ws_source(args: tuple[str, str, float, object, str]) -> list[_ParsedHotItem]:
+            board_url, source_label, source_weight, parser, note = args
             try:
                 html = self.http_client.get_text(board_url)
-                parsed_items.extend(
-                    parser(
-                        html,
-                        board_url=board_url,
-                        source_label=source_label,
-                        source_weight=source_weight,
-                        note=note,
-                    )
+                return parser(  # type: ignore[operator]
+                    html,
+                    board_url=board_url,
+                    source_label=source_label,
+                    source_weight=source_weight,
+                    note=note,
                 )
             except Exception as exc:  # pragma: no cover - network-dependent.
                 logger.warning("WS trend source failed url=%s error=%s", board_url, exc)
+                return []
 
-        try:
-            html = self.http_client.get_text(MAGI_WS_RANKING_URL)
-            parsed_items.extend(self._parse_magi_ws_items(html))
-        except Exception as exc:  # pragma: no cover - network-dependent.
-            logger.warning("Magi WS listing page failed; continuing without it. error=%s", exc)
+        def _fetch_magi_ws() -> list[_ParsedHotItem]:
+            try:
+                html = self.http_client.get_text(MAGI_WS_RANKING_URL)
+                return self._parse_magi_ws_items(html)
+            except Exception as exc:  # pragma: no cover - network-dependent.
+                logger.warning("Magi WS listing page failed; continuing without it. error=%s", exc)
+                return []
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            ws_futures = [executor.submit(_fetch_ws_source, args) for args in ws_trend_sources]
+            magi_future = executor.submit(_fetch_magi_ws)
+            for future in ws_futures:
+                parsed_items.extend(future.result())
+            parsed_items.extend(magi_future.result())
 
         return (parsed_items, "".join(methodology_parts))
 
@@ -653,13 +686,17 @@ class TcgHotCardService:
             return {}
 
         candidate_limit = min(len(ranked), max(min(limit, 4), SOCIAL_QUERY_CANDIDATE_LIMIT))
+        candidates = ranked[:candidate_limit]
         signals: dict[str, HotCardSocialSignal] = {}
-        for aggregate in ranked[:candidate_limit]:
+
+        def _fetch_social(aggregate: dict[str, object]) -> tuple[str, HotCardSocialSignal | None]:
             best_item: _ParsedHotItem = aggregate["best_item"]  # type: ignore[assignment]
-            signal = self._lookup_social_signal(game=game, item=best_item)
-            if signal is None:
-                continue
-            signals[str(aggregate["key"])] = signal
+            return str(aggregate["key"]), self._lookup_social_signal(game=game, item=best_item)
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            for key, signal in executor.map(_fetch_social, candidates):
+                if signal is not None:
+                    signals[key] = signal
         return signals
 
     def _lookup_social_signal(self, *, game: str, item: _ParsedHotItem) -> HotCardSocialSignal | None:

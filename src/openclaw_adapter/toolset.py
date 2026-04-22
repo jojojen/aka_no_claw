@@ -14,6 +14,7 @@ from .formatters import (
     lookup_result_to_json,
     reference_sources_to_json,
 )
+from .reputation_agent import check_prerequisites, run_agent_loop, start_agent_thread
 from .telegram_bot import (
     default_board_loader,
     default_lookup_renderer,
@@ -81,6 +82,15 @@ def build_tool_registry(settings: AssistantSettings | None = None) -> ToolRegist
             aliases=("telegram-send-test",),
         )
     )
+    registry.register(
+        AssistantTool(
+            name="assistant.reputation-agent",
+            description="Run the reputation-snapshot polling agent (claims jobs from the server and executes Playwright captures).",
+            configure_parser=lambda parser: _configure_reputation_agent_parser(parser, settings),
+            handler=lambda args: _handle_reputation_agent(args, settings),
+            aliases=("reputation-agent",),
+        )
+    )
     return registry
 
 
@@ -122,12 +132,16 @@ def _configure_dashboard_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--open-browser", action="store_true")
+    parser.add_argument("--with-reputation-agent", action="store_true",
+                        help="Also start the reputation-snapshot polling agent in a background thread.")
 
 
 def _configure_telegram_poll_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--poll-timeout", type=int, default=20)
     parser.add_argument("--notify-startup", action="store_true")
     parser.add_argument("--keep-pending", action="store_true")
+    parser.add_argument("--with-reputation-agent", action="store_true",
+                        help="Also start the reputation-snapshot polling agent in a background thread.")
 
 
 def _configure_telegram_send_test_parser(parser: argparse.ArgumentParser) -> None:
@@ -185,12 +199,29 @@ def _handle_list_reference_sources(args: argparse.Namespace) -> int:
     return 0
 
 
+def _maybe_start_reputation_agent(args: argparse.Namespace, settings: AssistantSettings) -> None:
+    if not getattr(args, "with_reputation_agent", False):
+        return
+    err = check_prerequisites(settings.reputation_agent_admin_token or "")
+    if err:
+        logger.error("reputation_agent: cannot start — %s", err)
+        print(f"[reputation-agent] WARNING: cannot start — {err}")
+        return
+    start_agent_thread(
+        server_url=settings.reputation_agent_server_url,
+        api_key=settings.reputation_agent_admin_token or "",
+        poll_secs=settings.reputation_agent_poll_secs,
+    )
+    print(f"[reputation-agent] background thread started → {settings.reputation_agent_server_url}")
+
+
 def _handle_serve_dashboard(
     args: argparse.Namespace,
     settings: AssistantSettings,
     registry: ToolRegistry,
 ) -> int:
     logger.info("CLI serve-dashboard command received host=%s port=%s open_browser=%s", args.host, args.port, args.open_browser)
+    _maybe_start_reputation_agent(args, settings)
     return serve_dashboard(
         settings=settings,
         registry=registry,
@@ -206,11 +237,13 @@ def _handle_telegram_poll(
     registry: ToolRegistry,
 ) -> int:
     logger.info(
-        "CLI telegram-poll command received poll_timeout=%s notify_startup=%s keep_pending=%s",
+        "CLI telegram-poll command received poll_timeout=%s notify_startup=%s keep_pending=%s with_reputation_agent=%s",
         args.poll_timeout,
         args.notify_startup,
         args.keep_pending,
+        getattr(args, "with_reputation_agent", False),
     )
+    _maybe_start_reputation_agent(args, settings)
     return run_telegram_polling(
         settings=settings,
         lookup_renderer=default_lookup_renderer(settings),
@@ -228,3 +261,47 @@ def _handle_telegram_send_test(
 ) -> int:
     logger.info("CLI telegram-send-test command received custom_message=%s", bool(args.message))
     return send_telegram_test_message(settings=settings, message=args.message)
+
+
+def _configure_reputation_agent_parser(
+    parser: argparse.ArgumentParser,
+    settings: AssistantSettings,
+) -> None:
+    parser.add_argument(
+        "--server-url",
+        default=settings.reputation_agent_server_url,
+        help="reputation-snapshot server URL (default: REPUTATION_AGENT_SERVER_URL env or fly.io endpoint)",
+    )
+    parser.add_argument(
+        "--token",
+        default=settings.reputation_agent_admin_token or "",
+        help="Admin token (default: REPUTATION_AGENT_ADMIN_TOKEN env var)",
+    )
+    parser.add_argument(
+        "--poll-secs",
+        type=int,
+        default=settings.reputation_agent_poll_secs,
+        help="Polling interval in seconds (default: REPUTATION_AGENT_POLL_SECS env or 5)",
+    )
+
+
+def _handle_reputation_agent(
+    args: argparse.Namespace,
+    settings: AssistantSettings,
+) -> int:
+    token = args.token or settings.reputation_agent_admin_token or ""
+    err = check_prerequisites(token)
+    if err:
+        print(f"ERROR: {err}")
+        return 1
+    logger.info(
+        "CLI reputation-agent command received server_url=%s poll_secs=%s",
+        args.server_url,
+        args.poll_secs,
+    )
+    run_agent_loop(
+        server_url=args.server_url,
+        api_key=token,
+        poll_secs=args.poll_secs,
+    )
+    return 0

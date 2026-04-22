@@ -4,13 +4,23 @@ setlocal
 pushd "%~dp0" >nul
 
 if not exist ".venv\Scripts\python.exe" (
-  echo [ERROR] Cannot find .venv\Scripts\python.exe
-  echo.
-  echo Please create the virtual environment first:
-  echo   python -m venv .venv
-  echo   .venv\Scripts\python.exe -m pip install -r requirements-dev.txt
-  popd >nul
-  exit /b 1
+  echo [setup] .venv not found, creating virtual environment...
+  python -m venv .venv
+  if errorlevel 1 (
+    echo [ERROR] Failed to create .venv. Make sure Python 3.12+ is installed.
+    pause
+    popd >nul
+    exit /b 1
+  )
+  echo [setup] Installing dependencies...
+  ".venv\Scripts\python.exe" -m pip install -r requirements-dev.txt
+  if errorlevel 1 (
+    echo [ERROR] pip install failed.
+    pause
+    popd >nul
+    exit /b 1
+  )
+  echo [setup] Done.
 )
 
 set "DASHBOARD_ARGS=%*"

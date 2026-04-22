@@ -4,6 +4,8 @@ import json
 import logging
 import ssl
 import tempfile
+import time
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -577,11 +579,27 @@ def require_telegram_chat_id(settings: AssistantSettings) -> str:
     return chat_id
 
 
+_BOARD_CACHE_TTL_SECONDS = 20 * 60
+_board_cache_lock = threading.Lock()
+_board_cache: tuple[HotCardBoard, ...] | None = None
+_board_cache_ts: float = 0.0
+
+
 def default_board_loader(settings: AssistantSettings | None = None) -> tuple[HotCardBoard, ...]:
-    client = HttpClient(
-        ssl_context=build_ssl_context(settings),
-    )
-    return TcgHotCardService(http_client=client).load_boards()
+    global _board_cache, _board_cache_ts
+    now = time.time()
+    with _board_cache_lock:
+        if _board_cache is not None and now - _board_cache_ts < _BOARD_CACHE_TTL_SECONDS:
+            logger.debug("Board cache hit age_seconds=%.0f", now - _board_cache_ts)
+            return _board_cache
+
+    client = HttpClient(ssl_context=build_ssl_context(settings))
+    boards = TcgHotCardService(http_client=client).load_boards()
+    with _board_cache_lock:
+        _board_cache = boards
+        _board_cache_ts = time.time()
+    logger.info("Board cache refreshed boards=%s", len(boards))
+    return boards
 
 
 def _handle_photo_message(
