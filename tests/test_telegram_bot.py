@@ -410,3 +410,4 @@ def test_format_liquidity_board_includes_reference_url() -> None:
     assert "attn 41.70" in text
     assert "support 90.08" in text
     assert "buy-up" in text
+    assert "stub methodology" not in text

@@ -381,7 +381,7 @@ def parse_lookup_command(raw: str) -> TelegramLookupQuery:
 
 
 def format_liquidity_board(board: HotCardBoard, *, limit: int = 5) -> str:
-    lines = [board.label, board.methodology]
+    lines = [board.label]
     for item in board.items[:limit]:
         price_text = "price n/a" if item.price_jpy is None else format_jpy(item.price_jpy)
         bid_text = "bid n/a" if item.best_bid_jpy is None else f"bid {format_jpy(item.best_bid_jpy)}"
