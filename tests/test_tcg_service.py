@@ -23,6 +23,11 @@ class StubLookupClient:
         return list(self.offers)
 
 
+class TimeoutLookupClient:
+    def lookup(self, spec: TcgCardSpec) -> list[MarketOffer]:
+        raise TimeoutError("read timed out")
+
+
 def test_name_only_lookup_is_marked_ambiguous_and_skips_fair_value(tmp_path) -> None:
     service = TcgPriceService(
         db_path=tmp_path / "monitor.sqlite3",
@@ -166,3 +171,39 @@ def test_lookup_aggregates_secondary_reference_sources(tmp_path) -> None:
     assert {offer.source for offer in result.offers} == {"yuyutei", "cardrush_pokemon", "magi"}
     assert result.fair_value is not None
     assert result.fair_value.sample_count == 3
+
+
+def test_lookup_continues_when_one_source_times_out(tmp_path, caplog) -> None:
+    shared_timestamp = datetime.now(timezone.utc)
+    service = TcgPriceService(
+        db_path=tmp_path / "monitor.sqlite3",
+        reference_clients=(
+            TimeoutLookupClient(),
+            StubLookupClient(
+                [
+                    MarketOffer(
+                        source="cardrush_pokemon",
+                        listing_id="cardrush-ask",
+                        url="https://example.com/cardrush",
+                        title="メガルカリオex",
+                        price_jpy=65800,
+                        price_kind="ask",
+                        captured_at=shared_timestamp,
+                        source_category="specialty_store",
+                        attributes={"card_number": "092/063", "rarity": "MUR", "version_code": "m1l"},
+                    )
+                ]
+            ),
+        ),
+    )
+
+    with caplog.at_level("WARNING"):
+        result = service.lookup(
+            TcgCardSpec(game="pokemon", title="メガルカリオex", card_number="092/063", rarity="MUR", set_code="m1l"),
+            persist=False,
+        )
+
+    assert len(result.offers) == 1
+    assert result.offers[0].source == "cardrush_pokemon"
+    assert "Source client timed out" in caplog.text
+    assert "Traceback" not in caplog.text

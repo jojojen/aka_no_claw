@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import socket
 from pathlib import Path
 from typing import Protocol
 
@@ -18,6 +19,7 @@ from .magi import MagiProductClient
 from .yuyutei import YuyuteiClient
 
 logger = logging.getLogger(__name__)
+_TRANSIENT_SOURCE_EXCEPTIONS = (TimeoutError, socket.timeout)
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +112,14 @@ class TcgPriceService:
             logger.debug("Querying source client=%s title=%s", client_name, spec.title)
             try:
                 client_offers = client.lookup(spec)
+            except _TRANSIENT_SOURCE_EXCEPTIONS as exc:
+                logger.warning(
+                    "Source client timed out client=%s title=%s error=%s",
+                    client_name,
+                    spec.title,
+                    exc,
+                )
+                continue
             except Exception:
                 logger.exception("Source client failed client=%s title=%s", client_name, spec.title)
                 continue

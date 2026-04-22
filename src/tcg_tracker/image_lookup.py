@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import unicodedata
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -16,7 +17,7 @@ from market_monitor.normalize import normalize_card_number, normalize_text
 
 from .catalog import TcgCardSpec
 from .hot_cards import TcgHotCardService
-from .local_vision import LocalVisionCardCandidate, build_local_vision_clients
+from .local_vision import LocalVisionCardCandidate, LocalVisionTimeoutError, build_local_vision_clients
 from .service import TcgLookupResult, TcgPriceService
 
 logger = logging.getLogger(__name__)
@@ -297,17 +298,69 @@ class TcgImagePriceService:
         warnings: list[str] = []
         candidates: list[LocalVisionCardCandidate] = []
         for client in self._local_vision_clients:
+            if getattr(client, "is_temporarily_disabled", lambda: False)():
+                remaining = getattr(client, "cooldown_remaining_seconds", lambda: 0)()
+                logger.info(
+                    "Local vision fallback skipped image=%s backend=%s cooldown_seconds=%s",
+                    image_path,
+                    client.descriptor,
+                    remaining,
+                )
+                warnings.append(
+                    f"Local vision fallback via {client.descriptor} is cooling down after a recent timeout."
+                )
+                continue
+
+            started_at = time.monotonic()
+            logger.info(
+                "Local vision fallback starting image=%s backend=%s game_hint=%s title_hint=%s",
+                image_path,
+                client.descriptor,
+                game_hint,
+                title_hint,
+            )
             try:
                 candidate = client.analyze_card_image(
                     image_path,
                     game_hint=game_hint,
                     title_hint=title_hint,
                 )
+            except LocalVisionTimeoutError as exc:
+                descriptor = client.descriptor
+                mark_timeout_cooldown = getattr(client, "mark_timeout_cooldown", None)
+                if callable(mark_timeout_cooldown):
+                    mark_timeout_cooldown()
+                cooldown_seconds = getattr(client, "cooldown_remaining_seconds", lambda: 0)()
+                logger.warning(
+                    "Local vision fallback timed out image=%s backend=%s elapsed_seconds=%.2f timeout_seconds=%s cooldown_seconds=%s error=%s",
+                    image_path,
+                    descriptor,
+                    time.monotonic() - started_at,
+                    exc.timeout_seconds,
+                    cooldown_seconds,
+                    exc.detail,
+                )
+                warnings.append(
+                    f"Local vision fallback via {descriptor} timed out and was put on cooldown."
+                )
+                continue
             except Exception:
                 descriptor = client.descriptor
                 logger.exception("Local vision fallback failed image=%s backend=%s", image_path, descriptor)
                 warnings.append(f"Local vision fallback via {descriptor} failed.")
                 continue
+
+            logger.info(
+                "Local vision fallback completed image=%s backend=%s elapsed_seconds=%.2f candidate_game=%s candidate_title=%s candidate_card_number=%s candidate_rarity=%s candidate_set_code=%s",
+                image_path,
+                client.descriptor,
+                time.monotonic() - started_at,
+                None if candidate is None else candidate.game,
+                None if candidate is None else candidate.title,
+                None if candidate is None else candidate.card_number,
+                None if candidate is None else candidate.rarity,
+                None if candidate is None else candidate.set_code,
+            )
 
             if candidate is None:
                 warnings.append(f"Local vision fallback via {client.descriptor} did not return a usable candidate.")

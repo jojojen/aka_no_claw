@@ -4,13 +4,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from assistant_runtime import AssistantSettings
+from market_monitor.models import FairValueEstimate, MarketOffer, TrackedItem
+from tcg_tracker.catalog import TcgCardSpec
 from tcg_tracker.hot_cards import HotCardBoard, HotCardEntry, HotCardReference
+from tcg_tracker.image_lookup import ParsedCardImage, TcgImageLookupOutcome
+from tcg_tracker.service import TcgLookupResult
 
+from openclaw_adapter.formatters import format_lookup_result_telegram
 from openclaw_adapter.telegram_bot import (
     TelegramCommandProcessor,
     TelegramLookupQuery,
     build_processing_ack,
     format_liquidity_board,
+    format_photo_lookup_result,
     handle_telegram_message,
     parse_lookup_command,
 )
@@ -203,6 +209,134 @@ def test_handle_telegram_message_sends_ack_then_text_result() -> None:
         "pokemon:Pikachu ex",
     )
     assert client.sent_messages == list(replies)
+
+
+def _mixed_grade_lookup_result() -> TcgLookupResult:
+    now = datetime.now(timezone.utc)
+    offers = (
+        MarketOffer(source="cardrush_pokemon", listing_id="a1", url="https://cardrush.example/a1",
+                    title="ピカチュウex 132/106", price_jpy=32800, price_kind="ask",
+                    captured_at=now, source_category="marketplace",
+                    attributes={"card_number": "132/106", "rarity": "SAR"}),
+        MarketOffer(source="cardrush_pokemon", listing_id="a2", url="https://cardrush.example/a2",
+                    title="ピカチュウex 132/106", price_jpy=28000, price_kind="bid",
+                    captured_at=now, source_category="marketplace",
+                    attributes={"card_number": "132/106", "rarity": "SAR"}),
+        MarketOffer(source="magi", listing_id="m1", url="https://magi.example/m1",
+                    title="ピカチュウex 132/106", price_jpy=30500, price_kind="market",
+                    captured_at=now, source_category="marketplace",
+                    attributes={"card_number": "132/106", "rarity": "SAR"}),
+        MarketOffer(source="cardrush_pokemon", listing_id="p1", url="https://cardrush.example/p1",
+                    title="【PSA10】ピカチュウex 132/106", price_jpy=98000, price_kind="ask",
+                    captured_at=now, source_category="marketplace", condition="graded",
+                    attributes={"card_number": "132/106", "rarity": "SAR", "is_graded": "1", "grade_label": "PSA10"}),
+        MarketOffer(source="cardrush_pokemon", listing_id="p2", url="https://cardrush.example/p2",
+                    title="【PSA10】ピカチュウex 132/106", price_jpy=88000, price_kind="bid",
+                    captured_at=now, source_category="marketplace", condition="graded",
+                    attributes={"card_number": "132/106", "rarity": "SAR", "is_graded": "1", "grade_label": "PSA10"}),
+        MarketOffer(source="magi", listing_id="p3", url="https://magi.example/p3",
+                    title="【PSA10】ピカチュウex 132/106", price_jpy=92000, price_kind="market",
+                    captured_at=now, source_category="marketplace", condition="graded",
+                    attributes={"card_number": "132/106", "rarity": "SAR", "is_graded": "1", "grade_label": "PSA10"}),
+    )
+    spec = TcgCardSpec(game="pokemon", title="Pikachu ex", card_number="132/106", rarity="SAR")
+    item = TrackedItem(item_id="x", item_type="card", category="tcg", title="Pikachu ex")
+    fv = FairValueEstimate(item_id="x", amount_jpy=32500, confidence=0.72, sample_count=3, reasoning=())
+    return TcgLookupResult(spec=spec, item=item, offers=offers, fair_value=fv, notes=("sample note",))
+
+
+def test_format_lookup_result_telegram_shows_raw_and_psa10_sections_without_mixed_total_price() -> None:
+    text = format_lookup_result_telegram(_mixed_grade_lookup_result())
+
+    assert "Raw" in text
+    assert "PSA 10" in text
+
+    raw_section = text.split("Raw", 1)[1].split("PSA 10", 1)[0]
+    psa_section = text.split("PSA 10", 1)[1].split("Sources:", 1)[0]
+    header_section = text.split("Raw", 1)[0]
+
+    for section_name, section in (("raw", raw_section), ("psa10", psa_section)):
+        assert "Fair Value:" in section, f"{section_name} section missing Fair Value"
+        assert "Avg Price:" in section, f"{section_name} section missing Avg Price"
+        assert "Best Bid:" in section, f"{section_name} section missing Best Bid"
+        assert "Best Ask:" in section, f"{section_name} section missing Best Ask"
+        assert "Best Market:" in section, f"{section_name} section missing Best Market"
+
+    assert "Fair Value: ￥32,500" not in header_section
+    assert "Fair Value: ￥32,800" in raw_section
+    assert "￥31,100" in raw_section or "￥31,200" in raw_section or "￥31,650" in raw_section
+    assert "￥28,000" in raw_section
+    assert "￥32,800" in raw_section
+    assert "￥30,500" in raw_section
+    assert "Source URL: https://magi.example/m1" in raw_section
+    assert "Fair Value: ￥98,000" in psa_section
+    assert "￥95,000" in psa_section
+    assert "￥88,000" in psa_section
+    assert "￥98,000" in psa_section
+    assert "￥92,000" in psa_section
+    assert "Source URL: https://magi.example/p3" in psa_section
+    assert "Offers:" not in text
+
+
+def test_format_lookup_result_telegram_has_no_scan_or_note_noise() -> None:
+    text = format_lookup_result_telegram(_mixed_grade_lookup_result())
+
+    for forbidden in ("Image scan result", "Detected game", "Detected card", "Detected fields", "Note:", "sample note"):
+        assert forbidden not in text, f"Telegram output should not contain {forbidden!r}: {text!r}"
+
+
+def test_format_photo_lookup_result_is_identical_to_telegram_lookup_result() -> None:
+    lookup_result = _mixed_grade_lookup_result()
+    parsed = ParsedCardImage(
+        status="success",
+        game="pokemon",
+        title="Pikachu ex",
+        aliases=(),
+        card_number="132/106",
+        rarity="SAR",
+        set_code=None,
+        raw_text="",
+        extracted_lines=(),
+    )
+    outcome = TcgImageLookupOutcome(
+        status="success",
+        parsed=parsed,
+        lookup_result=lookup_result,
+        warnings=("sample warning",),
+    )
+
+    text = format_photo_lookup_result(outcome)
+
+    assert text == format_lookup_result_telegram(lookup_result)
+    for forbidden in ("Image scan result", "Detected game", "Detected card", "Detected fields", "sample warning", "sample note"):
+        assert forbidden not in text
+
+
+def test_format_lookup_result_telegram_detects_psa10_from_title_with_spacing() -> None:
+    now = datetime.now(timezone.utc)
+    lookup_result = TcgLookupResult(
+        spec=TcgCardSpec(game="pokemon", title="Pikachu ex", card_number="132/106", rarity="SAR"),
+        item=TrackedItem(item_id="x", item_type="card", category="tcg", title="Pikachu ex"),
+        offers=(
+            MarketOffer(
+                source="magi",
+                listing_id="p1",
+                url="https://magi.example/p1",
+                title="PSA 10 ピカチュウex 132/106",
+                price_jpy=92000,
+                price_kind="market",
+                captured_at=now,
+                source_category="marketplace",
+                condition="graded",
+            ),
+        ),
+        fair_value=None,
+    )
+
+    text = format_lookup_result_telegram(lookup_result)
+
+    assert "PSA 10" in text
+    assert "其他鑑定卡" not in text
 
 
 def test_format_liquidity_board_includes_reference_url() -> None:

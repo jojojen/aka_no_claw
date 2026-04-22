@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import socket
 import shutil
 import ssl
 import subprocess
@@ -11,6 +12,7 @@ from urllib.request import Request, urlopen
 import truststore
 
 logger = logging.getLogger(__name__)
+_TRANSIENT_HTTP_EXCEPTIONS = (HTTPError, URLError, TimeoutError, socket.timeout)
 
 
 class HttpClient:
@@ -64,11 +66,13 @@ class HttpClient:
                     selected_encoding,
                 )
                 return text
-        except (HTTPError, URLError) as exc:
+        except _TRANSIENT_HTTP_EXCEPTIONS as exc:
             if isinstance(exc, HTTPError):
                 logger.warning("HTTP GET failed target=%s status=%s; trying curl fallback", target, exc.code)
-            else:
+            elif isinstance(exc, URLError):
                 logger.warning("HTTP GET failed target=%s reason=%s; trying curl fallback", target, exc.reason)
+            else:
+                logger.warning("HTTP GET timed out target=%s error=%s; trying curl fallback", target, exc)
 
             curl_text = self._get_text_with_curl(target=target, headers=request_headers, encoding=encoding)
             if curl_text is not None:

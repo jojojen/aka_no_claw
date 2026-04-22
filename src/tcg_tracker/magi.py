@@ -103,6 +103,8 @@ class MagiProductClient:
                 attributes["listing_count"] = str(parsed.listing_count)
             if parsed.is_graded:
                 attributes["is_graded"] = "1"
+                if parsed.grade_label:
+                    attributes["grade_label"] = parsed.grade_label
 
             offers.append(
                 MarketOffer(

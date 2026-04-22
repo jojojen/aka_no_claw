@@ -15,7 +15,7 @@ from tcg_tracker.image_lookup import (
     parse_tcg_ocr_text,
 )
 from tcg_tracker.hot_cards import TcgLookupHint
-from tcg_tracker.local_vision import LocalVisionCardCandidate, OllamaLocalVisionClient
+from tcg_tracker.local_vision import LocalVisionCardCandidate, LocalVisionTimeoutError, OllamaLocalVisionClient
 from tcg_tracker.service import TcgLookupResult
 
 CHARIZARD_JP = "\u30ea\u30b6\u30fc\u30c9\u30f3ex"
@@ -560,6 +560,72 @@ def test_parse_image_escalates_to_second_local_vision_model_when_first_is_incomp
     assert parsed.rarity == "SAR"
     assert parsed.set_code == "sv2a"
     assert any("Applied local vision fallback via ollama:gemma3:4b." in warning for warning in parsed.warnings)
+
+
+def test_parse_image_uses_second_local_vision_model_after_first_times_out(tmp_path, caplog) -> None:
+    image_path = tmp_path / "telegram-upload-charizard.jpg"
+    image_path.write_bytes(b"fake-image")
+
+    settings = AssistantSettings(
+        monitor_db_path=str(tmp_path / "monitor.sqlite3"),
+        openclaw_tesseract_path="C:/missing/tesseract.exe",
+        openclaw_local_vision_model="qwen2.5vl:7b,gemma3:12b",
+    )
+    service = TcgImagePriceService(db_path=settings.monitor_db_path, settings=settings)
+
+    class TimeoutClient:
+        descriptor = "ollama:qwen2.5vl:7b"
+
+        def cooldown_remaining_seconds(self) -> int:
+            return 900
+
+        def is_temporarily_disabled(self) -> bool:
+            return False
+
+        def mark_timeout_cooldown(self) -> None:
+            return None
+
+        def analyze_card_image(
+            self,
+            image_path: Path,
+            *,
+            game_hint: str | None = None,
+            title_hint: str | None = None,
+        ) -> LocalVisionCardCandidate:
+            raise LocalVisionTimeoutError(self.descriptor, timeout_seconds=45, detail="timed out")
+
+    class CompleteClient:
+        descriptor = "ollama:gemma3:12b"
+
+        def analyze_card_image(
+            self,
+            image_path: Path,
+            *,
+            game_hint: str | None = None,
+            title_hint: str | None = None,
+        ) -> LocalVisionCardCandidate:
+            return LocalVisionCardCandidate(
+                backend="ollama",
+                model="gemma3:12b",
+                game="pokemon",
+                title=CHARIZARD_JP,
+                aliases=("Charizard ex",),
+                card_number="201/165",
+                rarity="SAR",
+                set_code="sv2a",
+                confidence=0.91,
+            )
+
+    service._local_vision_clients = (TimeoutClient(), CompleteClient())
+
+    with caplog.at_level("WARNING"):
+        parsed = service.parse_image(image_path)
+
+    assert parsed.status == "success"
+    assert parsed.title == CHARIZARD_JP
+    assert parsed.card_number == "201/165"
+    assert any("timed out and was put on cooldown" in warning for warning in parsed.warnings)
+    assert "Local vision fallback timed out" in caplog.text
 
 
 def test_parse_image_escalates_when_first_local_vision_candidate_looks_slab_derived(tmp_path) -> None:

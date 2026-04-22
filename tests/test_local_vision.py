@@ -5,6 +5,7 @@ import json
 from assistant_runtime import AssistantSettings
 
 from tcg_tracker.local_vision import (
+    LocalVisionTimeoutError,
     OllamaLocalVisionClient,
     build_local_vision_client,
     build_local_vision_clients,
@@ -71,3 +72,23 @@ def test_ollama_local_vision_client_parses_structured_card_response(monkeypatch,
     assert candidate.rarity == "SAR"
     assert candidate.set_code == "sv2a"
     assert candidate.confidence == 0.94
+
+
+def test_ollama_local_vision_client_raises_structured_timeout(monkeypatch, tmp_path) -> None:
+    image_path = tmp_path / "charizard.jpg"
+    image_path.write_bytes(b"fake-image")
+
+    client = OllamaLocalVisionClient(
+        endpoint="http://127.0.0.1:11434",
+        model="qwen2.5vl:3b",
+        timeout_seconds=45,
+    )
+    monkeypatch.setattr("tcg_tracker.local_vision.urlopen", lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError("timed out")))
+
+    try:
+        client.analyze_card_image(image_path)
+    except LocalVisionTimeoutError as exc:
+        assert exc.timeout_seconds == 45
+        assert exc.descriptor == "ollama:qwen2.5vl:3b"
+    else:
+        raise AssertionError("expected LocalVisionTimeoutError")

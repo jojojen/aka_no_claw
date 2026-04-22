@@ -19,7 +19,7 @@ from tcg_tracker.hot_cards import HotCardBoard, TcgHotCardService
 from tcg_tracker.image_lookup import TcgImageLookupOutcome, TcgImagePriceService
 
 from .commands import lookup_card
-from .formatters import format_jpy, format_lookup_result
+from .formatters import format_jpy, format_lookup_result_telegram
 
 LookupRenderer = Callable[["TelegramLookupQuery"], str]
 PhotoLookupRenderer = Callable[["TelegramPhotoQuery"], str]
@@ -331,38 +331,11 @@ def format_liquidity_board(board: HotCardBoard, *, limit: int = 5) -> str:
 
 
 def format_photo_lookup_result(outcome: TcgImageLookupOutcome) -> str:
-    parsed = outcome.parsed
-    lines = ["Image scan result"]
-
-    if parsed.game:
-        lines.append(f"Detected game: {parsed.game}")
-    if parsed.title:
-        lines.append(f"Detected card: {parsed.title}")
-    metadata = " / ".join(
-        value
-        for value in (
-            parsed.card_number or "",
-            parsed.rarity or "",
-            parsed.set_code or "",
-        )
-        if value
-    )
-    if metadata:
-        lines.append(f"Detected fields: {metadata}")
-
-    for warning in outcome.warnings:
-        lines.append(f"Note: {warning}")
-
     if outcome.status == "unavailable":
-        lines.append("Price lookup was skipped because OCR is not available on this machine yet.")
-        return "\n".join(lines)
+        return "尚未設定 OCR，無法解析卡片圖片。"
     if outcome.status == "unresolved" or outcome.lookup_result is None:
-        lines.append("I could not extract enough card fields to run a price lookup from the image.")
-        return "\n".join(lines)
-
-    lines.append("")
-    lines.append(format_lookup_result(outcome.lookup_result))
-    return "\n".join(lines)
+        return "無法從圖片提取足夠資訊進行查價。"
+    return format_lookup_result_telegram(outcome.lookup_result)
 
 
 def default_lookup_renderer(settings: AssistantSettings) -> LookupRenderer:
@@ -391,7 +364,26 @@ def default_lookup_renderer(settings: AssistantSettings) -> LookupRenderer:
             len(result.offers),
             None if result.fair_value is None else result.fair_value.amount_jpy,
         )
-        return format_lookup_result(result)
+        logger.debug(
+            "Telegram lookup result detail game=%s name=%s notes=%s confidence=%s offers=%s",
+            query.game,
+            query.name,
+            list(result.notes),
+            None if result.fair_value is None else f"{result.fair_value.confidence:.2f}",
+            [
+                {
+                    "source": o.source,
+                    "kind": o.price_kind,
+                    "jpy": o.price_jpy,
+                    "num": o.attributes.get("card_number"),
+                    "rarity": o.attributes.get("rarity"),
+                    "score": o.score,
+                    "url": o.url,
+                }
+                for o in result.offers[:10]
+            ],
+        )
+        return format_lookup_result_telegram(result)
 
     return render
 
@@ -417,13 +409,28 @@ def default_photo_renderer(settings: AssistantSettings) -> PhotoLookupRenderer:
             persist=False,
         )
         logger.info(
-            "Telegram photo renderer completed status=%s title=%s game=%s card_number=%s rarity=%s offers=%s",
+            "Telegram image scan result chat_id=%s file_id=%s status=%s game=%s title=%s card_number=%s rarity=%s set_code=%s extracted_lines=%s raw_text=%s",
+            mask_identifier(query.chat_id),
+            query.file_id,
+            outcome.parsed.status,
+            outcome.parsed.game,
+            outcome.parsed.title,
+            outcome.parsed.card_number,
+            outcome.parsed.rarity,
+            outcome.parsed.set_code,
+            list(outcome.parsed.extracted_lines[:12]),
+            trim_for_log(outcome.parsed.raw_text, limit=600),
+        )
+        logger.info(
+            "Telegram photo renderer completed status=%s title=%s game=%s card_number=%s rarity=%s set_code=%s offers=%s warnings=%s",
             outcome.status,
             outcome.parsed.title,
             outcome.parsed.game,
             outcome.parsed.card_number,
             outcome.parsed.rarity,
+            outcome.parsed.set_code,
             0 if outcome.lookup_result is None else len(outcome.lookup_result.offers),
+            list(outcome.warnings),
         )
         return format_photo_lookup_result(outcome)
 

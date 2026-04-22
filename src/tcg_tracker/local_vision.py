@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import socket
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,7 @@ from assistant_runtime import AssistantSettings, build_ssl_context
 from market_monitor.normalize import normalize_card_number
 
 logger = logging.getLogger(__name__)
+_LOCAL_VISION_TIMEOUT_COOLDOWN_SECONDS = 15 * 60
 
 CARD_JSON_SCHEMA = {
     "type": "object",
@@ -53,8 +55,17 @@ class LocalVisionCardCandidate:
         return f"{self.backend}:{self.model}"
 
 
+class LocalVisionTimeoutError(RuntimeError):
+    def __init__(self, descriptor: str, *, timeout_seconds: int, detail: str) -> None:
+        super().__init__(f"{descriptor} timed out after {timeout_seconds}s: {detail}")
+        self.descriptor = descriptor
+        self.timeout_seconds = timeout_seconds
+        self.detail = detail
+
+
 class OllamaLocalVisionClient:
     backend = "ollama"
+    _timeout_backoff_until: dict[str, float] = {}
 
     def __init__(
         self,
@@ -72,6 +83,23 @@ class OllamaLocalVisionClient:
     @property
     def descriptor(self) -> str:
         return f"{self.backend}:{self.model}"
+
+    @property
+    def cooldown_key(self) -> str:
+        return f"{self.endpoint}|{self.descriptor}"
+
+    def cooldown_remaining_seconds(self) -> int:
+        until = self._timeout_backoff_until.get(self.cooldown_key)
+        if until is None:
+            return 0
+        remaining = int(round(until - time.monotonic()))
+        return max(0, remaining)
+
+    def is_temporarily_disabled(self) -> bool:
+        return self.cooldown_remaining_seconds() > 0
+
+    def mark_timeout_cooldown(self) -> None:
+        self._timeout_backoff_until[self.cooldown_key] = time.monotonic() + _LOCAL_VISION_TIMEOUT_COOLDOWN_SECONDS
 
     def analyze_card_image(
         self,
@@ -139,6 +167,7 @@ class OllamaLocalVisionClient:
         target = _resolve_generate_url(self.endpoint)
         body = None
         for attempt in range(2):
+            started_at = time.monotonic()
             request = Request(
                 target,
                 data=json.dumps(payload).encode("utf-8"),
@@ -148,10 +177,24 @@ class OllamaLocalVisionClient:
                 },
                 method="POST",
             )
-            logger.debug("Local vision request target=%s model=%s attempt=%s", target, self.model, attempt + 1)
+            logger.info(
+                "Local vision request starting target=%s model=%s attempt=%s timeout_seconds=%s",
+                target,
+                self.model,
+                attempt + 1,
+                self.timeout_seconds,
+            )
             try:
                 with urlopen(request, timeout=self.timeout_seconds, context=self._ssl_context) as response:
                     body = response.read().decode("utf-8", errors="replace")
+                logger.info(
+                    "Local vision request completed target=%s model=%s attempt=%s elapsed_seconds=%.2f bytes=%s",
+                    target,
+                    self.model,
+                    attempt + 1,
+                    time.monotonic() - started_at,
+                    len(body.encode("utf-8", errors="replace")),
+                )
                 break
             except HTTPError as exc:
                 if exc.code >= 500 and attempt == 0:
@@ -159,10 +202,22 @@ class OllamaLocalVisionClient:
                     continue
                 raise RuntimeError(f"Ollama request failed with status {exc.code}.") from exc
             except URLError as exc:
+                if isinstance(exc.reason, TimeoutError | socket.timeout):  # type: ignore[arg-type]
+                    raise LocalVisionTimeoutError(
+                        self.descriptor,
+                        timeout_seconds=self.timeout_seconds,
+                        detail=str(exc.reason) or "request timed out",
+                    ) from exc
                 if attempt == 0:
                     time.sleep(1)
                     continue
                 raise RuntimeError(f"Ollama request failed: {exc.reason}.") from exc
+            except (TimeoutError, socket.timeout) as exc:
+                raise LocalVisionTimeoutError(
+                    self.descriptor,
+                    timeout_seconds=self.timeout_seconds,
+                    detail=str(exc) or "request timed out",
+                ) from exc
 
         if body is None:
             raise RuntimeError(f"Ollama request failed without a response body for {self.descriptor}.")

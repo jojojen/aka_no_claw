@@ -183,6 +183,7 @@ class _ParsedHotItem:
     source_label: str = "Source"
     source_rank: int | None = None
     demand_ratio: float = 0.0
+    grade_label: str | None = None
 
 
 class TcgHotCardService:
@@ -1351,6 +1352,7 @@ def _parse_magi_text(
 ) -> _ParsedHotItem | None:
     grading_match = GRADING_RE.match(text)
     is_graded = grading_match is not None
+    grade_label = re.sub(r"\s+", "", grading_match.group("label")).upper() if grading_match is not None else None
     working = text[grading_match.end():].strip() if grading_match is not None else text
 
     price_match = MAGI_PRICE_RE.search(working)
@@ -1401,6 +1403,7 @@ def _parse_magi_text(
         source_label=source_label,
         source_rank=source_rank,
         demand_ratio=demand_ratio,
+        grade_label=grade_label,
     )
 
 

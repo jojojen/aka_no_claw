@@ -21,4 +21,7 @@ if not exist ".venv\Scripts\python.exe" (
   echo [setup] Done.
 )
 
+echo [startup] Checking for existing telegram-poll bot instances...
+powershell -NoProfile -Command "& {Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'python.exe' -and $_.CommandLine -match 'openclaw_adapter.*telegram-poll' -and $_.ProcessId -ne $PID } | ForEach-Object { Write-Host ('[startup] Stopping existing bot PID ' + $_.ProcessId); Stop-Process -Id $_.ProcessId -Force }}"
+
 ".venv\Scripts\python.exe" -m openclaw_adapter telegram-poll --with-reputation-agent %*
