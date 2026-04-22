@@ -9,6 +9,7 @@ from tcg_tracker.catalog import TcgCardSpec
 from tcg_tracker.hot_cards import HotCardBoard, HotCardEntry, HotCardReference
 from tcg_tracker.image_lookup import ParsedCardImage, TcgImageLookupOutcome
 from tcg_tracker.service import TcgLookupResult
+from tests.image_lookup_case_fixtures import get_image_lookup_live_case
 
 from openclaw_adapter.formatters import format_lookup_result_telegram
 from openclaw_adapter.telegram_bot import (
@@ -156,7 +157,7 @@ def test_build_processing_ack_for_heavy_actions() -> None:
 
 
 def test_handle_telegram_message_sends_ack_then_photo_result() -> None:
-    sample_path = Path(__file__).resolve().parents[1] / "fwdspecptcg" / "pikachu.jpg"
+    sample_path = get_image_lookup_live_case("pokemon-pikachu-partial-s40").image_path
     client = FakeTelegramClient(sample_path=sample_path)
     settings = AssistantSettings(openclaw_telegram_chat_id="123")
     processor = TelegramCommandProcessor(

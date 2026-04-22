@@ -11,12 +11,14 @@ from tcg_tracker.image_lookup import (
     ParsedCardImage,
     TcgImagePriceService,
     _merge_local_vision_candidate,
+    _repair_pokemon_card_number_with_slab,
     parse_image_caption_hints,
     parse_tcg_ocr_text,
 )
 from tcg_tracker.hot_cards import TcgLookupHint
 from tcg_tracker.local_vision import LocalVisionCardCandidate, LocalVisionTimeoutError, OllamaLocalVisionClient
 from tcg_tracker.service import TcgLookupResult
+from tests.image_lookup_case_fixtures import get_image_lookup_live_case
 
 CHARIZARD_JP = "\u30ea\u30b6\u30fc\u30c9\u30f3ex"
 PIKACHU_EX_JP = "\u30d4\u30ab\u30c1\u30e5\u30a6ex"
@@ -65,7 +67,38 @@ def test_parse_tcg_ocr_text_preserves_zero_padded_pokemon_card_numbers() -> None
 
     assert parsed.card_number == "110/080"
     assert parsed.rarity == "SAR"
-    assert parsed.set_code == "m2"
+
+
+def test_parse_tcg_ocr_text_recovers_dense_footer_card_number() -> None:
+    raw_text = "\n".join(
+        [
+            "sv2a 2017,165 SAR",
+            "lee. cath Cencto",
+        ]
+    )
+
+    parsed = parse_tcg_ocr_text(raw_text, game_hint="pokemon")
+
+    assert parsed.card_number == "201/165"
+    assert parsed.rarity == "SAR"
+
+
+def test_repair_pokemon_card_number_with_slab_repairs_wrong_numerator() -> None:
+    assert _repair_pokemon_card_number_with_slab("470/080", "110") == "110/080"
+
+
+def test_parse_tcg_ocr_text_rejects_lowercase_multiline_gibberish_title() -> None:
+    raw_text = "\n".join(
+        [
+            "lee. cath Cero",
+            "sv2a 2077,165 SAR",
+        ]
+    )
+
+    parsed = parse_tcg_ocr_text(raw_text, game_hint="pokemon")
+
+    assert parsed.title is None
+    assert parsed.card_number == "207/165"
 
 
 def test_parse_tcg_ocr_text_rejects_zero_denominator_card_number_noise() -> None:
@@ -277,7 +310,7 @@ def test_image_service_reports_unavailable_when_tesseract_is_missing() -> None:
         openclaw_tesseract_path="C:/missing/tesseract.exe",
     )
     service = TcgImagePriceService(db_path=settings.monitor_db_path, settings=settings)
-    sample_path = Path(__file__).resolve().parents[1] / "fwdspecptcg" / "charizard.jpg"
+    sample_path = get_image_lookup_live_case("pokemon-mega-charizard-x-ex-223-193-ma-m2a").image_path
 
     outcome = service.lookup_image(sample_path, caption="/scan pokemon")
 
@@ -493,6 +526,150 @@ def test_parse_image_uses_local_vision_when_tesseract_is_missing(tmp_path) -> No
     assert parsed.rarity == "SAR"
     assert parsed.set_code == "sv2a"
     assert any("Applied local vision fallback via ollama:qwen2.5vl:3b." in warning for warning in parsed.warnings)
+
+
+def test_lookup_image_uses_footer_focused_local_vision_metadata_to_recover_charizard(monkeypatch, tmp_path) -> None:
+    calls: list[TcgCardSpec] = []
+
+    class StubService:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def lookup(self, spec: TcgCardSpec, *, persist: bool = True) -> TcgLookupResult:
+            calls.append(spec)
+            if spec.card_number == "201/165":
+                offer = MarketOffer(
+                    source="cardrush_pokemon",
+                    listing_id="sv2a-201-165",
+                    url="https://example.com/charizard",
+                    title=CHARIZARD_JP,
+                    price_jpy=60800,
+                    price_kind="ask",
+                    captured_at=datetime.now(timezone.utc),
+                    source_category="specialty_store",
+                    attributes={"card_number": "201/165", "rarity": "SAR", "version_code": "sv2a"},
+                )
+                fair_value = FairValueEstimate(
+                    item_id="tcg-charizard",
+                    amount_jpy=60800,
+                    confidence=0.82,
+                    sample_count=1,
+                    reasoning=("stub",),
+                )
+                item = TrackedItem(
+                    item_id="tcg-charizard",
+                    item_type="tcg_card",
+                    category="tcg",
+                    title=spec.title,
+                    attributes={"game": "pokemon", "card_number": "201/165", "rarity": "SAR", "set_code": "sv2a"},
+                )
+                return TcgLookupResult(spec=spec, item=item, offers=(offer,), fair_value=fair_value, notes=())
+
+            item = TrackedItem(
+                item_id="tcg-empty",
+                item_type="tcg_card",
+                category="tcg",
+                title=spec.title,
+                attributes={"game": spec.game},
+            )
+            return TcgLookupResult(spec=spec, item=item, offers=(), fair_value=None, notes=("No matching offers were found.",))
+
+    monkeypatch.setattr("tcg_tracker.image_lookup.TcgPriceService", StubService)
+
+    settings = AssistantSettings(
+        monitor_db_path=str(tmp_path / "monitor.sqlite3"),
+        openclaw_tesseract_path=str(tmp_path / "tesseract.exe"),
+        openclaw_local_vision_model="gemma3:12b",
+    )
+    service = TcgImagePriceService(db_path=settings.monitor_db_path, settings=settings)
+    service._tesseract_path = "tesseract"
+    monkeypatch.setattr(
+        service,
+        "_extract_text",
+        lambda _image_path: (
+            "\n".join(
+                [
+                    "lee. cath Cero",
+                    "sv2a 2077,165 SAR",
+                ]
+            ),
+            (),
+        ),
+    )
+
+    class StubVisionClient:
+        descriptor = "ollama:gemma3:12b"
+
+        def analyze_card_image(
+            self,
+            image_path: Path,
+            *,
+            game_hint: str | None = None,
+            title_hint: str | None = None,
+        ) -> LocalVisionCardCandidate:
+            return LocalVisionCardCandidate(
+                backend="ollama",
+                model="gemma3:12b",
+                game="pokemon",
+                title="Pikachu",
+                aliases=("ピカチュウ",),
+                card_number="166/198",
+                rarity="ULTRARARE",
+                set_code="spl",
+                confidence=0.99,
+            )
+
+        def analyze_card_image_text_focus(
+            self,
+            image_path: Path,
+            *,
+            game_hint: str | None = None,
+            title_hint: str | None = None,
+        ) -> LocalVisionCardCandidate:
+            return LocalVisionCardCandidate(
+                backend="ollama",
+                model="gemma3:12b",
+                game="pokemon",
+                title=None,
+                aliases=(),
+                card_number="201/165",
+                rarity="SAR",
+                set_code="sv2a",
+                confidence=0.93,
+            )
+
+    service._local_vision_clients = (StubVisionClient(),)
+    monkeypatch.setattr(
+        service,
+        "_run_footer_metadata_probe",
+        lambda *args, **kwargs: (
+            LocalVisionCardCandidate(
+                backend="ollama",
+                model="gemma3:12b",
+                game="pokemon",
+                title=None,
+                aliases=(),
+                card_number="201/165",
+                rarity="SAR",
+                set_code="sv2a",
+                confidence=0.93,
+            ),
+            (),
+        ),
+    )
+
+    image_path = tmp_path / "telegram-upload-charizard.jpg"
+    image_path.write_bytes(b"fake-image")
+
+    outcome = service.lookup_image(image_path, persist=False)
+
+    assert outcome.status == "success"
+    assert outcome.lookup_result is not None
+    assert outcome.lookup_result.spec.title == CHARIZARD_JP
+    assert outcome.lookup_result.spec.card_number == "201/165"
+    assert outcome.parsed.title == CHARIZARD_JP
+    assert calls[0].title == "201/165"
+    assert any("footer-focused local vision metadata" in warning for warning in outcome.warnings)
 
 
 def test_parse_image_escalates_to_second_local_vision_model_when_first_is_incomplete(tmp_path) -> None:
@@ -784,4 +961,62 @@ def test_prepare_lookup_spec_uses_slab_number_to_recover_full_card_number(monkey
     assert spec.card_number == "110/080"
     assert spec.rarity == "SAR"
     assert spec.set_code == "m2"
+    assert resolved_parsed.card_number == "110/080"
+
+
+def test_prepare_lookup_spec_repairs_wrong_card_number_using_slab_number(monkeypatch, tmp_path) -> None:
+    class StubPriceService:
+        def __init__(self, db_path):
+            self.db_path = db_path
+
+        def lookup(self, spec: TcgCardSpec, *, persist: bool = False) -> TcgLookupResult:
+            if spec.card_number != "110/080":
+                return TcgLookupResult(
+                    spec=spec,
+                    item=TrackedItem(item_id="x", item_type="card", category="tcg", title=spec.title),
+                    offers=(),
+                    fair_value=None,
+                )
+            offer = MarketOffer(
+                source="cardrush_pokemon",
+                listing_id="1",
+                url="https://example.com/1",
+                title="メガリザードンXex",
+                price_jpy=79800,
+                price_kind="ask",
+                captured_at=datetime.now(timezone.utc),
+                source_category="marketplace",
+                attributes={"card_number": "110/080", "rarity": "SAR", "set_code": "m2"},
+            )
+            return TcgLookupResult(
+                spec=spec,
+                item=TrackedItem(item_id="x", item_type="card", category="tcg", title=spec.title),
+                offers=(offer,),
+                fair_value=None,
+            )
+
+    monkeypatch.setattr("tcg_tracker.image_lookup.TcgPriceService", StubPriceService)
+
+    service = TcgImagePriceService(
+        db_path=tmp_path / "monitor.sqlite3",
+        settings=AssistantSettings(monitor_db_path=str(tmp_path / "monitor.sqlite3")),
+    )
+    parsed = ParsedCardImage(
+        status="success",
+        game="pokemon",
+        title="MEGA CHARIZARD X ex",
+        aliases=(),
+        card_number="470/080",
+        rarity="AR",
+        set_code="m2",
+        raw_text="2025 POKEMON M2 JP\n#110\nMEGA CHARIZARD X ex",
+        extracted_lines=("2025 POKEMON M2 JP", "#110", "MEGA CHARIZARD X ex"),
+        warnings=(),
+    )
+
+    resolved_parsed, spec = service._prepare_lookup_spec(parsed)
+
+    assert spec is not None
+    assert spec.title == "メガリザードンXex"
+    assert spec.card_number == "110/080"
     assert resolved_parsed.card_number == "110/080"

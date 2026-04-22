@@ -34,3 +34,6 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+markers = [
+  "live_image_lookup: verifies live image lookup regression fixtures against current OCR and marketplace sources.",
+]

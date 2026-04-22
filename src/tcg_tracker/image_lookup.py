@@ -35,6 +35,7 @@ POKEMON_NOISY_NUMBER_RE = re.compile(
     r"(?<!\d)(?P<number>\d{1,3})\s*(?P<separator>[/\\|)\]}>-]?)\s*(?P<denominator>\d{2,3})(?!\d)(?:\s*[/\\|)\]}>-]?\s*(?P<rarity>[A-Z]{1,5}))?",
     re.IGNORECASE,
 )
+POKEMON_DENSE_FOOTER_RE = re.compile(r"(?<!\d)(?P<blob>(?:\d[\d\]\[\{\}\.,;:/\\\s]{0,2}){6,7})(?!\d)", re.IGNORECASE)
 WS_NUMBER_RE = re.compile(r"(?P<number>[A-Z0-9]{2,6}/[A-Z0-9]{1,6}-\d{2,3}[A-Z]{0,4})", re.IGNORECASE)
 SET_CODE_RE = re.compile(
     r"\b(SVP(?:\s*EN)?|SV-P|MC(?:\s*JP)?|M-P|SM-P|S-P|XY-P|BW-P|SV\d{1,2}[A-Z]?|M\d{1,2}[A-Z]?|SM\d{1,2}[A-Z]?|S\d{1,2}[A-Z]?|PJS|SMP|KMS)\b",
@@ -254,6 +255,7 @@ class TcgImagePriceService:
                 resolved_path,
                 game_hint=parsed.game or resolved_game_hint,
                 title_hint=resolved_title_hint,
+                parsed=parsed,
             )
             warnings.extend(vision_warnings)
             if vision_candidate is not None:
@@ -284,6 +286,8 @@ class TcgImagePriceService:
             return True
         if parsed.title is None:
             return True
+        if _pokemon_ocr_metadata_looks_suspicious(parsed):
+            return True
         return not _title_looks_usable(parsed.title)
 
     def _run_local_vision_fallback(
@@ -292,12 +296,16 @@ class TcgImagePriceService:
         *,
         game_hint: str | None,
         title_hint: str | None,
+        parsed: ParsedCardImage,
     ) -> tuple[LocalVisionCardCandidate | None, tuple[str, ...]]:
         if not self._local_vision_clients:
             return None, ()
         warnings: list[str] = []
         candidates: list[LocalVisionCardCandidate] = []
-        for client in self._local_vision_clients:
+        ordered_clients = list(self._local_vision_clients)
+        if _pokemon_ocr_metadata_looks_suspicious(parsed):
+            ordered_clients.sort(key=lambda client: _local_vision_client_priority(client.descriptor))
+        for client in ordered_clients:
             if getattr(client, "is_temporarily_disabled", lambda: False)():
                 remaining = getattr(client, "cooldown_remaining_seconds", lambda: 0)()
                 logger.info(
@@ -362,20 +370,167 @@ class TcgImagePriceService:
                 None if candidate is None else candidate.set_code,
             )
 
-            if candidate is None:
+            if candidate is not None:
+                candidate = _sanitize_local_vision_candidate(candidate)
+
+            footer_candidate = None
+            if self._should_try_footer_metadata_probe(parsed, candidate, game_hint=game_hint):
+                footer_candidate, footer_warnings = self._run_footer_metadata_probe(
+                    client,
+                    image_path,
+                    game_hint=game_hint,
+                    title_hint=title_hint,
+                )
+                warnings.extend(footer_warnings)
+                if footer_candidate is not None:
+                    footer_candidate = _sanitize_local_vision_candidate(footer_candidate)
+
+            selected_candidates: list[LocalVisionCardCandidate] = []
+            if footer_candidate is not None and _should_prefer_footer_metadata_candidate(candidate, footer_candidate):
+                logger.info(
+                    "Local vision footer metadata candidate selected image=%s backend=%s generic_card_number=%s footer_card_number=%s",
+                    image_path,
+                    client.descriptor,
+                    None if candidate is None else candidate.card_number,
+                    footer_candidate.card_number,
+                )
+                selected_candidates.append(footer_candidate)
+                warnings.append(
+                    f"Used footer-focused local vision metadata via {client.descriptor} to stabilize the card number."
+                )
+            else:
+                if candidate is not None:
+                    selected_candidates.append(candidate)
+                if footer_candidate is not None:
+                    selected_candidates.append(footer_candidate)
+
+            if not selected_candidates:
                 warnings.append(f"Local vision fallback via {client.descriptor} did not return a usable candidate.")
                 continue
 
-            candidate = _sanitize_local_vision_candidate(candidate)
-            candidates.append(candidate)
-            warnings.extend(candidate.warnings)
-            if _local_vision_candidate_is_complete(candidate):
+            for selected_candidate in selected_candidates:
+                candidates.append(selected_candidate)
+                warnings.extend(selected_candidate.warnings)
+            should_stop_after_footer_metadata = (
+                footer_candidate is not None
+                and selected_candidates == [footer_candidate]
+                and (
+                    parsed.title is None
+                    or not _title_looks_usable(parsed.title)
+                    or _pokemon_ocr_metadata_looks_suspicious(parsed)
+                )
+                and _pokemon_card_number_looks_complete(footer_candidate.card_number)
+            )
+            if should_stop_after_footer_metadata or any(
+                _local_vision_candidate_is_complete(selected_candidate) for selected_candidate in selected_candidates
+            ):
                 break
 
         best_candidate = _select_best_local_vision_candidate(candidates)
         if best_candidate is None:
             return None, tuple(_dedupe_preserve_order(warnings))
         return best_candidate, tuple(_dedupe_preserve_order(warnings))
+
+    def _should_try_footer_metadata_probe(
+        self,
+        parsed: ParsedCardImage,
+        candidate: LocalVisionCardCandidate | None,
+        *,
+        game_hint: str | None,
+    ) -> bool:
+        if game_hint != "pokemon":
+            return False
+        if _pokemon_ocr_metadata_looks_suspicious(parsed):
+            return True
+        if parsed.card_number is None or not _pokemon_card_number_looks_complete(parsed.card_number):
+            return True
+        if parsed.title is None or not _title_looks_usable(parsed.title):
+            return True
+        if candidate is None:
+            return True
+        return _card_number_quality("pokemon", candidate.card_number) < 4
+
+    def _run_footer_metadata_probe(
+        self,
+        client,
+        image_path: Path,
+        *,
+        game_hint: str | None,
+        title_hint: str | None,
+    ) -> tuple[LocalVisionCardCandidate | None, tuple[str, ...]]:
+        if not hasattr(client, "analyze_card_image_text_focus"):
+            return None, ()
+        try:
+            from PIL import Image, ImageOps
+        except ImportError:
+            return None, ("Pillow is required for footer-focused local vision metadata probing.",)
+
+        warnings: list[str] = []
+        temporary_path: Path | None = None
+        started_at = time.monotonic()
+        logger.info(
+            "Local vision footer metadata probe starting image=%s backend=%s game_hint=%s",
+            image_path,
+            client.descriptor,
+            game_hint,
+        )
+        try:
+            with Image.open(image_path) as opened:
+                image = ImageOps.exif_transpose(opened).convert("RGB")
+                width, height = image.size
+                footer_region = image.crop((0, int(height * 0.74), int(width * 0.72), int(height * 0.99)))
+                footer_region = footer_region.resize((footer_region.width * 2, footer_region.height * 2))
+                with tempfile.NamedTemporaryFile(
+                    mode="w+b",
+                    suffix=".png",
+                    prefix="lv-footer-",
+                    dir=self._workspace_temp_dir,
+                    delete=False,
+                ) as handle:
+                    temporary_path = Path(handle.name)
+                footer_region.save(temporary_path)
+            candidate = client.analyze_card_image_text_focus(
+                temporary_path,
+                game_hint=game_hint,
+                title_hint=title_hint,
+            )
+        except LocalVisionTimeoutError:
+            raise
+        except Exception:
+            logger.exception(
+                "Local vision footer metadata probe failed image=%s backend=%s",
+                image_path,
+                client.descriptor,
+            )
+            warnings.append(f"Footer-focused local vision metadata probe via {client.descriptor} failed.")
+            return None, tuple(_dedupe_preserve_order(warnings))
+        finally:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except PermissionError:
+                    logger.debug("Could not remove temporary local vision footer probe path=%s", temporary_path)
+
+        if candidate is None:
+            logger.info(
+                "Local vision footer metadata probe returned no candidate image=%s backend=%s elapsed_seconds=%.2f",
+                image_path,
+                client.descriptor,
+                time.monotonic() - started_at,
+            )
+            return None, tuple(_dedupe_preserve_order(warnings))
+
+        candidate = replace(candidate, title=None, aliases=())
+        logger.info(
+            "Local vision footer metadata probe completed image=%s backend=%s elapsed_seconds=%.2f candidate_card_number=%s candidate_rarity=%s candidate_set_code=%s",
+            image_path,
+            client.descriptor,
+            time.monotonic() - started_at,
+            candidate.card_number,
+            candidate.rarity,
+            candidate.set_code,
+        )
+        return candidate, tuple(_dedupe_preserve_order(warnings))
 
     def _prepare_lookup_spec(self, parsed: ParsedCardImage) -> tuple[ParsedCardImage, TcgCardSpec | None]:
         spec = parsed.to_spec()
@@ -424,17 +579,20 @@ class TcgImagePriceService:
                 processed = ImageOps.autocontrast(image.convert("L"))
                 processed = processed.filter(ImageFilter.UnsharpMask(radius=2, percent=180, threshold=3))
                 width, height = processed.size
+                footer_left = processed.crop((int(width * 0.02), int(height * 0.80), int(width * 0.60), int(height * 0.96)))
+                footer_left_binary = ImageOps.autocontrast(footer_left).point(lambda value: 255 if value > 145 else 0)
                 regions = (
-                    ("slab_top", processed.crop((0, 0, width, int(height * 0.24))), "eng", (11, 7)),
-                    ("card_title", processed.crop((0, int(height * 0.20), width, int(height * 0.40))), "jpn+eng", (7, 11)),
-                    ("card_body", processed.crop((0, int(height * 0.38), width, int(height * 0.78))), "jpn+eng", (6, 11)),
-                    ("card_footer", processed.crop((0, int(height * 0.78), width, height)), "jpn+eng", (11, 6)),
-                    ("card_code_strip", processed.crop((0, int(height * 0.82), width, int(height * 0.98))), "jpn+eng", (11, 6, 7)),
+                    ("slab_top", processed.crop((0, 0, width, int(height * 0.24))), "eng", (11, 7), (1,)),
+                    ("card_title", processed.crop((0, int(height * 0.20), width, int(height * 0.40))), "jpn+eng", (7, 11), (1,)),
+                    ("card_body", processed.crop((0, int(height * 0.38), width, int(height * 0.78))), "jpn+eng", (6, 11), (1,)),
+                    ("card_footer", processed.crop((0, int(height * 0.78), width, height)), "jpn+eng", (11, 6), (1,)),
+                    ("card_code_strip", processed.crop((0, int(height * 0.82), width, int(height * 0.98))), "jpn+eng", (11, 6, 7), (1, 4)),
+                    ("card_footer_left", footer_left, "jpn+eng", (11, 12, 6), (2, 4, 6)),
+                    ("card_footer_left_binary", footer_left_binary, "jpn+eng", (11, 12), (4, 6)),
                 )
                 temporary_paths: list[Path] = []
                 try:
-                    for region_name, region_image, language, psm_values in regions:
-                        scale_factors = (1, 4) if region_name == "card_code_strip" else (1,)
+                    for region_name, region_image, language, psm_values, scale_factors in regions:
                         for scale_factor in scale_factors:
                             scaled_region = region_image
                             if scale_factor > 1:
@@ -625,23 +783,29 @@ class TcgImagePriceService:
         if not any((parsed.card_number, parsed.rarity, parsed.set_code)):
             return None
 
-        if parsed.card_number:
+        slab_number = _extract_slab_label_metadata(list(parsed.extracted_lines))[2]
+        repaired_card_number = _repair_pokemon_card_number_with_slab(
+            parsed.card_number,
+            slab_number,
+        ) if parsed.game == "pokemon" else parsed.card_number
+
+        if repaired_card_number:
             direct_aliases = list(parsed.aliases)
             if parsed.title and _title_looks_usable(parsed.title) and parsed.title not in direct_aliases:
                 direct_aliases.append(parsed.title)
             direct_specs = (
                 TcgCardSpec(
                     game=parsed.game,
-                    title=parsed.card_number,
-                    card_number=parsed.card_number,
+                    title=repaired_card_number,
+                    card_number=repaired_card_number,
                     rarity=parsed.rarity,
                     set_code=parsed.set_code,
                     aliases=tuple(direct_aliases),
                 ),
                 TcgCardSpec(
                     game=parsed.game,
-                    title=parsed.card_number,
-                    card_number=parsed.card_number,
+                    title=repaired_card_number,
+                    card_number=repaired_card_number,
                     aliases=tuple(direct_aliases),
                 ),
             )
@@ -655,18 +819,17 @@ class TcgImagePriceService:
         candidate_title = (
             parsed.title
             if parsed.title and _title_looks_usable(parsed.title)
-            else parsed.card_number or parsed.rarity or parsed.set_code or "ocr-partial"
+            else repaired_card_number or parsed.rarity or parsed.set_code or "ocr-partial"
         )
         candidate_spec = TcgCardSpec(
             game=parsed.game,
             title=candidate_title,
-            card_number=parsed.card_number,
+            card_number=repaired_card_number,
             rarity=parsed.rarity,
             set_code=parsed.set_code,
             aliases=parsed.aliases,
         )
-        slab_number = _extract_slab_label_metadata(list(parsed.extracted_lines))[2]
-        if candidate_spec.game == "pokemon" and candidate_spec.card_number is None and slab_number is not None:
+        if candidate_spec.game == "pokemon" and slab_number is not None:
             resolved_from_slab = _resolve_spec_from_slab_lookup_hints(candidate_spec, slab_number)
             if resolved_from_slab is not None:
                 return resolved_from_slab
@@ -837,6 +1000,7 @@ def _extract_card_number_and_rarity(lines: list[str]) -> tuple[str | None, str |
             exact_candidates.append((card_number, rarity, score))
 
         noisy_candidates.extend(_extract_noisy_pokemon_candidates(line))
+        noisy_candidates.extend(_extract_dense_pokemon_footer_candidates(line))
 
     if promo_candidates:
         card_number, rarity, _ = max(promo_candidates, key=lambda item: item[2])
@@ -926,6 +1090,18 @@ def _coalesce_rarity(game: str | None, extracted_rarity: str | None, slab_rarity
     return extracted_rarity or slab_rarity
 
 
+def _repair_pokemon_card_number_with_slab(card_number: str | None, slab_number: str | None) -> str | None:
+    normalized = _normalize_pokemon_card_number_value(card_number)
+    if normalized is None or slab_number is None or "/" not in normalized:
+        return normalized
+    numerator, denominator = normalized.split("/", 1)
+    if not numerator.isdigit() or not denominator.isdigit():
+        return normalized
+    repaired = f"{int(slab_number):0{len(numerator)}d}/{denominator}"
+    repaired_number, _ = _normalize_pokemon_number_candidate(repaired, None)
+    return repaired_number or normalized
+
+
 def _extract_pokemon_promo_candidates(line: str) -> list[tuple[str, str | None, int]]:
     normalized_line = unicodedata.normalize("NFKC", line or "")
     candidates: list[tuple[str, str | None, int]] = []
@@ -982,6 +1158,41 @@ def _extract_noisy_pokemon_candidates(line: str) -> list[tuple[str, str | None, 
             score += 12
         if denominator in {86, 100, 165, 190, 193}:
             score += 8
+        candidates.append((card_number, normalized_rarity, score))
+    return candidates
+
+
+def _extract_dense_pokemon_footer_candidates(line: str) -> list[tuple[str, str | None, int]]:
+    normalized_line = unicodedata.normalize("NFKC", line or "")
+    upper_line = normalized_line.upper()
+    has_set_code_context = bool(_extract_set_code(upper_line))
+    rarity = _extract_rarity(upper_line)
+    has_footer_context = has_set_code_context or rarity is not None or "EX" in upper_line
+    if not has_footer_context:
+        return []
+
+    candidates: list[tuple[str, str | None, int]] = []
+    for match in POKEMON_DENSE_FOOTER_RE.finditer(upper_line):
+        digits = "".join(character for character in match.group("blob") if character.isdigit())
+        if len(digits) not in {6, 7}:
+            continue
+        card_number, normalized_rarity = _normalize_pokemon_number_candidate(
+            f"{digits[:3]}/{digits[-3:]}",
+            rarity,
+        )
+        if card_number is None:
+            continue
+
+        denominator = int(card_number.split("/", 1)[1])
+        score = 34
+        if has_set_code_context:
+            score += 18
+        if normalized_rarity is not None:
+            score += 14
+        if denominator in {80, 86, 100, 165, 190, 193}:
+            score += 10
+        if len(digits) == 7:
+            score += 4
         candidates.append((card_number, normalized_rarity, score))
     return candidates
 
@@ -1295,16 +1506,31 @@ def _title_looks_usable_v2(value: str) -> bool:
     if signal / total < 0.55:
         return False
     if not _contains_japanese(stripped):
+        if not re.fullmatch(r"[A-Za-z0-9 .'/:-]+", stripped):
+            return False
         latin_words = re.findall(r"[A-Za-z']+", stripped)
         if latin_words:
             total_letters = sum(len(word) for word in latin_words)
             vowel_count = sum(1 for word in latin_words for char in word.lower() if char in {"a", "e", "i", "o", "u"})
             short_word_count = sum(1 for word in latin_words if len(word) <= 3)
+            capitalized_word_count = sum(1 for word in latin_words if word[:1].isupper() or word.isupper())
             if total_letters >= 6:
                 vowel_ratio = vowel_count / total_letters
                 if vowel_ratio > 0.72:
                     return False
             if len(latin_words) >= 4 and short_word_count >= len(latin_words) - 1:
+                return False
+            if len(latin_words) >= 3 and max(len(word) for word in latin_words) <= 4 and not any(
+                token.upper() in {"EX", "GX", "VMAX", "VSTAR", "TAG", "TEAM"}
+                for token in latin_words
+            ):
+                return False
+            if len(latin_words) >= 3 and capitalized_word_count <= 1 and not any(
+                token.upper() in {"EX", "GX", "VMAX", "VSTAR", "TAG", "TEAM"}
+                for token in latin_words
+            ):
+                return False
+            if len(latin_words) == 1 and len(latin_words[0]) >= 12 and latin_words[0].islower():
                 return False
             if len(latin_words) == 1 and "-" in stripped and not re.search(
                 r"\b(EX|GX|VMAX|VSTAR|LV\.?\d+)\b",
@@ -1339,6 +1565,10 @@ def _merge_local_vision_candidate(
 
     parsed_title_usable = bool(parsed.title and _title_looks_usable(parsed.title))
     candidate_title_usable = bool(candidate.title and _title_looks_usable(candidate.title))
+    metadata_only_candidate = (
+        candidate.title is None
+        and _card_number_quality(parsed.game or candidate.game, candidate.card_number) >= 4
+    )
     if parsed_title_usable and candidate_title_usable and normalize_text(parsed.title or "") != normalize_text(candidate.title or ""):
         if candidate.title not in aliases:
             aliases.append(candidate.title)
@@ -1348,21 +1578,38 @@ def _merge_local_vision_candidate(
     game = parsed.game or candidate.game
     card_number = parsed.card_number
     if metadata_compatible:
-        if _card_number_quality(game, candidate.card_number) > _card_number_quality(game, parsed.card_number):
+        if metadata_only_candidate and candidate.card_number is not None:
+            card_number = candidate.card_number
+        elif (
+            not parsed_title_usable
+            and candidate.card_number is not None
+            and normalize_card_number(candidate.card_number) != normalize_card_number(parsed.card_number or "")
+            and _card_number_quality(game, candidate.card_number) >= _card_number_quality(game, parsed.card_number)
+        ):
+            card_number = candidate.card_number
+        elif _card_number_quality(game, candidate.card_number) > _card_number_quality(game, parsed.card_number):
             card_number = candidate.card_number
         elif card_number is None:
             card_number = candidate.card_number
 
     rarity = parsed.rarity
     if metadata_compatible:
-        if _rarity_quality(parsed.rarity) < _rarity_quality(candidate.rarity):
+        if metadata_only_candidate and candidate.rarity is not None:
+            rarity = candidate.rarity
+        elif not parsed_title_usable and _rarity_quality(candidate.rarity) >= _rarity_quality(parsed.rarity):
+            rarity = candidate.rarity
+        elif _rarity_quality(parsed.rarity) < _rarity_quality(candidate.rarity):
             rarity = candidate.rarity
         elif rarity is None:
             rarity = candidate.rarity
 
     set_code = parsed.set_code
     if metadata_compatible:
-        if _set_code_quality(candidate.set_code) > _set_code_quality(parsed.set_code):
+        if metadata_only_candidate and candidate.set_code is not None:
+            set_code = candidate.set_code
+        elif not parsed_title_usable and _set_code_quality(candidate.set_code) >= _set_code_quality(parsed.set_code):
+            set_code = candidate.set_code
+        elif _set_code_quality(candidate.set_code) > _set_code_quality(parsed.set_code):
             set_code = candidate.set_code
         elif set_code is None:
             set_code = candidate.set_code
@@ -1454,6 +1701,26 @@ def _local_vision_candidates_are_compatible(
     if left.title and right.title:
         return normalize_text(left.title) == normalize_text(right.title)
     return True
+
+
+def _should_prefer_footer_metadata_candidate(
+    generic_candidate: LocalVisionCardCandidate | None,
+    footer_candidate: LocalVisionCardCandidate,
+) -> bool:
+    footer_quality = _card_number_quality(footer_candidate.game, footer_candidate.card_number)
+    if generic_candidate is None:
+        return footer_quality >= 4
+
+    generic_quality = _card_number_quality(generic_candidate.game, generic_candidate.card_number)
+    if footer_quality > generic_quality:
+        return True
+    if footer_quality < 4:
+        return False
+    if generic_quality < 4:
+        return True
+    if generic_candidate.card_number and footer_candidate.card_number:
+        return normalize_card_number(generic_candidate.card_number) != normalize_card_number(footer_candidate.card_number)
+    return False
 
 
 def _merge_local_vision_candidates(
@@ -1610,6 +1877,39 @@ def _dedupe_preserve_order(values: list[str]) -> list[str]:
         if value and value not in deduped:
             deduped.append(value)
     return deduped
+
+
+def _local_vision_client_priority(descriptor: str) -> tuple[int, str]:
+    lowered = descriptor.lower()
+    if "gemma" in lowered:
+        return (0, lowered)
+    if "qwen" in lowered:
+        return (1, lowered)
+    return (2, lowered)
+
+
+def _pokemon_ocr_metadata_looks_suspicious(parsed: ParsedCardImage) -> bool:
+    if parsed.game != "pokemon":
+        return False
+    set_code = (parsed.set_code or "").lower()
+    title = parsed.title or ""
+    if set_code and re.fullmatch(r"s\d{1,3}[a-z]?", set_code) and not set_code.startswith("sv"):
+        return True
+    if (
+        parsed.rarity in {"PR", "SS", "H"}
+        and set_code
+        and set_code.startswith("s")
+        and not set_code.startswith("sv")
+    ):
+        return True
+    if (
+        title
+        and not _contains_japanese(title)
+        and not re.search(r"\b(EX|GX|VMAX|VSTAR)\b", title.upper())
+        and len(parsed.extracted_lines) >= 80
+    ):
+        return True
+    return False
 
 
 def _local_vision_metadata_is_compatible(

@@ -108,10 +108,36 @@ class OllamaLocalVisionClient:
         game_hint: str | None = None,
         title_hint: str | None = None,
     ) -> LocalVisionCardCandidate | None:
+        return self._analyze_with_prompt(
+            image_path,
+            prompt=self._build_prompt(game_hint=game_hint, title_hint=title_hint),
+            game_hint=game_hint,
+        )
+
+    def analyze_card_image_text_focus(
+        self,
+        image_path: Path,
+        *,
+        game_hint: str | None = None,
+        title_hint: str | None = None,
+    ) -> LocalVisionCardCandidate | None:
+        return self._analyze_with_prompt(
+            image_path,
+            prompt=self._build_text_focus_prompt(game_hint=game_hint, title_hint=title_hint),
+            game_hint=game_hint,
+        )
+
+    def _analyze_with_prompt(
+        self,
+        image_path: Path,
+        *,
+        prompt: str,
+        game_hint: str | None,
+    ) -> LocalVisionCardCandidate | None:
         image_payload = base64.b64encode(image_path.read_bytes()).decode("ascii")
         payload = {
             "model": self.model,
-            "prompt": self._build_prompt(game_hint=game_hint, title_hint=title_hint),
+            "prompt": prompt,
             "images": [image_payload],
             "format": CARD_JSON_SCHEMA,
             "stream": False,
@@ -159,6 +185,24 @@ class OllamaLocalVisionClient:
             "Preserve the Japanese title when visible.\n"
             "Use null for unknown values instead of guessing.\n"
             "aliases should contain only high-confidence alternate names.\n"
+            "Hints:\n"
+            f"{hint_text}\n"
+        )
+
+    def _build_text_focus_prompt(self, *, game_hint: str | None, title_hint: str | None) -> str:
+        hints: list[str] = []
+        if game_hint in {"pokemon", "ws"}:
+            hints.append(f"game_hint={game_hint}")
+        if title_hint:
+            hints.append(f"title_hint={title_hint}")
+        hint_text = "\n".join(hints) if hints else "no external hints"
+        return (
+            "Read only the printed card identity text from this trading card image and return only JSON.\n"
+            "Prioritize the printed card name near the top and the collector number, rarity, and set code near the bottom.\n"
+            "Do not identify the artwork subject, attack names, slab labels, cert numbers, or promo guesses unless the printed card text supports them.\n"
+            "If you are unsure about the title, keep title null but still return card_number, rarity, and set_code when visible.\n"
+            "For Pokemon cards, prefer collector numbers like 201/165, 110/080, 085/SV-P, or 020/M-P.\n"
+            'Use game values "pokemon", "ws", or null.\n'
             "Hints:\n"
             f"{hint_text}\n"
         )

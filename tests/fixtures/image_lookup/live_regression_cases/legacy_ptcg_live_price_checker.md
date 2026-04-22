@@ -1,9 +1,9 @@
 # PTCG Live Price Checker
 
 This repository implements a complete Vue 3 + FastAPI service that:
-1) OCRs uploaded card/slab images in real time  
-2) Generates search keywords from OCR output  
-3) Queries live web sources for price data  
+1) OCRs uploaded card/slab images in real time
+2) Generates search keywords from OCR output
+3) Queries live web sources for price data
 4) Returns normalized JPY prices with full step-by-step logs
 
 No static card-price table is used.
