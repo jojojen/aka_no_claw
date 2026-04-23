@@ -59,6 +59,20 @@ class TelegramPhotoQuery:
     file_id: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class TelegramTextReplyPlan:
+    ack: str | None
+    reply: str | None
+    reply_factory: Callable[[], str] | None = None
+
+    def execute(self) -> str | None:
+        if self.reply is not None:
+            return self.reply
+        if self.reply_factory is not None:
+            return self.reply_factory()
+        return None
+
+
 class TelegramBotClient:
     def __init__(
         self,
@@ -155,46 +169,64 @@ class TelegramCommandProcessor:
         return str(chat_id) == str(allowed_chat_id)
 
     def build_reply(self, *, chat_id: str | int, text: str | None) -> str | None:
+        return self.build_reply_plan(chat_id=chat_id, text=text).execute()
+
+    def build_reply_plan(self, *, chat_id: str | int, text: str | None) -> TelegramTextReplyPlan:
         logger.info(
             "Telegram message received chat_id=%s text=%s",
             mask_identifier(chat_id),
             trim_for_log(text or "", limit=320),
         )
         if text is None:
-            return None
+            return TelegramTextReplyPlan(ack=None, reply=None)
         if not self.is_allowed_chat(chat_id):
             logger.warning("Rejected Telegram message from unauthorized chat_id=%s", mask_identifier(chat_id))
-            return None
+            return TelegramTextReplyPlan(ack=None, reply=None)
 
         content = text.strip()
         if not content:
-            return "Empty command. Use /help to see supported commands."
+            return TelegramTextReplyPlan(ack=None, reply="Empty command. Use /help to see supported commands.")
 
         command = _extract_command_name(content)
         remainder = _extract_command_remainder(content)
         logger.debug("Telegram command parsed command=%s remainder=%s", command, trim_for_log(remainder, limit=240))
 
         if command in {"/start", "/help"}:
-            return self._help_text()
+            return TelegramTextReplyPlan(ack=None, reply=self._help_text())
         if command == "/ping":
-            return "pong"
+            return TelegramTextReplyPlan(ack=None, reply="pong")
         if command == "/status":
-            return self._status_text()
+            return TelegramTextReplyPlan(ack=None, reply=self._status_text())
         if command == "/tools":
-            return self._catalog_renderer()
+            return TelegramTextReplyPlan(ack=None, reply=self._catalog_renderer())
         if command in PRICE_LOOKUP_COMMANDS:
-            return self._handle_lookup(remainder)
+            return TelegramTextReplyPlan(
+                ack=build_processing_ack(text=content),
+                reply=None,
+                reply_factory=lambda remainder=remainder: self._handle_lookup(remainder),
+            )
         if command in TREND_BOARD_COMMANDS:
-            return self._handle_liquidity(remainder)
+            return TelegramTextReplyPlan(
+                ack=build_processing_ack(text=content),
+                reply=None,
+                reply_factory=lambda remainder=remainder: self._handle_liquidity(remainder),
+            )
         if command in PHOTO_SCAN_COMMANDS:
-            return "Send a card photo with the caption /scan pokemon or /scan ws, and I will parse it and then look up the price."
+            return TelegramTextReplyPlan(
+                ack=None,
+                reply="Send a card photo with the caption /scan pokemon or /scan ws, and I will parse it and then look up the price.",
+            )
         if not content.startswith("/"):
-            natural_language_reply = self._handle_natural_language(content)
-            if natural_language_reply is not None:
-                return natural_language_reply
+            intent = self._route_natural_language(content)
+            natural_language_plan = self._build_natural_language_reply_plan(intent)
+            if natural_language_plan is not None:
+                return natural_language_plan
 
         logger.info("Telegram unknown command command=%s", command)
-        return "Unknown command. Use /help, /price, /trend, or send a photo with /scan. You can also ask in natural language."
+        return TelegramTextReplyPlan(
+            ack=None,
+            reply="Unknown command. Use /help, /price, /trend, or send a photo with /scan. You can also ask in natural language.",
+        )
 
     def _handle_lookup(self, raw: str) -> str:
         try:
@@ -244,14 +276,26 @@ class TelegramCommandProcessor:
 
     def _handle_natural_language(self, text: str) -> str | None:
         intent = self._route_natural_language(text)
+        plan = self._build_natural_language_reply_plan(intent)
+        if plan is None:
+            return None
+        return plan.reply
+
+    def _build_natural_language_reply_plan(
+        self,
+        intent: TelegramNaturalLanguageIntent | None,
+    ) -> TelegramTextReplyPlan | None:
         if intent is None:
             return None
         if intent.intent == "help":
             logger.info("Telegram natural-language routed intent=help")
-            return self._help_text()
+            return TelegramTextReplyPlan(ack=None, reply=self._help_text())
         if intent.intent == "trend_board":
             if intent.game not in {"pokemon", "ws"}:
-                return "I understood that you want the hot board, but I still need the game: pokemon or ws."
+                return TelegramTextReplyPlan(
+                    ack=None,
+                    reply="I understood that you want the hot board, but I still need the game: pokemon or ws.",
+                )
             limit = 5 if intent.limit is None else max(1, min(10, intent.limit))
             logger.info(
                 "Telegram natural-language routed intent=trend_board game=%s limit=%s confidence=%s",
@@ -259,13 +303,23 @@ class TelegramCommandProcessor:
                 limit,
                 intent.confidence,
             )
-            return self._handle_liquidity(f"{intent.game} {limit}")
+            return TelegramTextReplyPlan(
+                ack=f"已理解查詢內容，相當於 /trend {intent.game} {limit}，開始整理資料。",
+                reply=None,
+                reply_factory=lambda game=intent.game, limit=limit: self._handle_liquidity(f"{game} {limit}"),
+            )
         if intent.intent == "lookup_card":
             if intent.game not in {"pokemon", "ws"}:
-                return "I understood that you want a card lookup, but I still need the game: pokemon or ws."
+                return TelegramTextReplyPlan(
+                    ack=None,
+                    reply="I understood that you want a card lookup, but I still need the game: pokemon or ws.",
+                )
             resolved_name = intent.name or intent.card_number
             if not resolved_name:
-                return "I understood that you want a card lookup, but I still need the card name."
+                return TelegramTextReplyPlan(
+                    ack=None,
+                    reply="I understood that you want a card lookup, but I still need the card name.",
+                )
             query = TelegramLookupQuery(
                 game=intent.game,
                 name=resolved_name,
@@ -283,10 +337,17 @@ class TelegramCommandProcessor:
                 intent.confidence,
             )
             try:
-                return self._lookup_renderer(query)
+                return TelegramTextReplyPlan(
+                    ack=f"已理解查詢內容，相當於 {_format_lookup_ack_command(query)}，開始查價。",
+                    reply=None,
+                    reply_factory=lambda query=query: self._lookup_renderer(query),
+                )
             except Exception as exc:  # pragma: no cover - source/network-dependent.
                 logger.exception("Telegram natural-language lookup failed game=%s name=%s", query.game, query.name)
-                return f"Lookup failed: {exc}"
+                return TelegramTextReplyPlan(
+                    ack=None,
+                    reply=f"Lookup failed: {exc}",
+                )
         return None
 
     def _route_natural_language(self, text: str) -> TelegramNaturalLanguageIntent | None:
@@ -378,6 +439,14 @@ def parse_lookup_command(raw: str) -> TelegramLookupQuery:
     if not name:
         raise ValueError("Lookup name cannot be empty.")
     return TelegramLookupQuery(game=game, name=name)
+
+
+def _format_lookup_ack_command(query: TelegramLookupQuery) -> str:
+    metadata = [query.card_number, query.rarity, query.set_code]
+    if any(metadata):
+        parts = [query.game, query.name, *(value or "" for value in metadata)]
+        return f"/price {' | '.join(parts)}"
+    return f"/price {query.game} {query.name}"
 
 
 def format_liquidity_board(board: HotCardBoard, *, limit: int = 5) -> str:
@@ -618,12 +687,12 @@ def handle_telegram_message(
         return tuple(replies)
 
     text = message.get("text")
-    ack = build_processing_ack(text=text if isinstance(text, str) else None)
-    if ack:
-        client.send_message(chat_id=chat_id, text=ack)
-        replies.append(ack)
+    plan = processor.build_reply_plan(chat_id=chat_id, text=text if isinstance(text, str) else None)
+    if plan.ack:
+        client.send_message(chat_id=chat_id, text=plan.ack)
+        replies.append(plan.ack)
 
-    reply = processor.build_reply(chat_id=chat_id, text=text if isinstance(text, str) else None)
+    reply = plan.execute()
     if reply:
         logger.debug(
             "Telegram reply sending chat_id=%s text=%s",

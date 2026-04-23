@@ -211,6 +211,41 @@ def test_command_processor_handles_natural_language_trend_via_router() -> None:
     assert router.seen_texts == ["pokemon 熱門前 3"]
 
 
+def test_command_processor_builds_ack_for_natural_language_trend() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    router = StubNaturalLanguageRouter(
+        TelegramNaturalLanguageIntent(
+            intent="trend_board",
+            game="ws",
+            limit=5,
+            confidence=0.94,
+        )
+    )
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (
+            HotCardBoard(
+                game="ws",
+                label="WS Liquidity Board",
+                methodology="stub methodology",
+                generated_at=datetime.now(timezone.utc),
+                items=_stub_board().items,
+            ),
+        ),
+        catalog_renderer=lambda: "catalog",
+        natural_language_router=router,
+    )
+
+    plan = processor.build_reply_plan(chat_id="123", text="ws 熱門前 5")
+
+    assert plan.ack == "已理解查詢內容，相當於 /trend ws 5，開始整理資料。"
+    reply = plan.execute()
+    assert reply is not None
+    assert "WS Liquidity Board" in reply
+    assert router.seen_texts == ["ws 熱門前 5"]
+
+
 def test_build_processing_ack_for_heavy_actions() -> None:
     assert build_processing_ack(text="/price pokemon Pikachu ex") == "收到查價指令，開始處理。"
     assert build_processing_ack(text="/trend pokemon") == "收到趨勢榜查詢，開始整理資料。"
@@ -272,6 +307,94 @@ def test_handle_telegram_message_sends_ack_then_text_result() -> None:
         "pokemon:Pikachu ex",
     )
     assert client.sent_messages == list(replies)
+
+
+def test_handle_telegram_message_sends_natural_language_ack_then_result() -> None:
+    client = FakeTelegramClient()
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    router = StubNaturalLanguageRouter(
+        TelegramNaturalLanguageIntent(
+            intent="trend_board",
+            game="ws",
+            limit=5,
+            confidence=0.94,
+        )
+    )
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: f"{query.game}:{query.name}",
+        board_loader=lambda: (
+            HotCardBoard(
+                game="ws",
+                label="WS Liquidity Board",
+                methodology="stub methodology",
+                generated_at=datetime.now(timezone.utc),
+                items=_stub_board().items,
+            ),
+        ),
+        catalog_renderer=lambda: "catalog",
+        natural_language_router=router,
+    )
+
+    replies = handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={
+            "chat": {"id": "123"},
+            "text": "ws 熱門前 5",
+        },
+    )
+
+    assert replies[0] == "已理解查詢內容，相當於 /trend ws 5，開始整理資料。"
+    assert "WS Liquidity Board" in replies[1]
+    assert client.sent_messages == list(replies)
+
+
+def test_handle_telegram_message_sends_natural_language_ack_before_running_heavy_work() -> None:
+    client = FakeTelegramClient()
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    router = StubNaturalLanguageRouter(
+        TelegramNaturalLanguageIntent(
+            intent="trend_board",
+            game="ws",
+            limit=3,
+            confidence=0.94,
+        )
+    )
+
+    def board_loader() -> tuple[HotCardBoard, ...]:
+        assert client.sent_messages == ["已理解查詢內容，相當於 /trend ws 3，開始整理資料。"]
+        return (
+            HotCardBoard(
+                game="ws",
+                label="WS Liquidity Board",
+                methodology="stub methodology",
+                generated_at=datetime.now(timezone.utc),
+                items=_stub_board().items,
+            ),
+        )
+
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: f"{query.game}:{query.name}",
+        board_loader=board_loader,
+        catalog_renderer=lambda: "catalog",
+        natural_language_router=router,
+    )
+
+    replies = handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={
+            "chat": {"id": "123"},
+            "text": "查ws熱門前3",
+        },
+    )
+
+    assert replies[0] == "已理解查詢內容，相當於 /trend ws 3，開始整理資料。"
+    assert "WS Liquidity Board" in replies[1]
 
 
 def _mixed_grade_lookup_result() -> TcgLookupResult:
