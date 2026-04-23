@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+from market_monitor.http import HttpClient
 from tcg_tracker.hot_cards import (
     HotCardBuySignal,
     HotCardReference,
     HotCardSocialSignal,
+    YUYUTEI_WS_TOP_URL,
     TcgHotCardService,
     _ParsedHotItem,
     _parse_cardrush_text,
@@ -12,6 +16,19 @@ from tcg_tracker.hot_cards import (
     _parse_yahoo_realtime_signal,
 )
 from tcg_tracker.catalog import TcgCardSpec
+
+FIXTURE_DIR = Path(__file__).parent / "fixtures"
+
+
+class FixtureHttpClient(HttpClient):
+    def __init__(self, responses: dict[str, str]) -> None:
+        self.responses = responses
+        super().__init__(user_agent="fixture")
+
+    def get_text(self, url: str, *, params=None, encoding="utf-8", headers=None) -> str:  # type: ignore[override]
+        if url in self.responses:
+            return self.responses[url]
+        raise AssertionError(f"unexpected url: {url}")
 
 
 def _buy_signal(
@@ -633,6 +650,47 @@ def test_parse_magi_ws_items_extracts_thumbnail_url() -> None:
     assert len(items) == 1
     assert items[0].thumbnail_url == "https://magi.camp/cdn/ws-thumb.jpg"
     assert items[0].detail_url == "https://magi.camp/products/999"
+
+
+def test_parse_yuyutei_ws_carousel_items_extracts_featured_cards() -> None:
+    html = (FIXTURE_DIR / "yuyutei_ws_sell_search.html").read_text(encoding="utf-8")
+
+    service = TcgHotCardService()
+    items = service._parse_yuyutei_ws_carousel_items(  # type: ignore[attr-defined]
+        html,
+        board_url=YUYUTEI_WS_TOP_URL,
+        carousel_id="recommendedItemList",
+        source_label="Yuyutei featured singles",
+        source_weight=0.34,
+        note="featured",
+        minimum_price_jpy=5000,
+    )
+
+    assert items
+    assert items[0].card_number == "PJS/S125-083EX"
+    assert items[0].rarity == "SEC"
+    assert items[0].price_jpy == 19800
+    assert items[0].detail_url == "https://yuyu-tei.jp/sell/ws/card/pjs3.0/10263"
+    assert items[0].board_url == YUYUTEI_WS_TOP_URL
+    assert items[0].source_label == "Yuyutei featured singles"
+
+
+def test_load_ws_board_items_uses_live_sources_instead_of_legacy_articles() -> None:
+    service = TcgHotCardService(
+        http_client=FixtureHttpClient(
+            {
+                YUYUTEI_WS_TOP_URL: (FIXTURE_DIR / "yuyutei_ws_sell_search.html").read_text(encoding="utf-8"),
+            }
+        )
+    )
+
+    items, methodology = service._load_ws_board_items()  # type: ignore[attr-defined]
+
+    assert items
+    assert all(item.board_url == YUYUTEI_WS_TOP_URL for item in items)
+    assert any(item.source_label == "Yuyutei featured singles" for item in items)
+    assert any(item.source_label == "Yuyutei latest-release spotlight" for item in items)
+    assert "Static SNKRDUNK article rankings are no longer used as primary WS market-activity inputs" in methodology
 
 
 def test_parse_yahoo_realtime_signal_extracts_matched_posts_and_engagement() -> None:

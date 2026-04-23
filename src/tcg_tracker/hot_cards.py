@@ -25,6 +25,7 @@ from .yuyutei import YuyuteiClient
 CARDRUSH_POKEMON_RANKING_URL = "https://www.cardrush-pokemon.jp/product-group/22?sort=rank&num=100"
 MAGI_WS_RANKING_URL = "https://magi.camp/series/7/products"
 MAGI_POKEMON_LIST_URL = "https://magi.camp/brands/3/items"
+YUYUTEI_WS_TOP_URL = "https://yuyu-tei.jp/top/ws"
 SNKRDUNK_POKEMON_MONTHLY_TRADES_URL = "https://snkrdunk.com/articles/31649/"
 SNKRDUNK_POKEMON_UR_TRADES_URL = "https://snkrdunk.com/articles/31962/"
 SNKRDUNK_POKEMON_SA_TRADES_URL = "https://snkrdunk.com/articles/31708/"
@@ -612,7 +613,7 @@ class TcgHotCardService:
 
         return (parsed_items, "".join(methodology_parts))
 
-    def _load_ws_board_items(self) -> tuple[list[_ParsedHotItem], str]:
+    def _load_ws_board_items_legacy(self) -> tuple[list[_ParsedHotItem], str]:
         parsed_items: list[_ParsedHotItem] = []
         methodology_parts = [
             "WS 現在會先把外部市場活動頁面的熱度信號拉進來，再和遊々亭買盤與 Yahoo!リアルタイム検索 一起做綜合排序。",
@@ -672,6 +673,58 @@ class TcgHotCardService:
             magi_future = executor.submit(_fetch_magi_ws)
             for future in ws_futures:
                 parsed_items.extend(future.result())
+            parsed_items.extend(magi_future.result())
+
+        return (parsed_items, "".join(methodology_parts))
+
+    def _load_ws_board_items(self) -> tuple[list[_ParsedHotItem], str]:
+        parsed_items: list[_ParsedHotItem] = []
+        methodology_parts = [
+            "WS liquidity board now prioritizes live marketplace/store surfaces: Yuyutei top-page featured singles, Yuyutei latest-release spotlight, and Magi's current Weiss Schwarz listing order.",
+            " Static SNKRDUNK article rankings are no longer used as primary WS market-activity inputs, because year-old article pages can distort what is actually active today.",
+            " Yuyutei bid / ask and priceup remain in the score because they are still the best buy-side support signal, while Yahoo realtime remains only a light secondary attention check.",
+        ]
+
+        def _fetch_yuyutei_ws_top() -> list[_ParsedHotItem]:
+            try:
+                html = self.http_client.get_text(YUYUTEI_WS_TOP_URL)
+            except Exception as exc:  # pragma: no cover - network-dependent.
+                logger.warning("Yuyutei WS top page failed; continuing without it. error=%s", exc)
+                return []
+
+            return [
+                *self._parse_yuyutei_ws_carousel_items(
+                    html,
+                    board_url=YUYUTEI_WS_TOP_URL,
+                    carousel_id="recommendedItemList",
+                    source_label="Yuyutei featured singles",
+                    source_weight=0.34,
+                    note="Signal source: Yuyutei top-page featured Weiss Schwarz singles.",
+                    minimum_price_jpy=5000,
+                ),
+                *self._parse_yuyutei_ws_carousel_items(
+                    html,
+                    board_url=YUYUTEI_WS_TOP_URL,
+                    carousel_id="newestCardList",
+                    source_label="Yuyutei latest-release spotlight",
+                    source_weight=0.12,
+                    note="Signal source: Yuyutei latest-release Weiss Schwarz spotlight.",
+                    minimum_price_jpy=1000,
+                ),
+            ]
+
+        def _fetch_magi_ws() -> list[_ParsedHotItem]:
+            try:
+                html = self.http_client.get_text(MAGI_WS_RANKING_URL)
+                return self._parse_magi_ws_items(html)
+            except Exception as exc:  # pragma: no cover - network-dependent.
+                logger.warning("Magi WS listing page failed; continuing without it. error=%s", exc)
+                return []
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            yuyutei_future = executor.submit(_fetch_yuyutei_ws_top)
+            magi_future = executor.submit(_fetch_magi_ws)
+            parsed_items.extend(yuyutei_future.result())
             parsed_items.extend(magi_future.result())
 
         return (parsed_items, "".join(methodology_parts))
@@ -1196,6 +1249,96 @@ class TcgHotCardService:
             if parsed is not None:
                 items.append(parsed)
         return items
+
+    def _parse_yuyutei_ws_carousel_items(
+        self,
+        html: str,
+        *,
+        board_url: str,
+        carousel_id: str,
+        source_label: str,
+        source_weight: float,
+        note: str,
+        minimum_price_jpy: int = 0,
+    ) -> list[_ParsedHotItem]:
+        soup = BeautifulSoup(html, "html.parser")
+        carousel = soup.select_one(f"#{carousel_id}")
+        if carousel is None:
+            return []
+
+        parsed_candidates: list[_ParsedHotItem] = []
+        seen_urls: set[str] = set()
+        for card_box in carousel.select("div.col-md-4"):
+            anchors = [
+                anchor
+                for anchor in card_box.select("a[href*='/sell/ws/card/']")
+                if anchor.select_one("img") is not None
+            ]
+            if not anchors:
+                continue
+
+            anchor = anchors[0]
+            href = anchor.get("href")
+            if not isinstance(href, str) or not href:
+                continue
+
+            detail_url = urljoin("https://yuyu-tei.jp", href)
+            if detail_url in seen_urls:
+                continue
+
+            image = anchor.select_one("img")
+            if image is None:
+                continue
+
+            image_alt = " ".join(str(image.get("alt", "")).split())
+            alt_parts = image_alt.split()
+            if len(alt_parts) < 3:
+                continue
+
+            card_number = alt_parts[0].strip()
+            rarity = alt_parts[1].strip()
+            title = " ".join(alt_parts[2:]).strip()
+            price_element = card_box.select_one("strong")
+            price_jpy = _parse_jpy_price_text(price_element.get_text(" ", strip=True) if price_element is not None else None)
+            if price_jpy is None or price_jpy < minimum_price_jpy:
+                continue
+
+            parsed_candidates.append(
+                _ParsedHotItem(
+                    title=title,
+                    price_jpy=price_jpy,
+                    thumbnail_url=_pick_image_url(image, attribute_names=("src", "data-src")),
+                    card_number=card_number,
+                    rarity=rarity,
+                    set_code=card_number.split("/", 1)[0].lower() if "/" in card_number else None,
+                    listing_count=1,
+                    is_graded=False,
+                    condition=None,
+                    detail_url=detail_url,
+                    board_url=board_url,
+                    note=note,
+                    source_label=source_label,
+                )
+            )
+            seen_urls.add(detail_url)
+
+        max_rank = len(parsed_candidates)
+        if max_rank <= 0:
+            return []
+
+        return [
+            replace(
+                parsed,
+                source_rank=source_rank,
+                demand_ratio=_rank_signal_ratio(
+                    rank=source_rank,
+                    max_rank=max_rank,
+                    source_weight=source_weight,
+                    floor=0.10,
+                ),
+            )
+            for source_rank, parsed in enumerate(parsed_candidates, start=1)
+        ]
 
     def _parse_magi_pokemon_items(self, html: str) -> list[_ParsedHotItem]:
         soup = BeautifulSoup(html, "html.parser")
