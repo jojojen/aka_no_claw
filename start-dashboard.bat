@@ -12,16 +12,27 @@ if not exist ".venv\Scripts\python.exe" (
     popd >nul
     exit /b 1
   )
-  echo [setup] Installing dependencies...
-  ".venv\Scripts\python.exe" -m pip install -r requirements-dev.txt
-  if errorlevel 1 (
-    echo [ERROR] pip install failed.
-    pause
-    popd >nul
-    exit /b 1
-  )
-  echo [setup] Done.
 )
+
+echo [setup] Syncing Python dependencies...
+".venv\Scripts\python.exe" -m pip install -r requirements-dev.txt
+if errorlevel 1 (
+  echo [ERROR] pip install failed.
+  pause
+  popd >nul
+  exit /b 1
+)
+
+echo [setup] Ensuring Playwright Chromium is installed...
+".venv\Scripts\python.exe" -m playwright install chromium
+if errorlevel 1 (
+  echo [ERROR] playwright install chromium failed.
+  pause
+  popd >nul
+  exit /b 1
+)
+
+echo [setup] Done.
 
 set "DASHBOARD_ARGS=%*"
 if "%DASHBOARD_ARGS%"=="" set "DASHBOARD_ARGS=--open-browser"

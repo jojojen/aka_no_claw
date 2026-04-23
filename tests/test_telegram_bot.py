@@ -16,11 +16,15 @@ from openclaw_adapter.natural_language import TelegramNaturalLanguageIntent
 from openclaw_adapter.telegram_bot import (
     TelegramCommandProcessor,
     TelegramLookupQuery,
+    TelegramReputationQuery,
     build_processing_ack,
+    default_reputation_renderer,
     format_liquidity_board,
     format_photo_lookup_result,
+    format_reputation_snapshot_result,
     handle_telegram_message,
     parse_lookup_command,
+    parse_reputation_snapshot_command,
 )
 
 
@@ -157,7 +161,48 @@ def test_command_processor_help_lists_trend_and_scan_commands() -> None:
 
     assert "/trend pokemon" in help_reply
     assert "/price pokemon | Pikachu ex | 132/106 | SAR | sv08" in help_reply
+    assert "/snapshot https://jp.mercari.com/item/m123456789" in help_reply
     assert "Send a photo with caption: /scan pokemon" in help_reply
+
+
+def test_parse_reputation_snapshot_command_requires_url() -> None:
+    query = parse_reputation_snapshot_command("https://jp.mercari.com/item/m123456789")
+
+    assert query == TelegramReputationQuery(query_url="https://jp.mercari.com/item/m123456789")
+
+
+def test_command_processor_handles_snapshot_command() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        reputation_renderer=lambda query: f"snapshot:{query.query_url}",
+    )
+
+    reply = processor.build_reply(chat_id="123", text="/snapshot https://jp.mercari.com/item/m123456789")
+
+    assert reply == "snapshot:https://jp.mercari.com/item/m123456789"
+
+
+def test_format_reputation_snapshot_result_shows_proof_link() -> None:
+    text = format_reputation_snapshot_result(
+        type(
+            "Result",
+            (),
+            {
+                "proof_url": "http://127.0.0.1:5000/p/proof_123",
+                "proof_id": "proof_123",
+                "reused": True,
+            },
+        )()
+    )
+
+    assert "信譽快照已就緒" in text
+    assert "沿用既有快照" in text
+    assert "proof_123" in text
+    assert "http://127.0.0.1:5000/p/proof_123" in text
 
 
 def test_command_processor_handles_natural_language_lookup_via_router() -> None:
@@ -249,6 +294,9 @@ def test_command_processor_builds_ack_for_natural_language_trend() -> None:
 def test_build_processing_ack_for_heavy_actions() -> None:
     assert build_processing_ack(text="/price pokemon Pikachu ex") == "收到查價指令，開始處理。"
     assert build_processing_ack(text="/trend pokemon") == "收到趨勢榜查詢，開始整理資料。"
+    assert build_processing_ack(text="/snapshot https://jp.mercari.com/item/m123456789") == (
+        "收到信譽快照查詢，先檢查既有 proof，必要時建立新快照。"
+    )
     assert build_processing_ack(has_photo=True) == "收到圖片，開始解析與查價。"
     assert build_processing_ack(text="/ping") is None
 
@@ -307,6 +355,84 @@ def test_handle_telegram_message_sends_ack_then_text_result() -> None:
         "pokemon:Pikachu ex",
     )
     assert client.sent_messages == list(replies)
+
+
+def test_handle_telegram_message_sends_snapshot_ack_then_result() -> None:
+    client = FakeTelegramClient()
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: f"{query.game}:{query.name}",
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        reputation_renderer=lambda query: f"snapshot:{query.query_url}",
+    )
+
+    replies = handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={
+            "chat": {"id": "123"},
+            "text": "/snapshot https://jp.mercari.com/item/m123456789",
+        },
+    )
+
+    assert replies == (
+        "收到信譽快照查詢，先檢查既有 proof，必要時建立新快照。",
+        "snapshot:https://jp.mercari.com/item/m123456789",
+    )
+    assert client.sent_messages == list(replies)
+
+
+def test_default_reputation_renderer_fails_fast_when_agent_cannot_start(monkeypatch) -> None:
+    settings = AssistantSettings(
+        openclaw_telegram_chat_id="123",
+        reputation_agent_admin_token=None,
+    )
+
+    def fail_ensure(**kwargs):
+        raise RuntimeError("REPUTATION_AGENT_ADMIN_TOKEN is not set")
+
+    monkeypatch.setattr("openclaw_adapter.telegram_bot.ensure_agent_thread", fail_ensure)
+    monkeypatch.setattr(
+        "openclaw_adapter.telegram_bot.request_reputation_snapshot",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("request_reputation_snapshot should not run")),
+    )
+
+    renderer = default_reputation_renderer(settings)
+
+    try:
+        renderer(TelegramReputationQuery(query_url="https://jp.mercari.com/item/m123456789"))
+    except RuntimeError as exc:
+        assert "REPUTATION_AGENT_ADMIN_TOKEN is not set" in str(exc)
+    else:  # pragma: no cover - defensive.
+        raise AssertionError("Expected renderer to fail immediately when the agent cannot start.")
+
+
+def test_default_reputation_renderer_fails_fast_when_agent_token_is_invalid(monkeypatch) -> None:
+    settings = AssistantSettings(
+        openclaw_telegram_chat_id="123",
+        reputation_agent_admin_token="wrong-token",
+    )
+
+    def fail_ensure(**kwargs):
+        raise RuntimeError("REPUTATION_AGENT_ADMIN_TOKEN is invalid for REPUTATION_AGENT_SERVER_URL")
+
+    monkeypatch.setattr("openclaw_adapter.telegram_bot.ensure_agent_thread", fail_ensure)
+    monkeypatch.setattr(
+        "openclaw_adapter.telegram_bot.request_reputation_snapshot",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("request_reputation_snapshot should not run")),
+    )
+
+    renderer = default_reputation_renderer(settings)
+
+    try:
+        renderer(TelegramReputationQuery(query_url="https://jp.mercari.com/item/m123456789"))
+    except RuntimeError as exc:
+        assert "invalid" in str(exc)
+    else:  # pragma: no cover - defensive.
+        raise AssertionError("Expected renderer to fail immediately when the token is invalid.")
 
 
 def test_handle_telegram_message_sends_natural_language_ack_then_result() -> None:

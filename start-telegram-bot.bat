@@ -11,15 +11,25 @@ if not exist ".venv\Scripts\python.exe" (
     pause
     exit /b 1
   )
-  echo [setup] Installing dependencies...
-  ".venv\Scripts\python.exe" -m pip install -r requirements-dev.txt
-  if errorlevel 1 (
-    echo [ERROR] pip install failed.
-    pause
-    exit /b 1
-  )
-  echo [setup] Done.
 )
+
+echo [setup] Syncing Python dependencies...
+".venv\Scripts\python.exe" -m pip install -r requirements-dev.txt
+if errorlevel 1 (
+  echo [ERROR] pip install failed.
+  pause
+  exit /b 1
+)
+
+echo [setup] Ensuring Playwright Chromium is installed...
+".venv\Scripts\python.exe" -m playwright install chromium
+if errorlevel 1 (
+  echo [ERROR] playwright install chromium failed.
+  pause
+  exit /b 1
+)
+
+echo [setup] Done.
 
 echo [startup] Checking for existing telegram-poll bot instances...
 powershell -NoProfile -Command "& {Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'python.exe' -and $_.CommandLine -match 'openclaw_adapter.*telegram-poll' -and $_.ProcessId -ne $PID } | ForEach-Object { Write-Host ('[startup] Stopping existing bot PID ' + $_.ProcessId); Stop-Process -Id $_.ProcessId -Force }}"

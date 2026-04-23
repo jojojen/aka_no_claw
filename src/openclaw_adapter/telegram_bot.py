@@ -26,16 +26,20 @@ from .natural_language import (
     build_telegram_natural_language_router,
     fallback_route_telegram_natural_language,
 )
+from .reputation_agent import ensure_agent_thread
+from .reputation_snapshot import ReputationSnapshotResult, request_reputation_snapshot
 
 LookupRenderer = Callable[["TelegramLookupQuery"], str]
 PhotoLookupRenderer = Callable[["TelegramPhotoQuery"], str]
+ReputationRenderer = Callable[["TelegramReputationQuery"], str]
 BoardLoader = Callable[[], tuple[HotCardBoard, ...]]
 CatalogRenderer = Callable[[], str]
 
 PRICE_LOOKUP_COMMANDS = {"/lookup", "/price"}
 TREND_BOARD_COMMANDS = {"/trend", "/trending", "/hot", "/heat", "/liquidity"}
 PHOTO_SCAN_COMMANDS = {"/scan", "/image", "/photo"}
-HEAVY_COMMANDS = PRICE_LOOKUP_COMMANDS | TREND_BOARD_COMMANDS
+REPUTATION_SNAPSHOT_COMMANDS = {"/snapshot", "/proof", "/repcheck", "/reputation"}
+HEAVY_COMMANDS = PRICE_LOOKUP_COMMANDS | TREND_BOARD_COMMANDS | REPUTATION_SNAPSHOT_COMMANDS
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +61,11 @@ class TelegramPhotoQuery:
     game_hint: str | None = None
     title_hint: str | None = None
     file_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramReputationQuery:
+    query_url: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,12 +163,14 @@ class TelegramCommandProcessor:
         lookup_renderer: LookupRenderer,
         board_loader: BoardLoader,
         catalog_renderer: CatalogRenderer,
+        reputation_renderer: ReputationRenderer | None = None,
         natural_language_router: TelegramNaturalLanguageRouter | None = None,
     ) -> None:
         self._settings = settings
         self._lookup_renderer = lookup_renderer
         self._board_loader = board_loader
         self._catalog_renderer = catalog_renderer
+        self._reputation_renderer = reputation_renderer
         self._natural_language_router = natural_language_router
 
     def is_allowed_chat(self, chat_id: str | int) -> bool:
@@ -216,6 +227,12 @@ class TelegramCommandProcessor:
                 ack=None,
                 reply="Send a card photo with the caption /scan pokemon or /scan ws, and I will parse it and then look up the price.",
             )
+        if command in REPUTATION_SNAPSHOT_COMMANDS:
+            return TelegramTextReplyPlan(
+                ack=build_processing_ack(text=content),
+                reply=None,
+                reply_factory=lambda remainder=remainder: self._handle_reputation_snapshot(remainder),
+            )
         if not content.startswith("/"):
             intent = self._route_natural_language(content)
             natural_language_plan = self._build_natural_language_reply_plan(intent)
@@ -225,7 +242,7 @@ class TelegramCommandProcessor:
         logger.info("Telegram unknown command command=%s", command)
         return TelegramTextReplyPlan(
             ack=None,
-            reply="Unknown command. Use /help, /price, /trend, or send a photo with /scan. You can also ask in natural language.",
+            reply="Unknown command. Use /help, /price, /trend, /snapshot, or send a photo with /scan. You can also ask in natural language.",
         )
 
     def _handle_lookup(self, raw: str) -> str:
@@ -273,6 +290,21 @@ class TelegramCommandProcessor:
 
         logger.info("Telegram liquidity board loaded game=%s limit=%s items=%s", game, limit, len(board.items))
         return format_liquidity_board(board, limit=limit)
+
+    def _handle_reputation_snapshot(self, raw: str) -> str:
+        if self._reputation_renderer is None:
+            return "Reputation snapshot integration is not configured in this OpenClaw runtime."
+
+        try:
+            query = parse_reputation_snapshot_command(raw)
+        except ValueError as exc:
+            return f"{exc}\nExample: /snapshot https://jp.mercari.com/item/m123456789"
+
+        try:
+            return self._reputation_renderer(query)
+        except Exception as exc:  # pragma: no cover - network-dependent.
+            logger.exception("Telegram reputation snapshot failed query_url=%s", query.query_url)
+            return f"Snapshot failed: {exc}"
 
     def _handle_natural_language(self, text: str) -> str | None:
         intent = self._route_natural_language(text)
@@ -401,6 +433,7 @@ class TelegramCommandProcessor:
                 "/trend ws 5",
                 "/hot pokemon",
                 "/liquidity ws 5",
+                "/snapshot https://jp.mercari.com/item/m123456789",
                 "Send a photo with caption: /scan pokemon",
                 "You can also ask things like: 幫我查 pokemon Pikachu ex 132/106",
                 "Or: pokemon 熱門前 5",
@@ -439,6 +472,13 @@ def parse_lookup_command(raw: str) -> TelegramLookupQuery:
     if not name:
         raise ValueError("Lookup name cannot be empty.")
     return TelegramLookupQuery(game=game, name=name)
+
+
+def parse_reputation_snapshot_command(raw: str) -> TelegramReputationQuery:
+    query_url = raw.strip()
+    if not query_url:
+        raise ValueError("Snapshot command requires a Mercari item or profile URL.")
+    return TelegramReputationQuery(query_url=query_url)
 
 
 def _format_lookup_ack_command(query: TelegramLookupQuery) -> str:
@@ -488,6 +528,18 @@ def format_photo_lookup_result(outcome: TcgImageLookupOutcome) -> str:
     if outcome.status == "unresolved" or outcome.lookup_result is None:
         return "無法從圖片提取足夠資訊進行查價。"
     return format_lookup_result_telegram(outcome.lookup_result)
+
+
+def format_reputation_snapshot_result(result: ReputationSnapshotResult) -> str:
+    action_text = "沿用既有快照" if result.reused else "已建立新快照"
+    lines = [
+        "信譽快照已就緒",
+        action_text,
+        result.proof_url,
+    ]
+    if result.proof_id:
+        lines.insert(2, f"proof_id: {result.proof_id}")
+    return "\n".join(lines)
 
 
 def default_lookup_renderer(settings: AssistantSettings) -> LookupRenderer:
@@ -589,6 +641,32 @@ def default_photo_renderer(settings: AssistantSettings) -> PhotoLookupRenderer:
     return render
 
 
+def default_reputation_renderer(settings: AssistantSettings) -> ReputationRenderer:
+    def render(query: TelegramReputationQuery) -> str:
+        logger.info("Telegram reputation snapshot requested query_url=%s", trim_for_log(query.query_url, limit=240))
+        thread, started_now = ensure_agent_thread(
+            server_url=settings.reputation_agent_server_url,
+            api_key=settings.reputation_agent_admin_token or "",
+            poll_secs=settings.reputation_agent_poll_secs,
+        )
+        logger.info(
+            "Telegram reputation agent ready started_now=%s thread_name=%s alive=%s",
+            started_now,
+            thread.name,
+            thread.is_alive(),
+        )
+        result = request_reputation_snapshot(settings=settings, query_url=query.query_url)
+        logger.info(
+            "Telegram reputation snapshot completed query_url=%s proof_id=%s reused=%s",
+            trim_for_log(query.query_url, limit=240),
+            result.proof_id,
+            result.reused,
+        )
+        return format_reputation_snapshot_result(result)
+
+    return render
+
+
 def run_telegram_polling(
     *,
     settings: AssistantSettings,
@@ -623,6 +701,7 @@ def run_telegram_polling(
         lookup_renderer=lookup_renderer,
         board_loader=board_loader,
         catalog_renderer=catalog_renderer,
+        reputation_renderer=default_reputation_renderer(settings),
         natural_language_router=build_telegram_natural_language_router(settings),
     )
     resolved_photo_renderer = photo_renderer or default_photo_renderer(settings)
@@ -712,6 +791,8 @@ def build_processing_ack(*, text: str | None = None, has_photo: bool = False) ->
         return "收到查價指令，開始處理。"
     if command in TREND_BOARD_COMMANDS:
         return "收到趨勢榜查詢，開始整理資料。"
+    if command in REPUTATION_SNAPSHOT_COMMANDS:
+        return "收到信譽快照查詢，先檢查既有 proof，必要時建立新快照。"
     return None
 
 

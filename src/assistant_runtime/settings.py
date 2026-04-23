@@ -25,7 +25,7 @@ class AssistantSettings:
     openclaw_local_text_timeout_seconds: int = 45
     openclaw_ca_bundle_path: str | None = None
     openclaw_tls_insecure_skip_verify: bool = False
-    reputation_agent_server_url: str = "https://reputation-snapshot.fly.dev"
+    reputation_agent_server_url: str = "http://127.0.0.1:5000"
     reputation_agent_admin_token: str | None = None
     reputation_agent_poll_secs: int = 5
     monitor_env: str = "development"
@@ -84,7 +84,7 @@ def get_settings() -> AssistantSettings:
         openclaw_ca_bundle_path=_none_if_empty(os.getenv("OPENCLAW_CA_BUNDLE_PATH")),
         openclaw_tls_insecure_skip_verify=_as_bool(os.getenv("OPENCLAW_TLS_INSECURE_SKIP_VERIFY")),
         reputation_agent_server_url=os.getenv(
-            "REPUTATION_AGENT_SERVER_URL", "https://reputation-snapshot.fly.dev"
+            "REPUTATION_AGENT_SERVER_URL", "http://127.0.0.1:5000"
         ),
         reputation_agent_admin_token=_none_if_empty(os.getenv("REPUTATION_AGENT_ADMIN_TOKEN")),
         reputation_agent_poll_secs=_as_int(os.getenv("REPUTATION_AGENT_POLL_SECS"), default=5),

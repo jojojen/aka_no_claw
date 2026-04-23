@@ -5,18 +5,23 @@ import json
 import logging
 import os
 import re
+import subprocess
 import threading
 import time
 import urllib.error
 import urllib.request
 from html import unescape
+from pathlib import Path
+from urllib.parse import urlencode
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
 _MERCARI_HOST = "jp.mercari.com"
-_DEFAULT_SERVER_URL = "https://reputation-snapshot.fly.dev"
+_DEFAULT_SERVER_URL = "http://127.0.0.1:5000"
 _DEFAULT_POLL_SECS = 5
+_agent_thread_lock = threading.Lock()
+_agent_thread: threading.Thread | None = None
 
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
@@ -203,14 +208,23 @@ def start_agent_thread(
     api_key: str = "",
     poll_secs: int = _DEFAULT_POLL_SECS,
 ) -> threading.Thread:
-    """Start the agent loop in a background daemon thread and return it."""
-    t = threading.Thread(
-        target=run_agent_loop,
-        args=(server_url, api_key, poll_secs),
-        daemon=True,
-        name="reputation-agent",
-    )
-    t.start()
+    """Start the agent loop in a background daemon thread and return it.
+
+    If a local agent thread is already alive in this process, it is reused.
+    """
+    global _agent_thread
+    with _agent_thread_lock:
+        if _agent_thread is not None and _agent_thread.is_alive():
+            logger.debug("reputation_agent: reusing existing background thread")
+            return _agent_thread
+        t = threading.Thread(
+            target=run_agent_loop,
+            args=(server_url, api_key, poll_secs),
+            daemon=True,
+            name="reputation-agent",
+        )
+        t.start()
+        _agent_thread = t
     logger.info("reputation_agent: background thread started (daemon)")
     return t
 
@@ -220,7 +234,131 @@ def check_prerequisites(api_key: str) -> str | None:
     if not api_key:
         return "REPUTATION_AGENT_ADMIN_TOKEN is not set"
     try:
-        from playwright.sync_api import sync_playwright as _  # noqa: F401
+        from pathlib import Path
+
+        from playwright.sync_api import sync_playwright
     except ImportError:
         return "playwright is not installed — run: pip install playwright && playwright install chromium"
+    try:
+        with sync_playwright() as playwright:
+            executable = Path(playwright.chromium.executable_path)
+            if not executable.exists():
+                return "Playwright Chromium is not installed — run: playwright install chromium"
+    except Exception as exc:
+        return f"Playwright runtime is not ready: {exc}"
     return None
+
+
+def check_server_authorization(server_url: str, api_key: str) -> str | None:
+    """Return an error message if the remote server rejects the admin token."""
+    server_url = server_url.rstrip("/")
+    query = urlencode({"token": api_key})
+    url = f"{server_url}/admin?{query}"
+    try:
+        with urllib.request.urlopen(url, timeout=15) as response:
+            status = getattr(response, "status", 200)
+            if status != 200:
+                return f"reputation_snapshot admin check failed with HTTP {status}"
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            return "REPUTATION_AGENT_ADMIN_TOKEN is invalid for REPUTATION_AGENT_SERVER_URL"
+        return f"reputation_snapshot admin check failed with HTTP {exc.code}"
+    except Exception as exc:
+        return f"Could not reach reputation_snapshot server: {exc}"
+    return None
+
+
+def _is_local_server_url(server_url: str) -> bool:
+    parsed = urlparse(server_url.rstrip("/"))
+    return (parsed.hostname or "").lower() in {"127.0.0.1", "localhost"}
+
+
+def _find_local_reputation_snapshot_dir() -> Path | None:
+    workspace_root = Path(__file__).resolve().parents[3]
+    candidate = workspace_root / "reputation_snapshot"
+    if candidate.exists():
+        return candidate
+    return None
+
+
+def _launch_local_reputation_snapshot(repo_dir: Path) -> None:
+    start_script = repo_dir / "start.bat"
+    if start_script.exists():
+        subprocess.Popen(
+            ["cmd", "/c", "start", "", "start.bat", "go"],
+            cwd=str(repo_dir),
+        )
+        return
+
+    python_exe = repo_dir / ".venv" / "Scripts" / "python.exe"
+    app_file = repo_dir / "app.py"
+    if python_exe.exists() and app_file.exists():
+        subprocess.Popen(
+            [str(python_exe), str(app_file)],
+            cwd=str(repo_dir),
+            creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+        )
+        return
+
+    raise RuntimeError(f"Could not find a launcher for local reputation_snapshot at {repo_dir}")
+
+
+def ensure_server_ready(server_url: str, api_key: str, *, timeout_seconds: float = 20.0) -> tuple[bool, str | None]:
+    """Ensure the target reputation_snapshot server is reachable and accepts the token.
+
+    Returns ``(server_started_now, error_message)``.
+    """
+    err = check_server_authorization(server_url, api_key)
+    if err is None:
+        return False, None
+    if not _is_local_server_url(server_url):
+        return False, err
+    if "Could not reach reputation_snapshot server:" not in err:
+        return False, err
+
+    repo_dir = _find_local_reputation_snapshot_dir()
+    if repo_dir is None:
+        return False, err
+
+    logger.info("reputation_agent: local server unreachable, attempting auto-start repo=%s", repo_dir)
+    try:
+        _launch_local_reputation_snapshot(repo_dir)
+    except Exception as exc:
+        return False, f"{err}. Local auto-start failed: {exc}"
+
+    deadline = time.monotonic() + timeout_seconds
+    last_err = err
+    while time.monotonic() < deadline:
+        time.sleep(1.0)
+        last_err = check_server_authorization(server_url, api_key)
+        if last_err is None:
+            logger.info("reputation_agent: local reputation_snapshot server is now reachable")
+            return True, None
+        if "REPUTATION_AGENT_ADMIN_TOKEN is invalid" in last_err:
+            return True, last_err
+
+    return True, last_err
+
+
+def ensure_agent_thread(
+    server_url: str = _DEFAULT_SERVER_URL,
+    api_key: str = "",
+    poll_secs: int = _DEFAULT_POLL_SECS,
+) -> tuple[threading.Thread, bool]:
+    """Ensure a local reputation agent thread is alive.
+
+    Returns ``(thread, started_now)``. Raises ``RuntimeError`` if prerequisites fail.
+    """
+    thread = _agent_thread
+    if thread is not None and thread.is_alive():
+        return thread, False
+
+    err = check_prerequisites(api_key)
+    if err:
+        raise RuntimeError(err)
+    _, err = ensure_server_ready(server_url, api_key)
+    if err:
+        raise RuntimeError(err)
+
+    thread = start_agent_thread(server_url=server_url, api_key=api_key, poll_secs=poll_secs)
+    return thread, True

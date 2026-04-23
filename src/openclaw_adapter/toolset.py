@@ -14,7 +14,7 @@ from .formatters import (
     lookup_result_to_json,
     reference_sources_to_json,
 )
-from .reputation_agent import check_prerequisites, run_agent_loop, start_agent_thread
+from .reputation_agent import check_prerequisites, ensure_agent_thread, run_agent_loop
 from .telegram_bot import (
     default_board_loader,
     default_lookup_renderer,
@@ -213,6 +213,21 @@ def _maybe_start_reputation_agent(args: argparse.Namespace, settings: AssistantS
         poll_secs=settings.reputation_agent_poll_secs,
     )
     print(f"[reputation-agent] background thread started → {settings.reputation_agent_server_url}")
+def _ensure_reputation_agent_started(args: argparse.Namespace, settings: AssistantSettings) -> None:
+    if not getattr(args, "with_reputation_agent", False):
+        return
+    try:
+        _, started_now = ensure_agent_thread(
+            server_url=settings.reputation_agent_server_url,
+            api_key=settings.reputation_agent_admin_token or "",
+            poll_secs=settings.reputation_agent_poll_secs,
+        )
+    except RuntimeError as exc:
+        logger.error("reputation_agent: cannot start — %s", exc)
+        print(f"[reputation-agent] WARNING: cannot start — {exc}")
+        return
+    status = "started" if started_now else "already running"
+    print(f"[reputation-agent] {status} -> {settings.reputation_agent_server_url}")
 
 
 def _handle_serve_dashboard(
@@ -221,7 +236,7 @@ def _handle_serve_dashboard(
     registry: ToolRegistry,
 ) -> int:
     logger.info("CLI serve-dashboard command received host=%s port=%s open_browser=%s", args.host, args.port, args.open_browser)
-    _maybe_start_reputation_agent(args, settings)
+    _ensure_reputation_agent_started(args, settings)
     return serve_dashboard(
         settings=settings,
         registry=registry,
@@ -243,7 +258,7 @@ def _handle_telegram_poll(
         args.keep_pending,
         getattr(args, "with_reputation_agent", False),
     )
-    _maybe_start_reputation_agent(args, settings)
+    _ensure_reputation_agent_started(args, settings)
     return run_telegram_polling(
         settings=settings,
         lookup_renderer=default_lookup_renderer(settings),
@@ -270,7 +285,7 @@ def _configure_reputation_agent_parser(
     parser.add_argument(
         "--server-url",
         default=settings.reputation_agent_server_url,
-        help="reputation-snapshot server URL (default: REPUTATION_AGENT_SERVER_URL env or fly.io endpoint)",
+        help="reputation-snapshot server URL (default: REPUTATION_AGENT_SERVER_URL env or local http://127.0.0.1:5000)",
     )
     parser.add_argument(
         "--token",

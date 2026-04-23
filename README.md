@@ -156,6 +156,8 @@ python -m openclaw_adapter telegram-poll --notify-startup
 .\start-telegram-bot.bat --notify-startup
 ```
 
+- `start-telegram-bot.bat` 會在啟動前自動同步 `.venv` 依賴，並確認 Playwright Chromium 已安裝。
+
 目前 Telegram 測試指令：
 
 ```text
@@ -173,12 +175,20 @@ python -m openclaw_adapter telegram-poll --notify-startup
 /hot ws 5
 /liquidity pokemon
 /liquidity ws 5
+/snapshot https://jp.mercari.com/item/m123456789
 /scan pokemon
 傳卡圖並加上 caption: /scan pokemon
 ```
 
 - `Telegram Claw` 現在會對較花時間的操作先回一則確認訊息，再回最後結果。
 - 文字查價 / 趨勢榜會先回「收到…開始處理」。
+- `/snapshot <Mercari 商品或賣家 URL>` 會先檢查既有 proof，沒有的話就排入 `reputation_snapshot` 建立新快照，最後回傳 proof 連結。
+- `/snapshot` 也接受 `/proof`、`/repcheck`、`/reputation` 這幾個別名。
+- 當 `/snapshot` 需要新快照時，Telegram bot 會先自動確認本機 reputation agent 可用；如果沒在跑，會嘗試自動拉起來。
+- 如果 `REPUTATION_AGENT_SERVER_URL` 指向 `127.0.0.1` 或 `localhost`，但本機 `reputation_snapshot` 還沒啟動，bot 會嘗試自動拉起隔壁 repo 的 `reputation_snapshot/start.bat`。
+- 如果命中既有快照，bot 會直接回舊 proof；如果需要新快照，bot 會等待背景 agent 完成 job 後再回連結。
+- 如果 token / Playwright / Chromium 沒準備好，bot 會立即回明確錯誤，不會先排 job 再等到 timeout。
+- 如果 `REPUTATION_AGENT_SERVER_URL` 與 `REPUTATION_AGENT_ADMIN_TOKEN` 不匹配，bot 也會立即回報 token 無效，而不是讓背景 agent 持續刷 401。
 - 圖片查價會先回「收到圖片，開始解析與查價。」。
 - 圖片 OCR 目前參考 `fwdspecptcg/` 的流程實作；這台機器若尚未安裝 Tesseract，bot 會明確回覆缺少 OCR runtime，而不是無聲失敗。
 
@@ -221,12 +231,26 @@ OPENCLAW_TELEGRAM_BOT_TOKEN=你的新token
 在 `.env` 補上：
 
 ```dotenv
-REPUTATION_AGENT_SERVER_URL=https://reputation-snapshot.fly.dev
+REPUTATION_AGENT_SERVER_URL=http://127.0.0.1:5000
 REPUTATION_AGENT_ADMIN_TOKEN=你的ADMIN_TOKEN
 REPUTATION_AGENT_POLL_SECS=5
 ```
 
-`REPUTATION_AGENT_ADMIN_TOKEN` 必須和 `reputation-snapshot` server 的 `ADMIN_TOKEN` 一致。
+`REPUTATION_AGENT_ADMIN_TOKEN` 必須和你本機 `reputation_snapshot/.env` 裡的 `ADMIN_TOKEN` 一致。
+
+建議的本機啟動順序：
+
+```powershell
+cd ..\reputation_snapshot
+python app.py
+```
+
+再開另一個終端：
+
+```powershell
+cd ..\aka_no_claw
+.\start-telegram-bot.bat --notify-startup
+```
 
 確認 `playwright` 已安裝（如果你還沒裝過）：
 
@@ -259,6 +283,8 @@ python -m openclaw_adapter telegram-poll --notify-startup --with-reputation-agen
 python -m openclaw_adapter serve-dashboard --open-browser --with-reputation-agent
 ```
 
+- `start-dashboard.bat` 也會在啟動前自動同步 `.venv` 依賴，並確認 Playwright Chromium 已安裝。
+
 ### 只跑 agent（不啟動 Telegram / Dashboard）
 
 ```powershell
@@ -276,6 +302,7 @@ python -m openclaw_adapter reputation-agent --server-url http://localhost:5000 -
 - Agent 以 daemon thread 跑在背景，主進程（Telegram bot 或 dashboard）結束時 agent 也一起停掉。
 - 如果 `REPUTATION_AGENT_ADMIN_TOKEN` 未設定，claw 仍會正常啟動，只會在 console 印出警告，不會中斷。
 - `reputation_snapshot/agent_local.py` 保留原樣，`reputation_snapshot` 仍可獨立運作。
+- `/snapshot` 若要建立新 proof，至少要有一個 reputation agent 正在輪詢 server；否則只能重用既有 proof，新的 job 會等待到 timeout。
 
 查卡價：
 
