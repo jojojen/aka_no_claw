@@ -4,7 +4,7 @@ import json
 import time
 from dataclasses import dataclass
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 
 from assistant_runtime import AssistantSettings, build_ssl_context
@@ -75,12 +75,17 @@ class ReputationSnapshotClient:
         resolved_proof_url = urljoin(f"{self._server_url}/", proof_url.lstrip("/"))
         proof_id_raw = payload.get("proof_id")
         proof_id = None if proof_id_raw in {None, ""} else str(proof_id_raw)
+        if proof_id is None:
+            proof_id = _extract_proof_id_from_url(resolved_proof_url)
         return ReputationSnapshotResult(
             proof_url=resolved_proof_url,
             proof_id=proof_id,
             reused=bool(payload.get("reused")),
             job_id=job_id,
         )
+
+    def get_proof_document(self, proof_id: str) -> dict[str, object]:
+        return self._request_json(f"/api/proofs/{proof_id}", method="GET")
 
     def _request_json(
         self,
@@ -140,3 +145,26 @@ def request_reputation_snapshot(
         job_timeout_seconds=job_timeout_seconds,
     )
     return client.create_or_reuse_snapshot(query_url)
+
+
+def fetch_reputation_proof_document(
+    *,
+    settings: AssistantSettings,
+    proof_id: str,
+    timeout_seconds: float = 30.0,
+) -> dict[str, object]:
+    client = ReputationSnapshotClient(
+        settings=settings,
+        timeout_seconds=timeout_seconds,
+    )
+    return client.get_proof_document(proof_id)
+
+
+def _extract_proof_id_from_url(proof_url: str) -> str | None:
+    path = urlparse(proof_url).path.strip("/")
+    if not path:
+        return None
+    parts = path.split("/")
+    if len(parts) >= 2 and parts[-2] == "p":
+        return parts[-1] or None
+    return None

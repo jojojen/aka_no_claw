@@ -15,8 +15,10 @@ from openclaw_adapter.formatters import format_lookup_result_telegram
 from openclaw_adapter.natural_language import TelegramNaturalLanguageIntent
 from openclaw_adapter.telegram_bot import (
     TelegramCommandProcessor,
+    TelegramFileAttachment,
     TelegramLookupQuery,
     TelegramReputationQuery,
+    TelegramReputationDelivery,
     build_processing_ack,
     default_reputation_renderer,
     format_liquidity_board,
@@ -68,10 +70,20 @@ class FakeTelegramClient:
     def __init__(self, sample_path: Path | None = None) -> None:
         self.sample_path = sample_path
         self.sent_messages: list[str] = []
+        self.sent_documents: list[tuple[str, str | None]] = []
+        self.sent_photos: list[tuple[str, str | None]] = []
 
     def send_message(self, *, chat_id: str | int, text: str) -> dict[str, object]:
         self.sent_messages.append(text)
         return {"chat_id": str(chat_id), "text": text}
+
+    def send_document(self, *, chat_id: str | int, document_path: Path, caption: str | None = None) -> dict[str, object]:
+        self.sent_documents.append((document_path.name, caption))
+        return {"chat_id": str(chat_id), "document": document_path.name, "caption": caption}
+
+    def send_photo(self, *, chat_id: str | int, photo_path: Path, caption: str | None = None) -> dict[str, object]:
+        self.sent_photos.append((photo_path.name, caption))
+        return {"chat_id": str(chat_id), "photo": photo_path.name, "caption": caption}
 
     def get_file(self, *, file_id: str) -> dict[str, object]:
         assert self.sample_path is not None
@@ -357,15 +369,26 @@ def test_handle_telegram_message_sends_ack_then_text_result() -> None:
     assert client.sent_messages == list(replies)
 
 
-def test_handle_telegram_message_sends_snapshot_ack_then_result() -> None:
+def test_handle_telegram_message_sends_snapshot_ack_then_result(tmp_path: Path) -> None:
     client = FakeTelegramClient()
     settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    pdf_path = tmp_path / "proof_123.pdf"
+    png_path = tmp_path / "proof_123.png"
+    pdf_path.write_bytes(b"%PDF-1.4 stub")
+    png_path.write_bytes(b"\x89PNG\r\n\x1a\nstub")
     processor = TelegramCommandProcessor(
         settings=settings,
         lookup_renderer=lambda query: f"{query.game}:{query.name}",
         board_loader=lambda: (_stub_board(),),
         catalog_renderer=lambda: "catalog",
-        reputation_renderer=lambda query: f"snapshot:{query.query_url}",
+        reputation_renderer=lambda query: TelegramReputationDelivery(
+            summary_text=f"snapshot:{query.query_url}",
+            attachments=(
+                TelegramFileAttachment(kind="document", path=pdf_path, caption="Reputation snapshot PDF"),
+                TelegramFileAttachment(kind="photo", path=png_path, caption="Reputation snapshot preview"),
+            ),
+            cleanup_paths=(pdf_path, png_path),
+        ),
     )
 
     replies = handle_telegram_message(
@@ -383,6 +406,10 @@ def test_handle_telegram_message_sends_snapshot_ack_then_result() -> None:
         "snapshot:https://jp.mercari.com/item/m123456789",
     )
     assert client.sent_messages == list(replies)
+    assert client.sent_documents == [("proof_123.pdf", "Reputation snapshot PDF")]
+    assert client.sent_photos == [("proof_123.png", "Reputation snapshot preview")]
+    assert not pdf_path.exists()
+    assert not png_path.exists()
 
 
 def test_default_reputation_renderer_fails_fast_when_agent_cannot_start(monkeypatch) -> None:

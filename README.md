@@ -186,7 +186,8 @@ python -m openclaw_adapter telegram-poll --notify-startup
 - `/snapshot` 也接受 `/proof`、`/repcheck`、`/reputation` 這幾個別名。
 - 當 `/snapshot` 需要新快照時，Telegram bot 會先自動確認本機 reputation agent 可用；如果沒在跑，會嘗試自動拉起來。
 - 如果 `REPUTATION_AGENT_SERVER_URL` 指向 `127.0.0.1` 或 `localhost`，但本機 `reputation_snapshot` 還沒啟動，bot 會嘗試自動拉起隔壁 repo 的 `reputation_snapshot/start.bat`。
-- 如果命中既有快照，bot 會直接回舊 proof；如果需要新快照，bot 會等待背景 agent 完成 job 後再回連結。
+- 如果命中既有快照，bot 會直接回舊 proof；如果需要新快照，bot 會等待背景 agent 完成 job。
+- `/snapshot` 完成後，Telegram 會送出文字摘要、PDF 與 PNG 預覽，方便直接在手機查看；本機 proof URL 仍會保留在摘要裡，方便之後切回外網分享模式。
 - 如果 token / Playwright / Chromium 沒準備好，bot 會立即回明確錯誤，不會先排 job 再等到 timeout。
 - 如果 `REPUTATION_AGENT_SERVER_URL` 與 `REPUTATION_AGENT_ADMIN_TOKEN` 不匹配，bot 也會立即回報 token 無效，而不是讓背景 agent 持續刷 401。
 - 圖片查價會先回「收到圖片，開始解析與查價。」。

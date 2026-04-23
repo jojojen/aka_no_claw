@@ -57,13 +57,259 @@ def _capture_page(page, url: str) -> dict:
     }
 
 
+def _profile_candidate_records(page) -> list[dict[str, str]]:
+    try:
+        candidates = page.eval_on_selector_all(
+            "a",
+            """
+            (els) => els.map((e) => ({
+              href: e.href || "",
+              text: (e.innerText || "").trim(),
+              location: e.getAttribute("data-location") || "",
+              aria: e.getAttribute("aria-label") || "",
+            }))
+            """,
+        )
+    except Exception:
+        return []
+
+    return [candidate for candidate in candidates if isinstance(candidate, dict)]
+
+
+def _select_profile_candidate(candidates: list[dict[str, str]]) -> dict[str, str] | None:
+    prioritized: list[dict[str, str]] = []
+    fallback: list[dict[str, str]] = []
+    for candidate in candidates:
+        href = str(candidate.get("href") or "").strip()
+        if "/user/profile/" not in href:
+            continue
+        location = str(candidate.get("location") or "").strip().lower()
+        text = str(candidate.get("text") or "").strip()
+        aria = str(candidate.get("aria") or "").strip().lower()
+        if "seller" in location or "seller" in aria or text:
+            prioritized.append(candidate)
+        else:
+            fallback.append(candidate)
+    return (prioritized + fallback)[0] if prioritized or fallback else None
+
+
 def _find_profile_url(html: str) -> str | None:
-    for pat in [r'href="(/user/profile/([A-Za-z0-9_-]+))"',
-                r'["\x27](/user/profile/([A-Za-z0-9_-]+))["\x27]']:
+    patterns = [
+        rf'href=(?:"|\')(?P<url>https://{re.escape(_MERCARI_HOST)}/user/profile/[A-Za-z0-9_-]+)(?:"|\')',
+        r'href=(?:"|\')(?P<url>/user/profile/[A-Za-z0-9_-]+)(?:"|\')',
+        r'(?:"|\')(?P<url>/user/profile/[A-Za-z0-9_-]+)(?:"|\')',
+    ]
+    for pat in patterns:
         m = re.search(pat, html)
         if m:
-            return f"https://{_MERCARI_HOST}{unescape(m.group(1))}"
+            url = unescape(m.group("url"))
+            if url.startswith("http://") or url.startswith("https://"):
+                return url
+            return f"https://{_MERCARI_HOST}{url}"
     return None
+
+
+def _find_profile_url_in_page(page) -> str | None:
+    candidate = _select_profile_candidate(_profile_candidate_records(page))
+    if candidate is None:
+        return None
+    href = str(candidate.get("href") or "").strip()
+    if href.startswith("http://") or href.startswith("https://"):
+        return href
+    if href.startswith("/"):
+        return f"https://{_MERCARI_HOST}{href}"
+    return None
+
+
+def _extract_first_integer(text: str) -> int | None:
+    segments = [segment.strip() for segment in text.split(",") if segment.strip()]
+    for segment in segments[1:] + segments[:1]:
+        match = re.search(r"(?<![\d.])([\d][\d,]*)(?![\d.])", segment)
+        if match:
+            return int(match.group(1).replace(",", ""))
+    return None
+
+
+def _looks_like_person_name(value: str) -> bool:
+    candidate = value.strip()
+    if not candidate or len(candidate) > 80:
+        return False
+    if candidate.startswith("http"):
+        return False
+    if re.fullmatch(r"[\d,\s]+", candidate):
+        return False
+    if any(token in candidate for token in ("メルカリについて", "会社概要", "運営会社")):
+        return False
+    return True
+
+
+def _parse_item_seller_label(label: str) -> dict[str, object]:
+    segments = [segment.strip() for segment in label.split(",") if segment.strip()]
+    display_name = segments[0] if segments and _looks_like_person_name(segments[0]) else None
+    return {
+        "display_name": display_name,
+        "seller_total_reviews": _extract_first_integer(label),
+    }
+
+
+def _extract_item_seller_from_text(visible_text: str) -> dict[str, object]:
+    lines: list[str] = []
+    seen: set[str] = set()
+    for raw_line in visible_text.splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        if not line or line in seen:
+            continue
+        seen.add(line)
+        lines.append(line)
+
+    display_name = None
+    total_reviews = None
+    seller_window = lines[:12]
+
+    for line in seller_window:
+        combined_match = re.fullmatch(r"(.+?)\s+([\d,]+)", line)
+        if combined_match and _looks_like_person_name(combined_match.group(1)):
+            display_name = combined_match.group(1).strip()
+            total_reviews = int(combined_match.group(2).replace(",", ""))
+            break
+
+    if display_name is None:
+        for line in seller_window:
+            if _looks_like_person_name(line):
+                display_name = line
+                break
+
+    if total_reviews is None:
+        for line in seller_window:
+            if re.fullmatch(r"[\d,]+", line):
+                total_reviews = int(line.replace(",", ""))
+                break
+
+    return {
+        "display_name": display_name,
+        "seller_total_reviews": total_reviews,
+    }
+
+
+def _extract_item_seller_context(page, item_html: str, item_text: str) -> dict[str, object]:
+    context: dict[str, object] = {
+        "profile_url": _find_profile_url(item_html),
+        "display_name": None,
+        "seller_total_reviews": None,
+    }
+
+    candidate = _select_profile_candidate(_profile_candidate_records(page))
+    if candidate is not None:
+        href = str(candidate.get("href") or "").strip()
+        if href and context["profile_url"] is None:
+            context["profile_url"] = href if href.startswith("http") else f"https://{_MERCARI_HOST}{href}"
+        candidate_text = " , ".join(
+            part for part in (str(candidate.get("aria") or "").strip(), str(candidate.get("text") or "").strip()) if part
+        )
+        parsed_candidate = _parse_item_seller_label(candidate_text)
+        for key, value in parsed_candidate.items():
+            if context.get(key) is None and value is not None:
+                context[key] = value
+
+    if context["profile_url"] is None:
+        context["profile_url"] = _find_profile_url_in_page(page)
+
+    parsed_label = _parse_item_seller_label(item_html)
+    for key, value in parsed_label.items():
+        if context.get(key) is None and value is not None:
+            context[key] = value
+
+    parsed_text = _extract_item_seller_from_text(item_text)
+    for key, value in parsed_text.items():
+        if context.get(key) is None and value is not None:
+            context[key] = value
+    return context
+
+
+def _read_profile_page_state(page, profile_id: str) -> dict[str, object]:
+    try:
+        snapshot = page.evaluate(
+            """
+            (profileId) => {
+              const bodyText = document.body ? document.body.innerText : "";
+              const hrefs = Array.from(document.querySelectorAll("a[href]")).map((e) => e.href || "");
+              return {
+                body_text: bodyText,
+                has_heading: !!document.querySelector('[data-testid="mer-profile-heading"] h1, h1'),
+                has_avatar: !!document.querySelector('img[src*="thumb/members/"]'),
+                has_reviews_link: hrefs.some((href) => href.includes(`/user/reviews/${profileId}`)),
+                has_profile_link: hrefs.some((href) => href.includes(`/user/profile/${profileId}`)),
+              };
+            }
+            """,
+            profile_id,
+        )
+    except Exception:
+        return {}
+    return snapshot if isinstance(snapshot, dict) else None
+
+
+def _profile_page_loaded(snapshot: dict[str, object] | None) -> bool:
+    if not isinstance(snapshot, dict):
+        return False
+    body_text = str(snapshot.get("body_text") or "")
+    has_heading = bool(snapshot.get("has_heading"))
+    has_avatar = bool(snapshot.get("has_avatar"))
+    has_reviews_link = bool(snapshot.get("has_reviews_link"))
+    has_profile_link = bool(snapshot.get("has_profile_link"))
+    if has_avatar or has_reviews_link:
+        return True
+    if any(token in body_text for token in ("メルカリについて", "会社概要", "運営会社")) and not has_avatar:
+        return False
+    return has_heading and has_profile_link
+
+
+def _capture_profile_page(page, profile_url: str) -> tuple[str, str, bytes]:
+    page.goto(profile_url, wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_selector("body", timeout=15000)
+    profile_id = profile_url.rstrip("/").split("/")[-1]
+
+    for attempt in range(2):
+        for selector in ('[data-testid="mer-profile-heading"]', 'img[src*="thumb/members/"]'):
+            try:
+                page.wait_for_selector(selector, timeout=4000)
+                break
+            except Exception:
+                continue
+        page.wait_for_timeout(1500)
+        try:
+            page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass
+        if _profile_page_loaded(_read_profile_page_state(page, profile_id)):
+            return (
+                page.content(),
+                page.evaluate("() => document.body ? document.body.innerText : ''"),
+                page.screenshot(full_page=True, type="png"),
+            )
+        if attempt == 0:
+            page.reload(wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_selector("body", timeout=15000)
+    raise RuntimeError("Could not load seller profile content from Mercari.")
+
+
+def _resolve_item_profile_url(page, item_html: str) -> str | None:
+    profile_url = _find_profile_url(item_html)
+    if profile_url:
+        return profile_url
+
+    for selector in ('a[data-location="item_details:seller_info"]', '[data-testid="seller-link"]'):
+        try:
+            page.wait_for_selector(selector, timeout=5000)
+            break
+        except Exception:
+            continue
+
+    page.wait_for_timeout(1500)
+    profile_url = _find_profile_url(page.content())
+    if profile_url:
+        return profile_url
+    return _find_profile_url_in_page(page)
 
 
 def _run_capture(query_url: str) -> dict:
@@ -93,31 +339,27 @@ def _run_capture(query_url: str) -> dict:
 
         item_html = item_text = None
         profile_url = None
+        display_name = None
+        seller_total_reviews = None
         query_kind = "profile"
 
         if is_item:
             pg = ctx.new_page()
             d = _capture_page(pg, f"https://{_MERCARI_HOST}{path}")
             item_html, item_text = d["raw_html"], d["visible_text"]
-            pg.close()
             query_kind = "item"
-            profile_url = _find_profile_url(item_html)
+            seller_context = _extract_item_seller_context(pg, item_html, item_text)
+            profile_url = str(seller_context.get("profile_url") or "") or _resolve_item_profile_url(pg, item_html)
+            display_name = seller_context.get("display_name")
+            seller_total_reviews = seller_context.get("seller_total_reviews")
+            pg.close()
             if not profile_url:
                 raise RuntimeError("Could not find seller profile in item page.")
         else:
             profile_url = f"https://{_MERCARI_HOST}{path}"
 
         pg = ctx.new_page()
-        pg.goto(profile_url, wait_until="domcontentloaded", timeout=60000)
-        pg.wait_for_selector("body", timeout=15000)
-        pg.wait_for_timeout(2000)
-        try:
-            pg.wait_for_load_state("networkidle", timeout=10000)
-        except Exception:
-            pass
-        profile_html = pg.content()
-        profile_text = pg.evaluate("() => document.body ? document.body.innerText : ''")
-        screenshot_bytes = pg.screenshot(full_page=True, type="png")
+        profile_html, profile_text, screenshot_bytes = _capture_profile_page(pg, profile_url)
         pg.close()
 
         profile_id  = profile_url.rstrip("/").split("/")[-1]
@@ -156,6 +398,8 @@ def _run_capture(query_url: str) -> dict:
         "reviews_bad_text":  reviews_bad_text,
         "item_html":         item_html,
         "item_text":         item_text,
+        "display_name":      display_name,
+        "seller_total_reviews": seller_total_reviews,
     }
 
 

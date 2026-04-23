@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
+import mimetypes
 import ssl
 import tempfile
 import time
 import threading
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -27,11 +29,15 @@ from .natural_language import (
     fallback_route_telegram_natural_language,
 )
 from .reputation_agent import ensure_agent_thread
-from .reputation_snapshot import ReputationSnapshotResult, request_reputation_snapshot
+from .reputation_snapshot import (
+    ReputationSnapshotResult,
+    fetch_reputation_proof_document,
+    request_reputation_snapshot,
+)
 
 LookupRenderer = Callable[["TelegramLookupQuery"], str]
 PhotoLookupRenderer = Callable[["TelegramPhotoQuery"], str]
-ReputationRenderer = Callable[["TelegramReputationQuery"], str]
+ReputationRenderer = Callable[["TelegramReputationQuery"], object]
 BoardLoader = Callable[[], tuple[HotCardBoard, ...]]
 CatalogRenderer = Callable[[], str]
 
@@ -66,6 +72,20 @@ class TelegramPhotoQuery:
 @dataclass(frozen=True, slots=True)
 class TelegramReputationQuery:
     query_url: str
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramFileAttachment:
+    kind: str
+    path: Path
+    caption: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramReputationDelivery:
+    summary_text: str
+    attachments: tuple[TelegramFileAttachment, ...] = ()
+    cleanup_paths: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +139,22 @@ class TelegramBotClient:
             },
         )
 
+    def send_photo(self, *, chat_id: str | int, photo_path: Path, caption: str | None = None) -> dict[str, object]:
+        return self._call_multipart(
+            "sendPhoto",
+            fields={"chat_id": str(chat_id), "caption": caption},
+            file_field="photo",
+            file_path=photo_path,
+        )
+
+    def send_document(self, *, chat_id: str | int, document_path: Path, caption: str | None = None) -> dict[str, object]:
+        return self._call_multipart(
+            "sendDocument",
+            fields={"chat_id": str(chat_id), "caption": caption},
+            file_field="document",
+            file_path=document_path,
+        )
+
     def get_file(self, *, file_id: str) -> dict[str, object]:
         result = self._call("getFile", {"file_id": file_id})
         return result if isinstance(result, dict) else {}
@@ -153,6 +189,43 @@ class TelegramBotClient:
             description = response_payload.get("description", "Unknown Telegram API error.")
             raise RuntimeError(f"Telegram API {method} failed: {description}")
         return response_payload.get("result", {})
+
+    def _call_multipart(
+        self,
+        method: str,
+        *,
+        fields: dict[str, str | None],
+        file_field: str,
+        file_path: Path,
+    ) -> dict[str, object]:
+        boundary = f"----OpenClawBoundary{uuid.uuid4().hex}"
+        content_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+        body = _encode_multipart_body(
+            boundary=boundary,
+            fields=fields,
+            file_field=file_field,
+            file_path=file_path,
+            content_type=content_type,
+        )
+        request = Request(
+            self._base_url + method,
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=self._timeout_seconds, context=self._ssl_context) as response:
+                response_payload = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:  # pragma: no cover - network-dependent.
+            raise RuntimeError(f"Telegram API HTTP {exc.code} for {method}.") from exc
+        except URLError as exc:  # pragma: no cover - network-dependent.
+            raise RuntimeError(f"Telegram API request failed for {method}: {exc.reason}") from exc
+
+        if not response_payload.get("ok"):
+            description = response_payload.get("description", "Unknown Telegram API error.")
+            raise RuntimeError(f"Telegram API {method} failed: {description}")
+        result = response_payload.get("result", {})
+        return result if isinstance(result, dict) else {}
 
 
 class TelegramCommandProcessor:
@@ -292,19 +365,29 @@ class TelegramCommandProcessor:
         return format_liquidity_board(board, limit=limit)
 
     def _handle_reputation_snapshot(self, raw: str) -> str:
+        return self.build_reputation_delivery(raw).summary_text
+
+    def build_reputation_delivery(self, raw: str) -> TelegramReputationDelivery:
         if self._reputation_renderer is None:
-            return "Reputation snapshot integration is not configured in this OpenClaw runtime."
+            return TelegramReputationDelivery(
+                summary_text="Reputation snapshot integration is not configured in this OpenClaw runtime."
+            )
 
         try:
             query = parse_reputation_snapshot_command(raw)
         except ValueError as exc:
-            return f"{exc}\nExample: /snapshot https://jp.mercari.com/item/m123456789"
+            return TelegramReputationDelivery(
+                summary_text=f"{exc}\nExample: /snapshot https://jp.mercari.com/item/m123456789"
+            )
 
         try:
-            return self._reputation_renderer(query)
+            rendered = self._reputation_renderer(query)
+            if isinstance(rendered, TelegramReputationDelivery):
+                return rendered
+            return TelegramReputationDelivery(summary_text=str(rendered))
         except Exception as exc:  # pragma: no cover - network-dependent.
             logger.exception("Telegram reputation snapshot failed query_url=%s", query.query_url)
-            return f"Snapshot failed: {exc}"
+            return TelegramReputationDelivery(summary_text=f"Snapshot failed: {exc}")
 
     def _handle_natural_language(self, text: str) -> str | None:
         intent = self._route_natural_language(text)
@@ -542,6 +625,46 @@ def format_reputation_snapshot_result(result: ReputationSnapshotResult) -> str:
     return "\n".join(lines)
 
 
+def format_reputation_snapshot_delivery_text(
+    result: ReputationSnapshotResult,
+    proof_document: dict[str, object] | None,
+) -> str:
+    action_text = "沿用既有快照" if result.reused else "已建立新快照"
+    subject = proof_document.get("subject", {}) if isinstance(proof_document, dict) else {}
+    metrics = proof_document.get("metrics", {}) if isinstance(proof_document, dict) else {}
+
+    display_name = subject.get("display_name") if isinstance(subject, dict) else None
+    captured_at = proof_document.get("captured_at") if isinstance(proof_document, dict) else None
+    total_reviews = metrics.get("total_reviews") if isinstance(metrics, dict) else None
+    listing_count = metrics.get("listing_count") if isinstance(metrics, dict) else None
+    followers_count = metrics.get("followers_count") if isinstance(metrics, dict) else None
+    following_count = metrics.get("following_count") if isinstance(metrics, dict) else None
+
+    lines = ["信譽快照已就緒", action_text]
+    if display_name:
+        lines.append(f"賣家：{display_name}")
+
+    metrics_bits = []
+    if total_reviews is not None:
+        metrics_bits.append(f"評價 {total_reviews}")
+    if listing_count is not None:
+        metrics_bits.append(f"刊登 {listing_count}")
+    if followers_count is not None:
+        metrics_bits.append(f"追蹤者 {followers_count}")
+    if following_count is not None:
+        metrics_bits.append(f"追蹤中 {following_count}")
+    if metrics_bits:
+        lines.append(" / ".join(metrics_bits))
+
+    if captured_at:
+        lines.append(f"快照時間：{captured_at}")
+    if result.proof_id:
+        lines.append(f"proof_id: {result.proof_id}")
+    lines.append("已附上 PDF 與預覽圖，可直接在手機查看。")
+    lines.append(result.proof_url)
+    return "\n".join(lines)
+
+
 def default_lookup_renderer(settings: AssistantSettings) -> LookupRenderer:
     def render(query: TelegramLookupQuery) -> str:
         logger.debug(
@@ -642,7 +765,7 @@ def default_photo_renderer(settings: AssistantSettings) -> PhotoLookupRenderer:
 
 
 def default_reputation_renderer(settings: AssistantSettings) -> ReputationRenderer:
-    def render(query: TelegramReputationQuery) -> str:
+    def render(query: TelegramReputationQuery) -> TelegramReputationDelivery:
         logger.info("Telegram reputation snapshot requested query_url=%s", trim_for_log(query.query_url, limit=240))
         thread, started_now = ensure_agent_thread(
             server_url=settings.reputation_agent_server_url,
@@ -662,9 +785,92 @@ def default_reputation_renderer(settings: AssistantSettings) -> ReputationRender
             result.proof_id,
             result.reused,
         )
-        return format_reputation_snapshot_result(result)
+        proof_document = None
+        if result.proof_id is not None:
+            try:
+                proof_document = fetch_reputation_proof_document(settings=settings, proof_id=result.proof_id)
+            except Exception:
+                logger.exception("Telegram reputation proof fetch failed proof_id=%s", result.proof_id)
+        pdf_path, preview_path = render_reputation_snapshot_artifacts(settings=settings, result=result)
+        return TelegramReputationDelivery(
+            summary_text=format_reputation_snapshot_delivery_text(result, proof_document),
+            attachments=(
+                TelegramFileAttachment(kind="document", path=pdf_path, caption="Reputation snapshot PDF"),
+                TelegramFileAttachment(kind="photo", path=preview_path, caption="Reputation snapshot preview"),
+            ),
+            cleanup_paths=(pdf_path, preview_path),
+        )
 
     return render
+
+
+def render_reputation_snapshot_artifacts(
+    *,
+    settings: AssistantSettings,
+    result: ReputationSnapshotResult,
+) -> tuple[Path, Path]:
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:  # pragma: no cover - environment-dependent.
+        raise RuntimeError("playwright is not installed — run: pip install playwright && playwright install chromium") from exc
+
+    proof_id = result.proof_id or f"proof_{uuid.uuid4().hex[:12]}"
+    temp_root = Path.cwd() / ".openclaw_tmp" / "reputation_snapshot"
+    temp_root.mkdir(parents=True, exist_ok=True)
+    pdf_path = temp_root / f"{proof_id}.pdf"
+    preview_path = temp_root / f"{proof_id}.png"
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context(
+            locale="ja-JP",
+            viewport={"width": 1400, "height": 1800},
+            ignore_https_errors=settings.openclaw_tls_insecure_skip_verify,
+        )
+        page = context.new_page()
+        page.goto(result.proof_url, wait_until="networkidle", timeout=60000)
+        page.emulate_media(media="screen")
+        page.pdf(
+            path=str(pdf_path),
+            format="A4",
+            print_background=True,
+            margin={"top": "12mm", "right": "10mm", "bottom": "12mm", "left": "10mm"},
+        )
+        page.screenshot(path=str(preview_path), full_page=False)
+        context.close()
+        browser.close()
+
+    return pdf_path, preview_path
+
+
+def _encode_multipart_body(
+    *,
+    boundary: str,
+    fields: dict[str, str | None],
+    file_field: str,
+    file_path: Path,
+    content_type: str,
+) -> bytes:
+    body = bytearray()
+    for key, value in fields.items():
+        if value is None:
+            continue
+        body.extend(f"--{boundary}\r\n".encode("utf-8"))
+        body.extend(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode("utf-8"))
+        body.extend(str(value).encode("utf-8"))
+        body.extend(b"\r\n")
+
+    body.extend(f"--{boundary}\r\n".encode("utf-8"))
+    body.extend(
+        (
+            f'Content-Disposition: form-data; name="{file_field}"; filename="{file_path.name}"\r\n'
+            f"Content-Type: {content_type}\r\n\r\n"
+        ).encode("utf-8")
+    )
+    body.extend(file_path.read_bytes())
+    body.extend(b"\r\n")
+    body.extend(f"--{boundary}--\r\n".encode("utf-8"))
+    return bytes(body)
 
 
 def run_telegram_polling(
@@ -766,7 +972,20 @@ def handle_telegram_message(
         return tuple(replies)
 
     text = message.get("text")
-    plan = processor.build_reply_plan(chat_id=chat_id, text=text if isinstance(text, str) else None)
+    text_value = text if isinstance(text, str) else None
+    if text_value is not None and _extract_command_name(text_value) in REPUTATION_SNAPSHOT_COMMANDS:
+        if not processor.is_allowed_chat(chat_id):
+            return ()
+        ack = build_processing_ack(text=text_value)
+        if ack:
+            client.send_message(chat_id=chat_id, text=ack)
+            replies.append(ack)
+        delivery = processor.build_reputation_delivery(_extract_command_remainder(text_value))
+        _send_reputation_delivery(client=client, chat_id=chat_id, delivery=delivery)
+        replies.append(delivery.summary_text)
+        return tuple(replies)
+
+    plan = processor.build_reply_plan(chat_id=chat_id, text=text_value)
     if plan.ack:
         client.send_message(chat_id=chat_id, text=plan.ack)
         replies.append(plan.ack)
@@ -781,6 +1000,36 @@ def handle_telegram_message(
         client.send_message(chat_id=chat_id, text=reply)
         replies.append(reply)
     return tuple(replies)
+
+
+def _send_reputation_delivery(
+    *,
+    client: TelegramBotClient,
+    chat_id: str | int,
+    delivery: TelegramReputationDelivery,
+) -> None:
+    cleanup_paths = list(delivery.cleanup_paths)
+    try:
+        logger.debug(
+            "Telegram reputation delivery sending chat_id=%s text=%s attachments=%s",
+            mask_identifier(chat_id),
+            trim_for_log(delivery.summary_text, limit=320),
+            [attachment.path.name for attachment in delivery.attachments],
+        )
+        client.send_message(chat_id=chat_id, text=delivery.summary_text)
+        for attachment in delivery.attachments:
+            if attachment.kind == "document":
+                client.send_document(chat_id=chat_id, document_path=attachment.path, caption=attachment.caption)
+            elif attachment.kind == "photo":
+                client.send_photo(chat_id=chat_id, photo_path=attachment.path, caption=attachment.caption)
+            else:
+                logger.warning("Unknown Telegram attachment kind=%s path=%s", attachment.kind, attachment.path)
+    finally:
+        for path in cleanup_paths:
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                logger.debug("Could not remove temporary reputation artifact path=%s", path)
 
 
 def build_processing_ack(*, text: str | None = None, has_photo: bool = False) -> str | None:

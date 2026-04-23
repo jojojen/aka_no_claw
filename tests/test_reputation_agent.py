@@ -118,3 +118,87 @@ def test_ensure_server_ready_reports_local_startup_failure(monkeypatch) -> None:
     assert started_now is False
     assert err is not None
     assert "Local auto-start failed" in err
+
+
+def test_find_profile_url_matches_relative_and_absolute_urls() -> None:
+    relative_html = '<a href="/user/profile/427403243">seller</a>'
+    absolute_html = '<a href="https://jp.mercari.com/user/profile/427403243">seller</a>'
+
+    assert reputation_agent._find_profile_url(relative_html) == "https://jp.mercari.com/user/profile/427403243"
+    assert reputation_agent._find_profile_url(absolute_html) == "https://jp.mercari.com/user/profile/427403243"
+
+
+class _FakeItemPage:
+    def __init__(self) -> None:
+        self.waited_selectors: list[str] = []
+        self.waited_timeouts: list[int] = []
+
+    def eval_on_selector_all(self, selector: str, script: str):
+        assert selector == "a"
+        return [
+            {"href": "https://jp.mercari.com/notifications", "text": "", "location": "", "aria": ""},
+            {
+                "href": "https://jp.mercari.com/user/profile/427403243",
+                "text": "ミヤジ",
+                "location": "item_details:seller_info",
+                "aria": "ミヤジ, 384件のレビュー",
+            },
+        ]
+
+    def wait_for_selector(self, selector: str, timeout: int) -> None:
+        self.waited_selectors.append(selector)
+        raise RuntimeError("selector not available in test")
+
+    def wait_for_timeout(self, ms: int) -> None:
+        self.waited_timeouts.append(ms)
+
+    def content(self) -> str:
+        return "<html><body>no profile href in serialized html</body></html>"
+
+
+def test_resolve_item_profile_url_falls_back_to_dom_anchor_href() -> None:
+    page = _FakeItemPage()
+
+    profile_url = reputation_agent._resolve_item_profile_url(page, "<html><body>initial html without profile</body></html>")
+
+    assert profile_url == "https://jp.mercari.com/user/profile/427403243"
+    assert page.waited_selectors == ['a[data-location="item_details:seller_info"]', '[data-testid="seller-link"]']
+    assert page.waited_timeouts == [1500]
+
+
+def test_extract_item_seller_context_reads_display_name_and_total_reviews() -> None:
+    page = _FakeItemPage()
+
+    context = reputation_agent._extract_item_seller_context(
+        page,
+        "<html><body>initial html without profile</body></html>",
+        "seller name\n384",
+    )
+
+    assert context["profile_url"] == "https://jp.mercari.com/user/profile/427403243"
+    assert context["display_name"]
+    assert context["seller_total_reviews"] == 384
+
+
+def test_profile_page_loaded_rejects_company_page_snapshot() -> None:
+    assert reputation_agent._profile_page_loaded(
+        {
+            "body_text": "メルカリについて 会社概要（運営会社）",
+            "has_heading": True,
+            "has_avatar": False,
+            "has_reviews_link": False,
+            "has_profile_link": False,
+        }
+    ) is False
+
+
+def test_profile_page_loaded_accepts_profile_snapshot() -> None:
+    assert reputation_agent._profile_page_loaded(
+        {
+            "body_text": "seller profile",
+            "has_heading": True,
+            "has_avatar": True,
+            "has_reviews_link": True,
+            "has_profile_link": True,
+        }
+    ) is True
