@@ -9,10 +9,8 @@ description = "Reusable price-monitoring core with a separate OpenClaw adapter a
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-  "beautifulsoup4>=4.14,<5",
-  "Pillow>=11,<12",
   "playwright>=1.54,<2",
-  "truststore>=0.10,<1",
+  "price-monitor-bot",
 ]
 
 [project.optional-dependencies]

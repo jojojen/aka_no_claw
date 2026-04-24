@@ -1,3 +1,4 @@
-# Install the local project in editable mode.
-# Runtime dependencies are declared in pyproject.toml.
+# Install price_monitor_bot first (provides market_monitor, tcg_tracker, price_monitor_bot packages).
+-e ../price_monitor_bot
+# Then install this project in editable mode.
 -e .
