@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>OpenClaw Dashboard</title>
-    <link rel="stylesheet" href="/assets/dashboard.css?v=20260417a" />
+    <link rel="stylesheet" href="/assets/dashboard.css?v=20260427b" />
   </head>
   <body>
     <div class="page-shell">
@@ -40,6 +40,32 @@
           </div>
         </div>
       </header>
+
+      <section class="mercari-watch-zone">
+        <div class="card__heading">
+          <p class="eyebrow">Mercari 追蹤</p>
+          <h2>Mercari 關鍵字追蹤清單</h2>
+        </div>
+        <form id="mercari-watch-form" class="lookup-form mercari-watch-form">
+          <div class="field-row field-row--compact">
+            <label class="field field--grow">
+              <span>追蹤關鍵字</span>
+              <input name="query" type="text" placeholder="例如: 想いが重なる場所で 初音ミク SSP" required />
+            </label>
+            <label class="field">
+              <span>價格上限 (JPY)</span>
+              <input name="price_threshold_jpy" type="number" placeholder="300000" min="1" required />
+            </label>
+            <label class="field">
+              <span>Chat ID (選填)</span>
+              <input name="chat_id" type="text" placeholder="留空用預設" />
+            </label>
+          </div>
+          <button class="button button--primary" type="submit">新增追蹤</button>
+        </form>
+        <div id="mercari-watch-status" class="status-pill" style="display:none"></div>
+        <div id="mercari-watch-list" class="mercari-watch-grid"></div>
+      </section>
 
       <section class="hot-zone">
         <article class="hot-board">
@@ -162,9 +188,10 @@
           </div>
           <div id="watchlist-list" class="source-grid"></div>
         </section>
+
       </main>
     </div>
 
-    <script src="/assets/dashboard.js?v=20260417a"></script>
+    <script src="/assets/dashboard.js?v=20260427b"></script>
   </body>
 </html>

@@ -9,6 +9,7 @@ from pathlib import Path
 from assistant_runtime import AssistantSettings, build_ssl_context
 from assistant_runtime.logging_utils import trim_for_log
 
+from market_monitor.storage import MonitorDatabase
 from price_monitor_bot.bot import (  # noqa: F401
     BoardLoader,
     CatalogRenderer,
@@ -35,6 +36,7 @@ from price_monitor_bot.bot import (  # noqa: F401
     run_telegram_polling as _base_run_telegram_polling,
     send_telegram_test_message as _base_send_telegram_test_message,
 )
+from price_monitor_bot.watch_monitor import ensure_monitor as _ensure_watch_monitor
 from tcg_tracker.image_lookup import TcgVisionSettings
 
 from .natural_language import build_telegram_natural_language_router_from_settings
@@ -220,6 +222,8 @@ def run_telegram_polling(
     drop_pending_updates: bool = True,
 ) -> int:
     token = require_telegram_token(settings)
+    watch_db = _bootstrap_watch_db(settings)
+    _start_watch_monitor(settings=settings, watch_db=watch_db, token=token)
     return _base_run_telegram_polling(
         token=token,
         lookup_renderer=lookup_renderer,
@@ -231,10 +235,47 @@ def run_telegram_polling(
         ssl_context=build_ssl_context(settings),
         allowed_chat_id=settings.openclaw_telegram_chat_id,
         status_renderer=lambda: _build_status_text(settings),
+        watch_db=watch_db,
         poll_timeout=poll_timeout,
         notify_startup=notify_startup,
         drop_pending_updates=drop_pending_updates,
     )
+
+
+def _bootstrap_watch_db(settings: AssistantSettings) -> MonitorDatabase:
+    db = MonitorDatabase(settings.monitor_db_path)
+    db.bootstrap()
+    return db
+
+
+def _start_watch_monitor(
+    *,
+    settings: AssistantSettings,
+    watch_db: MonitorDatabase,
+    token: str,
+) -> None:
+    chat_id = settings.openclaw_telegram_chat_id
+    if not chat_id:
+        logger.warning("Mercari watch monitor: no OPENCLAW_TELEGRAM_CHAT_ID set, notifications will be skipped")
+
+    ssl_ctx = build_ssl_context(settings)
+
+    def notify(notification_chat_id: str, text: str) -> None:
+        resolved_chat = notification_chat_id if notification_chat_id and notification_chat_id != "dashboard" else chat_id
+        if not resolved_chat:
+            logger.warning("Mercari watch notify: no chat_id, dropping message")
+            return
+        client = TelegramBotClient(token, ssl_context=ssl_ctx)
+        client.send_message(chat_id=resolved_chat, text=text)
+
+    monitor, started = _ensure_watch_monitor(
+        db_path=watch_db.path,
+        notify_fn=notify,
+        interval_seconds=60,
+    )
+    logger.info("Mercari watch monitor started=%s running=%s", started, monitor.is_running())
+    if started:
+        print("[watch-monitor] Mercari watch monitor started (interval=60s)")
 
 
 def send_telegram_test_message(*, settings: AssistantSettings, message: str) -> int:

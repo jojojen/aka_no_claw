@@ -384,11 +384,155 @@ function formatDecimal(value) {
 document.getElementById("lookup-form").addEventListener("submit", submitLookup);
 document.getElementById("refresh-dashboard").addEventListener("click", () => {
   loadDashboard().catch(renderFatalError);
+  loadMercariWatchlist().catch(console.error);
 });
 document.getElementById("hot-pokemon-limit").addEventListener("change", handleHotLimitChange);
 document.getElementById("hot-ws-limit").addEventListener("change", handleHotLimitChange);
+document.getElementById("mercari-watch-form").addEventListener("submit", submitMercariWatch);
 
 loadDashboard().catch(renderFatalError);
+loadMercariWatchlist().catch(console.error);
+
+// ─── Mercari Watchlist ───────────────────────────────────────────────────────
+
+async function loadMercariWatchlist() {
+  const response = await fetch("/api/mercari-watchlist", { cache: "no-store" });
+  if (!response.ok) {
+    throw new Error(`Watchlist request failed: ${response.status}`);
+  }
+  const watches = await response.json();
+  renderMercariWatchlist(watches);
+}
+
+function renderMercariWatchlist(watches) {
+  const root = document.getElementById("mercari-watch-list");
+  root.innerHTML = "";
+
+  if (!watches.length) {
+    root.innerHTML = `<div class="tracked-card empty-state">目前沒有追蹤項目。在上方表單新增。</div>`;
+    return;
+  }
+
+  for (const watch of watches) {
+    const card = document.createElement("article");
+    card.className = "mercari-watch-card";
+    card.dataset.watchId = watch.watch_id;
+
+    const statusClass = watch.enabled ? "watch-status--on" : "watch-status--off";
+    const statusLabel = watch.enabled ? "啟用中" : "已停用";
+    const checked = watch.last_checked_at
+      ? watch.last_checked_at.replace("T", " ").slice(0, 16)
+      : "尚未檢查";
+
+    const hitsHtml = Array.isArray(watch.recent_hits) && watch.recent_hits.length
+      ? watch.recent_hits.map(h => `
+          <div class="watch-hit">
+            <a class="watch-hit__link" href="${escapeHtml(h.url)}" target="_blank" rel="noreferrer">
+              ${h.thumbnail_url ? `<img class="watch-hit__thumb" src="${escapeHtml(h.thumbnail_url)}" alt="" loading="lazy" />` : ""}
+              <span class="watch-hit__title">${escapeHtml(h.title || "（無標題）")}</span>
+            </a>
+            <span class="watch-hit__price">¥${Number(h.price_jpy).toLocaleString()}</span>
+            <span class="muted">${escapeHtml(h.first_seen_at.replace("T", " ").slice(0, 16))}</span>
+          </div>
+        `).join("")
+      : `<p class="muted">尚無命中紀錄。</p>`;
+
+    card.innerHTML = `
+      <div class="watch-card__header">
+        <div>
+          <span class="watch-status ${statusClass}">${escapeHtml(statusLabel)}</span>
+          <span class="tag" style="font-size:0.72rem;margin-left:4px">${escapeHtml(watch.watch_id)}</span>
+        </div>
+        <div class="watch-card__actions">
+          <button class="button button--small button--ghost" data-action="toggle" title="${watch.enabled ? "停用" : "啟用"}">
+            ${watch.enabled ? "停用" : "啟用"}
+          </button>
+          <button class="button button--small button--danger" data-action="delete" title="刪除">刪除</button>
+        </div>
+      </div>
+      <h3 class="watch-card__query">${escapeHtml(watch.query)}</h3>
+      <p class="source-meta">價格上限：¥${Number(watch.price_threshold_jpy).toLocaleString()} | 最後檢查：${escapeHtml(checked)}</p>
+      <details class="watch-hits">
+        <summary>近期命中（${watch.recent_hits ? watch.recent_hits.length : 0} 筆）</summary>
+        <div class="watch-hits__list">${hitsHtml}</div>
+      </details>
+    `;
+
+    card.querySelector("[data-action='toggle']").addEventListener("click", () => {
+      toggleMercariWatch(watch.watch_id, !watch.enabled);
+    });
+    card.querySelector("[data-action='delete']").addEventListener("click", () => {
+      deleteMercariWatch(watch.watch_id);
+    });
+
+    root.appendChild(card);
+  }
+}
+
+async function submitMercariWatch(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const data = new FormData(form);
+  const query = String(data.get("query") || "").trim();
+  const threshold = parseInt(String(data.get("price_threshold_jpy") || "0"), 10);
+  const chatId = String(data.get("chat_id") || "").trim() || "dashboard";
+
+  const status = document.getElementById("mercari-watch-status");
+  status.style.display = "";
+  status.textContent = "新增中…";
+
+  try {
+    const response = await fetch("/api/mercari-watchlist", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query, price_threshold_jpy: threshold, chat_id: chatId }),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || `HTTP ${response.status}`);
+    }
+    status.textContent = `已新增追蹤 [${payload.watch_id}]`;
+    form.reset();
+    await loadMercariWatchlist();
+  } catch (error) {
+    status.textContent = `新增失敗：${error.message}`;
+  }
+}
+
+async function deleteMercariWatch(watchId) {
+  if (!confirm(`確定要刪除追蹤 [${watchId}]？`)) return;
+  try {
+    const response = await fetch(`/api/mercari-watchlist/${encodeURIComponent(watchId)}`, {
+      method: "DELETE",
+    });
+    if (!response.ok) {
+      const payload = await response.json();
+      throw new Error(payload.error || `HTTP ${response.status}`);
+    }
+    await loadMercariWatchlist();
+  } catch (error) {
+    alert(`刪除失敗：${error.message}`);
+  }
+}
+
+async function toggleMercariWatch(watchId, enabled) {
+  try {
+    const response = await fetch(`/api/mercari-watchlist/${encodeURIComponent(watchId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    });
+    if (!response.ok) {
+      const payload = await response.json();
+      throw new Error(payload.error || `HTTP ${response.status}`);
+    }
+    await loadMercariWatchlist();
+  } catch (error) {
+    alert(`更新失敗：${error.message}`);
+  }
+}
+
+// ─── Fatal Error ─────────────────────────────────────────────────────────────
 
 function renderFatalError(error) {
   const result = document.getElementById("lookup-result");

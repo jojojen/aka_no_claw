@@ -4,6 +4,7 @@ import json
 import logging
 import sqlite3
 import webbrowser
+from hashlib import sha1
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -14,6 +15,7 @@ from assistant_runtime import AssistantSettings, ToolRegistry, build_ssl_context
 from assistant_runtime.logging_utils import trim_for_log
 from market_monitor import load_reference_sources
 from market_monitor.http import HttpClient
+from market_monitor.storage import MercariWatch, MonitorDatabase
 from tcg_tracker.hot_cards import HotCardBoard, TcgHotCardService
 
 from .commands import lookup_card
@@ -161,11 +163,147 @@ def _build_handler(*, settings: AssistantSettings, registry: ToolRegistry) -> ty
             if parsed.path == "/api/tcg/lookup":
                 self._handle_lookup(parsed.query)
                 return
+            if parsed.path == "/api/mercari-watchlist":
+                self._handle_watchlist_get()
+                return
 
+            self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+
+        def do_POST(self) -> None:  # noqa: N802
+            parsed = urlparse(self.path)
+            if parsed.path == "/api/mercari-watchlist":
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length)
+                try:
+                    data = json.loads(body.decode("utf-8"))
+                except Exception:
+                    self._write_json({"error": "Invalid JSON"}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                self._handle_watchlist_post(data)
+                return
+            self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+
+        def do_DELETE(self) -> None:  # noqa: N802
+            parsed = urlparse(self.path)
+            if parsed.path.startswith("/api/mercari-watchlist/"):
+                watch_id = parsed.path.removeprefix("/api/mercari-watchlist/")
+                self._handle_watchlist_delete(watch_id)
+                return
+            self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+
+        def do_PATCH(self) -> None:  # noqa: N802
+            parsed = urlparse(self.path)
+            if parsed.path.startswith("/api/mercari-watchlist/"):
+                watch_id = parsed.path.removeprefix("/api/mercari-watchlist/")
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length)
+                try:
+                    data = json.loads(body.decode("utf-8"))
+                except Exception:
+                    self._write_json({"error": "Invalid JSON"}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                self._handle_watchlist_patch(watch_id, data)
+                return
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
         def log_message(self, format: str, *args: object) -> None:
             return
+
+        def _get_watch_db(self) -> MonitorDatabase:
+            db = MonitorDatabase(settings.monitor_db_path)
+            db.bootstrap()
+            return db
+
+        def _handle_watchlist_get(self) -> None:
+            db = self._get_watch_db()
+            watches = db.list_mercari_watchlist()
+            payload = []
+            for w in watches:
+                hits = db.list_mercari_hits(w.watch_id, limit=5)
+                payload.append({
+                    "watch_id": w.watch_id,
+                    "query": w.query,
+                    "price_threshold_jpy": w.price_threshold_jpy,
+                    "enabled": w.enabled,
+                    "chat_id": w.chat_id,
+                    "last_checked_at": w.last_checked_at,
+                    "created_at": w.created_at,
+                    "updated_at": w.updated_at,
+                    "recent_hits": [
+                        {
+                            "mercari_item_id": h.mercari_item_id,
+                            "title": h.title,
+                            "price_jpy": h.price_jpy,
+                            "url": h.url,
+                            "thumbnail_url": h.thumbnail_url,
+                            "first_seen_at": h.first_seen_at,
+                            "notified": h.notified,
+                        }
+                        for h in hits
+                    ],
+                })
+            self._write_json(payload)
+
+        def _handle_watchlist_post(self, data: dict[str, object]) -> None:
+            query = str(data.get("query") or "").strip()
+            threshold_raw = data.get("price_threshold_jpy")
+            chat_id = str(data.get("chat_id") or "dashboard").strip()
+            if not query:
+                self._write_json({"error": "query is required"}, status=HTTPStatus.BAD_REQUEST)
+                return
+            try:
+                threshold = int(str(threshold_raw).replace(",", ""))
+            except (TypeError, ValueError):
+                self._write_json({"error": "price_threshold_jpy must be an integer"}, status=HTTPStatus.BAD_REQUEST)
+                return
+            if threshold <= 0:
+                self._write_json({"error": "price_threshold_jpy must be > 0"}, status=HTTPStatus.BAD_REQUEST)
+                return
+            watch_id = sha1(f"{chat_id}|{query}".encode()).hexdigest()[:16]
+            watch = MercariWatch(
+                watch_id=watch_id,
+                query=query,
+                price_threshold_jpy=threshold,
+                enabled=True,
+                chat_id=chat_id,
+                last_checked_at=None,
+                created_at="",
+                updated_at="",
+            )
+            db = self._get_watch_db()
+            db.add_mercari_watch(watch)
+            logger.info("Dashboard watchlist add watch_id=%s query=%s threshold=%d", watch_id, query, threshold)
+            self._write_json({"watch_id": watch_id, "query": query, "price_threshold_jpy": threshold}, status=HTTPStatus.CREATED)
+
+        def _handle_watchlist_delete(self, watch_id: str) -> None:
+            db = self._get_watch_db()
+            deleted = db.delete_mercari_watch(watch_id)
+            if deleted:
+                logger.info("Dashboard watchlist delete watch_id=%s", watch_id)
+                self._write_json({"deleted": True, "watch_id": watch_id})
+            else:
+                self._write_json({"error": f"watch_id '{watch_id}' not found"}, status=HTTPStatus.NOT_FOUND)
+
+        def _handle_watchlist_patch(self, watch_id: str, data: dict[str, object]) -> None:
+            db = self._get_watch_db()
+            watch = db.get_mercari_watch(watch_id)
+            if watch is None:
+                self._write_json({"error": f"watch_id '{watch_id}' not found"}, status=HTTPStatus.NOT_FOUND)
+                return
+            if "enabled" in data:
+                db.toggle_mercari_watch(watch_id, enabled=bool(data["enabled"]))
+            query = str(data["query"]).strip() if "query" in data else None
+            threshold = None
+            if "price_threshold_jpy" in data:
+                try:
+                    threshold = int(str(data["price_threshold_jpy"]).replace(",", ""))
+                except (TypeError, ValueError):
+                    self._write_json({"error": "price_threshold_jpy must be integer"}, status=HTTPStatus.BAD_REQUEST)
+                    return
+            if query or threshold is not None:
+                db.update_mercari_watch(watch_id, query=query, price_threshold_jpy=threshold)
+            logger.info("Dashboard watchlist patch watch_id=%s", watch_id)
+            self._write_json({"updated": True, "watch_id": watch_id})
 
         def _handle_lookup(self, query: str) -> None:
             params = parse_qs(query)

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import threading
+import time
+import webbrowser
 from pathlib import Path
 
 from assistant_runtime import AssistantSettings, AssistantTool, ToolRegistry, get_settings
@@ -142,6 +145,10 @@ def _configure_telegram_poll_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--keep-pending", action="store_true")
     parser.add_argument("--with-reputation-agent", action="store_true",
                         help="Also start the reputation-snapshot polling agent in a background thread.")
+    parser.add_argument("--no-dashboard", action="store_true",
+                        help="Do not auto-start the dashboard server and open browser.")
+    parser.add_argument("--dashboard-port", type=int, default=8765,
+                        help="Port for the auto-started dashboard (default: 8765).")
 
 
 def _configure_telegram_send_test_parser(parser: argparse.ArgumentParser) -> None:
@@ -252,13 +259,21 @@ def _handle_telegram_poll(
     registry: ToolRegistry,
 ) -> int:
     logger.info(
-        "CLI telegram-poll command received poll_timeout=%s notify_startup=%s keep_pending=%s with_reputation_agent=%s",
+        "CLI telegram-poll command received poll_timeout=%s notify_startup=%s keep_pending=%s with_reputation_agent=%s no_dashboard=%s",
         args.poll_timeout,
         args.notify_startup,
         args.keep_pending,
         getattr(args, "with_reputation_agent", False),
+        getattr(args, "no_dashboard", False),
     )
     _ensure_reputation_agent_started(args, settings)
+    if not getattr(args, "no_dashboard", False):
+        _start_dashboard_background(
+            args=args,
+            settings=settings,
+            registry=registry,
+            port=getattr(args, "dashboard_port", 8765),
+        )
     return run_telegram_polling(
         settings=settings,
         lookup_renderer=default_lookup_renderer(settings),
@@ -268,6 +283,36 @@ def _handle_telegram_poll(
         notify_startup=args.notify_startup,
         drop_pending_updates=not args.keep_pending,
     )
+
+
+def _start_dashboard_background(
+    *,
+    args: argparse.Namespace,
+    settings: AssistantSettings,
+    registry: ToolRegistry,
+    port: int = 8765,
+) -> None:
+    host = "127.0.0.1"
+    url = f"http://{host}:{port}"
+
+    def _run() -> None:
+        try:
+            serve_dashboard(
+                settings=settings,
+                registry=registry,
+                host=host,
+                port=port,
+                open_browser=False,
+            )
+        except Exception:
+            logger.exception("Background dashboard server failed")
+
+    thread = threading.Thread(target=_run, name="dashboard-server", daemon=True)
+    thread.start()
+    # Give the server a moment to bind before opening the browser
+    time.sleep(0.6)
+    webbrowser.open(url)
+    print(f"[dashboard] Server started at {url}")
 
 
 def _handle_telegram_send_test(
