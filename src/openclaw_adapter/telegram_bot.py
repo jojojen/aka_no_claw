@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import uuid
 from pathlib import Path
 
@@ -177,6 +178,7 @@ def format_reputation_snapshot_delivery_text(
     action_text = "沿用既有快照" if result.reused else "已建立新快照"
     subject = proof_document.get("subject", {}) if isinstance(proof_document, dict) else {}
     metrics = proof_document.get("metrics", {}) if isinstance(proof_document, dict) else {}
+    quality = proof_document.get("quality", {}) if isinstance(proof_document, dict) else {}
 
     display_name = subject.get("display_name") if isinstance(subject, dict) else None
     captured_at = proof_document.get("captured_at") if isinstance(proof_document, dict) else None
@@ -184,22 +186,45 @@ def format_reputation_snapshot_delivery_text(
     listing_count = metrics.get("listing_count") if isinstance(metrics, dict) else None
     followers_count = metrics.get("followers_count") if isinstance(metrics, dict) else None
     following_count = metrics.get("following_count") if isinstance(metrics, dict) else None
+    as_seller = quality.get("as_seller") if isinstance(quality, dict) else None
+    as_buyer = quality.get("as_buyer") if isinstance(quality, dict) else None
+    overall = quality.get("overall") if isinstance(quality, dict) else None
 
     lines = ["信譽快照已就緒", action_text]
     if display_name:
         lines.append(f"賣家：{display_name}")
 
-    metrics_bits = []
+    # Overall review count (from metrics, covers full history)
+    meta_bits = []
     if total_reviews is not None:
-        metrics_bits.append(f"評價 {total_reviews}")
+        meta_bits.append(f"評價 {total_reviews}")
     if listing_count is not None:
-        metrics_bits.append(f"刊登 {listing_count}")
+        meta_bits.append(f"刊登 {listing_count}")
     if followers_count is not None:
-        metrics_bits.append(f"追蹤者 {followers_count}")
+        meta_bits.append(f"追蹤者 {followers_count}")
     if following_count is not None:
-        metrics_bits.append(f"追蹤中 {following_count}")
-    if metrics_bits:
-        lines.append(" / ".join(metrics_bits))
+        meta_bits.append(f"追蹤中 {following_count}")
+    if meta_bits:
+        lines.append(" / ".join(meta_bits))
+
+    # Buyer / seller breakdown (from quality, based on captured review entries)
+    if isinstance(as_seller, dict) and (as_seller.get("positive") or as_seller.get("negative")):
+        pos = as_seller.get("positive") or 0
+        neg = as_seller.get("negative") or 0
+        rate = as_seller.get("rate")
+        rate_str = f"，好評率 {rate}%" if rate is not None else ""
+        lines.append(f"身為賣家：好評 {pos} / 差評 {neg}{rate_str}")
+    if isinstance(as_buyer, dict) and (as_buyer.get("positive") or as_buyer.get("negative")):
+        pos = as_buyer.get("positive") or 0
+        neg = as_buyer.get("negative") or 0
+        rate = as_buyer.get("rate")
+        rate_str = f"，好評率 {rate}%" if rate is not None else ""
+        lines.append(f"身為買家：好評 {pos} / 差評 {neg}{rate_str}")
+    elif isinstance(overall, dict) and as_seller is None and as_buyer is None:
+        # Fallback: only overall quality, no role breakdown available
+        rate = overall.get("rate")
+        if rate is not None:
+            lines.append(f"整體好評率：{rate}%")
 
     if captured_at:
         lines.append(f"快照時間：{captured_at}")
@@ -268,9 +293,63 @@ def _start_watch_monitor(
         client = TelegramBotClient(token, ssl_context=ssl_ctx)
         client.send_message(chat_id=resolved_chat, text=text)
 
+    def do_snapshot(notification_chat_id: str, urls: list[str]) -> None:
+        resolved_chat = notification_chat_id if notification_chat_id and notification_chat_id != "dashboard" else chat_id
+        if not resolved_chat:
+            logger.warning("Auto-snapshot: no chat_id, skipping")
+            return
+        bot_client = TelegramBotClient(token, ssl_context=ssl_ctx)
+        try:
+            bot_client.send_message(
+                chat_id=resolved_chat,
+                text=f"正在為 {len(urls)} 筆新商品建立賣家信譽快照，請稍候…",
+            )
+        except Exception:
+            logger.warning("Auto-snapshot: failed to send ack message")
+
+        def _run() -> None:
+            for url in urls:
+                try:
+                    result = request_reputation_snapshot(settings=settings, query_url=url)
+                    proof_document = None
+                    if result.proof_id:
+                        try:
+                            proof_document = fetch_reputation_proof_document(
+                                settings=settings, proof_id=result.proof_id
+                            )
+                        except Exception:
+                            logger.exception("Auto-snapshot: proof fetch failed proof_id=%s", result.proof_id)
+                    pdf_path, preview_path = render_reputation_snapshot_artifacts(
+                        settings=settings, result=result
+                    )
+                    summary = format_reputation_snapshot_delivery_text(result, proof_document)
+                    c = TelegramBotClient(token, ssl_context=ssl_ctx)
+                    c.send_message(chat_id=resolved_chat, text=summary)
+                    c.send_document(
+                        chat_id=resolved_chat,
+                        document_path=pdf_path,
+                        caption="信譽快照 PDF",
+                    )
+                    c.send_photo(
+                        chat_id=resolved_chat,
+                        photo_path=preview_path,
+                        caption="信譽快照預覽",
+                    )
+                    for p in (pdf_path, preview_path):
+                        try:
+                            p.unlink()
+                        except Exception:
+                            pass
+                    logger.info("Auto-snapshot: completed url=%s proof_id=%s", url, result.proof_id)
+                except Exception:
+                    logger.exception("Auto-snapshot: failed url=%s", url)
+
+        threading.Thread(target=_run, name="auto-snapshot", daemon=True).start()
+
     monitor, started = _ensure_watch_monitor(
         db_path=watch_db.path,
         notify_fn=notify,
+        snapshot_fn=do_snapshot,
         interval_seconds=60,
     )
     logger.info("Mercari watch monitor started=%s running=%s", started, monitor.is_running())

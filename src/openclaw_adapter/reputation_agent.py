@@ -57,6 +57,78 @@ def _capture_page(page, url: str) -> dict:
     }
 
 
+def _read_body_text(page) -> str:
+    return page.evaluate("() => document.body ? document.body.innerText : ''")
+
+
+def _click_review_tab(page, tab: str) -> bool:
+    selector_map = {
+        "good": ('[aria-controls="good"]', '[data-testid*="good"]'),
+        "bad": ('[aria-controls="bad"]', '[data-testid*="bad"]'),
+        "seller": ('[aria-controls="seller"]', '[aria-controls*="seller"]', '[data-testid*="seller"]'),
+        "buyer": ('[aria-controls="buyer"]', '[aria-controls*="buyer"]', '[data-testid*="buyer"]'),
+    }
+    label_map = {
+        "good": ("良かった", "良い"),
+        "bad": ("残念だった", "悪い"),
+        "seller": ("出品者",),
+        "buyer": ("購入者",),
+    }
+    for selector in selector_map[tab]:
+        try:
+            element = page.query_selector(selector)
+            if element:
+                element.click()
+                page.wait_for_timeout(1200)
+                return True
+        except Exception:
+            pass
+    for label in label_map[tab]:
+        try:
+            locator = page.get_by_role("tab", name=re.compile(label))
+            if locator.count():
+                locator.first.click()
+                page.wait_for_timeout(1200)
+                return True
+        except Exception:
+            pass
+        try:
+            locator = page.get_by_text(label, exact=False)
+            if locator.count():
+                locator.first.click()
+                page.wait_for_timeout(1200)
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _capture_review_tab_texts(page, initial_capture: dict) -> dict:
+    tab_text = {
+        "reviews_html": initial_capture["raw_html"],
+        "reviews_text": initial_capture["visible_text"],
+        "reviews_bad_text": "",
+        "reviews_buyer_text": "",
+        "reviews_buyer_bad_text": "",
+    }
+
+    if _click_review_tab(page, "seller"):
+        _click_review_tab(page, "good")
+        tab_text["reviews_html"] = page.content()
+        tab_text["reviews_text"] = _read_body_text(page)
+
+    if _click_review_tab(page, "bad"):
+        tab_text["reviews_bad_text"] = _read_body_text(page)
+
+    if _click_review_tab(page, "buyer"):
+        _click_review_tab(page, "good")
+        tab_text["reviews_buyer_text"] = _read_body_text(page)
+        if _click_review_tab(page, "bad"):
+            tab_text["reviews_buyer_bad_text"] = _read_body_text(page)
+
+    return tab_text
+
+
 def _profile_candidate_records(page) -> list[dict[str, str]]:
     try:
         candidates = page.eval_on_selector_all(
@@ -136,11 +208,19 @@ def _looks_like_person_name(value: str) -> bool:
         return False
     if candidate.startswith("http"):
         return False
+    if "<" in candidate or ">" in candidate:
+        return False
     if re.fullmatch(r"[\d,\s]+", candidate):
+        return False
+    if _is_suspicious_seller_name(candidate):
         return False
     if any(token in candidate for token in ("メルカリについて", "会社概要", "運営会社")):
         return False
     return True
+
+
+def _is_suspicious_seller_name(value: str) -> bool:
+    return bool(re.fullmatch(r"(?:Seller Level|Quick shipment)(?:\s+\d+)?", value.strip()))
 
 
 def _parse_item_seller_label(label: str) -> dict[str, object]:
@@ -164,7 +244,11 @@ def _extract_item_seller_from_text(visible_text: str) -> dict[str, object]:
 
     display_name = None
     total_reviews = None
-    seller_window = lines[:12]
+    try:
+        seller_index = lines.index("出品者")
+    except ValueError:
+        seller_index = -1
+    seller_window = lines[seller_index + 1 : seller_index + 6] if seller_index >= 0 else lines[:12]
 
     for line in seller_window:
         combined_match = re.fullmatch(r"(.+?)\s+([\d,]+)", line)
@@ -221,7 +305,15 @@ def _extract_item_seller_context(page, item_html: str, item_text: str) -> dict[s
 
     parsed_text = _extract_item_seller_from_text(item_text)
     for key, value in parsed_text.items():
-        if context.get(key) is None and value is not None:
+        if value is None:
+            continue
+        if key == "display_name" and (
+            context.get(key) is None or _is_suspicious_seller_name(str(context.get(key)))
+        ):
+            context[key] = value
+        elif key == "seller_total_reviews" and (
+            context.get(key) is None or int(value) > int(context.get(key) or 0)
+        ):
             context[key] = value
     return context
 
@@ -365,20 +457,23 @@ def _run_capture(query_url: str) -> dict:
         profile_id  = profile_url.rstrip("/").split("/")[-1]
         reviews_url = f"https://{_MERCARI_HOST}/user/reviews/{profile_id}"
         reviews_html = reviews_text = reviews_bad_text = None
+        reviews_buyer_text = reviews_buyer_bad_text = None
         try:
             rpg = ctx.new_page()
             rd = _capture_page(rpg, reviews_url)
-            reviews_html, reviews_text = rd["raw_html"], rd["visible_text"]
-            try:
-                bad_btn = rpg.query_selector('[aria-controls="bad"]')
-                if bad_btn:
-                    bad_btn.click()
-                    rpg.wait_for_timeout(2000)
-                    reviews_bad_text = rpg.evaluate(
-                        "() => document.body ? document.body.innerText : ''"
-                    )
-            except Exception:
-                pass
+            tab_text = _capture_review_tab_texts(rpg, rd)
+            reviews_html = tab_text["reviews_html"]
+            reviews_text = tab_text["reviews_text"]
+            reviews_bad_text = tab_text["reviews_bad_text"]
+            reviews_buyer_text = tab_text["reviews_buyer_text"]
+            reviews_buyer_bad_text = tab_text["reviews_buyer_bad_text"]
+            logger.info(
+                "reputation_agent: reviews captured text_len=%d bad_len=%d buyer_len=%d buyer_bad_len=%d",
+                len(reviews_text or ""),
+                len(reviews_bad_text or ""),
+                len(reviews_buyer_text or ""),
+                len(reviews_buyer_bad_text or ""),
+            )
             rpg.close()
         except Exception as e:
             logger.warning("reputation_agent: reviews capture skipped: %s", e)
@@ -396,6 +491,8 @@ def _run_capture(query_url: str) -> dict:
         "reviews_html":      reviews_html,
         "reviews_text":      reviews_text,
         "reviews_bad_text":  reviews_bad_text,
+        "reviews_buyer_text":     reviews_buyer_text,
+        "reviews_buyer_bad_text": reviews_buyer_bad_text,
         "item_html":         item_html,
         "item_text":         item_text,
         "display_name":      display_name,

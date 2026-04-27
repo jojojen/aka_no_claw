@@ -180,6 +180,98 @@ def test_extract_item_seller_context_reads_display_name_and_total_reviews() -> N
     assert context["seller_total_reviews"] == 384
 
 
+def test_extract_item_seller_context_prefers_visible_seller_over_badge_label() -> None:
+    class BadgePage(_FakeItemPage):
+        def eval_on_selector_all(self, selector: str, script: str):
+            return [
+                {
+                    "href": "https://jp.mercari.com/user/profile/954805077",
+                    "text": "Seller Level 10",
+                    "location": "item_details:seller_info",
+                    "aria": "Seller Level 10",
+                },
+            ]
+
+    context = reputation_agent._extract_item_seller_context(
+        BadgePage(),
+        "<html><body>initial html without profile</body></html>",
+        "\n".join(
+            [
+                "メルカリ安心への取り組み",
+                "出品者",
+                "きずま",
+                "3962",
+                "本人確認済",
+                "Quick shipment",
+                "Seller Level 10",
+            ]
+        ),
+    )
+
+    assert context["profile_url"] == "https://jp.mercari.com/user/profile/954805077"
+    assert context["display_name"] == "きずま"
+    assert context["seller_total_reviews"] == 3962
+
+
+class _FakeReviewElement:
+    def __init__(self, page: "_FakeReviewPage", tab: str) -> None:
+        self.page = page
+        self.tab = tab
+
+    def click(self) -> None:
+        if self.tab in {"seller", "buyer"}:
+            self.page.role_tab = self.tab
+            self.page.rating_tab = "good"
+        else:
+            self.page.rating_tab = self.tab
+
+
+class _FakeReviewPage:
+    def __init__(self) -> None:
+        self.role_tab = "seller"
+        self.rating_tab = "good"
+
+    def query_selector(self, selector: str):
+        mapping = {
+            '[aria-controls="good"]': "good",
+            '[aria-controls="bad"]': "bad",
+            '[aria-controls="seller"]': "seller",
+            '[aria-controls="buyer"]': "buyer",
+        }
+        tab = mapping.get(selector)
+        if not tab:
+            return None
+        return _FakeReviewElement(self, tab)
+
+    def wait_for_timeout(self, ms: int) -> None:
+        pass
+
+    def content(self) -> str:
+        return "<html>seller good</html>"
+
+    def evaluate(self, script: str) -> str:
+        active_tab = f"{self.role_tab}_{self.rating_tab}"
+        return {
+            "seller_good": "良かった (2)\n購入者\nseller review\n2026/04",
+            "seller_bad": "残念だった (1)\n購入者\nbad seller review\n2026/04",
+            "buyer_good": "良かった (1)\n出品者\nbuyer review\n2026/04",
+            "buyer_bad": "残念だった (0)",
+        }.get(active_tab, "")
+
+
+def test_capture_review_tab_texts_keeps_seller_and_buyer_review_texts() -> None:
+    page = _FakeReviewPage()
+
+    result = reputation_agent._capture_review_tab_texts(
+        page,
+        {"raw_html": "<html>initial</html>", "visible_text": "良かった (2)\n購入者\ninitial\n2026/04"},
+    )
+
+    assert "seller review" in result["reviews_text"]
+    assert "bad seller review" in result["reviews_bad_text"]
+    assert "buyer review" in result["reviews_buyer_text"]
+
+
 def test_profile_page_loaded_rejects_company_page_snapshot() -> None:
     assert reputation_agent._profile_page_loaded(
         {
