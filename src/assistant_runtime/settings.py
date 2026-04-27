@@ -11,7 +11,8 @@ DEFAULT_ENV_PATH = Path(".env")
 class AssistantSettings:
     monitor_db_path: str = "data/monitor.sqlite3"
     yuyutei_user_agent: str = "OpenClawPriceMonitor/0.1 (+https://local-dev)"
-    openclaw_telegram_chat_id: str | None = None
+    openclaw_telegram_chat_id: str | None = None  # primary (first) chat id
+    openclaw_telegram_chat_ids: tuple[str, ...] = ()  # all allowed chat ids
     openclaw_telegram_bot_token: str | None = None
     openclaw_tesseract_path: str | None = None
     openclaw_tessdata_dir: str | None = None
@@ -52,12 +53,13 @@ def load_dotenv(path: str | Path = DEFAULT_ENV_PATH, *, override: bool = False) 
 
 
 def get_settings() -> AssistantSettings:
+    _raw_chat_ids = _getenv_any("OPENCLAW_TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_ID")
+    _parsed_chat_ids = _parse_chat_ids(_raw_chat_ids)
     return AssistantSettings(
         monitor_db_path=os.getenv("MONITOR_DB_PATH", "data/monitor.sqlite3"),
         yuyutei_user_agent=os.getenv("YUYUTEI_USER_AGENT", "OpenClawPriceMonitor/0.1 (+https://local-dev)"),
-        openclaw_telegram_chat_id=_none_if_empty(
-            _getenv_any("OPENCLAW_TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_ID")
-        ),
+        openclaw_telegram_chat_id=_parsed_chat_ids[0] if _parsed_chat_ids else None,
+        openclaw_telegram_chat_ids=tuple(_parsed_chat_ids),
         openclaw_telegram_bot_token=_none_if_empty(
             _getenv_any("OPENCLAW_TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN")
         ),
@@ -105,6 +107,13 @@ def _none_if_empty(value: str | None) -> str | None:
     if value is None or value == "":
         return None
     return value
+
+
+def _parse_chat_ids(value: str | None) -> list[str]:
+    """Split a comma-separated chat ID string into a list of non-empty IDs."""
+    if not value:
+        return []
+    return [part.strip() for part in value.split(",") if part.strip()]
 
 
 def _getenv_any(*keys: str) -> str | None:

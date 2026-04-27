@@ -233,7 +233,7 @@ def run_telegram_polling(
         reputation_renderer=default_reputation_renderer(settings),
         natural_language_router=build_telegram_natural_language_router_from_settings(settings),
         ssl_context=build_ssl_context(settings),
-        allowed_chat_id=settings.openclaw_telegram_chat_id,
+        allowed_chat_ids=frozenset(settings.openclaw_telegram_chat_ids),
         status_renderer=lambda: _build_status_text(settings),
         watch_db=watch_db,
         poll_timeout=poll_timeout,
@@ -304,7 +304,7 @@ def require_telegram_chat_id(settings: AssistantSettings) -> str:
 
 
 def _build_status_text(settings: AssistantSettings) -> str:
-    allowed_chat = settings.openclaw_telegram_chat_id or "not restricted"
+    allowed_chats = ", ".join(settings.openclaw_telegram_chat_ids) if settings.openclaw_telegram_chat_ids else "not restricted"
     tesseract = settings.openclaw_tesseract_path or "PATH lookup"
     tessdata = settings.openclaw_tessdata_dir or "auto"
     return "\n".join(
@@ -312,7 +312,7 @@ def _build_status_text(settings: AssistantSettings) -> str:
             "OpenClaw Telegram status",
             f"env: {settings.monitor_env}",
             f"db: {settings.monitor_db_path}",
-            f"allowed chat: {allowed_chat}",
+            f"allowed chats: {allowed_chats}",
             f"tesseract: {tesseract}",
             f"tessdata: {tessdata}",
         ]
