@@ -623,10 +623,18 @@ def _find_local_reputation_snapshot_dir() -> Path | None:
 
 
 def _launch_local_reputation_snapshot(repo_dir: Path) -> None:
+    no_browser_script = repo_dir / "start-no-browser.bat"
+    if no_browser_script.exists():
+        subprocess.Popen(
+            ["cmd", "/c", "start", "", "start-no-browser.bat"],
+            cwd=str(repo_dir),
+        )
+        return
+
     start_script = repo_dir / "start.bat"
     if start_script.exists():
         subprocess.Popen(
-            ["cmd", "/c", "start", "", "start.bat", "go"],
+            ["cmd", "/c", "start", "", "start.bat", "go", "--no-browser"],
             cwd=str(repo_dir),
         )
         return

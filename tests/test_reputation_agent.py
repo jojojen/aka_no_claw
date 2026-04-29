@@ -120,6 +120,45 @@ def test_ensure_server_ready_reports_local_startup_failure(monkeypatch) -> None:
     assert "Local auto-start failed" in err
 
 
+def test_launch_local_reputation_snapshot_prefers_no_browser_launcher(monkeypatch, tmp_path) -> None:
+    commands: list[tuple[list[str], str]] = []
+    (tmp_path / "start-no-browser.bat").write_text("@echo off\n", encoding="utf-8")
+    (tmp_path / "start.bat").write_text("@echo off\n", encoding="utf-8")
+
+    def fake_popen(command, *, cwd=None, **kwargs):
+        commands.append((list(command), str(cwd)))
+
+    monkeypatch.setattr(reputation_agent.subprocess, "Popen", fake_popen)
+
+    reputation_agent._launch_local_reputation_snapshot(tmp_path)
+
+    assert commands == [
+        (
+            ["cmd", "/c", "start", "", "start-no-browser.bat"],
+            str(tmp_path),
+        )
+    ]
+
+
+def test_launch_local_reputation_snapshot_passes_no_browser_to_start_bat(monkeypatch, tmp_path) -> None:
+    commands: list[tuple[list[str], str]] = []
+    (tmp_path / "start.bat").write_text("@echo off\n", encoding="utf-8")
+
+    def fake_popen(command, *, cwd=None, **kwargs):
+        commands.append((list(command), str(cwd)))
+
+    monkeypatch.setattr(reputation_agent.subprocess, "Popen", fake_popen)
+
+    reputation_agent._launch_local_reputation_snapshot(tmp_path)
+
+    assert commands == [
+        (
+            ["cmd", "/c", "start", "", "start.bat", "go", "--no-browser"],
+            str(tmp_path),
+        )
+    ]
+
+
 def test_find_profile_url_matches_relative_and_absolute_urls() -> None:
     relative_html = '<a href="/user/profile/427403243">seller</a>'
     absolute_html = '<a href="https://jp.mercari.com/user/profile/427403243">seller</a>'
