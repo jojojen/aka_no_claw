@@ -20,6 +20,7 @@ from openclaw_adapter.telegram_bot import (
     TelegramReputationQuery,
     TelegramReputationDelivery,
     build_processing_ack,
+    default_photo_renderer,
     default_reputation_renderer,
     format_liquidity_board,
     format_photo_lookup_result,
@@ -27,6 +28,7 @@ from openclaw_adapter.telegram_bot import (
     handle_telegram_message,
     parse_lookup_command,
     parse_reputation_snapshot_command,
+    _chromium_launch_options,
 )
 
 
@@ -124,6 +126,38 @@ def test_parse_lookup_command_supports_simple_format() -> None:
         game="ws",
         name="Hatsune Miku",
     )
+
+
+def test_default_photo_renderer_tolerates_disabled_local_vision_backend(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_base_default_photo_renderer(**kwargs):
+        captured.update(kwargs)
+        return lambda query: "unused"
+
+    monkeypatch.setattr(
+        "openclaw_adapter.telegram_bot._base_default_photo_renderer",
+        fake_base_default_photo_renderer,
+    )
+    settings = AssistantSettings(
+        openclaw_local_vision_backend=None,
+        openclaw_local_vision_model="qwen2.5vl:7b",
+    )
+
+    renderer = default_photo_renderer(settings)
+
+    assert renderer is not None
+    assert captured["vision_settings"].backend == ""
+    assert captured["vision_settings"].model == "qwen2.5vl:7b"
+
+
+def test_reputation_snapshot_artifacts_use_configured_system_chromium(monkeypatch) -> None:
+    monkeypatch.setenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH", "/usr/bin/chromium")
+
+    assert _chromium_launch_options() == {
+        "headless": True,
+        "executable_path": "/usr/bin/chromium",
+    }
 
 
 def test_command_processor_restricts_unconfigured_chat() -> None:

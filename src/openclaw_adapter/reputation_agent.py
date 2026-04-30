@@ -411,11 +411,18 @@ def _run_capture(query_url: str) -> dict:
     is_item = "/item/" in path
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled",
-                  "--no-sandbox", "--disable-dev-shm-usage"],
-        )
+        launch_kwargs = {
+            "headless": True,
+            "args": [
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        }
+        chromium_executable = os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH")
+        if chromium_executable:
+            launch_kwargs["executable_path"] = chromium_executable
+        browser = p.chromium.launch(**launch_kwargs)
         ctx = browser.new_context(
             locale="ja-JP",
             viewport={"width": 1440, "height": 2200},
@@ -582,7 +589,10 @@ def check_prerequisites(api_key: str) -> str | None:
         return "playwright is not installed — run: pip install playwright && playwright install chromium"
     try:
         with sync_playwright() as playwright:
-            executable = Path(playwright.chromium.executable_path)
+            executable = Path(
+                os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH")
+                or playwright.chromium.executable_path
+            )
             if not executable.exists():
                 return "Playwright Chromium is not installed — run: playwright install chromium"
     except Exception as exc:

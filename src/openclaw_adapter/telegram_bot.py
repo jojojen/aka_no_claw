@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import shutil
 import threading
 import uuid
 from pathlib import Path
@@ -18,7 +20,6 @@ from price_monitor_bot.bot import (  # noqa: F401
     PhotoLookupRenderer,
     ReputationRenderer,
     TelegramBotClient,
-    TelegramCommandProcessor,
     TelegramFileAttachment,
     TelegramLookupQuery,
     TelegramPhotoQuery,
@@ -36,6 +37,7 @@ from price_monitor_bot.bot import (  # noqa: F401
     parse_reputation_snapshot_command,
     run_telegram_polling as _base_run_telegram_polling,
     send_telegram_test_message as _base_send_telegram_test_message,
+    TelegramCommandProcessor as _BaseTelegramCommandProcessor,
 )
 from price_monitor_bot.watch_monitor import ensure_monitor as _ensure_watch_monitor
 from tcg_tracker.image_lookup import TcgVisionSettings
@@ -57,6 +59,21 @@ REPUTATION_SNAPSHOT_COMMANDS = {"/snapshot", "/proof", "/repcheck", "/reputation
 HEAVY_COMMANDS = PRICE_LOOKUP_COMMANDS | TREND_BOARD_COMMANDS | REPUTATION_SNAPSHOT_COMMANDS
 
 
+class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
+    """OpenClaw compatibility wrapper around the reusable Telegram processor."""
+
+    def __init__(
+        self,
+        *,
+        settings: AssistantSettings | None = None,
+        allowed_chat_ids: frozenset[str] | None = None,
+        **kwargs,
+    ) -> None:
+        if allowed_chat_ids is None and settings is not None and settings.openclaw_telegram_chat_id:
+            allowed_chat_ids = frozenset({settings.openclaw_telegram_chat_id})
+        super().__init__(allowed_chat_ids=allowed_chat_ids, **kwargs)
+
+
 def default_lookup_renderer(settings: AssistantSettings) -> LookupRenderer:
     return _base_default_lookup_renderer(db_path=settings.monitor_db_path)
 
@@ -67,7 +84,7 @@ def default_photo_renderer(settings: AssistantSettings) -> PhotoLookupRenderer:
         tesseract_path=settings.openclaw_tesseract_path,
         tessdata_dir=settings.openclaw_tessdata_dir,
         vision_settings=TcgVisionSettings(
-            backend=(settings.openclaw_local_vision_backend or "ollama"),
+            backend=settings.openclaw_local_vision_backend or "",
             endpoint=settings.openclaw_local_vision_endpoint,
             model=settings.openclaw_local_vision_model,
             timeout_seconds=settings.openclaw_local_vision_timeout_seconds,
@@ -137,7 +154,7 @@ def render_reputation_snapshot_artifacts(
     preview_path = temp_root / f"{proof_id}.png"
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
+        browser = playwright.chromium.launch(**_chromium_launch_options())
         context = browser.new_context(
             locale="ja-JP",
             viewport={"width": 1400, "height": 1800},
@@ -157,6 +174,25 @@ def render_reputation_snapshot_artifacts(
         browser.close()
 
     return pdf_path, preview_path
+
+
+def _chromium_launch_options() -> dict[str, object]:
+    options: dict[str, object] = {"headless": True}
+    executable_path = _resolve_chromium_executable()
+    if executable_path:
+        options["executable_path"] = executable_path
+    return options
+
+
+def _resolve_chromium_executable() -> str | None:
+    configured = os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH")
+    if configured:
+        return configured
+    for candidate in ("chromium", "chromium-browser", "google-chrome-stable"):
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+    return None
 
 
 def format_reputation_snapshot_result(result: ReputationSnapshotResult) -> str:

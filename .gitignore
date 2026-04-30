@@ -25,6 +25,7 @@ data/*.db
 data/*.log
 !data/.gitkeep
 logs/
+run/
 .openclaw_tmp/
 .openclaw_ocr/
 reports/

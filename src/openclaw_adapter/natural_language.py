@@ -22,7 +22,9 @@ def build_telegram_natural_language_router_from_settings(
     if model is None:
         return None
 
-    backend = (settings.openclaw_local_text_backend or "ollama").strip().lower()
+    backend = (settings.openclaw_local_text_backend or "").strip().lower()
+    if not backend:
+        return None
     if backend != "ollama":
         logger.warning("Unsupported Telegram natural-language router backend=%s", backend)
         return None
