@@ -6,6 +6,19 @@ WORKSPACE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REPUTATION_DIR="${WORKSPACE_DIR}/reputation_snapshot"
 AKA_VENV="${SCRIPT_DIR}/.venv"
 PID_FILE="${SCRIPT_DIR}/run/mac-mini-stack.pid"
+LAUNCHCTL_LABELS=(local.openclaw.reputation local.openclaw.telegram)
+
+stop_launchctl_jobs() {
+  if ! command -v launchctl >/dev/null 2>&1; then
+    return
+  fi
+  for label in "${LAUNCHCTL_LABELS[@]}"; do
+    if launchctl print "gui/$(id -u)/${label}" >/dev/null 2>&1; then
+      printf '[mac-mini-stack] Stopping launchctl job %s\n' "${label}"
+      launchctl remove "${label}" >/dev/null 2>&1 || true
+    fi
+  done
+}
 
 stop_orphaned_stack_processes() {
   found=0
@@ -25,6 +38,8 @@ stop_orphaned_stack_processes() {
     sleep 1
   fi
 }
+
+stop_launchctl_jobs
 
 if [[ ! -f "${PID_FILE}" ]]; then
   printf '[mac-mini-stack] No PID file found at %s\n' "${PID_FILE}"

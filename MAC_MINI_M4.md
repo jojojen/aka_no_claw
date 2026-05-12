@@ -73,6 +73,14 @@ To skip Homebrew package setup after you have prepared dependencies yourself:
 AUTO_INSTALL_SYSTEM_DEPS=0 ./start-mac-mini-stack.command
 ```
 
+The reputation snapshot service defaults to port `5000`. If that port is already
+in use on macOS, the launcher automatically falls back to a nearby local port
+such as `5055`. To force a specific port:
+
+```bash
+REPUTATION_PORT=5055 ./start-mac-mini-stack.command
+```
+
 To require Apple Silicon:
 
 ```bash

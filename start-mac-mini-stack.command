@@ -26,6 +26,9 @@ REPUTATION_VENV="${REPUTATION_DIR}/.venv"
 RUN_DIR="${AKA_DIR}/run"
 LOG_DIR="${AKA_DIR}/logs"
 PID_FILE="${RUN_DIR}/mac-mini-stack.pid"
+RUNTIME_ENV_FILE="${RUN_DIR}/mac-mini-stack.env"
+LAUNCHCTL_REPUTATION_LABEL="local.openclaw.reputation"
+LAUNCHCTL_TELEGRAM_LABEL="local.openclaw.telegram"
 
 mkdir -p "${RUN_DIR}" "${LOG_DIR}"
 
@@ -56,6 +59,10 @@ is_darwin() {
 
 is_macos_runtime() {
   is_darwin || [[ "${MACOS_DOCKER_SIMULATE}" == "1" ]]
+}
+
+use_launchctl_services() {
+  is_darwin && [[ "${MACOS_DOCKER_SIMULATE}" != "1" ]] && have_command launchctl
 }
 
 sudo_if_needed() {
@@ -273,6 +280,50 @@ ensure_python() {
   fail "Could not find or prepare a Python 3.12+ interpreter."
 }
 
+port_is_available() {
+  local host="$1"
+  local port="$2"
+  "${PYTHON_BIN}" - "${host}" "${port}" <<'PY' >/dev/null 2>&1
+import socket
+import sys
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.settimeout(0.5)
+    if sock.connect_ex((host, port)) == 0:
+        raise SystemExit(1)
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    try:
+        sock.bind((host, port))
+    except OSError:
+        raise SystemExit(1)
+PY
+}
+
+choose_reputation_port() {
+  if port_is_available "${HOST}" "${PORT}"; then
+    return
+  fi
+
+  if [[ -n "${REPUTATION_PORT:-}" ]]; then
+    fail "REPUTATION_PORT=${PORT} is already in use on ${HOST}. Choose a free REPUTATION_PORT and retry."
+  fi
+
+  local candidate
+  for candidate in 5055 5056 5057 8765; do
+    if port_is_available "${HOST}" "${candidate}"; then
+      log "Port ${PORT} is already in use on ${HOST}; using REPUTATION_PORT=${candidate} for this run."
+      PORT="${candidate}"
+      return
+    fi
+  done
+
+  fail "No free local reputation_snapshot port found. Set REPUTATION_PORT to an available port and retry."
+}
+
 ensure_venv() {
   local venv_dir="$1"
   local project_name="$2"
@@ -321,7 +372,10 @@ install_openclaw() {
   log "Installing price_monitor_bot and aka_no_claw dependencies..."
   ensure_venv "${AKA_VENV}" "aka_no_claw"
   "${AKA_VENV}/bin/python" -m pip install --upgrade pip
-  "${AKA_VENV}/bin/python" -m pip install -r "${AKA_DIR}/requirements-dev.txt"
+  (
+    cd "${AKA_DIR}"
+    "${AKA_VENV}/bin/python" -m pip install -r requirements-dev.txt
+  )
   if find_system_chromium >/dev/null; then
     log "Using system Chromium at $(find_system_chromium)."
   else
@@ -488,7 +542,7 @@ configure_aka_env() {
   ensure_prompted_env_value "${env_path}" "OPENCLAW_TELEGRAM_BOT_TOKEN" "Telegram bot token from @BotFather" "1"
   ensure_prompted_env_value "${env_path}" "OPENCLAW_TELEGRAM_CHAT_ID" "Telegram chat id to send and receive OpenClaw messages"
   ensure_admin_token_env_value "${env_path}"
-  ensure_default_env_value "${env_path}" "REPUTATION_AGENT_SERVER_URL" "http://${HOST}:${PORT}"
+  set_env_value "${env_path}" "REPUTATION_AGENT_SERVER_URL" "http://${HOST}:${PORT}"
   ensure_default_env_value "${env_path}" "REPUTATION_AGENT_POLL_SECS" "5"
 }
 
@@ -737,6 +791,41 @@ init_reputation_runtime() {
   )
 }
 
+launchctl_job_exists() {
+  local label="$1"
+  launchctl print "gui/$(id -u)/${label}" >/dev/null 2>&1
+}
+
+launchctl_job_pid() {
+  local label="$1"
+  launchctl print "gui/$(id -u)/${label}" 2>/dev/null | awk -F= '/pid =/ { gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit }'
+}
+
+stop_launchctl_jobs() {
+  if ! use_launchctl_services; then
+    return
+  fi
+  local label
+  for label in "${LAUNCHCTL_REPUTATION_LABEL}" "${LAUNCHCTL_TELEGRAM_LABEL}"; do
+    if launchctl_job_exists "${label}"; then
+      log "Stopping launchctl job ${label}."
+      launchctl remove "${label}" >/dev/null 2>&1 || true
+    fi
+  done
+}
+
+append_runtime_export() {
+  local key="$1"
+  local value="${2:-}"
+  printf 'export %s=' "${key}" >> "${RUNTIME_ENV_FILE}"
+  printf '%q\n' "${value}" >> "${RUNTIME_ENV_FILE}"
+}
+
+reset_runtime_env_file() {
+  : > "${RUNTIME_ENV_FILE}"
+  chmod 600 "${RUNTIME_ENV_FILE}" || true
+}
+
 stop_orphaned_stack_processes() {
   local found=0
   while read -r pid command_line; do
@@ -757,6 +846,7 @@ stop_orphaned_stack_processes() {
 }
 
 stop_existing_stack() {
+  stop_launchctl_jobs
   if [[ ! -f "${PID_FILE}" ]]; then
     stop_orphaned_stack_processes
     return
@@ -789,6 +879,25 @@ start_reputation_server() {
   local chromium_path
   admin_token="$(get_env_value "${AKA_DIR}/.env" "REPUTATION_AGENT_ADMIN_TOKEN")"
   chromium_path="$(find_system_chromium || true)"
+
+  if use_launchctl_services; then
+    reset_runtime_env_file
+    append_runtime_export "APP_HOST" "${HOST}"
+    append_runtime_export "APP_PORT" "${PORT}"
+    append_runtime_export "ADMIN_TOKEN" "${admin_token}"
+    if [[ -n "${chromium_path}" ]]; then
+      append_runtime_export "PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH" "${chromium_path}"
+    fi
+    launchctl submit -l "${LAUNCHCTL_REPUTATION_LABEL}" \
+      -o "${LOG_DIR}/reputation_snapshot.log" \
+      -e "${LOG_DIR}/reputation_snapshot.log" \
+      -- /bin/bash -lc "source '${RUNTIME_ENV_FILE}'; cd '${REPUTATION_DIR}'; exec '${REPUTATION_VENV}/bin/python' app.py"
+    local pid
+    pid="$(launchctl_job_pid "${LAUNCHCTL_REPUTATION_LABEL}")"
+    [[ -n "${pid}" ]] && echo "${pid}" >> "${PID_FILE}"
+    return
+  fi
+
   (
     cd "${REPUTATION_DIR}"
     export APP_HOST="${HOST}"
@@ -830,12 +939,44 @@ start_openclaw_telegram() {
   log "Starting OpenClaw Telegram bot without dashboards..."
   local admin_token
   local chromium_path
+  local notify_arg=""
   admin_token="$(get_env_value "${AKA_DIR}/.env" "REPUTATION_AGENT_ADMIN_TOKEN")"
   chromium_path="$(find_system_chromium || true)"
   local args=(telegram-poll --with-reputation-agent --no-dashboard)
   if [[ "${START_NOTIFY}" == "1" ]]; then
     args+=(--notify-startup)
+    notify_arg=" --notify-startup"
   fi
+
+  if use_launchctl_services; then
+    (
+      cd "${AKA_DIR}"
+      export REPUTATION_AGENT_SERVER_URL="http://${HOST}:${PORT}"
+      export REPUTATION_AGENT_ADMIN_TOKEN="${admin_token}"
+      prepare_openclaw_runtime_env
+      if [[ -n "${chromium_path}" ]]; then
+        export PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH="${chromium_path}"
+      fi
+      append_runtime_export "REPUTATION_AGENT_SERVER_URL" "${REPUTATION_AGENT_SERVER_URL}"
+      append_runtime_export "REPUTATION_AGENT_ADMIN_TOKEN" "${REPUTATION_AGENT_ADMIN_TOKEN}"
+      append_runtime_export "OPENCLAW_TESSERACT_PATH" "${OPENCLAW_TESSERACT_PATH:-}"
+      append_runtime_export "OPENCLAW_TESSDATA_DIR" "${OPENCLAW_TESSDATA_DIR:-}"
+      append_runtime_export "OPENCLAW_LOCAL_VISION_BACKEND" "${OPENCLAW_LOCAL_VISION_BACKEND:-}"
+      append_runtime_export "OPENCLAW_LOCAL_VISION_MODEL" "${OPENCLAW_LOCAL_VISION_MODEL:-}"
+      append_runtime_export "OPENCLAW_LOCAL_TEXT_BACKEND" "${OPENCLAW_LOCAL_TEXT_BACKEND:-}"
+      append_runtime_export "OPENCLAW_LOCAL_TEXT_MODEL" "${OPENCLAW_LOCAL_TEXT_MODEL:-}"
+      append_runtime_export "PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH" "${PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH:-}"
+    )
+    launchctl submit -l "${LAUNCHCTL_TELEGRAM_LABEL}" \
+      -o "${LOG_DIR}/openclaw_telegram.log" \
+      -e "${LOG_DIR}/openclaw_telegram.log" \
+      -- /bin/bash -lc "source '${RUNTIME_ENV_FILE}'; cd '${AKA_DIR}'; exec '${AKA_VENV}/bin/python' -m openclaw_adapter telegram-poll --with-reputation-agent --no-dashboard${notify_arg}"
+    local pid
+    pid="$(launchctl_job_pid "${LAUNCHCTL_TELEGRAM_LABEL}")"
+    [[ -n "${pid}" ]] && echo "${pid}" >> "${PID_FILE}"
+    return
+  fi
+
   (
     cd "${AKA_DIR}"
     export REPUTATION_AGENT_SERVER_URL="http://${HOST}:${PORT}"
@@ -857,6 +998,7 @@ main() {
   cleanup_copied_runtime_artifacts
   install_system_packages
   ensure_python
+  choose_reputation_port
   validate_env
   install_reputation_snapshot
   install_openclaw
@@ -871,6 +1013,9 @@ main() {
   log "Logs:"
   log "  ${LOG_DIR}/reputation_snapshot.log"
   log "  ${LOG_DIR}/openclaw_telegram.log"
+  if use_launchctl_services; then
+    log "macOS Terminal may show '[Process completed]' after this; the services keep running in the background."
+  fi
 }
 
 main "$@"
