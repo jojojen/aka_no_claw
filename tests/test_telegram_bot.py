@@ -28,6 +28,7 @@ from openclaw_adapter.telegram_bot import (
     handle_telegram_message,
     parse_lookup_command,
     parse_reputation_snapshot_command,
+    _build_status_text,
     _chromium_launch_options,
 )
 
@@ -211,6 +212,77 @@ def test_command_processor_help_lists_trend_and_scan_commands() -> None:
     assert "Send a photo with caption: /scan pokemon" in help_reply
 
 
+def test_build_status_text_includes_feature_models_and_sizes() -> None:
+    settings = AssistantSettings(
+        monitor_env="development",
+        monitor_db_path="data/monitor.sqlite3",
+        openclaw_telegram_chat_ids=("123", "456"),
+        openclaw_tesseract_path="/opt/homebrew/bin/tesseract",
+        openclaw_tessdata_dir="/opt/homebrew/share/tessdata",
+        openclaw_local_text_backend="ollama",
+        openclaw_local_text_model="qwen3:4b",
+        openclaw_local_text_endpoint="http://127.0.0.1:11434",
+        openclaw_local_text_timeout_seconds=75,
+        openclaw_local_vision_backend="ollama",
+        openclaw_local_vision_model="qwen2.5vl:7b,gemma3:12b",
+        openclaw_local_vision_endpoint="http://127.0.0.1:11434",
+        openclaw_local_vision_timeout_seconds=180,
+        reputation_agent_server_url="http://127.0.0.1:5055",
+        reputation_agent_poll_secs=5,
+    )
+
+    text = _build_status_text(settings)
+
+    assert "text routing: active=ollama / gemma3:12b (12B) | configured=ollama / qwen3:4b (4B) | timeout=75s" in text
+    assert "image scan vision: ollama / qwen2.5vl:7b (7B), gemma3:12b (12B) | timeout=180s" in text
+    assert "image scan OCR: engine=tesseract | binary=/opt/homebrew/bin/tesseract" in text
+    assert "price lookup / trend / watch: model=none" in text
+    assert "reputation snapshot: model=none | server=http://127.0.0.1:5055 | poll=5s" in text
+
+
+def test_build_status_text_shows_configured_models_when_runtime_is_disabled(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env.example").write_text(
+        "\n".join(
+            [
+                "OPENCLAW_LOCAL_TEXT_BACKEND=ollama",
+                "OPENCLAW_LOCAL_TEXT_MODEL=qwen3:4b",
+                "OPENCLAW_LOCAL_TEXT_TIMEOUT_SECONDS=75",
+                "OPENCLAW_LOCAL_TEXT_ENDPOINT=http://127.0.0.1:11434",
+                "OPENCLAW_LOCAL_VISION_BACKEND=ollama",
+                "OPENCLAW_LOCAL_VISION_MODEL=gemma3:4b",
+                "OPENCLAW_LOCAL_VISION_TIMEOUT_SECONDS=180",
+                "OPENCLAW_LOCAL_VISION_ENDPOINT=http://127.0.0.1:11434",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                "OPENCLAW_LOCAL_VISION_BACKEND=ollama",
+                "OPENCLAW_LOCAL_VISION_MODEL=qwen2.5vl:7b,gemma3:12b",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    settings = AssistantSettings(
+        openclaw_local_text_backend=None,
+        openclaw_local_text_model=None,
+        openclaw_local_text_endpoint="http://127.0.0.1:11434",
+        openclaw_local_text_timeout_seconds=45,
+        openclaw_local_vision_backend=None,
+        openclaw_local_vision_model=None,
+        openclaw_local_vision_endpoint="http://127.0.0.1:11434",
+        openclaw_local_vision_timeout_seconds=180,
+    )
+
+    text = _build_status_text(settings)
+
+    assert "text routing: active=disabled / none | configured=ollama / qwen3:4b (4B) | timeout=75s" in text
+    assert "image scan vision: active=disabled / none | configured=ollama / qwen2.5vl:7b (7B), gemma3:12b (12B) | timeout=180s" in text
+
+
 def test_parse_reputation_snapshot_command_requires_url() -> None:
     query = parse_reputation_snapshot_command("https://jp.mercari.com/item/m123456789")
 
@@ -335,6 +407,73 @@ def test_command_processor_builds_ack_for_natural_language_trend() -> None:
     assert reply is not None
     assert "WS Liquidity Board" in reply
     assert router.seen_texts == ["ws 熱門前 5"]
+
+
+def test_command_processor_handles_natural_language_status_via_router() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    router = StubNaturalLanguageRouter(
+        TelegramNaturalLanguageIntent(
+            intent="status",
+            confidence=0.96,
+        )
+    )
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        natural_language_router=router,
+        status_renderer=lambda: "runtime ok",
+    )
+
+    reply = processor.build_reply(chat_id="123", text="你現在狀態如何")
+
+    assert reply == "runtime ok"
+    assert router.seen_texts == ["你現在狀態如何"]
+
+
+def test_command_processor_handles_natural_language_tools_via_router() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    router = StubNaturalLanguageRouter(
+        TelegramNaturalLanguageIntent(
+            intent="tools",
+            confidence=0.94,
+        )
+    )
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "tool catalog",
+        natural_language_router=router,
+    )
+
+    reply = processor.build_reply(chat_id="123", text="把所有工具列出來")
+
+    assert reply == "tool catalog"
+    assert router.seen_texts == ["把所有工具列出來"]
+
+
+def test_command_processor_handles_natural_language_scan_help_via_router() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    router = StubNaturalLanguageRouter(
+        TelegramNaturalLanguageIntent(
+            intent="scan_help",
+            confidence=0.93,
+        )
+    )
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        natural_language_router=router,
+    )
+
+    reply = processor.build_reply(chat_id="123", text="我要怎麼用照片查價")
+
+    assert reply == "Send a card photo with the caption /scan pokemon or /scan ws, and I will parse it and then look up the price."
+    assert router.seen_texts == ["我要怎麼用照片查價"]
 
 
 def test_build_processing_ack_for_heavy_actions() -> None:

@@ -6,7 +6,7 @@ WORKSPACE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REPUTATION_DIR="${WORKSPACE_DIR}/reputation_snapshot"
 AKA_VENV="${SCRIPT_DIR}/.venv"
 PID_FILE="${SCRIPT_DIR}/run/mac-mini-stack.pid"
-LAUNCHCTL_LABELS=(local.openclaw.reputation local.openclaw.telegram)
+LAUNCHCTL_LABELS=(local.openclaw.ollama local.openclaw.reputation local.openclaw.telegram)
 
 stop_launchctl_jobs() {
   if ! command -v launchctl >/dev/null 2>&1; then

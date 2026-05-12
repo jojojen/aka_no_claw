@@ -420,15 +420,133 @@ def require_telegram_chat_id(settings: AssistantSettings) -> str:
 
 def _build_status_text(settings: AssistantSettings) -> str:
     allowed_chats = ", ".join(settings.openclaw_telegram_chat_ids) if settings.openclaw_telegram_chat_ids else "not restricted"
-    tesseract = settings.openclaw_tesseract_path or "PATH lookup"
-    tessdata = settings.openclaw_tessdata_dir or "auto"
+    configured = _load_status_configuration_snapshot()
+    tesseract = settings.openclaw_tesseract_path or configured.get("OPENCLAW_TESSERACT_PATH") or "PATH lookup"
+    tessdata = settings.openclaw_tessdata_dir or configured.get("OPENCLAW_TESSDATA_DIR") or "auto"
+    text_backend = (settings.openclaw_local_text_backend or "").strip().lower() or "none"
+    text_model = _select_router_model_for_status(settings)
+    configured_text_backend = configured.get("OPENCLAW_LOCAL_TEXT_BACKEND") or "none"
+    configured_text_model = configured.get("OPENCLAW_LOCAL_TEXT_MODEL")
+    configured_text_timeout = configured.get("OPENCLAW_LOCAL_TEXT_TIMEOUT_SECONDS") or str(settings.openclaw_local_text_timeout_seconds)
+    configured_text_endpoint = configured.get("OPENCLAW_LOCAL_TEXT_ENDPOINT") or settings.openclaw_local_text_endpoint
+    vision_backend = (settings.openclaw_local_vision_backend or "").strip().lower() or "none"
+    vision_models = _split_model_list(settings.openclaw_local_vision_model)
+    configured_vision_backend = configured.get("OPENCLAW_LOCAL_VISION_BACKEND") or "none"
+    configured_vision_models = _split_model_list(configured.get("OPENCLAW_LOCAL_VISION_MODEL"))
+    configured_vision_timeout = configured.get("OPENCLAW_LOCAL_VISION_TIMEOUT_SECONDS") or str(settings.openclaw_local_vision_timeout_seconds)
+    configured_vision_endpoint = configured.get("OPENCLAW_LOCAL_VISION_ENDPOINT") or settings.openclaw_local_vision_endpoint
+    reputation_host = settings.reputation_agent_server_url or "not configured"
     return "\n".join(
         [
             "OpenClaw Telegram status",
             f"env: {settings.monitor_env}",
             f"db: {settings.monitor_db_path}",
             f"allowed chats: {allowed_chats}",
-            f"tesseract: {tesseract}",
-            f"tessdata: {tessdata}",
+            "",
+            "Features",
+            _format_status_feature_line(
+                "text routing",
+                active_backend=text_backend,
+                active_model_display=_format_model_display(text_model),
+                configured_backend=configured_text_backend,
+                configured_model_display=_format_model_display(configured_text_model),
+                timeout_seconds=configured_text_timeout,
+                endpoint=configured_text_endpoint,
+            ),
+            _format_status_feature_line(
+                "image scan vision",
+                active_backend=vision_backend,
+                active_model_display=_format_model_list_display(vision_models),
+                configured_backend=configured_vision_backend,
+                configured_model_display=_format_model_list_display(configured_vision_models),
+                timeout_seconds=configured_vision_timeout,
+                endpoint=configured_vision_endpoint,
+            ),
+            f"image scan OCR: engine=tesseract | binary={tesseract} | tessdata={tessdata}",
+            "price lookup / trend / watch: model=none | source-driven matching and pricing rules",
+            f"reputation snapshot: model=none | server={reputation_host} | poll={settings.reputation_agent_poll_secs}s | renderer=playwright chromium",
         ]
     )
+
+
+def _select_router_model_for_status(settings: AssistantSettings) -> str | None:
+    from .natural_language import _select_router_model
+
+    return _select_router_model(settings)
+
+
+def _split_model_list(raw_models: str | None) -> tuple[str, ...]:
+    if not raw_models:
+        return ()
+    return tuple(part.strip() for part in raw_models.split(",") if part.strip())
+
+
+def _format_model_list_display(models: tuple[str, ...]) -> str:
+    if not models:
+        return "none"
+    return ", ".join(_format_model_display(model) for model in models)
+
+
+def _format_model_display(model: str | None) -> str:
+    if not model:
+        return "none"
+    size = _extract_model_size(model)
+    if size is None:
+        return model
+    return f"{model} ({size})"
+
+
+def _extract_model_size(model: str) -> str | None:
+    for segment in reversed(model.split(":")):
+        candidate = segment.strip()
+        if not candidate:
+            continue
+        lowered = candidate.lower()
+        if lowered.endswith("b") and any(ch.isdigit() for ch in lowered):
+            return lowered.upper()
+    return None
+
+
+def _format_feature_runtime(backend: str, model_display: str) -> str:
+    if backend == "none":
+        return f"disabled / {model_display}"
+    return f"{backend} / {model_display}"
+
+
+def _format_status_feature_line(
+    label: str,
+    *,
+    active_backend: str,
+    active_model_display: str,
+    configured_backend: str,
+    configured_model_display: str,
+    timeout_seconds: str,
+    endpoint: str,
+) -> str:
+    active_runtime = _format_feature_runtime(active_backend, active_model_display)
+    configured_runtime = _format_feature_runtime(configured_backend, configured_model_display)
+    if active_runtime == configured_runtime:
+        runtime_text = active_runtime
+    else:
+        runtime_text = f"active={active_runtime} | configured={configured_runtime}"
+    return f"{label}: {runtime_text} | timeout={timeout_seconds}s | endpoint={endpoint}"
+
+
+def _load_status_configuration_snapshot() -> dict[str, str]:
+    merged: dict[str, str] = {}
+    for file_name in (".env.example", ".env"):
+        merged.update(_read_env_values(Path.cwd() / file_name))
+    return merged
+
+
+def _read_env_values(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    values: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip("'\"")
+    return values

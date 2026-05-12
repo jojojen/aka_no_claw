@@ -27,6 +27,7 @@ RUN_DIR="${AKA_DIR}/run"
 LOG_DIR="${AKA_DIR}/logs"
 PID_FILE="${RUN_DIR}/mac-mini-stack.pid"
 RUNTIME_ENV_FILE="${RUN_DIR}/mac-mini-stack.env"
+LAUNCHCTL_OLLAMA_LABEL="local.openclaw.ollama"
 LAUNCHCTL_REPUTATION_LABEL="local.openclaw.reputation"
 LAUNCHCTL_TELEGRAM_LABEL="local.openclaw.telegram"
 
@@ -542,6 +543,10 @@ configure_aka_env() {
   ensure_prompted_env_value "${env_path}" "OPENCLAW_TELEGRAM_BOT_TOKEN" "Telegram bot token from @BotFather" "1"
   ensure_prompted_env_value "${env_path}" "OPENCLAW_TELEGRAM_CHAT_ID" "Telegram chat id to send and receive OpenClaw messages"
   ensure_admin_token_env_value "${env_path}"
+  ensure_default_env_value "${env_path}" "OPENCLAW_LOCAL_TEXT_BACKEND" "ollama"
+  ensure_default_env_value "${env_path}" "OPENCLAW_LOCAL_TEXT_ENDPOINT" "http://127.0.0.1:11434"
+  ensure_default_env_value "${env_path}" "OPENCLAW_LOCAL_TEXT_MODEL" "${OLLAMA_DEFAULT_TEXT_MODEL}"
+  ensure_default_env_value "${env_path}" "OPENCLAW_LOCAL_TEXT_TIMEOUT_SECONDS" "75"
   set_env_value "${env_path}" "REPUTATION_AGENT_SERVER_URL" "http://${HOST}:${PORT}"
   ensure_default_env_value "${env_path}" "REPUTATION_AGENT_POLL_SECS" "5"
 }
@@ -626,8 +631,21 @@ start_ollama_if_available() {
   if ollama_endpoint_ready "http://127.0.0.1:11434"; then
     return 0
   fi
-  nohup ollama serve >> "${LOG_DIR}/ollama.log" 2>&1 &
-  echo $! >> "${PID_FILE}"
+  if use_launchctl_services; then
+    if launchctl_job_exists "${LAUNCHCTL_OLLAMA_LABEL}"; then
+      launchctl remove "${LAUNCHCTL_OLLAMA_LABEL}" >/dev/null 2>&1 || true
+    fi
+    launchctl submit -l "${LAUNCHCTL_OLLAMA_LABEL}" \
+      -o "${LOG_DIR}/ollama.log" \
+      -e "${LOG_DIR}/ollama.log" \
+      -- /bin/bash -lc 'exec ollama serve'
+    local pid
+    pid="$(launchctl_job_pid "${LAUNCHCTL_OLLAMA_LABEL}")"
+    [[ -n "${pid}" ]] && echo "${pid}" >> "${PID_FILE}"
+  else
+    nohup ollama serve >> "${LOG_DIR}/ollama.log" 2>&1 &
+    echo $! >> "${PID_FILE}"
+  fi
   for _ in $(seq 1 20); do
     if ollama_endpoint_ready "http://127.0.0.1:11434"; then
       return 0
@@ -644,6 +662,67 @@ model_list_from_env() {
     raw="${fallback}"
   fi
   printf '%s\n' "${raw}" | tr ',' '\n' | awk '{ gsub(/^[ \t]+|[ \t]+$/, ""); if ($0 != "") print }'
+}
+
+configured_ollama_required() {
+  local text_backend
+  local vision_backend
+  text_backend="$(get_env_value "${AKA_DIR}/.env" "OPENCLAW_LOCAL_TEXT_BACKEND")"
+  vision_backend="$(get_env_value "${AKA_DIR}/.env" "OPENCLAW_LOCAL_VISION_BACKEND")"
+  [[ "${text_backend}" == "ollama" || "${vision_backend}" == "ollama" ]]
+}
+
+ensure_ollama_installed_if_needed() {
+  if have_command ollama; then
+    return
+  fi
+  if [[ "${MACOS_DOCKER_SIMULATE}" == "1" ]]; then
+    fail "Ollama is required by the configured local AI backends, but it is unavailable in Docker simulation."
+  fi
+  if [[ "${AUTO_INSTALL_SYSTEM_DEPS}" != "1" ]]; then
+    fail "Ollama is required by the configured local AI backends. Re-run with AUTO_INSTALL_SYSTEM_DEPS=1 or install Ollama manually."
+  fi
+  install_homebrew_if_needed
+  log "Installing Ollama because .env enables local AI backends..."
+  brew install ollama
+}
+
+ensure_configured_ollama_models() {
+  local text_backend
+  local vision_backend
+  local text_model
+  local vision_models
+
+  text_backend="$(get_env_value "${AKA_DIR}/.env" "OPENCLAW_LOCAL_TEXT_BACKEND")"
+  vision_backend="$(get_env_value "${AKA_DIR}/.env" "OPENCLAW_LOCAL_VISION_BACKEND")"
+  text_model="$(get_env_value "${AKA_DIR}/.env" "OPENCLAW_LOCAL_TEXT_MODEL")"
+  vision_models="$(get_env_value "${AKA_DIR}/.env" "OPENCLAW_LOCAL_VISION_MODEL")"
+
+  while read -r model; do
+    [[ -z "${model}" ]] && continue
+    log "Ensuring Ollama model is available: ${model}"
+    ollama pull "${model}"
+  done < <(
+    {
+      if [[ "${text_backend}" == "ollama" ]]; then
+        model_list_from_env "${text_model}" "${OLLAMA_DEFAULT_TEXT_MODEL}"
+      fi
+      if [[ "${vision_backend}" == "ollama" ]]; then
+        model_list_from_env "${vision_models}" ""
+      fi
+    } | awk '!seen[$0]++'
+  )
+}
+
+ensure_configured_ollama_runtime() {
+  if ! configured_ollama_required; then
+    return
+  fi
+  ensure_ollama_installed_if_needed
+  if ! start_ollama_if_available; then
+    fail "Ollama is configured for local AI, but the server did not become reachable on http://127.0.0.1:11434"
+  fi
+  ensure_configured_ollama_models
 }
 
 setup_ollama_if_requested() {
@@ -705,15 +784,38 @@ prepare_openclaw_runtime_env() {
   local tessdata_dir
   local local_vision_backend
   local local_vision_endpoint
+  local local_vision_model
   local local_text_backend
   local local_text_endpoint
+  local local_text_model
 
   tesseract_path="$(get_env_value "${AKA_DIR}/.env" "OPENCLAW_TESSERACT_PATH")"
   tessdata_dir="$(get_env_value "${AKA_DIR}/.env" "OPENCLAW_TESSDATA_DIR")"
   local_vision_backend="$(get_env_value "${AKA_DIR}/.env" "OPENCLAW_LOCAL_VISION_BACKEND")"
   local_vision_endpoint="$(get_env_value "${AKA_DIR}/.env" "OPENCLAW_LOCAL_VISION_ENDPOINT")"
+  local_vision_model="$(get_env_value "${AKA_DIR}/.env" "OPENCLAW_LOCAL_VISION_MODEL")"
   local_text_backend="$(get_env_value "${AKA_DIR}/.env" "OPENCLAW_LOCAL_TEXT_BACKEND")"
   local_text_endpoint="$(get_env_value "${AKA_DIR}/.env" "OPENCLAW_LOCAL_TEXT_ENDPOINT")"
+  local_text_model="$(get_env_value "${AKA_DIR}/.env" "OPENCLAW_LOCAL_TEXT_MODEL")"
+
+  if [[ -n "${local_vision_backend}" ]]; then
+    export OPENCLAW_LOCAL_VISION_BACKEND="${local_vision_backend}"
+  fi
+  if [[ -n "${local_vision_endpoint}" ]]; then
+    export OPENCLAW_LOCAL_VISION_ENDPOINT="${local_vision_endpoint}"
+  fi
+  if [[ -n "${local_vision_model}" ]]; then
+    export OPENCLAW_LOCAL_VISION_MODEL="${local_vision_model}"
+  fi
+  if [[ -n "${local_text_backend}" ]]; then
+    export OPENCLAW_LOCAL_TEXT_BACKEND="${local_text_backend}"
+  fi
+  if [[ -n "${local_text_endpoint}" ]]; then
+    export OPENCLAW_LOCAL_TEXT_ENDPOINT="${local_text_endpoint}"
+  fi
+  if [[ -n "${local_text_model}" ]]; then
+    export OPENCLAW_LOCAL_TEXT_MODEL="${local_text_model}"
+  fi
 
   if [[ "${SETUP_OLLAMA}" == "1" ]]; then
     if [[ -z "${local_text_backend}" ]]; then
@@ -806,7 +908,7 @@ stop_launchctl_jobs() {
     return
   fi
   local label
-  for label in "${LAUNCHCTL_REPUTATION_LABEL}" "${LAUNCHCTL_TELEGRAM_LABEL}"; do
+  for label in "${LAUNCHCTL_OLLAMA_LABEL}" "${LAUNCHCTL_REPUTATION_LABEL}" "${LAUNCHCTL_TELEGRAM_LABEL}"; do
     if launchctl_job_exists "${label}"; then
       log "Stopping launchctl job ${label}."
       launchctl remove "${label}" >/dev/null 2>&1 || true
@@ -1003,6 +1105,7 @@ main() {
   install_reputation_snapshot
   install_openclaw
   init_reputation_runtime
+  ensure_configured_ollama_runtime
   setup_ollama_if_requested
   start_reputation_server
   wait_for_reputation_server
