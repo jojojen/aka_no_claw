@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import pytest
 from assistant_runtime.settings import AssistantSettings
 from openclaw_adapter.natural_language import (
     _select_router_model,
     build_telegram_natural_language_router_from_settings,
 )
+from price_monitor_bot.natural_language import fallback_route_telegram_natural_language
 
+
+# ── Router settings tests ─────────────────────────────────────────────────────
 
 def test_natural_language_router_is_disabled_without_text_backend() -> None:
     settings = AssistantSettings(
@@ -25,3 +29,309 @@ def test_select_router_model_prefers_strongest_available_local_model() -> None:
     )
 
     assert _select_router_model(settings) == "gemma3:12b"
+
+
+def test_natural_language_router_loads_tool_spec_from_file() -> None:
+    settings = AssistantSettings(
+        openclaw_local_text_backend="ollama",
+        openclaw_local_text_model="gemma3:4b",
+        openclaw_local_vision_model=None,
+    )
+
+    router = build_telegram_natural_language_router_from_settings(settings)
+
+    assert router is not None
+    assert len(router.tool_spec) > 0
+    assert "lookup_card" in router.tool_spec
+    assert "trend_board" in router.tool_spec
+    assert "reputation_snapshot" in router.tool_spec
+
+
+# ── /help — capability / usage questions ─────────────────────────────────────
+
+def test_fallback_routes_capability_question_to_help() -> None:
+    result = fallback_route_telegram_natural_language("你會什麼")
+
+    assert result is not None
+    assert result.intent == "help"
+
+
+def test_fallback_routes_usage_question_to_help() -> None:
+    result = fallback_route_telegram_natural_language("怎麼用這個機器人")
+
+    assert result is not None
+    assert result.intent == "help"
+
+
+# ── /status — runtime / model / service-health questions ─────────────────────
+
+def test_fallback_routes_runtime_question_to_status() -> None:
+    result = fallback_route_telegram_natural_language("目前狀況如何")
+
+    assert result is not None
+    assert result.intent == "status"
+
+
+def test_fallback_routes_model_question_to_status() -> None:
+    result = fallback_route_telegram_natural_language("你現在在跑什麼模型")
+
+    assert result is not None
+    assert result.intent == "status"
+
+
+def test_fallback_routes_health_keyword_to_status() -> None:
+    result = fallback_route_telegram_natural_language("bot health check")
+
+    assert result is not None
+    assert result.intent == "status"
+
+
+# ── /tools — full tool catalog ───────────────────────────────────────────────
+
+def test_fallback_routes_all_tools_request_to_tools() -> None:
+    result = fallback_route_telegram_natural_language("列出所有工具")
+
+    assert result is not None
+    assert result.intent == "tools"
+
+
+def test_fallback_routes_capabilities_request_to_tools() -> None:
+    result = fallback_route_telegram_natural_language("有哪些可用工具")
+
+    assert result is not None
+    assert result.intent == "tools"
+
+
+def test_fallback_routes_catalog_keyword_to_tools() -> None:
+    result = fallback_route_telegram_natural_language("功能清單")
+
+    assert result is not None
+    assert result.intent == "tools"
+
+
+# ── /price — single-card price lookup ────────────────────────────────────────
+
+def test_fallback_routes_pokemon_price_lookup_with_card_number_and_rarity() -> None:
+    result = fallback_route_telegram_natural_language("幫我查寶可夢 リザードンex 201/165 SAR")
+
+    assert result is not None
+    assert result.intent == "lookup_card"
+    assert result.game == "pokemon"
+    assert result.card_number == "201/165"
+    assert result.rarity == "SAR"
+
+
+def test_fallback_routes_ws_price_lookup_with_rarity() -> None:
+    result = fallback_route_telegram_natural_language("ws 初音ミク SSP 價格")
+
+    assert result is not None
+    assert result.intent == "lookup_card"
+    assert result.game == "ws"
+    assert result.rarity == "SSP"
+
+
+def test_fallback_routes_ptcg_card_valuation() -> None:
+    result = fallback_route_telegram_natural_language("ptcg Pikachu ex 估價")
+
+    assert result is not None
+    assert result.intent == "lookup_card"
+    assert result.game == "pokemon"
+
+
+# ── /trend /hot /liquidity — hot / trending / liquidity boards ───────────────
+
+def test_fallback_routes_pokemon_trend_board_with_limit() -> None:
+    result = fallback_route_telegram_natural_language("pokemon 熱門前5")
+
+    assert result is not None
+    assert result.intent == "trend_board"
+    assert result.game == "pokemon"
+    assert result.limit == 5
+
+
+def test_fallback_routes_ws_trending_with_top_limit() -> None:
+    result = fallback_route_telegram_natural_language("ws trending top 3")
+
+    assert result is not None
+    assert result.intent == "trend_board"
+    assert result.game == "ws"
+    assert result.limit == 3
+
+
+def test_fallback_routes_pokemon_liquidity_board() -> None:
+    result = fallback_route_telegram_natural_language("寶可夢流動性排行")
+
+    assert result is not None
+    assert result.intent == "trend_board"
+    assert result.game == "pokemon"
+
+
+def test_fallback_returns_none_for_trend_without_game() -> None:
+    # Trend keywords present but no game specified → cannot route
+    result = fallback_route_telegram_natural_language("最近什麼熱門排行")
+
+    assert result is None
+
+
+# ── /snapshot — Mercari reputation snapshot ───────────────────────────────────
+
+def test_fallback_routes_reputation_query_with_url() -> None:
+    result = fallback_route_telegram_natural_language(
+        "查詢信用 https://jp.mercari.com/item/m12345"
+    )
+
+    assert result is not None
+    assert result.intent == "reputation_snapshot"
+    assert result.query_url == "https://jp.mercari.com/item/m12345"
+
+
+def test_fallback_routes_seller_trust_question_with_url() -> None:
+    result = fallback_route_telegram_natural_language(
+        "這個賣家信譽如何 https://jp.mercari.com/item/m99999"
+    )
+
+    assert result is not None
+    assert result.intent == "reputation_snapshot"
+    assert result.query_url == "https://jp.mercari.com/item/m99999"
+
+
+def test_fallback_routes_snapshot_keyword_with_url() -> None:
+    result = fallback_route_telegram_natural_language(
+        "snapshot https://jp.mercari.com/item/m12345"
+    )
+
+    assert result is not None
+    assert result.intent == "reputation_snapshot"
+    assert result.query_url == "https://jp.mercari.com/item/m12345"
+
+
+# ── Photo scan — image lookup instructions ───────────────────────────────────
+
+def test_fallback_routes_photo_price_instructions_to_scan_help() -> None:
+    result = fallback_route_telegram_natural_language("我要怎麼用照片查價")
+
+    assert result is not None
+    assert result.intent == "scan_help"
+
+
+def test_fallback_routes_scan_image_question_to_scan_help() -> None:
+    result = fallback_route_telegram_natural_language("如何掃圖查詢")
+
+    assert result is not None
+    assert result.intent == "scan_help"
+
+
+def test_fallback_routes_ocr_question_to_scan_help() -> None:
+    result = fallback_route_telegram_natural_language("OCR 怎麼用")
+
+    assert result is not None
+    assert result.intent == "scan_help"
+
+
+# ── /watch — add a Mercari watch ─────────────────────────────────────────────
+
+def test_fallback_routes_watch_add_with_kanji_price_threshold() -> None:
+    result = fallback_route_telegram_natural_language("追蹤 初音ミク SSP 5萬以下")
+
+    assert result is not None
+    assert result.intent == "add_watch"
+    assert result.watch_price_threshold == 50000
+
+
+def test_fallback_routes_alert_watch_add_with_plain_digits() -> None:
+    result = fallback_route_telegram_natural_language("提醒我 Pikachu ex 低於 30000")
+
+    assert result is not None
+    assert result.intent == "add_watch"
+    assert result.watch_price_threshold == 30000
+
+
+def test_fallback_routes_watch_add_with_complex_kanji_price() -> None:
+    result = fallback_route_telegram_natural_language("alert ws Aqua SSR 三十萬以内")
+
+    assert result is not None
+    assert result.intent == "add_watch"
+    assert result.watch_price_threshold == 300000
+
+
+# ── /watchlist — show current watch list ─────────────────────────────────────
+
+def test_fallback_routes_watchlist_request() -> None:
+    result = fallback_route_telegram_natural_language("看我的追蹤清單")
+
+    assert result is not None
+    assert result.intent == "list_watches"
+
+
+def test_fallback_routes_my_watches_request() -> None:
+    result = fallback_route_telegram_natural_language("我的追蹤")
+
+    assert result is not None
+    assert result.intent == "list_watches"
+
+
+def test_fallback_routes_watchlist_keyword() -> None:
+    result = fallback_route_telegram_natural_language("watchlist")
+
+    assert result is not None
+    assert result.intent == "list_watches"
+
+
+# ── /unwatch — remove a watch ────────────────────────────────────────────────
+
+def test_fallback_routes_cancel_watch_with_id() -> None:
+    result = fallback_route_telegram_natural_language("取消追蹤 abc12345678")
+
+    assert result is not None
+    assert result.intent == "remove_watch"
+    assert result.watch_id == "abc12345678"
+
+
+def test_fallback_routes_stop_watch_with_id() -> None:
+    result = fallback_route_telegram_natural_language("停止追蹤 abc12345678")
+
+    assert result is not None
+    assert result.intent == "remove_watch"
+    assert result.watch_id == "abc12345678"
+
+
+def test_fallback_routes_unwatch_keyword_with_id() -> None:
+    result = fallback_route_telegram_natural_language("unwatch abc12345678")
+
+    assert result is not None
+    assert result.intent == "remove_watch"
+    assert result.watch_id == "abc12345678"
+
+
+# ── /setprice — update price threshold of a watch ────────────────────────────
+
+def test_fallback_routes_setprice_with_kanji_threshold() -> None:
+    result = fallback_route_telegram_natural_language("把 abc12345678 改成 4萬")
+
+    assert result is not None
+    assert result.intent == "update_watch_price"
+    assert result.watch_id == "abc12345678"
+    assert result.watch_price_threshold == 40000
+
+
+def test_fallback_routes_update_watch_price_with_plain_digits() -> None:
+    result = fallback_route_telegram_natural_language("幫我更新 abc12345678 的價格上限 30000")
+
+    assert result is not None
+    assert result.intent == "update_watch_price"
+    assert result.watch_id == "abc12345678"
+    assert result.watch_price_threshold == 30000
+
+
+# ── unknown — unrelated messages ─────────────────────────────────────────────
+
+def test_fallback_returns_none_for_unrelated_message() -> None:
+    result = fallback_route_telegram_natural_language("明天天氣如何")
+
+    assert result is None
+
+
+def test_fallback_returns_none_for_empty_message() -> None:
+    result = fallback_route_telegram_natural_language("")
+
+    assert result is None

@@ -1,7 +1,7 @@
 @echo off
 setlocal
 
-pushd "%~dp0" >nul
+pushd "%~dp0.." >nul
 
 if not exist ".venv\Scripts\python.exe" (
   echo [setup] .venv not found, creating virtual environment...
@@ -37,7 +37,7 @@ echo [setup] Done.
 set "DASHBOARD_ARGS=%*"
 if "%DASHBOARD_ARGS%"=="" set "DASHBOARD_ARGS=--open-browser"
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\ensure-dashboard-port.ps1" %DASHBOARD_ARGS%
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0..\scripts\ensure-dashboard-port.ps1" %DASHBOARD_ARGS%
 if errorlevel 1 (
   popd >nul
   exit /b 1

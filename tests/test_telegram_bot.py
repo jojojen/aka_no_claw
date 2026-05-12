@@ -212,7 +212,23 @@ def test_command_processor_help_lists_trend_and_scan_commands() -> None:
     assert "Send a photo with caption: /scan pokemon" in help_reply
 
 
-def test_build_status_text_includes_feature_models_and_sizes() -> None:
+def test_build_status_text_includes_feature_models_and_sizes(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    # .env.example sets configured text=qwen3:4b, vision=qwen2.5vl:7b,gemma3:12b
+    # No .env override, so configured stays as .env.example values.
+    (tmp_path / ".env.example").write_text(
+        "\n".join([
+            "OPENCLAW_LOCAL_TEXT_BACKEND=ollama",
+            "OPENCLAW_LOCAL_TEXT_MODEL=qwen3:4b",
+            "OPENCLAW_LOCAL_TEXT_TIMEOUT_SECONDS=75",
+            "OPENCLAW_LOCAL_TEXT_ENDPOINT=http://127.0.0.1:11434",
+            "OPENCLAW_LOCAL_VISION_BACKEND=ollama",
+            "OPENCLAW_LOCAL_VISION_MODEL=qwen2.5vl:7b,gemma3:12b",
+            "OPENCLAW_LOCAL_VISION_TIMEOUT_SECONDS=180",
+            "OPENCLAW_LOCAL_VISION_ENDPOINT=http://127.0.0.1:11434",
+        ]),
+        encoding="utf-8",
+    )
     settings = AssistantSettings(
         monitor_env="development",
         monitor_db_path="data/monitor.sqlite3",
@@ -233,6 +249,8 @@ def test_build_status_text_includes_feature_models_and_sizes() -> None:
 
     text = _build_status_text(settings)
 
+    # Active router model = gemma3:12b (strongest across text+vision models).
+    # Configured text model = qwen3:4b (from .env.example) → shows active vs configured.
     assert "text routing: active=ollama / gemma3:12b (12B) | configured=ollama / qwen3:4b (4B) | timeout=75s" in text
     assert "image scan vision: ollama / qwen2.5vl:7b (7B), gemma3:12b (12B) | timeout=180s" in text
     assert "image scan OCR: engine=tesseract | binary=/opt/homebrew/bin/tesseract" in text

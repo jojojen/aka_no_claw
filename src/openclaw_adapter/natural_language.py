@@ -15,7 +15,7 @@ from price_monitor_bot.natural_language import (  # noqa: F401
 )
 
 logger = logging.getLogger(__name__)
-_ROUTER_SPEC_PATH = Path(__file__).resolve().parents[2] / "TELEGRAM_TOOL_SPEC.md"
+_ROUTER_SPEC_PATH = Path(__file__).resolve().parents[2] / "docs" / "TELEGRAM_TOOL_SPEC.md"
 
 
 def build_telegram_natural_language_router_from_settings(
