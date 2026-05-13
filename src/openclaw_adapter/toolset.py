@@ -18,6 +18,20 @@ from .formatters import (
     reference_sources_to_json,
 )
 from .reputation_agent import check_prerequisites, ensure_agent_thread, run_agent_loop
+from .sns_tools import (
+    _configure_sns_add_account_parser,
+    _configure_sns_add_keyword_parser,
+    _configure_sns_add_trend_parser,
+    _configure_sns_delete_parser,
+    _configure_sns_list_parser,
+    _configure_sns_toggle_parser,
+    _handle_sns_add_account,
+    _handle_sns_add_keyword,
+    _handle_sns_add_trend,
+    _handle_sns_delete,
+    _handle_sns_list,
+    _handle_sns_toggle,
+)
 from .telegram_bot import (
     default_board_loader,
     default_lookup_renderer,
@@ -92,6 +106,60 @@ def build_tool_registry(settings: AssistantSettings | None = None) -> ToolRegist
             configure_parser=lambda parser: _configure_reputation_agent_parser(parser, settings),
             handler=lambda args: _handle_reputation_agent(args, settings),
             aliases=("reputation-agent",),
+        )
+    )
+    registry.register(
+        AssistantTool(
+            name="sns.add-account",
+            description="Add an X (Twitter) account to the SNS watch list.",
+            configure_parser=lambda parser: _configure_sns_add_account_parser(parser, settings),
+            handler=lambda args: _handle_sns_add_account(args, settings),
+            aliases=("sns-add-account",),
+        )
+    )
+    registry.register(
+        AssistantTool(
+            name="sns.add-keyword",
+            description="Add a keyword search to the SNS watch list.",
+            configure_parser=lambda parser: _configure_sns_add_keyword_parser(parser, settings),
+            handler=lambda args: _handle_sns_add_keyword(args, settings),
+            aliases=("sns-add-keyword",),
+        )
+    )
+    registry.register(
+        AssistantTool(
+            name="sns.add-trend",
+            description="Add a trend category to the SNS watch list.",
+            configure_parser=lambda parser: _configure_sns_add_trend_parser(parser, settings),
+            handler=lambda args: _handle_sns_add_trend(args, settings),
+            aliases=("sns-add-trend",),
+        )
+    )
+    registry.register(
+        AssistantTool(
+            name="sns.list-rules",
+            description="List all SNS watch rules.",
+            configure_parser=lambda parser: _configure_sns_list_parser(parser, settings),
+            handler=lambda args: _handle_sns_list(args, settings),
+            aliases=("sns-list-rules", "sns-list"),
+        )
+    )
+    registry.register(
+        AssistantTool(
+            name="sns.toggle-rule",
+            description="Enable or disable a SNS watch rule.",
+            configure_parser=lambda parser: _configure_sns_toggle_parser(parser, settings),
+            handler=lambda args: _handle_sns_toggle(args, settings),
+            aliases=("sns-toggle-rule",),
+        )
+    )
+    registry.register(
+        AssistantTool(
+            name="sns.delete-rule",
+            description="Delete a SNS watch rule.",
+            configure_parser=lambda parser: _configure_sns_delete_parser(parser, settings),
+            handler=lambda args: _handle_sns_delete(args, settings),
+            aliases=("sns-delete-rule",),
         )
     )
     return registry

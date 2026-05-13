@@ -282,9 +282,12 @@ def run_telegram_polling(
     notify_startup: bool = False,
     drop_pending_updates: bool = True,
 ) -> int:
+    from .sns_tools import _start_sns_monitor
+
     token = require_telegram_token(settings)
     watch_db = _bootstrap_watch_db(settings)
     _start_watch_monitor(settings=settings, watch_db=watch_db, token=token)
+    sns_db, sns_buzz_fn = _start_sns_monitor(settings=settings, token=token, ssl_context=build_ssl_context(settings))
     return _base_run_telegram_polling(
         token=token,
         lookup_renderer=lookup_renderer,
@@ -297,6 +300,8 @@ def run_telegram_polling(
         allowed_chat_ids=frozenset(settings.openclaw_telegram_chat_ids),
         status_renderer=lambda: _build_status_text(settings),
         watch_db=watch_db,
+        sns_db=sns_db,
+        sns_buzz_fn=sns_buzz_fn,
         poll_timeout=poll_timeout,
         notify_startup=notify_startup,
         drop_pending_updates=drop_pending_updates,
