@@ -33,6 +33,7 @@ class AssistantSettings:
     log_level: str = "INFO"
     log_file_path: str = "logs/openclaw.log"
     log_raw_result_limit: int = 20
+    sns_db_path: str = "data/sns.sqlite3"
 
 
 def load_dotenv(path: str | Path = DEFAULT_ENV_PATH, *, override: bool = False) -> None:
@@ -94,6 +95,7 @@ def get_settings() -> AssistantSettings:
         log_level=os.getenv("LOG_LEVEL", "INFO"),
         log_file_path=os.getenv("LOG_FILE_PATH", "logs/openclaw.log"),
         log_raw_result_limit=_as_int(os.getenv("LOG_RAW_RESULT_LIMIT"), default=20),
+        sns_db_path=os.getenv("SNS_DB_PATH", "data/sns.sqlite3"),
     )
 
 

@@ -46,6 +46,25 @@ The Telegram assistant can reach these tools:
 - `/setprice <watch_id> <price>`
   - Update the price threshold of an existing watch.
 
+- `/snsadd @username`
+  - Add an X (Twitter) account to the watch list.
+  - Usage: `/snsadd @akanoclaw`
+
+- `/snsadd keyword:<search_term>`
+  - Add a keyword search to the watch list.
+  - Usage: `/snsadd keyword:機動戰士`
+
+- `/snsadd trend:<category>`
+  - Add a trend category to the watch list.
+  - Categories: `trending`, `for-you`, `news`, `sports`, `entertainment`
+  - Usage: `/snsadd trend:trending`
+
+- `/snslist`
+  - List all X (Twitter) watch rules.
+
+- `/snsdelete <rule_id>`
+  - Remove an X watch rule.
+
 Routing rules:
 
 - Return `help` for capability or usage questions.
