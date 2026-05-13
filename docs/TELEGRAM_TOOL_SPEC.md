@@ -62,8 +62,20 @@ The Telegram assistant can reach these tools:
 - `/snslist`
   - List all X (Twitter) watch rules.
 
-- `/snsdelete <rule_id>`
-  - Remove an X watch rule.
+- `/snsdelete <target>`
+  - Remove an X watch rule. `<target>` may be a rule ID prefix, an @handle, or `keyword:xxx`.
+  - Examples: `/snsdelete @elonmusk`, `/snsdelete abc12345`, `/snsdelete keyword:機動戰士`
+
+- `/snsbuzz <keyword>`
+  - Summarise Reddit's top discussion on a topic via LLM.
+  - Usage: `/snsbuzz amd`
+
+Natural-language examples for SNS intents (router must distinguish these from Mercari watch intents — any `@handle` or X/Twitter/推特 keyword forces SNS):
+
+- "追蹤 @elonmusk" → `sns_add_account`, sns_handle="elonmusk"
+- "刪除追蹤 @elonmusk" / "取消追蹤 @elonmusk" / "unfollow @elonmusk" → `sns_delete`, sns_handle="elonmusk"
+- "我的 X 追蹤清單" / "推主追蹤" → `sns_list`
+- "整理一下 amd 最近熱門討論" → `sns_buzz`, sns_buzz_query="amd"
 
 Routing rules:
 
