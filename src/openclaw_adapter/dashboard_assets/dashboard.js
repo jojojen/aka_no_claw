@@ -3,8 +3,12 @@ const state = {
   hotDisplayLimits: {
     pokemon: 10,
     ws: 10,
+    yugioh: 10,
+    union_arena: 10,
   },
 };
+
+const HOT_GAMES = ["pokemon", "ws", "yugioh", "union_arena"];
 
 async function loadDashboard() {
   const response = await fetch("/api/dashboard", { cache: "no-store" });
@@ -41,7 +45,7 @@ function renderDashboard(payload) {
 }
 
 function renderHotBoardsLoading() {
-  for (const game of ["pokemon", "ws"]) {
+  for (const game of HOT_GAMES) {
     const methodology = document.getElementById(`hot-${game}-methodology`);
     const summary = document.getElementById(`hot-${game}-summary`);
     const list = document.getElementById(`hot-${game}-list`);
@@ -176,11 +180,9 @@ function renderTrackedItems(items) {
 
 function renderHotBoards(boards, errorMessage) {
   const safeBoards = Array.isArray(boards) ? boards : [];
-  const pokemonBoard = safeBoards.find((board) => board.game === "pokemon");
-  const wsBoard = safeBoards.find((board) => board.game === "ws");
-
-  renderHotBoard("pokemon", pokemonBoard, errorMessage);
-  renderHotBoard("ws", wsBoard, errorMessage);
+  for (const game of HOT_GAMES) {
+    renderHotBoard(game, safeBoards.find((board) => board.game === game), errorMessage);
+  }
 }
 
 function renderHotBoard(game, board, errorMessage) {
@@ -388,6 +390,8 @@ document.getElementById("refresh-dashboard").addEventListener("click", () => {
 });
 document.getElementById("hot-pokemon-limit").addEventListener("change", handleHotLimitChange);
 document.getElementById("hot-ws-limit").addEventListener("change", handleHotLimitChange);
+document.getElementById("hot-yugioh-limit").addEventListener("change", handleHotLimitChange);
+document.getElementById("hot-union_arena-limit").addEventListener("change", handleHotLimitChange);
 document.getElementById("mercari-watch-form").addEventListener("submit", submitMercariWatch);
 
 loadDashboard().catch(renderFatalError);

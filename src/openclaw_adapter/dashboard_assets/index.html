@@ -99,6 +99,38 @@
           <p id="hot-ws-methodology" class="hot-board__methodology"></p>
           <div id="hot-ws-list" class="hot-list"></div>
         </article>
+
+        <article class="hot-board">
+          <div class="hot-board__toolbar">
+            <div class="card__heading">
+              <p class="eyebrow">Liquidity Board</p>
+              <h2>Yugioh 高流動性榜</h2>
+            </div>
+            <label class="hot-control" for="hot-yugioh-limit">
+              <span>顯示前</span>
+              <select id="hot-yugioh-limit" data-game="yugioh"></select>
+            </label>
+          </div>
+          <p id="hot-yugioh-summary" class="hot-board__summary"></p>
+          <p id="hot-yugioh-methodology" class="hot-board__methodology"></p>
+          <div id="hot-yugioh-list" class="hot-list"></div>
+        </article>
+
+        <article class="hot-board">
+          <div class="hot-board__toolbar">
+            <div class="card__heading">
+              <p class="eyebrow">Liquidity Board</p>
+              <h2>Union Arena 高流動性榜</h2>
+            </div>
+            <label class="hot-control" for="hot-union_arena-limit">
+              <span>顯示前</span>
+              <select id="hot-union_arena-limit" data-game="union_arena"></select>
+            </label>
+          </div>
+          <p id="hot-union_arena-summary" class="hot-board__summary"></p>
+          <p id="hot-union_arena-methodology" class="hot-board__methodology"></p>
+          <div id="hot-union_arena-list" class="hot-list"></div>
+        </article>
       </section>
 
       <main class="dashboard-grid">
@@ -114,6 +146,8 @@
                 <select name="game">
                   <option value="pokemon">Pokemon</option>
                   <option value="ws">Weiss Schwarz</option>
+                  <option value="yugioh">Yugioh</option>
+                  <option value="union_arena">Union Arena</option>
                 </select>
               </label>
               <label class="field field--grow">
