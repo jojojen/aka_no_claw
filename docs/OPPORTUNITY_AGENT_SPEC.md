@@ -51,12 +51,14 @@ One tick performs:
    - remove non-product words such as `抽選情報`, `予約情報`, `発売情報`, and `Mercari`
    - convert `セット名収録 カード名` into the individual card name when it is clearly a card target
 4. Reject obvious unsupported franchises such as `遊☆戯☆王`, `デュエルマスターズ`, and `ONE PIECE CARD GAME`.
-5. Save/update candidates in `opportunity_candidates`.
-6. For due candidates, run fair-value lookup using `price_monitor_bot`.
-7. Search Mercari for listings below the calculated target price.
-8. For each unseen listing, request a reputation snapshot.
-9. Score the full opportunity.
-10. Send Telegram recommendation only if all thresholds pass.
+5. Use the web search tool to gather outside-market context for each candidate.
+6. Ask the configured local text LLM to judge whether those web sources support real demand, then store source URLs in candidate metadata.
+7. Save/update candidates in `opportunity_candidates`.
+8. For due candidates, run fair-value lookup using `price_monitor_bot`.
+9. Search Mercari for listings below the calculated target price.
+10. For each unseen listing, request a reputation snapshot.
+11. Score the full opportunity.
+12. Send Telegram recommendation only if all thresholds pass.
 
 ## Default Thresholds
 
@@ -88,6 +90,7 @@ The message includes:
 
 - Product title
 - SNS heat and reason
+- Web research source URLs when available
 - Fair value
 - Listing price
 - Discount percentage
