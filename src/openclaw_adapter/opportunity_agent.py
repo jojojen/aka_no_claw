@@ -8,7 +8,8 @@ import ssl
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from collections.abc import Mapping as MappingABC
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Sequence
@@ -31,6 +32,7 @@ from .opportunity_models import (
 from .opportunity_pipeline import OpportunityPipeline, OpportunityPipelineStats
 from .opportunity_scoring import OpportunityThresholds, reputation_passes
 from .opportunity_store import OpportunityStore
+from .web_search import WebSearchResult, search_duckduckgo
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +147,107 @@ class SnsLlmCandidateProvider:
             )
             for row in rows
         ]
+
+
+class WebResearchCandidateProvider:
+    def __init__(
+        self,
+        *,
+        base_provider,
+        researcher: "WebOpportunityResearcher",
+    ) -> None:
+        self._base_provider = base_provider
+        self._researcher = researcher
+
+    def discover(self, *, limit: int) -> Sequence[OpportunityCandidate]:
+        candidates = self._base_provider.discover(limit=limit)
+        enriched: list[OpportunityCandidate] = []
+        for candidate in candidates:
+            try:
+                enriched.append(self._researcher.enrich(candidate))
+            except Exception:
+                logger.exception("Opportunity web research enrichment failed candidate_id=%s", candidate.candidate_id)
+                enriched.append(candidate)
+        return tuple(enriched)
+
+
+class WebOpportunityResearcher:
+    def __init__(
+        self,
+        *,
+        endpoint: str,
+        model: str,
+        timeout_seconds: int,
+        max_results: int = 3,
+        ssl_context: ssl.SSLContext | None = None,
+        search_fn=None,
+        json_call_fn=None,
+    ) -> None:
+        self._endpoint = endpoint
+        self._model = model
+        self._timeout_seconds = timeout_seconds
+        self._max_results = max(1, min(5, max_results))
+        self._ssl_context = ssl_context
+        self._search_fn = search_fn or (
+            lambda query, limit: search_duckduckgo(
+                query,
+                max_results=limit,
+                ssl_context=ssl_context,
+            )
+        )
+        self._json_call_fn = json_call_fn or _call_ollama_json
+
+    def enrich(self, candidate: OpportunityCandidate) -> OpportunityCandidate:
+        query = _build_opportunity_research_query(candidate)
+        sources = tuple(self._search_fn(query, self._max_results))
+        if not sources:
+            return candidate
+
+        assessment = _default_web_assessment(candidate, query=query, sources=sources)
+        if self._endpoint and self._model:
+            prompt = _build_opportunity_web_assessment_prompt(candidate, query=query, sources=sources)
+            try:
+                raw = self._json_call_fn(
+                    endpoint=self._endpoint,
+                    model=self._model,
+                    prompt=prompt,
+                    timeout_seconds=self._timeout_seconds,
+                    ssl_context=self._ssl_context,
+                )
+                assessment = _parse_web_assessment(raw, fallback=assessment)
+            except Exception:
+                logger.exception("Opportunity web research LLM assessment failed candidate_id=%s", candidate.candidate_id)
+
+        heat_score = _apply_web_assessment_to_heat(candidate.heat_score, assessment)
+        metadata = dict(candidate.metadata)
+        metadata["web_research"] = {
+            "query": query,
+            "assessment": {
+                "is_relevant": assessment.is_relevant,
+                "demand_score": assessment.demand_score,
+                "reason": assessment.reason,
+            },
+            "sources": [_source_to_metadata(source) for source in sources],
+        }
+
+        reason = candidate.reason
+        if assessment.reason:
+            reason = f"{reason} Web research: {assessment.reason}"
+
+        return replace(
+            candidate,
+            heat_score=heat_score,
+            reason=reason,
+            source_kind=_append_source_kind(candidate.source_kind, "web"),
+            metadata=metadata,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class WebOpportunityAssessment:
+    is_relevant: bool
+    demand_score: float
+    reason: str
 
 
 class TcgFairValueChecker:
@@ -352,16 +455,28 @@ def build_opportunity_agent(settings: AssistantSettings | None = None) -> Opport
     ssl_context = build_ssl_context(settings)
     store = OpportunityStore(settings.opportunity_db_path)
     store.bootstrap()
+    text_model = (settings.openclaw_local_text_model or "").split(",")[0].strip()
+    candidate_provider = SnsLlmCandidateProvider(
+        db_path=settings.sns_db_path,
+        endpoint=settings.openclaw_local_text_endpoint,
+        model=text_model,
+        timeout_seconds=settings.opportunity_llm_timeout_seconds,
+        lookback_hours=settings.opportunity_sns_lookback_hours,
+        ssl_context=ssl_context if settings.openclaw_local_text_endpoint.startswith("https://") else None,
+    )
+    if (settings.openclaw_local_text_backend or "").strip().lower() == "ollama" and text_model:
+        candidate_provider = WebResearchCandidateProvider(
+            base_provider=candidate_provider,
+            researcher=WebOpportunityResearcher(
+                endpoint=settings.openclaw_local_text_endpoint,
+                model=text_model,
+                timeout_seconds=settings.opportunity_llm_timeout_seconds,
+                ssl_context=ssl_context,
+            ),
+        )
     pipeline = OpportunityPipeline(
         store=store,
-        candidate_provider=SnsLlmCandidateProvider(
-            db_path=settings.sns_db_path,
-            endpoint=settings.openclaw_local_text_endpoint,
-            model=(settings.openclaw_local_text_model or "").split(",")[0].strip(),
-            timeout_seconds=settings.opportunity_llm_timeout_seconds,
-            lookback_hours=settings.opportunity_sns_lookback_hours,
-            ssl_context=ssl_context if settings.openclaw_local_text_endpoint.startswith("https://") else None,
-        ),
+        candidate_provider=candidate_provider,
         price_checker=TcgFairValueChecker(db_path=settings.monitor_db_path),
         listing_finder=MercariOpportunityListingFinder(),
         reputation_checker=ReputationSnapshotOpportunityChecker(
@@ -392,6 +507,17 @@ def format_opportunity_recommendation(recommendation: OpportunityRecommendation)
         f"商品：{c.title}",
         f"熱度：{c.heat_score:.0f}/100",
         f"理由：{c.reason}",
+    ]
+    web_sources = _web_research_sources_from_metadata(c.metadata)
+    if web_sources:
+        lines.extend(["", "市場佐證："])
+        for index, source in enumerate(web_sources[:3], 1):
+            title = source.get("title") or "source"
+            url = source.get("url") or ""
+            lines.append(f"[{index}] {title}")
+            if url:
+                lines.append(url)
+    lines.extend([
         "",
         f"合理價：約 ¥{p.fair_value_jpy:,}",
         f"目前售價：¥{listing.price_jpy:,}",
@@ -407,7 +533,7 @@ def format_opportunity_recommendation(recommendation: OpportunityRecommendation)
         listing.url,
         "",
         "判斷：價格低於目標價，賣家信譽通過，值得人工確認。",
-    ]
+    ])
     return "\n".join(lines)
 
 
@@ -480,6 +606,133 @@ def _build_sns_candidate_prompt(posts: Sequence[SnsPost], *, limit: int) -> str:
             f"[{index}] id={post.tweet_id} rule={post.rule_label} author={post.author_handle} date={post.created_at}: {text}"
         )
     return "\n".join(lines)
+
+
+def _build_opportunity_research_query(candidate: OpportunityCandidate) -> str:
+    game_label = {
+        "pokemon": "Pokemon card",
+        "ws": "Weiss Schwarz card",
+        "yugioh": "Yu-Gi-Oh card",
+        "union_arena": "Union Arena card",
+    }.get(candidate.game, f"{candidate.game} card")
+    topic = candidate.search_query or candidate.title
+    return f"{topic} {game_label} demand popularity price trend resale"
+
+
+def _build_opportunity_web_assessment_prompt(
+    candidate: OpportunityCandidate,
+    *,
+    query: str,
+    sources: Sequence[WebSearchResult],
+) -> str:
+    lines = [
+        "You are evaluating whether a TCG/collectible-card opportunity has real outside-market support.",
+        "Use only the provided web search results. Do not invent facts.",
+        "Return strict JSON only with this shape:",
+        '{"is_relevant":true,"demand_score":0-100,"reason":"one short evidence-based sentence"}',
+        "",
+        f"Candidate game: {candidate.game}",
+        f"Candidate title: {candidate.title}",
+        f"Candidate Mercari search query: {candidate.search_query}",
+        f"SNS heat score: {candidate.heat_score:.0f}/100",
+        f"SNS reason: {candidate.reason}",
+        f"Web query: {query}",
+        "",
+        "Search results:",
+    ]
+    for index, source in enumerate(sources, 1):
+        lines.append(f"[{index}] {source.title}")
+        lines.append(f"URL: {source.url}")
+        lines.append(f"Snippet: {source.snippet or '(no snippet)'}")
+    lines.extend(
+        [
+            "",
+            "Scoring guidance:",
+            "- 80-100: strong demand signal, sellouts, price movement, releases, or collector attention.",
+            "- 55-79: plausible interest but limited evidence.",
+            "- 0-54: weak, unrelated, stale, or source evidence does not support the candidate.",
+            "- is_relevant=false if results are mostly about the wrong franchise, wrong product, or generic unrelated content.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _parse_web_assessment(raw: str, *, fallback: WebOpportunityAssessment) -> WebOpportunityAssessment:
+    try:
+        payload = json.loads(_strip_json_fence(raw))
+    except json.JSONDecodeError:
+        logger.warning("Opportunity web assessment response was not JSON: %s", raw[:500])
+        return fallback
+    if not isinstance(payload, dict):
+        return fallback
+    return WebOpportunityAssessment(
+        is_relevant=_as_bool(payload.get("is_relevant"), default=fallback.is_relevant),
+        demand_score=_clamp_float(
+            payload.get("demand_score"),
+            minimum=0.0,
+            maximum=100.0,
+            default=fallback.demand_score,
+        ),
+        reason=str(payload.get("reason") or fallback.reason).strip(),
+    )
+
+
+def _default_web_assessment(
+    candidate: OpportunityCandidate,
+    *,
+    query: str,
+    sources: Sequence[WebSearchResult],
+) -> WebOpportunityAssessment:
+    signal_hits = 0
+    signal_terms = (
+        "popular",
+        "popularity",
+        "demand",
+        "trend",
+        "price",
+        "sold out",
+        "resale",
+        "collector",
+        "高騰",
+        "人気",
+        "注目",
+        "予約",
+        "抽選",
+        "再販",
+    )
+    haystack = " ".join(f"{source.title} {source.snippet}" for source in sources).lower()
+    for term in signal_terms:
+        if term.lower() in haystack:
+            signal_hits += 1
+    demand_score = min(100.0, max(candidate.heat_score, 50.0 + len(sources) * 4.0 + signal_hits * 4.0))
+    first_title = sources[0].title if sources else query
+    return WebOpportunityAssessment(
+        is_relevant=True,
+        demand_score=demand_score,
+        reason=f"Found {len(sources)} web sources; top result: {first_title}.",
+    )
+
+
+def _apply_web_assessment_to_heat(current_heat: float, assessment: WebOpportunityAssessment) -> float:
+    if not assessment.is_relevant:
+        return round(max(0.0, current_heat - 15.0), 1)
+    blended = current_heat * 0.70 + assessment.demand_score * 0.30
+    return round(max(current_heat, min(100.0, blended)), 1)
+
+
+def _source_to_metadata(source: WebSearchResult) -> dict[str, str]:
+    return {
+        "title": source.title,
+        "url": source.url,
+        "snippet": source.snippet,
+    }
+
+
+def _append_source_kind(source_kind: str, suffix: str) -> str:
+    parts = [part for part in source_kind.split("+") if part]
+    if suffix not in parts:
+        parts.append(suffix)
+    return "+".join(parts) or suffix
 
 
 def _call_ollama_json(
@@ -620,6 +873,18 @@ def _clamp_float(value: object, *, minimum: float, maximum: float, default: floa
     return min(max(parsed, minimum), maximum)
 
 
+def _as_bool(value: object, *, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "y", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "n", "off"}:
+            return False
+    return default
+
+
 def _as_int_or_none(value: object) -> int | None:
     try:
         return int(value)
@@ -646,6 +911,27 @@ def _format_optional_int(value: int | None) -> str:
 
 def _format_optional_pct(value: float | None) -> str:
     return "n/a" if value is None else f"{value:.1f}%"
+
+
+def _web_research_sources_from_metadata(metadata: object) -> list[dict[str, str]]:
+    if not isinstance(metadata, MappingABC):
+        return []
+    web_research = metadata.get("web_research")
+    if not isinstance(web_research, MappingABC):
+        return []
+    sources = web_research.get("sources")
+    if not isinstance(sources, list):
+        return []
+    normalized: list[dict[str, str]] = []
+    for source in sources:
+        if not isinstance(source, MappingABC):
+            continue
+        url = str(source.get("url") or "").strip()
+        title = str(source.get("title") or "").strip()
+        if not url:
+            continue
+        normalized.append({"title": title or url, "url": url})
+    return normalized
 
 
 def run_opportunity_agent(*, settings: AssistantSettings | None = None, once: bool = False) -> OpportunityPipelineStats | None:

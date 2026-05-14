@@ -65,10 +65,23 @@ Completed on 2026-05-13:
 - Existing local candidate rows were normalized so `/hunt status` no longer shows `アビスアイ 抽選情報` as a product.
 - Focused opportunity tests after this fix: `7 passed`.
 
+### Phase 6 - Web Research Enrichment
+
+Completed on 2026-05-14:
+
+- The opportunity agent now wraps SNS candidate discovery with web research when the local Ollama text model is configured.
+- For each SNS candidate, it searches DuckDuckGo using the shared web search helper and asks the text model for a JSON relevance/demand assessment.
+- Web research can boost candidate heat when outside sources support demand, or lower heat when sources look unrelated.
+- Candidate metadata now stores the research query, assessment, and source URLs.
+- Telegram opportunity recommendations include a `市場佐證` section with web reference URLs when available.
+- Focused opportunity/web-search tests after this change: `20 passed`.
+- Full `aka_no_claw` tests after this change: `220 passed, 7 skipped`.
+
 ## Important Runtime Notes
 
 - The agent is recommendation-only. It does not buy anything.
 - It needs the local text model through Ollama for SNS product extraction.
+- When the local text model is configured, the agent also uses DuckDuckGo web research to evaluate outside-market support for each candidate.
 - It needs `reputation_snapshot` running for seller checks.
 - It reads SNS data from `SNS_DB_PATH`, currently defaulting to `data/sns.sqlite3`.
 - It sends Telegram messages through the same OpenClaw bot token and allowed chat IDs.
