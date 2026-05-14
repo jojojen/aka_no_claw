@@ -29,6 +29,12 @@ The Telegram assistant can reach these tools:
 - `/snapshot <url>`
   - Build or reuse a reputation snapshot for a Mercari item/profile URL.
 
+- `/search <question>`
+- `/research <question>`
+  - Search the web with DuckDuckGo, then summarize the result with the configured local LLM.
+  - Include source URLs / references in the final reply.
+  - Use when the user asks a general explanatory or background question that needs sources, such as why a TCG card is popular.
+
 - Photo scan flow
   - Send a photo with caption `/scan pokemon` or `/scan ws`.
   - The bot can also handle a plain card photo without a strict caption and try OCR/vision lookup.
@@ -86,5 +92,6 @@ Routing rules:
 - Return `lookup_card` for one-card valuation requests.
 - Return `trend_board` for hot/trending/liquidity/ranking requests.
 - Return `reputation_snapshot` when a Mercari URL is provided for seller/item trust checking.
+- Return `web_research` when the user asks an explanatory/background question that needs web sources and summarization.
 - Return watch intents for tracking requests.
 - Return `unknown` when the request is unrelated or too ambiguous.

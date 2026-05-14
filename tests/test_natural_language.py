@@ -45,6 +45,7 @@ def test_natural_language_router_loads_tool_spec_from_file() -> None:
     assert "lookup_card" in router.tool_spec
     assert "trend_board" in router.tool_spec
     assert "reputation_snapshot" in router.tool_spec
+    assert "web_research" in router.tool_spec
 
 
 # ── /help — capability / usage questions ─────────────────────────────────────
@@ -189,6 +190,22 @@ def test_fallback_routes_pokemon_liquidity_board() -> None:
 def test_fallback_returns_none_for_trend_without_game() -> None:
     # Trend keywords present but no game specified → cannot route
     result = fallback_route_telegram_natural_language("最近什麼熱門排行")
+
+    assert result is None
+
+
+# ── /search — sourced web research questions ─────────────────────────────────
+
+def test_fallback_routes_tcg_why_question_to_web_research() -> None:
+    result = fallback_route_telegram_natural_language("why pokemon card pickachu card is so popular?")
+
+    assert result is not None
+    assert result.intent == "web_research"
+    assert result.research_query == "why pokemon card pickachu card is so popular"
+
+
+def test_fallback_does_not_route_unrelated_weather_question_to_web_research() -> None:
+    result = fallback_route_telegram_natural_language("why is tomorrow weather so hot?")
 
     assert result is None
 
