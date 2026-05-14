@@ -34,6 +34,19 @@ class AssistantSettings:
     log_file_path: str = "logs/openclaw.log"
     log_raw_result_limit: int = 20
     sns_db_path: str = "data/sns.sqlite3"
+    opportunity_agent_enabled: bool = False
+    opportunity_db_path: str = "data/opportunities.sqlite3"
+    opportunity_interval_seconds: int = 900
+    opportunity_llm_timeout_seconds: int = 180
+    opportunity_sns_lookback_hours: int = 24
+    opportunity_candidate_limit: int = 4
+    opportunity_listing_limit: int = 5
+    opportunity_candidate_check_interval_seconds: int = 1800
+    opportunity_min_heat_score: float = 70.0
+    opportunity_max_price_ratio: float = 0.85
+    opportunity_min_price_confidence: float = 0.60
+    opportunity_min_total_reviews: int = 30
+    opportunity_min_positive_rate: float = 97.0
 
 
 def load_dotenv(path: str | Path = DEFAULT_ENV_PATH, *, override: bool = False) -> None:
@@ -96,6 +109,52 @@ def get_settings() -> AssistantSettings:
         log_file_path=os.getenv("LOG_FILE_PATH", "logs/openclaw.log"),
         log_raw_result_limit=_as_int(os.getenv("LOG_RAW_RESULT_LIMIT"), default=20),
         sns_db_path=os.getenv("SNS_DB_PATH", "data/sns.sqlite3"),
+        opportunity_agent_enabled=_as_bool(os.getenv("OPENCLAW_OPPORTUNITY_AGENT_ENABLED")),
+        opportunity_db_path=os.getenv("OPENCLAW_OPPORTUNITY_DB_PATH", "data/opportunities.sqlite3"),
+        opportunity_interval_seconds=_as_int(
+            os.getenv("OPENCLAW_OPPORTUNITY_INTERVAL_SECONDS"),
+            default=900,
+        ),
+        opportunity_llm_timeout_seconds=_as_int(
+            os.getenv("OPENCLAW_OPPORTUNITY_LLM_TIMEOUT_SECONDS"),
+            default=180,
+        ),
+        opportunity_sns_lookback_hours=_as_int(
+            os.getenv("OPENCLAW_OPPORTUNITY_SNS_LOOKBACK_HOURS"),
+            default=24,
+        ),
+        opportunity_candidate_limit=_as_int(
+            os.getenv("OPENCLAW_OPPORTUNITY_CANDIDATE_LIMIT"),
+            default=4,
+        ),
+        opportunity_listing_limit=_as_int(
+            os.getenv("OPENCLAW_OPPORTUNITY_LISTING_LIMIT"),
+            default=5,
+        ),
+        opportunity_candidate_check_interval_seconds=_as_int(
+            os.getenv("OPENCLAW_OPPORTUNITY_CANDIDATE_CHECK_INTERVAL_SECONDS"),
+            default=1800,
+        ),
+        opportunity_min_heat_score=_as_float(
+            os.getenv("OPENCLAW_OPPORTUNITY_MIN_HEAT_SCORE"),
+            default=70.0,
+        ),
+        opportunity_max_price_ratio=_as_float(
+            os.getenv("OPENCLAW_OPPORTUNITY_MAX_PRICE_RATIO"),
+            default=0.85,
+        ),
+        opportunity_min_price_confidence=_as_float(
+            os.getenv("OPENCLAW_OPPORTUNITY_MIN_PRICE_CONFIDENCE"),
+            default=0.60,
+        ),
+        opportunity_min_total_reviews=_as_int(
+            os.getenv("OPENCLAW_OPPORTUNITY_MIN_TOTAL_REVIEWS"),
+            default=30,
+        ),
+        opportunity_min_positive_rate=_as_float(
+            os.getenv("OPENCLAW_OPPORTUNITY_MIN_POSITIVE_RATE"),
+            default=97.0,
+        ),
     )
 
 
@@ -137,5 +196,14 @@ def _as_int(value: str | None, *, default: int) -> int:
         return default
     try:
         return int(value.strip())
+    except ValueError:
+        return default
+
+
+def _as_float(value: str | None, *, default: float) -> float:
+    if value is None:
+        return default
+    try:
+        return float(value.strip())
     except ValueError:
         return default

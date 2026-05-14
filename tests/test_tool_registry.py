@@ -13,6 +13,8 @@ def test_tool_registry_exposes_assistant_tools() -> None:
     assert "assistant.serve-dashboard" in names
     assert "assistant.telegram-poll" in names
     assert "assistant.telegram-send-test" in names
+    assert "assistant.opportunity-agent" in names
+    assert "assistant.opportunity-status" in names
     assert "lookup-card" in registry.tools()[0].aliases
 
 
@@ -25,3 +27,5 @@ def test_tool_catalog_mentions_lookup_tool() -> None:
     assert "market.list-reference-sources" in catalog
     assert "assistant.serve-dashboard" in catalog
     assert "assistant.telegram-poll" in catalog
+    assert "assistant.opportunity-agent" in catalog
+    assert "assistant.opportunity-status" in catalog

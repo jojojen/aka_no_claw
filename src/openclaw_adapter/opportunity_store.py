@@ -1,0 +1,304 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Iterator
+
+from .opportunity_models import (
+    ListingOffer,
+    OpportunityCandidate,
+    OpportunityRecommendation,
+    PriceCheck,
+    ReputationCheck,
+    build_listing_key,
+    utc_now_iso,
+)
+
+
+SCHEMA = """
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS opportunity_candidates (
+    candidate_id TEXT PRIMARY KEY,
+    game TEXT NOT NULL,
+    title TEXT NOT NULL,
+    search_query TEXT NOT NULL,
+    heat_score REAL NOT NULL,
+    reason TEXT NOT NULL,
+    source_kind TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'active',
+    last_checked_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS opportunity_price_checks (
+    check_id TEXT PRIMARY KEY,
+    candidate_id TEXT NOT NULL,
+    fair_value_jpy INTEGER NOT NULL,
+    confidence REAL NOT NULL,
+    sample_count INTEGER NOT NULL,
+    target_price_jpy INTEGER,
+    notes_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (candidate_id) REFERENCES opportunity_candidates(candidate_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS opportunity_recommendations (
+    recommendation_id TEXT PRIMARY KEY,
+    candidate_id TEXT NOT NULL,
+    listing_id TEXT NOT NULL,
+    listing_title TEXT NOT NULL,
+    listing_price_jpy INTEGER NOT NULL,
+    listing_url TEXT NOT NULL UNIQUE,
+    thumbnail_url TEXT,
+    fair_value_jpy INTEGER NOT NULL,
+    price_confidence REAL NOT NULL,
+    discount_pct REAL NOT NULL,
+    opportunity_score REAL NOT NULL,
+    accepted INTEGER NOT NULL,
+    reasons_json TEXT NOT NULL DEFAULT '[]',
+    proof_url TEXT NOT NULL,
+    seller_total_reviews INTEGER,
+    seller_positive_rate REAL,
+    seller_grade TEXT,
+    reputation_status TEXT NOT NULL,
+    notified_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (candidate_id) REFERENCES opportunity_candidates(candidate_id) ON DELETE CASCADE
+);
+"""
+
+
+def _json(data: object) -> str:
+    return json.dumps(data, ensure_ascii=False, sort_keys=True)
+
+
+class OpportunityStore:
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+
+    @contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(self.path)
+        connection.row_factory = sqlite3.Row
+        try:
+            yield connection
+            connection.commit()
+        finally:
+            connection.close()
+
+    def bootstrap(self) -> None:
+        with self.connect() as connection:
+            connection.executescript(SCHEMA)
+
+    def upsert_candidate(self, candidate: OpportunityCandidate) -> None:
+        now = utc_now_iso()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO opportunity_candidates (
+                    candidate_id, game, title, search_query, heat_score, reason,
+                    source_kind, source_url, metadata_json, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(candidate_id) DO UPDATE SET
+                    game=excluded.game,
+                    title=excluded.title,
+                    search_query=excluded.search_query,
+                    heat_score=MAX(opportunity_candidates.heat_score, excluded.heat_score),
+                    reason=excluded.reason,
+                    source_kind=excluded.source_kind,
+                    source_url=excluded.source_url,
+                    metadata_json=excluded.metadata_json,
+                    status='active',
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    candidate.candidate_id,
+                    candidate.game,
+                    candidate.title,
+                    candidate.search_query,
+                    candidate.heat_score,
+                    candidate.reason,
+                    candidate.source_kind,
+                    candidate.source_url,
+                    _json(dict(candidate.metadata)),
+                    candidate.created_at or now,
+                    now,
+                ),
+            )
+
+    def list_due_candidates(self, *, limit: int, min_interval_seconds: int) -> list[OpportunityCandidate]:
+        now = utc_now_iso()
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM opportunity_candidates
+                WHERE status = 'active'
+                  AND (
+                    last_checked_at IS NULL
+                    OR strftime('%s', ?) - strftime('%s', last_checked_at) >= ?
+                  )
+                ORDER BY heat_score DESC, updated_at DESC
+                LIMIT ?
+                """,
+                (now, min_interval_seconds, limit),
+            ).fetchall()
+        return [_candidate_from_row(row) for row in rows]
+
+    def mark_candidate_checked(self, candidate_id: str) -> None:
+        now = utc_now_iso()
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE opportunity_candidates SET last_checked_at = ?, updated_at = ? WHERE candidate_id = ?",
+                (now, now, candidate_id),
+            )
+
+    def record_price_check(self, price: PriceCheck) -> str:
+        now = utc_now_iso()
+        check_id = f"price_{price.candidate_id}_{now}"
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO opportunity_price_checks (
+                    check_id, candidate_id, fair_value_jpy, confidence, sample_count,
+                    target_price_jpy, notes_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    check_id,
+                    price.candidate_id,
+                    price.fair_value_jpy,
+                    price.confidence,
+                    price.sample_count,
+                    price.target_price_jpy,
+                    _json(list(price.notes)),
+                    now,
+                ),
+            )
+        return check_id
+
+    def listing_seen(self, url: str) -> bool:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM opportunity_recommendations WHERE listing_url = ? LIMIT 1",
+                (url,),
+            ).fetchone()
+        return row is not None
+
+    def record_recommendation(self, recommendation: OpportunityRecommendation, *, accepted: bool) -> None:
+        now = utc_now_iso()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO opportunity_recommendations (
+                    recommendation_id, candidate_id, listing_id, listing_title, listing_price_jpy,
+                    listing_url, thumbnail_url, fair_value_jpy, price_confidence, discount_pct,
+                    opportunity_score, accepted, reasons_json, proof_url, seller_total_reviews,
+                    seller_positive_rate, seller_grade, reputation_status, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(listing_url) DO UPDATE SET
+                    opportunity_score=excluded.opportunity_score,
+                    accepted=excluded.accepted,
+                    reasons_json=excluded.reasons_json,
+                    proof_url=excluded.proof_url,
+                    seller_total_reviews=excluded.seller_total_reviews,
+                    seller_positive_rate=excluded.seller_positive_rate,
+                    seller_grade=excluded.seller_grade,
+                    reputation_status=excluded.reputation_status,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    recommendation.recommendation_id,
+                    recommendation.candidate.candidate_id,
+                    recommendation.listing.listing_id,
+                    recommendation.listing.title,
+                    recommendation.listing.price_jpy,
+                    recommendation.listing.url,
+                    recommendation.listing.thumbnail_url,
+                    recommendation.price.fair_value_jpy,
+                    recommendation.price.confidence,
+                    recommendation.discount_pct,
+                    recommendation.score,
+                    int(accepted),
+                    _json(list(recommendation.reasons)),
+                    recommendation.reputation.proof_url,
+                    recommendation.reputation.total_reviews,
+                    recommendation.reputation.positive_rate,
+                    recommendation.reputation.grade,
+                    recommendation.reputation.status,
+                    now,
+                    now,
+                ),
+            )
+
+    def mark_notified(self, recommendation_id: str) -> None:
+        now = utc_now_iso()
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE opportunity_recommendations SET notified_at = ?, updated_at = ? WHERE recommendation_id = ?",
+                (now, now, recommendation_id),
+            )
+
+    def list_recent_recommendations(self, *, limit: int = 10) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            return list(
+                connection.execute(
+                    """
+                    SELECT *
+                    FROM opportunity_recommendations
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+            )
+
+    def list_recent_candidates(self, *, limit: int = 10) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            return list(
+                connection.execute(
+                    """
+                    SELECT *
+                    FROM opportunity_candidates
+                    WHERE status = 'active'
+                    ORDER BY updated_at DESC, heat_score DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+            )
+
+
+def _candidate_from_row(row: sqlite3.Row) -> OpportunityCandidate:
+    metadata_raw = row["metadata_json"] or "{}"
+    try:
+        metadata = json.loads(metadata_raw)
+    except json.JSONDecodeError:
+        metadata = {}
+    return OpportunityCandidate(
+        candidate_id=row["candidate_id"],
+        game=row["game"],
+        title=row["title"],
+        search_query=row["search_query"],
+        heat_score=float(row["heat_score"]),
+        reason=row["reason"],
+        source_kind=row["source_kind"],
+        source_url=row["source_url"],
+        metadata=metadata,
+        created_at=row["created_at"],
+    )
+
+
+def recommendation_id_for(listing: ListingOffer) -> str:
+    return build_listing_key(listing.url)

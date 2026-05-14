@@ -30,6 +30,7 @@ RUNTIME_ENV_FILE="${RUN_DIR}/mac-mini-stack.env"
 LAUNCHCTL_OLLAMA_LABEL="local.openclaw.ollama"
 LAUNCHCTL_REPUTATION_LABEL="local.openclaw.reputation"
 LAUNCHCTL_TELEGRAM_LABEL="local.openclaw.telegram"
+LAUNCHCTL_OPPORTUNITY_LABEL="local.openclaw.opportunity"
 
 mkdir -p "${RUN_DIR}" "${LOG_DIR}"
 
@@ -547,6 +548,19 @@ configure_aka_env() {
   ensure_default_env_value "${env_path}" "OPENCLAW_LOCAL_TEXT_ENDPOINT" "http://127.0.0.1:11434"
   ensure_default_env_value "${env_path}" "OPENCLAW_LOCAL_TEXT_MODEL" "${OLLAMA_DEFAULT_TEXT_MODEL}"
   ensure_default_env_value "${env_path}" "OPENCLAW_LOCAL_TEXT_TIMEOUT_SECONDS" "75"
+  ensure_default_env_value "${env_path}" "OPENCLAW_OPPORTUNITY_AGENT_ENABLED" "1"
+  ensure_default_env_value "${env_path}" "OPENCLAW_OPPORTUNITY_DB_PATH" "data/opportunities.sqlite3"
+  ensure_default_env_value "${env_path}" "OPENCLAW_OPPORTUNITY_INTERVAL_SECONDS" "900"
+  ensure_default_env_value "${env_path}" "OPENCLAW_OPPORTUNITY_LLM_TIMEOUT_SECONDS" "180"
+  ensure_default_env_value "${env_path}" "OPENCLAW_OPPORTUNITY_SNS_LOOKBACK_HOURS" "24"
+  ensure_default_env_value "${env_path}" "OPENCLAW_OPPORTUNITY_CANDIDATE_LIMIT" "4"
+  ensure_default_env_value "${env_path}" "OPENCLAW_OPPORTUNITY_LISTING_LIMIT" "5"
+  ensure_default_env_value "${env_path}" "OPENCLAW_OPPORTUNITY_CANDIDATE_CHECK_INTERVAL_SECONDS" "1800"
+  ensure_default_env_value "${env_path}" "OPENCLAW_OPPORTUNITY_MIN_HEAT_SCORE" "70"
+  ensure_default_env_value "${env_path}" "OPENCLAW_OPPORTUNITY_MAX_PRICE_RATIO" "0.85"
+  ensure_default_env_value "${env_path}" "OPENCLAW_OPPORTUNITY_MIN_PRICE_CONFIDENCE" "0.60"
+  ensure_default_env_value "${env_path}" "OPENCLAW_OPPORTUNITY_MIN_TOTAL_REVIEWS" "30"
+  ensure_default_env_value "${env_path}" "OPENCLAW_OPPORTUNITY_MIN_POSITIVE_RATE" "97"
   set_env_value "${env_path}" "REPUTATION_AGENT_SERVER_URL" "http://${HOST}:${PORT}"
   ensure_default_env_value "${env_path}" "REPUTATION_AGENT_POLL_SECS" "5"
 }
@@ -908,7 +922,7 @@ stop_launchctl_jobs() {
     return
   fi
   local label
-  for label in "${LAUNCHCTL_OLLAMA_LABEL}" "${LAUNCHCTL_REPUTATION_LABEL}" "${LAUNCHCTL_TELEGRAM_LABEL}"; do
+  for label in "${LAUNCHCTL_OLLAMA_LABEL}" "${LAUNCHCTL_REPUTATION_LABEL}" "${LAUNCHCTL_TELEGRAM_LABEL}" "${LAUNCHCTL_OPPORTUNITY_LABEL}"; do
     if launchctl_job_exists "${label}"; then
       log "Stopping launchctl job ${label}."
       launchctl remove "${label}" >/dev/null 2>&1 || true
@@ -1072,7 +1086,7 @@ start_openclaw_telegram() {
     launchctl submit -l "${LAUNCHCTL_TELEGRAM_LABEL}" \
       -o "${LOG_DIR}/openclaw_telegram.log" \
       -e "${LOG_DIR}/openclaw_telegram.log" \
-      -- /bin/bash -lc "source '${RUNTIME_ENV_FILE}'; cd '${AKA_DIR}'; exec '${AKA_VENV}/bin/python' -m openclaw_adapter telegram-poll --with-reputation-agent --no-dashboard${notify_arg}"
+      -- /bin/bash -lc "source '${RUNTIME_ENV_FILE}'; cd '${AKA_DIR}'; export PYTHONPATH='.:src'; exec '${AKA_VENV}/bin/python' -m openclaw_adapter telegram-poll --with-reputation-agent --no-dashboard${notify_arg}"
     local pid
     pid="$(launchctl_job_pid "${LAUNCHCTL_TELEGRAM_LABEL}")"
     [[ -n "${pid}" ]] && echo "${pid}" >> "${PID_FILE}"
@@ -1088,6 +1102,38 @@ start_openclaw_telegram() {
       export PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH="${chromium_path}"
     fi
     nohup "${AKA_VENV}/bin/python" -m openclaw_adapter "${args[@]}" >> "${LOG_DIR}/openclaw_telegram.log" 2>&1 &
+    echo $! >> "${PID_FILE}"
+  )
+}
+
+opportunity_agent_enabled() {
+  local enabled
+  enabled="$(get_env_value "${AKA_DIR}/.env" "OPENCLAW_OPPORTUNITY_AGENT_ENABLED")"
+  enabled="$(printf '%s' "${enabled:-0}" | tr '[:upper:]' '[:lower:]')"
+  [[ "${enabled}" != "0" && "${enabled}" != "false" && "${enabled}" != "no" && "${enabled}" != "off" ]]
+}
+
+start_opportunity_agent() {
+  if ! opportunity_agent_enabled; then
+    log "Skipping opportunity agent because OPENCLAW_OPPORTUNITY_AGENT_ENABLED=0."
+    return
+  fi
+
+  log "Starting OpenClaw opportunity agent..."
+  if use_launchctl_services; then
+    launchctl submit -l "${LAUNCHCTL_OPPORTUNITY_LABEL}" \
+      -o "${LOG_DIR}/opportunity_agent.log" \
+      -e "${LOG_DIR}/opportunity_agent.log" \
+      -- /bin/bash -lc "source '${RUNTIME_ENV_FILE}'; cd '${AKA_DIR}'; export PYTHONPATH='.:src'; exec '${AKA_VENV}/bin/python' -m openclaw_adapter opportunity-agent"
+    local pid
+    pid="$(launchctl_job_pid "${LAUNCHCTL_OPPORTUNITY_LABEL}")"
+    [[ -n "${pid}" ]] && echo "${pid}" >> "${PID_FILE}"
+    return
+  fi
+
+  (
+    cd "${AKA_DIR}"
+    nohup "${AKA_VENV}/bin/python" -m openclaw_adapter opportunity-agent >> "${LOG_DIR}/opportunity_agent.log" 2>&1 &
     echo $! >> "${PID_FILE}"
   )
 }
@@ -1110,12 +1156,14 @@ main() {
   start_reputation_server
   wait_for_reputation_server
   start_openclaw_telegram
+  start_opportunity_agent
 
   log "Started."
   log "PID file: ${PID_FILE}"
   log "Logs:"
   log "  ${LOG_DIR}/reputation_snapshot.log"
   log "  ${LOG_DIR}/openclaw_telegram.log"
+  log "  ${LOG_DIR}/opportunity_agent.log"
   if use_launchctl_services; then
     log "macOS Terminal may show '[Process completed]' after this; the services keep running in the background."
   fi

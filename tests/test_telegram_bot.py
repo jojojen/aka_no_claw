@@ -210,6 +210,20 @@ def test_command_processor_help_lists_trend_and_scan_commands() -> None:
     assert "/price pokemon | Pikachu ex | 132/106 | SAR | sv08" in help_reply
     assert "/snapshot https://jp.mercari.com/item/m123456789" in help_reply
     assert "Send a photo with caption: /scan pokemon" in help_reply
+    assert "/hunt status" in help_reply
+
+
+def test_command_processor_handles_hunt_status() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        opportunity_status_renderer=lambda: "targets: Umbreon",
+    )
+
+    assert processor.build_reply(chat_id="123", text="/hunt status") == "targets: Umbreon"
 
 
 def test_build_status_text_includes_feature_models_and_sizes(tmp_path, monkeypatch) -> None:
