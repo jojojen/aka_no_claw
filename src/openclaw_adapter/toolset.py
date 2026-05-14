@@ -5,6 +5,7 @@ import logging
 import threading
 import time
 import webbrowser
+from dataclasses import replace
 from pathlib import Path
 
 from assistant_runtime import AssistantSettings, AssistantTool, ToolRegistry, get_settings
@@ -17,6 +18,7 @@ from .formatters import (
     lookup_result_to_json,
     reference_sources_to_json,
 )
+from .opportunity_agent import format_opportunity_status, run_opportunity_agent
 from .reputation_agent import check_prerequisites, ensure_agent_thread, run_agent_loop
 from .sns_tools import (
     _configure_sns_add_account_parser,
@@ -106,6 +108,24 @@ def build_tool_registry(settings: AssistantSettings | None = None) -> ToolRegist
             configure_parser=lambda parser: _configure_reputation_agent_parser(parser, settings),
             handler=lambda args: _handle_reputation_agent(args, settings),
             aliases=("reputation-agent",),
+        )
+    )
+    registry.register(
+        AssistantTool(
+            name="assistant.opportunity-agent",
+            description="Run the SNS→price→reputation opportunity pipeline and recommend qualified Mercari listings via Telegram.",
+            configure_parser=lambda parser: _configure_opportunity_agent_parser(parser, settings),
+            handler=lambda args: _handle_opportunity_agent(args, settings),
+            aliases=("opportunity-agent", "hunt-agent"),
+        )
+    )
+    registry.register(
+        AssistantTool(
+            name="assistant.opportunity-status",
+            description="Show recent opportunity candidates and recommendation decisions.",
+            configure_parser=_configure_opportunity_status_parser,
+            handler=lambda args: _handle_opportunity_status(args, settings),
+            aliases=("opportunity-status", "hunt-status"),
         )
     )
     registry.register(
@@ -413,6 +433,23 @@ def _configure_reputation_agent_parser(
     )
 
 
+def _configure_opportunity_agent_parser(
+    parser: argparse.ArgumentParser,
+    settings: AssistantSettings,
+) -> None:
+    parser.add_argument("--once", action="store_true", help="Run one opportunity pipeline tick and exit.")
+    parser.add_argument(
+        "--interval-seconds",
+        type=int,
+        default=settings.opportunity_interval_seconds,
+        help=f"Seconds between continuous opportunity scans (default: {settings.opportunity_interval_seconds})",
+    )
+
+
+def _configure_opportunity_status_parser(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--limit", type=int, default=10, help="Maximum candidates to show.")
+
+
 def _handle_reputation_agent(
     args: argparse.Namespace,
     settings: AssistantSettings,
@@ -432,4 +469,38 @@ def _handle_reputation_agent(
         api_key=token,
         poll_secs=args.poll_secs,
     )
+    return 0
+
+
+def _handle_opportunity_agent(
+    args: argparse.Namespace,
+    settings: AssistantSettings,
+) -> int:
+    effective_settings = replace(settings, opportunity_interval_seconds=args.interval_seconds)
+    logger.info(
+        "CLI opportunity-agent command received once=%s interval_seconds=%s db=%s sns_db=%s",
+        args.once,
+        effective_settings.opportunity_interval_seconds,
+        effective_settings.opportunity_db_path,
+        effective_settings.sns_db_path,
+    )
+    stats = run_opportunity_agent(settings=effective_settings, once=args.once)
+    if stats is not None:
+        print(
+            "opportunity-agent tick: "
+            f"discovered={stats.discovered} "
+            f"candidates_checked={stats.candidates_checked} "
+            f"price_checks={stats.price_checks} "
+            f"listings_checked={stats.listings_checked} "
+            f"recommendations_sent={stats.recommendations_sent} "
+            f"rejected={stats.rejected}"
+        )
+    return 0
+
+
+def _handle_opportunity_status(
+    args: argparse.Namespace,
+    settings: AssistantSettings,
+) -> int:
+    print(format_opportunity_status(settings, limit=max(1, min(30, args.limit))))
     return 0

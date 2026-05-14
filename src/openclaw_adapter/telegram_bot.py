@@ -43,6 +43,7 @@ from price_monitor_bot.watch_monitor import ensure_monitor as _ensure_watch_moni
 from tcg_tracker.image_lookup import TcgVisionSettings
 
 from .natural_language import build_telegram_natural_language_router_from_settings
+from .opportunity_agent import format_opportunity_status
 from .reputation_agent import ensure_agent_thread
 from .reputation_snapshot import (
     ReputationSnapshotResult,
@@ -299,6 +300,7 @@ def run_telegram_polling(
         ssl_context=build_ssl_context(settings),
         allowed_chat_ids=frozenset(settings.openclaw_telegram_chat_ids),
         status_renderer=lambda: _build_status_text(settings),
+        opportunity_status_renderer=lambda: format_opportunity_status(settings),
         watch_db=watch_db,
         sns_db=sns_db,
         sns_buzz_fn=sns_buzz_fn,
@@ -470,6 +472,14 @@ def _build_status_text(settings: AssistantSettings) -> str:
             f"image scan OCR: engine=tesseract | binary={tesseract} | tessdata={tessdata}",
             "price lookup / trend / watch: model=none | source-driven matching and pricing rules",
             f"reputation snapshot: model=none | server={reputation_host} | poll={settings.reputation_agent_poll_secs}s | renderer=playwright chromium",
+            (
+                "opportunity agent: "
+                f"{'enabled' if settings.opportunity_agent_enabled else 'disabled'}"
+                f" | db={settings.opportunity_db_path}"
+                f" | interval={settings.opportunity_interval_seconds}s"
+                f" | llm_timeout={settings.opportunity_llm_timeout_seconds}s"
+                f" | sns_lookback={settings.opportunity_sns_lookback_hours}h"
+            ),
         ]
     )
 
