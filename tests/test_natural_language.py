@@ -138,6 +138,26 @@ def test_fallback_routes_ptcg_card_valuation() -> None:
     assert result.game == "pokemon"
 
 
+def test_fallback_routes_yugioh_price_lookup_with_card_number() -> None:
+    result = fallback_route_telegram_natural_language("查遊戯王 青眼の白龍 QCCP-JP001 UR 價格")
+
+    assert result is not None
+    assert result.intent == "lookup_card"
+    assert result.game == "yugioh"
+    assert result.name == "青眼の白龍"
+    assert result.card_number == "QCCP-JP001"
+
+
+def test_fallback_routes_union_arena_price_lookup_with_card_number() -> None:
+    result = fallback_route_telegram_natural_language("Union Area UAPR/EVA-1-71 綾波レイ 估價")
+
+    assert result is not None
+    assert result.intent == "lookup_card"
+    assert result.game == "union_arena"
+    assert result.name == "綾波レイ"
+    assert result.card_number == "UAPR/EVA-1-71"
+
+
 # ── /trend /hot /liquidity — hot / trending / liquidity boards ───────────────
 
 def test_fallback_routes_pokemon_trend_board_with_limit() -> None:

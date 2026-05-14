@@ -16,6 +16,7 @@ from assistant_runtime.logging_utils import trim_for_log
 from market_monitor import load_reference_sources
 from market_monitor.http import HttpClient
 from market_monitor.storage import MercariWatch, MonitorDatabase
+from tcg_tracker.catalog import normalize_game_key, supported_game_hint
 from tcg_tracker.hot_cards import HotCardBoard, TcgHotCardService
 
 from .commands import lookup_card
@@ -309,6 +310,7 @@ def _build_handler(*, settings: AssistantSettings, registry: ToolRegistry) -> ty
             params = parse_qs(query)
             game = _single_value(params, "game")
             name = _single_value(params, "name")
+            normalized_game = normalize_game_key(game)
             logger.info(
                 "Dashboard lookup received game=%s name=%s card_number=%s rarity=%s set_code=%s",
                 game,
@@ -317,10 +319,10 @@ def _build_handler(*, settings: AssistantSettings, registry: ToolRegistry) -> ty
                 _single_value(params, "rarity"),
                 _single_value(params, "set_code"),
             )
-            if game not in {"pokemon", "ws"} or not name:
+            if normalized_game is None or not name:
                 self._write_json(
                     {
-                        "error": "Both game and name are required. game must be one of pokemon or ws."
+                        "error": f"Both game and name are required. game must be one of {supported_game_hint()}."
                     },
                     status=HTTPStatus.BAD_REQUEST,
                 )
@@ -329,7 +331,7 @@ def _build_handler(*, settings: AssistantSettings, registry: ToolRegistry) -> ty
             try:
                 result = lookup_card(
                     db_path=settings.monitor_db_path,
-                    game=game,
+                    game=normalized_game,
                     name=name,
                     card_number=_single_value(params, "card_number"),
                     rarity=_single_value(params, "rarity"),

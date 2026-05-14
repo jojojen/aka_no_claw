@@ -9,6 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from assistant_runtime import AssistantSettings, AssistantTool, ToolRegistry, get_settings
+from tcg_tracker.catalog import SUPPORTED_GAMES, normalize_game_key
 
 from .commands import list_reference_sources, lookup_card, seed_example_watchlist
 from .dashboard import serve_dashboard
@@ -195,7 +196,7 @@ def render_tool_catalog(registry: ToolRegistry) -> str:
 
 def _configure_lookup_card_parser(parser: argparse.ArgumentParser, settings: AssistantSettings) -> None:
     parser.add_argument("--db", default=settings.monitor_db_path)
-    parser.add_argument("--game", choices=["pokemon", "ws"], required=True)
+    parser.add_argument("--game", choices=[*SUPPORTED_GAMES, "ygo", "ua"], required=True)
     parser.add_argument("--name", required=True)
     parser.add_argument("--card-number")
     parser.add_argument("--rarity")
@@ -213,7 +214,7 @@ def _configure_seed_watchlist_parser(parser: argparse.ArgumentParser, settings: 
 
 def _configure_reference_sources_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", default="config/reference_sources.json")
-    parser.add_argument("--game", choices=["pokemon", "ws"])
+    parser.add_argument("--game", choices=[*SUPPORTED_GAMES, "ygo", "ua"])
     parser.add_argument("--kind")
     parser.add_argument("--role")
     parser.add_argument("--json", action="store_true")
@@ -255,7 +256,7 @@ def _handle_lookup_card(args: argparse.Namespace) -> int:
     )
     result = lookup_card(
         db_path=args.db,
-        game=args.game,
+        game=normalize_game_key(args.game) or args.game,
         name=args.name,
         card_number=args.card_number,
         rarity=args.rarity,
@@ -286,7 +287,7 @@ def _handle_list_reference_sources(args: argparse.Namespace) -> int:
     )
     sources = list_reference_sources(
         config_path=Path(args.config),
-        game=args.game,
+        game=normalize_game_key(args.game) if args.game else None,
         source_kind=args.kind,
         reference_role=args.role,
     )

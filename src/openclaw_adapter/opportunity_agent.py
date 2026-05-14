@@ -17,6 +17,7 @@ from assistant_runtime import AssistantSettings, build_ssl_context, get_settings
 from market_monitor.mercari_search import search_mercari
 from price_monitor_bot.bot import TelegramBotClient
 from price_monitor_bot.commands import lookup_card
+from tcg_tracker.catalog import normalize_game_key, supported_game_hint
 
 from .opportunity_models import (
     ListingOffer,
@@ -48,10 +49,6 @@ _SEARCH_QUERY_NOISE_REPLACEMENTS: tuple[tuple[str, str], ...] = (
     (r"\s*(?:情報|ニュース|まとめ)\s*", " "),
 )
 _UNSUPPORTED_FRANCHISE_MARKERS: tuple[str, ...] = (
-    "遊☆戯☆王",
-    "遊戯王",
-    "yu-gi-oh",
-    "yugioh",
     "デュエルマスターズ",
     "デュエマ",
     "one piece card game",
@@ -155,8 +152,8 @@ class TcgFairValueChecker:
         self._db_path = db_path
 
     def check(self, candidate: OpportunityCandidate) -> PriceCheck | None:
-        game = candidate.game.strip().lower()
-        if game not in {"pokemon", "ws"}:
+        game = normalize_game_key(candidate.game)
+        if game is None:
             logger.info("Opportunity price skipped unsupported game=%s title=%s", candidate.game, candidate.title)
             return None
         result = lookup_card(
@@ -458,15 +455,15 @@ def format_opportunity_status(settings: AssistantSettings, *, limit: int = 10) -
 def _build_sns_candidate_prompt(posts: Sequence[SnsPost], *, limit: int) -> str:
     lines = [
         "你是 OpenClaw 的商品機會偵測器。請從 SNS 貼文中找出有交易潛力的 TCG/收藏卡商品。",
-        "只接受 pokemon 或 ws。忽略不明確、不是商品、或沒有買賣價值的話題。",
-        "忽略明顯不是 pokemon/ws 的系列，例如遊戯王、デュエルマスターズ、ONE PIECE CARD GAME。",
+        f"只接受 {supported_game_hint()}。忽略不明確、不是商品、或沒有買賣價值的話題。",
+        "忽略明顯不在支援範圍的系列，例如デュエルマスターズ、ONE PIECE CARD GAME、Dragon Ball。",
         "title 必須是真正能在二級市場交易/搜尋的商品名，不要包含情報詞、活動詞或來源詞。",
         "如果貼文是「商品名 + 抽選情報/予約情報/発売情報」，title 只保留商品名。",
         "如果貼文是「セット名収録 卡名」，title 優先輸出卡名；除非整個セット本身才是商品。",
         f"最多輸出 {limit} 個候選。",
         "",
         "請嚴格輸出 JSON，不要 markdown：",
-        '{"candidates":[{"game":"pokemon|ws","title":"商品名","search_query":"Mercari 搜尋關鍵字","heat_score":0-100,"reason":"一句話原因","source_tweet_ids":["..."]}]}',
+        '{"candidates":[{"game":"pokemon|ws|yugioh|union_arena","title":"商品名","search_query":"Mercari 搜尋關鍵字","heat_score":0-100,"reason":"一句話原因","source_tweet_ids":["..."]}]}',
         "",
         "正確例子：",
         "- アビスアイ 抽選情報 -> title=アビスアイ, search_query=アビスアイ",
@@ -529,12 +526,12 @@ def _parse_candidate_response(raw: str, *, posts: Sequence[SnsPost], limit: int)
     for item in raw_candidates:
         if not isinstance(item, dict):
             continue
-        game = str(item.get("game") or "").strip().lower()
+        game = normalize_game_key(str(item.get("game") or "").strip())
         raw_title = str(item.get("title") or "").strip()
         raw_search_query = str(item.get("search_query") or raw_title).strip()
         title = _normalize_product_title(raw_title)
         search_query = _normalize_search_query(raw_search_query, fallback=title)
-        if game not in {"pokemon", "ws"} or not title or not search_query or _looks_like_unsupported_franchise(title):
+        if game is None or not title or not search_query or _looks_like_unsupported_franchise(title):
             continue
         heat_score = _clamp_float(item.get("heat_score"), minimum=0.0, maximum=100.0, default=0.0)
         source_ids = [
