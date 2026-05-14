@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import threading
 import time
@@ -8,7 +9,7 @@ import webbrowser
 from dataclasses import replace
 from pathlib import Path
 
-from assistant_runtime import AssistantSettings, AssistantTool, ToolRegistry, get_settings
+from assistant_runtime import AssistantSettings, AssistantTool, ToolRegistry, build_ssl_context, get_settings
 from tcg_tracker.catalog import SUPPORTED_GAMES, normalize_game_key
 
 from .commands import list_reference_sources, lookup_card, seed_example_watchlist
@@ -38,8 +39,15 @@ from .sns_tools import (
 from .telegram_bot import (
     default_board_loader,
     default_lookup_renderer,
+    _select_text_generation_model,
     run_telegram_polling,
     send_telegram_test_message,
+)
+from .web_search import (
+    build_web_research_answer,
+    format_web_research_answer,
+    search_duckduckgo,
+    summarize_web_sources_with_ollama,
 )
 
 logger = logging.getLogger(__name__)
@@ -100,6 +108,15 @@ def build_tool_registry(settings: AssistantSettings | None = None) -> ToolRegist
             configure_parser=_configure_telegram_send_test_parser,
             handler=lambda args: _handle_telegram_send_test(args, settings),
             aliases=("telegram-send-test",),
+        )
+    )
+    registry.register(
+        AssistantTool(
+            name="assistant.web-search",
+            description="Search the web with DuckDuckGo and summarize the sources with the configured local LLM.",
+            configure_parser=_configure_web_search_parser,
+            handler=lambda args: _handle_web_search(args, settings),
+            aliases=("web-search", "research", "search-web"),
         )
     )
     registry.register(
@@ -244,6 +261,13 @@ def _configure_telegram_send_test_parser(parser: argparse.ArgumentParser) -> Non
     parser.add_argument("--message", default="OpenClaw Telegram test successful.")
 
 
+def _configure_web_search_parser(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("query", nargs="+", help="Question or search query to research.")
+    parser.add_argument("--provider", choices=["duckduckgo"], default="duckduckgo")
+    parser.add_argument("--limit", type=int, default=5, help="Number of search results to use, 1-10.")
+    parser.add_argument("--json", action="store_true", help="Print structured answer JSON.")
+
+
 def _handle_lookup_card(args: argparse.Namespace) -> int:
     logger.info(
         "CLI lookup command received game=%s name=%s card_number=%s rarity=%s set_code=%s json=%s",
@@ -292,6 +316,53 @@ def _handle_list_reference_sources(args: argparse.Namespace) -> int:
         reference_role=args.role,
     )
     print(reference_sources_to_json(sources) if args.json else format_reference_sources(sources))
+    return 0
+
+
+def _handle_web_search(args: argparse.Namespace, settings: AssistantSettings) -> int:
+    query = " ".join(args.query).strip()
+    model = _select_text_generation_model(settings)
+    backend = (settings.openclaw_local_text_backend or "").strip().lower()
+    endpoint = settings.openclaw_local_text_endpoint
+    if backend != "ollama" or not endpoint or not model:
+        print("ERROR: configure OPENCLAW_LOCAL_TEXT_BACKEND=ollama and OPENCLAW_LOCAL_TEXT_MODEL to summarize web results.")
+        return 1
+
+    ssl_ctx = build_ssl_context(settings) if endpoint.startswith("https://") else None
+    answer = build_web_research_answer(
+        query,
+        max_results=args.limit,
+        search_fn=lambda q, limit: search_duckduckgo(
+            q,
+            max_results=limit,
+            ssl_context=ssl_ctx,
+        ),
+        summarize_fn=lambda q, sources: summarize_web_sources_with_ollama(
+            q,
+            sources,
+            endpoint=endpoint,
+            model=model,
+            timeout_seconds=max(1, settings.openclaw_local_text_timeout_seconds),
+            ssl_context=ssl_ctx,
+        ),
+    )
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "query": answer.query,
+                    "summary": answer.summary,
+                    "sources": [
+                        {"title": source.title, "url": source.url, "snippet": source.snippet}
+                        for source in answer.sources
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    else:
+        print(format_web_research_answer(answer))
     return 0
 
 

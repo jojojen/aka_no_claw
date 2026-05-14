@@ -17,6 +17,7 @@ from openclaw_adapter.telegram_bot import (
     TelegramCommandProcessor,
     TelegramFileAttachment,
     TelegramLookupQuery,
+    TelegramResearchQuery,
     TelegramReputationQuery,
     TelegramReputationDelivery,
     build_processing_ack,
@@ -138,6 +139,7 @@ def test_parse_lookup_command_supports_yugioh_and_union_arena_aliases() -> None:
         name="青眼の白龍",
         card_number="QCCP-JP001",
         rarity="ウルトラ",
+        set_code="qccp",
     )
     assert ua_query == TelegramLookupQuery(game="union_arena", name="綾波レイ")
 
@@ -222,6 +224,7 @@ def test_command_processor_help_lists_trend_and_scan_commands() -> None:
     assert "/trend pokemon" in help_reply
     assert "/price pokemon | Pikachu ex | 132/106 | SAR | sv08" in help_reply
     assert "/snapshot https://jp.mercari.com/item/m123456789" in help_reply
+    assert "/search why Pikachu Pokemon cards are popular" in help_reply
     assert "Send a photo with caption: /scan pokemon" in help_reply
     assert "/hunt status" in help_reply
 
@@ -347,6 +350,23 @@ def test_command_processor_handles_snapshot_command() -> None:
     reply = processor.build_reply(chat_id="123", text="/snapshot https://jp.mercari.com/item/m123456789")
 
     assert reply == "snapshot:https://jp.mercari.com/item/m123456789"
+
+
+def test_command_processor_handles_web_search_command() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    seen: list[TelegramResearchQuery] = []
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        research_renderer=lambda query: seen.append(query) or "researched answer\nReferences:\nhttps://example.com/source",
+    )
+
+    reply = processor.build_reply(chat_id="123", text="/search why Pikachu Pokemon cards are popular")
+
+    assert reply == "researched answer\nReferences:\nhttps://example.com/source"
+    assert seen == [TelegramResearchQuery(query="why Pikachu Pokemon cards are popular")]
 
 
 def test_format_reputation_snapshot_result_shows_proof_link() -> None:
@@ -521,12 +541,40 @@ def test_command_processor_handles_natural_language_scan_help_via_router() -> No
     assert router.seen_texts == ["我要怎麼用照片查價"]
 
 
+def test_command_processor_handles_natural_language_web_research_via_router() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    router = StubNaturalLanguageRouter(
+        TelegramNaturalLanguageIntent(
+            intent="web_research",
+            research_query="why Pikachu Pokemon cards are popular",
+            confidence=0.91,
+        )
+    )
+    seen: list[TelegramResearchQuery] = []
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        natural_language_router=router,
+        research_renderer=lambda query: seen.append(query) or "Pikachu is iconic [1].\n\nReferences:\n[1] Source\nhttps://example.com/source",
+    )
+
+    plan = processor.build_reply_plan(chat_id="123", text="why pokemon card pickachu card is so popular?")
+
+    assert plan.ack == "已理解：相當於 /search why Pikachu Pokemon cards are popular，正在搜尋資料來源並整理答案…"
+    assert plan.execute() == "Pikachu is iconic [1].\n\nReferences:\n[1] Source\nhttps://example.com/source"
+    assert seen == [TelegramResearchQuery(query="why Pikachu Pokemon cards are popular")]
+    assert router.seen_texts == ["why pokemon card pickachu card is so popular?"]
+
+
 def test_build_processing_ack_for_heavy_actions() -> None:
     assert build_processing_ack(text="/price pokemon Pikachu ex") == "收到查價指令，開始處理。"
     assert build_processing_ack(text="/trend pokemon") == "收到趨勢榜查詢，開始整理資料。"
     assert build_processing_ack(text="/snapshot https://jp.mercari.com/item/m123456789") == (
         "收到信譽快照查詢，先檢查既有 proof，必要時建立新快照。"
     )
+    assert build_processing_ack(text="/search why Pikachu is popular") == "收到搜尋問題，正在找資料來源並整理答案。"
     assert build_processing_ack(has_photo=True) == "收到圖片，開始解析與查價。"
     assert build_processing_ack(text="/ping") is None
 
@@ -766,6 +814,34 @@ def test_handle_telegram_message_sends_natural_language_ack_before_running_heavy
 
     assert replies[0] == "已理解查詢內容，相當於 /trend ws 3，開始整理資料。"
     assert "WS Liquidity Board" in replies[1]
+
+
+def test_handle_telegram_message_sends_web_research_ack_then_result() -> None:
+    client = FakeTelegramClient()
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: f"{query.game}:{query.name}",
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        research_renderer=lambda query: "Pikachu is iconic [1].\n\nReferences:\n[1] Source\nhttps://example.com/source",
+    )
+
+    replies = handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={
+            "chat": {"id": "123"},
+            "text": "/search why Pikachu Pokemon cards are popular",
+        },
+    )
+
+    assert replies == (
+        "收到搜尋問題，正在找資料來源並整理答案。",
+        "Pikachu is iconic [1].\n\nReferences:\n[1] Source\nhttps://example.com/source",
+    )
+    assert client.sent_messages == list(replies)
 
 
 def _mixed_grade_lookup_result() -> TcgLookupResult:

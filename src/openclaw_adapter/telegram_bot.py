@@ -18,11 +18,13 @@ from price_monitor_bot.bot import (  # noqa: F401
     CatalogRenderer,
     LookupRenderer,
     PhotoLookupRenderer,
+    ResearchRenderer,
     ReputationRenderer,
     TelegramBotClient,
     TelegramFileAttachment,
     TelegramLookupQuery,
     TelegramPhotoQuery,
+    TelegramResearchQuery,
     TelegramReputationDelivery,
     TelegramReputationQuery,
     TelegramTextReplyPlan,
@@ -49,6 +51,12 @@ from .reputation_snapshot import (
     ReputationSnapshotResult,
     fetch_reputation_proof_document,
     request_reputation_snapshot,
+)
+from .web_search import (
+    build_web_research_answer,
+    format_web_research_answer,
+    search_duckduckgo,
+    summarize_web_sources_with_ollama,
 )
 
 logger = logging.getLogger(__name__)
@@ -136,6 +144,47 @@ def default_reputation_renderer(settings: AssistantSettings) -> ReputationRender
         )
 
     return render
+
+
+def default_web_research_renderer(settings: AssistantSettings) -> ResearchRenderer:
+    backend = (settings.openclaw_local_text_backend or "").strip().lower()
+    endpoint = settings.openclaw_local_text_endpoint
+    model = _select_text_generation_model(settings)
+    timeout = max(1, settings.openclaw_local_text_timeout_seconds)
+    ssl_ctx = build_ssl_context(settings) if endpoint.startswith("https://") else None
+
+    def render(query: TelegramResearchQuery) -> str:
+        if backend != "ollama" or not endpoint or not model:
+            return (
+                "Web research is available, but the local text LLM is not configured. "
+                "Set OPENCLAW_LOCAL_TEXT_BACKEND=ollama and OPENCLAW_LOCAL_TEXT_MODEL."
+            )
+        answer = build_web_research_answer(
+            query.query,
+            max_results=5,
+            search_fn=lambda q, limit: search_duckduckgo(
+                q,
+                max_results=limit,
+                ssl_context=ssl_ctx,
+            ),
+            summarize_fn=lambda q, sources: summarize_web_sources_with_ollama(
+                q,
+                sources,
+                endpoint=endpoint,
+                model=model,
+                timeout_seconds=timeout,
+                ssl_context=ssl_ctx,
+            ),
+        )
+        return format_web_research_answer(answer)
+
+    return render
+
+
+def _select_text_generation_model(settings: AssistantSettings) -> str | None:
+    if not settings.openclaw_local_text_model:
+        return None
+    return next((part.strip() for part in settings.openclaw_local_text_model.split(",") if part.strip()), None)
 
 
 def render_reputation_snapshot_artifacts(
@@ -296,6 +345,7 @@ def run_telegram_polling(
         catalog_renderer=catalog_renderer,
         photo_renderer=photo_renderer or default_photo_renderer(settings),
         reputation_renderer=default_reputation_renderer(settings),
+        research_renderer=default_web_research_renderer(settings),
         natural_language_router=build_telegram_natural_language_router_from_settings(settings),
         ssl_context=build_ssl_context(settings),
         allowed_chat_ids=frozenset(settings.openclaw_telegram_chat_ids),
