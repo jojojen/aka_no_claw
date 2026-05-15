@@ -67,14 +67,18 @@ def test_fallback_routes_usage_question_to_help() -> None:
 # ── /status — runtime / model / service-health questions ─────────────────────
 
 def test_fallback_routes_runtime_question_to_status() -> None:
-    result = fallback_route_telegram_natural_language("目前狀況如何")
+    # Canonical "狀態" phrasing — the fallback intentionally no longer covers
+    # synonym sprawl like "目前狀況"; that case falls through to the LLM in prod.
+    result = fallback_route_telegram_natural_language("目前狀態如何")
 
     assert result is not None
     assert result.intent == "status"
 
 
 def test_fallback_routes_model_question_to_status() -> None:
-    result = fallback_route_telegram_natural_language("你現在在跑什麼模型")
+    # Model-introspection questions are now LLM-only (slimmed keyword list);
+    # the fallback safety net still covers explicit "health" / "狀態" phrasings.
+    result = fallback_route_telegram_natural_language("service health check 狀態")
 
     assert result is not None
     assert result.intent == "status"
