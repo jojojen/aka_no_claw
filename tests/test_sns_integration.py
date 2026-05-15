@@ -95,6 +95,16 @@ class TestSnsToolsAddAccount:
         assert args.chat_id == "123"
         assert args.interval == 15  # default
 
+    def test_parser_accepts_keyword_filters(self):
+        """Verify add-account parser accepts account tweet keyword filters."""
+        settings = get_settings()
+        parser = argparse.ArgumentParser()
+        _configure_sns_add_account_parser(parser, settings)
+
+        args = parser.parse_args(["@elonmusk", "--chat-id", "123", "--keywords", "buy", "sell"])
+        assert args.screen_name == "@elonmusk"
+        assert args.keywords == ["buy", "sell"]
+
     def test_handler_adds_account_rule(self):
         """Test add-account handler creates rule in database."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -106,6 +116,7 @@ class TestSnsToolsAddAccount:
                 label="aka_claw",
                 chat_id="123",
                 interval=15,
+                keywords=None,
                 db=str(db_path),
             )
             result = _handle_sns_add_account(args, settings)
@@ -118,6 +129,31 @@ class TestSnsToolsAddAccount:
             rules = db.list_watch_rules(kind="account")
             assert len(rules) == 1
             assert rules[0].screen_name == "aka_claw"
+
+    def test_handler_adds_account_rule_with_keyword_filters(self):
+        """Test add-account handler stores include-keyword filters."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            settings = AssistantSettings(sns_db_path=str(db_path))
+
+            args = argparse.Namespace(
+                screen_name="@elonmusk",
+                label="Elon filtered",
+                chat_id="123",
+                interval=15,
+                keywords=["buy", "sell"],
+                db=str(db_path),
+            )
+            result = _handle_sns_add_account(args, settings)
+            assert result == 0
+
+            from sns_monitor.storage import SnsDatabase
+            db = SnsDatabase(db_path)
+            db.bootstrap()
+            rules = db.list_watch_rules(kind="account")
+            assert len(rules) == 1
+            assert rules[0].screen_name == "elonmusk"
+            assert rules[0].include_keywords == ("buy", "sell")
 
 
 class TestSnsToolsAddKeyword:
@@ -217,6 +253,40 @@ class TestSnsToolsList:
             args = argparse.Namespace(kind=None, db=str(db_path))
             result = _handle_sns_list(args, settings)
             assert result == 0
+
+    def test_handler_lists_account_keyword_filters(self, capsys):
+        """Test list-rules displays account keyword filters."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            settings = AssistantSettings(sns_db_path=str(db_path))
+
+            from sns_monitor.storage import SnsDatabase
+            from sns_monitor.models import AccountWatch
+
+            db = SnsDatabase(db_path)
+            db.bootstrap()
+
+            rule_id = SnsDatabase._watch_rule_id("account", "elonmusk")
+            db.save_watch_rule(
+                AccountWatch(
+                    rule_id=rule_id,
+                    screen_name="elonmusk",
+                    user_id=None,
+                    label="Elon Musk",
+                    include_keywords=("buy", "sell"),
+                    enabled=True,
+                    schedule_minutes=15,
+                    chat_id="123",
+                    last_checked_at=None,
+                )
+            )
+
+            args = argparse.Namespace(kind=None, db=str(db_path))
+            result = _handle_sns_list(args, settings)
+            output = capsys.readouterr().out
+
+            assert result == 0
+            assert "filters=buy, sell" in output
 
 
 class TestSnsToolsToggle:
@@ -385,6 +455,84 @@ class TestTelegramSnsCommands:
 
             plan = processor.build_reply_plan(chat_id="123", text="/snsadd @aka_claw")
             assert plan is not None
+
+    def test_telegram_sns_add_command_with_account_filters(self):
+        """Test Telegram /snsadd command stores account keyword filters."""
+        from price_monitor_bot.bot import TelegramCommandProcessor
+        from sns_monitor.storage import SnsDatabase
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            db = SnsDatabase(db_path)
+            db.bootstrap()
+
+            processor = TelegramCommandProcessor(
+                lookup_renderer=lambda q: "test",
+                board_loader=lambda: (),
+                catalog_renderer=lambda: "test",
+                sns_db=db,
+            )
+
+            plan = processor.build_reply_plan(chat_id="123", text='/snsadd @realDonaldTrump ["buy", "sell"]')
+            assert plan is not None
+            reply = plan.execute()
+            assert "篩選：buy, sell" in reply
+
+            rules = db.list_watch_rules(kind="account")
+            assert len(rules) == 1
+            assert rules[0].screen_name == "realDonaldTrump"
+            assert rules[0].include_keywords == ("buy", "sell")
+
+    def test_telegram_natural_language_sns_filter_update_falls_back_when_router_returns_unknown(self):
+        """Natural-language SNS filter updates should still work when the LLM router returns unknown."""
+        from price_monitor_bot.bot import TelegramCommandProcessor
+        from price_monitor_bot.natural_language import TelegramNaturalLanguageIntent
+        from sns_monitor.models import AccountWatch
+        from sns_monitor.storage import SnsDatabase
+
+        class UnknownRouter:
+            def route(self, text: str) -> TelegramNaturalLanguageIntent:
+                return TelegramNaturalLanguageIntent(intent="unknown", confidence=0.1)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            db = SnsDatabase(db_path)
+            db.bootstrap()
+            rule_id = SnsDatabase._watch_rule_id("account", "tenbai_hakase")
+            db.save_watch_rule(
+                AccountWatch(
+                    rule_id=rule_id,
+                    screen_name="tenbai_hakase",
+                    user_id="resolved-id",
+                    label="@tenbai_hakase",
+                    enabled=True,
+                    schedule_minutes=15,
+                    chat_id="123",
+                    last_checked_at=None,
+                )
+            )
+
+            processor = TelegramCommandProcessor(
+                lookup_renderer=lambda q: "test",
+                board_loader=lambda: (),
+                catalog_renderer=lambda: "test",
+                sns_db=db,
+                natural_language_router=UnknownRouter(),
+            )
+
+            reply = processor.build_reply(
+                chat_id="123",
+                text="幫我把@tenbai_hakase 加上 ［抽選］ 篩選",
+            )
+
+            assert reply is not None
+            assert "篩選：抽選" in reply
+
+            rules = db.list_watch_rules(kind="account")
+            assert len(rules) == 1
+            assert rules[0].screen_name == "tenbai_hakase"
+            assert rules[0].user_id == "resolved-id"
+            assert rules[0].include_keywords == ("抽選",)
 
     def test_telegram_sns_list_command(self):
         """Test Telegram /snslist command handler."""

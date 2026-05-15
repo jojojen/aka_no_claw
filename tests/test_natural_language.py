@@ -309,6 +309,15 @@ def test_fallback_routes_watch_add_with_complex_kanji_price() -> None:
     assert result.watch_price_threshold == 300000
 
 
+def test_fallback_routes_sns_account_filter_update_with_full_width_brackets() -> None:
+    result = fallback_route_telegram_natural_language("幫我把@tenbai_hakase 加上 ［抽選］ 篩選")
+
+    assert result is not None
+    assert result.intent == "sns_add_account"
+    assert result.sns_handle == "tenbai_hakase"
+    assert result.sns_include_keywords == ("抽選",)
+
+
 # ── /watchlist — show current watch list ─────────────────────────────────────
 
 def test_fallback_routes_watchlist_request() -> None:

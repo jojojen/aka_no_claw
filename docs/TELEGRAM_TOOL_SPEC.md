@@ -55,6 +55,7 @@ The Telegram assistant can reach these tools:
 - `/snsadd @username`
   - Add an X (Twitter) account to the watch list.
   - Usage: `/snsadd @akanoclaw`
+  - Optional account tweet filters: `/snsadd @elonmusk ["buy", "sell"]` only notifies when the account tweet contains any listed keyword.
 
 - `/snsadd keyword:<search_term>`
   - Add a keyword search to the watch list.

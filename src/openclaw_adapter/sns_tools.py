@@ -112,11 +112,19 @@ def _configure_sns_add_account_parser(parser: argparse.ArgumentParser, settings:
     parser.add_argument("--label", default="", help="Optional label for this watch rule")
     parser.add_argument("--chat-id", required=True, help="Telegram chat ID to notify")
     parser.add_argument("--interval", type=int, default=15, help="Check interval in minutes (default 15)")
+    parser.add_argument(
+        "--keywords",
+        "--filters",
+        nargs="*",
+        default=None,
+        help='Only notify account tweets containing any keyword. Accepts: buy sell, buy,sell, or \'["buy","sell"]\'.',
+    )
     parser.add_argument("--db", default=settings.sns_db_path, help=f"Database path (default {settings.sns_db_path})")
 
 
 def _handle_sns_add_account(args: argparse.Namespace, settings: AssistantSettings) -> int:
     """Add an X account to the watch list."""
+    from sns_monitor.filters import normalize_keyword_filters
     from sns_monitor.storage import SnsDatabase
     from sns_monitor.models import AccountWatch
 
@@ -124,19 +132,24 @@ def _handle_sns_add_account(args: argparse.Namespace, settings: AssistantSetting
         db = SnsDatabase(args.db)
         db.bootstrap()
 
-        rule_id = SnsDatabase._watch_rule_id("account", args.screen_name)
+        screen_name = args.screen_name.lstrip("@")
+        include_keywords = normalize_keyword_filters(args.keywords)
+        rule_id = SnsDatabase._watch_rule_id("account", screen_name)
+        existing_rule = db.get_watch_rule(rule_id)
         rule = AccountWatch(
             rule_id=rule_id,
-            screen_name=args.screen_name,
-            user_id=None,
-            label=args.label or f"@{args.screen_name}",
+            screen_name=screen_name,
+            user_id=getattr(existing_rule, "user_id", None),
+            label=args.label or getattr(existing_rule, "label", None) or f"@{screen_name}",
+            include_keywords=include_keywords,
             enabled=True,
             schedule_minutes=args.interval,
             chat_id=args.chat_id,
-            last_checked_at=None,
+            last_checked_at=getattr(existing_rule, "last_checked_at", None),
         )
         db.save_watch_rule(rule)
-        print(f"✓ Added X account @{args.screen_name} (id={rule_id[:8]}...)")
+        suffix = f" filters={list(include_keywords)}" if include_keywords else ""
+        print(f"✓ Added X account @{screen_name}{suffix} (id={rule_id[:8]}...)")
         return 0
     except Exception as exc:
         logger.error("Failed to add account: %s", exc)
@@ -246,7 +259,8 @@ def _handle_sns_list(args: argparse.Namespace, settings: AssistantSettings) -> i
 
             # Format based on rule type
             if rule.__class__.__name__ == "AccountWatch":
-                info = f"@{rule.screen_name}"
+                filters = f" filters={', '.join(rule.include_keywords)}" if rule.include_keywords else ""
+                info = f"@{rule.screen_name}{filters}"
             elif rule.__class__.__name__ == "KeywordWatch":
                 info = f'Keyword: "{rule.query}"'
             elif rule.__class__.__name__ == "TrendWatch":
