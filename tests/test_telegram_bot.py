@@ -34,6 +34,11 @@ from openclaw_adapter.telegram_bot import (
     _chromium_launch_options,
 )
 
+# Every call to handle_telegram_message now sends an immediate intake ack
+# before kicking off the real processing pipeline.
+PHOTO_INTAKE_ACK = "已收到圖片，開始解讀使用者意圖"
+TEXT_INTAKE_ACK = "已收到訊息，開始解讀使用者意圖"
+
 
 def _stub_board() -> HotCardBoard:
     return HotCardBoard(
@@ -660,6 +665,7 @@ def test_handle_telegram_message_sends_ack_then_photo_result() -> None:
     )
 
     assert replies == (
+        PHOTO_INTAKE_ACK,
         "收到圖片，開始解析與查價。",
         "photo:pokemon:Pikachu ex:.jpg",
     )
@@ -687,6 +693,7 @@ def test_handle_telegram_message_sends_ack_then_text_result() -> None:
     )
 
     assert replies == (
+        TEXT_INTAKE_ACK,
         "收到查價指令，開始處理。",
         "pokemon:Pikachu ex",
     )
@@ -715,9 +722,10 @@ def test_handle_telegram_message_clarifies_image_without_caption() -> None:
         },
     )
 
-    assert len(replies) == 1
-    assert "1. 要我查這張寶可夢卡市價嗎？" in replies[0]
-    assert "4. 都不是，請回答：否，[您的意圖]" in replies[0]
+    assert len(replies) == 2
+    assert replies[0] == PHOTO_INTAKE_ACK
+    assert "1. 要我查這張寶可夢卡市價嗎？" in replies[1]
+    assert "4. 都不是，請回答：否，[您的意圖]" in replies[1]
 
 
 def test_handle_telegram_message_runs_selected_photo_option_after_clarification() -> None:
@@ -752,6 +760,7 @@ def test_handle_telegram_message_runs_selected_photo_option_after_clarification(
     )
 
     assert replies == (
+        TEXT_INTAKE_ACK,
         "收到，我就照第 1 個方式處理。",
         "resolved:/scan pokemon:pokemon",
     )
@@ -789,6 +798,7 @@ def test_handle_telegram_message_supports_photo_override_text() -> None:
     )
 
     assert replies == (
+        TEXT_INTAKE_ACK,
         "收到，我改照你補充的意思處理：查這張遊戲王卡市價",
         "resolved:/scan yugioh:yugioh:card",
     )
@@ -827,6 +837,7 @@ def test_handle_telegram_message_sends_snapshot_ack_then_result(tmp_path: Path) 
     )
 
     assert replies == (
+        TEXT_INTAKE_ACK,
         "收到信譽快照查詢，先檢查既有 proof，必要時建立新快照。",
         "snapshot:https://jp.mercari.com/item/m123456789",
     )
@@ -924,8 +935,9 @@ def test_handle_telegram_message_sends_natural_language_ack_then_result() -> Non
         },
     )
 
-    assert replies[0] == "已理解查詢內容，相當於 /trend ws 5，開始整理資料。"
-    assert "WS Liquidity Board" in replies[1]
+    assert replies[0] == TEXT_INTAKE_ACK
+    assert replies[1] == "已理解查詢內容，相當於 /trend ws 5，開始整理資料。"
+    assert "WS Liquidity Board" in replies[2]
     assert client.sent_messages == list(replies)
 
 
@@ -942,7 +954,7 @@ def test_handle_telegram_message_sends_natural_language_ack_before_running_heavy
     )
 
     def board_loader() -> tuple[HotCardBoard, ...]:
-        assert client.sent_messages == ["已理解查詢內容，相當於 /trend ws 3，開始整理資料。"]
+        assert client.sent_messages == [TEXT_INTAKE_ACK, "已理解查詢內容，相當於 /trend ws 3，開始整理資料。"]
         return (
             HotCardBoard(
                 game="ws",
@@ -971,8 +983,9 @@ def test_handle_telegram_message_sends_natural_language_ack_before_running_heavy
         },
     )
 
-    assert replies[0] == "已理解查詢內容，相當於 /trend ws 3，開始整理資料。"
-    assert "WS Liquidity Board" in replies[1]
+    assert replies[0] == TEXT_INTAKE_ACK
+    assert replies[1] == "已理解查詢內容，相當於 /trend ws 3，開始整理資料。"
+    assert "WS Liquidity Board" in replies[2]
 
 
 def test_handle_telegram_message_sends_web_research_ack_then_result() -> None:
@@ -997,6 +1010,7 @@ def test_handle_telegram_message_sends_web_research_ack_then_result() -> None:
     )
 
     assert replies == (
+        TEXT_INTAKE_ACK,
         "收到搜尋問題，正在找資料來源並整理答案。",
         "皮卡丘是寶可夢代表角色之一 [1]。\n\n參考來源：\n[1] Source\nhttps://example.com/source",
     )

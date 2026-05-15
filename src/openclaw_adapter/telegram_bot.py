@@ -88,7 +88,11 @@ def default_lookup_renderer(settings: AssistantSettings) -> LookupRenderer:
     return _base_default_lookup_renderer(db_path=settings.monitor_db_path)
 
 
-def default_photo_renderer(settings: AssistantSettings) -> PhotoLookupRenderer:
+def default_photo_renderer(
+    settings: AssistantSettings,
+    *,
+    research_renderer=None,
+) -> PhotoLookupRenderer:
     return _base_default_photo_renderer(
         db_path=settings.monitor_db_path,
         tesseract_path=settings.openclaw_tesseract_path,
@@ -100,6 +104,7 @@ def default_photo_renderer(settings: AssistantSettings) -> PhotoLookupRenderer:
             timeout_seconds=settings.openclaw_local_vision_timeout_seconds,
             ssl_context=build_ssl_context(settings),
         ),
+        research_renderer=research_renderer,
     )
 
 
@@ -354,15 +359,16 @@ def run_telegram_polling(
     watch_db = _bootstrap_watch_db(settings)
     _start_watch_monitor(settings=settings, watch_db=watch_db, token=token)
     sns_db, sns_buzz_fn = _start_sns_monitor(settings=settings, token=token, ssl_context=build_ssl_context(settings))
+    research_renderer = default_web_research_renderer(settings)
     return _base_run_telegram_polling(
         token=token,
         lookup_renderer=lookup_renderer,
         board_loader=board_loader,
         catalog_renderer=catalog_renderer,
-        photo_renderer=photo_renderer or default_photo_renderer(settings),
+        photo_renderer=photo_renderer or default_photo_renderer(settings, research_renderer=research_renderer),
         photo_intent_analyzer=default_photo_intent_analyzer(settings),
         reputation_renderer=default_reputation_renderer(settings),
-        research_renderer=default_web_research_renderer(settings),
+        research_renderer=research_renderer,
         natural_language_router=build_telegram_natural_language_router_from_settings(settings),
         ssl_context=build_ssl_context(settings),
         allowed_chat_ids=frozenset(settings.openclaw_telegram_chat_ids),
