@@ -22,9 +22,10 @@ The Telegram assistant can reach these tools:
 - `/trend <game> [limit]`
 - `/hot <game> [limit]`
 - `/liquidity <game> [limit]`
-  - Show hot / trending / liquidity boards.
+  - Show the static hot / ranking / liquidity leaderboard for a game.
   - Games: `pokemon`, `ws`.
   - Limit should usually be 1-10, default 5.
+  - Use ONLY for explicit leaderboard / top-N / ranking requests. Does NOT analyse price direction or market sentiment — those go to `/search`.
 
 - `/snapshot <url>`
   - Build or reuse a reputation snapshot for a Mercari item/profile URL.
@@ -33,7 +34,7 @@ The Telegram assistant can reach these tools:
 - `/research <question>`
   - Search the web with DuckDuckGo, then summarize the result with the configured local LLM.
   - Include source URLs / references in the final reply.
-  - Use when the user asks a general explanatory or background question that needs sources, such as why a TCG card is popular.
+  - Use for price-direction / market-sentiment / recent-news / why-how questions, e.g. "寶可夢卡是不是在跌", "why are pokemon cards popular", "pokemon 市場最近怎麼了", "遊戲王最近暴跌".
 
 - Photo scan flow
   - Send a photo with caption `/scan pokemon` or `/scan ws`.
@@ -101,9 +102,9 @@ Routing rules:
 - Return `tools` when the user explicitly wants a tool catalog.
 - Return `scan_help` when the user asks how to use image/photo scan or wants image lookup instructions before sending a photo.
 - Return `lookup_card` for one-card valuation requests.
-- Return `trend_board` for hot/trending/liquidity/ranking requests.
+- Return `trend_board` ONLY for explicit leaderboard / top-N / ranking requests (e.g. "pokemon 熱門前 5", "遊戲王熱門排行"). Price-direction questions go to `web_research`, not `trend_board`.
 - Return `reputation_snapshot` when a Mercari URL is provided for seller/item trust checking.
-- Return `web_research` when the user asks an explanatory/background question that needs web sources and summarization.
+- Return `web_research` when the user asks about price direction, market sentiment, recent news, or any why/how/explanatory question that needs web sources and summarization.
 - Return `opportunity_remove` when the user wants to remove/dismiss a target from the opportunity/hunt list.
 - Return watch intents for tracking requests.
 - Return `unknown` when the request is unrelated or too ambiguous.
