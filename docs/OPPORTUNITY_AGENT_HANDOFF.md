@@ -77,6 +77,14 @@ Completed on 2026-05-14:
 - Focused opportunity/web-search tests after this change: `20 passed`.
 - Full `aka_no_claw` tests after this change: `220 passed, 7 skipped`.
 
+### Phase 7 - Target Dismissal
+
+Completed on 2026-05-14:
+
+- Telegram now supports `/hunt remove <number-or-name>` for dismissing targets from `/hunt status`.
+- Natural language routing supports requests such as `remove target 2 from the opportunity list` and `I am not interested in Umbreon ex SAR`.
+- Dismissed candidates are marked `status='dismissed'` and remain hidden if the same candidate ID appears again in later SNS discovery.
+
 ## Important Runtime Notes
 
 - The agent is recommendation-only. It does not buy anything.
@@ -85,6 +93,7 @@ Completed on 2026-05-14:
 - It needs `reputation_snapshot` running for seller checks.
 - It reads SNS data from `SNS_DB_PATH`, currently defaulting to `data/sns.sqlite3`.
 - It sends Telegram messages through the same OpenClaw bot token and allowed chat IDs.
+- You can remove unwanted active targets with `/hunt remove 2` or natural language after checking `/hunt status`.
 
 ## Useful Commands
 

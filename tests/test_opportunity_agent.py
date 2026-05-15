@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from assistant_runtime import AssistantSettings
 from openclaw_adapter.opportunity_agent import (
     SnsPost,
     WebOpportunityResearcher,
     WebResearchCandidateProvider,
     _build_opportunity_research_query,
     _parse_candidate_response,
+    dismiss_opportunity_target,
     format_opportunity_recommendation,
 )
 from openclaw_adapter.opportunity_models import (
@@ -132,6 +134,39 @@ def test_pipeline_skips_seen_listing(tmp_path: Path) -> None:
     assert pipeline.run_once().skipped_seen_listings == 1
 
 
+def test_dismiss_opportunity_target_by_status_index(tmp_path: Path) -> None:
+    db_path = tmp_path / "opportunities.sqlite3"
+    store = OpportunityStore(db_path)
+    store.bootstrap()
+    first = _candidate(title="Umbreon ex SAR", heat_score=91)
+    second = _candidate(title="Pikachu promo", heat_score=84)
+    store.upsert_candidate(first)
+    store.upsert_candidate(second)
+    settings = AssistantSettings(opportunity_db_path=str(db_path))
+
+    reply = dismiss_opportunity_target(settings, "2")
+
+    assert "已從機會清單移除" in reply
+    assert "Pikachu promo" in reply
+    active_titles = [row["title"] for row in store.list_recent_candidates(limit=10)]
+    assert active_titles == ["Umbreon ex SAR"]
+
+
+def test_dismissed_opportunity_target_stays_hidden_after_upsert(tmp_path: Path) -> None:
+    db_path = tmp_path / "opportunities.sqlite3"
+    store = OpportunityStore(db_path)
+    store.bootstrap()
+    candidate = _candidate(title="Umbreon ex SAR", heat_score=91)
+    store.upsert_candidate(candidate)
+    settings = AssistantSettings(opportunity_db_path=str(db_path))
+
+    reply = dismiss_opportunity_target(settings, "Umbreon")
+    store.upsert_candidate(candidate)
+
+    assert "Umbreon ex SAR" in reply
+    assert store.list_recent_candidates(limit=10) == []
+
+
 def test_parse_sns_candidate_response_builds_candidates() -> None:
     posts = [
         SnsPost(
@@ -237,7 +272,7 @@ def test_web_opportunity_researcher_enriches_candidate_with_sources() -> None:
 
     def json_call(**kwargs) -> str:
         calls["prompt"] = kwargs["prompt"]
-        return '{"is_relevant":true,"demand_score":98,"reason":"Outside sources mention collector demand and price movement."}'
+        return '{"is_relevant":true,"demand_score":98,"reason":"外部來源提到收藏需求與價格動能。"}'
 
     enriched = WebOpportunityResearcher(
         endpoint="http://127.0.0.1:11434",
@@ -254,7 +289,8 @@ def test_web_opportunity_researcher_enriches_candidate_with_sources() -> None:
     assert "Umbreon ex SAR" in str(calls["prompt"])
     assert enriched.heat_score > candidate.heat_score
     assert enriched.source_kind == "sns+web"
-    assert "Web research: Outside sources mention collector demand" in enriched.reason
+    assert "網路佐證：外部來源提到收藏需求與價格動能。" in enriched.reason
+    assert "Traditional Chinese as used in Taiwan" in str(calls["prompt"])
     web_research = enriched.metadata["web_research"]
     assert web_research["assessment"]["demand_score"] == 98.0
     assert web_research["sources"][0]["url"] == "https://example.com/pikachu-demand"
@@ -289,12 +325,12 @@ def test_web_opportunity_researcher_lowers_heat_when_sources_are_irrelevant() ->
         model="qwen3:4b",
         timeout_seconds=30,
         search_fn=lambda query, limit: sources,
-        json_call_fn=lambda **kwargs: '{"is_relevant":false,"demand_score":10,"reason":"Search results point to the wrong product."}',
+        json_call_fn=lambda **kwargs: '{"is_relevant":false,"demand_score":10,"reason":"搜尋結果指向錯誤商品。"}',
     ).enrich(candidate)
 
     assert enriched.heat_score == candidate.heat_score - 15
     assert enriched.metadata["web_research"]["assessment"]["is_relevant"] is False
-    assert "wrong product" in enriched.reason
+    assert "搜尋結果指向錯誤商品" in enriched.reason
 
 
 def test_web_research_candidate_provider_preserves_candidate_when_enrichment_fails() -> None:
@@ -372,7 +408,7 @@ def test_format_opportunity_recommendation_includes_web_research_sources() -> No
         title="Umbreon ex SAR",
         search_query="Umbreon ex SAR",
         heat_score=94.0,
-        reason="SNS demand is rising. Web research: Collector demand is visible.",
+        reason="SNS 需求升溫。網路佐證：看得到收藏需求。",
         metadata={
             "web_research": {
                 "sources": [
@@ -424,13 +460,13 @@ def test_format_opportunity_recommendation_includes_web_research_sources() -> No
     assert "[2] Price source" in text
 
 
-def _candidate() -> OpportunityCandidate:
+def _candidate(title: str = "Umbreon ex SAR", heat_score: float = 91.0) -> OpportunityCandidate:
     return OpportunityCandidate(
-        candidate_id=build_candidate_id(game="pokemon", title="Umbreon ex SAR", search_query="Umbreon ex SAR"),
+        candidate_id=build_candidate_id(game="pokemon", title=title, search_query=title),
         game="pokemon",
-        title="Umbreon ex SAR",
-        search_query="Umbreon ex SAR",
-        heat_score=91.0,
+        title=title,
+        search_query=title,
+        heat_score=heat_score,
         reason="SNS demand is rising.",
     )
 

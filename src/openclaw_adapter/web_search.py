@@ -78,13 +78,13 @@ def build_web_research_answer(
     if not sources:
         return WebResearchAnswer(
             query=cleaned_query,
-            summary=f"I could not find useful web sources for: {cleaned_query}",
+            summary=f"我找不到足夠有用的網路來源來回答：{cleaned_query}",
             sources=(),
         )
 
     summary = summarize_fn(cleaned_query, sources).strip()
     if not summary:
-        summary = "I found sources, but the LLM did not return a usable summary."
+        summary = "我找到了來源，但本地 LLM 沒有回傳可用的摘要。"
     return WebResearchAnswer(query=cleaned_query, summary=summary, sources=sources)
 
 
@@ -98,7 +98,7 @@ def summarize_web_sources_with_ollama(
     ssl_context: ssl.SSLContext | None = None,
 ) -> str:
     if not sources:
-        return f"I could not find useful web sources for: {query}"
+        return f"我找不到足夠有用的網路來源來回答：{query}"
 
     payload = {
         "model": model,
@@ -133,7 +133,7 @@ def format_web_research_answer(answer: WebResearchAnswer) -> str:
         return lines[0]
 
     lines.append("")
-    lines.append("References:")
+    lines.append("參考來源：")
     for index, source in enumerate(answer.sources, start=1):
         title = _compact_whitespace(source.title)
         lines.append(f"[{index}] {title}")
@@ -176,8 +176,11 @@ def _build_summary_prompt(query: str, sources: tuple[WebSearchResult, ...]) -> s
         )
     return (
         "You answer Telegram questions for OpenClaw using web search results.\n"
+        "CRITICAL LANGUAGE RULE: Always answer in Traditional Chinese as used in Taiwan (zh-TW).\n"
+        "Do not answer in English, Japanese, Simplified Chinese, or Mainland Chinese phrasing.\n"
+        "Use Taiwan wording such as 資訊、品質、熱門、價格、來源, and avoid simplified characters.\n"
         "Use only the provided sources. If the sources are weak, say so plainly.\n"
-        "Match the user's language when practical. Keep the answer concise and useful.\n"
+        "Keep the answer concise and useful.\n"
         "Cite claims with bracketed source numbers like [1] or [2].\n\n"
         f"User question:\n{query}\n\n"
         "Sources:\n"

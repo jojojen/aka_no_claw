@@ -76,12 +76,22 @@ The Telegram assistant can reach these tools:
   - Summarise Reddit's top discussion on a topic via LLM.
   - Usage: `/snsbuzz amd`
 
+- `/hunt status`
+  - Show recent opportunity candidates and recommendation decisions.
+
+- `/hunt remove <number-or-name>`
+  - Remove/dismiss an opportunity target from the active hunt list.
+  - Use when the user says they are not interested in a target from `/hunt status`.
+  - `<number-or-name>` may be the visible list number from `/hunt status` or part of the product name.
+
 Natural-language examples for SNS intents (router must distinguish these from Mercari watch intents — any `@handle` or X/Twitter/推特 keyword forces SNS):
 
 - "追蹤 @elonmusk" → `sns_add_account`, sns_handle="elonmusk"
 - "刪除追蹤 @elonmusk" / "取消追蹤 @elonmusk" / "unfollow @elonmusk" → `sns_delete`, sns_handle="elonmusk"
 - "我的 X 追蹤清單" / "推主追蹤" → `sns_list`
 - "整理一下 amd 最近熱門討論" → `sns_buzz`, sns_buzz_query="amd"
+- "remove target 2 from opportunity list" → `opportunity_remove`, opportunity_target="2"
+- "I am not interested in Umbreon ex SAR" → `opportunity_remove`, opportunity_target="Umbreon ex SAR"
 
 Routing rules:
 
@@ -93,5 +103,6 @@ Routing rules:
 - Return `trend_board` for hot/trending/liquidity/ranking requests.
 - Return `reputation_snapshot` when a Mercari URL is provided for seller/item trust checking.
 - Return `web_research` when the user asks an explanatory/background question that needs web sources and summarization.
+- Return `opportunity_remove` when the user wants to remove/dismiss a target from the opportunity/hunt list.
 - Return watch intents for tracking requests.
 - Return `unknown` when the request is unrelated or too ambiguous.

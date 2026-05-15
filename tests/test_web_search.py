@@ -90,7 +90,7 @@ def test_build_web_research_answer_passes_sources_to_summarizer() -> None:
 
     def summarize(query: str, found_sources: tuple[WebSearchResult, ...]) -> str:
         calls["summarize"] = (query, found_sources)
-        return "Pikachu cards are popular because Pikachu is the franchise mascot [1]."
+        return "皮卡丘卡受歡迎，主因是皮卡丘是寶可夢代表角色之一 [1]。"
 
     answer = build_web_research_answer(
         "why are Pikachu cards popular",
@@ -101,14 +101,14 @@ def test_build_web_research_answer_passes_sources_to_summarizer() -> None:
 
     assert calls["search"] == ("why are Pikachu cards popular", 5)
     assert calls["summarize"] == ("why are Pikachu cards popular", sources)
-    assert answer.summary.endswith("[1].")
+    assert answer.summary.endswith("[1]。")
     assert answer.sources == sources
 
 
 def test_format_web_research_answer_includes_reference_urls() -> None:
     answer = WebResearchAnswer(
         query="why are Pikachu cards popular",
-        summary="Pikachu is the franchise mascot [1].",
+        summary="皮卡丘是寶可夢代表角色之一 [1]。",
         sources=(
             WebSearchResult(title="Mascot source", url="https://example.com/mascot", snippet="Mascot."),
             WebSearchResult(title="Demand source", url="https://example.com/demand", snippet="Demand."),
@@ -117,8 +117,8 @@ def test_format_web_research_answer_includes_reference_urls() -> None:
 
     text = format_web_research_answer(answer)
 
-    assert "Pikachu is the franchise mascot [1]." in text
-    assert "References:" in text
+    assert "皮卡丘是寶可夢代表角色之一 [1]。" in text
+    assert "參考來源：" in text
     assert "[1] Mascot source" in text
     assert "https://example.com/mascot" in text
     assert "[2] Demand source" in text
@@ -136,7 +136,7 @@ def test_summarize_web_sources_with_ollama_posts_sources(monkeypatch) -> None:
             return None
 
         def read(self) -> bytes:
-            return json.dumps({"response": "Summary with citations [1]."}).encode("utf-8")
+            return json.dumps({"response": "皮卡丘是寶可夢代表角色之一 [1]。"}).encode("utf-8")
 
     def fake_urlopen(request, timeout: int, context):
         captured["url"] = request.full_url
@@ -155,10 +155,23 @@ def test_summarize_web_sources_with_ollama_posts_sources(monkeypatch) -> None:
         timeout_seconds=9,
     )
 
-    assert text == "Summary with citations [1]."
+    assert text == "皮卡丘是寶可夢代表角色之一 [1]。"
     assert captured["url"] == "http://127.0.0.1:11434/api/generate"
     assert captured["timeout"] == 9
     payload = captured["payload"]
     assert payload["model"] == "qwen3:4b"
+    assert "Always answer in Traditional Chinese as used in Taiwan" in payload["prompt"]
+    assert "Do not answer in English, Japanese, Simplified Chinese" in payload["prompt"]
+    assert "Match the user's language" not in payload["prompt"]
     assert "Mascot source" in payload["prompt"]
     assert "https://example.com/mascot" in payload["prompt"]
+
+
+def test_build_web_research_answer_uses_traditional_chinese_no_source_fallback() -> None:
+    answer = build_web_research_answer(
+        "why are Pikachu cards popular",
+        search_fn=lambda query, limit: (),
+        summarize_fn=lambda query, sources: "unused",
+    )
+
+    assert answer.summary == "我找不到足夠有用的網路來源來回答：why are Pikachu cards popular"

@@ -5,6 +5,7 @@ Owner layer: `aka_no_claw` integration runtime
 Runtime command: `python -m openclaw_adapter opportunity-agent`
 Status command: `python -m openclaw_adapter opportunity-status`
 Telegram status: `/hunt status`
+Telegram dismiss: `/hunt remove <number-or-name>`
 
 ## Goal
 
@@ -107,6 +108,14 @@ The current candidate targets can be inspected without opening SQLite:
 - CLI: `python -m openclaw_adapter opportunity-status --limit 10`
 
 The status view shows recent candidates, heat score, Mercari search query, last checked time, and recent accepted/rejected recommendation records.
+
+Targets can be dismissed from Telegram after reading `/hunt status`:
+
+- `/hunt remove 2`
+- `/hunt remove Umbreon ex SAR`
+- Natural language such as `remove target 2 from the opportunity list`
+
+Dismissed targets are marked inactive in SQLite and are not reactivated by later SNS discovery for the same candidate ID.
 
 ## Current Limitations
 

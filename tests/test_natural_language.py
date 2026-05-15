@@ -210,6 +210,24 @@ def test_fallback_does_not_route_unrelated_weather_question_to_web_research() ->
     assert result is None
 
 
+# ── /hunt remove — opportunity target controls ───────────────────────────────
+
+def test_fallback_routes_opportunity_target_remove_by_number() -> None:
+    result = fallback_route_telegram_natural_language("remove target 2 from the opportunity list")
+
+    assert result is not None
+    assert result.intent == "opportunity_remove"
+    assert result.opportunity_target == "2"
+
+
+def test_fallback_routes_opportunity_target_remove_by_name() -> None:
+    result = fallback_route_telegram_natural_language("I am not interested in Umbreon ex SAR anymore")
+
+    assert result is not None
+    assert result.intent == "opportunity_remove"
+    assert result.opportunity_target == "Umbreon ex SAR"
+
+
 # ── /snapshot — Mercari reputation snapshot ───────────────────────────────────
 
 def test_fallback_routes_reputation_query_with_url() -> None:
