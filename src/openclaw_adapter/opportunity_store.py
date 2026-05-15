@@ -117,7 +117,10 @@ class OpportunityStore:
                     source_kind=excluded.source_kind,
                     source_url=excluded.source_url,
                     metadata_json=excluded.metadata_json,
-                    status='active',
+                    status=CASE
+                        WHEN opportunity_candidates.status = 'dismissed' THEN 'dismissed'
+                        ELSE 'active'
+                    END,
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -134,6 +137,19 @@ class OpportunityStore:
                     now,
                 ),
             )
+
+    def dismiss_candidate(self, candidate_id: str) -> bool:
+        now = utc_now_iso()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE opportunity_candidates
+                SET status = 'dismissed', updated_at = ?
+                WHERE candidate_id = ? AND status = 'active'
+                """,
+                (now, candidate_id),
+            )
+        return cursor.rowcount > 0
 
     def list_due_candidates(self, *, limit: int, min_interval_seconds: int) -> list[OpportunityCandidate]:
         now = utc_now_iso()

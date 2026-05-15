@@ -232,7 +232,7 @@ class WebOpportunityResearcher:
 
         reason = candidate.reason
         if assessment.reason:
-            reason = f"{reason} Web research: {assessment.reason}"
+            reason = f"{reason} 網路佐證：{assessment.reason}"
 
         return replace(
             candidate,
@@ -578,6 +578,79 @@ def format_opportunity_status(settings: AssistantSettings, *, limit: int = 10) -
     return "\n".join(lines)
 
 
+def dismiss_opportunity_target(settings: AssistantSettings, target: str, *, limit: int = 30) -> str:
+    selector = " ".join(target.split()).strip()
+    if not selector:
+        return "請提供要移除的機會目標，例如：/hunt remove 2 或 /hunt remove Umbreon ex SAR"
+
+    store = OpportunityStore(settings.opportunity_db_path)
+    store.bootstrap()
+    candidates = store.list_recent_candidates(limit=max(1, limit))
+    if not candidates:
+        return "目前沒有可移除的機會目標。"
+
+    resolved = _resolve_candidate_selector(candidates, selector)
+    if isinstance(resolved, str):
+        return resolved
+
+    removed = store.dismiss_candidate(str(resolved["candidate_id"]))
+    if not removed:
+        return f"找不到可移除的 active 目標：{selector}"
+
+    return (
+        "已從機會清單移除\n"
+        f"目標：[{resolved['game']}] {resolved['title']}\n"
+        "之後相同 candidate_id 再出現時會保持隱藏。"
+    )
+
+
+def _resolve_candidate_selector(candidates: Sequence[Any], selector: str) -> Any | str:
+    lowered = selector.lower()
+    if selector.isdigit():
+        index = int(selector)
+        if 1 <= index <= len(candidates):
+            return candidates[index - 1]
+        return f"找不到第 {index} 個目標。請先用 /hunt status 看目前清單。"
+
+    id_matches = [
+        row for row in candidates
+        if str(row["candidate_id"]).lower().startswith(lowered)
+    ]
+    if len(id_matches) == 1:
+        return id_matches[0]
+    if len(id_matches) > 1:
+        return _format_ambiguous_candidate_matches(id_matches)
+
+    exact_matches = [
+        row for row in candidates
+        if lowered in {str(row["title"]).lower(), str(row["search_query"]).lower()}
+    ]
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+    if len(exact_matches) > 1:
+        return _format_ambiguous_candidate_matches(exact_matches)
+
+    partial_matches = [
+        row for row in candidates
+        if lowered in str(row["title"]).lower() or lowered in str(row["search_query"]).lower()
+    ]
+    if len(partial_matches) == 1:
+        return partial_matches[0]
+    if len(partial_matches) > 1:
+        return _format_ambiguous_candidate_matches(partial_matches)
+
+    return f"找不到符合「{selector}」的 active 目標。請先用 /hunt status 確認名稱或編號。"
+
+
+def _format_ambiguous_candidate_matches(matches: Sequence[Any]) -> str:
+    lines = ["找到多個可能目標，請用更完整名稱或 candidate_id 前綴指定："]
+    for row in matches[:8]:
+        lines.append(
+            f"- {str(row['candidate_id'])[:12]} | [{row['game']}] {row['title']} | search: {row['search_query']}"
+        )
+    return "\n".join(lines)
+
+
 def _build_sns_candidate_prompt(posts: Sequence[SnsPost], *, limit: int) -> str:
     lines = [
         "你是 OpenClaw 的商品機會偵測器。請從 SNS 貼文中找出有交易潛力的 TCG/收藏卡商品。",
@@ -627,9 +700,11 @@ def _build_opportunity_web_assessment_prompt(
 ) -> str:
     lines = [
         "You are evaluating whether a TCG/collectible-card opportunity has real outside-market support.",
+        "CRITICAL LANGUAGE RULE: The JSON reason value must be Traditional Chinese as used in Taiwan (zh-TW).",
+        "Do not write the reason in English, Japanese, Simplified Chinese, or Mainland Chinese phrasing.",
         "Use only the provided web search results. Do not invent facts.",
         "Return strict JSON only with this shape:",
-        '{"is_relevant":true,"demand_score":0-100,"reason":"one short evidence-based sentence"}',
+        '{"is_relevant":true,"demand_score":0-100,"reason":"一句繁體中文（台灣）佐證原因"}',
         "",
         f"Candidate game: {candidate.game}",
         f"Candidate title: {candidate.title}",
@@ -709,7 +784,7 @@ def _default_web_assessment(
     return WebOpportunityAssessment(
         is_relevant=True,
         demand_score=demand_score,
-        reason=f"Found {len(sources)} web sources; top result: {first_title}.",
+        reason=f"找到 {len(sources)} 個網路來源；第一筆結果是「{first_title}」。",
     )
 
 

@@ -242,6 +242,23 @@ def test_command_processor_handles_hunt_status() -> None:
     assert processor.build_reply(chat_id="123", text="/hunt status") == "targets: Umbreon"
 
 
+def test_command_processor_handles_hunt_remove() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    seen: list[str] = []
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        opportunity_status_renderer=lambda: "targets: Umbreon",
+        opportunity_target_remover=lambda target: seen.append(target) or f"removed:{target}",
+    )
+
+    assert processor.build_reply(chat_id="123", text="/hunt remove 2") == "removed:2"
+    assert processor.build_reply(chat_id="123", text="/hunt delete Umbreon ex SAR") == "removed:Umbreon ex SAR"
+    assert seen == ["2", "Umbreon ex SAR"]
+
+
 def test_build_status_text_includes_feature_models_and_sizes(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     # .env.example sets configured text=qwen3:4b, vision=qwen2.5vl:7b,gemma3:12b
@@ -360,12 +377,12 @@ def test_command_processor_handles_web_search_command() -> None:
         lookup_renderer=lambda query: query.name,
         board_loader=lambda: (_stub_board(),),
         catalog_renderer=lambda: "catalog",
-        research_renderer=lambda query: seen.append(query) or "researched answer\nReferences:\nhttps://example.com/source",
+        research_renderer=lambda query: seen.append(query) or "已整理搜尋結果。\n參考來源：\nhttps://example.com/source",
     )
 
     reply = processor.build_reply(chat_id="123", text="/search why Pikachu Pokemon cards are popular")
 
-    assert reply == "researched answer\nReferences:\nhttps://example.com/source"
+    assert reply == "已整理搜尋結果。\n參考來源：\nhttps://example.com/source"
     assert seen == [TelegramResearchQuery(query="why Pikachu Pokemon cards are popular")]
 
 
@@ -557,15 +574,42 @@ def test_command_processor_handles_natural_language_web_research_via_router() ->
         board_loader=lambda: (_stub_board(),),
         catalog_renderer=lambda: "catalog",
         natural_language_router=router,
-        research_renderer=lambda query: seen.append(query) or "Pikachu is iconic [1].\n\nReferences:\n[1] Source\nhttps://example.com/source",
+        research_renderer=lambda query: seen.append(query) or "皮卡丘是寶可夢代表角色之一 [1]。\n\n參考來源：\n[1] Source\nhttps://example.com/source",
     )
 
     plan = processor.build_reply_plan(chat_id="123", text="why pokemon card pickachu card is so popular?")
 
     assert plan.ack == "已理解：相當於 /search why Pikachu Pokemon cards are popular，正在搜尋資料來源並整理答案…"
-    assert plan.execute() == "Pikachu is iconic [1].\n\nReferences:\n[1] Source\nhttps://example.com/source"
+    assert plan.execute() == "皮卡丘是寶可夢代表角色之一 [1]。\n\n參考來源：\n[1] Source\nhttps://example.com/source"
     assert seen == [TelegramResearchQuery(query="why Pikachu Pokemon cards are popular")]
     assert router.seen_texts == ["why pokemon card pickachu card is so popular?"]
+
+
+def test_command_processor_handles_natural_language_opportunity_remove_via_router() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    router = StubNaturalLanguageRouter(
+        TelegramNaturalLanguageIntent(
+            intent="opportunity_remove",
+            opportunity_target="2",
+            confidence=0.92,
+        )
+    )
+    seen: list[str] = []
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        natural_language_router=router,
+        opportunity_target_remover=lambda target: seen.append(target) or f"removed:{target}",
+    )
+
+    plan = processor.build_reply_plan(chat_id="123", text="remove target 2 from the opportunity list")
+
+    assert plan.ack == "已理解：相當於 /hunt remove 2，正在移除。"
+    assert plan.execute() == "removed:2"
+    assert seen == ["2"]
+    assert router.seen_texts == ["remove target 2 from the opportunity list"]
 
 
 def test_build_processing_ack_for_heavy_actions() -> None:
@@ -824,7 +868,7 @@ def test_handle_telegram_message_sends_web_research_ack_then_result() -> None:
         lookup_renderer=lambda query: f"{query.game}:{query.name}",
         board_loader=lambda: (_stub_board(),),
         catalog_renderer=lambda: "catalog",
-        research_renderer=lambda query: "Pikachu is iconic [1].\n\nReferences:\n[1] Source\nhttps://example.com/source",
+        research_renderer=lambda query: "皮卡丘是寶可夢代表角色之一 [1]。\n\n參考來源：\n[1] Source\nhttps://example.com/source",
     )
 
     replies = handle_telegram_message(
@@ -839,7 +883,7 @@ def test_handle_telegram_message_sends_web_research_ack_then_result() -> None:
 
     assert replies == (
         "收到搜尋問題，正在找資料來源並整理答案。",
-        "Pikachu is iconic [1].\n\nReferences:\n[1] Source\nhttps://example.com/source",
+        "皮卡丘是寶可夢代表角色之一 [1]。\n\n參考來源：\n[1] Source\nhttps://example.com/source",
     )
     assert client.sent_messages == list(replies)
 

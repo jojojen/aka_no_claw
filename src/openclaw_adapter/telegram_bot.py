@@ -45,7 +45,7 @@ from price_monitor_bot.watch_monitor import ensure_monitor as _ensure_watch_moni
 from tcg_tracker.image_lookup import TcgVisionSettings
 
 from .natural_language import build_telegram_natural_language_router_from_settings
-from .opportunity_agent import format_opportunity_status
+from .opportunity_agent import dismiss_opportunity_target, format_opportunity_status
 from .reputation_agent import ensure_agent_thread
 from .reputation_snapshot import (
     ReputationSnapshotResult,
@@ -156,8 +156,8 @@ def default_web_research_renderer(settings: AssistantSettings) -> ResearchRender
     def render(query: TelegramResearchQuery) -> str:
         if backend != "ollama" or not endpoint or not model:
             return (
-                "Web research is available, but the local text LLM is not configured. "
-                "Set OPENCLAW_LOCAL_TEXT_BACKEND=ollama and OPENCLAW_LOCAL_TEXT_MODEL."
+                "網路搜尋摘要功能已可使用，但本地文字 LLM 尚未設定。"
+                "請設定 OPENCLAW_LOCAL_TEXT_BACKEND=ollama 與 OPENCLAW_LOCAL_TEXT_MODEL。"
             )
         answer = build_web_research_answer(
             query.query,
@@ -351,6 +351,7 @@ def run_telegram_polling(
         allowed_chat_ids=frozenset(settings.openclaw_telegram_chat_ids),
         status_renderer=lambda: _build_status_text(settings),
         opportunity_status_renderer=lambda: format_opportunity_status(settings),
+        opportunity_target_remover=lambda target: dismiss_opportunity_target(settings, target),
         watch_db=watch_db,
         sns_db=sns_db,
         sns_buzz_fn=sns_buzz_fn,
