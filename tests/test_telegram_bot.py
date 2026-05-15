@@ -10,6 +10,7 @@ from tcg_tracker.hot_cards import HotCardBoard, HotCardEntry, HotCardReference
 from tcg_tracker.image_lookup import ParsedCardImage, TcgImageLookupOutcome
 from tcg_tracker.service import TcgLookupResult
 from tests.image_lookup_case_fixtures import get_image_lookup_live_case
+from price_monitor_bot.bot import TelegramPhotoIntentAnalysis, TelegramPhotoIntentOption
 
 from openclaw_adapter.formatters import format_lookup_result_telegram
 from openclaw_adapter.natural_language import TelegramNaturalLanguageIntent
@@ -107,6 +108,19 @@ class StubNaturalLanguageRouter:
     def route(self, text: str) -> TelegramNaturalLanguageIntent | None:
         self.seen_texts.append(text)
         return self.intent
+
+
+def _ambiguous_photo_analysis() -> TelegramPhotoIntentAnalysis:
+    return TelegramPhotoIntentAnalysis(
+        options=(
+            TelegramPhotoIntentOption(1, "pokemon_card_price", "要我查這張寶可夢卡市價嗎？", "/scan pokemon"),
+            TelegramPhotoIntentOption(2, "yugioh_card_price", "要我查這張遊戲王卡市價嗎？", "/scan yugioh"),
+            TelegramPhotoIntentOption(3, "pokemon_box_price", "要我查這個寶可夢卡盒市價嗎？", "/scan pokemon"),
+        ),
+        parsed_game="pokemon",
+        parsed_item_kind="card",
+        parsed_title="Pikachu ex",
+    )
 
 
 def test_parse_lookup_command_supports_pipe_format() -> None:
@@ -677,6 +691,107 @@ def test_handle_telegram_message_sends_ack_then_text_result() -> None:
         "pokemon:Pikachu ex",
     )
     assert client.sent_messages == list(replies)
+
+
+def test_handle_telegram_message_clarifies_image_without_caption() -> None:
+    sample_path = get_image_lookup_live_case("pokemon-pikachu-partial-s40").image_path
+    client = FakeTelegramClient(sample_path=sample_path)
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        photo_intent_analyzer=lambda query: _ambiguous_photo_analysis(),
+    )
+
+    replies = handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={
+            "chat": {"id": "123"},
+            "photo": [{"file_id": "photo-1", "file_size": 128}],
+        },
+    )
+
+    assert len(replies) == 1
+    assert "1. 要我查這張寶可夢卡市價嗎？" in replies[0]
+    assert "4. 都不是，請回答：否，[您的意圖]" in replies[0]
+
+
+def test_handle_telegram_message_runs_selected_photo_option_after_clarification() -> None:
+    sample_path = get_image_lookup_live_case("pokemon-pikachu-partial-s40").image_path
+    client = FakeTelegramClient(sample_path=sample_path)
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        photo_intent_analyzer=lambda query: _ambiguous_photo_analysis(),
+    )
+
+    handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={
+            "chat": {"id": "123"},
+            "photo": [{"file_id": "photo-1", "file_size": 128}],
+        },
+    )
+    replies = handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: f"resolved:{query.caption}:{query.game_hint}",
+        message={
+            "chat": {"id": "123"},
+            "text": "1",
+        },
+    )
+
+    assert replies == (
+        "收到，我就照第 1 個方式處理。",
+        "resolved:/scan pokemon:pokemon",
+    )
+
+
+def test_handle_telegram_message_supports_photo_override_text() -> None:
+    sample_path = get_image_lookup_live_case("pokemon-pikachu-partial-s40").image_path
+    client = FakeTelegramClient(sample_path=sample_path)
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        photo_intent_analyzer=lambda query: _ambiguous_photo_analysis(),
+    )
+
+    handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={
+            "chat": {"id": "123"},
+            "photo": [{"file_id": "photo-1", "file_size": 128}],
+        },
+    )
+    replies = handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: f"resolved:{query.caption}:{query.game_hint}:{query.item_kind_hint}",
+        message={
+            "chat": {"id": "123"},
+            "text": "否，查這張遊戲王卡市價",
+        },
+    )
+
+    assert replies == (
+        "收到，我改照你補充的意思處理：查這張遊戲王卡市價",
+        "resolved:/scan yugioh:yugioh:card",
+    )
 
 
 def test_handle_telegram_message_sends_snapshot_ack_then_result(tmp_path: Path) -> None:

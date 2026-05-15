@@ -29,6 +29,7 @@ from price_monitor_bot.bot import (  # noqa: F401
     TelegramReputationQuery,
     TelegramTextReplyPlan,
     build_processing_ack,
+    default_photo_intent_analyzer as _base_default_photo_intent_analyzer,
     default_board_loader as _base_default_board_loader,
     default_lookup_renderer as _base_default_lookup_renderer,
     default_photo_renderer as _base_default_photo_renderer,
@@ -89,6 +90,21 @@ def default_lookup_renderer(settings: AssistantSettings) -> LookupRenderer:
 
 def default_photo_renderer(settings: AssistantSettings) -> PhotoLookupRenderer:
     return _base_default_photo_renderer(
+        db_path=settings.monitor_db_path,
+        tesseract_path=settings.openclaw_tesseract_path,
+        tessdata_dir=settings.openclaw_tessdata_dir,
+        vision_settings=TcgVisionSettings(
+            backend=settings.openclaw_local_vision_backend or "",
+            endpoint=settings.openclaw_local_vision_endpoint,
+            model=settings.openclaw_local_vision_model,
+            timeout_seconds=settings.openclaw_local_vision_timeout_seconds,
+            ssl_context=build_ssl_context(settings),
+        ),
+    )
+
+
+def default_photo_intent_analyzer(settings: AssistantSettings):
+    return _base_default_photo_intent_analyzer(
         db_path=settings.monitor_db_path,
         tesseract_path=settings.openclaw_tesseract_path,
         tessdata_dir=settings.openclaw_tessdata_dir,
@@ -344,6 +360,7 @@ def run_telegram_polling(
         board_loader=board_loader,
         catalog_renderer=catalog_renderer,
         photo_renderer=photo_renderer or default_photo_renderer(settings),
+        photo_intent_analyzer=default_photo_intent_analyzer(settings),
         reputation_renderer=default_reputation_renderer(settings),
         research_renderer=default_web_research_renderer(settings),
         natural_language_router=build_telegram_natural_language_router_from_settings(settings),
