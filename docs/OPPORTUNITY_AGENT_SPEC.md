@@ -1,7 +1,7 @@
 # OpenClaw Opportunity Agent Spec
 
-Status: MVP implementation in progress  
-Owner layer: `aka_no_claw` integration runtime  
+Status: production. Last updated 2026-05-16.
+Owner layer: `aka_no_claw` integration runtime
 Runtime command: `python -m openclaw_adapter opportunity-agent`
 Status command: `python -m openclaw_adapter opportunity-status`
 Telegram status: `/hunt status`
@@ -9,12 +9,15 @@ Telegram dismiss: `/hunt remove <number-or-name>`
 
 ## Goal
 
-Continuously find buying opportunities by combining three existing systems:
+Continuously find buying opportunities by combining several signals:
 
-1. `sns_monitor_bot` discovers social buzz and promising product targets.
+1. **Three candidate providers** (chained, deduped by candidate_id):
+   - `SnsLlmCandidateProvider` — domain-filtered SNS tweets (only rules whose `domains` intersect `{pokemon, yugioh, ws, union_arena, tcg}`).
+   - `HotCardBoardCandidateProvider` — reuses the `/trend` hot-card boards.
+   - `ScheduledWebSearchCandidateProvider` — periodic DuckDuckGo TCG-trend queries.
 2. `price_monitor_bot` estimates fair value and searches Mercari listings at or below the target price.
-3. `reputation_snapshot` verifies the seller reputation for each listing.
-4. OpenClaw Telegram sends only qualified recommendations to the user for final human judgment.
+3. `reputation_snapshot` verifies seller reputation for each listing.
+4. OpenClaw Telegram sends only qualified recommendations to the user.
 
 The agent never buys automatically.
 
@@ -42,24 +45,43 @@ State:
 
 - `data/opportunities.sqlite3`
 
+## Candidate Data Model (three-level hierarchy)
+
+`OpportunityCandidate` (`opportunity_models.py`):
+
+- `game` — Layer 1 IP: `pokemon / ws / yugioh / union_arena`.
+- `product_type` — Layer 2 constrained enum: `single_card / booster_pack / sealed_box / starter_deck / promo / other`. Free-text alias inputs are normalised via `normalize_product_type`.
+- `title` — Layer 3 specific product name.
+- `product_identifier` — Layer 3 detail: card_number (e.g. `201/165`, `QCCP-JP001`) for single_card; set_code (e.g. `sv-p`) for sealed_box / booster_pack; `None` otherwise.
+
+`build_candidate_id` hashes all four levels plus `search_query`, so two records with identical names but different product_types stay distinct.
+
+## SNS Rule Domain Mechanism
+
+Every `AccountWatch / KeywordWatch / TrendWatch` in `sns_monitor_bot` now carries `domains: tuple[str, ...]`. Topic-specific agents filter by intersection:
+
+- `TCG_DOMAINS = {pokemon, yugioh, ws, union_arena, tcg}` — TCG opportunity agent reads only rules whose `domains` intersect this set.
+- Untagged rules (`domains=()`) are invisible to the TCG agent until backfill tags them.
+- The opportunity agent's preflight runs domain backfill (one rule per tick, LLM-driven) and account auto-discovery (every 6 h, capped 2 per run).
+
 ## Pipeline
 
-One tick performs:
+Each tick performs:
 
-1. Read recent SNS posts from `SNS_DB_PATH`.
-2. Ask the configured local text LLM to extract candidate products as JSON.
-3. Normalize extracted product names before saving:
-   - remove non-product words such as `抽選情報`, `予約情報`, `発売情報`, and `Mercari`
-   - convert `セット名収録 カード名` into the individual card name when it is clearly a card target
-4. Reject obvious unsupported franchises such as `遊☆戯☆王`, `デュエルマスターズ`, and `ONE PIECE CARD GAME`.
-5. Use the web search tool to gather outside-market context for each candidate.
-6. Ask the configured local text LLM to judge whether those web sources support real demand, then store source URLs in candidate metadata.
-7. Save/update candidates in `opportunity_candidates`.
-8. For due candidates, run fair-value lookup using `price_monitor_bot`.
-9. Search Mercari for listings below the calculated target price.
-10. For each unseen listing, request a reputation snapshot.
-11. Score the full opportunity.
-12. Send Telegram recommendation only if all thresholds pass.
+1. **Preflight** — `opportunity_sns_domain_backfill` (one untagged rule) + `opportunity_sns_discovery` (every 6 h).
+2. **Candidate discovery** via `ChainedCandidateProvider`:
+   - SNS LLM extraction (domain-filtered).
+   - Hot card board snapshot (per-game top-N).
+   - Scheduled web-trend search + LLM extraction.
+   - Optional `WebResearchCandidateProvider` enrichment on top.
+3. **Title normalisation**: strip `抽選情報 / 予約情報 / 発売情報 / Mercari` noise; convert `セット名収録 カード名` to the card name when it's clearly a single-card target; reject unsupported franchises (`デュエルマスターズ`, `ONE PIECE CARD GAME`, etc.).
+4. **Multi-product split**: the LLM prompt instructs splitting `インフェルノX・スタートデッキ100`-style multi-product mentions into separate candidates; product-internal `・` (e.g. card with multiple Pokemon names) preserved.
+5. **Save/upsert** into `opportunity_candidates` (rebuilt schema with `product_type` + `product_identifier`).
+6. For due candidates, run fair-value lookup via `price_monitor_bot`.
+7. Search Mercari for listings ≤ target price.
+8. For each unseen listing, request a reputation snapshot.
+9. Score the full opportunity.
+10. Send Telegram recommendation only if all thresholds pass.
 
 ## Default Thresholds
 
@@ -71,6 +93,7 @@ One tick performs:
 
 Environment variables:
 
+Core agent:
 - `OPENCLAW_OPPORTUNITY_AGENT_ENABLED`
 - `OPENCLAW_OPPORTUNITY_DB_PATH`
 - `OPENCLAW_OPPORTUNITY_INTERVAL_SECONDS`
@@ -84,6 +107,23 @@ Environment variables:
 - `OPENCLAW_OPPORTUNITY_MIN_PRICE_CONFIDENCE`
 - `OPENCLAW_OPPORTUNITY_MIN_TOTAL_REVIEWS`
 - `OPENCLAW_OPPORTUNITY_MIN_POSITIVE_RATE`
+
+Hot-card board provider:
+- `OPENCLAW_OPPORTUNITY_HOT_CARD_PROVIDER_ENABLED` (default `true`)
+- `OPENCLAW_OPPORTUNITY_HOT_CARD_PER_GAME_LIMIT` (default `3`)
+- `OPENCLAW_OPPORTUNITY_HOT_CARD_MIN_SCORE` (default `60.0`)
+
+Web-trend search provider:
+- `OPENCLAW_OPPORTUNITY_WEB_TREND_PROVIDER_ENABLED` (default `true`)
+- `OPENCLAW_OPPORTUNITY_WEB_TREND_QUERIES` (CSV; defaults to the five built-in TCG queries)
+- `OPENCLAW_OPPORTUNITY_WEB_TREND_RESULTS_PER_QUERY` (default `5`)
+
+SNS domain backfill / auto-discovery:
+- `OPENCLAW_OPPORTUNITY_SNS_DOMAIN_BACKFILL_ENABLED` (default `true`)
+- `OPENCLAW_OPPORTUNITY_SNS_AUTO_DISCOVERY_ENABLED` (default `true`)
+- `OPENCLAW_OPPORTUNITY_SNS_AUTO_DISCOVERY_INTERVAL_HOURS` (default `6`)
+- `OPENCLAW_OPPORTUNITY_SNS_AUTO_DISCOVERY_MAX_NEW_PER_RUN` (default `2`)
+- `OPENCLAW_OPPORTUNITY_SNS_AUTO_DISCOVERY_MIN_CONFIDENCE` (default `0.7`)
 
 ## Telegram Recommendation Format
 
@@ -119,20 +159,19 @@ Dismissed targets are marked inactive in SQLite and are not reactivated by later
 
 ## Current Limitations
 
-- Product extraction depends on recent rows in the SNS SQLite database.
-- MVP supports `pokemon` and `ws`, matching the current TCG price modules.
+- Candidate sources are SNS (domain-filtered), hot-card board, and DuckDuckGo. Per-vendor restock-page scrapers (Yuyutei / Cardrush / Magi) are not yet wired.
+- Supported IPs: `pokemon`, `ws`, `yugioh`, `union_arena` (matches the current TCG price modules and the `RECOMMENDED_DOMAINS` enum).
 - It only recommends Mercari listings.
-- Reputation verification waits for `reputation_snapshot` job completion, so a first-time seller check can take several minutes.
+- Reputation verification waits for `reputation_snapshot` job completion, so a first-time seller check can take several minutes (default 240 s timeout).
+- Providers run sequentially in the chain; a slow web-search query stretches the tick.
 - There is no `/hunt approve` or `/hunt reject` feedback loop yet.
 
 ## Next Useful Upgrade
 
-Add more Telegram control commands:
+In priority order:
 
-- `/hunt pause`
-- `/hunt resume`
-- `/hunt thresholds`
-- `/hunt reject <recommendation_id>`
-- `/hunt summary`
-
-Then use those decisions as feedback for future scoring.
+1. **Per-vendor restock scrapers** (Yuyutei / Cardrush / Magi). Most structured signal still untapped. Add as a fourth provider beside `HotCardBoardCandidateProvider` and chain in `build_opportunity_agent()`.
+2. Telegram control commands: `/hunt pause / resume / thresholds / summary / reject <recommendation_id>`. Feed accept/reject decisions back into scoring.
+3. Provider concurrency (thread-pool / asyncio).
+4. Auto-cleanup of low-yield SNS accounts (observe first, then automate).
+5. Second-pass LLM verifier for separator-containing candidate titles, if the prompt fix in Phase 12 isn't enough in practice.

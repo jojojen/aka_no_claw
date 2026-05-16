@@ -54,25 +54,36 @@ The Telegram assistant can reach these tools:
   - Update the price threshold of an existing watch.
 
 - `/snsadd @username`
-  - Add an X (Twitter) account to the watch list.
+  - Add (or upsert) an X (Twitter) account watch rule.
   - Usage: `/snsadd @akanoclaw`
-  - Optional account tweet filters: `/snsadd @elonmusk ["buy", "sell"]` only notifies when the account tweet contains any listed keyword.
+  - Optional **filter** keywords (tweet must contain any of them to notify): `/snsadd @elonmusk filter[buy, sell]` or legacy `/snsadd @elonmusk ["buy", "sell"]`.
+  - Optional **domain** tags so the right topic agent can pick up the account: `/snsadd @Laurier_News filter[抽選] domain[pokemon, yugioh]`.
+  - Re-running `/snsadd @same_handle` becomes an upsert: filter and domain replace if explicitly provided; otherwise existing values are preserved.
 
-- `/snsadd keyword:<search_term>`
-  - Add a keyword search to the watch list.
-  - Usage: `/snsadd keyword:機動戰士`
+- `/snsadd keyword:<search_term> domain[<tags>]`
+  - Add (or upsert) a keyword search watch rule.
+  - Usage: `/snsadd keyword:機動戰士 domain[gundam, anime]`
 
-- `/snsadd trend:<category>`
+- `/snsadd trend:<category> domain[<tags>]`
   - Add a trend category to the watch list.
   - Categories: `trending`, `for-you`, `news`, `sports`, `entertainment`
-  - Usage: `/snsadd trend:trending`
+  - Usage: `/snsadd trend:trending domain[news]`
 
 - `/snslist`
-  - List all X (Twitter) watch rules.
+  - List all X (Twitter) watch rules. Each row shows `filter[…]` and `domain[…]`; rules awaiting LLM backfill display `domain[?]`.
 
 - `/snsdelete <target>`
   - Remove an X watch rule. `<target>` may be a rule ID prefix, an @handle, or `keyword:xxx`.
   - Examples: `/snsdelete @elonmusk`, `/snsdelete abc12345`, `/snsdelete keyword:機動戰士`
+
+### Domain tags
+
+Each watch rule carries a `domains` tuple. Topic-specific agents filter by intersection (TCG agent reads only rules whose `domains` intersect `{pokemon, yugioh, ws, union_arena, tcg}`). Recommended values:
+
+- TCG: `pokemon`, `yugioh`, `ws`, `union_arena`, `tcg`
+- Non-TCG: `politic`, `stock`, `news`, `gaming`, `entertainment`, `anime`, `gundam`, `other`
+
+Free-text values are accepted (normalised to lowercase). Untagged rules are auto-tagged by the opportunity agent's LLM backfill, one rule per cron tick — the user receives a Telegram heads-up `🏷 自動標記 @X 領域：…` and can override with `/snsadd @X domain[…]`.
 
 - `/snsbuzz <keyword>`
   - Summarise Reddit's top discussion on a topic via LLM.
