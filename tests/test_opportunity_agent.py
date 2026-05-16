@@ -1,20 +1,33 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 from assistant_runtime import AssistantSettings
+from tcg_tracker.hot_cards import HotCardBoard, HotCardEntry
 from openclaw_adapter.opportunity_agent import (
+    ChainedCandidateProvider,
+    DEFAULT_WEB_TREND_QUERIES,
+    HotCardBoardCandidateProvider,
+    ScheduledWebSearchCandidateProvider,
+    SnsLlmCandidateProvider,
     SnsPost,
     WebOpportunityResearcher,
     WebResearchCandidateProvider,
     _build_opportunity_research_query,
     _build_sns_candidate_prompt,
+    _build_web_trend_candidate_prompt,
     _format_title_with_identifier,
     _parse_candidate_response,
     dismiss_opportunity_target,
     format_opportunity_recommendation,
     format_opportunity_status,
 )
+from openclaw_adapter.opportunity_sns_discovery import (
+    DEFAULT_DISCOVERY_QUERIES,
+    discover_tcg_sns_accounts,
+)
+from openclaw_adapter.opportunity_sns_domain_backfill import backfill_missing_domains
 from openclaw_adapter.opportunity_models import (
     ListingOffer,
     OpportunityCandidate,
@@ -748,3 +761,387 @@ def test_opportunity_store_migrates_legacy_schema_by_drop_rebuild(tmp_path: Path
     assert rows == []  # legacy row was dropped during migration
     assert "product_type" in columns
     assert "product_identifier" in columns
+
+
+# ─── Provider A / B / chain + SNS domain filter & auto-discovery ─────────────
+
+
+class _FakeHotCardService:
+    def __init__(self, boards):
+        self._boards = tuple(boards)
+
+    def load_boards(self, *, limit):  # noqa: ARG002 — sig mirrors real service
+        return self._boards
+
+
+def _hot_entry(*, rank, title, card_number, hot_score, rarity="SAR", set_code="sv08"):
+    return HotCardEntry(
+        game="pokemon",
+        rank=rank,
+        title=title,
+        price_jpy=10000,
+        thumbnail_url="",
+        card_number=card_number,
+        rarity=rarity,
+        set_code=set_code,
+        listing_count=5,
+        best_ask_jpy=10000,
+        best_bid_jpy=8000,
+        previous_bid_jpy=8000,
+        bid_ask_ratio=0.8,
+        buy_support_score=80.0,
+        momentum_boost_score=5.0,
+        buy_signal_label=None,
+        hot_score=hot_score,
+        attention_score=40.0,
+        social_post_count=2,
+        social_engagement_count=50,
+        notes=(),
+        is_graded=False,
+        references=(),
+    )
+
+
+def _hot_board(items):
+    return HotCardBoard(
+        game="pokemon",
+        label="Pokemon Liquidity Board",
+        methodology="stub",
+        generated_at=datetime.now(timezone.utc),
+        items=tuple(items),
+    )
+
+
+def test_hot_card_board_provider_emits_single_card_candidates() -> None:
+    service = _FakeHotCardService([
+        _hot_board([
+            _hot_entry(rank=1, title="ピカチュウex SAR", card_number="201/165", hot_score=92.0),
+            _hot_entry(rank=2, title="リザードンex SAR", card_number="195/165", hot_score=88.0),
+        ])
+    ])
+    provider = HotCardBoardCandidateProvider(hot_card_service=service, per_game_limit=2, min_hot_score=50.0)
+
+    candidates = list(provider.discover(limit=5))
+
+    assert len(candidates) == 2
+    assert all(c.product_type == "single_card" for c in candidates)
+    assert {c.product_identifier for c in candidates} == {"201/165", "195/165"}
+    assert all(c.source_kind == "hot_card_board" for c in candidates)
+
+
+def test_hot_card_board_provider_filters_below_min_score() -> None:
+    service = _FakeHotCardService([
+        _hot_board([
+            _hot_entry(rank=1, title="A", card_number="100/165", hot_score=30.0),
+            _hot_entry(rank=2, title="B", card_number="101/165", hot_score=65.0),
+            _hot_entry(rank=3, title="C", card_number="102/165", hot_score=80.0),
+        ])
+    ])
+    provider = HotCardBoardCandidateProvider(hot_card_service=service, per_game_limit=5, min_hot_score=60.0)
+
+    titles = [c.title for c in provider.discover(limit=10)]
+
+    assert titles == ["B", "C"]
+
+
+def test_scheduled_web_search_provider_runs_each_query_and_extracts_candidates() -> None:
+    from openclaw_adapter.web_search import WebSearchResult
+
+    seen_queries: list[str] = []
+
+    def fake_search(query, *, max_results):  # noqa: ARG001
+        seen_queries.append(query)
+        return (WebSearchResult(title=f"{query} 結果", url=f"https://example.com/{len(seen_queries)}", snippet="snippet"),)
+
+    def fake_llm(prompt):  # noqa: ARG001
+        return (
+            '{"candidates":[{"game":"pokemon","product_type":"sealed_box","title":"インフェルノX",'
+            '"product_identifier":null,"search_query":"インフェルノX","heat_score":70,"reason":"web",'
+            '"source_tweet_ids":["https://example.com/1"]}]}'
+        )
+
+    provider = ScheduledWebSearchCandidateProvider(
+        search_fn=fake_search,
+        llm_fn=fake_llm,
+        queries=("q1", "q2", "q3"),
+        results_per_query=1,
+    )
+    candidates = list(provider.discover(limit=5))
+
+    assert seen_queries == ["q1", "q2", "q3"]
+    assert len(candidates) == 1
+    assert candidates[0].product_type == "sealed_box"
+    assert candidates[0].title == "インフェルノX"
+    assert candidates[0].source_kind == "web_trend_search"
+
+
+def test_chained_candidate_provider_dedupes_by_candidate_id() -> None:
+    from openclaw_adapter.opportunity_models import build_candidate_id
+
+    spec = dict(game="pokemon", product_type="single_card", title="Same", search_query="Same")
+    shared_id = build_candidate_id(**spec)
+    shared = OpportunityCandidate(
+        candidate_id=shared_id,
+        game="pokemon",
+        product_type="single_card",
+        title="Same",
+        product_identifier=None,
+        search_query="Same",
+        heat_score=70.0,
+        reason="provider A",
+    )
+    duplicate_with_higher_heat = OpportunityCandidate(
+        candidate_id=shared_id,
+        game="pokemon",
+        product_type="single_card",
+        title="Same",
+        product_identifier=None,
+        search_query="Same",
+        heat_score=90.0,
+        reason="provider B",
+    )
+
+    class _StaticProvider:
+        def __init__(self, items):
+            self._items = items
+
+        def discover(self, *, limit):  # noqa: ARG002
+            return tuple(self._items)
+
+    chained = ChainedCandidateProvider([
+        _StaticProvider([shared]),
+        _StaticProvider([duplicate_with_higher_heat]),
+    ])
+    candidates = list(chained.discover(limit=10))
+
+    assert len(candidates) == 1
+    assert candidates[0].heat_score == 90.0  # higher heat wins
+
+
+def test_sns_provider_filters_by_tcg_domain_intersection(tmp_path: Path) -> None:
+    """End-to-end: seed three rules (Trump=politic, Laurier=pokemon, untagged),
+    seed corresponding tweets, and assert _read_recent_posts only yields the
+    pokemon-tagged author's tweets.
+    """
+    import sqlite3
+    from sns_monitor.storage import SnsDatabase
+    from sns_monitor.models import AccountWatch
+
+    db_path = tmp_path / "sns.sqlite3"
+    sns_db = SnsDatabase(db_path)
+    sns_db.bootstrap()
+
+    sns_db.save_watch_rule(AccountWatch(
+        rule_id="r-trump", screen_name="realDonaldTrump", user_id=None,
+        label="@realDonaldTrump", include_keywords=(),
+        domains=("politic", "stock"), enabled=True, schedule_minutes=15, chat_id="",
+        last_checked_at=None,
+    ))
+    sns_db.save_watch_rule(AccountWatch(
+        rule_id="r-laurier", screen_name="Laurier_News", user_id=None,
+        label="@Laurier_News", include_keywords=(),
+        domains=("pokemon", "yugioh"), enabled=True, schedule_minutes=15, chat_id="",
+        last_checked_at=None,
+    ))
+    sns_db.save_watch_rule(AccountWatch(
+        rule_id="r-untagged", screen_name="aka_claw", user_id=None,
+        label="@aka_claw", include_keywords=(),
+        domains=(), enabled=True, schedule_minutes=15, chat_id="",
+        last_checked_at=None,
+    ))
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(db_path) as connection:
+        for (tid, rule_id, handle, text) in (
+            ("t1", "r-trump", "realDonaldTrump", "America First"),
+            ("t2", "r-laurier", "Laurier_News", "Pokemon TCG 新弾 情報"),
+            ("t3", "r-untagged", "aka_claw", "no domain tag"),
+        ):
+            connection.execute(
+                "INSERT INTO seen_tweets (tweet_id, rule_id, author_handle, text, created_at, first_seen_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (tid, rule_id, handle, text, now_iso, now_iso),
+            )
+        connection.commit()
+
+    provider = SnsLlmCandidateProvider(
+        db_path=db_path,
+        endpoint="http://stub",
+        model="",  # avoid actual LLM call
+        timeout_seconds=1,
+        lookback_hours=24,
+    )
+    posts = provider._read_recent_posts(limit=10)
+
+    assert [p.author_handle for p in posts] == ["Laurier_News"]
+
+
+def test_account_watch_supports_domains_field_round_trip(tmp_path: Path) -> None:
+    from sns_monitor.models import AccountWatch
+    from sns_monitor.storage import SnsDatabase
+
+    db = SnsDatabase(tmp_path / "sns.sqlite3")
+    db.bootstrap()
+    rule = AccountWatch(
+        rule_id="abc",
+        screen_name="Laurier_News",
+        user_id=None,
+        label="@Laurier_News",
+        include_keywords=("抽選",),
+        domains=("pokemon", "yugioh"),
+        enabled=True,
+        schedule_minutes=15,
+        chat_id="123",
+        last_checked_at=None,
+    )
+    db.save_watch_rule(rule)
+    loaded = db.get_watch_rule("abc")
+    assert isinstance(loaded, AccountWatch)
+    assert loaded.include_keywords == ("抽選",)
+    assert loaded.domains == ("pokemon", "yugioh")
+
+
+def test_snsadd_parses_filter_bracket_and_domain_bracket() -> None:
+    from sns_monitor.filters import parse_account_watch_text
+
+    assert parse_account_watch_text("@Laurier_News filter[抽選, 予約] domain[pokemon, ws]") == (
+        "Laurier_News",
+        ("抽選", "予約"),
+        ("pokemon", "ws"),
+    )
+
+
+def test_snsadd_keeps_legacy_json_array_filter_compat() -> None:
+    from sns_monitor.filters import parse_account_watch_text
+
+    handle, filters, domains = parse_account_watch_text('@elonmusk ["buy", "sell"]')
+    assert handle == "elonmusk"
+    assert filters == ("buy", "sell")
+    assert domains is None  # caller preserves existing rule's domains
+
+
+def test_domain_backfill_uses_llm_and_saves_one_per_run(tmp_path: Path, monkeypatch) -> None:
+    from sns_monitor.models import AccountWatch, KeywordWatch
+    from sns_monitor.storage import SnsDatabase
+
+    db = SnsDatabase(tmp_path / "sns.sqlite3")
+    db.bootstrap()
+
+    # Two enabled, no-domain rules → only the first should be processed.
+    db.save_watch_rule(AccountWatch(
+        rule_id="r1", screen_name="alpha", user_id=None, label="@alpha",
+        include_keywords=(), domains=(),
+        enabled=True, schedule_minutes=15, chat_id="", last_checked_at=None,
+    ))
+    db.save_watch_rule(KeywordWatch(
+        rule_id="r2", query="機動戦士", label="機動戦士",
+        domains=(),
+        enabled=True, schedule_minutes=30, chat_id="", last_checked_at=None,
+    ))
+
+    llm_calls = []
+
+    def fake_llm(prompt):
+        llm_calls.append(prompt)
+        return '{"domains":["pokemon"],"reason":"頻繁提到 pokemon"}'
+
+    notifications: list[str] = []
+    updated = backfill_missing_domains(
+        sns_db=db,
+        sns_db_path=tmp_path / "sns.sqlite3",
+        llm_fn=fake_llm,
+        telegram_notify_fn=notifications.append,
+        limit=1,
+    )
+
+    assert len(updated) == 1
+    assert updated[0].domains == ("pokemon",)
+    assert len(llm_calls) == 1
+    assert notifications and "自動標記" in notifications[0]
+
+    # Second rule still has no domain
+    remaining = db.list_watch_rules_missing_domains()
+    assert len(remaining) == 1
+
+
+def test_sns_account_auto_discovery_extracts_handles_from_search_urls(tmp_path: Path) -> None:
+    """Regex must pull genuine handles and skip protected paths."""
+    from openclaw_adapter.opportunity_sns_discovery import _HANDLE_RE
+
+    assert _HANDLE_RE.findall("https://twitter.com/pokemon_cojp/status/12345") == ["pokemon_cojp"]
+    assert _HANDLE_RE.findall("https://x.com/foo_bar123") == ["foo_bar123"]
+    # Protected paths must NOT yield handles
+    assert _HANDLE_RE.findall("https://twitter.com/i/status/12345") == []
+    assert _HANDLE_RE.findall("https://twitter.com/search?q=pokemon") == []
+    assert _HANDLE_RE.findall("https://twitter.com/hashtag/PokemonCard") == []
+
+
+def test_sns_account_auto_discovery_respects_confidence_cap_and_tcg_intersection(tmp_path: Path) -> None:
+    """Cap=2, only high-confidence + TCG-domain candidates get added."""
+    from openclaw_adapter.web_search import WebSearchResult
+    from sns_monitor.storage import SnsDatabase
+
+    db = SnsDatabase(tmp_path / "sns.sqlite3")
+    db.bootstrap()
+
+    # 5 search URLs → 5 candidate handles
+    fake_results = [
+        WebSearchResult(title=f"r{i}", url=f"https://twitter.com/handle{i}", snippet="")
+        for i in range(1, 6)
+    ]
+
+    def fake_search(query, *, max_results):  # noqa: ARG001
+        return fake_results
+
+    verdicts = iter([
+        '{"is_tcg":true,"domains":["pokemon"],"confidence":0.9,"reason":"r1"}',
+        '{"is_tcg":true,"domains":["yugioh"],"confidence":0.85,"reason":"r2"}',
+        '{"is_tcg":true,"domains":["pokemon"],"confidence":0.5,"reason":"low conf"}',  # below 0.7 floor
+        '{"is_tcg":false,"domains":[],"confidence":0.9,"reason":"not tcg"}',
+        '{"is_tcg":true,"domains":["politic"],"confidence":0.95,"reason":"wrong domain"}',
+    ])
+
+    def fake_llm(prompt):  # noqa: ARG001
+        return next(verdicts)
+
+    added = discover_tcg_sns_accounts(
+        sns_db=db,
+        search_fn=fake_search,
+        llm_fn=fake_llm,
+        queries=("site:twitter.com test",),
+        max_new_per_run=2,
+        min_confidence=0.7,
+        results_per_query=5,
+    )
+
+    assert [r.screen_name for r in added] == ["handle1", "handle2"]
+
+
+def test_sns_account_auto_discovery_sends_notification_with_domains(tmp_path: Path) -> None:
+    from openclaw_adapter.web_search import WebSearchResult
+    from sns_monitor.storage import SnsDatabase
+
+    db = SnsDatabase(tmp_path / "sns.sqlite3")
+    db.bootstrap()
+
+    def fake_search(query, *, max_results):  # noqa: ARG001
+        return (WebSearchResult(title="r", url="https://twitter.com/poke_news_jp", snippet=""),)
+
+    def fake_llm(prompt):  # noqa: ARG001
+        return '{"is_tcg":true,"domains":["pokemon","tcg"],"confidence":0.9,"reason":"covers TCG news"}'
+
+    notifications: list[str] = []
+    added = discover_tcg_sns_accounts(
+        sns_db=db,
+        search_fn=fake_search,
+        llm_fn=fake_llm,
+        telegram_notify_fn=notifications.append,
+        queries=("test",),
+        max_new_per_run=1,
+        min_confidence=0.7,
+    )
+
+    assert len(added) == 1
+    assert added[0].screen_name == "poke_news_jp"
+    assert notifications and "自動加入追蹤 @poke_news_jp" in notifications[0]
+    assert "pokemon" in notifications[0]
