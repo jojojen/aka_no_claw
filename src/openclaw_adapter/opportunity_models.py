@@ -6,12 +6,70 @@ from hashlib import sha1
 from typing import Mapping
 
 
+# Layer 2 of the candidate hierarchy. The LLM is constrained to these values
+# so that two products on different "type" lines never get squeezed into the
+# same candidate just because they happen to be the same IP.
+PRODUCT_TYPES: tuple[str, ...] = (
+    "single_card",
+    "booster_pack",
+    "sealed_box",
+    "starter_deck",
+    "promo",
+    "other",
+)
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def build_candidate_id(*, game: str, title: str, search_query: str, source_url: str = "") -> str:
-    key = f"{game.strip().lower()}|{title.strip().lower()}|{search_query.strip().lower()}|{source_url.strip()}"
+def normalize_product_type(value: object) -> str:
+    """Coerce an LLM-supplied product_type string into the constrained enum.
+
+    Falls back to ``"other"`` for unknown / missing values. Only common
+    English/Japanese aliases are mapped; the goal is to absorb the most
+    obvious variants without growing into a sprawling synonym table.
+    """
+    if not isinstance(value, str):
+        return "other"
+    cleaned = value.strip().lower().replace(" ", "_").replace("-", "_")
+    aliases = {
+        "card": "single_card",
+        "singles": "single_card",
+        "trading_card": "single_card",
+        "booster": "booster_pack",
+        "pack": "booster_pack",
+        "box": "sealed_box",
+        "display": "sealed_box",
+        "deck": "starter_deck",
+        "structure_deck": "starter_deck",
+        "trial_deck": "starter_deck",
+        "promo_card": "promo",
+        "promotional": "promo",
+    }
+    cleaned = aliases.get(cleaned, cleaned)
+    return cleaned if cleaned in PRODUCT_TYPES else "other"
+
+
+def build_candidate_id(
+    *,
+    game: str,
+    product_type: str,
+    title: str,
+    search_query: str,
+    product_identifier: str | None = None,
+    source_url: str = "",
+) -> str:
+    key = "|".join(
+        [
+            game.strip().lower(),
+            product_type.strip().lower(),
+            title.strip().lower(),
+            (product_identifier or "").strip().lower(),
+            search_query.strip().lower(),
+            source_url.strip(),
+        ]
+    )
     return "opp_" + sha1(key.encode("utf-8")).hexdigest()[:16]
 
 
@@ -22,11 +80,13 @@ def build_listing_key(url: str) -> str:
 @dataclass(frozen=True, slots=True)
 class OpportunityCandidate:
     candidate_id: str
-    game: str
-    title: str
+    game: str                              # Layer 1: IP (pokemon/ws/yugioh/union_arena)
+    product_type: str                      # Layer 2: PRODUCT_TYPES enum
+    title: str                             # Layer 3: specific product name
     search_query: str
     heat_score: float
     reason: str
+    product_identifier: str | None = None  # Layer 3 detail: card number or set code
     source_kind: str = "sns"
     source_url: str = ""
     metadata: Mapping[str, object] = field(default_factory=dict)

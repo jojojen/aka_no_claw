@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -16,6 +17,8 @@ from .opportunity_models import (
     utc_now_iso,
 )
 
+logger = logging.getLogger(__name__)
+
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -23,7 +26,9 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS opportunity_candidates (
     candidate_id TEXT PRIMARY KEY,
     game TEXT NOT NULL,
+    product_type TEXT NOT NULL DEFAULT 'other',
     title TEXT NOT NULL,
+    product_identifier TEXT,
     search_query TEXT NOT NULL,
     heat_score REAL NOT NULL,
     reason TEXT NOT NULL,
@@ -96,6 +101,26 @@ class OpportunityStore:
 
     def bootstrap(self) -> None:
         with self.connect() as connection:
+            # One-time migration: legacy schemas had no product_type column.
+            # Drop the opportunity tables so the new schema can be applied
+            # cleanly. The opportunity cron tick repopulates candidates
+            # within ~1 hour. Tests use tmp DBs and are unaffected.
+            existing = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='opportunity_candidates'"
+            ).fetchone()
+            if existing is not None:
+                column_names = {
+                    row[1] for row in connection.execute("PRAGMA table_info(opportunity_candidates)")
+                }
+                if "product_type" not in column_names:
+                    logger.warning(
+                        "Dropping legacy opportunity tables to migrate to three-level (game / product_type / title) schema"
+                    )
+                    connection.executescript(
+                        "DROP TABLE IF EXISTS opportunity_recommendations;"
+                        "DROP TABLE IF EXISTS opportunity_price_checks;"
+                        "DROP TABLE IF EXISTS opportunity_candidates;"
+                    )
             connection.executescript(SCHEMA)
 
     def upsert_candidate(self, candidate: OpportunityCandidate) -> None:
@@ -104,13 +129,16 @@ class OpportunityStore:
             connection.execute(
                 """
                 INSERT INTO opportunity_candidates (
-                    candidate_id, game, title, search_query, heat_score, reason,
+                    candidate_id, game, product_type, title, product_identifier,
+                    search_query, heat_score, reason,
                     source_kind, source_url, metadata_json, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(candidate_id) DO UPDATE SET
                     game=excluded.game,
+                    product_type=excluded.product_type,
                     title=excluded.title,
+                    product_identifier=excluded.product_identifier,
                     search_query=excluded.search_query,
                     heat_score=MAX(opportunity_candidates.heat_score, excluded.heat_score),
                     reason=excluded.reason,
@@ -126,7 +154,9 @@ class OpportunityStore:
                 (
                     candidate.candidate_id,
                     candidate.game,
+                    candidate.product_type,
                     candidate.title,
+                    candidate.product_identifier,
                     candidate.search_query,
                     candidate.heat_score,
                     candidate.reason,
@@ -305,7 +335,9 @@ def _candidate_from_row(row: sqlite3.Row) -> OpportunityCandidate:
     return OpportunityCandidate(
         candidate_id=row["candidate_id"],
         game=row["game"],
+        product_type=row["product_type"] if "product_type" in row.keys() else "other",
         title=row["title"],
+        product_identifier=row["product_identifier"] if "product_identifier" in row.keys() else None,
         search_query=row["search_query"],
         heat_score=float(row["heat_score"]),
         reason=row["reason"],
