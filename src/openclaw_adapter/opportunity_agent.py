@@ -19,6 +19,7 @@ from market_monitor.mercari_search import search_mercari
 from price_monitor_bot.bot import TelegramBotClient
 from price_monitor_bot.commands import lookup_card
 from tcg_tracker.catalog import normalize_game_key, supported_game_hint
+from tcg_tracker.hot_cards import TcgHotCardService
 
 from .opportunity_models import (
     ListingOffer,
@@ -30,7 +31,7 @@ from .opportunity_models import (
     build_listing_key,
     normalize_product_type,
 )
-from .opportunity_pipeline import OpportunityPipeline, OpportunityPipelineStats
+from .opportunity_pipeline import CandidateProvider, OpportunityPipeline, OpportunityPipelineStats
 from .opportunity_scoring import OpportunityThresholds, reputation_passes
 from .opportunity_store import OpportunityStore
 from .web_search import WebSearchResult, search_duckduckgo
@@ -124,30 +125,54 @@ class SnsLlmCandidateProvider:
         try:
             with sqlite3.connect(self._db_path) as connection:
                 connection.row_factory = sqlite3.Row
+                # Over-fetch by a factor so the Python-side domain filter
+                # still leaves us with `limit` matched rows even when the
+                # SNS DB is dominated by non-TCG-tagged accounts.
                 rows = connection.execute(
                     """
-                    SELECT t.tweet_id, t.author_handle, t.text, t.created_at, r.label AS rule_label
+                    SELECT t.tweet_id, t.author_handle, t.text, t.created_at,
+                           r.label AS rule_label, r.query_json AS rule_query_json
                     FROM seen_tweets t
                     LEFT JOIN watch_rules r ON r.rule_id = t.rule_id
                     WHERE t.first_seen_at >= ? OR t.created_at >= ?
                     ORDER BY t.first_seen_at DESC
                     LIMIT ?
                     """,
-                    (cutoff, cutoff, limit),
+                    (cutoff, cutoff, limit * 8),
                 ).fetchall()
         except sqlite3.Error as exc:
             logger.warning("Opportunity SNS read failed path=%s error=%s", self._db_path, exc)
             return []
-        return [
-            SnsPost(
-                tweet_id=str(row["tweet_id"]),
-                author_handle=str(row["author_handle"]),
-                text=str(row["text"]),
-                created_at=str(row["created_at"]),
-                rule_label=str(row["rule_label"] or ""),
+        from sns_monitor.models import TCG_DOMAINS, normalize_domains
+
+        posts: list[SnsPost] = []
+        for row in rows:
+            raw_json = row["rule_query_json"]
+            domains: tuple[str, ...] = ()
+            if raw_json:
+                try:
+                    parsed = json.loads(raw_json)
+                except (TypeError, ValueError):
+                    parsed = None
+                if isinstance(parsed, dict):
+                    domains = normalize_domains(parsed.get("domains"))
+            if not domains or not (set(domains) & TCG_DOMAINS):
+                # Rule is tagged with no domains, or with non-TCG domains.
+                # Skip — this is what stops @realDonaldTrump-style tweets
+                # from polluting the TCG opportunity LLM.
+                continue
+            posts.append(
+                SnsPost(
+                    tweet_id=str(row["tweet_id"]),
+                    author_handle=str(row["author_handle"]),
+                    text=str(row["text"]),
+                    created_at=str(row["created_at"]),
+                    rule_label=str(row["rule_label"] or ""),
+                )
             )
-            for row in rows
-        ]
+            if len(posts) >= limit:
+                break
+        return posts
 
 
 class WebResearchCandidateProvider:
@@ -170,6 +195,226 @@ class WebResearchCandidateProvider:
                 logger.exception("Opportunity web research enrichment failed candidate_id=%s", candidate.candidate_id)
                 enriched.append(candidate)
         return tuple(enriched)
+
+
+# ─── Provider A: hot-card-board → single_card candidates ─────────────────────
+
+class HotCardBoardCandidateProvider:
+    """Convert items in the existing `/trend` hot-card boards into TCG
+    opportunity candidates. Zero external dependencies — the hot-card service
+    is already wired for the `/trend` command, so this just plugs the same
+    data into the candidate pipeline.
+    """
+
+    def __init__(
+        self,
+        *,
+        hot_card_service: TcgHotCardService,
+        per_game_limit: int = 3,
+        min_hot_score: float = 60.0,
+    ) -> None:
+        self._hot_card_service = hot_card_service
+        self._per_game_limit = max(1, per_game_limit)
+        self._min_hot_score = min_hot_score
+
+    def discover(self, *, limit: int) -> Sequence[OpportunityCandidate]:
+        try:
+            boards = self._hot_card_service.load_boards(limit=self._per_game_limit)
+        except Exception:
+            logger.exception("HotCardBoardCandidateProvider failed to load boards")
+            return ()
+        candidates: list[OpportunityCandidate] = []
+        for board in boards:
+            for entry in board.items[: self._per_game_limit]:
+                if entry.hot_score is None or entry.hot_score < self._min_hot_score:
+                    continue
+                search_parts = [
+                    part for part in (entry.title, entry.card_number, entry.rarity) if part
+                ]
+                search_query = " ".join(search_parts) or entry.title
+                candidate = OpportunityCandidate(
+                    candidate_id=build_candidate_id(
+                        game=board.game,
+                        product_type="single_card",
+                        title=entry.title,
+                        search_query=search_query,
+                        product_identifier=entry.card_number,
+                    ),
+                    game=board.game,
+                    product_type="single_card",
+                    title=entry.title,
+                    product_identifier=entry.card_number,
+                    search_query=search_query,
+                    heat_score=float(entry.hot_score),
+                    reason=f"熱門卡排行 #{entry.rank} ({board.label})",
+                    source_kind="hot_card_board",
+                    metadata={"board_game": board.game, "rank": entry.rank},
+                )
+                candidates.append(candidate)
+                if len(candidates) >= limit:
+                    return tuple(candidates)
+        return tuple(candidates)
+
+
+# ─── Provider B: periodic web-trend search → LLM-extracted candidates ─────────
+
+DEFAULT_WEB_TREND_QUERIES: tuple[str, ...] = (
+    "ポケモンカード 再販 抽選情報 2026",
+    "遊戯王 QCCP Quarter Century 新弾",
+    "Weiss Schwarz 新ブースター 2026",
+    "Union Arena 新ブースター 2026",
+    "Pokemon Start Deck 100 新一波 抽選",
+)
+
+
+class ScheduledWebSearchCandidateProvider:
+    """Run a small batch of TCG-trend queries via DuckDuckGo, then feed the
+    snippets to the existing SNS-extraction LLM prompt (lightly adapted) to
+    pull out structured candidates. Surfaces sealed_box / starter_deck /
+    booster_pack / promo signals that don't show up on the hot-card board.
+    """
+
+    def __init__(
+        self,
+        *,
+        search_fn,
+        llm_fn,
+        queries: Sequence[str] = DEFAULT_WEB_TREND_QUERIES,
+        results_per_query: int = 5,
+    ) -> None:
+        self._search_fn = search_fn
+        self._llm_fn = llm_fn
+        self._queries = tuple(queries)
+        self._results_per_query = max(1, results_per_query)
+
+    def discover(self, *, limit: int) -> Sequence[OpportunityCandidate]:
+        if not self._queries:
+            return ()
+        snippets: list[WebSearchResult] = []
+        for query in self._queries:
+            try:
+                results = self._search_fn(query, max_results=self._results_per_query)
+            except Exception:
+                logger.exception("ScheduledWebSearchCandidateProvider search failed query=%s", query)
+                continue
+            if results:
+                snippets.extend(results)
+        if not snippets:
+            return ()
+        pseudo_posts = _snippets_as_pseudo_posts(snippets)
+        prompt = _build_web_trend_candidate_prompt(snippets, limit=limit)
+        try:
+            raw = self._llm_fn(prompt)
+        except Exception:
+            logger.exception("ScheduledWebSearchCandidateProvider LLM extraction failed")
+            return ()
+        candidates = list(_parse_candidate_response(raw, posts=pseudo_posts, limit=limit))
+        retagged: list[OpportunityCandidate] = []
+        for candidate in candidates:
+            metadata = dict(candidate.metadata)
+            metadata.setdefault("source_urls", [r.url for r in snippets[:5]])
+            retagged.append(
+                OpportunityCandidate(
+                    candidate_id=candidate.candidate_id,
+                    game=candidate.game,
+                    product_type=candidate.product_type,
+                    title=candidate.title,
+                    product_identifier=candidate.product_identifier,
+                    search_query=candidate.search_query,
+                    heat_score=candidate.heat_score,
+                    reason=candidate.reason,
+                    source_kind="web_trend_search",
+                    source_url=candidate.source_url,
+                    metadata=metadata,
+                    created_at=candidate.created_at,
+                )
+            )
+        return tuple(retagged)
+
+
+def _snippets_as_pseudo_posts(snippets: Sequence[WebSearchResult]) -> tuple[SnsPost, ...]:
+    """Wrap web search results as SnsPost shapes so we can reuse
+    `_parse_candidate_response` (which expects a `posts` collection to
+    validate `source_tweet_ids` against). The URL becomes the tweet_id.
+    """
+    posts: list[SnsPost] = []
+    for snippet in snippets:
+        posts.append(
+            SnsPost(
+                tweet_id=snippet.url,
+                author_handle=snippet.url,
+                text=f"{snippet.title} — {snippet.snippet}",
+                created_at="",
+                rule_label="web_trend",
+            )
+        )
+    return tuple(posts)
+
+
+def _build_web_trend_candidate_prompt(snippets: Sequence[WebSearchResult], *, limit: int) -> str:
+    """Same overall instructions as `_build_sns_candidate_prompt` but the
+    inputs are search-engine snippets instead of tweets. We reuse the same
+    parser (`_parse_candidate_response`) so the prompt's output schema must
+    match exactly.
+    """
+    lines = [
+        "你是 OpenClaw 的商品機會偵測器。以下是搜尋引擎回的 title + snippet，請從中找出真正能在二級市場交易的 TCG 商品。",
+        f"只接受 {supported_game_hint()}。忽略不明確、不是商品、或沒有買賣價值的話題。",
+        "忽略明顯不在支援範圍的系列，例如デュエルマスターズ、ONE PIECE CARD GAME、Dragon Ball。",
+        "",
+        "每個候選必須描述「同一個」具體商品，並且帶上三層結構：",
+        "- game (IP)：pokemon / ws / yugioh / union_arena",
+        "- product_type：single_card / booster_pack / sealed_box / starter_deck / promo / other",
+        "- title：可在二級市場搜尋到的具體商品名（不要包含「抽選情報」「予約情報」等情報詞）",
+        "- product_identifier：單張卡填卡號、整盒填 set code、其他可為 null",
+        "- search_query：Mercari 搜尋用的關鍵字",
+        "",
+        "如果一則 snippet 同時提到多個不同 product_type 的商品，要拆成多個 candidate；商品名本身內含的「・」要保留。",
+        f"最多輸出 {limit} 個候選。",
+        "",
+        "請嚴格輸出 JSON：",
+        '{"candidates":[{"game":"...","product_type":"...","title":"...","product_identifier":"...|null","search_query":"...","heat_score":0-100,"reason":"...","source_tweet_ids":["<URL>"]}]}',
+        "",
+        "搜尋結果：",
+    ]
+    for index, snippet in enumerate(snippets, 1):
+        text = " ".join(f"{snippet.title} — {snippet.snippet}".split())
+        if len(text) > 260:
+            text = text[:260] + "..."
+        lines.append(f"[{index}] url={snippet.url}: {text}")
+    return "\n".join(lines)
+
+
+# ─── Chained candidate provider (compose multiple providers) ─────────────────
+
+class ChainedCandidateProvider:
+    """Run a list of providers in order, merge their outputs, dedupe by
+    candidate_id, sort by heat_score descending, and truncate to `limit`.
+    """
+
+    def __init__(self, providers: Sequence["CandidateProvider"]) -> None:
+        self._providers = tuple(providers)
+
+    def discover(self, *, limit: int) -> Sequence[OpportunityCandidate]:
+        seen: dict[str, OpportunityCandidate] = {}
+        for provider in self._providers:
+            try:
+                discovered = provider.discover(limit=limit)
+            except Exception:
+                logger.exception(
+                    "ChainedCandidateProvider sub-provider failed type=%s",
+                    type(provider).__name__,
+                )
+                continue
+            for candidate in discovered:
+                if candidate.candidate_id in seen:
+                    # Same ID — keep whichever has the higher heat_score.
+                    if candidate.heat_score > seen[candidate.candidate_id].heat_score:
+                        seen[candidate.candidate_id] = candidate
+                    continue
+                seen[candidate.candidate_id] = candidate
+        ranked = sorted(seen.values(), key=lambda c: c.heat_score, reverse=True)
+        return tuple(ranked[:limit])
 
 
 class WebOpportunityResearcher:
@@ -426,11 +671,18 @@ class OpportunityAgent:
         *,
         pipeline: OpportunityPipeline,
         interval_seconds: int,
+        preflight_fn=None,
     ) -> None:
         self._pipeline = pipeline
         self._interval_seconds = interval_seconds
+        self._preflight_fn = preflight_fn
 
     def run_once(self) -> OpportunityPipelineStats:
+        if self._preflight_fn is not None:
+            try:
+                self._preflight_fn()
+            except Exception:
+                logger.exception("Opportunity agent preflight failed")
         return self._pipeline.run_once()
 
     def run_forever(self) -> None:
@@ -457,7 +709,7 @@ def build_opportunity_agent(settings: AssistantSettings | None = None) -> Opport
     store = OpportunityStore(settings.opportunity_db_path)
     store.bootstrap()
     text_model = (settings.openclaw_local_text_model or "").split(",")[0].strip()
-    candidate_provider = SnsLlmCandidateProvider(
+    sns_provider = SnsLlmCandidateProvider(
         db_path=settings.sns_db_path,
         endpoint=settings.openclaw_local_text_endpoint,
         model=text_model,
@@ -465,6 +717,53 @@ def build_opportunity_agent(settings: AssistantSettings | None = None) -> Opport
         lookback_hours=settings.opportunity_sns_lookback_hours,
         ssl_context=ssl_context if settings.openclaw_local_text_endpoint.startswith("https://") else None,
     )
+
+    sub_providers: list[CandidateProvider] = [sns_provider]
+
+    if settings.opportunity_hot_card_provider_enabled:
+        try:
+            hot_card_service = TcgHotCardService()
+            sub_providers.append(
+                HotCardBoardCandidateProvider(
+                    hot_card_service=hot_card_service,
+                    per_game_limit=settings.opportunity_hot_card_per_game_limit,
+                    min_hot_score=settings.opportunity_hot_card_min_score,
+                )
+            )
+            logger.info("Opportunity agent: HotCardBoardCandidateProvider enabled")
+        except Exception:
+            logger.exception("Failed to wire HotCardBoardCandidateProvider; skipping")
+
+    if settings.opportunity_web_trend_provider_enabled and text_model:
+        text_endpoint = settings.openclaw_local_text_endpoint
+        timeout_seconds = settings.opportunity_llm_timeout_seconds
+        text_ssl = ssl_context if text_endpoint.startswith("https://") else None
+
+        def _llm_fn(prompt: str, *, endpoint=text_endpoint, model=text_model,
+                    timeout=timeout_seconds, ssl=text_ssl) -> str:
+            return _call_ollama_json(
+                endpoint=endpoint, model=model, prompt=prompt,
+                timeout_seconds=timeout, ssl_context=ssl,
+            )
+
+        queries = settings.opportunity_web_trend_queries or DEFAULT_WEB_TREND_QUERIES
+        sub_providers.append(
+            ScheduledWebSearchCandidateProvider(
+                search_fn=search_duckduckgo,
+                llm_fn=_llm_fn,
+                queries=queries,
+                results_per_query=settings.opportunity_web_trend_results_per_query,
+            )
+        )
+        logger.info(
+            "Opportunity agent: ScheduledWebSearchCandidateProvider enabled queries=%d",
+            len(queries),
+        )
+
+    candidate_provider: CandidateProvider = (
+        sub_providers[0] if len(sub_providers) == 1 else ChainedCandidateProvider(sub_providers)
+    )
+
     if (settings.openclaw_local_text_backend or "").strip().lower() == "ollama" and text_model:
         candidate_provider = WebResearchCandidateProvider(
             base_provider=candidate_provider,
@@ -494,7 +793,101 @@ def build_opportunity_agent(settings: AssistantSettings | None = None) -> Opport
         listing_limit=settings.opportunity_listing_limit,
         candidate_check_interval_seconds=settings.opportunity_candidate_check_interval_seconds,
     )
-    return OpportunityAgent(pipeline=pipeline, interval_seconds=settings.opportunity_interval_seconds)
+
+    preflight_fn = _build_preflight_callable(settings=settings, ssl_context=ssl_context)
+    return OpportunityAgent(
+        pipeline=pipeline,
+        interval_seconds=settings.opportunity_interval_seconds,
+        preflight_fn=preflight_fn,
+    )
+
+
+def _build_preflight_callable(*, settings: AssistantSettings, ssl_context):
+    """Return a callable that the opportunity-agent invokes before every tick:
+
+    - Backfill domains for one untagged SNS rule (LLM-driven).
+    - Once every N hours, run SNS account auto-discovery to add new TCG
+      handles via search engine + LLM.
+
+    Returns None when both features are disabled, so the agent skips the
+    preflight step entirely.
+    """
+    backfill_enabled = settings.opportunity_sns_domain_backfill_enabled
+    discovery_enabled = settings.opportunity_sns_auto_discovery_enabled
+    if not (backfill_enabled or discovery_enabled):
+        return None
+    text_model = (settings.openclaw_local_text_model or "").split(",")[0].strip()
+    if not text_model:
+        # No local text model available → can't drive backfill / discovery.
+        return None
+    text_endpoint = settings.openclaw_local_text_endpoint
+    timeout_seconds = settings.opportunity_llm_timeout_seconds
+    text_ssl = ssl_context if text_endpoint.startswith("https://") else None
+
+    def _llm_fn(prompt: str) -> str:
+        return _call_ollama_json(
+            endpoint=text_endpoint,
+            model=text_model,
+            prompt=prompt,
+            timeout_seconds=timeout_seconds,
+            ssl_context=text_ssl,
+        )
+
+    notifier_state = {"client": None}
+
+    def _telegram_notify(text: str) -> None:
+        chat_ids = tuple(cid for cid in settings.openclaw_telegram_chat_ids if cid)
+        token = settings.openclaw_telegram_bot_token
+        if not token or not chat_ids:
+            logger.warning(
+                "Opportunity preflight notify suppressed (no telegram token / chat ids):\n%s",
+                text,
+            )
+            return
+        if notifier_state["client"] is None:
+            notifier_state["client"] = TelegramBotClient(token, ssl_context=ssl_context)
+        for chat_id in chat_ids:
+            notifier_state["client"].send_message(chat_id=chat_id, text=text)
+
+    last_discovery_at = {"value": 0.0}
+    discovery_interval_seconds = max(60, settings.opportunity_sns_auto_discovery_interval_hours * 3600)
+    primary_chat_id = settings.openclaw_telegram_chat_id or ""
+
+    def preflight() -> None:
+        from sns_monitor.storage import SnsDatabase
+        from .opportunity_sns_discovery import discover_tcg_sns_accounts
+        from .opportunity_sns_domain_backfill import backfill_missing_domains
+
+        sns_db = SnsDatabase(settings.sns_db_path)
+        if backfill_enabled:
+            try:
+                backfill_missing_domains(
+                    sns_db=sns_db,
+                    sns_db_path=settings.sns_db_path,
+                    llm_fn=_llm_fn,
+                    telegram_notify_fn=_telegram_notify,
+                    limit=1,
+                )
+            except Exception:
+                logger.exception("Opportunity preflight: domain backfill failed")
+        if discovery_enabled:
+            now = time.monotonic()
+            if now - last_discovery_at["value"] >= discovery_interval_seconds:
+                last_discovery_at["value"] = now
+                try:
+                    discover_tcg_sns_accounts(
+                        sns_db=sns_db,
+                        search_fn=search_duckduckgo,
+                        llm_fn=_llm_fn,
+                        telegram_notify_fn=_telegram_notify,
+                        chat_id=primary_chat_id,
+                        max_new_per_run=settings.opportunity_sns_auto_discovery_max_new_per_run,
+                        min_confidence=settings.opportunity_sns_auto_discovery_min_confidence,
+                    )
+                except Exception:
+                    logger.exception("Opportunity preflight: account auto-discovery failed")
+
+    return preflight
 
 
 def format_opportunity_recommendation(recommendation: OpportunityRecommendation) -> str:

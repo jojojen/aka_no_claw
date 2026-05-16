@@ -47,6 +47,19 @@ class AssistantSettings:
     opportunity_min_price_confidence: float = 0.60
     opportunity_min_total_reviews: int = 30
     opportunity_min_positive_rate: float = 97.0
+    # ── multi-source candidate providers ────────────────────────────────────
+    opportunity_hot_card_provider_enabled: bool = True
+    opportunity_hot_card_per_game_limit: int = 3
+    opportunity_hot_card_min_score: float = 60.0
+    opportunity_web_trend_provider_enabled: bool = True
+    opportunity_web_trend_queries: tuple[str, ...] = ()
+    opportunity_web_trend_results_per_query: int = 5
+    # ── SNS rule domain backfill / auto-discovery (Provider E + backfill) ────
+    opportunity_sns_domain_backfill_enabled: bool = True
+    opportunity_sns_auto_discovery_enabled: bool = True
+    opportunity_sns_auto_discovery_interval_hours: int = 6
+    opportunity_sns_auto_discovery_max_new_per_run: int = 2
+    opportunity_sns_auto_discovery_min_confidence: float = 0.7
 
 
 def load_dotenv(path: str | Path = DEFAULT_ENV_PATH, *, override: bool = False) -> None:
@@ -155,6 +168,49 @@ def get_settings() -> AssistantSettings:
             os.getenv("OPENCLAW_OPPORTUNITY_MIN_POSITIVE_RATE"),
             default=97.0,
         ),
+        opportunity_hot_card_provider_enabled=_as_bool(
+            os.getenv("OPENCLAW_OPPORTUNITY_HOT_CARD_PROVIDER_ENABLED"),
+            default=True,
+        ),
+        opportunity_hot_card_per_game_limit=_as_int(
+            os.getenv("OPENCLAW_OPPORTUNITY_HOT_CARD_PER_GAME_LIMIT"),
+            default=3,
+        ),
+        opportunity_hot_card_min_score=_as_float(
+            os.getenv("OPENCLAW_OPPORTUNITY_HOT_CARD_MIN_SCORE"),
+            default=60.0,
+        ),
+        opportunity_web_trend_provider_enabled=_as_bool(
+            os.getenv("OPENCLAW_OPPORTUNITY_WEB_TREND_PROVIDER_ENABLED"),
+            default=True,
+        ),
+        opportunity_web_trend_queries=_parse_csv(
+            os.getenv("OPENCLAW_OPPORTUNITY_WEB_TREND_QUERIES"),
+        ),
+        opportunity_web_trend_results_per_query=_as_int(
+            os.getenv("OPENCLAW_OPPORTUNITY_WEB_TREND_RESULTS_PER_QUERY"),
+            default=5,
+        ),
+        opportunity_sns_domain_backfill_enabled=_as_bool(
+            os.getenv("OPENCLAW_OPPORTUNITY_SNS_DOMAIN_BACKFILL_ENABLED"),
+            default=True,
+        ),
+        opportunity_sns_auto_discovery_enabled=_as_bool(
+            os.getenv("OPENCLAW_OPPORTUNITY_SNS_AUTO_DISCOVERY_ENABLED"),
+            default=True,
+        ),
+        opportunity_sns_auto_discovery_interval_hours=_as_int(
+            os.getenv("OPENCLAW_OPPORTUNITY_SNS_AUTO_DISCOVERY_INTERVAL_HOURS"),
+            default=6,
+        ),
+        opportunity_sns_auto_discovery_max_new_per_run=_as_int(
+            os.getenv("OPENCLAW_OPPORTUNITY_SNS_AUTO_DISCOVERY_MAX_NEW_PER_RUN"),
+            default=2,
+        ),
+        opportunity_sns_auto_discovery_min_confidence=_as_float(
+            os.getenv("OPENCLAW_OPPORTUNITY_SNS_AUTO_DISCOVERY_MIN_CONFIDENCE"),
+            default=0.7,
+        ),
     )
 
 
@@ -185,10 +241,21 @@ def _getenv_any(*keys: str) -> str | None:
     return None
 
 
-def _as_bool(value: str | None) -> bool:
+def _as_bool(value: str | None, *, default: bool = False) -> bool:
     if value is None:
+        return default
+    stripped = value.strip().lower()
+    if stripped in {"1", "true", "yes", "on"}:
+        return True
+    if stripped in {"0", "false", "no", "off"}:
         return False
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+    return default
+
+
+def _parse_csv(value: str | None) -> tuple[str, ...]:
+    if not value:
+        return ()
+    return tuple(item.strip() for item in value.split(",") if item.strip())
 
 
 def _as_int(value: str | None, *, default: int) -> int:
