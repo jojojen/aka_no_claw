@@ -8,17 +8,22 @@ from openclaw_adapter.opportunity_agent import (
     WebOpportunityResearcher,
     WebResearchCandidateProvider,
     _build_opportunity_research_query,
+    _build_sns_candidate_prompt,
+    _format_title_with_identifier,
     _parse_candidate_response,
     dismiss_opportunity_target,
     format_opportunity_recommendation,
+    format_opportunity_status,
 )
 from openclaw_adapter.opportunity_models import (
     ListingOffer,
     OpportunityCandidate,
     OpportunityRecommendation,
+    PRODUCT_TYPES,
     PriceCheck,
     ReputationCheck,
     build_candidate_id,
+    normalize_product_type,
 )
 from openclaw_adapter.web_search import WebSearchResult
 from openclaw_adapter.opportunity_pipeline import OpportunityPipeline
@@ -403,8 +408,14 @@ def test_format_opportunity_recommendation_contains_key_fields() -> None:
 
 def test_format_opportunity_recommendation_includes_web_research_sources() -> None:
     candidate = OpportunityCandidate(
-        candidate_id=build_candidate_id(game="pokemon", title="Umbreon ex SAR", search_query="Umbreon ex SAR"),
+        candidate_id=build_candidate_id(
+            game="pokemon",
+            product_type="single_card",
+            title="Umbreon ex SAR",
+            search_query="Umbreon ex SAR",
+        ),
         game="pokemon",
+        product_type="single_card",
         title="Umbreon ex SAR",
         search_query="Umbreon ex SAR",
         heat_score=94.0,
@@ -460,11 +471,25 @@ def test_format_opportunity_recommendation_includes_web_research_sources() -> No
     assert "[2] Price source" in text
 
 
-def _candidate(title: str = "Umbreon ex SAR", heat_score: float = 91.0) -> OpportunityCandidate:
+def _candidate(
+    title: str = "Umbreon ex SAR",
+    heat_score: float = 91.0,
+    *,
+    product_type: str = "single_card",
+    product_identifier: str | None = None,
+) -> OpportunityCandidate:
     return OpportunityCandidate(
-        candidate_id=build_candidate_id(game="pokemon", title=title, search_query=title),
+        candidate_id=build_candidate_id(
+            game="pokemon",
+            product_type=product_type,
+            title=title,
+            search_query=title,
+            product_identifier=product_identifier,
+        ),
         game="pokemon",
+        product_type=product_type,
         title=title,
+        product_identifier=product_identifier,
         search_query=title,
         heat_score=heat_score,
         reason="SNS demand is rising.",
@@ -509,3 +534,217 @@ class _FakeNotifier:
 
     def notify(self, recommendation) -> None:
         self.sent.append(recommendation)
+
+
+# ─── Three-level candidate structure (game / product_type / title) ───────────
+
+
+def test_parse_sns_candidate_response_extracts_three_level_structure() -> None:
+    posts = [
+        SnsPost(
+            tweet_id="t1",
+            author_handle="@source",
+            text="スタートデッキ100 予約情報",
+            created_at="2026-05-16T00:00:00+00:00",
+            rule_label="pokemon",
+        )
+    ]
+    raw = """
+    {"candidates":[{"game":"pokemon","product_type":"starter_deck","title":"スタートデッキ100","product_identifier":null,"search_query":"スタートデッキ100","heat_score":70,"reason":"予約","source_tweet_ids":["t1"]}]}
+    """
+
+    candidates = _parse_candidate_response(raw, posts=posts, limit=5)
+
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate.game == "pokemon"
+    assert candidate.product_type == "starter_deck"
+    assert candidate.title == "スタートデッキ100"
+    assert candidate.product_identifier is None
+
+
+def test_parse_sns_candidate_response_splits_multi_product_into_separate_candidates() -> None:
+    # The previously merged "インフェルノX・スタートデッキ100" bug case — once
+    # the LLM correctly emits two candidates with different product_types,
+    # the parser must keep them separate (different candidate_ids).
+    posts = [
+        SnsPost(
+            tweet_id="t1",
+            author_handle="@source",
+            text="インフェルノX・スタートデッキ100 抽選情報",
+            created_at="2026-05-16T00:00:00+00:00",
+            rule_label="pokemon",
+        )
+    ]
+    raw = """
+    {
+      "candidates": [
+        {"game":"pokemon","product_type":"sealed_box","title":"インフェルノX","product_identifier":null,"search_query":"インフェルノX","heat_score":70,"reason":"再販情報","source_tweet_ids":["t1"]},
+        {"game":"pokemon","product_type":"starter_deck","title":"スタートデッキ100","product_identifier":null,"search_query":"スタートデッキ100","heat_score":68,"reason":"予約情報","source_tweet_ids":["t1"]}
+      ]
+    }
+    """
+
+    candidates = _parse_candidate_response(raw, posts=posts, limit=5)
+
+    assert len(candidates) == 2
+    assert {c.title for c in candidates} == {"インフェルノX", "スタートデッキ100"}
+    assert {c.product_type for c in candidates} == {"sealed_box", "starter_deck"}
+    assert candidates[0].candidate_id != candidates[1].candidate_id
+
+
+def test_normalize_product_type_maps_aliases() -> None:
+    assert normalize_product_type("single_card") == "single_card"
+    assert normalize_product_type("trading_card") == "single_card"
+    assert normalize_product_type("box") == "sealed_box"
+    assert normalize_product_type("Display") == "sealed_box"
+    assert normalize_product_type("deck") == "starter_deck"
+    assert normalize_product_type("structure-deck") == "starter_deck"
+    assert normalize_product_type("Booster") == "booster_pack"
+    assert normalize_product_type("random_nonsense") == "other"
+    assert normalize_product_type(None) == "other"
+    assert normalize_product_type("") == "other"
+    # Every alias output should be a real enum value.
+    for alias_input in ("card", "trading_card", "pack", "Box", "Display", "Trial Deck", "promotional"):
+        assert normalize_product_type(alias_input) in PRODUCT_TYPES
+
+
+def test_build_candidate_id_differs_when_product_type_differs() -> None:
+    common = dict(game="pokemon", title="ピカチュウex", search_query="ピカチュウex")
+    single = build_candidate_id(**common, product_type="single_card")
+    sealed = build_candidate_id(**common, product_type="sealed_box")
+    assert single != sealed
+
+
+def test_opportunity_status_renders_product_type_layer(tmp_path: Path) -> None:
+    settings = AssistantSettings(opportunity_db_path=str(tmp_path / "hunt.sqlite3"))
+    store = OpportunityStore(settings.opportunity_db_path)
+    store.bootstrap()
+    store.upsert_candidate(
+        OpportunityCandidate(
+            candidate_id=build_candidate_id(
+                game="pokemon",
+                product_type="single_card",
+                title="ピカチュウex SAR",
+                search_query="ピカチュウex 201/165 SAR",
+                product_identifier="201/165",
+            ),
+            game="pokemon",
+            product_type="single_card",
+            title="ピカチュウex SAR",
+            product_identifier="201/165",
+            search_query="ピカチュウex 201/165 SAR",
+            heat_score=85.0,
+            reason="收藏熱度上升",
+        )
+    )
+    store.upsert_candidate(
+        OpportunityCandidate(
+            candidate_id=build_candidate_id(
+                game="pokemon",
+                product_type="starter_deck",
+                title="スタートデッキ100",
+                search_query="スタートデッキ100",
+            ),
+            game="pokemon",
+            product_type="starter_deck",
+            title="スタートデッキ100",
+            search_query="スタートデッキ100",
+            heat_score=70.0,
+            reason="再販情報",
+        )
+    )
+
+    text = format_opportunity_status(settings)
+
+    # Three-level header on each row.
+    assert "[pokemon / single_card]" in text
+    assert "[pokemon / starter_deck]" in text
+    # Single card shows identifier in parentheses.
+    assert "ピカチュウex SAR (201/165)" in text
+
+
+def test_format_title_with_identifier_uses_product_type_aware_braces() -> None:
+    assert _format_title_with_identifier(title="X", product_type="single_card", identifier="201/165") == "X (201/165)"
+    assert _format_title_with_identifier(title="X", product_type="sealed_box", identifier="sv-p") == "X [sv-p]"
+    assert _format_title_with_identifier(title="X", product_type="booster_pack", identifier="sv-p") == "X [sv-p]"
+    assert _format_title_with_identifier(title="X", product_type="other", identifier="sv-p") == "X"
+    assert _format_title_with_identifier(title="X", product_type="single_card", identifier=None) == "X"
+
+
+def test_sns_candidate_prompt_explains_three_level_structure() -> None:
+    prompt = _build_sns_candidate_prompt(
+        posts=[
+            SnsPost(
+                tweet_id="t1",
+                author_handle="@source",
+                text="dummy",
+                created_at="2026-05-16T00:00:00+00:00",
+                rule_label="pokemon",
+            )
+        ],
+        limit=3,
+    )
+
+    # All six enum values must appear so the LLM knows the constrained set.
+    for product_type in PRODUCT_TYPES:
+        assert product_type in prompt
+    # Rule wording exists.
+    assert "拆成多個 candidate" in prompt
+    # Both the "split" example and the "keep" example are present.
+    assert "インフェルノX・スタートデッキ100" in prompt
+    assert "ピカチュウ・カビゴンex" in prompt
+
+
+def test_opportunity_store_migrates_legacy_schema_by_drop_rebuild(tmp_path: Path) -> None:
+    import sqlite3
+
+    db_path = tmp_path / "hunt.sqlite3"
+    legacy_schema = """
+    CREATE TABLE opportunity_candidates (
+        candidate_id TEXT PRIMARY KEY,
+        game TEXT NOT NULL,
+        title TEXT NOT NULL,
+        search_query TEXT NOT NULL,
+        heat_score REAL NOT NULL,
+        reason TEXT NOT NULL,
+        source_kind TEXT NOT NULL,
+        source_url TEXT NOT NULL,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        status TEXT NOT NULL DEFAULT 'active',
+        last_checked_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    """
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript(legacy_schema)
+        connection.execute(
+            "INSERT INTO opportunity_candidates VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "legacy_id",
+                "pokemon",
+                "legacy title",
+                "legacy search",
+                10.0,
+                "legacy reason",
+                "sns",
+                "",
+                "{}",
+                "active",
+                None,
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        connection.commit()
+
+    store = OpportunityStore(db_path)
+    store.bootstrap()
+
+    with sqlite3.connect(db_path) as connection:
+        rows = list(connection.execute("SELECT * FROM opportunity_candidates"))
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(opportunity_candidates)")}
+    assert rows == []  # legacy row was dropped during migration
+    assert "product_type" in columns
+    assert "product_identifier" in columns

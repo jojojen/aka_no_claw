@@ -28,6 +28,7 @@ from .opportunity_models import (
     ReputationCheck,
     build_candidate_id,
     build_listing_key,
+    normalize_product_type,
 )
 from .opportunity_pipeline import OpportunityPipeline, OpportunityPipelineStats
 from .opportunity_scoring import OpportunityThresholds, reputation_passes
@@ -537,6 +538,16 @@ def format_opportunity_recommendation(recommendation: OpportunityRecommendation)
     return "\n".join(lines)
 
 
+def _format_title_with_identifier(*, title: str, product_type: str, identifier: str | None) -> str:
+    if not identifier:
+        return title
+    if product_type == "single_card":
+        return f"{title} ({identifier})"
+    if product_type in {"sealed_box", "booster_pack"}:
+        return f"{title} [{identifier}]"
+    return title
+
+
 def format_opportunity_status(settings: AssistantSettings, *, limit: int = 10) -> str:
     store = OpportunityStore(settings.opportunity_db_path)
     store.bootstrap()
@@ -557,8 +568,17 @@ def format_opportunity_status(settings: AssistantSettings, *, limit: int = 10) -
     else:
         for index, row in enumerate(candidates, 1):
             checked = row["last_checked_at"] or "尚未檢查"
+            product_type = (
+                row["product_type"] if "product_type" in row.keys() and row["product_type"] else "other"
+            )
+            identifier = row["product_identifier"] if "product_identifier" in row.keys() else None
+            title_with_id = _format_title_with_identifier(
+                title=row["title"],
+                product_type=product_type,
+                identifier=identifier,
+            )
             lines.append(
-                f"{index}. [{row['game']}] {row['title']} | heat={float(row['heat_score']):.0f} | checked={checked}"
+                f"{index}. [{row['game']} / {product_type}] {title_with_id} | heat={float(row['heat_score']):.0f} | checked={checked}"
             )
             lines.append(f"   search: {row['search_query']}")
             if row["reason"]:
@@ -656,18 +676,46 @@ def _build_sns_candidate_prompt(posts: Sequence[SnsPost], *, limit: int) -> str:
         "你是 OpenClaw 的商品機會偵測器。請從 SNS 貼文中找出有交易潛力的 TCG/收藏卡商品。",
         f"只接受 {supported_game_hint()}。忽略不明確、不是商品、或沒有買賣價值的話題。",
         "忽略明顯不在支援範圍的系列，例如デュエルマスターズ、ONE PIECE CARD GAME、Dragon Ball。",
-        "title 必須是真正能在二級市場交易/搜尋的商品名，不要包含情報詞、活動詞或來源詞。",
-        "如果貼文是「商品名 + 抽選情報/予約情報/発売情報」，title 只保留商品名。",
-        "如果貼文是「セット名収録 卡名」，title 優先輸出卡名；除非整個セット本身才是商品。",
+        "",
+        "每個候選必須描述「同一個」具體商品，並且帶上三層結構：",
+        "- game (Layer 1, IP)：pokemon / ws / yugioh / union_arena",
+        "- product_type (Layer 2, 商品類型)：必須是下列其中之一：",
+        "    single_card  - 單張卡片（例：ピカチュウex SAR、青眼の白龍 QCCP-JP001）",
+        "    booster_pack - 拆售或補充包（例：強化拡張パック 単品）",
+        "    sealed_box   - 整盒、整箱、display（例：強化拡張パック ボックス、ハイクラスパック ボックス）",
+        "    starter_deck - 預組產品（例：スタートデッキ100、Structure Deck、Trial Deck）",
+        "    promo        - 抽選 / promo 卡（例：プロモパック）",
+        "    other        - 不屬上面五類",
+        "- title (Layer 3)：可在二級市場搜尋到的具體商品名（不要包含「抽選情報」「予約情報」等情報詞）",
+        "- product_identifier (Layer 3 細項)：單張卡填卡號（例 201/165、QCCP-JP001），整盒填 set code（例 sv-p），其他可為 null",
+        "- search_query：Mercari 搜尋用的關鍵字",
+        "",
+        "拆分規則（重要）：",
+        "- 如果同一則貼文同時提到多個不同 product_type 的商品（例如「擴充包系列」+「Start Deck 產品」），必須拆成多個 candidate，每個 candidate 只描述一個具體商品。",
+        "- 即使兩個商品都是同一個 IP、即使在同一個句子裡用「・」「／」「、」「&」「+」分隔，只要是兩個獨立商品線（不同 product_type，或同 type 但不同商品），就要拆開成多個 candidate。",
+        "- 但是商品名本身內含的「・」（例：同一張卡上的多個寶可夢名）要保留不拆。",
+        "",
+        "Title 規則：",
+        "- 如果貼文是「商品名 + 抽選情報/予約情報/発売情報」，title 只保留商品名。",
+        "- 如果貼文是「セット名収録 卡名」，title 優先輸出卡名（product_type=single_card）；除非整套 set 本身才是商品（product_type=sealed_box 或 booster_pack）。",
         f"最多輸出 {limit} 個候選。",
         "",
         "請嚴格輸出 JSON，不要 markdown：",
-        '{"candidates":[{"game":"pokemon|ws|yugioh|union_arena","title":"商品名","search_query":"Mercari 搜尋關鍵字","heat_score":0-100,"reason":"一句話原因","source_tweet_ids":["..."]}]}',
+        '{"candidates":[{"game":"pokemon|ws|yugioh|union_arena","product_type":"single_card|booster_pack|sealed_box|starter_deck|promo|other","title":"商品名","product_identifier":"卡號或set code或null","search_query":"Mercari 關鍵字","heat_score":0-100,"reason":"一句話原因","source_tweet_ids":["..."]}]}',
         "",
         "正確例子：",
-        "- アビスアイ 抽選情報 -> title=アビスアイ, search_query=アビスアイ",
-        "- アビスアイ収録 ホエルオーex -> title=ホエルオーex, search_query=ホエルオーex",
-        "- カスミの元気 Mercari -> title=カスミの元気, search_query=カスミの元気",
+        "- 貼文「インフェルノX・スタートデッキ100 抽選情報」",
+        "  -> 兩個 candidate：",
+        '     {"game":"pokemon","product_type":"sealed_box","title":"インフェルノX","product_identifier":null,...}',
+        '     {"game":"pokemon","product_type":"starter_deck","title":"スタートデッキ100","product_identifier":null,...}',
+        "- 貼文「アビスアイ収録 ホエルオーex 201/165 SAR」",
+        "  -> 一個 candidate：",
+        '     {"game":"pokemon","product_type":"single_card","title":"ホエルオーex","product_identifier":"201/165",...}',
+        "- 貼文「ピカチュウ・カビゴンex（同一張卡）」",
+        "  -> 一個 candidate（保留商品名內固有的「・」）：",
+        '     {"game":"pokemon","product_type":"single_card","title":"ピカチュウ・カビゴンex","product_identifier":null,...}',
+        "- 貼文「カスミの元気 Mercari」",
+        '  -> {"game":"pokemon","product_type":"single_card","title":"カスミの元気","search_query":"カスミの元気",...}',
         "",
         "SNS 貼文：",
     ]
@@ -861,6 +909,24 @@ def _parse_candidate_response(raw: str, *, posts: Sequence[SnsPost], limit: int)
         search_query = _normalize_search_query(raw_search_query, fallback=title)
         if game is None or not title or not search_query or _looks_like_unsupported_franchise(title):
             continue
+        product_type = normalize_product_type(item.get("product_type"))
+        raw_identifier = item.get("product_identifier")
+        if isinstance(raw_identifier, str):
+            cleaned_identifier = raw_identifier.strip()
+            product_identifier: str | None = cleaned_identifier or None
+        else:
+            product_identifier = None
+        # Telemetry: surface candidates whose title still contains a typical
+        # multi-product separator. If the LLM had correctly split, neither half
+        # of the source would have these. Frequent hits in prod = signal to
+        # tighten the prompt or add a second-pass split verifier.
+        if any(sep in title for sep in ("・", "／", "、", "&")):
+            logger.info(
+                "Opportunity candidate title still contains a multi-product separator after LLM extraction title=%r game=%s product_type=%s",
+                title,
+                game,
+                product_type,
+            )
         heat_score = _clamp_float(item.get("heat_score"), minimum=0.0, maximum=100.0, default=0.0)
         source_ids = [
             str(source_id)
@@ -869,9 +935,17 @@ def _parse_candidate_response(raw: str, *, posts: Sequence[SnsPost], limit: int)
         ] if isinstance(item.get("source_tweet_ids"), list) else []
         candidates.append(
             OpportunityCandidate(
-                candidate_id=build_candidate_id(game=game, title=title, search_query=search_query),
+                candidate_id=build_candidate_id(
+                    game=game,
+                    product_type=product_type,
+                    title=title,
+                    search_query=search_query,
+                    product_identifier=product_identifier,
+                ),
                 game=game,
+                product_type=product_type,
                 title=title,
+                product_identifier=product_identifier,
                 search_query=search_query,
                 heat_score=heat_score,
                 reason=str(item.get("reason") or "SNS discussion signal").strip(),
