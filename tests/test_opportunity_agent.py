@@ -1205,3 +1205,39 @@ def test_sns_account_auto_discovery_omits_source_when_same_as_profile(tmp_path: 
     kb = notifications[0]["reply_markup"]
     assert kb is not None
     assert kb["inline_keyboard"][0][0]["callback_data"] == "snsdel:poke_news_jp"
+
+
+def test_mercari_listing_finder_passes_default_condition_ids(monkeypatch) -> None:
+    """Hunt's Mercari listing finder must filter to (1, 2, 3) — same quality
+    bar as the user-watch default — so we don't recommend dirty cards."""
+    from openclaw_adapter.opportunity_agent import MercariOpportunityListingFinder
+    from openclaw_adapter import opportunity_agent as oa_module
+    from openclaw_adapter.opportunity_models import OpportunityCandidate
+
+    captured = {}
+
+    def fake_search(query, *, price_max, max_results, condition_ids=None):
+        captured["query"] = query
+        captured["price_max"] = price_max
+        captured["max_results"] = max_results
+        captured["condition_ids"] = condition_ids
+        return []
+
+    monkeypatch.setattr(oa_module, "search_mercari", fake_search)
+
+    finder = MercariOpportunityListingFinder()
+    finder.find(
+        OpportunityCandidate(
+            candidate_id="opp_test",
+            game="pokemon",
+            product_type="single_card",
+            title="Test card",
+            search_query="test",
+            heat_score=1.0,
+            reason="test",
+        ),
+        price_max_jpy=5000,
+        limit=10,
+    )
+
+    assert captured["condition_ids"] == (1, 2, 3)

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from assistant_runtime import AssistantSettings, build_ssl_context, get_settings
-from market_monitor.mercari_search import search_mercari
+from market_monitor.mercari_search import DEFAULT_CONDITION_IDS, search_mercari
 from price_monitor_bot.bot import TelegramBotClient
 from price_monitor_bot.commands import lookup_card
 from tcg_tracker.catalog import normalize_game_key, supported_game_hint
@@ -525,7 +525,15 @@ class TcgFairValueChecker:
 
 class MercariOpportunityListingFinder:
     def find(self, candidate: OpportunityCandidate, *, price_max_jpy: int, limit: int) -> Sequence[ListingOffer]:
-        results = search_mercari(candidate.search_query or candidate.title, price_max=price_max_jpy, max_results=limit)
+        # Hunt is system-driven; filter to the same "目立った傷や汚れなし以上"
+        # quality bar as the default user watches so we don't recommend
+        # listings the user would never buy.
+        results = search_mercari(
+            candidate.search_query or candidate.title,
+            price_max=price_max_jpy,
+            max_results=limit,
+            condition_ids=DEFAULT_CONDITION_IDS,
+        )
         offers: list[ListingOffer] = []
         for raw in results:
             url = str(raw.get("url") or "")
