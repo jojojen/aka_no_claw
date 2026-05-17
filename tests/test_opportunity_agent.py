@@ -1124,8 +1124,10 @@ def test_sns_account_auto_discovery_sends_notification_with_domains(tmp_path: Pa
     db = SnsDatabase(tmp_path / "sns.sqlite3")
     db.bootstrap()
 
+    source_tweet_url = "https://twitter.com/poke_news_jp/status/1234567890"
+
     def fake_search(query, *, max_results):  # noqa: ARG001
-        return (WebSearchResult(title="r", url="https://twitter.com/poke_news_jp", snippet=""),)
+        return (WebSearchResult(title="r", url=source_tweet_url, snippet=""),)
 
     def fake_llm(prompt):  # noqa: ARG001
         return '{"is_tcg":true,"domains":["pokemon","tcg"],"confidence":0.9,"reason":"covers TCG news"}'
@@ -1143,5 +1145,42 @@ def test_sns_account_auto_discovery_sends_notification_with_domains(tmp_path: Pa
 
     assert len(added) == 1
     assert added[0].screen_name == "poke_news_jp"
-    assert notifications and "自動加入追蹤 @poke_news_jp" in notifications[0]
-    assert "pokemon" in notifications[0]
+    msg = notifications[0]
+    assert "自動加入追蹤 @poke_news_jp" in msg
+    assert "pokemon" in msg
+    # Account link the user can click straight to the profile
+    assert "帳號：https://x.com/poke_news_jp" in msg
+    # The specific URL that triggered the auto-add (only included when distinct
+    # from the bare profile link)
+    assert f"觸發來源：{source_tweet_url}" in msg
+
+
+def test_sns_account_auto_discovery_omits_source_when_same_as_profile(tmp_path: Path) -> None:
+    """If the only search-result URL is the profile itself there's no extra
+    tweet to surface — don't echo the same link twice."""
+    from openclaw_adapter.web_search import WebSearchResult
+    from sns_monitor.storage import SnsDatabase
+
+    db = SnsDatabase(tmp_path / "sns.sqlite3")
+    db.bootstrap()
+
+    def fake_search(query, *, max_results):  # noqa: ARG001
+        return (WebSearchResult(title="r", url="https://x.com/poke_news_jp", snippet=""),)
+
+    def fake_llm(prompt):  # noqa: ARG001
+        return '{"is_tcg":true,"domains":["pokemon"],"confidence":0.9,"reason":"covers TCG news"}'
+
+    notifications: list[str] = []
+    discover_tcg_sns_accounts(
+        sns_db=db,
+        search_fn=fake_search,
+        llm_fn=fake_llm,
+        telegram_notify_fn=notifications.append,
+        queries=("test",),
+        max_new_per_run=1,
+        min_confidence=0.7,
+    )
+
+    assert notifications
+    assert "觸發來源" not in notifications[0]
+    assert "帳號：https://x.com/poke_news_jp" in notifications[0]
