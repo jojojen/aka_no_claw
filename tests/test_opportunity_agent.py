@@ -1132,12 +1132,16 @@ def test_sns_account_auto_discovery_sends_notification_with_domains(tmp_path: Pa
     def fake_llm(prompt):  # noqa: ARG001
         return '{"is_tcg":true,"domains":["pokemon","tcg"],"confidence":0.9,"reason":"covers TCG news"}'
 
-    notifications: list[str] = []
+    notifications: list[dict[str, object]] = []
+
+    def capture(text, *, reply_markup=None):
+        notifications.append({"text": text, "reply_markup": reply_markup})
+
     added = discover_tcg_sns_accounts(
         sns_db=db,
         search_fn=fake_search,
         llm_fn=fake_llm,
-        telegram_notify_fn=notifications.append,
+        telegram_notify_fn=capture,
         queries=("test",),
         max_new_per_run=1,
         min_confidence=0.7,
@@ -1145,7 +1149,8 @@ def test_sns_account_auto_discovery_sends_notification_with_domains(tmp_path: Pa
 
     assert len(added) == 1
     assert added[0].screen_name == "poke_news_jp"
-    msg = notifications[0]
+    assert notifications
+    msg = notifications[0]["text"]
     assert "自動加入追蹤 @poke_news_jp" in msg
     assert "pokemon" in msg
     # Account link the user can click straight to the profile
@@ -1153,6 +1158,13 @@ def test_sns_account_auto_discovery_sends_notification_with_domains(tmp_path: Pa
     # The specific URL that triggered the auto-add (only included when distinct
     # from the bare profile link)
     assert f"觸發來源：{source_tweet_url}" in msg
+    # The legacy "/snsdelete @..." text is replaced by an inline button.
+    assert "/snsdelete" not in msg
+    kb = notifications[0]["reply_markup"]
+    assert kb is not None
+    button = kb["inline_keyboard"][0][0]
+    assert button["callback_data"] == "snsdel:poke_news_jp"
+    assert "@poke_news_jp" in button["text"]
 
 
 def test_sns_account_auto_discovery_omits_source_when_same_as_profile(tmp_path: Path) -> None:
@@ -1170,17 +1182,26 @@ def test_sns_account_auto_discovery_omits_source_when_same_as_profile(tmp_path: 
     def fake_llm(prompt):  # noqa: ARG001
         return '{"is_tcg":true,"domains":["pokemon"],"confidence":0.9,"reason":"covers TCG news"}'
 
-    notifications: list[str] = []
+    notifications: list[dict[str, object]] = []
+
+    def capture(text, *, reply_markup=None):
+        notifications.append({"text": text, "reply_markup": reply_markup})
+
     discover_tcg_sns_accounts(
         sns_db=db,
         search_fn=fake_search,
         llm_fn=fake_llm,
-        telegram_notify_fn=notifications.append,
+        telegram_notify_fn=capture,
         queries=("test",),
         max_new_per_run=1,
         min_confidence=0.7,
     )
 
     assert notifications
-    assert "觸發來源" not in notifications[0]
-    assert "帳號：https://x.com/poke_news_jp" in notifications[0]
+    msg = notifications[0]["text"]
+    assert "觸發來源" not in msg
+    assert "帳號：https://x.com/poke_news_jp" in msg
+    # Inline button is still present even without the extra source URL.
+    kb = notifications[0]["reply_markup"]
+    assert kb is not None
+    assert kb["inline_keyboard"][0][0]["callback_data"] == "snsdel:poke_news_jp"

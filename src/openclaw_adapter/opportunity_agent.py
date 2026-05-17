@@ -835,7 +835,7 @@ def _build_preflight_callable(*, settings: AssistantSettings, ssl_context):
 
     notifier_state = {"client": None}
 
-    def _telegram_notify(text: str) -> None:
+    def _telegram_notify(text: str, *, reply_markup: dict[str, object] | None = None) -> None:
         chat_ids = tuple(cid for cid in settings.openclaw_telegram_chat_ids if cid)
         token = settings.openclaw_telegram_bot_token
         if not token or not chat_ids:
@@ -847,7 +847,9 @@ def _build_preflight_callable(*, settings: AssistantSettings, ssl_context):
         if notifier_state["client"] is None:
             notifier_state["client"] = TelegramBotClient(token, ssl_context=ssl_context)
         for chat_id in chat_ids:
-            notifier_state["client"].send_message(chat_id=chat_id, text=text)
+            notifier_state["client"].send_message(
+                chat_id=chat_id, text=text, reply_markup=reply_markup
+            )
 
     last_discovery_at = {"value": 0.0}
     discovery_interval_seconds = max(60, settings.opportunity_sns_auto_discovery_interval_hours * 3600)
