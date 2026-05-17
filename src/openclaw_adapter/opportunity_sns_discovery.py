@@ -188,8 +188,15 @@ def discover_tcg_sns_accounts(
                     lines.append(f"原因：{verdict['reason']}")
                 if candidate.url and candidate.url != account_url:
                     lines.append(f"觸發來源：{candidate.url}")
-                lines.append(f"不滿意可：/snsdelete @{candidate.handle}")
-                telegram_notify_fn("\n".join(lines))
+                reply_markup = {
+                    "inline_keyboard": [[
+                        {
+                            "text": f"❌ 刪除追蹤 @{candidate.handle}",
+                            "callback_data": f"snsdel:{candidate.handle}",
+                        }
+                    ]]
+                }
+                telegram_notify_fn("\n".join(lines), reply_markup=reply_markup)
             except Exception:
                 logger.exception("SnsAccountAutoDiscovery Telegram notify failed handle=@%s", candidate.handle)
         if len(added) >= max_new_per_run:
