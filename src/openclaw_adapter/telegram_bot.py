@@ -46,7 +46,7 @@ from price_monitor_bot.watch_monitor import ensure_monitor as _ensure_watch_moni
 from tcg_tracker.image_lookup import TcgVisionSettings
 
 from .natural_language import build_telegram_natural_language_router_from_settings
-from .opportunity_agent import dismiss_opportunity_target, format_opportunity_status
+from .opportunity_agent import dismiss_opportunity_target, format_opportunity_status, list_opportunity_targets
 from .reputation_agent import ensure_agent_thread
 from .reputation_snapshot import (
     ReputationSnapshotResult,
@@ -375,6 +375,7 @@ def run_telegram_polling(
         status_renderer=lambda: _build_status_text(settings),
         opportunity_status_renderer=lambda: format_opportunity_status(settings),
         opportunity_target_remover=lambda target: dismiss_opportunity_target(settings, target),
+        opportunity_list_provider=lambda: list_opportunity_targets(settings),
         watch_db=watch_db,
         sns_db=sns_db,
         sns_buzz_fn=sns_buzz_fn,
