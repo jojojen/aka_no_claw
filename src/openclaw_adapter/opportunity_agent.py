@@ -993,6 +993,34 @@ def format_opportunity_status(settings: AssistantSettings, *, limit: int = 10) -
     return "\n".join(lines)
 
 
+def list_opportunity_targets(settings: AssistantSettings, *, limit: int = 50) -> list[dict[str, object]]:
+    """Structured candidate list for the bot's paginated `/hunt` view.
+
+    Returns rows in the same recency-ordered shape as ``format_opportunity_status``
+    uses, but as plain dicts the Telegram-side renderer can paginate over without
+    touching ``OpportunityStore`` directly.
+    """
+    store = OpportunityStore(settings.opportunity_db_path)
+    store.bootstrap()
+    rows = store.list_recent_candidates(limit=limit)
+    results: list[dict[str, object]] = []
+    for row in rows:
+        product_type = (
+            row["product_type"] if "product_type" in row.keys() and row["product_type"] else "other"
+        )
+        results.append({
+            "candidate_id": row["candidate_id"],
+            "game": row["game"],
+            "product_type": product_type,
+            "title": row["title"],
+            "heat_score": float(row["heat_score"]) if row["heat_score"] is not None else None,
+            "search_query": row["search_query"],
+            "last_checked_at": row["last_checked_at"] or None,
+            "reason": row["reason"] if "reason" in row.keys() else None,
+        })
+    return results
+
+
 def dismiss_opportunity_target(settings: AssistantSettings, target: str, *, limit: int = 30) -> str:
     selector = " ".join(target.split()).strip()
     if not selector:

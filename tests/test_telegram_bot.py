@@ -83,9 +83,15 @@ class FakeTelegramClient:
         self.sent_documents: list[tuple[str, str | None]] = []
         self.sent_photos: list[tuple[str, str | None]] = []
 
-    def send_message(self, *, chat_id: str | int, text: str) -> dict[str, object]:
+    def send_message(
+        self,
+        *,
+        chat_id: str | int,
+        text: str,
+        reply_markup: dict[str, object] | None = None,
+    ) -> dict[str, object]:
         self.sent_messages.append(text)
-        return {"chat_id": str(chat_id), "text": text}
+        return {"chat_id": str(chat_id), "text": text, "reply_markup": reply_markup}
 
     def send_document(self, *, chat_id: str | int, document_path: Path, caption: str | None = None) -> dict[str, object]:
         self.sent_documents.append((document_path.name, caption))
