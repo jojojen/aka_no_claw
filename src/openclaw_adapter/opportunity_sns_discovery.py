@@ -178,13 +178,18 @@ def discover_tcg_sns_accounts(
         )
         if telegram_notify_fn is not None:
             try:
-                telegram_notify_fn(
-                    "🔎 自動加入追蹤 @"
-                    + candidate.handle
-                    + "\n領域：" + ", ".join(domains)
-                    + (f"\n原因：{verdict['reason']}" if verdict.get("reason") else "")
-                    + f"\n不滿意可：/snsdelete @{candidate.handle}"
-                )
+                account_url = f"https://x.com/{candidate.handle}"
+                lines = [
+                    f"🔎 自動加入追蹤 @{candidate.handle}",
+                    f"帳號：{account_url}",
+                    f"領域：{', '.join(domains)}",
+                ]
+                if verdict.get("reason"):
+                    lines.append(f"原因：{verdict['reason']}")
+                if candidate.url and candidate.url != account_url:
+                    lines.append(f"觸發來源：{candidate.url}")
+                lines.append(f"不滿意可：/snsdelete @{candidate.handle}")
+                telegram_notify_fn("\n".join(lines))
             except Exception:
                 logger.exception("SnsAccountAutoDiscovery Telegram notify failed handle=@%s", candidate.handle)
         if len(added) >= max_new_per_run:
