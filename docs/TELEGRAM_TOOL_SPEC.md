@@ -53,28 +53,30 @@ The Telegram assistant can reach these tools:
 - `/setprice <watch_id> <price>`
   - Update the price threshold of an existing watch.
 
-- `/snsadd @username`
-  - Add (or upsert) an X (Twitter) account watch rule.
-  - Usage: `/snsadd @akanoclaw`
-  - Optional **filter** keywords (tweet must contain any of them to notify): `/snsadd @elonmusk filter[buy, sell]` or legacy `/snsadd @elonmusk ["buy", "sell"]`.
-  - Optional **domain** tags so the right topic agent can pick up the account: `/snsadd @Laurier_News filter[抽選] domain[pokemon, yugioh]`.
-  - Re-running `/snsadd @same_handle` becomes an upsert: filter and domain replace if explicitly provided; otherwise existing values are preserved.
-
-- `/snsadd keyword:<search_term> domain[<tags>]`
-  - Add (or upsert) a keyword search watch rule.
-  - Usage: `/snsadd keyword:機動戰士 domain[gundam, anime]`
-
-- `/snsadd trend:<category> domain[<tags>]`
-  - Add a trend category to the watch list.
-  - Categories: `trending`, `for-you`, `news`, `sports`, `entertainment`
-  - Usage: `/snsadd trend:trending domain[news]`
+- `/snsadd <source>:<target> [filter[...] domain[...] schedule:NN]`
+  - Add (or upsert) a watch rule. Supported sources:
+    - `x:` — X (Twitter) via Nitter RSS. Account form `@handle`, keyword form `keyword:<term>`, trend form `trend:<category>`.
+    - `reddit:` — Reddit via public JSON API. Subreddit form `r/<sub>`, keyword form `keyword:<term>`. No trend form.
+  - Examples:
+    - `/snsadd x:@akanoclaw domain[pokemon]`
+    - `/snsadd x:@elonmusk filter[buy, sell] domain[stock] schedule:30`
+    - `/snsadd x:keyword:機動戰士 domain[gundam, anime]`
+    - `/snsadd x:trend:trending domain[news]`
+    - `/snsadd reddit:r/PokemonTCG domain[pokemon] schedule:30`
+    - `/snsadd reddit:r/yugioh domain[yugioh] schedule:60`
+    - `/snsadd reddit:keyword:Umbreon ex domain[pokemon]`
+  - **Backcompat**: a bare `@handle` / `keyword:` / `trend:` (no source prefix) is treated as `x:` so existing scripts keep working.
+  - Optional **filter** keywords (post must contain any of them to notify): `filter[抽選, 再販]` or legacy `["抽選", "再販"]`.
+  - Optional **domain** tags so the right topic agent can pick up the rule: `domain[pokemon, yugioh]`.
+  - Optional **schedule** override (per-rule, in minutes, clamped 5–1440): `schedule:30`. Per-source defaults are X-account=15m, X-keyword=30m, X-trend=60m, Reddit-account=30m, Reddit-keyword=60m.
+  - Re-running with the same `<source>:<target>` is an upsert: filter / domain / schedule replace if explicitly provided; otherwise existing values are preserved.
 
 - `/snslist`
-  - List all X (Twitter) watch rules. Each row shows `filter[…]` and `domain[…]`; rules awaiting LLM backfill display `domain[?]`.
+  - List all watch rules. Each row shows `[source] <target> filter[…] domain[…] schedule:NNm`; rules awaiting LLM backfill display `domain[?]`.
 
 - `/snsdelete <target>`
-  - Remove an X watch rule. `<target>` may be a rule ID prefix, an @handle, or `keyword:xxx`.
-  - Examples: `/snsdelete @elonmusk`, `/snsdelete abc12345`, `/snsdelete keyword:機動戰士`
+  - Remove a watch rule. `<target>` may be a rule ID prefix, an @handle (X), `r/<sub>` (Reddit), `keyword:<term>`, or a source-prefixed form (`x:@elon`, `reddit:r/PokemonTCG`, `reddit:keyword:…`).
+  - Examples: `/snsdelete @elonmusk`, `/snsdelete abc12345`, `/snsdelete keyword:機動戰士`, `/snsdelete reddit:r/PokemonTCG`
 
 - Clear filter (natural language only, no slash form)
   - Pattern: `把 @<handle> 的 filter 全部拿掉` / `清空 @<handle> 的篩選` / `clear filter on @<handle>`

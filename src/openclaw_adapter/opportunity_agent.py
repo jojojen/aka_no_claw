@@ -69,6 +69,7 @@ class SnsPost:
     text: str
     created_at: str
     rule_label: str
+    source: str = "x"
 
 
 class SnsLlmCandidateProvider:
@@ -131,7 +132,8 @@ class SnsLlmCandidateProvider:
                 rows = connection.execute(
                     """
                     SELECT t.tweet_id, t.author_handle, t.text, t.created_at,
-                           r.label AS rule_label, r.query_json AS rule_query_json
+                           r.label AS rule_label, r.query_json AS rule_query_json,
+                           COALESCE(r.source, 'x') AS rule_source
                     FROM seen_tweets t
                     LEFT JOIN watch_rules r ON r.rule_id = t.rule_id
                     WHERE t.first_seen_at >= ? OR t.created_at >= ?
@@ -168,6 +170,7 @@ class SnsLlmCandidateProvider:
                     text=str(row["text"]),
                     created_at=str(row["created_at"]),
                     rule_label=str(row["rule_label"] or ""),
+                    source=str(row["rule_source"] or "x"),
                 )
             )
             if len(posts) >= limit:
@@ -1155,7 +1158,7 @@ def _build_sns_candidate_prompt(posts: Sequence[SnsPost], *, limit: int) -> str:
         if len(text) > 260:
             text = text[:260] + "..."
         lines.append(
-            f"[{index}] id={post.tweet_id} rule={post.rule_label} author={post.author_handle} date={post.created_at}: {text}"
+            f"[{index}] id={post.tweet_id} source={post.source} rule={post.rule_label} author={post.author_handle} date={post.created_at}: {text}"
         )
     return "\n".join(lines)
 

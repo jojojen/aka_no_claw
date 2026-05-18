@@ -70,8 +70,16 @@ def _start_sns_monitor(
 
     try:
         from sns_monitor.reddit_buzz import RedditBuzzClient
+        from sns_monitor.sources import RedditSource, XSource
+
         db = bootstrap_sns_db(settings)
-        x_client = XClient(buzz_search_backend=RedditBuzzClient())
+        reddit_client = RedditBuzzClient()
+        x_client = XClient(buzz_search_backend=reddit_client)
+
+        sources = {
+            "x": XSource(x_client),
+            "reddit": RedditSource(client=reddit_client),
+        }
 
         def notify_fn(chat_id: str, text: str) -> None:
             """Notify via Telegram."""
@@ -84,13 +92,15 @@ def _start_sns_monitor(
         monitor, started = ensure_monitor(
             db_path=settings.sns_db_path,
             x_client=x_client,
+            sources=sources,
             notify_fn=notify_fn,
             interval_seconds=60,
         )
-        logger.info("SNS monitor started=%s running=%s", started, monitor.is_running())
+        logger.info("SNS monitor started=%s running=%s sources=%s",
+                    started, monitor.is_running(), sorted(sources.keys()))
         if started:
-            print("[sns-monitor] ✅ X/Twitter monitor started (interval=60s)")
-            print("[sns-monitor] 📱 Monitoring: @aka_claw, @elonmusk, and more")
+            print("[sns-monitor] ✅ SNS monitor started (interval=60s, sources=x+reddit)")
+            print("[sns-monitor] 📱 Monitoring X timelines + Reddit subreddits per watch rules")
 
         buzz_fn = _build_sns_buzz_fn(settings, x_client, ssl_context=ssl_context)
         if buzz_fn is not None:
