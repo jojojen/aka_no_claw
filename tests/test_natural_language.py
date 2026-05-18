@@ -391,6 +391,176 @@ def test_fallback_routes_update_watch_price_with_plain_digits() -> None:
     assert result.watch_price_threshold == 30000
 
 
+# ── sns_bulk_add_filter — batch filter update by domain ──────────────────────
+
+def test_fallback_routes_bulk_filter_update_for_pokemon_domain() -> None:
+    result = fallback_route_telegram_natural_language(
+        "把每個跟pokemon相關的sns 追蹤帳號 filter都加上「抽選」"
+    )
+
+    assert result is not None
+    assert result.intent == "sns_bulk_add_filter"
+    assert result.bulk_target_domain == "pokemon"
+    assert result.bulk_filter_keywords == ("抽選",)
+
+
+def test_fallback_routes_bulk_filter_update_for_tcg_umbrella() -> None:
+    result = fallback_route_telegram_natural_language(
+        "把每個跟 tcg 相關的 sns 追蹤帳號 filter 都加上「抽選」"
+    )
+
+    assert result is not None
+    assert result.intent == "sns_bulk_add_filter"
+    assert result.bulk_target_domain == "tcg"
+    assert result.bulk_filter_keywords == ("抽選",)
+
+
+def test_fallback_routes_bulk_filter_update_for_yugioh() -> None:
+    result = fallback_route_telegram_natural_language(
+        "所有遊戲王帳號的 filter 都加上「新弾」"
+    )
+
+    assert result is not None
+    assert result.intent == "sns_bulk_add_filter"
+    assert result.bulk_target_domain == "yugioh"
+    assert result.bulk_filter_keywords == ("新弾",)
+
+
+def test_fallback_routes_bulk_filter_update_for_ws() -> None:
+    result = fallback_route_telegram_natural_language(
+        "幫所有 ws 帳號 filter 加上「再販」"
+    )
+
+    assert result is not None
+    assert result.intent == "sns_bulk_add_filter"
+    assert result.bulk_target_domain == "ws"
+    assert result.bulk_filter_keywords == ("再販",)
+
+
+def test_fallback_routes_bulk_filter_update_for_union_arena() -> None:
+    result = fallback_route_telegram_natural_language(
+        "把每個 union arena 帳號的 filter 都加上「抽選」"
+    )
+
+    assert result is not None
+    assert result.intent == "sns_bulk_add_filter"
+    assert result.bulk_target_domain == "union_arena"
+    assert result.bulk_filter_keywords == ("抽選",)
+
+
+def test_single_handle_filter_update_still_routes_to_sns_add_account() -> None:
+    """Regression: bulk-filter rescue must not steal single-@handle updates."""
+    result = fallback_route_telegram_natural_language(
+        "幫我把 @tenbai_hakase 加上 [抽選] 篩選"
+    )
+
+    assert result is not None
+    assert result.intent == "sns_add_account"
+    assert result.sns_handle == "tenbai_hakase"
+
+
+# ── _normalize_intent accepts sns_bulk_add_filter LLM payload ────────────────
+
+def test_normalize_intent_accepts_bulk_filter_payload() -> None:
+    from price_monitor_bot.natural_language import _normalize_intent
+
+    payload = {
+        "intent": "sns_bulk_add_filter",
+        "bulk_target_domain": "pokemon",
+        "bulk_filter_keywords": ["抽選"],
+    }
+    result = _normalize_intent(payload)
+
+    assert result.intent == "sns_bulk_add_filter"
+    assert result.bulk_target_domain == "pokemon"
+    assert result.bulk_filter_keywords == ("抽選",)
+
+
+def test_normalize_intent_aliases_bulk_target_domain_chinese() -> None:
+    from price_monitor_bot.natural_language import _normalize_intent
+
+    payload = {
+        "intent": "sns_bulk_add_filter",
+        "bulk_target_domain": "寶可夢",
+        "bulk_filter_keywords": ["抽選"],
+    }
+    result = _normalize_intent(payload)
+
+    assert result.bulk_target_domain == "pokemon"
+
+
+# ── sns_clear_filter — clear include_keywords on a single @handle ─────────────
+
+def test_fallback_routes_clear_filter_for_at_handle() -> None:
+    result = fallback_route_telegram_natural_language(
+        "把 @ARS_Arsales 的 filter 全部拿掉"
+    )
+
+    assert result is not None
+    assert result.intent == "sns_clear_filter"
+    assert result.sns_handle == "ARS_Arsales"
+
+
+def test_fallback_routes_clear_filter_with_qingkong() -> None:
+    result = fallback_route_telegram_natural_language("清空 @elonmusk 的篩選")
+
+    assert result is not None
+    assert result.intent == "sns_clear_filter"
+    assert result.sns_handle == "elonmusk"
+
+
+def test_fallback_routes_clear_filter_with_qingchu() -> None:
+    result = fallback_route_telegram_natural_language("把 @aka_claw 的關鍵字清除")
+
+    assert result is not None
+    assert result.intent == "sns_clear_filter"
+    assert result.sns_handle == "aka_claw"
+
+
+def test_fallback_routes_clear_filter_english() -> None:
+    result = fallback_route_telegram_natural_language("clear filter on @aka_claw")
+
+    assert result is not None
+    assert result.intent == "sns_clear_filter"
+    assert result.sns_handle == "aka_claw"
+
+
+def test_clear_filter_requires_both_clear_verb_and_filter_hint() -> None:
+    """'拿掉 @X' alone (no filter/篩選 keyword) must NOT become sns_clear_filter."""
+    result = fallback_route_telegram_natural_language("拿掉 @aka_claw")
+
+    assert result is None or result.intent != "sns_clear_filter"
+
+
+# ── Regression — sns_delete keeps working for the right phrases ──────────────
+
+def test_delete_zhuizong_still_routes_to_sns_delete() -> None:
+    result = fallback_route_telegram_natural_language("刪除追蹤 @elonmusk")
+
+    assert result is not None
+    assert result.intent == "sns_delete"
+    assert result.sns_handle == "elonmusk"
+
+
+def test_unfollow_still_routes_to_sns_delete() -> None:
+    result = fallback_route_telegram_natural_language("unfollow @elonmusk")
+
+    assert result is not None
+    assert result.intent == "sns_delete"
+
+
+# ── _normalize_intent accepts sns_clear_filter LLM payload ───────────────────
+
+def test_normalize_intent_accepts_clear_filter_payload() -> None:
+    from price_monitor_bot.natural_language import _normalize_intent
+
+    payload = {"intent": "sns_clear_filter", "sns_handle": "ARS_Arsales"}
+    result = _normalize_intent(payload)
+
+    assert result.intent == "sns_clear_filter"
+    assert result.sns_handle == "ARS_Arsales"
+
+
 # ── unknown — unrelated messages ─────────────────────────────────────────────
 
 def test_fallback_returns_none_for_unrelated_message() -> None:
