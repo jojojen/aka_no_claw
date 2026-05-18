@@ -76,6 +76,12 @@ The Telegram assistant can reach these tools:
   - Remove an X watch rule. `<target>` may be a rule ID prefix, an @handle, or `keyword:xxx`.
   - Examples: `/snsdelete @elonmusk`, `/snsdelete abc12345`, `/snsdelete keyword:機動戰士`
 
+- Clear filter (natural language only, no slash form)
+  - Pattern: `把 @<handle> 的 filter 全部拿掉` / `清空 @<handle> 的篩選` / `clear filter on @<handle>`
+  - Action: only clears `include_keywords` on the @handle while keeping the watch rule active. `domains` and other fields are preserved.
+  - To remove the rule entirely, use `/snsdelete @<handle>` instead.
+  - Idempotent: if there's no filter, bot replies `目前沒有 filter，無需清空`.
+
 ### Domain tags
 
 Each watch rule carries a `domains` tuple. Topic-specific agents filter by intersection (TCG agent reads only rules whose `domains` intersect `{pokemon, yugioh, ws, union_arena, tcg}`). Recommended values:
@@ -84,6 +90,17 @@ Each watch rule carries a `domains` tuple. Topic-specific agents filter by inter
 - Non-TCG: `politic`, `stock`, `news`, `gaming`, `entertainment`, `anime`, `gundam`, `other`
 
 Free-text values are accepted (normalised to lowercase). Untagged rules are auto-tagged by the opportunity agent's LLM backfill, one rule per cron tick — the user receives a Telegram heads-up `🏷 自動標記 @X 領域：…` and can override with `/snsadd @X domain[…]`.
+
+### Bulk filter update (natural language only)
+
+- Pattern: `把每個跟 <domain> 相關的 SNS 追蹤帳號 filter 都加上「<keyword>」`
+- Examples:
+  - `把每個跟 pokemon 相關的 sns 追蹤帳號 filter 都加上「抽選」`
+  - `幫所有 yugioh 帳號加上 新弾 filter`
+  - `所有遊戲王帳號的篩選都改成包含 新弾`
+- Bot 會列出符合 domain 的帳號 + inline 鍵盤要求二次確認。
+- Allowed `<domain>`: `tcg`（=所有 TCG）、`pokemon`、`yugioh`、`ws`、`union_arena`。
+- 已含該 filter 的帳號會被跳過（idempotent）。
 
 - `/snsbuzz <keyword>`
   - Summarise Reddit's top discussion on a topic via LLM.
@@ -101,6 +118,7 @@ Natural-language examples for SNS intents (router must distinguish these from Me
 
 - "追蹤 @elonmusk" → `sns_add_account`, sns_handle="elonmusk"
 - "刪除追蹤 @elonmusk" / "取消追蹤 @elonmusk" / "unfollow @elonmusk" → `sns_delete`, sns_handle="elonmusk"
+- "把 @ARS_Arsales 的 filter 全部拿掉" / "清空 @elonmusk 的篩選" / "clear filter on @aka_claw" → `sns_clear_filter`, sns_handle="<handle>"
 - "我的 X 追蹤清單" / "推主追蹤" → `sns_list`
 - "整理一下 amd 最近熱門討論" → `sns_buzz`, sns_buzz_query="amd"
 - "remove target 2 from opportunity list" → `opportunity_remove`, opportunity_target="2"
