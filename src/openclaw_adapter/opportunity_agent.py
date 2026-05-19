@@ -9,6 +9,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Mapping as MappingABC
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -29,6 +30,7 @@ from .opportunity_models import (
     ReputationCheck,
     build_candidate_id,
     build_listing_key,
+    merge_string_list,
     normalize_product_type,
 )
 from .opportunity_pipeline import CandidateProvider, OpportunityPipeline, OpportunityPipelineStats
@@ -330,6 +332,8 @@ class ScheduledWebSearchCandidateProvider:
                     source_url=candidate.source_url,
                     metadata=metadata,
                     created_at=candidate.created_at,
+                    aliases=candidate.aliases,
+                    related_keywords=candidate.related_keywords,
                 )
             )
         return tuple(retagged)
@@ -371,12 +375,14 @@ def _build_web_trend_candidate_prompt(snippets: Sequence[WebSearchResult], *, li
         "- title：可在二級市場搜尋到的具體商品名（不要包含「抽選情報」「予約情報」等情報詞）",
         "- product_identifier：單張卡填卡號、整盒填 set code、其他可為 null",
         "- search_query：Mercari 搜尋用的關鍵字",
+        "- aliases：**同一商品**的其他寫法／別名（不同語言、簡稱、官方 vs 玩家口語）；最多 8 個；不確定留 []；禁止包含 title 本身。",
+        "- related_keywords：跟此商品「**不同但市場連動**」的關鍵字（同 IP 新弾、相關角色）；最多 5 個；不確定留 []。",
         "",
         "如果一則 snippet 同時提到多個不同 product_type 的商品，要拆成多個 candidate；商品名本身內含的「・」要保留。",
         f"最多輸出 {limit} 個候選。",
         "",
         "請嚴格輸出 JSON：",
-        '{"candidates":[{"game":"...","product_type":"...","title":"...","product_identifier":"...|null","search_query":"...","heat_score":0-100,"reason":"...","source_tweet_ids":["<URL>"]}]}',
+        '{"candidates":[{"game":"...","product_type":"...","title":"...","product_identifier":"...|null","search_query":"...","heat_score":0-100,"reason":"...","aliases":["..."],"related_keywords":["..."],"source_tweet_ids":["<URL>"]}]}',
         "",
         "搜尋結果：",
     ]
@@ -475,6 +481,8 @@ class WebOpportunityResearcher:
                 "is_relevant": assessment.is_relevant,
                 "demand_score": assessment.demand_score,
                 "reason": assessment.reason,
+                "discovered_aliases": list(assessment.discovered_aliases),
+                "discovered_related": list(assessment.discovered_related),
             },
             "sources": [_source_to_metadata(source) for source in sources],
         }
@@ -483,12 +491,27 @@ class WebOpportunityResearcher:
         if assessment.reason:
             reason = f"{reason} 網路佐證：{assessment.reason}"
 
+        skip = (candidate.title, candidate.search_query)
+        merged_aliases = merge_string_list(
+            candidate.aliases, assessment.discovered_aliases, max_len=12, skip=skip,
+        )
+        merged_related = merge_string_list(
+            candidate.related_keywords, assessment.discovered_related, max_len=12, skip=skip,
+        )
+        if assessment.discovered_aliases or assessment.discovered_related:
+            logger.info(
+                "Opportunity web enrich discovered candidate_id=%s aliases=%s related=%s",
+                candidate.candidate_id, assessment.discovered_aliases, assessment.discovered_related,
+            )
+
         return replace(
             candidate,
             heat_score=heat_score,
             reason=reason,
             source_kind=_append_source_kind(candidate.source_kind, "web"),
             metadata=metadata,
+            aliases=merged_aliases,
+            related_keywords=merged_related,
         )
 
 
@@ -497,6 +520,8 @@ class WebOpportunityAssessment:
     is_relevant: bool
     demand_score: float
     reason: str
+    discovered_aliases: tuple[str, ...] = ()
+    discovered_related: tuple[str, ...] = ()
 
 
 class TcgFairValueChecker:
@@ -531,34 +556,73 @@ class MercariOpportunityListingFinder:
         # Hunt is system-driven; filter to the same "目立った傷や汚れなし以上"
         # quality bar as the default user watches so we don't recommend
         # listings the user would never buy.
-        results = search_mercari(
-            candidate.search_query or candidate.title,
-            price_max=price_max_jpy,
-            max_results=limit,
-            condition_ids=DEFAULT_CONDITION_IDS,
-        )
+        primary = candidate.search_query or candidate.title
+        first_alias = candidate.aliases[0] if candidate.aliases else None
+
+        primary_queries: list[str] = [primary]
+        if first_alias and first_alias.casefold() != primary.casefold():
+            primary_queries.append(first_alias)
+
         offers: list[ListingOffer] = []
-        for raw in results:
-            url = str(raw.get("url") or "")
-            if not url:
-                continue
-            listing_id = str(raw.get("item_id") or "") or build_listing_key(url)
+        seen: set[str] = set()
+
+        def _run_one(q: str) -> list[dict]:
             try:
-                price_jpy = int(raw.get("price_jpy") or 0)
-            except (TypeError, ValueError):
-                continue
-            if price_jpy <= 0:
-                continue
-            offers.append(
-                ListingOffer(
+                return list(search_mercari(
+                    q, price_max=price_max_jpy, max_results=limit, condition_ids=DEFAULT_CONDITION_IDS,
+                ))
+            except Exception:
+                logger.exception("Mercari search failed query=%r", q)
+                return []
+
+        def _absorb(raw_results: list[dict]) -> None:
+            for raw in raw_results:
+                url = str(raw.get("url") or "")
+                if not url:
+                    continue
+                listing_id = str(raw.get("item_id") or "") or build_listing_key(url)
+                if listing_id in seen:
+                    continue
+                try:
+                    price_jpy = int(raw.get("price_jpy") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if price_jpy <= 0:
+                    continue
+                seen.add(listing_id)
+                offers.append(ListingOffer(
                     listing_id=listing_id,
                     title=str(raw.get("title") or ""),
                     price_jpy=price_jpy,
                     url=url,
                     thumbnail_url=str(raw.get("thumbnail_url") or "") or None,
-                )
+                ))
+
+        # Primary + alias[0] in parallel.
+        if len(primary_queries) == 1:
+            _absorb(_run_one(primary_queries[0]))
+        else:
+            with ThreadPoolExecutor(max_workers=len(primary_queries)) as ex:
+                for batch in ex.map(_run_one, primary_queries):
+                    _absorb(batch)
+            logger.info(
+                "Opportunity Mercari parallel queries=%d primary=%r alias=%r dedup_offers=%d",
+                len(primary_queries), primary, first_alias, len(offers),
             )
-        return tuple(offers)
+
+        # Fallback: only walk alias[1:] sequentially when the parallel pair was empty.
+        if not offers and len(candidate.aliases) > 1:
+            for alias in candidate.aliases[1:]:
+                if alias.casefold() == primary.casefold():
+                    continue
+                _absorb(_run_one(alias))
+                if offers:
+                    logger.info(
+                        "Opportunity Mercari fallback alias hit alias=%r offers=%d", alias, len(offers),
+                    )
+                    break
+
+        return tuple(offers[:limit])
 
 
 class ReputationSnapshotOpportunityChecker:
@@ -915,6 +979,10 @@ def format_opportunity_recommendation(recommendation: OpportunityRecommendation)
         f"熱度：{c.heat_score:.0f}/100",
         f"理由：{c.reason}",
     ]
+    if c.aliases:
+        lines.append(f"別名：{_truncate_string_list(c.aliases, 3)}")
+    if c.related_keywords:
+        lines.append(f"相關：{_truncate_string_list(c.related_keywords, 3)}")
     web_sources = _web_research_sources_from_metadata(c.metadata)
     if web_sources:
         lines.extend(["", "市場佐證："])
@@ -942,6 +1010,32 @@ def format_opportunity_recommendation(recommendation: OpportunityRecommendation)
         "判斷：價格低於目標價，賣家信譽通過，值得人工確認。",
     ])
     return "\n".join(lines)
+
+
+def _truncate_string_list(values: Sequence[str], head: int) -> str:
+    """Render a string list with up to `head` items shown, ellipsis for the rest."""
+    shown = list(values[:head])
+    rendered = ", ".join(shown)
+    remaining = len(values) - len(shown)
+    if remaining > 0:
+        rendered += f"…(+{remaining})"
+    return rendered
+
+
+def _row_string_list(row: sqlite3.Row, column: str) -> tuple[str, ...]:
+    """Decode a row's JSON string list column, tolerating legacy rows."""
+    if column not in row.keys():
+        return ()
+    raw = row[column]
+    if not raw:
+        return ()
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ()
+    if not isinstance(parsed, list):
+        return ()
+    return tuple(str(item) for item in parsed if isinstance(item, str) and item.strip())
 
 
 def _format_title_with_identifier(*, title: str, product_type: str, identifier: str | None) -> str:
@@ -989,6 +1083,12 @@ def format_opportunity_status(settings: AssistantSettings, *, limit: int = 10) -
             lines.append(f"   search: {row['search_query']}")
             if row["reason"]:
                 lines.append(f"   reason: {row['reason']}")
+            row_aliases = _row_string_list(row, "aliases_json")
+            if row_aliases:
+                lines.append(f"   別名：{_truncate_string_list(row_aliases, 3)}")
+            row_related = _row_string_list(row, "related_keywords_json")
+            if row_related:
+                lines.append(f"   相關：{_truncate_string_list(row_related, 3)}")
 
     lines.append("")
     lines.append(f"最近推薦紀錄（最近 {len(recommendations)} 筆）")
@@ -1028,6 +1128,8 @@ def list_opportunity_targets(settings: AssistantSettings, *, limit: int = 50) ->
             "search_query": row["search_query"],
             "last_checked_at": row["last_checked_at"] or None,
             "reason": row["reason"] if "reason" in row.keys() else None,
+            "aliases": list(_row_string_list(row, "aliases_json")),
+            "related_keywords": list(_row_string_list(row, "related_keywords_json")),
         })
     return results
 
@@ -1058,6 +1160,64 @@ def dismiss_opportunity_target(settings: AssistantSettings, target: str, *, limi
     )
 
 
+def update_opportunity_string_list(
+    settings: AssistantSettings,
+    selector: str,
+    *,
+    kind: str,
+    action: str,
+    names: Sequence[str],
+    limit: int = 30,
+) -> str:
+    """Add or remove items in a candidate's aliases / related_keywords list.
+
+    `kind` must be "aliases" or "related". `action` must be "add" or "remove".
+    """
+    if kind not in {"aliases", "related"}:
+        return f"未知的清單類型：{kind}"
+    if action not in {"add", "remove"}:
+        return f"未知的操作：{action}"
+    cleaned_names = tuple(n.strip() for n in names if n and n.strip())
+    if not cleaned_names:
+        return "請提供至少一個名稱。"
+
+    cleaned_selector = " ".join(selector.split()).strip()
+    if not cleaned_selector:
+        return "請提供候選目標的編號、id 或名稱。"
+
+    store = OpportunityStore(settings.opportunity_db_path)
+    store.bootstrap()
+    candidates = store.list_recent_candidates(limit=max(1, limit))
+    if not candidates:
+        return "目前沒有可編輯的候選目標。"
+
+    resolved = _resolve_candidate_selector(candidates, cleaned_selector)
+    if isinstance(resolved, str):
+        return resolved
+
+    candidate_id = str(resolved["candidate_id"])
+    label_target = f"[{resolved['game']}] {resolved['title']}"
+    label_kind = "別名" if kind == "aliases" else "相關關鍵字"
+
+    update_fn = (
+        store.update_candidate_aliases if kind == "aliases" else store.update_candidate_related_keywords
+    )
+    if action == "add":
+        updated = update_fn(candidate_id, add=cleaned_names)
+    else:
+        updated = update_fn(candidate_id, remove=cleaned_names)
+
+    if updated is None:
+        return f"找不到候選目標：{cleaned_selector}"
+
+    if not updated:
+        return f"✓ {label_target} 的{label_kind}已清空。"
+    return (
+        f"✓ {label_target} 的{label_kind}已更新 (action={action}, 共 {len(updated)} 個)\n"
+        + ", ".join(updated)
+    )
+
+
 def _resolve_candidate_selector(candidates: Sequence[Any], selector: str) -> Any | str:
     lowered = selector.lower()
     if selector.isdigit():
@@ -1075,19 +1235,23 @@ def _resolve_candidate_selector(candidates: Sequence[Any], selector: str) -> Any
     if len(id_matches) > 1:
         return _format_ambiguous_candidate_matches(id_matches)
 
-    exact_matches = [
-        row for row in candidates
-        if lowered in {str(row["title"]).lower(), str(row["search_query"]).lower()}
-    ]
+    exact_matches = []
+    for row in candidates:
+        keys = {str(row["title"]).lower(), str(row["search_query"]).lower()}
+        keys.update(a.lower() for a in _row_string_list(row, "aliases_json"))
+        if lowered in keys:
+            exact_matches.append(row)
     if len(exact_matches) == 1:
         return exact_matches[0]
     if len(exact_matches) > 1:
         return _format_ambiguous_candidate_matches(exact_matches)
 
-    partial_matches = [
-        row for row in candidates
-        if lowered in str(row["title"]).lower() or lowered in str(row["search_query"]).lower()
-    ]
+    partial_matches = []
+    for row in candidates:
+        haystacks = [str(row["title"]).lower(), str(row["search_query"]).lower()]
+        haystacks.extend(a.lower() for a in _row_string_list(row, "aliases_json"))
+        if any(lowered in h for h in haystacks):
+            partial_matches.append(row)
     if len(partial_matches) == 1:
         return partial_matches[0]
     if len(partial_matches) > 1:
@@ -1123,6 +1287,12 @@ def _build_sns_candidate_prompt(posts: Sequence[SnsPost], *, limit: int) -> str:
         "- title (Layer 3)：可在二級市場搜尋到的具體商品名（不要包含「抽選情報」「予約情報」等情報詞）",
         "- product_identifier (Layer 3 細項)：單張卡填卡號（例 201/165、QCCP-JP001），整盒填 set code（例 sv-p），其他可為 null",
         "- search_query：Mercari 搜尋用的關鍵字",
+        "- aliases (Layer 3 補充)：**同一個商品**的其他寫法／別名（不同語言、簡稱、官方 vs 玩家口語）。",
+        "    例：「ピカチュウex SAR」也可能寫作「テラスタル ピカチュウ sar」「Terastal Pikachu SAR」。",
+        "    最多 8 個，不確定就留 []。**禁止**把 title 本身或 title 的子字串再放進來。",
+        "- related_keywords：跟這個商品「**不同但市場連動**」的關鍵字（同 IP 的新弾、相關角色、會拉抬此商品需求的話題）。",
+        "    例：寶可夢 SAR 卡會被「MEGA ドリームex」新弾話題拉抬 → 加進 related_keywords。",
+        "    最多 5 個，不確定就留 []。不是同商品的別名就不要放這裡。",
         "",
         "拆分規則（重要）：",
         "- 如果同一則貼文同時提到多個不同 product_type 的商品（例如「擴充包系列」+「Start Deck 產品」），必須拆成多個 candidate，每個 candidate 只描述一個具體商品。",
@@ -1135,21 +1305,24 @@ def _build_sns_candidate_prompt(posts: Sequence[SnsPost], *, limit: int) -> str:
         f"最多輸出 {limit} 個候選。",
         "",
         "請嚴格輸出 JSON，不要 markdown：",
-        '{"candidates":[{"game":"pokemon|ws|yugioh|union_arena","product_type":"single_card|booster_pack|sealed_box|starter_deck|promo|other","title":"商品名","product_identifier":"卡號或set code或null","search_query":"Mercari 關鍵字","heat_score":0-100,"reason":"一句話原因","source_tweet_ids":["..."]}]}',
+        '{"candidates":[{"game":"pokemon|ws|yugioh|union_arena","product_type":"single_card|booster_pack|sealed_box|starter_deck|promo|other","title":"商品名","product_identifier":"卡號或set code或null","search_query":"Mercari 關鍵字","heat_score":0-100,"reason":"一句話原因","aliases":["..."],"related_keywords":["..."],"source_tweet_ids":["..."]}]}',
         "",
         "正確例子：",
         "- 貼文「インフェルノX・スタートデッキ100 抽選情報」",
         "  -> 兩個 candidate：",
-        '     {"game":"pokemon","product_type":"sealed_box","title":"インフェルノX","product_identifier":null,...}',
-        '     {"game":"pokemon","product_type":"starter_deck","title":"スタートデッキ100","product_identifier":null,...}',
+        '     {"game":"pokemon","product_type":"sealed_box","title":"インフェルノX","product_identifier":null,"aliases":[],"related_keywords":[],...}',
+        '     {"game":"pokemon","product_type":"starter_deck","title":"スタートデッキ100","product_identifier":null,"aliases":[],"related_keywords":[],...}',
         "- 貼文「アビスアイ収録 ホエルオーex 201/165 SAR」",
         "  -> 一個 candidate：",
-        '     {"game":"pokemon","product_type":"single_card","title":"ホエルオーex","product_identifier":"201/165",...}',
+        '     {"game":"pokemon","product_type":"single_card","title":"ホエルオーex","product_identifier":"201/165","aliases":["ホエルオー ex SAR"],"related_keywords":[],...}',
+        "- 貼文「ピカチュウex SAR 234/193 MEGAドリームex 環境再起」",
+        "  -> 一個 candidate（aliases 同商品的不同寫法、related_keywords 是會帶動需求的不同商品）：",
+        '     {"game":"pokemon","product_type":"single_card","title":"ピカチュウex SAR","product_identifier":"234/193","aliases":["テラスタル ピカチュウ sar","Terastal Pikachu SAR"],"related_keywords":["MEGAドリームex"],...}',
         "- 貼文「ピカチュウ・カビゴンex（同一張卡）」",
         "  -> 一個 candidate（保留商品名內固有的「・」）：",
-        '     {"game":"pokemon","product_type":"single_card","title":"ピカチュウ・カビゴンex","product_identifier":null,...}',
+        '     {"game":"pokemon","product_type":"single_card","title":"ピカチュウ・カビゴンex","product_identifier":null,"aliases":[],"related_keywords":[],...}',
         "- 貼文「カスミの元気 Mercari」",
-        '  -> {"game":"pokemon","product_type":"single_card","title":"カスミの元気","search_query":"カスミの元気",...}',
+        '  -> {"game":"pokemon","product_type":"single_card","title":"カスミの元気","search_query":"カスミの元気","aliases":[],"related_keywords":[],...}',
         "",
         "SNS 貼文：",
     ]
@@ -1171,7 +1344,13 @@ def _build_opportunity_research_query(candidate: OpportunityCandidate) -> str:
         "union_arena": "Union Arena card",
     }.get(candidate.game, f"{candidate.game} card")
     topic = candidate.search_query or candidate.title
-    return f"{topic} {game_label} demand popularity price trend resale"
+    alias_segment = ""
+    if candidate.aliases:
+        # Two best aliases only — DuckDuckGo handles OR-groups well but long
+        # queries get truncated.
+        joined = " OR ".join(f'"{a}"' for a in candidate.aliases[:2])
+        alias_segment = f" OR ({joined})"
+    return f"{topic}{alias_segment} {game_label} demand popularity price trend resale"
 
 
 def _build_opportunity_web_assessment_prompt(
@@ -1186,11 +1365,20 @@ def _build_opportunity_web_assessment_prompt(
         "Do not write the reason in English, Japanese, Simplified Chinese, or Mainland Chinese phrasing.",
         "Use only the provided web search results. Do not invent facts.",
         "Return strict JSON only with this shape:",
-        '{"is_relevant":true,"demand_score":0-100,"reason":"一句繁體中文（台灣）佐證原因"}',
+        '{"is_relevant":true,"demand_score":0-100,"reason":"一句繁體中文（台灣）佐證原因",'
+        '"discovered_aliases":["..."],"discovered_related":["..."]}',
+        "",
+        "Field guidance:",
+        "- discovered_aliases: SAME product, different spellings/languages found in the snippets.",
+        '    Skip aliases already present below in "Candidate existing aliases" — only return NEW ones. Max 5.',
+        "- discovered_related: DIFFERENT but market-correlated keywords (e.g. an upcoming set that drives demand for the candidate). Max 3.",
+        "- Leave either list empty [] when the snippets give no evidence.",
         "",
         f"Candidate game: {candidate.game}",
         f"Candidate title: {candidate.title}",
         f"Candidate Mercari search query: {candidate.search_query}",
+        f"Candidate existing aliases: {list(candidate.aliases) if candidate.aliases else '[]'}",
+        f"Candidate existing related: {list(candidate.related_keywords) if candidate.related_keywords else '[]'}",
         f"SNS heat score: {candidate.heat_score:.0f}/100",
         f"SNS reason: {candidate.reason}",
         f"Web query: {query}",
@@ -1222,6 +1410,18 @@ def _parse_web_assessment(raw: str, *, fallback: WebOpportunityAssessment) -> We
         return fallback
     if not isinstance(payload, dict):
         return fallback
+    discovered_aliases_raw = payload.get("discovered_aliases", [])
+    discovered_aliases = (
+        merge_string_list((), discovered_aliases_raw, max_len=5)
+        if isinstance(discovered_aliases_raw, list)
+        else ()
+    )
+    discovered_related_raw = payload.get("discovered_related", [])
+    discovered_related = (
+        merge_string_list((), discovered_related_raw, max_len=3)
+        if isinstance(discovered_related_raw, list)
+        else ()
+    )
     return WebOpportunityAssessment(
         is_relevant=_as_bool(payload.get("is_relevant"), default=fallback.is_relevant),
         demand_score=_clamp_float(
@@ -1231,6 +1431,8 @@ def _parse_web_assessment(raw: str, *, fallback: WebOpportunityAssessment) -> We
             default=fallback.demand_score,
         ),
         reason=str(payload.get("reason") or fallback.reason).strip(),
+        discovered_aliases=discovered_aliases,
+        discovered_related=discovered_related,
     )
 
 
@@ -1367,6 +1569,18 @@ def _parse_candidate_response(raw: str, *, posts: Sequence[SnsPost], limit: int)
             for source_id in item.get("source_tweet_ids", [])
             if str(source_id) in known_tweet_ids
         ] if isinstance(item.get("source_tweet_ids"), list) else []
+        aliases_raw = item.get("aliases", [])
+        aliases = (
+            merge_string_list((), aliases_raw, max_len=8, skip=(title, search_query))
+            if isinstance(aliases_raw, list)
+            else ()
+        )
+        related_raw = item.get("related_keywords", [])
+        related_keywords = (
+            merge_string_list((), related_raw, max_len=5, skip=(title, search_query))
+            if isinstance(related_raw, list)
+            else ()
+        )
         candidates.append(
             OpportunityCandidate(
                 candidate_id=build_candidate_id(
@@ -1385,6 +1599,8 @@ def _parse_candidate_response(raw: str, *, posts: Sequence[SnsPost], limit: int)
                 reason=str(item.get("reason") or "SNS discussion signal").strip(),
                 source_kind="sns_llm",
                 metadata={"source_tweet_ids": source_ids},
+                aliases=aliases,
+                related_keywords=related_keywords,
             )
         )
         if len(candidates) >= limit:

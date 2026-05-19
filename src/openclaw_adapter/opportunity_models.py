@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from hashlib import sha1
@@ -77,6 +78,37 @@ def build_listing_key(url: str) -> str:
     return "listing_" + sha1(url.strip().encode("utf-8")).hexdigest()[:16]
 
 
+def merge_string_list(
+    existing: Sequence[str],
+    incoming: Iterable[str],
+    *,
+    max_len: int = 12,
+    skip: Iterable[str] = (),
+) -> tuple[str, ...]:
+    """Merge two string sequences, casefold-deduped, preserving order, capped.
+
+    `skip` is a set of strings (e.g. the candidate's own title) that must not
+    appear in the output — LLMs commonly echo the title back as an alias.
+    """
+    skip_set = {s.casefold() for s in skip if s}
+    seen: set[str] = set()
+    out: list[str] = []
+    for kw in tuple(existing) + tuple(incoming):
+        if not isinstance(kw, str):
+            continue
+        cleaned = " ".join(kw.strip().split())
+        if not cleaned:
+            continue
+        key = cleaned.casefold()
+        if key in seen or key in skip_set:
+            continue
+        seen.add(key)
+        out.append(cleaned)
+        if len(out) >= max_len:
+            break
+    return tuple(out)
+
+
 @dataclass(frozen=True, slots=True)
 class OpportunityCandidate:
     candidate_id: str
@@ -91,6 +123,8 @@ class OpportunityCandidate:
     source_url: str = ""
     metadata: Mapping[str, object] = field(default_factory=dict)
     created_at: str = field(default_factory=utc_now_iso)
+    aliases: tuple[str, ...] = ()
+    related_keywords: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

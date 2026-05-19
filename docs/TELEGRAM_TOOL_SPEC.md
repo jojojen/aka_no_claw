@@ -114,7 +114,19 @@ Free-text values are accepted (normalised to lowercase). Untagged rules are auto
 - `/hunt remove <number-or-name>`
   - Remove/dismiss an opportunity target from the active hunt list.
   - Use when the user says they are not interested in a target from `/hunt status`.
-  - `<number-or-name>` may be the visible list number from `/hunt status` or part of the product name.
+  - `<number-or-name>` may be the visible list number from `/hunt status`, the candidate id prefix, the product name, OR any of the product's `aliases`.
+
+- `/hunt alias <selector> add <names>` / `/hunt alias <selector> remove <names>`
+  - Mutate the `aliases` list on one candidate (same-product synonyms / spellings used to expand Mercari search and `/hunt remove` matching).
+  - `<selector>` is the visible list number from `/hunt status` or a candidate-id prefix.
+  - `<names>` accepts comma separators (`,` / `，` / `、`); without separators the entire tail is one alias (so multi-word aliases like `テラスタル ピカチュウ sar` work without quoting).
+  - Idempotent: re-adding existing aliases is a no-op; removing missing ones doesn't error.
+  - Examples:
+    - `/hunt alias 2 add Pikachu SAR, テラスタル ピカチュウ sar`
+    - `/hunt alias opp_abc12345 remove Terastal Pikachu SAR`
+
+- `/hunt related <selector> add <names>` / `/hunt related <selector> remove <names>`
+  - Same shape as `/hunt alias`, but operates on `related_keywords` (different products with market correlation, e.g. an upcoming set that drives demand). `related_keywords` are surfaced to the user and used as LLM/Web-research context but **not** for Mercari search nor `/hunt remove` matching — that would mis-target different products.
 
 Natural-language examples for SNS intents (router must distinguish these from Mercari watch intents — any `@handle` or X/Twitter/推特 keyword forces SNS):
 
