@@ -14,6 +14,7 @@ from .opportunity_models import (
     PriceCheck,
     ReputationCheck,
     build_listing_key,
+    merge_string_list,
     utc_now_iso,
 )
 
@@ -38,7 +39,9 @@ CREATE TABLE IF NOT EXISTS opportunity_candidates (
     status TEXT NOT NULL DEFAULT 'active',
     last_checked_at TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    aliases_json TEXT NOT NULL DEFAULT '[]',
+    related_keywords_json TEXT NOT NULL DEFAULT '[]'
 );
 
 CREATE TABLE IF NOT EXISTS opportunity_price_checks (
@@ -122,18 +125,44 @@ class OpportunityStore:
                         "DROP TABLE IF EXISTS opportunity_candidates;"
                     )
             connection.executescript(SCHEMA)
+            # Idempotent ALTER for DBs that pre-date the alias columns.
+            column_names = {
+                row[1] for row in connection.execute("PRAGMA table_info(opportunity_candidates)")
+            }
+            if "aliases_json" not in column_names:
+                connection.execute(
+                    "ALTER TABLE opportunity_candidates ADD COLUMN aliases_json TEXT NOT NULL DEFAULT '[]'"
+                )
+            if "related_keywords_json" not in column_names:
+                connection.execute(
+                    "ALTER TABLE opportunity_candidates ADD COLUMN related_keywords_json TEXT NOT NULL DEFAULT '[]'"
+                )
 
     def upsert_candidate(self, candidate: OpportunityCandidate) -> None:
         now = utc_now_iso()
         with self.connect() as connection:
+            # Read existing alias / related lists first so we can merge instead
+            # of overwriting — user-curated entries via /hunt alias must not be
+            # erased by a subsequent LLM extraction that didn't echo them back.
+            existing = connection.execute(
+                "SELECT aliases_json, related_keywords_json FROM opportunity_candidates "
+                "WHERE candidate_id = ?",
+                (candidate.candidate_id,),
+            ).fetchone()
+            existing_aliases = _decode_json_list(existing["aliases_json"] if existing else "[]")
+            existing_related = _decode_json_list(existing["related_keywords_json"] if existing else "[]")
+            skip = (candidate.title, candidate.search_query)
+            merged_aliases = merge_string_list(existing_aliases, candidate.aliases, skip=skip)
+            merged_related = merge_string_list(existing_related, candidate.related_keywords, skip=skip)
             connection.execute(
                 """
                 INSERT INTO opportunity_candidates (
                     candidate_id, game, product_type, title, product_identifier,
                     search_query, heat_score, reason,
-                    source_kind, source_url, metadata_json, created_at, updated_at
+                    source_kind, source_url, metadata_json, created_at, updated_at,
+                    aliases_json, related_keywords_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(candidate_id) DO UPDATE SET
                     game=excluded.game,
                     product_type=excluded.product_type,
@@ -149,7 +178,9 @@ class OpportunityStore:
                         WHEN opportunity_candidates.status = 'dismissed' THEN 'dismissed'
                         ELSE 'active'
                     END,
-                    updated_at=excluded.updated_at
+                    updated_at=excluded.updated_at,
+                    aliases_json=excluded.aliases_json,
+                    related_keywords_json=excluded.related_keywords_json
                 """,
                 (
                     candidate.candidate_id,
@@ -165,8 +196,55 @@ class OpportunityStore:
                     _json(dict(candidate.metadata)),
                     candidate.created_at or now,
                     now,
+                    _json(list(merged_aliases)),
+                    _json(list(merged_related)),
                 ),
             )
+
+    def update_candidate_aliases(
+        self, candidate_id: str, *, add: tuple[str, ...] = (), remove: tuple[str, ...] = ()
+    ) -> tuple[str, ...] | None:
+        return self._mutate_string_list(
+            candidate_id, column="aliases_json", add=add, remove=remove
+        )
+
+    def update_candidate_related_keywords(
+        self, candidate_id: str, *, add: tuple[str, ...] = (), remove: tuple[str, ...] = ()
+    ) -> tuple[str, ...] | None:
+        return self._mutate_string_list(
+            candidate_id, column="related_keywords_json", add=add, remove=remove
+        )
+
+    def _mutate_string_list(
+        self,
+        candidate_id: str,
+        *,
+        column: str,
+        add: tuple[str, ...],
+        remove: tuple[str, ...],
+    ) -> tuple[str, ...] | None:
+        """Mutate the JSON list at column for candidate_id. Returns new list, or None if not found."""
+        now = utc_now_iso()
+        with self.connect() as connection:
+            row = connection.execute(
+                f"SELECT title, search_query, {column} FROM opportunity_candidates "
+                "WHERE candidate_id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            current = _decode_json_list(row[column])
+            remove_set = {r.casefold() for r in remove if r}
+            kept = tuple(item for item in current if item.casefold() not in remove_set)
+            merged = merge_string_list(
+                kept, add, skip=(row["title"], row["search_query"])
+            )
+            connection.execute(
+                f"UPDATE opportunity_candidates SET {column} = ?, updated_at = ? "
+                "WHERE candidate_id = ?",
+                (_json(list(merged)), now, candidate_id),
+            )
+            return merged
 
     def dismiss_candidate(self, candidate_id: str) -> bool:
         now = utc_now_iso()
@@ -326,18 +404,38 @@ class OpportunityStore:
             )
 
 
+def _decode_json_list(value: object) -> tuple[str, ...]:
+    """Decode a JSON-encoded string list, tolerating missing/corrupt values."""
+    if not value:
+        return ()
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ()
+    if not isinstance(parsed, list):
+        return ()
+    return tuple(str(item) for item in parsed if isinstance(item, str) and item.strip())
+
+
 def _candidate_from_row(row: sqlite3.Row) -> OpportunityCandidate:
     metadata_raw = row["metadata_json"] or "{}"
     try:
         metadata = json.loads(metadata_raw)
     except json.JSONDecodeError:
         metadata = {}
+    row_keys = row.keys() if hasattr(row, "keys") else ()
+    aliases = _decode_json_list(row["aliases_json"]) if "aliases_json" in row_keys else ()
+    related = (
+        _decode_json_list(row["related_keywords_json"])
+        if "related_keywords_json" in row_keys
+        else ()
+    )
     return OpportunityCandidate(
         candidate_id=row["candidate_id"],
         game=row["game"],
-        product_type=row["product_type"] if "product_type" in row.keys() else "other",
+        product_type=row["product_type"] if "product_type" in row_keys else "other",
         title=row["title"],
-        product_identifier=row["product_identifier"] if "product_identifier" in row.keys() else None,
+        product_identifier=row["product_identifier"] if "product_identifier" in row_keys else None,
         search_query=row["search_query"],
         heat_score=float(row["heat_score"]),
         reason=row["reason"],
@@ -345,6 +443,8 @@ def _candidate_from_row(row: sqlite3.Row) -> OpportunityCandidate:
         source_url=row["source_url"],
         metadata=metadata,
         created_at=row["created_at"],
+        aliases=aliases,
+        related_keywords=related,
     )
 
 
