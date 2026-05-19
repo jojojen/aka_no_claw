@@ -561,6 +561,95 @@ def test_normalize_intent_accepts_clear_filter_payload() -> None:
     assert result.sns_handle == "ARS_Arsales"
 
 
+# ── sns_add_account with schedule update via NL ──────────────────────────────
+
+def test_fallback_routes_schedule_update_to_sns_add_account_with_minutes() -> None:
+    result = fallback_route_telegram_natural_language(
+        "把 @PokeGetInfoMain 的追蹤排程改成每 720分鐘"
+    )
+
+    assert result is not None
+    assert result.intent == "sns_add_account"
+    assert result.sns_handle == "PokeGetInfoMain"
+    assert result.sns_schedule_minutes == 720
+
+
+def test_fallback_routes_schedule_only_phrasing_without_watch_verbs() -> None:
+    # "排程" alone (no 追蹤/監控) should still trigger sns_add_account because
+    # the schedule extractor is itself a watch-add intent signal.
+    result = fallback_route_telegram_natural_language(
+        "把 @aka_claw 的排程改成每 60 分鐘"
+    )
+
+    assert result is not None
+    assert result.intent == "sns_add_account"
+    assert result.sns_handle == "aka_claw"
+    assert result.sns_schedule_minutes == 60
+
+
+def test_fallback_routes_english_schedule_phrasing() -> None:
+    result = fallback_route_telegram_natural_language(
+        "schedule @elonmusk to 90 minutes"
+    )
+
+    assert result is not None
+    assert result.intent == "sns_add_account"
+    assert result.sns_handle == "elonmusk"
+    assert result.sns_schedule_minutes == 90
+
+
+def test_fallback_rejects_out_of_range_schedule() -> None:
+    result = fallback_route_telegram_natural_language(
+        "把 @aka_claw 的排程改成每 99999 分鐘"
+    )
+
+    # Out-of-range schedule must be dropped, but the @handle trigger keeps
+    # sns_add_account as the routed intent so the user still gets a useful ack.
+    assert result is not None
+    assert result.intent == "sns_add_account"
+    assert result.sns_handle == "aka_claw"
+    assert result.sns_schedule_minutes is None
+
+
+def test_fallback_does_not_populate_schedule_without_hint_keyword() -> None:
+    # Bare "追蹤 @X" has no schedule hint → sns_schedule_minutes stays None.
+    result = fallback_route_telegram_natural_language("追蹤 @elonmusk")
+
+    assert result is not None
+    assert result.intent == "sns_add_account"
+    assert result.sns_schedule_minutes is None
+
+
+def test_normalize_intent_accepts_sns_schedule_minutes_payload() -> None:
+    from price_monitor_bot.natural_language import _normalize_intent
+
+    payload = {
+        "intent": "sns_add_account",
+        "sns_handle": "PokeGetInfoMain",
+        "sns_schedule_minutes": 720,
+    }
+    result = _normalize_intent(payload)
+
+    assert result.intent == "sns_add_account"
+    assert result.sns_handle == "PokeGetInfoMain"
+    assert result.sns_schedule_minutes == 720
+
+
+def test_normalize_intent_rejects_out_of_range_schedule_in_payload() -> None:
+    from price_monitor_bot.natural_language import _normalize_intent
+
+    # 4 is below the 5-minute floor; 1500 is above the 1440 ceiling;
+    # garbage strings and None should also normalize to None.
+    for bad in (4, 1500, "not a number", None):
+        payload = {
+            "intent": "sns_add_account",
+            "sns_handle": "x",
+            "sns_schedule_minutes": bad,
+        }
+        result = _normalize_intent(payload)
+        assert result.sns_schedule_minutes is None
+
+
 # ── unknown — unrelated messages ─────────────────────────────────────────────
 
 def test_fallback_returns_none_for_unrelated_message() -> None:
