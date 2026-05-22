@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS opportunity_candidates (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     aliases_json TEXT NOT NULL DEFAULT '[]',
-    related_keywords_json TEXT NOT NULL DEFAULT '[]'
+    related_keywords_json TEXT NOT NULL DEFAULT '[]',
+    is_target INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS opportunity_price_checks (
@@ -76,6 +77,8 @@ CREATE TABLE IF NOT EXISTS opportunity_recommendations (
     seller_grade TEXT,
     reputation_status TEXT NOT NULL,
     notified_at TEXT,
+    feedback_kind TEXT,           -- 'up' / 'down' / 'bought' / null
+    feedback_at TEXT,             -- ISO timestamp of last feedback
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY (candidate_id) REFERENCES opportunity_candidates(candidate_id) ON DELETE CASCADE
@@ -137,6 +140,25 @@ class OpportunityStore:
                 connection.execute(
                     "ALTER TABLE opportunity_candidates ADD COLUMN related_keywords_json TEXT NOT NULL DEFAULT '[]'"
                 )
+            if "is_target" not in column_names:
+                connection.execute(
+                    "ALTER TABLE opportunity_candidates ADD COLUMN is_target INTEGER NOT NULL DEFAULT 0"
+                )
+            if "cooldown_until" not in column_names:
+                connection.execute(
+                    "ALTER TABLE opportunity_candidates ADD COLUMN cooldown_until TEXT"
+                )
+            rec_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(opportunity_recommendations)")
+            }
+            if "feedback_kind" not in rec_columns:
+                connection.execute(
+                    "ALTER TABLE opportunity_recommendations ADD COLUMN feedback_kind TEXT"
+                )
+            if "feedback_at" not in rec_columns:
+                connection.execute(
+                    "ALTER TABLE opportunity_recommendations ADD COLUMN feedback_at TEXT"
+                )
 
     def upsert_candidate(self, candidate: OpportunityCandidate) -> None:
         now = utc_now_iso()
@@ -160,9 +182,9 @@ class OpportunityStore:
                     candidate_id, game, product_type, title, product_identifier,
                     search_query, heat_score, reason,
                     source_kind, source_url, metadata_json, created_at, updated_at,
-                    aliases_json, related_keywords_json
+                    aliases_json, related_keywords_json, is_target
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(candidate_id) DO UPDATE SET
                     game=excluded.game,
                     product_type=excluded.product_type,
@@ -180,7 +202,8 @@ class OpportunityStore:
                     END,
                     updated_at=excluded.updated_at,
                     aliases_json=excluded.aliases_json,
-                    related_keywords_json=excluded.related_keywords_json
+                    related_keywords_json=excluded.related_keywords_json,
+                    is_target=MAX(opportunity_candidates.is_target, excluded.is_target)
                 """,
                 (
                     candidate.candidate_id,
@@ -198,6 +221,7 @@ class OpportunityStore:
                     now,
                     _json(list(merged_aliases)),
                     _json(list(merged_related)),
+                    1 if candidate.is_target else 0,
                 ),
             )
 
@@ -267,6 +291,7 @@ class OpportunityStore:
                 SELECT *
                 FROM opportunity_candidates
                 WHERE status = 'active'
+                  AND (cooldown_until IS NULL OR cooldown_until < ?)
                   AND (
                     last_checked_at IS NULL
                     OR strftime('%s', ?) - strftime('%s', last_checked_at) >= ?
@@ -274,9 +299,43 @@ class OpportunityStore:
                 ORDER BY heat_score DESC, updated_at DESC
                 LIMIT ?
                 """,
-                (now, min_interval_seconds, limit),
+                (now, now, min_interval_seconds, limit),
             ).fetchall()
         return [_candidate_from_row(row) for row in rows]
+
+    def list_target_candidates(self, *, limit: int) -> list[OpportunityCandidate]:
+        """Return active is_target=True candidates. Targets get every-tick
+        attention (skipping the 30-min cooldown that auto-discovered ones use)."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM opportunity_candidates
+                WHERE status = 'active' AND is_target = 1
+                ORDER BY heat_score DESC, COALESCE(last_checked_at, '') ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [_candidate_from_row(row) for row in rows]
+
+    def set_is_target(self, candidate_id: str, is_target: bool) -> bool:
+        now = utc_now_iso()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE opportunity_candidates SET is_target = ?, updated_at = ? "
+                "WHERE candidate_id = ?",
+                (1 if is_target else 0, now, candidate_id),
+            )
+        return cursor.rowcount > 0
+
+    def has_any_target(self) -> bool:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM opportunity_candidates "
+                "WHERE status = 'active' AND is_target = 1 LIMIT 1"
+            ).fetchone()
+        return row is not None
 
     def mark_candidate_checked(self, candidate_id: str) -> None:
         now = utc_now_iso()
@@ -374,6 +433,51 @@ class OpportunityStore:
                 (now, now, recommendation_id),
             )
 
+    def record_feedback(self, recommendation_id: str, kind: str) -> str | None:
+        """Persist feedback_kind / feedback_at on the recommendation row.
+
+        Returns the candidate_id for downstream side-effect handling, or None
+        if the recommendation_id doesn't exist.
+        """
+        now = utc_now_iso()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE opportunity_recommendations SET feedback_kind = ?, feedback_at = ?, "
+                "updated_at = ? WHERE recommendation_id = ?",
+                (kind, now, now, recommendation_id),
+            )
+            if cursor.rowcount == 0:
+                return None
+            row = connection.execute(
+                "SELECT candidate_id FROM opportunity_recommendations WHERE recommendation_id = ?",
+                (recommendation_id,),
+            ).fetchone()
+        return str(row["candidate_id"]) if row else None
+
+    def count_recent_feedback(
+        self, candidate_id: str, kind: str, *, since_iso: str
+    ) -> int:
+        """Count recommendations for `candidate_id` whose `feedback_kind` matches
+        and `feedback_at` is >= `since_iso`. Powers the 3-strikes auto-dismiss
+        rule for 👎 feedback."""
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS n FROM opportunity_recommendations "
+                "WHERE candidate_id = ? AND feedback_kind = ? AND feedback_at >= ?",
+                (candidate_id, kind, since_iso),
+            ).fetchone()
+        return int(row["n"]) if row else 0
+
+    def set_cooldown(self, candidate_id: str, until_iso: str | None) -> bool:
+        now = utc_now_iso()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE opportunity_candidates SET cooldown_until = ?, updated_at = ? "
+                "WHERE candidate_id = ?",
+                (until_iso, now, candidate_id),
+            )
+        return cursor.rowcount > 0
+
     def list_recent_recommendations(self, *, limit: int = 10) -> list[sqlite3.Row]:
         with self.connect() as connection:
             return list(
@@ -430,6 +534,7 @@ def _candidate_from_row(row: sqlite3.Row) -> OpportunityCandidate:
         if "related_keywords_json" in row_keys
         else ()
     )
+    is_target = bool(row["is_target"]) if "is_target" in row_keys else False
     return OpportunityCandidate(
         candidate_id=row["candidate_id"],
         game=row["game"],
@@ -445,6 +550,7 @@ def _candidate_from_row(row: sqlite3.Row) -> OpportunityCandidate:
         created_at=row["created_at"],
         aliases=aliases,
         related_keywords=related,
+        is_target=is_target,
     )
 
 

@@ -50,6 +50,8 @@ from .opportunity_agent import (
     dismiss_opportunity_target,
     format_opportunity_status,
     list_opportunity_targets,
+    pin_opportunity_target,
+    unpin_opportunity_target,
     update_opportunity_string_list,
 )
 from .reputation_agent import ensure_agent_thread
@@ -384,6 +386,8 @@ def run_telegram_polling(
         opportunity_alias_updater=lambda selector, kind, action, names: update_opportunity_string_list(
             settings, selector, kind=kind, action=action, names=names,
         ),
+        opportunity_target_pinner=lambda name: pin_opportunity_target(settings, name),
+        opportunity_target_unpinner=lambda selector: unpin_opportunity_target(settings, selector),
         watch_db=watch_db,
         sns_db=sns_db,
         sns_buzz_fn=sns_buzz_fn,

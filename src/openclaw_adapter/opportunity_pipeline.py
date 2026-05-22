@@ -86,22 +86,30 @@ class OpportunityPipeline:
         for candidate in discovered:
             self._store.upsert_candidate(candidate)
 
+        has_any_target = self._store.has_any_target()
         due_candidates = self._store.list_due_candidates(
             limit=self._candidate_limit,
             min_interval_seconds=self._candidate_check_interval_seconds,
         )
         for candidate in due_candidates:
-            self._run_candidate(candidate, stats)
+            self._run_candidate(candidate, stats, has_any_target=has_any_target)
         return stats.freeze()
 
-    def _run_candidate(self, candidate: OpportunityCandidate, stats: "_MutableStats") -> None:
+    def _run_candidate(
+        self,
+        candidate: OpportunityCandidate,
+        stats: "_MutableStats",
+        *,
+        has_any_target: bool,
+    ) -> None:
         stats.candidates_checked += 1
         logger.info(
-            "Opportunity candidate check started candidate_id=%s game=%s title=%s heat=%s",
+            "Opportunity candidate check started candidate_id=%s game=%s title=%s heat=%s is_target=%s",
             candidate.candidate_id,
             candidate.game,
             candidate.title,
             candidate.heat_score,
+            candidate.is_target,
         )
         try:
             price = self._price_checker.check(candidate)
@@ -111,10 +119,10 @@ class OpportunityPipeline:
             stats.price_checks += 1
             self._store.record_price_check(price)
 
-            price_max = target_price_for(price, self._thresholds)
+            price_max = target_price_for(price, self._thresholds, is_target=candidate.is_target)
             listings = list(self._listing_finder.find(candidate, price_max_jpy=price_max, limit=self._listing_limit))
             for listing in listings:
-                self._run_listing(candidate, price, listing, stats)
+                self._run_listing(candidate, price, listing, stats, has_any_target=has_any_target)
         finally:
             self._store.mark_candidate_checked(candidate.candidate_id)
 
@@ -124,6 +132,8 @@ class OpportunityPipeline:
         price: PriceCheck,
         listing: ListingOffer,
         stats: "_MutableStats",
+        *,
+        has_any_target: bool,
     ) -> None:
         if self._store.listing_seen(listing.url):
             stats.skipped_seen_listings += 1
@@ -137,6 +147,7 @@ class OpportunityPipeline:
             listing=listing,
             reputation=reputation,
             thresholds=self._thresholds,
+            has_any_target=has_any_target,
         )
         recommendation = OpportunityRecommendation(
             recommendation_id=recommendation_id_for(listing),

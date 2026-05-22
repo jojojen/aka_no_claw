@@ -125,6 +125,7 @@ class OpportunityCandidate:
     created_at: str = field(default_factory=utc_now_iso)
     aliases: tuple[str, ...] = ()
     related_keywords: tuple[str, ...] = ()
+    is_target: bool = False                # 🎯 user-declared target (lenient thresholds) vs 🔍 system-discovered opportunity
 
 
 @dataclass(frozen=True, slots=True)
