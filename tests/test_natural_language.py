@@ -459,6 +459,106 @@ def test_single_handle_filter_update_still_routes_to_sns_add_account() -> None:
     assert result.sns_handle == "tenbai_hakase"
 
 
+# ── sns_bulk_remove_filter — batch filter-keyword removal ────────────────────
+# The fallback is intentionally narrow (explicit plural + bracketed keyword) —
+# natural Chinese phrasings (e.g. "domain 有 tcg 的帳號 ... 都 X") are routed by
+# the LLM via the prompt examples, NOT by the fallback regex. Tests below
+# cover the LLM payload path via `_normalize_intent`.
+
+def test_fallback_routes_bulk_remove_filter_with_explicit_plural_and_brackets() -> None:
+    result = fallback_route_telegram_natural_language(
+        "把所有 tcg 帳號 filter 裡的「720分鐘」都移除"
+    )
+    assert result is not None
+    assert result.intent == "sns_bulk_remove_filter"
+    assert result.bulk_target_domain == "tcg"
+    assert result.bulk_filter_keywords == ("720分鐘",)
+
+
+def test_fallback_remove_filter_does_not_become_add() -> None:
+    """The remove path runs BEFORE add, so a REMOVE verb wins."""
+    result = fallback_route_telegram_natural_language(
+        "把所有 tcg 帳號 filter 裡的「720分鐘」都移除"
+    )
+    assert result is not None
+    assert result.intent == "sns_bulk_remove_filter"
+
+
+def test_fallback_remove_filter_unbracketed_is_not_routed() -> None:
+    """Without brackets, fallback does NOT route — LLM is expected to handle
+    these natural phrasings via the prompt examples."""
+    result = fallback_route_telegram_natural_language(
+        "把所有 pokemon 帳號 filter 裡的 抽選 移除"
+    )
+    assert result is None or result.intent != "sns_bulk_remove_filter"
+
+
+# ── sns_bulk_update_schedule — batch schedule_minutes update ─────────────────
+
+def test_fallback_routes_bulk_update_schedule_with_explicit_plural() -> None:
+    result = fallback_route_telegram_natural_language(
+        "所有 yugioh 帳號排程改成每 60 分鐘"
+    )
+
+    assert result is not None
+    assert result.intent == "sns_bulk_update_schedule"
+    assert result.bulk_target_domain == "yugioh"
+    assert result.sns_schedule_minutes == 60
+
+
+def test_fallback_prefers_schedule_when_both_signals_present() -> None:
+    """When schedule hint + integer minutes appear with filter keyword,
+    schedule wins (the integer is the disambiguator)."""
+    result = fallback_route_telegram_natural_language(
+        "把所有 tcg 帳號 排程都改成每 720 分鐘 順便 filter 也清"
+    )
+    assert result is not None
+    assert result.intent == "sns_bulk_update_schedule"
+    assert result.sns_schedule_minutes == 720
+
+
+# ── LLM payload path for natural phrasings (user's actual commands) ──────────
+# The user's commands lack an explicit 每個/所有 quantifier — by design they
+# flow through the LLM router. These tests verify the JSON payload path.
+
+def test_normalize_intent_accepts_bulk_remove_filter_payload() -> None:
+    from price_monitor_bot.natural_language import _normalize_intent
+
+    payload = {
+        "intent": "sns_bulk_remove_filter",
+        "bulk_target_domain": "tcg",
+        "bulk_filter_keywords": ["720分鐘"],
+    }
+    result = _normalize_intent(payload)
+    assert result.intent == "sns_bulk_remove_filter"
+    assert result.bulk_target_domain == "tcg"
+    assert result.bulk_filter_keywords == ("720分鐘",)
+
+
+def test_normalize_intent_accepts_bulk_update_schedule_payload() -> None:
+    from price_monitor_bot.natural_language import _normalize_intent
+
+    payload = {
+        "intent": "sns_bulk_update_schedule",
+        "bulk_target_domain": "tcg",
+        "sns_schedule_minutes": 720,
+    }
+    result = _normalize_intent(payload)
+    assert result.intent == "sns_bulk_update_schedule"
+    assert result.bulk_target_domain == "tcg"
+    assert result.sns_schedule_minutes == 720
+
+
+# ── Regression: existing add path still works ────────────────────────────────
+
+def test_existing_bulk_add_filter_still_routes_with_explicit_plural() -> None:
+    result = fallback_route_telegram_natural_language(
+        "把每個跟 tcg 相關的 sns 追蹤帳號 filter 都加上「抽選」"
+    )
+    assert result is not None
+    assert result.intent == "sns_bulk_add_filter"
+
+
 # ── _normalize_intent accepts sns_bulk_add_filter LLM payload ────────────────
 
 def test_normalize_intent_accepts_bulk_filter_payload() -> None:
