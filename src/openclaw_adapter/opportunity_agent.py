@@ -551,6 +551,86 @@ class TcgFairValueChecker:
         )
 
 
+# ── Listing title → product_type heuristic classifier ───────────────────────
+#
+# Mercari search returns whatever text-matches the query; for sealed-box / pack
+# / deck candidates that share their set name with single cards (e.g. アビスアイ
+# is both a set name AND appears in every single-card title from that set),
+# this leads to single-card listings being matched against box-priced
+# candidates. We classify each listing by title heuristics and reject
+# cross-type matches in `MercariOpportunityListingFinder._absorb` below.
+
+# Strong "sealed box" signals — full-set unopened products.
+_SEALED_BOX_RE = re.compile(
+    r"(?:1\s*box|box\s*未開封|未開封\s*box|ボックス|シュリンク|"
+    r"1\s*カートン|display\s*box|30\s*パック\s*入|20\s*パック\s*入)",
+    re.IGNORECASE,
+)
+# Starter / structure / trial deck — checked before booster_pack since "デッキ"
+# is a stronger signal than naked "パック".
+_STARTER_DECK_RE = re.compile(
+    r"(?:スタートデッキ|structure\s+deck|trial\s+deck|構築済み?デッキ)",
+    re.IGNORECASE,
+)
+# Booster pack: multi-pack bundles that aren't a full box. Requires a digit
+# prefix so naked "パック" (which often appears in card names like "プロモパック")
+# doesn't false-match.
+_BOOSTER_PACK_RE = re.compile(
+    r"(?:\d+\s*パック|booster\s*pack)",
+    re.IGNORECASE,
+)
+_PROMO_RE = re.compile(
+    r"(?:プロモ\s*パック|プロモ(?!ーション)|promo(?!\s*tion))",
+    re.IGNORECASE,
+)
+# Single card: card number "201/165" or a rarity tag at word boundary.
+_SINGLE_CARD_HINT_RE = re.compile(
+    r"\d{1,3}\s*/\s*\d{2,3}|(?:^|[^A-Za-z])(?:SAR|SR|UR|HR|AR|RR|PSA\s?10|シングル)(?:$|[^A-Za-z])",
+    re.IGNORECASE,
+)
+
+
+def _classify_listing_product_type(title: str) -> str:
+    """Heuristic-classify a Mercari listing title into a PRODUCT_TYPES value.
+
+    Precedence (most-specific first): sealed_box > starter_deck > booster_pack
+    > promo > single_card > "other". Returns "other" for unambiguous-to-classify
+    titles; the caller decides per-candidate-type how strict to be.
+    """
+    if not title:
+        return "other"
+    if _SEALED_BOX_RE.search(title):
+        return "sealed_box"
+    if _STARTER_DECK_RE.search(title):
+        return "starter_deck"
+    if _BOOSTER_PACK_RE.search(title):
+        return "booster_pack"
+    if _PROMO_RE.search(title):
+        return "promo"
+    if _SINGLE_CARD_HINT_RE.search(title):
+        return "single_card"
+    return "other"
+
+
+def _listing_matches_candidate_type(title: str, candidate_product_type: str) -> bool:
+    """Return True iff this listing is an acceptable match for the candidate's
+    declared product_type.
+
+    Asymmetric strictness — sealed_box / booster_pack / starter_deck / promo
+    candidates REQUIRE a positive classification ("other" rejected) because
+    the cost of matching a wrong product is high (user pays box price for a
+    single card, or vice versa). single_card candidates accept "single_card"
+    and "other" since many genuine card listings have noisy titles, but
+    REJECT "sealed_box" so a box never gets matched to a card candidate.
+    """
+    inferred = _classify_listing_product_type(title)
+    if candidate_product_type in {"sealed_box", "booster_pack", "starter_deck", "promo"}:
+        return inferred == candidate_product_type
+    if candidate_product_type == "single_card":
+        return inferred in {"single_card", "other"}
+    return True
+
+
 class MercariOpportunityListingFinder:
     def find(self, candidate: OpportunityCandidate, *, price_max_jpy: int, limit: int) -> Sequence[ListingOffer]:
         # Hunt is system-driven; filter to the same "目立った傷や汚れなし以上"
@@ -583,6 +663,18 @@ class MercariOpportunityListingFinder:
                 listing_id = str(raw.get("item_id") or "") or build_listing_key(url)
                 if listing_id in seen:
                     continue
+                title = str(raw.get("title") or "")
+                if not _listing_matches_candidate_type(title, candidate.product_type):
+                    logger.info(
+                        "Opportunity Mercari listing skipped: type mismatch "
+                        "candidate=[%s] %s vs listing inferred=%s title=%r url=%s",
+                        candidate.product_type,
+                        candidate.title,
+                        _classify_listing_product_type(title),
+                        title,
+                        url,
+                    )
+                    continue
                 try:
                     price_jpy = int(raw.get("price_jpy") or 0)
                 except (TypeError, ValueError):
@@ -592,7 +684,7 @@ class MercariOpportunityListingFinder:
                 seen.add(listing_id)
                 offers.append(ListingOffer(
                     listing_id=listing_id,
-                    title=str(raw.get("title") or ""),
+                    title=title,
                     price_jpy=price_jpy,
                     url=url,
                     thumbnail_url=str(raw.get("thumbnail_url") or "") or None,
