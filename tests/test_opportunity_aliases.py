@@ -5,11 +5,14 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import pytest
 from openclaw_adapter.opportunity_agent import (
     MercariOpportunityListingFinder,
     WebOpportunityAssessment,
     WebOpportunityResearcher,
     _build_opportunity_research_query,
+    _classify_listing_product_type,
+    _listing_matches_candidate_type,
     _parse_candidate_response,
     _parse_web_assessment,
     _resolve_candidate_selector,
@@ -374,3 +377,134 @@ def test_update_opportunity_string_list_unknown_selector(tmp_path: Path) -> None
     )
     # Either empty-list or not-found message — both acceptable, but never crash.
     assert isinstance(reply, str) and reply
+
+
+# ── _classify_listing_product_type — title heuristic ────────────────────────
+
+
+@pytest.mark.parametrize("title,expected", [
+    # Sealed box signals
+    ("ポケモンカード アビスアイ 1BOX 未開封 シュリンク付き", "sealed_box"),
+    ("Pokemon Abyss Eye 1 BOX Japanese", "sealed_box"),
+    ("アビスアイ ボックス", "sealed_box"),
+    # Single card signals
+    ("ポケモンカード アビスアイ ピカチュウex SAR 234/193", "single_card"),
+    ("グラジオの決戦 SAR アビスアイ", "single_card"),
+    ("メガダークライex アビスアイ RR", "single_card"),
+    # Booster pack
+    ("アビスアイ 5パック", "booster_pack"),
+    # Starter deck (deck wins over an incidental 未開封)
+    ("ポケモンカード スタートデッキ100 未開封", "starter_deck"),
+    # Promo
+    ("プロモパック 限定", "promo"),
+    # Single-card via card number
+    ("アビスアイ ピカチュウex 234/193", "single_card"),
+    # Single-card via rarity tag — production-observed forms from the bug
+    ("アビスアイ　トサキント　ar", "single_card"),
+    ("アビスアイ エネルギーつけかえ SR 汎用", "single_card"),
+    # Bare set name — no signal, classifier punts to "other"
+    ("アビスアイ", "other"),
+])
+def test_classify_listing_product_type(title: str, expected: str) -> None:
+    assert _classify_listing_product_type(title) == expected
+
+
+# ── _listing_matches_candidate_type — asymmetric strictness ─────────────────
+
+
+def test_sealed_box_candidate_rejects_single_card_listing() -> None:
+    title = "ポケモンカード アビスアイ ピカチュウex SAR 234/193"
+    assert not _listing_matches_candidate_type(title, "sealed_box")
+
+
+def test_sealed_box_candidate_accepts_box_listing() -> None:
+    title = "ポケモンカード アビスアイ 1BOX 未開封"
+    assert _listing_matches_candidate_type(title, "sealed_box")
+
+
+def test_sealed_box_candidate_rejects_ambiguous_listing() -> None:
+    # "other"-classified — sealed_box is strict, must see positive box signal
+    assert not _listing_matches_candidate_type("アビスアイ", "sealed_box")
+
+
+def test_single_card_candidate_accepts_other_listings() -> None:
+    # single_card is loose — noisy card titles common on Mercari
+    assert _listing_matches_candidate_type("アビスアイ", "single_card")
+    assert _listing_matches_candidate_type("ピカチュウex 234/193", "single_card")
+
+
+def test_single_card_candidate_rejects_explicit_box_listing() -> None:
+    # never match a box to a single-card candidate
+    assert not _listing_matches_candidate_type(
+        "ポケモンカード 1BOX 未開封 シュリンク付き", "single_card"
+    )
+
+
+def test_booster_pack_candidate_rejects_box_listing() -> None:
+    # Box has stronger signal than digit+パック, so 1BOX takes precedence
+    assert not _listing_matches_candidate_type(
+        "アビスアイ 1BOX 30パック入", "booster_pack"
+    )
+
+
+def test_starter_deck_candidate_rejects_bare_single_card() -> None:
+    # Without any "スタートデッキ" wording, a SAR card is single_card and
+    # a starter_deck candidate must reject it.
+    assert not _listing_matches_candidate_type(
+        "ポケモンカード ピカチュウex SAR 234/193", "starter_deck"
+    )
+
+
+# ── MercariOpportunityListingFinder end-to-end with the filter ──────────────
+
+
+def test_mercari_finder_skips_single_card_listing_for_sealed_box_candidate(monkeypatch) -> None:
+    """The アビスアイ production bug: single SR cards must not be matched
+    against a sealed_box candidate just because the set name appears in
+    both titles."""
+
+    def fake_search(query, *, price_max, max_results, condition_ids):
+        return [
+            {"item_id": "A", "url": "u/A", "price_jpy": 4622,
+             "title": "ポケモンカード アビスアイ ピカチュウex SAR 234/193",
+             "thumbnail_url": ""},
+            {"item_id": "B", "url": "u/B", "price_jpy": 8500,
+             "title": "アビスアイ 1BOX 未開封 シュリンク付き", "thumbnail_url": ""},
+        ]
+
+    monkeypatch.setattr(
+        "openclaw_adapter.opportunity_agent.search_mercari", fake_search
+    )
+    cand = OpportunityCandidate(
+        candidate_id="opp_box",
+        game="pokemon", product_type="sealed_box",
+        title="アビスアイ", search_query="アビスアイ",
+        heat_score=95, reason="abyss eye box",
+    )
+    offers = MercariOpportunityListingFinder().find(cand, price_max_jpy=10000, limit=5)
+    assert [o.listing_id for o in offers] == ["B"]
+
+
+def test_mercari_finder_keeps_card_listings_for_single_card_candidate(monkeypatch) -> None:
+    """Single_card candidates must still match noisy card listings — many
+    real card listings lack rarity tags in the title."""
+
+    def fake_search(query, *, price_max, max_results, condition_ids):
+        return [
+            {"item_id": "X", "url": "u/X", "price_jpy": 800,
+             "title": "アビスアイ トサキント ar", "thumbnail_url": ""},
+            {"item_id": "Y", "url": "u/Y", "price_jpy": 1200,
+             "title": "ピカチュウex 234/193 美品", "thumbnail_url": ""},
+        ]
+
+    monkeypatch.setattr(
+        "openclaw_adapter.opportunity_agent.search_mercari", fake_search
+    )
+    cand = OpportunityCandidate(
+        candidate_id="opp_card",
+        game="pokemon", product_type="single_card",
+        title="ピカチュウex", search_query="ピカチュウex",
+        heat_score=80, reason="r",
+    )
+    offers = MercariOpportunityListingFinder().find(cand, price_max_jpy=5000, limit=5)
+    assert {o.listing_id for o in offers} == {"X", "Y"}
