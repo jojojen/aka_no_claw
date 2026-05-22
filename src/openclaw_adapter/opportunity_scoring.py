@@ -7,11 +7,19 @@ from .opportunity_models import ListingOffer, OpportunityCandidate, PriceCheck, 
 
 @dataclass(frozen=True, slots=True)
 class OpportunityThresholds:
+    # Strict path: 🔍 system-discovered (SNS / hot board / web search) opportunities.
     min_heat_score: float = 70.0
     max_price_ratio: float = 0.85
     min_price_confidence: float = 0.60
     min_total_reviews: int = 30
     min_positive_rate: float = 97.0
+    # When any Target exists, tighten the strict path further to suppress noise
+    # the user already opted out of via /hunt pin and /watchlist focus.
+    min_heat_score_when_target_active: float = 85.0
+    # Lenient path: 🎯 user-declared Target (/hunt pin, mercari /watchlist, 👍 feedback).
+    target_min_heat_score: float = 0.0
+    target_max_price_ratio: float = 0.95
+    target_min_price_confidence: float = 0.50
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,10 +30,16 @@ class OpportunityDecision:
     reasons: tuple[str, ...]
 
 
-def target_price_for(price: PriceCheck, thresholds: OpportunityThresholds) -> int:
+def target_price_for(
+    price: PriceCheck,
+    thresholds: OpportunityThresholds,
+    *,
+    is_target: bool = False,
+) -> int:
     if price.target_price_jpy is not None:
         return price.target_price_jpy
-    return int(price.fair_value_jpy * thresholds.max_price_ratio)
+    ratio = thresholds.target_max_price_ratio if is_target else thresholds.max_price_ratio
+    return int(price.fair_value_jpy * ratio)
 
 
 def evaluate_opportunity(
@@ -35,25 +49,41 @@ def evaluate_opportunity(
     listing: ListingOffer,
     reputation: ReputationCheck,
     thresholds: OpportunityThresholds,
+    has_any_target: bool = False,
 ) -> OpportunityDecision:
     reasons: list[str] = []
     accepted = True
 
-    if candidate.heat_score < thresholds.min_heat_score:
+    if candidate.is_target:
+        min_heat = thresholds.target_min_heat_score
+        max_ratio = thresholds.target_max_price_ratio
+        min_conf = thresholds.target_min_price_confidence
+    else:
+        # When the user has set up Target(s), tighten the bar for unrelated
+        # auto-discovered candidates so they don't keep spamming on top.
+        min_heat = (
+            thresholds.min_heat_score_when_target_active
+            if has_any_target
+            else thresholds.min_heat_score
+        )
+        max_ratio = thresholds.max_price_ratio
+        min_conf = thresholds.min_price_confidence
+
+    if candidate.heat_score < min_heat:
         accepted = False
-        reasons.append(f"SNS heat {candidate.heat_score:.0f} is below {thresholds.min_heat_score:.0f}.")
+        reasons.append(f"SNS heat {candidate.heat_score:.0f} is below {min_heat:.0f}.")
     else:
         reasons.append(f"SNS heat {candidate.heat_score:.0f} passed.")
 
-    if price.confidence < thresholds.min_price_confidence:
+    if price.confidence < min_conf:
         accepted = False
-        reasons.append(f"Price confidence {price.confidence:.2f} is below {thresholds.min_price_confidence:.2f}.")
+        reasons.append(f"Price confidence {price.confidence:.2f} is below {min_conf:.2f}.")
     else:
         reasons.append(f"Price confidence {price.confidence:.2f} passed.")
 
     price_ratio = listing.price_jpy / price.fair_value_jpy if price.fair_value_jpy > 0 else 999.0
     discount_pct = max(0.0, (1.0 - price_ratio) * 100.0)
-    if price_ratio > thresholds.max_price_ratio:
+    if price_ratio > max_ratio:
         accepted = False
         reasons.append(f"Listing price is only {discount_pct:.1f}% below fair value.")
     else:

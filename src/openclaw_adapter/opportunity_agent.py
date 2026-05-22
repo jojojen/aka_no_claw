@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -17,6 +18,7 @@ from typing import Any, Sequence
 
 from assistant_runtime import AssistantSettings, build_ssl_context, get_settings
 from market_monitor.mercari_search import DEFAULT_CONDITION_IDS, search_mercari
+from market_monitor.storage import MercariWatch, MonitorDatabase
 from price_monitor_bot.bot import TelegramBotClient
 from price_monitor_bot.commands import lookup_card
 from tcg_tracker.catalog import normalize_game_key, supported_game_hint
@@ -717,6 +719,183 @@ class MercariOpportunityListingFinder:
         return tuple(offers[:limit])
 
 
+# ─── Target providers (🎯 user-declared) ─────────────────────────────────────
+
+# Game-detection markers. First match wins; order = specificity.
+_GAME_HINT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"union\s*arena", re.IGNORECASE), "union_arena"),
+    (re.compile(r"ユニオンアリーナ"), "union_arena"),
+    (re.compile(r"weiss\s*schwarz|ヴァイス\s*シュヴァルツ|ヴァイスシュヴァルツ", re.IGNORECASE), "ws"),
+    (re.compile(r"\bws\b", re.IGNORECASE), "ws"),
+    (re.compile(r"遊戯王|遊戯王カード|yu[\-\s]?gi[\-\s]?oh", re.IGNORECASE), "yugioh"),
+    (re.compile(r"ポケモン|ポケカ|pokemon", re.IGNORECASE), "pokemon"),
+)
+
+
+def _normalize_target_query(
+    query: str,
+    *,
+    llm_fn=None,
+    default_game: str = "pokemon",
+) -> dict[str, str]:
+    """Coerce a free-form user/watchlist query into a structured target.
+
+    Returns dict with keys: game, product_type, title, search_query. Tries
+    rule-based inference first (so the function is usable without an LLM),
+    then optionally upgrades with an LLM call when llm_fn is provided.
+
+    No LLM call is made if the rule-based pass already produces a confident
+    answer (game + product_type both inferred); avoids per-tick LLM cost on
+    obvious queries.
+    """
+    cleaned = " ".join((query or "").split())
+    if not cleaned:
+        return {"game": default_game, "product_type": "other", "title": "", "search_query": ""}
+
+    inferred_game = default_game
+    for pattern, game_key in _GAME_HINT_PATTERNS:
+        if pattern.search(cleaned):
+            inferred_game = game_key
+            break
+
+    inferred_product_type = _classify_listing_product_type(cleaned)
+
+    result = {
+        "game": inferred_game,
+        "product_type": inferred_product_type,
+        "title": cleaned,
+        "search_query": cleaned,
+    }
+
+    # If rule-based gives us a confident product_type, skip the LLM round-trip.
+    # (Game can stay at the default — most TCG queries are pokemon anyway, and
+    # the LLM rarely flips it when explicit markers are absent.)
+    rule_confident = inferred_product_type != "other"
+    if llm_fn is None or rule_confident:
+        return result
+
+    prompt = (
+        "你是 TCG 商品分類助手。請判斷以下使用者輸入屬於哪個遊戲與商品類型，並回規範化的 title 與 Mercari search_query。\n"
+        "game 只能是：pokemon / ws / yugioh / union_arena\n"
+        "product_type 只能是：single_card / booster_pack / sealed_box / starter_deck / promo / other\n"
+        f"使用者輸入：「{cleaned}」\n"
+        "不確定 game 預設 pokemon；不確定 product_type 用 other。\n"
+        '請嚴格回 JSON：{"game":"...", "product_type":"...", "title":"...", "search_query":"..."}'
+    )
+    try:
+        raw = llm_fn(prompt)
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            game = normalize_game_key(parsed.get("game")) or inferred_game
+            product_type = normalize_product_type(parsed.get("product_type"))
+            title = str(parsed.get("title") or cleaned).strip() or cleaned
+            search_query = str(parsed.get("search_query") or cleaned).strip() or cleaned
+            return {"game": game, "product_type": product_type, "title": title, "search_query": search_query}
+    except Exception:
+        logger.exception("_normalize_target_query LLM call failed query=%r", cleaned)
+    return result
+
+
+class UserTargetCandidateProvider:
+    """Yield every active 🎯 Target candidate every tick.
+
+    Targets bypass the standard 30-min cooldown — when a user pins something,
+    they want it watched real-time. The pipeline still dedupes via candidate_id,
+    so re-yielding the same candidate per tick is safe.
+    """
+
+    def __init__(self, *, store: OpportunityStore) -> None:
+        self._store = store
+
+    def discover(self, *, limit: int) -> Sequence[OpportunityCandidate]:
+        try:
+            return tuple(self._store.list_target_candidates(limit=limit))
+        except Exception:
+            logger.exception("UserTargetCandidateProvider failed to load targets")
+            return ()
+
+
+class MercariWatchlistCandidateProvider:
+    """Bridge price_monitor_bot's mercari_watchlist into opportunity hunting.
+
+    Every enabled MercariWatch row is emitted as an is_target=True candidate
+    with a stable candidate_id (opp_mw_<sha1(watch_id)[:16]>) so the upsert
+    is idempotent across ticks. The watch's price_threshold_jpy is preserved
+    in metadata; the existing MercariWatchMonitor still does its own
+    price-floor notifications on the same table — this provider adds the
+    fair-value-discount + reputation hunt on top.
+
+    LLM normalization runs only once per watch_id; the resulting product_type
+    and canonical title are cached in candidate.metadata under
+    `normalized_at` / `normalized_*` and the store's upsert preserves them
+    across ticks.
+    """
+
+    def __init__(
+        self,
+        *,
+        market_db: MonitorDatabase,
+        llm_fn=None,
+        normalize_fn=_normalize_target_query,
+    ) -> None:
+        self._market_db = market_db
+        self._llm_fn = llm_fn
+        self._normalize_fn = normalize_fn
+        # Process-local cache so we don't even build a prompt for queries
+        # we've already normalized in this run.
+        self._cache: dict[str, dict[str, str]] = {}
+
+    def discover(self, *, limit: int) -> Sequence[OpportunityCandidate]:
+        try:
+            watches = self._market_db.list_mercari_watchlist()
+        except Exception:
+            logger.exception("MercariWatchlistCandidateProvider failed to read mercari_watchlist")
+            return ()
+        enabled = [w for w in watches if w.enabled]
+        out: list[OpportunityCandidate] = []
+        for watch in enabled[: max(0, limit)]:
+            normalized = self._cache.get(watch.query)
+            if normalized is None:
+                try:
+                    normalized = self._normalize_fn(watch.query, llm_fn=self._llm_fn)
+                except Exception:
+                    logger.exception(
+                        "MercariWatchlistCandidateProvider normalization failed query=%r",
+                        watch.query,
+                    )
+                    normalized = {
+                        "game": "pokemon",
+                        "product_type": "other",
+                        "title": watch.query,
+                        "search_query": watch.query,
+                    }
+                self._cache[watch.query] = normalized
+            digest = hashlib.sha1(watch.watch_id.encode("utf-8")).hexdigest()[:16]
+            candidate_id = f"opp_mw_{digest}"
+            out.append(
+                OpportunityCandidate(
+                    candidate_id=candidate_id,
+                    game=normalized["game"],
+                    product_type=normalized["product_type"],
+                    title=normalized["title"] or watch.query,
+                    search_query=normalized["search_query"] or watch.query,
+                    heat_score=100.0,
+                    reason=(
+                        f"Mercari watchlist: {watch.query} "
+                        f"(threshold ¥{watch.price_threshold_jpy:,})"
+                    ),
+                    source_kind="mercari_watchlist",
+                    source_url="",
+                    metadata={
+                        "mercari_watch_id": watch.watch_id,
+                        "price_threshold_jpy": watch.price_threshold_jpy,
+                    },
+                    is_target=True,
+                )
+            )
+        return tuple(out)
+
+
 class ReputationSnapshotOpportunityChecker:
     def __init__(
         self,
@@ -827,9 +1006,17 @@ class TelegramOpportunityNotifier:
         if not self._token or not self._chat_ids:
             logger.warning("Opportunity recommendation ready but Telegram token/chat ids are not configured:\n%s", text)
             return
+        rec_id = recommendation.recommendation_id
+        reply_markup = {
+            "inline_keyboard": [[
+                {"text": "👍 不錯", "callback_data": f"oppfb:up:{rec_id}"},
+                {"text": "👎 不感興趣", "callback_data": f"oppfb:down:{rec_id}"},
+                {"text": "💰 已買", "callback_data": f"oppfb:bought:{rec_id}"},
+            ]]
+        }
         client = TelegramBotClient(self._token, ssl_context=self._ssl_context)
         for chat_id in self._chat_ids:
-            client.send_message(chat_id=chat_id, text=text)
+            client.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
 
 
 class OpportunityAgent:
@@ -885,7 +1072,31 @@ def build_opportunity_agent(settings: AssistantSettings | None = None) -> Opport
         ssl_context=ssl_context if settings.openclaw_local_text_endpoint.startswith("https://") else None,
     )
 
-    sub_providers: list[CandidateProvider] = [sns_provider]
+    # 🎯 Target providers run first — anything the user explicitly pinned
+    # (/hunt pin or via the Mercari /watchlist bridge) gets priority over
+    # SNS-driven discoveries.
+    target_llm_fn = None
+    if (settings.openclaw_local_text_backend or "").strip().lower() == "ollama" and text_model:
+        target_endpoint = settings.openclaw_local_text_endpoint
+        target_timeout = settings.opportunity_llm_timeout_seconds
+        target_ssl = ssl_context if target_endpoint.startswith("https://") else None
+
+        def target_llm_fn(prompt: str, *, endpoint=target_endpoint, model=text_model,
+                          timeout=target_timeout, ssl=target_ssl) -> str:  # type: ignore[no-redef]
+            return _call_ollama_json(
+                endpoint=endpoint, model=model, prompt=prompt,
+                timeout_seconds=timeout, ssl_context=ssl,
+            )
+
+    sub_providers: list[CandidateProvider] = [
+        UserTargetCandidateProvider(store=store),
+        MercariWatchlistCandidateProvider(
+            market_db=MonitorDatabase(settings.monitor_db_path),
+            llm_fn=target_llm_fn,
+        ),
+        sns_provider,
+    ]
+    logger.info("Opportunity agent: UserTargetCandidateProvider + MercariWatchlistCandidateProvider enabled")
 
     if settings.opportunity_hot_card_provider_enabled:
         try:
@@ -1064,8 +1275,9 @@ def format_opportunity_recommendation(recommendation: OpportunityRecommendation)
     p = recommendation.price
     listing = recommendation.listing
     rep = recommendation.reputation
+    headline = "🎯 目標命中" if c.is_target else "🔍 系統發現"
     lines = [
-        "發現可能值得看的商品",
+        f"{headline}：可能值得看的商品",
         "",
         f"商品：{c.title}",
         f"熱度：{c.heat_score:.0f}/100",
@@ -1169,8 +1381,9 @@ def format_opportunity_status(settings: AssistantSettings, *, limit: int = 10) -
                 product_type=product_type,
                 identifier=identifier,
             )
+            badge = "🎯" if ("is_target" in row.keys() and row["is_target"]) else "🔍"
             lines.append(
-                f"{index}. [{row['game']} / {product_type}] {title_with_id} | heat={float(row['heat_score']):.0f} | checked={checked}"
+                f"{index}. {badge} [{row['game']} / {product_type}] {title_with_id} | heat={float(row['heat_score']):.0f} | checked={checked}"
             )
             lines.append(f"   search: {row['search_query']}")
             if row["reason"]:
@@ -1307,6 +1520,106 @@ def update_opportunity_string_list(
     return (
         f"✓ {label_target} 的{label_kind}已更新 (action={action}, 共 {len(updated)} 個)\n"
         + ", ".join(updated)
+    )
+
+
+def pin_opportunity_target(
+    settings: AssistantSettings,
+    name: str,
+    *,
+    llm_fn=None,
+    limit: int = 50,
+) -> str:
+    """Mark a candidate as 🎯 Target.
+
+    If `name` resolves to an existing active candidate (by id prefix, exact
+    match, or substring on title/search_query/aliases), flip its is_target
+    flag. Otherwise create a new candidate via `_normalize_target_query` and
+    upsert it with is_target=True, source_kind="user_pin", heat_score=100.
+
+    `llm_fn` is optional — without it the normalizer falls back to rule-based
+    game/product_type inference (still produces a usable candidate).
+    """
+    cleaned = " ".join(name.split()).strip() if name else ""
+    if not cleaned:
+        return "請提供要加入目標清單的商品名，例如：/hunt pin アビスアイ box"
+
+    store = OpportunityStore(settings.opportunity_db_path)
+    store.bootstrap()
+
+    candidates = store.list_recent_candidates(limit=max(1, limit))
+    if candidates:
+        resolved = _resolve_candidate_selector(candidates, cleaned)
+        if not isinstance(resolved, str):
+            # Existing candidate matches — just flip the flag.
+            candidate_id = str(resolved["candidate_id"])
+            if not store.set_is_target(candidate_id, True):
+                return f"找不到可標記的 active candidate：{cleaned}"
+            return (
+                "🎯 已加入目標清單\n"
+                f"目標：[{resolved['game']}] {resolved['title']}\n"
+                "下次該 candidate 走寬鬆門檻（折扣 ≥5%、heat 不卡）。"
+            )
+
+    # Fall through → create a brand-new user-pinned candidate.
+    normalized = _normalize_target_query(cleaned, llm_fn=llm_fn)
+    title = normalized["title"] or cleaned
+    search_query = normalized["search_query"] or cleaned
+    candidate_id = build_candidate_id(
+        game=normalized["game"],
+        product_type=normalized["product_type"],
+        title=title,
+        search_query=search_query,
+    )
+    candidate = OpportunityCandidate(
+        candidate_id=candidate_id,
+        game=normalized["game"],
+        product_type=normalized["product_type"],
+        title=title,
+        search_query=search_query,
+        heat_score=100.0,
+        reason="使用者透過 /hunt pin 主動加入目標清單",
+        source_kind="user_pin",
+        source_url="",
+        metadata={"pinned_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat()},
+        is_target=True,
+    )
+    store.upsert_candidate(candidate)
+    return (
+        "🎯 已加入目標清單\n"
+        f"目標：[{normalized['game']} / {normalized['product_type']}] {title}\n"
+        f"search_query：{search_query}\n"
+        "下輪 tick 開始走寬鬆門檻（折扣 ≥5%）。"
+    )
+
+
+def unpin_opportunity_target(
+    settings: AssistantSettings,
+    selector: str,
+    *,
+    limit: int = 30,
+) -> str:
+    cleaned = " ".join(selector.split()).strip() if selector else ""
+    if not cleaned:
+        return "請提供要從目標清單移除的編號或名稱，例如：/hunt unpin 1"
+
+    store = OpportunityStore(settings.opportunity_db_path)
+    store.bootstrap()
+    candidates = store.list_recent_candidates(limit=max(1, limit))
+    if not candidates:
+        return "目前沒有可調整的目標。"
+
+    resolved = _resolve_candidate_selector(candidates, cleaned)
+    if isinstance(resolved, str):
+        return resolved
+
+    candidate_id = str(resolved["candidate_id"])
+    if not store.set_is_target(candidate_id, False):
+        return f"找不到可調整的 active candidate：{cleaned}"
+    return (
+        "✓ 已從目標清單移除（candidate 仍 active，僅回到嚴格門檻）\n"
+        f"目標：[{resolved['game']}] {resolved['title']}\n"
+        "若要完全移除請改用 /hunt remove。"
     )
 
 
