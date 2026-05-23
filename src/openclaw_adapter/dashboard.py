@@ -15,7 +15,11 @@ from assistant_runtime import AssistantSettings, ToolRegistry, build_ssl_context
 from assistant_runtime.logging_utils import trim_for_log
 from market_monitor import load_reference_sources
 from market_monitor.http import HttpClient
-from market_monitor.storage import MercariWatch, MonitorDatabase
+from market_monitor.storage import (
+    MarketplaceWatch,
+    MonitorDatabase,
+    build_marketplace_watch_id,
+)
 from tcg_tracker.catalog import normalize_game_key, supported_game_hint
 from tcg_tracker.hot_cards import HotCardBoard, TcgHotCardService
 
@@ -217,14 +221,16 @@ def _build_handler(*, settings: AssistantSettings, registry: ToolRegistry) -> ty
 
         def _handle_watchlist_get(self) -> None:
             db = self._get_watch_db()
-            watches = db.list_mercari_watchlist()
+            watches = db.list_marketplace_watchlist()
             payload = []
             for w in watches:
-                hits = db.list_mercari_hits(w.watch_id, limit=5)
+                hits = db.list_marketplace_hits(w.watch_id, limit=5)
                 payload.append({
                     "watch_id": w.watch_id,
                     "query": w.query,
                     "price_threshold_jpy": w.price_threshold_jpy,
+                    "markets": list(w.markets),
+                    "market_options": {k: dict(v) for k, v in w.market_options.items()},
                     "enabled": w.enabled,
                     "chat_id": w.chat_id,
                     "last_checked_at": w.last_checked_at,
@@ -232,13 +238,16 @@ def _build_handler(*, settings: AssistantSettings, registry: ToolRegistry) -> ty
                     "updated_at": w.updated_at,
                     "recent_hits": [
                         {
-                            "mercari_item_id": h.mercari_item_id,
+                            "source": h.source,
+                            "source_item_id": h.source_item_id,
                             "title": h.title,
                             "price_jpy": h.price_jpy,
                             "url": h.url,
                             "thumbnail_url": h.thumbnail_url,
                             "first_seen_at": h.first_seen_at,
                             "notified": h.notified,
+                            "stock_count": h.stock_count,
+                            "listing_kind": h.listing_kind,
                         }
                         for h in hits
                     ],
@@ -249,8 +258,15 @@ def _build_handler(*, settings: AssistantSettings, registry: ToolRegistry) -> ty
             query = str(data.get("query") or "").strip()
             threshold_raw = data.get("price_threshold_jpy")
             chat_id = str(data.get("chat_id") or "dashboard").strip()
+            markets_raw = data.get("markets") or ["mercari", "rakuma"]
+            if isinstance(markets_raw, str):
+                markets_raw = [markets_raw]
+            markets = tuple(str(m).strip().lower() for m in markets_raw if str(m).strip())
             if not query:
                 self._write_json({"error": "query is required"}, status=HTTPStatus.BAD_REQUEST)
+                return
+            if not markets:
+                self._write_json({"error": "markets is required"}, status=HTTPStatus.BAD_REQUEST)
                 return
             try:
                 threshold = int(str(threshold_raw).replace(",", ""))
@@ -260,25 +276,40 @@ def _build_handler(*, settings: AssistantSettings, registry: ToolRegistry) -> ty
             if threshold <= 0:
                 self._write_json({"error": "price_threshold_jpy must be > 0"}, status=HTTPStatus.BAD_REQUEST)
                 return
-            watch_id = sha1(f"{chat_id}|{query}".encode()).hexdigest()[:16]
-            watch = MercariWatch(
+            watch_id = build_marketplace_watch_id(chat_id=chat_id, query=query)
+            market_options: dict[str, dict[str, object]] = {}
+            for market in markets:
+                if market == "mercari":
+                    market_options[market] = {"condition_ids": [1, 2, 3]}
+                else:
+                    market_options[market] = {}
+            watch = MarketplaceWatch(
                 watch_id=watch_id,
                 query=query,
                 price_threshold_jpy=threshold,
+                markets=markets,
                 enabled=True,
                 chat_id=chat_id,
                 last_checked_at=None,
                 created_at="",
                 updated_at="",
+                market_options=market_options,
             )
             db = self._get_watch_db()
-            db.add_mercari_watch(watch)
-            logger.info("Dashboard watchlist add watch_id=%s query=%s threshold=%d", watch_id, query, threshold)
-            self._write_json({"watch_id": watch_id, "query": query, "price_threshold_jpy": threshold}, status=HTTPStatus.CREATED)
+            db.add_marketplace_watch(watch)
+            logger.info(
+                "Dashboard watchlist add watch_id=%s query=%s threshold=%d markets=%s",
+                watch_id, query, threshold, list(markets),
+            )
+            self._write_json(
+                {"watch_id": watch_id, "markets": list(markets), "query": query,
+                 "price_threshold_jpy": threshold},
+                status=HTTPStatus.CREATED,
+            )
 
         def _handle_watchlist_delete(self, watch_id: str) -> None:
             db = self._get_watch_db()
-            deleted = db.delete_mercari_watch(watch_id)
+            deleted = db.delete_marketplace_watch(watch_id)
             if deleted:
                 logger.info("Dashboard watchlist delete watch_id=%s", watch_id)
                 self._write_json({"deleted": True, "watch_id": watch_id})
@@ -287,12 +318,12 @@ def _build_handler(*, settings: AssistantSettings, registry: ToolRegistry) -> ty
 
         def _handle_watchlist_patch(self, watch_id: str, data: dict[str, object]) -> None:
             db = self._get_watch_db()
-            watch = db.get_mercari_watch(watch_id)
+            watch = db.get_marketplace_watch(watch_id)
             if watch is None:
                 self._write_json({"error": f"watch_id '{watch_id}' not found"}, status=HTTPStatus.NOT_FOUND)
                 return
             if "enabled" in data:
-                db.toggle_mercari_watch(watch_id, enabled=bool(data["enabled"]))
+                db.toggle_marketplace_watch(watch_id, enabled=bool(data["enabled"]))
             query = str(data["query"]).strip() if "query" in data else None
             threshold = None
             if "price_threshold_jpy" in data:
@@ -302,7 +333,7 @@ def _build_handler(*, settings: AssistantSettings, registry: ToolRegistry) -> ty
                     self._write_json({"error": "price_threshold_jpy must be integer"}, status=HTTPStatus.BAD_REQUEST)
                     return
             if query or threshold is not None:
-                db.update_mercari_watch(watch_id, query=query, price_threshold_jpy=threshold)
+                db.update_marketplace_watch(watch_id, query=query, price_threshold_jpy=threshold)
             logger.info("Dashboard watchlist patch watch_id=%s", watch_id)
             self._write_json({"updated": True, "watch_id": watch_id})
 

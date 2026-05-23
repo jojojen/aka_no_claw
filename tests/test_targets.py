@@ -9,7 +9,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from market_monitor.storage import MercariWatch, MonitorDatabase
+from market_monitor.storage import (
+    MarketplaceWatch,
+    MonitorDatabase,
+    build_marketplace_watch_id,
+)
 from openclaw_adapter.opportunity_agent import (
     MercariWatchlistCandidateProvider,
     UserTargetCandidateProvider,
@@ -304,73 +308,83 @@ def test_user_target_provider_returns_empty_on_storage_error(tmp_path: Path) -> 
     assert provider.discover(limit=3) == ()
 
 
-# ─── MercariWatchlistCandidateProvider ────────────────────────────────────────
+# ─── MarketplaceWatchlistCandidateProvider ────────────────────────────────────
 
 
-def _seed_mercari_watch(
+def _seed_marketplace_watch(
     db: MonitorDatabase,
     *,
-    watch_id: str,
+    watch_id: str | None = None,
+    markets: tuple[str, ...] = ("mercari",),
     query: str,
     threshold: int = 8000,
     enabled: bool = True,
-) -> None:
-    watch = MercariWatch(
+) -> str:
+    """Insert a marketplace watch; returns the watch_id."""
+    if watch_id is None:
+        watch_id = build_marketplace_watch_id(chat_id="123", query=query)
+    market_options: dict[str, dict[str, object]] = {}
+    for m in markets:
+        market_options[m] = {"condition_ids": [1, 2, 3]} if m == "mercari" else {}
+    watch = MarketplaceWatch(
         watch_id=watch_id,
         query=query,
         price_threshold_jpy=threshold,
+        markets=markets,
         enabled=enabled,
         chat_id="123",
         last_checked_at=None,
         created_at="2026-01-01T00:00:00+00:00",
         updated_at="2026-01-01T00:00:00+00:00",
+        market_options=market_options,
     )
-    db.add_mercari_watch(watch)
+    db.add_marketplace_watch(watch)
+    return watch_id
 
 
-def test_mercari_watchlist_provider_emits_is_target_candidate(tmp_path: Path) -> None:
+def test_marketplace_watchlist_provider_emits_is_target_candidate(tmp_path: Path) -> None:
     db = MonitorDatabase(tmp_path / "monitor.sqlite3")
     db.bootstrap()
-    _seed_mercari_watch(db, watch_id="w-001", query="ポケモン アビスアイ 1BOX")
+    watch_id = _seed_marketplace_watch(db, query="ポケモン アビスアイ 1BOX")
     provider = MercariWatchlistCandidateProvider(market_db=db)
     candidates = list(provider.discover(limit=10))
     assert len(candidates) == 1
     c = candidates[0]
     assert c.is_target is True
-    assert c.source_kind == "mercari_watchlist"
+    assert c.source_kind == "marketplace_watchlist"
     assert c.candidate_id.startswith("opp_mw_")
-    assert c.metadata["mercari_watch_id"] == "w-001"
+    assert c.metadata["marketplace_watch_id"] == watch_id
+    assert c.metadata["marketplace_markets"] == ["mercari"]
     assert c.metadata["price_threshold_jpy"] == 8000
-    # Rule-based normalization should classify this as pokemon sealed_box
     assert c.game == "pokemon"
     assert c.product_type == "sealed_box"
 
 
-def test_mercari_watchlist_disabled_watches_are_skipped(tmp_path: Path) -> None:
+def test_marketplace_watchlist_disabled_watches_are_skipped(tmp_path: Path) -> None:
     db = MonitorDatabase(tmp_path / "monitor.sqlite3")
     db.bootstrap()
-    _seed_mercari_watch(db, watch_id="w-on", query="enabled", enabled=True)
-    _seed_mercari_watch(db, watch_id="w-off", query="disabled", enabled=False)
+    on_id = _seed_marketplace_watch(db, query="enabled", enabled=True)
+    _seed_marketplace_watch(db, query="disabled", enabled=False)
     provider = MercariWatchlistCandidateProvider(market_db=db)
     candidates = list(provider.discover(limit=10))
     assert len(candidates) == 1
-    assert candidates[0].metadata["mercari_watch_id"] == "w-on"
+    assert candidates[0].metadata["marketplace_watch_id"] == on_id
 
 
-def test_mercari_watchlist_candidate_id_stable_across_ticks(tmp_path: Path) -> None:
+def test_marketplace_watchlist_candidate_id_stable_across_ticks(tmp_path: Path) -> None:
     db = MonitorDatabase(tmp_path / "monitor.sqlite3")
     db.bootstrap()
-    _seed_mercari_watch(db, watch_id="w-stable", query="ピカチュウ ex SAR")
+    _seed_marketplace_watch(db, query="ピカチュウ ex SAR")
     provider = MercariWatchlistCandidateProvider(market_db=db)
     first = list(provider.discover(limit=10))
     second = list(provider.discover(limit=10))
     assert first[0].candidate_id == second[0].candidate_id
 
 
-def test_mercari_watchlist_llm_normalization_cached(tmp_path: Path) -> None:
+def test_marketplace_watchlist_llm_normalization_cached(tmp_path: Path) -> None:
     db = MonitorDatabase(tmp_path / "monitor.sqlite3")
     db.bootstrap()
-    _seed_mercari_watch(db, watch_id="w-cache", query="アビスアイ")  # ambiguous → would call LLM
+    _seed_marketplace_watch(db, query="アビスアイ")
     call_count = {"n": 0}
 
     def counting_normalize(query: str, *, llm_fn=None) -> dict[str, str]:
@@ -387,4 +401,30 @@ def test_mercari_watchlist_llm_normalization_cached(tmp_path: Path) -> None:
     )
     list(provider.discover(limit=5))
     list(provider.discover(limit=5))
-    assert call_count["n"] == 1  # only once across two ticks
+    assert call_count["n"] == 1  # cached by query
+
+
+def test_marketplace_watchlist_multi_market_watch_emits_one_candidate(tmp_path: Path) -> None:
+    """A watch with markets=[mercari, rakuma] is one logical opportunity
+    target — emit ONE candidate, with the markets list in metadata so the
+    downstream pipeline knows which platforms to search."""
+    db = MonitorDatabase(tmp_path / "monitor.sqlite3")
+    db.bootstrap()
+    _seed_marketplace_watch(
+        db, markets=("mercari", "rakuma"), query="綾波レイ ユニオンアリーナ プロモカード",
+    )
+    provider = MercariWatchlistCandidateProvider(market_db=db)
+    candidates = list(provider.discover(limit=10))
+    assert len(candidates) == 1
+    assert candidates[0].source_kind == "marketplace_watchlist"
+    assert candidates[0].metadata["marketplace_markets"] == ["mercari", "rakuma"]
+
+
+def test_marketplace_watchlist_includes_rakuma_only_watches(tmp_path: Path) -> None:
+    db = MonitorDatabase(tmp_path / "monitor.sqlite3")
+    db.bootstrap()
+    _seed_marketplace_watch(db, markets=("rakuma",), query="アビスアイ box")
+    provider = MercariWatchlistCandidateProvider(market_db=db)
+    candidates = list(provider.discover(limit=10))
+    assert len(candidates) == 1
+    assert candidates[0].metadata["marketplace_markets"] == ["rakuma"]

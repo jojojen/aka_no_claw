@@ -18,7 +18,7 @@ from typing import Any, Sequence
 
 from assistant_runtime import AssistantSettings, build_ssl_context, get_settings
 from market_monitor.mercari_search import DEFAULT_CONDITION_IDS, search_mercari
-from market_monitor.storage import MercariWatch, MonitorDatabase
+from market_monitor.storage import MarketplaceWatch, MonitorDatabase
 from price_monitor_bot.bot import TelegramBotClient
 from price_monitor_bot.commands import lookup_card
 from tcg_tracker.catalog import normalize_game_key, supported_game_hint
@@ -815,20 +815,21 @@ class UserTargetCandidateProvider:
             return ()
 
 
-class MercariWatchlistCandidateProvider:
-    """Bridge price_monitor_bot's mercari_watchlist into opportunity hunting.
+class MarketplaceWatchlistCandidateProvider:
+    """Bridge price_monitor_bot's marketplace_watchlist (any source) into
+    opportunity hunting.
 
-    Every enabled MercariWatch row is emitted as an is_target=True candidate
-    with a stable candidate_id (opp_mw_<sha1(watch_id)[:16]>) so the upsert
-    is idempotent across ticks. The watch's price_threshold_jpy is preserved
-    in metadata; the existing MercariWatchMonitor still does its own
-    price-floor notifications on the same table — this provider adds the
-    fair-value-discount + reputation hunt on top.
+    Every enabled MarketplaceWatch row is emitted as an is_target=True
+    candidate with a stable candidate_id (``opp_mw_<sha1(watch_id)[:16]>``)
+    so the upsert is idempotent across ticks. The watch's source and
+    price_threshold_jpy are preserved in metadata; the existing
+    MarketplaceWatchMonitor still does its own price-floor notifications on
+    the same table — this provider adds the fair-value-discount + reputation
+    hunt on top.
 
-    LLM normalization runs only once per watch_id; the resulting product_type
-    and canonical title are cached in candidate.metadata under
-    `normalized_at` / `normalized_*` and the store's upsert preserves them
-    across ticks.
+    LLM normalization runs only once per ``(source, query)`` pair; the
+    resulting product_type and canonical title are cached in the provider
+    instance for this process.
     """
 
     def __init__(
@@ -841,26 +842,30 @@ class MercariWatchlistCandidateProvider:
         self._market_db = market_db
         self._llm_fn = llm_fn
         self._normalize_fn = normalize_fn
-        # Process-local cache so we don't even build a prompt for queries
-        # we've already normalized in this run.
+        # Process-local cache: (source, query) → normalized dict.
         self._cache: dict[str, dict[str, str]] = {}
 
     def discover(self, *, limit: int) -> Sequence[OpportunityCandidate]:
         try:
-            watches = self._market_db.list_mercari_watchlist()
+            watches = self._market_db.list_marketplace_watchlist()
         except Exception:
-            logger.exception("MercariWatchlistCandidateProvider failed to read mercari_watchlist")
+            logger.exception(
+                "MarketplaceWatchlistCandidateProvider failed to read marketplace_watchlist"
+            )
             return ()
         enabled = [w for w in watches if w.enabled]
         out: list[OpportunityCandidate] = []
         for watch in enabled[: max(0, limit)]:
-            normalized = self._cache.get(watch.query)
+            # Cache keyed on query only — markets don't affect normalization
+            # (same product, different distribution channels).
+            cache_key = watch.query
+            normalized = self._cache.get(cache_key)
             if normalized is None:
                 try:
                     normalized = self._normalize_fn(watch.query, llm_fn=self._llm_fn)
                 except Exception:
                     logger.exception(
-                        "MercariWatchlistCandidateProvider normalization failed query=%r",
+                        "MarketplaceWatchlistCandidateProvider normalization failed query=%r",
                         watch.query,
                     )
                     normalized = {
@@ -869,9 +874,10 @@ class MercariWatchlistCandidateProvider:
                         "title": watch.query,
                         "search_query": watch.query,
                     }
-                self._cache[watch.query] = normalized
+                self._cache[cache_key] = normalized
             digest = hashlib.sha1(watch.watch_id.encode("utf-8")).hexdigest()[:16]
             candidate_id = f"opp_mw_{digest}"
+            markets_display = " / ".join(m.capitalize() for m in watch.markets) or "(無)"
             out.append(
                 OpportunityCandidate(
                     candidate_id=candidate_id,
@@ -881,19 +887,24 @@ class MercariWatchlistCandidateProvider:
                     search_query=normalized["search_query"] or watch.query,
                     heat_score=100.0,
                     reason=(
-                        f"Mercari watchlist: {watch.query} "
+                        f"Marketplace watchlist [{markets_display}]: {watch.query} "
                         f"(threshold ¥{watch.price_threshold_jpy:,})"
                     ),
-                    source_kind="mercari_watchlist",
+                    source_kind="marketplace_watchlist",
                     source_url="",
                     metadata={
-                        "mercari_watch_id": watch.watch_id,
+                        "marketplace_watch_id": watch.watch_id,
+                        "marketplace_markets": list(watch.markets),
                         "price_threshold_jpy": watch.price_threshold_jpy,
                     },
                     is_target=True,
                 )
             )
         return tuple(out)
+
+
+# Backward-compat alias — existing wiring imports the old name.
+MercariWatchlistCandidateProvider = MarketplaceWatchlistCandidateProvider
 
 
 class ReputationSnapshotOpportunityChecker:
@@ -1090,13 +1101,13 @@ def build_opportunity_agent(settings: AssistantSettings | None = None) -> Opport
 
     sub_providers: list[CandidateProvider] = [
         UserTargetCandidateProvider(store=store),
-        MercariWatchlistCandidateProvider(
+        MarketplaceWatchlistCandidateProvider(
             market_db=MonitorDatabase(settings.monitor_db_path),
             llm_fn=target_llm_fn,
         ),
         sns_provider,
     ]
-    logger.info("Opportunity agent: UserTargetCandidateProvider + MercariWatchlistCandidateProvider enabled")
+    logger.info("Opportunity agent: UserTargetCandidateProvider + MarketplaceWatchlistCandidateProvider enabled")
 
     if settings.opportunity_hot_card_provider_enabled:
         try:
