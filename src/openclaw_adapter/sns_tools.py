@@ -81,11 +81,18 @@ def _start_sns_monitor(
             "reddit": RedditSource(client=reddit_client),
         }
 
-        def notify_fn(chat_id: str, text: str) -> None:
-            """Notify via Telegram."""
+        def notify_fn(
+            chat_id: str,
+            text: str,
+            reply_markup: dict[str, object] | None = None,
+        ) -> None:
+            """Notify via Telegram. ``reply_markup`` is optional — the SNS
+            monitor passes a 👍/👎/💰 inline keyboard for per-tweet posts."""
             try:
                 client = SnsTelegramClient(token, ssl_context=ssl_context)
-                client.send_message(chat_id=chat_id, text=text)
+                client.send_message(
+                    chat_id=chat_id, text=text, reply_markup=reply_markup,
+                )
             except Exception as e:
                 logger.exception("SNS notification failed chat_id=%s: %s", chat_id, e)
 
