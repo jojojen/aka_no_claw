@@ -16,6 +16,7 @@ Game inference priority:
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import TYPE_CHECKING, Sequence
@@ -29,6 +30,8 @@ from .opportunity_models import (
 
 if TYPE_CHECKING:
     from market_monitor.official_store_base import OfficialStoreCrawler, OfficialStoreListing
+    from .collab_outcomes_store import CollabOutcomesStore
+    from .collab_similarity_provider import CollabSimilarityProvider
 
 logger = logging.getLogger(__name__)
 
@@ -66,14 +69,44 @@ _PRODUCT_TYPE_KW: dict[str, re.Pattern[str]] = {
     "promo": re.compile(r"プロモ|promo|特典|限定配布", re.IGNORECASE),
 }
 
+# Known TCG prefixes to strip when extracting IP canonical from title
+_TCG_TITLE_PREFIXES: tuple[str, ...] = (
+    "ヴァイスシュヴァルツ ",
+    "Weiss Schwarz ",
+    "ヴァイス ",
+    "UNION ARENA ",
+    "ユニオンアリーナ ",
+    "UA ",
+    "ポケモンカードゲーム ",
+    "ポケモンカード ",
+    "遊戯王 ",
+    "ワンピースカードゲーム ",
+    "ワンピースカード ",
+    "バトルスピリッツ ",
+    "バトスピ ",
+)
+
 
 class OfficialStoreCandidateProvider:
     """Discovers pre-order / lottery candidates from official store crawlers.
 
     Implements the CandidateProvider Protocol used by OpportunityPipeline."""
 
-    def __init__(self, crawlers: list["OfficialStoreCrawler"]) -> None:
+    def __init__(
+        self,
+        crawlers: list["OfficialStoreCrawler"],
+        *,
+        collab_store: "CollabOutcomesStore | None" = None,
+        top_n: int = 5,
+    ) -> None:
         self._crawlers = crawlers
+        if collab_store is not None:
+            from .collab_similarity_provider import CollabSimilarityProvider as _CSP
+            self._collab_similarity: "CollabSimilarityProvider | None" = _CSP(
+                collab_store, top_n=top_n
+            )
+        else:
+            self._collab_similarity = None
 
     def discover(self, *, limit: int) -> Sequence[OpportunityCandidate]:
         from market_monitor.official_store_base import ACTIVE_STATUSES
@@ -90,7 +123,9 @@ class OfficialStoreCandidateProvider:
             for listing in listings:
                 if listing.status not in ACTIVE_STATUSES:
                     continue
-                candidate = _listing_to_candidate(listing)
+                candidate = _listing_to_candidate(
+                    listing, collab_similarity=self._collab_similarity
+                )
                 if candidate:
                     candidates.append(candidate)
 
@@ -104,7 +139,11 @@ class OfficialStoreCandidateProvider:
         return result
 
 
-def _listing_to_candidate(listing: "OfficialStoreListing") -> OpportunityCandidate | None:
+def _listing_to_candidate(
+    listing: "OfficialStoreListing",
+    *,
+    collab_similarity: "CollabSimilarityProvider | None" = None,
+) -> "OpportunityCandidate | None":
     game = _infer_game(listing)
     product_type = _infer_product_type(listing.title)
     heat_score = _STATUS_HEAT.get(listing.status, 0.45)
@@ -137,6 +176,21 @@ def _listing_to_candidate(listing: "OfficialStoreListing") -> OpportunityCandida
         metadata["open_date_iso"] = listing.open_date_iso
     if listing.product_code:
         metadata["product_code"] = listing.product_code
+
+    # Attach collab inference if provider is wired in
+    if collab_similarity is not None:
+        ip_canonical = _infer_ip_canonical(listing.title, game)
+        try:
+            inference = collab_similarity.infer(ip_canonical, game)
+            if inference.n_samples > 0:
+                metadata["collab_inference_json"] = json.dumps(
+                    _inference_to_compact_dict(inference),
+                    ensure_ascii=False,
+                )
+        except Exception:
+            logger.exception(
+                "_listing_to_candidate: collab inference failed title=%r", listing.title
+            )
 
     return OpportunityCandidate(
         candidate_id=candidate_id,
@@ -186,3 +240,49 @@ def _build_search_query(listing: "OfficialStoreListing") -> str:
     title = re.sub(r"\s+\d?BOX$", "", title, flags=re.IGNORECASE).strip()
     # Limit to ~60 chars for search queries
     return title[:60]
+
+
+def _infer_ip_canonical(title: str, game: str) -> str:
+    """Strip known TCG product prefixes from title to get a best-effort IP name.
+
+    Returns a lowercase string suitable as ip_canonical for similarity lookup.
+    """
+    stripped = title.strip()
+    for prefix in _TCG_TITLE_PREFIXES:
+        if stripped.startswith(prefix):
+            stripped = stripped[len(prefix):]
+            break
+    # Also try a case-insensitive strip for ASCII prefixes
+    for prefix in _TCG_TITLE_PREFIXES:
+        if stripped.lower().startswith(prefix.lower()) and not stripped.startswith(prefix):
+            stripped = stripped[len(prefix):]
+            break
+    # Remove product-type trailing words (BOX / ブースターパック / etc.) for cleaner IP name
+    stripped = re.sub(
+        r"\s+(?:\d?BOX|ブースターパック|ブースター|拡張パック|スターターデッキ|スターター|プロモ).*$",
+        "",
+        stripped,
+        flags=re.IGNORECASE,
+    ).strip()
+    return stripped.lower()
+
+
+def _inference_to_compact_dict(inference: object) -> dict:
+    """Serialize a CollabInference to a compact JSON-safe dict for metadata storage."""
+    # Access attributes via getattr to avoid hard import in this module
+    return {
+        "n_samples": getattr(inference, "n_samples", 0),
+        "mean_profit_pct_180d": getattr(inference, "mean_profit_pct_180d", None),
+        "win_rate_180d": getattr(inference, "win_rate_180d", None),
+        "best_profit_pct_180d": getattr(inference, "best_profit_pct_180d", None),
+        "worst_profit_pct_180d": getattr(inference, "worst_profit_pct_180d", None),
+        "top_cases": [
+            {
+                "ip": getattr(c, "ip_canonical", ""),
+                "tcg": getattr(c, "tcg_game", ""),
+                "date": getattr(c, "announce_date", "")[:7],
+                "p180": getattr(c, "profit_pct_180d", None),
+            }
+            for c in list(getattr(inference, "similar_cases", []))[:3]
+        ],
+    }
