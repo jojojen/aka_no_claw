@@ -1158,6 +1158,13 @@ def build_opportunity_agent(settings: AssistantSettings | None = None) -> Opport
             len(queries),
         )
 
+    if settings.opportunity_official_store_provider_enabled:
+        try:
+            sub_providers.append(_build_official_store_provider(ssl_context=ssl_context))
+            logger.info("Opportunity agent: OfficialStoreCandidateProvider enabled")
+        except Exception:
+            logger.exception("Failed to wire OfficialStoreCandidateProvider; skipping")
+
     candidate_provider: CandidateProvider = (
         sub_providers[0] if len(sub_providers) == 1 else ChainedCandidateProvider(sub_providers)
     )
@@ -1198,6 +1205,34 @@ def build_opportunity_agent(settings: AssistantSettings | None = None) -> Opport
         interval_seconds=settings.opportunity_interval_seconds,
         preflight_fn=preflight_fn,
     )
+
+
+def _build_official_store_provider(*, ssl_context):
+    """Instantiate all official-store crawlers and wrap in the provider."""
+    import ssl as _ssl
+    from market_monitor.http import HttpClient
+    from market_monitor.joshin_preorder import JoshinPreorderCrawler
+    from market_monitor.yodobashi_preorder import YodobashiPreorderCrawler
+    from market_monitor.animate_preorder import AnimatePreorderCrawler
+    from market_monitor.pokecen_preorder import PokemonCenterPreorderCrawler
+    from market_monitor.ua_official_preorder import UaOfficialPreorderCrawler
+    from market_monitor.amiami_preorder import AmiAmiPreorderCrawler
+    from .official_store_provider import OfficialStoreCandidateProvider
+
+    http_client = HttpClient(
+        user_agent="OpenClawPriceMonitor/0.1 (+https://local-dev)",
+        timeout_seconds=25,
+        ssl_context=ssl_context,
+    )
+    crawlers = [
+        JoshinPreorderCrawler(http_client=http_client),
+        YodobashiPreorderCrawler(http_client=http_client),
+        AnimatePreorderCrawler(http_client=http_client),
+        PokemonCenterPreorderCrawler(http_client=http_client),
+        UaOfficialPreorderCrawler(http_client=http_client),
+        AmiAmiPreorderCrawler(http_client=http_client),
+    ]
+    return OfficialStoreCandidateProvider(crawlers=crawlers)
 
 
 def _build_preflight_callable(*, settings: AssistantSettings, ssl_context):

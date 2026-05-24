@@ -57,6 +57,7 @@ class AssistantSettings:
     opportunity_web_trend_provider_enabled: bool = True
     opportunity_web_trend_queries: tuple[str, ...] = ()
     opportunity_web_trend_results_per_query: int = 5
+    opportunity_official_store_provider_enabled: bool = True
     # ── SNS rule domain backfill / auto-discovery (Provider E + backfill) ────
     opportunity_sns_domain_backfill_enabled: bool = True
     opportunity_sns_auto_discovery_enabled: bool = True
@@ -200,6 +201,10 @@ def get_settings() -> AssistantSettings:
         opportunity_web_trend_results_per_query=_as_int(
             os.getenv("OPENCLAW_OPPORTUNITY_WEB_TREND_RESULTS_PER_QUERY"),
             default=5,
+        ),
+        opportunity_official_store_provider_enabled=_as_bool(
+            os.getenv("OPENCLAW_OPPORTUNITY_OFFICIAL_STORE_PROVIDER_ENABLED"),
+            default=True,
         ),
         opportunity_sns_domain_backfill_enabled=_as_bool(
             os.getenv("OPENCLAW_OPPORTUNITY_SNS_DOMAIN_BACKFILL_ENABLED"),
