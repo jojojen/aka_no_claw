@@ -1325,7 +1325,56 @@ def _build_preflight_callable(*, settings: AssistantSettings, ssl_context):
     return preflight
 
 
+_STORE_NAME_DISPLAY: dict[str, str] = {
+    "joshin": "Joshin web shop",
+    "yodobashi": "ヨドバシカメラ",
+    "animate": "アニメイトオンライン",
+    "pokecen": "ポケモンセンターオンライン",
+    "ua_official": "UNION ARENA 公式",
+    "amiami": "AmiAmi",
+}
+
+_STATUS_JP: dict[str, str] = {
+    "lottery_open": "抽選申込受付中",
+    "preorder_open": "予約受付中",
+    "available": "在庫あり",
+    "coming_soon": "近日公開",
+}
+
+
+def _format_official_store_recommendation(recommendation: OpportunityRecommendation) -> str:
+    """🎫 formatter for official-store pre-order / lottery notifications."""
+    c = recommendation.candidate
+    meta = c.metadata
+    store_raw = str(meta.get("source_store") or "")
+    store_display = _STORE_NAME_DISPLAY.get(store_raw, store_raw)
+    status_raw = str(meta.get("listing_status") or "")
+    status_jp = _STATUS_JP.get(status_raw, status_raw)
+    official_url = str(meta.get("listing_url") or c.source_url)
+    price_jpy = meta.get("official_price_jpy")
+    deadline = meta.get("deadline_iso")
+    open_date = meta.get("open_date_iso")
+
+    lines = [f"🎫 公式予約 / 抽選通知 — {c.title}"]
+    lines.append("")
+    lines.append(f"通路：{store_display}")
+    if status_jp:
+        lines.append(f"状態：{status_jp}")
+    if price_jpy:
+        lines.append(f"定価：¥{int(price_jpy):,}（税込）")
+    if open_date:
+        lines.append(f"申込開始：{open_date}")
+    if deadline:
+        lines.append(f"申込締切：{deadline}")
+    lines.append("")
+    lines.append("公式リンク：")
+    lines.append(official_url)
+    return "\n".join(lines)
+
+
 def format_opportunity_recommendation(recommendation: OpportunityRecommendation) -> str:
+    if recommendation.candidate.source_kind == "official_store_preorder":
+        return _format_official_store_recommendation(recommendation)
     c = recommendation.candidate
     p = recommendation.price
     listing = recommendation.listing

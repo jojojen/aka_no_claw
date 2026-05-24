@@ -10,6 +10,7 @@ from .opportunity_models import (
     OpportunityRecommendation,
     PriceCheck,
     ReputationCheck,
+    build_listing_key,
 )
 from .opportunity_scoring import OpportunityThresholds, evaluate_opportunity, target_price_for
 from .opportunity_store import OpportunityStore, recommendation_id_for
@@ -112,6 +113,10 @@ class OpportunityPipeline:
             candidate.is_target,
         )
         try:
+            if candidate.source_kind == "official_store_preorder":
+                self._run_official_store_candidate(candidate, stats)
+                return
+
             price = self._price_checker.check(candidate)
             if price is None:
                 logger.info("Opportunity candidate skipped: no fair value candidate_id=%s", candidate.candidate_id)
@@ -125,6 +130,63 @@ class OpportunityPipeline:
                 self._run_listing(candidate, price, listing, stats, has_any_target=has_any_target)
         finally:
             self._store.mark_candidate_checked(candidate.candidate_id)
+
+    def _run_official_store_candidate(
+        self,
+        candidate: OpportunityCandidate,
+        stats: "_MutableStats",
+    ) -> None:
+        """Direct-notify path for official-store pre-order / lottery candidates.
+
+        Bypasses the price_checker / listing_finder pipeline since official
+        store announcements are not Mercari listings — we push the 🎫 headline
+        immediately on first discovery. Dedup via listing_seen(source_url)."""
+        official_url = str(candidate.metadata.get("listing_url") or candidate.source_url)
+        if not official_url:
+            return
+        if self._store.listing_seen(official_url):
+            return
+
+        official_price = candidate.metadata.get("official_price_jpy")
+        price_jpy = int(official_price) if official_price is not None else 0
+        fair_value_jpy = int(price_jpy * 1.3) if price_jpy else 1  # notional fair value > retail
+
+        synthetic_listing = ListingOffer(
+            listing_id=build_listing_key(official_url),
+            title=candidate.title,
+            price_jpy=price_jpy,
+            url=official_url,
+        )
+        synthetic_price = PriceCheck(
+            candidate_id=candidate.candidate_id,
+            fair_value_jpy=fair_value_jpy,
+            confidence=0.9,
+            sample_count=0,
+        )
+        synthetic_reputation = ReputationCheck(
+            listing_url=official_url,
+            trusted=True,
+            status="official_store",
+            reason="公式店舗",
+        )
+        recommendation = OpportunityRecommendation(
+            recommendation_id=recommendation_id_for(synthetic_listing),
+            candidate=candidate,
+            price=synthetic_price,
+            listing=synthetic_listing,
+            reputation=synthetic_reputation,
+            discount_pct=0.0,
+            score=candidate.heat_score * 100,
+            reasons=("official_store_preorder",),
+        )
+        self._store.record_recommendation(recommendation, accepted=True)
+        self._notifier.notify(recommendation)
+        self._store.mark_notified(recommendation.recommendation_id)
+        stats.recommendations_sent += 1
+        logger.info(
+            "Official store pre-order notification sent candidate=%s url=%s",
+            candidate.title, official_url,
+        )
 
     def _run_listing(
         self,
