@@ -65,7 +65,9 @@ CREATE INDEX IF NOT EXISTS idx_aliases_alias_lower ON entity_aliases(alias);
 # Allowed entity_type values. Free-text values are accepted (the writer side
 # may invent new types as the system evolves) but the classifier prompt and
 # retrieval rendering treat these as the canonical set.
-ENTITY_TYPES: tuple[str, ...] = ("ip", "product", "set", "creator", "event", "store", "other")
+ENTITY_TYPES: tuple[str, ...] = ("ip", "tcg", "product", "set", "creator", "event", "store", "other")
+# "tcg" — TCG game system itself (e.g. UNION ARENA, Weiss Schwarz, Pokemon TCG)
+#         distinct from "ip" (a content brand) and "product" (a SKU).
 ORIGINS: tuple[str, ...] = ("web_research", "manual", "tweet_aggregation")
 
 
