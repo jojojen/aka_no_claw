@@ -51,6 +51,81 @@ def _build_sns_buzz_fn(settings: AssistantSettings, x_client, ssl_context=None):
     return buzz
 
 
+def _build_classifier_deps(settings: AssistantSettings, ssl_context=None):
+    """Build the dependencies SnsMonitor needs to run the two-opportunity
+    classifier: alias source, knowledge retriever, llm_fn, entity researcher.
+
+    Returns a dict whose keys map 1:1 to ensure_monitor's classifier kwargs.
+    If the local LLM isn't configured (no ollama backend), returns an empty
+    dict so the monitor falls back to the legacy notify path."""
+    backend = (settings.openclaw_local_text_backend or "").strip().lower()
+    endpoint = settings.openclaw_local_text_endpoint
+    model = (settings.openclaw_local_text_model or "").split(",")[0].strip()
+    timeout = max(1, settings.openclaw_local_text_timeout_seconds)
+
+    if not settings.sns_classifier_enabled:
+        logger.info("SNS classifier: disabled via OPENCLAW_SNS_CLASSIFIER_ENABLED")
+        return {}
+    if backend != "ollama" or not endpoint or not model:
+        logger.warning(
+            "SNS classifier: local LLM not configured "
+            "(backend=%s endpoint=%s model=%s) — falling back to legacy notify",
+            backend, endpoint, model,
+        )
+        return {}
+
+    from openclaw_adapter.knowledge_db import KnowledgeDatabase, format_knowledge_block
+    from openclaw_adapter.entity_researcher import EntityResearcher
+    from openclaw_adapter.opportunity_agent import _call_ollama_json
+
+    knowledge_db = KnowledgeDatabase(settings.knowledge_db_path)
+    logger.info("SNS classifier: knowledge DB ready path=%s", settings.knowledge_db_path)
+
+    llm_ssl = ssl_context if endpoint.startswith("https://") else None
+
+    def llm_fn(prompt: str) -> str:
+        return _call_ollama_json(
+            endpoint=endpoint, model=model, prompt=prompt,
+            timeout_seconds=timeout, ssl_context=llm_ssl,
+        )
+
+    researcher = EntityResearcher(
+        knowledge_db=knowledge_db,
+        endpoint=endpoint,
+        model=model,
+        timeout_seconds=timeout,
+        ssl_context=llm_ssl,
+    )
+    researcher.start()
+    logger.info("SNS classifier: EntityResearcher started")
+
+    def knowledge_retriever(canonicals: tuple[str, ...]) -> str:
+        entries = []
+        unknown: list[str] = []
+        for canonical in canonicals:
+            entry = knowledge_db.get_entry(canonical)
+            if entry is None:
+                unknown.append(canonical)
+                continue
+            entries.append(entry)
+            try:
+                knowledge_db.mark_referenced(canonical)
+            except Exception:
+                logger.exception("knowledge_retriever: mark_referenced failed for %s", canonical)
+        return format_knowledge_block(entries, unknown_entities=tuple(unknown))
+
+    return {
+        "classifier_llm_fn": llm_fn,
+        "entity_extraction_llm_fn": llm_fn,
+        "alias_source": knowledge_db,
+        "knowledge_retriever": knowledge_retriever,
+        "entity_research_fn": researcher.request,
+        "monitor_db_path": settings.monitor_db_path,
+        "opportunity_db_path": settings.opportunity_db_path,
+        "min_score_to_push": settings.sns_classifier_min_score,
+    }
+
+
 def _start_sns_monitor(
     *,
     settings: AssistantSettings,
@@ -96,18 +171,24 @@ def _start_sns_monitor(
             except Exception as e:
                 logger.exception("SNS notification failed chat_id=%s: %s", chat_id, e)
 
+        classifier_kwargs = _build_classifier_deps(settings, ssl_context=ssl_context)
         monitor, started = ensure_monitor(
             db_path=settings.sns_db_path,
             x_client=x_client,
             sources=sources,
             notify_fn=notify_fn,
             interval_seconds=60,
+            **classifier_kwargs,
         )
-        logger.info("SNS monitor started=%s running=%s sources=%s",
-                    started, monitor.is_running(), sorted(sources.keys()))
+        logger.info("SNS monitor started=%s running=%s sources=%s classifier=%s",
+                    started, monitor.is_running(), sorted(sources.keys()),
+                    "on" if classifier_kwargs else "off")
         if started:
             print("[sns-monitor] ✅ SNS monitor started (interval=60s, sources=x+reddit)")
             print("[sns-monitor] 📱 Monitoring X timelines + Reddit subreddits per watch rules")
+            if classifier_kwargs:
+                print("[sns-monitor] 🧠 Two-opportunity classifier enabled "
+                      f"(min_score={settings.sns_classifier_min_score})")
 
         buzz_fn = _build_sns_buzz_fn(settings, x_client, ssl_context=ssl_context)
         if buzz_fn is not None:

@@ -34,6 +34,9 @@ class AssistantSettings:
     log_file_path: str = "logs/openclaw.log"
     log_raw_result_limit: int = 20
     sns_db_path: str = "data/sns.sqlite3"
+    knowledge_db_path: str = "data/knowledge.sqlite3"
+    sns_classifier_enabled: bool = True
+    sns_classifier_min_score: int = 60
     opportunity_agent_enabled: bool = False
     opportunity_db_path: str = "data/opportunities.sqlite3"
     opportunity_interval_seconds: int = 900
@@ -122,6 +125,13 @@ def get_settings() -> AssistantSettings:
         log_file_path=os.getenv("LOG_FILE_PATH", "logs/openclaw.log"),
         log_raw_result_limit=_as_int(os.getenv("LOG_RAW_RESULT_LIMIT"), default=20),
         sns_db_path=os.getenv("SNS_DB_PATH", "data/sns.sqlite3"),
+        knowledge_db_path=os.getenv("KNOWLEDGE_DB_PATH", "data/knowledge.sqlite3"),
+        sns_classifier_enabled=_as_bool(
+            os.getenv("OPENCLAW_SNS_CLASSIFIER_ENABLED", "true")
+        ),
+        sns_classifier_min_score=_as_int(
+            os.getenv("OPENCLAW_SNS_CLASSIFIER_MIN_SCORE"), default=60
+        ),
         opportunity_agent_enabled=_as_bool(os.getenv("OPENCLAW_OPPORTUNITY_AGENT_ENABLED")),
         opportunity_db_path=os.getenv("OPENCLAW_OPPORTUNITY_DB_PATH", "data/opportunities.sqlite3"),
         opportunity_interval_seconds=_as_int(
