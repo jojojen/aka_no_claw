@@ -1046,10 +1046,14 @@ class OpportunityAgent:
         pipeline: OpportunityPipeline,
         interval_seconds: int,
         preflight_fn=None,
+        collab_backfiller=None,
     ) -> None:
         self._pipeline = pipeline
         self._interval_seconds = interval_seconds
         self._preflight_fn = preflight_fn
+        #: CollabProfitBackfiller instance or None.  Exposed so the Telegram
+        #: callback handler can pass it to record_opportunity_feedback.
+        self.collab_backfiller = collab_backfiller
 
     def run_once(self) -> OpportunityPipelineStats:
         if self._preflight_fn is not None:
@@ -1200,10 +1204,38 @@ def build_opportunity_agent(settings: AssistantSettings | None = None) -> Opport
     )
 
     preflight_fn = _build_preflight_callable(settings=settings, ssl_context=ssl_context)
+
+    # Build CollabProfitBackfiller (D4) — price_fetcher left None for now;
+    # the playwright-based fetcher lives in price_monitor_bot and is wired in
+    # a separate step.  The backfiller silently skips run_pending tasks when
+    # price_fetcher is None.
+    collab_backfiller = None
+    try:
+        from .collab_outcomes_store import CollabOutcomesStore
+        from .collab_profit_backfiller import CollabProfitBackfiller
+        _data_dir = Path(settings.opportunity_db_path).parent
+        _collab_store = CollabOutcomesStore(_data_dir / "collab_outcomes.sqlite3")
+        collab_backfiller = CollabProfitBackfiller(
+            store=_collab_store,
+            db_path=_data_dir / "collab_backfill.sqlite3",
+            price_fetcher=None,
+        )
+        logger.info(
+            "build_opportunity_agent: CollabProfitBackfiller ready db=%s",
+            _data_dir / "collab_backfill.sqlite3",
+        )
+    except Exception:
+        logger.warning(
+            "build_opportunity_agent: could not build CollabProfitBackfiller; "
+            "💰 backfill scheduling disabled",
+            exc_info=True,
+        )
+
     return OpportunityAgent(
         pipeline=pipeline,
         interval_seconds=settings.opportunity_interval_seconds,
         preflight_fn=preflight_fn,
+        collab_backfiller=collab_backfiller,
     )
 
 
