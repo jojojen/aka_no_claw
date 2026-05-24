@@ -266,11 +266,20 @@ class HotCardBoardCandidateProvider:
 # ─── Provider B: periodic web-trend search → LLM-extracted candidates ─────────
 
 DEFAULT_WEB_TREND_QUERIES: tuple[str, ...] = (
+    # ── 既有：通用 TCG 新弾 / 再販訊號 ──────────────────────────────────────
     "ポケモンカード 再販 抽選情報 2026",
     "遊戯王 QCCP Quarter Century 新弾",
     "Weiss Schwarz 新ブースター 2026",
-    "Union Arena 新ブースター 2026",
     "Pokemon Start Deck 100 新一波 抽選",
+    # ── ex-ante 訊號：抽選 / 予約開始事件（chainsaw-ua use case）─────────────
+    "UNION ARENA 抽選販売 2026",
+    "ユニオンアリーナ 予約開始 新弾",
+    "Bushiroad TCG 新発売 2026 予約",
+    # ── ex-ante 訊號：熱門 IP × TCG collab 公告（事前發現核心）──────────────
+    "チェンソーマン OR 鬼滅の刃 OR 推しの子 OR 葬送のフリーレン カードゲーム",
+    "新作アニメ TCG コラボ 2026",
+    # ── ex-ante 訊號：通路抽選販賣公告 ────────────────────────────────────
+    "Joshin OR Yodobashi OR Animate トレカ 抽選 申込",
 )
 
 
