@@ -1232,7 +1232,20 @@ def _build_official_store_provider(*, ssl_context):
         UaOfficialPreorderCrawler(http_client=http_client),
         AmiAmiPreorderCrawler(http_client=http_client),
     ]
-    return OfficialStoreCandidateProvider(crawlers=crawlers)
+
+    collab_store = None
+    try:
+        from .collab_outcomes_store import CollabOutcomesStore
+        _db_dir = Path(__file__).parent.parent.parent / "data"
+        collab_store = CollabOutcomesStore(_db_dir / "collab_outcomes.sqlite3")
+        logger.info("_build_official_store_provider: collab store loaded path=%s", _db_dir / "collab_outcomes.sqlite3")
+    except Exception:
+        logger.warning(
+            "_build_official_store_provider: could not load CollabOutcomesStore; "
+            "collab inference disabled"
+        )
+
+    return OfficialStoreCandidateProvider(crawlers=crawlers, collab_store=collab_store)
 
 
 def _build_preflight_callable(*, settings: AssistantSettings, ssl_context):
@@ -1366,6 +1379,37 @@ def _format_official_store_recommendation(recommendation: OpportunityRecommendat
         lines.append(f"申込開始：{open_date}")
     if deadline:
         lines.append(f"申込締切：{deadline}")
+
+    # Collab historical inference block
+    collab_json_str = meta.get("collab_inference_json")
+    if collab_json_str:
+        try:
+            ci = json.loads(str(collab_json_str))
+            n = ci.get("n_samples", 0)
+            if n > 0:
+                lines.append("")
+                lines.append(f"【📊 歴史推理】（類似 {n} 件）")
+                mean_180 = ci.get("mean_profit_pct_180d")
+                win_rate = ci.get("win_rate_180d")
+                if mean_180 is not None:
+                    n_win = int(round((win_rate or 0) * n))
+                    lines.append(f"  平均 180 日利益 {mean_180:+.1f}%、勝率 {n_win}/{n}")
+                best = ci.get("best_profit_pct_180d")
+                worst = ci.get("worst_profit_pct_180d")
+                if best is not None and worst is not None:
+                    lines.append(f"  最良 {best:+.0f}% / 最悪 {worst:+.0f}%")
+                for case in ci.get("top_cases", [])[:3]:
+                    p180 = case.get("p180")
+                    p_str = f"{p180:+.0f}%" if p180 is not None else "—"
+                    lines.append(
+                        f"  ・{case.get('ip', '')} × {case.get('tcg', '')} "
+                        f"({case.get('date', '')}) → {p_str}"
+                    )
+        except Exception:
+            logger.exception(
+                "_format_official_store_recommendation: failed to parse collab_inference_json"
+            )
+
     lines.append("")
     lines.append("公式リンク：")
     lines.append(official_url)

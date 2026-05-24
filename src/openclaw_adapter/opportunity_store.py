@@ -337,6 +337,17 @@ class OpportunityStore:
             ).fetchone()
         return row is not None
 
+    def get_candidate(self, candidate_id: str) -> "OpportunityCandidate | None":
+        """Return the full candidate record, or None if not found."""
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM opportunity_candidates WHERE candidate_id = ?",
+                (candidate_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return _candidate_from_row(row)
+
     def mark_candidate_checked(self, candidate_id: str) -> None:
         now = utc_now_iso()
         with self.connect() as connection:
