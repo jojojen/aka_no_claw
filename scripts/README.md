@@ -8,9 +8,20 @@ Production stack 的啟動 / 停止指令在 [`../launchers/`](../launchers/)；
 
 ## Claude Code 工具
 
-| 檔案 | 用途 |
+### ⚠️ 目前用 [autoclaude](https://github.com/henryaj/autoclaude)，不要再用本目錄的自製 watcher
+
+```bash
+brew install henryaj/tap/autoclaude
+# 在現有 tmux session 裡開一個新 window 跑：
+tmux new-window -t claude: -n autoclaude -d 'autoclaude'
+# TUI 出來後按 a（enable auto-continue for all Claude panes）即可離開
+```
+
+autoclaude 偵測 Claude Code 的 banner（`"limit reached ∙ resets Xpm"` / `"You've hit your limit"`），到 reset 時間後自動送 `Escape → continue → Enter`。Go binary，由社群維護，不需要我們追 Claude Code UI 變動。
+
+| 檔案 | 狀態 |
 |------|------|
-| [`claude-resume-watcher.sh`](claude-resume-watcher.sh) | tmux 內監看 Claude Code，偵測到 usage limit + reset 時間時 sleep 到時間自動送 `continue` 給 pane。watcher 自己會跟著 target pane 一起結束 — 不需手動 kill。 |
+| [`claude-resume-watcher.sh`](claude-resume-watcher.sh) | **⚠️ DEPRECATED（2026-05-24）**。我們自製的 bash watcher 已三度失敗：(1) 誤抓 chat 中的 `Reset at 10:50pm`（false positive），(2) `pipefail` + grep no-match silent death，(3) Claude Code 2026-05 後 banner 改用「8pm」無 HH:MM 格式，regex 永遠抓不到 + 對話中提到 reset time 又會誤觸發 sleep。**不要再 patch 這個檔案**，改用上面 autoclaude。檔案留存供歷史參考。 |
 
 ## 跨平台 Docker smoke 測試
 

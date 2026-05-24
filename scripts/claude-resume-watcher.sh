@@ -97,8 +97,12 @@ parse_reset_to_epoch() {
     local now_epoch
     now_epoch=$(date '+%s')
 
-    # Normalise whitespace and uppercase AM/PM.
-    raw=$(echo "$raw" | tr -d ',' | sed -E 's/[[:space:]]+/ /g' | sed -E 's/([aA])\.?[mM]\.?/AM/; s/([pP])\.?[mM]\.?/PM/')
+    # Normalise: strip commas, collapse whitespace, ensure a space between
+    # the minute digit and AM/PM (Claude's banner often shows "2:40pm" with
+    # no space — BSD `date -j -f` requires a literal space between %M and %p).
+    raw=$(echo "$raw" | tr -d ',' | sed -E 's/[[:space:]]+/ /g' \
+        | sed -E 's/([0-9])[[:space:]]*([aA])\.?[mM]\.?/\1 AM/g' \
+        | sed -E 's/([0-9])[[:space:]]*([pP])\.?[mM]\.?/\1 PM/g')
 
     local target_epoch=""
     # Try 12-hour first, then 24-hour.
@@ -150,7 +154,11 @@ while true; do
     #   - shell-/code-style comment lines (`#`, `//`)
     #   - markdown bullets/quotes that often appear in chat about rate limits
     # The remaining text is what Claude itself rendered to the pane.
-    content=$(printf '%s\n' "$raw_content" | grep -viE '^\[claude-resume-watcher|^[[:space:]]*#|^[[:space:]]*//|^[[:space:]]*[`>]|^[[:space:]]*\*[[:space:]]|^[[:space:]]*[+-][[:space:]]*#|^[[:space:]]*[0-9]+[[:space:]]+[+-]?[[:space:]]*#|^[[:space:]]*[+-][[:space:]]+"')
+    # `|| true` because grep exits 1 when nothing matches the inverse pattern
+    # (i.e. when EVERY line in the pane looks like a comment/log/diff). Without
+    # it, `set -euo pipefail` kills the script on a routine-empty result and
+    # the tmux window vanishes silently.
+    content=$(printf '%s\n' "$raw_content" | grep -viE '^\[claude-resume-watcher|^[[:space:]]*#|^[[:space:]]*//|^[[:space:]]*[`>]|^[[:space:]]*\*[[:space:]]|^[[:space:]]*[+-][[:space:]]*#|^[[:space:]]*[0-9]+[[:space:]]+[+-]?[[:space:]]*#|^[[:space:]]*[+-][[:space:]]+"' || true)
 
     # Tight detection: three cascading greps so the regex stays simple and
     # works under both BSD grep and ugrep. The line must:
@@ -160,16 +168,21 @@ while true; do
     # All three must match the SAME line — that's what Claude's actual
     # banner looks like (single-line UI element). Discussion mentioning
     # the words across multiple lines won't trigger.
+    # `|| true` on each pipe + the whole pipeline because `pipefail` + `set -e`
+    # treat a no-match grep as a script-killing failure. Most polls have no
+    # rate-limit banner, so the cascade MUST be allowed to return empty.
     detection_line=$(printf '%s\n' "$content" \
-        | grep -iE '[0-9]{1,2}:[0-9]{2}' \
-        | grep -iE '(reset|resume|available again|wait until|try again|come back|continue sending)' \
-        | grep -iE '(5[- ]hour|usage|claude pro|claude max|monthly|daily) limit|limit (reached|reset|will reset)|hit (your |the )?(usage )?limit|reached (your |the )?(usage |5[- ]hour )?limit' \
-        | tail -1)
+        | { grep -iE '[0-9]{1,2}:[0-9]{2}' || true; } \
+        | { grep -iE '(reset|resume|available again|wait until|try again|come back|continue sending)' || true; } \
+        | { grep -iE '(5[- ]hour|usage|claude pro|claude max|monthly|daily) limit|limit (reached|reset|will reset)|hit (your |the )?(usage )?(limit)|hit (your |the )?limit|reached (your |the )?(usage |5[- ]hour )?limit' || true; } \
+        | tail -1 || true)
 
     if [ -n "$detection_line" ]; then
+        # Match patterns like "2:40pm" / "2:40 PM" / "14:40" / "2:40 a.m."
+        # `|| true` for the same pipefail+set-e reason as above.
         reset_time=$(printf '%s' "$detection_line" \
-            | grep -oiE '[0-9]{1,2}:[0-9]{2}[[:space:]]*[APap][.]?[Mm][.]?|[0-9]{1,2}:[0-9]{2}' \
-            | tail -1)
+            | { grep -oiE '[0-9]{1,2}:[0-9]{2}[[:space:]]*[APap][.]?[Mm][.]?|[0-9]{1,2}:[0-9]{2}' || true; } \
+            | tail -1 || true)
 
         if [ -n "$reset_time" ]; then
             # Dedup: if we already fired for this exact reset time, ignore.
