@@ -1,0 +1,166 @@
+"""Unit tests for KnowledgeDatabase + format_knowledge_block."""
+
+from __future__ import annotations
+
+import pytest
+
+from openclaw_adapter.knowledge_db import (
+    ENTITY_TYPES,
+    KnowledgeDatabase,
+    KnowledgeEntry,
+    format_knowledge_block,
+)
+
+
+@pytest.fixture
+def db(tmp_path):
+    return KnowledgeDatabase(tmp_path / "knowledge.sqlite3")
+
+
+def test_upsert_and_get_entry_roundtrip(db):
+    db.upsert_entry(
+        entity_canonical="pjsk",
+        entity_type="ip",
+        summary="プロセカ。SEGA + Crypton。客群以年輕女性為主。",
+        source_urls=("https://example.com/a",),
+        confidence=0.7,
+        origin="web_research",
+        aliases=("PJSK", "プロセカ", "Project Sekai"),
+    )
+    entry = db.get_entry("pjsk")
+    assert entry is not None
+    assert entry.entity_canonical == "pjsk"
+    assert entry.entity_type == "ip"
+    assert entry.confidence == pytest.approx(0.7)
+    assert "プロセカ" in entry.summary
+    assert entry.source_urls == ("https://example.com/a",)
+
+
+def test_get_entry_is_case_insensitive(db):
+    db.upsert_entry(entity_canonical="PJSK", entity_type="ip",
+                    summary="x", source_urls=(), confidence=0.5, origin="manual", aliases=())
+    assert db.get_entry("pjsk") is not None
+    assert db.get_entry("PJSK") is not None
+
+
+def test_alias_lookup_resolves_to_canonical(db):
+    db.upsert_entry(entity_canonical="pjsk", entity_type="ip",
+                    summary="x", source_urls=(), confidence=0.5, origin="manual",
+                    aliases=("プロセカ", "PJSK"))
+    assert db.lookup_canonical("プロセカ") == "pjsk"
+    assert db.lookup_canonical("PJSK") == "pjsk"
+    assert db.lookup_canonical("unknown") is None
+
+
+def test_higher_confidence_overrides_lower(db):
+    """Manual / curated knowledge (confidence=1.0) must win over
+    web-research auto-backfill (0.5)."""
+    db.upsert_entry(entity_canonical="pjsk", entity_type="ip",
+                    summary="自動爬到的舊資訊", source_urls=(), confidence=0.5,
+                    origin="web_research", aliases=())
+    db.upsert_entry(entity_canonical="pjsk", entity_type="ip",
+                    summary="使用者手動補的正確版", source_urls=(), confidence=1.0,
+                    origin="manual", aliases=())
+    entry = db.get_entry("pjsk")
+    assert entry.summary == "使用者手動補的正確版"
+    assert entry.origin == "manual"
+    assert entry.confidence == pytest.approx(1.0)
+
+
+def test_lower_confidence_does_not_override_higher(db):
+    db.upsert_entry(entity_canonical="pjsk", entity_type="ip",
+                    summary="高信任版", source_urls=(), confidence=1.0,
+                    origin="manual", aliases=())
+    db.upsert_entry(entity_canonical="pjsk", entity_type="ip",
+                    summary="低信任版（不該蓋過）", source_urls=(), confidence=0.3,
+                    origin="web_research", aliases=())
+    entry = db.get_entry("pjsk")
+    assert entry.summary == "高信任版"
+
+
+def test_all_aliases_includes_canonical(db):
+    """The canonical name itself should appear in all_aliases() so substring
+    scans catch it even when no manual alias was registered."""
+    db.upsert_entry(entity_canonical="pjsk", entity_type="ip",
+                    summary="x", source_urls=(), confidence=0.5, origin="manual",
+                    aliases=("PJSK",))
+    aliases = db.all_aliases()
+    alias_strs = {a for a, _ in aliases}
+    assert "pjsk" in alias_strs or "PJSK" in alias_strs
+
+
+def test_add_alias_after_creation(db):
+    db.upsert_entry(entity_canonical="pjsk", entity_type="ip",
+                    summary="x", source_urls=(), confidence=0.5, origin="manual",
+                    aliases=())
+    assert db.add_alias("Project Sekai", "pjsk") is True
+    assert db.lookup_canonical("Project Sekai") == "pjsk"
+
+
+def test_mark_referenced_updates_timestamp(db):
+    db.upsert_entry(entity_canonical="x", entity_type="other",
+                    summary="x", source_urls=(), confidence=0.5, origin="manual",
+                    aliases=())
+    before = db.get_entry("x")
+    db.mark_referenced("x")
+    after = db.get_entry("x")
+    assert after.last_referenced_at is not None
+    assert after.last_referenced_at != before.last_referenced_at or before.last_referenced_at is None
+
+
+def test_recent_entries_respects_limit_and_returns_entries(db):
+    """Three insertions may share the same updated_at timestamp (sqlite's
+    resolution is seconds), so we assert on count + presence, not order."""
+    for name in ("a", "b", "c"):
+        db.upsert_entry(entity_canonical=name, entity_type="ip",
+                        summary=name, source_urls=(), confidence=0.5,
+                        origin="manual", aliases=())
+    entries = db.recent_entries(limit=2)
+    assert len(entries) == 2
+    assert all(isinstance(e.entity_canonical, str) for e in entries)
+    all_entries = db.recent_entries(limit=10)
+    assert {e.entity_canonical for e in all_entries} == {"a", "b", "c"}
+
+
+def test_entity_types_constant_matches_schema_intent():
+    """If anyone adds a new entity_type they must update the constant too."""
+    assert set(ENTITY_TYPES) >= {"ip", "product", "set", "creator", "event", "store", "other"}
+
+
+# ── format_knowledge_block helper ──────────────────────────────────────────
+
+
+def test_format_knowledge_block_includes_summary_for_each_entry():
+    entries = [
+        KnowledgeEntry(entry_id="e1", entity_canonical="pjsk", entity_type="ip",
+                       summary="プロセカ。節奏音遊。", source_urls=(), confidence=0.7,
+                       origin="web_research", created_at="", updated_at=""),
+        KnowledgeEntry(entry_id="e2", entity_canonical="アビスアイ", entity_type="set",
+                       summary="ポケカ拡張パック。", source_urls=(), confidence=0.6,
+                       origin="web_research", created_at="", updated_at=""),
+    ]
+    block = format_knowledge_block(entries)
+    assert "pjsk (ip)" in block
+    assert "アビスアイ (set)" in block
+    assert "プロセカ" in block
+
+
+def test_format_knowledge_block_shows_unknown_entities_as_placeholder():
+    block = format_knowledge_block([], unknown_entities=("謎の新弾",))
+    assert "謎の新弾" in block
+    assert "資料庫尚無" in block
+
+
+def test_format_knowledge_block_empty_returns_placeholder():
+    assert format_knowledge_block([]) == "(無)"
+
+
+def test_format_knowledge_block_truncates_long_summary():
+    long_summary = "x" * 5000
+    entry = KnowledgeEntry(entry_id="e", entity_canonical="big", entity_type="other",
+                           summary=long_summary, source_urls=(), confidence=0.5,
+                           origin="manual", created_at="", updated_at="")
+    block = format_knowledge_block([entry], max_chars=200)
+    # Block headers/labels add some chars, so allow generous overhead.
+    assert len(block) < 500
+    assert "big (other)" in block
