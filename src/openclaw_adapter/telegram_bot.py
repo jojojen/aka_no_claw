@@ -368,6 +368,7 @@ def run_telegram_polling(
     _start_watch_monitor(settings=settings, watch_db=watch_db, token=token)
     sns_db, sns_buzz_fn = _start_sns_monitor(settings=settings, token=token, ssl_context=build_ssl_context(settings))
     research_renderer = default_web_research_renderer(settings)
+    feedback_service = _build_feedback_service(watch_db)
     return _base_run_telegram_polling(
         token=token,
         lookup_renderer=lookup_renderer,
@@ -393,10 +394,22 @@ def run_telegram_polling(
         watch_db=watch_db,
         sns_db=sns_db,
         sns_buzz_fn=sns_buzz_fn,
+        feedback_service=feedback_service,
         poll_timeout=poll_timeout,
         notify_startup=notify_startup,
         drop_pending_updates=drop_pending_updates,
     )
+
+
+def _build_feedback_service(watch_db: MonitorDatabase):
+    """Construct a TcgPriceFeedbackService bound to the shared watch_db.
+    Returns None if the price_monitor_bot package isn't importable, so the
+    rest of the bot keeps running."""
+    try:
+        from tcg_tracker.feedback import TcgPriceFeedbackService
+    except Exception:
+        return None
+    return TcgPriceFeedbackService(database=watch_db)
 
 
 def _bootstrap_watch_db(settings: AssistantSettings) -> MonitorDatabase:
