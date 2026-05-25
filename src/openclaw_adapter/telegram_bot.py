@@ -369,6 +369,7 @@ def run_telegram_polling(
     sns_db, sns_buzz_fn = _start_sns_monitor(settings=settings, token=token, ssl_context=build_ssl_context(settings))
     research_renderer = default_web_research_renderer(settings)
     feedback_service = _build_feedback_service(watch_db)
+    _start_card_image_crawler(watch_db)
     return _base_run_telegram_polling(
         token=token,
         lookup_renderer=lookup_renderer,
@@ -410,6 +411,38 @@ def _build_feedback_service(watch_db: MonitorDatabase):
     except Exception:
         return None
     return TcgPriceFeedbackService(database=watch_db)
+
+
+def _start_card_image_crawler(watch_db: MonitorDatabase):
+    """Kick off the trend-driven perceptual-hash crawler in the background.
+    Pulls Snkrdunk's hot products every 6 hours and pre-populates
+    `card_image_fingerprints` so user photo uploads of popular boxes/cards
+    can short-circuit the slow OCR + vision LLM pipeline.
+
+    Best-effort: if the price_monitor_bot package isn't importable or any
+    other init issue arises, the bot keeps running without proactive
+    fingerprinting (the lookup-time persist path still learns over time)."""
+    try:
+        from tcg_tracker.image_crawler import CardImageCrawler, CardImageCrawlMonitor
+    except Exception as exc:
+        logger.warning("card image crawler unavailable: %s", exc)
+        return None
+    try:
+        crawler = CardImageCrawler(
+            database=watch_db,
+            games=("pokemon", "ws", "union_arena"),
+            per_game_limit=30,
+        )
+        monitor = CardImageCrawlMonitor(
+            crawler=crawler,
+            interval_seconds=6 * 3600,   # every 6 hours
+            initial_delay_seconds=120,    # let the rest of the bot finish booting
+        )
+        monitor.start()
+        return monitor
+    except Exception as exc:
+        logger.warning("card image crawler failed to start: %s", exc)
+        return None
 
 
 def _bootstrap_watch_db(settings: AssistantSettings) -> MonitorDatabase:
