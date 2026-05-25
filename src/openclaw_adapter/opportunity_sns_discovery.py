@@ -87,6 +87,12 @@ def discover_tcg_sns_accounts(
         for rule in sns_db.list_watch_rules()
         if isinstance(rule, AccountWatch) and rule.screen_name
     }
+    # Exclude handles the user already deleted — avoids re-adding rejected accounts.
+    try:
+        rejected_handles = sns_db.list_rejected_handles(days=90)
+    except Exception:
+        logger.warning("SnsAccountAutoDiscovery: could not load rejected handles; proceeding without exclusion")
+        rejected_handles = frozenset()
 
     seen_in_run: set[str] = set()
     candidates: list[_DiscoveryCandidate] = []
@@ -100,6 +106,11 @@ def discover_tcg_sns_accounts(
             for handle in _HANDLE_RE.findall(result.url or ""):
                 key = handle.lower()
                 if key in existing_handles or key in seen_in_run:
+                    continue
+                if key in rejected_handles:
+                    logger.info(
+                        "SnsAccountAutoDiscovery skipped @%s — previously rejected by user", handle
+                    )
                     continue
                 seen_in_run.add(key)
                 candidates.append(
@@ -153,7 +164,7 @@ def discover_tcg_sns_accounts(
                 domains,
             )
             continue
-        rule_id = SnsDatabase._watch_rule_id("account", candidate.handle)
+        rule_id = SnsDatabase._watch_rule_id("account", candidate.handle, source="auto_discovery")
         rule = AccountWatch(
             rule_id=rule_id,
             screen_name=candidate.handle,
@@ -165,6 +176,7 @@ def discover_tcg_sns_accounts(
             schedule_minutes=15,
             chat_id=chat_id,
             last_checked_at=None,
+            source="auto_discovery",
         )
         sns_db.save_watch_rule(rule)
         added.append(rule)
