@@ -1257,11 +1257,11 @@ def test_sns_account_auto_discovery_respects_confidence_cap_and_tcg_intersection
         return fake_results
 
     verdicts = iter([
-        '{"is_tcg":true,"domains":["pokemon"],"confidence":0.9,"reason":"r1"}',
-        '{"is_tcg":true,"domains":["yugioh"],"confidence":0.85,"reason":"r2"}',
-        '{"is_tcg":true,"domains":["pokemon"],"confidence":0.5,"reason":"low conf"}',  # below 0.7 floor
-        '{"is_tcg":false,"domains":[],"confidence":0.9,"reason":"not tcg"}',
-        '{"is_tcg":true,"domains":["politic"],"confidence":0.95,"reason":"wrong domain"}',
+        '{"is_tcg":true,"domains":["pokemon"],"confidence":0.9,"actionable_for_investing":0.9,"reason":"r1"}',
+        '{"is_tcg":true,"domains":["yugioh"],"confidence":0.85,"actionable_for_investing":0.85,"reason":"r2"}',
+        '{"is_tcg":true,"domains":["pokemon"],"confidence":0.5,"actionable_for_investing":0.9,"reason":"low conf"}',  # below 0.7 floor
+        '{"is_tcg":false,"domains":[],"confidence":0.9,"actionable_for_investing":0.9,"reason":"not tcg"}',
+        '{"is_tcg":true,"domains":["politic"],"confidence":0.95,"actionable_for_investing":0.9,"reason":"wrong domain"}',
     ])
 
     def fake_llm(prompt):  # noqa: ARG001
@@ -1293,7 +1293,7 @@ def test_sns_account_auto_discovery_sends_notification_with_domains(tmp_path: Pa
         return (WebSearchResult(title="r", url=source_tweet_url, snippet=""),)
 
     def fake_llm(prompt):  # noqa: ARG001
-        return '{"is_tcg":true,"domains":["pokemon","tcg"],"confidence":0.9,"reason":"covers TCG news"}'
+        return '{"is_tcg":true,"domains":["pokemon","tcg"],"confidence":0.9,"actionable_for_investing":0.9,"reason":"covers TCG news"}'
 
     notifications: list[dict[str, object]] = []
 
@@ -1321,13 +1321,19 @@ def test_sns_account_auto_discovery_sends_notification_with_domains(tmp_path: Pa
     # The specific URL that triggered the auto-add (only included when distinct
     # from the bare profile link)
     assert f"觸發來源：{source_tweet_url}" in msg
+    # Confidence + actionable scores now appear in the notification body so the
+    # user sees the LLM's per-account verdict before deciding 👍 / ❌.
+    assert "信心" in msg
+    assert "投資價值" in msg
     # The legacy "/snsdelete @..." text is replaced by an inline button.
     assert "/snsdelete" not in msg
     kb = notifications[0]["reply_markup"]
     assert kb is not None
-    button = kb["inline_keyboard"][0][0]
-    assert button["callback_data"] == "snsdel:poke_news_jp"
-    assert "@poke_news_jp" in button["text"]
+    # Two buttons now: 👍 對投資有幫助 (snsaddok) + ❌ 沒幫助/雜訊 (snsdel).
+    buttons = kb["inline_keyboard"][0]
+    callback_data = {btn["callback_data"] for btn in buttons}
+    assert "snsaddok:poke_news_jp" in callback_data
+    assert "snsdel:poke_news_jp" in callback_data
 
 
 def test_sns_account_auto_discovery_omits_source_when_same_as_profile(tmp_path: Path) -> None:
@@ -1343,7 +1349,7 @@ def test_sns_account_auto_discovery_omits_source_when_same_as_profile(tmp_path: 
         return (WebSearchResult(title="r", url="https://x.com/poke_news_jp", snippet=""),)
 
     def fake_llm(prompt):  # noqa: ARG001
-        return '{"is_tcg":true,"domains":["pokemon"],"confidence":0.9,"reason":"covers TCG news"}'
+        return '{"is_tcg":true,"domains":["pokemon"],"confidence":0.9,"actionable_for_investing":0.9,"reason":"covers TCG news"}'
 
     notifications: list[dict[str, object]] = []
 
@@ -1364,10 +1370,15 @@ def test_sns_account_auto_discovery_omits_source_when_same_as_profile(tmp_path: 
     msg = notifications[0]["text"]
     assert "觸發來源" not in msg
     assert "帳號：https://x.com/poke_news_jp" in msg
-    # Inline button is still present even without the extra source URL.
+    # Inline buttons (positive + negative) are still present even without
+    # the extra source URL.
     kb = notifications[0]["reply_markup"]
     assert kb is not None
-    assert kb["inline_keyboard"][0][0]["callback_data"] == "snsdel:poke_news_jp"
+    callback_data = {
+        btn["callback_data"] for btn in kb["inline_keyboard"][0]
+    }
+    assert "snsaddok:poke_news_jp" in callback_data
+    assert "snsdel:poke_news_jp" in callback_data
 
 
 def test_mercari_listing_finder_passes_default_condition_ids(monkeypatch) -> None:

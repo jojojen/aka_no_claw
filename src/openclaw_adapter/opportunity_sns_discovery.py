@@ -52,6 +52,10 @@ class _DiscoveryCandidate:
     url: str
 
 
+DEFAULT_MIN_CONFIDENCE: float = 0.88
+DEFAULT_ACTIONABLE_FLOOR: float = 0.75
+
+
 def discover_tcg_sns_accounts(
     *,
     sns_db: SnsDatabase,
@@ -61,10 +65,22 @@ def discover_tcg_sns_accounts(
     chat_id: str = "",
     queries: Sequence[str] = DEFAULT_DISCOVERY_QUERIES,
     max_new_per_run: int = 2,
-    min_confidence: float = 0.7,
+    min_confidence: float = DEFAULT_MIN_CONFIDENCE,
+    actionable_floor: float = DEFAULT_ACTIONABLE_FLOOR,
     results_per_query: int = 6,
 ) -> list[AccountWatch]:
     """Run one discovery pass. Returns the list of newly added rules.
+
+    Two LLM-supplied gates must clear before an account is auto-added:
+
+    1. ``is_tcg`` AND ``confidence >= min_confidence`` — the account is
+       genuinely TCG-related and the model is sure.
+    2. ``actionable_for_investing >= max(actionable_floor, per-domain
+       trust threshold)`` — the account posts content the user can
+       actually act on (抽選 / restock / 二手市場 / 漏網好物), not generic
+       hobby chatter. The per-domain threshold ratchets UP on rejections
+       (``record_auto_discovery_feedback`` polarity='negative') and never
+       loosens, so noisy domains tighten themselves over time.
 
     Parameters
     ----------
@@ -164,6 +180,37 @@ def discover_tcg_sns_accounts(
                 domains,
             )
             continue
+        # Second gate: actionable-for-investing. Per-domain trust ratchets
+        # this threshold up on past rejections — a noisy domain quietly
+        # tightens itself without manual config tuning.
+        actionable_raw = verdict.get("actionable_for_investing")
+        try:
+            actionable_score = float(actionable_raw) if actionable_raw is not None else 0.0
+        except (TypeError, ValueError):
+            actionable_score = 0.0
+        try:
+            domain_threshold = sns_db.effective_actionable_threshold(
+                domains, default=actionable_floor,
+            )
+        except Exception:
+            logger.exception(
+                "SnsAccountAutoDiscovery: failed to read per-domain threshold; falling back to floor"
+            )
+            domain_threshold = actionable_floor
+        effective_threshold = max(actionable_floor, domain_threshold)
+        if actionable_score < effective_threshold:
+            logger.info(
+                "SnsAccountAutoDiscovery skipped handle=%s — actionable score %.2f below threshold %.2f (floor=%.2f, per-domain=%.2f)",
+                candidate.handle,
+                actionable_score,
+                effective_threshold,
+                actionable_floor,
+                domain_threshold,
+            )
+            continue
+        # Rule_id is hashed from the legacy sentinel to keep IDs stable across
+        # the migration — pre-existing auto_discovery rule_ids already exist in
+        # users' DBs and we don't want to orphan them.
         rule_id = SnsDatabase._watch_rule_id("account", candidate.handle, source="auto_discovery")
         rule = AccountWatch(
             rule_id=rule_id,
@@ -176,7 +223,8 @@ def discover_tcg_sns_accounts(
             schedule_minutes=15,
             chat_id=chat_id,
             last_checked_at=None,
-            source="auto_discovery",
+            source="x",  # discovery currently only mines twitter.com / x.com handles
+            is_auto_discovered=True,
         )
         sns_db.save_watch_rule(rule)
         added.append(rule)
@@ -195,6 +243,7 @@ def discover_tcg_sns_accounts(
                     f"🔎 自動加入追蹤 @{candidate.handle}",
                     f"帳號：{account_url}",
                     f"領域：{', '.join(domains)}",
+                    f"信心 {confidence_value:.2f}（投資價值 {actionable_score:.2f}）",
                 ]
                 if verdict.get("reason"):
                     lines.append(f"原因：{verdict['reason']}")
@@ -203,9 +252,13 @@ def discover_tcg_sns_accounts(
                 reply_markup = {
                     "inline_keyboard": [[
                         {
-                            "text": f"❌ 刪除追蹤 @{candidate.handle}",
+                            "text": "👍 對投資有幫助",
+                            "callback_data": f"snsaddok:{candidate.handle}",
+                        },
+                        {
+                            "text": "❌ 沒幫助/雜訊",
                             "callback_data": f"snsdel:{candidate.handle}",
-                        }
+                        },
                     ]]
                 }
                 telegram_notify_fn("\n".join(lines), reply_markup=reply_markup)
@@ -219,16 +272,30 @@ def discover_tcg_sns_accounts(
 
 def _classify_candidate(candidate: _DiscoveryCandidate, *, llm_fn) -> dict:
     prompt = (
-        "你在幫使用者篩選值得追蹤的 X (Twitter) 帳號。判斷下面這個帳號是否真的是 TCG (寶可夢 / 遊戲王 / Weiss Schwarz / Union Arena) 相關內容。\n"
+        "你在幫使用者篩選值得追蹤的 X (Twitter) 帳號，目標是「對投資 / 抽選操作真的有幫助」的訊號源，而不是泛泛的 TCG 同好。\n\n"
         f"handle: @{candidate.handle}\n"
         f"網頁 title: {candidate.title}\n"
         f"網頁 snippet: {candidate.snippet}\n"
         f"網頁 URL: {candidate.url}\n\n"
+        "請判斷兩個獨立的分數（兩個都過才會被加進追蹤）：\n\n"
+        "1. is_tcg + confidence (0-1)：這個帳號真的在發 TCG (寶可夢 / 遊戲王 / Weiss Schwarz / Union Arena) 相關內容嗎？不確定就 is_tcg=false。\n\n"
+        "2. actionable_for_investing (0-1)：這個帳號發的內容是否能直接讓使用者「下手」？\n"
+        "   高分 (0.75-1.0) — 帳號類型：\n"
+        "     • 抽選販售情報 / 補貨時間 / 預訂開搶通知\n"
+        "     • 二手市場價格異動 / 未開封 BOX 投資機會\n"
+        "     • PSA / BGS 鑑定漏網好物 / 跨地區套利機會\n"
+        "     • 拍賣低於行情的物件提示\n"
+        "   中分 (0.4-0.7) — 個人玩家但偶爾發買賣情報、店家但只發新貨上架（無折扣 / 套利訊息）\n"
+        "   低分 (0.0-0.4) — 帳號類型：\n"
+        "     • 對戰心得 / decklist / 玩法分享\n"
+        "     • 開箱炫耀 / 卡圖鑑賞 / cosplay\n"
+        "     • 自家店面廣告 / 純自己賣東西的轉售\n"
+        "     • 純聊天 / 紀錄日常 / 抽到爛卡哀號\n\n"
         "推薦 domain 清單 (請只挑這裡面的)：\n"
         f"{', '.join(RECOMMENDED_DOMAINS)}\n\n"
         "請嚴格回 JSON：\n"
-        '{"is_tcg": true/false, "domains": ["pokemon"], "confidence": 0-1, "reason": "一句話"}\n'
-        "is_tcg=true 必須真的看到 TCG 相關內容；不確定就 false。"
+        '{"is_tcg": true/false, "confidence": 0-1, "actionable_for_investing": 0-1, "domains": ["pokemon"], "reason": "一句話說明 actionable 分數的依據"}\n'
+        "若你不確定某分數，寧可給低分 — 使用者要的是少而精的訊號源，不是覆蓋率。"
     )
     raw = llm_fn(prompt)
     return _safe_json_loads(raw) or {}
