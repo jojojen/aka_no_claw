@@ -26,10 +26,19 @@ def _one_result(handle: str) -> list[WebSearchResult]:
     return [WebSearchResult(title="t", url=f"https://twitter.com/{handle}", snippet="")]
 
 
-def _tcg_verdict(domains: list[str] = None) -> str:
+def _tcg_verdict(domains: list[str] = None, *, actionable: float = 0.9) -> str:
+    """Default verdict for tests — passes both the legacy is_tcg/confidence
+    gate AND the new actionable_for_investing gate. Override ``actionable``
+    in tests that exercise the second-gate behaviour."""
     d = domains or ["yugioh", "tcg"]
     import json
-    return json.dumps({"is_tcg": True, "domains": d, "confidence": 0.95, "reason": "ok"})
+    return json.dumps({
+        "is_tcg": True,
+        "domains": d,
+        "confidence": 0.95,
+        "actionable_for_investing": actionable,
+        "reason": "ok",
+    })
 
 
 # ── sns_auto_discovery_rejects table ──────────────────────────────────────────
@@ -207,10 +216,15 @@ def test_list_rejected_handles_respects_days_window(tmp_path: Path) -> None:
     assert "old_handle" in all_time
 
 
-# ── auto-added rules carry source='auto_discovery' ────────────────────────────
+# ── auto-added rules: source reflects platform, is_auto_discovered flags provenance
 
 
-def test_auto_added_rule_source_is_auto_discovery(tmp_path: Path) -> None:
+def test_auto_added_rule_is_attributed_to_x_with_provenance_flag(tmp_path: Path) -> None:
+    """Auto-discovery from twitter.com / x.com URLs sets ``source='x'`` so the
+    SnsMonitor runtime can dispatch to the X plugin. The ``is_auto_discovered``
+    flag carries the provenance information that was previously conflated
+    into ``source='auto_discovery'`` — a sentinel value the monitor's source
+    registry couldn't dispatch to."""
     db = _make_db(tmp_path)
 
     added = discover_tcg_sns_accounts(
@@ -221,9 +235,60 @@ def test_auto_added_rule_source_is_auto_discovery(tmp_path: Path) -> None:
         max_new_per_run=1,
     )
     assert len(added) == 1
-    assert added[0].source == "auto_discovery"
+    assert added[0].source == "x"
+    assert added[0].is_auto_discovered is True
 
     # Check DB round-trip
     fetched = db.get_watch_rule(added[0].rule_id)
     assert fetched is not None
-    assert getattr(fetched, "source", None) == "auto_discovery"
+    assert getattr(fetched, "source", None) == "x"
+    assert getattr(fetched, "is_auto_discovered", None) is True
+
+
+def test_legacy_auto_discovery_rule_is_migrated_on_bootstrap(tmp_path: Path) -> None:
+    """A pre-migration row with source='auto_discovery' must be rewritten by
+    bootstrap to source='x' / is_auto_discovered=1 so the monitor runtime
+    can finally start polling it. Otherwise the rule sits in the table
+    forever, skipped on every poll cycle (the live-DB regression that
+    motivated the split)."""
+    import sqlite3
+    db_path = tmp_path / "legacy.sqlite3"
+    legacy = sqlite3.connect(db_path)
+    legacy.executescript(
+        """
+        CREATE TABLE watch_rules (
+            rule_id      TEXT PRIMARY KEY,
+            kind         TEXT NOT NULL,
+            label        TEXT NOT NULL,
+            query_json   TEXT NOT NULL,
+            enabled      INTEGER NOT NULL DEFAULT 1,
+            schedule_minutes INTEGER NOT NULL,
+            chat_id      TEXT NOT NULL,
+            last_checked_at TEXT,
+            created_at   TEXT NOT NULL,
+            updated_at   TEXT NOT NULL,
+            source       TEXT NOT NULL DEFAULT 'x'
+        );
+        INSERT INTO watch_rules
+            (rule_id, kind, label, query_json, enabled, schedule_minutes,
+             chat_id, last_checked_at, created_at, updated_at, source)
+        VALUES
+            ('legacy-1', 'account', '@legacy_handle',
+             '{"screen_name": "legacy_handle", "domains": ["pokemon"]}',
+             1, 15, '', NULL,
+             '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00',
+             'auto_discovery');
+        """
+    )
+    legacy.commit()
+    legacy.close()
+
+    SnsDatabase(db_path).bootstrap()
+
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT source, is_auto_discovered FROM watch_rules WHERE rule_id = 'legacy-1'"
+        ).fetchone()
+    assert row["source"] == "x"
+    assert row["is_auto_discovered"] == 1
