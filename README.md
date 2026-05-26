@@ -421,14 +421,20 @@ Environment variables:
 ```dotenv
 OPENCLAW_LOCAL_VISION_BACKEND=ollama
 OPENCLAW_LOCAL_VISION_ENDPOINT=http://127.0.0.1:11434
-OPENCLAW_LOCAL_VISION_MODEL=qwen2.5vl:7b,gemma3:12b
+OPENCLAW_LOCAL_VISION_MODEL=qwen2.5vl:7b
 OPENCLAW_LOCAL_VISION_TIMEOUT_SECONDS=180
 ```
 
 Suggested starting points for a 16 GB RAM machine:
 
 - `qwen2.5vl:7b` as the main local vision pass
-- `gemma3:12b` as the slower rescue pass when the first model still misses card number / rarity / set code
+- `gemma3:12b` is **not** in the default pipeline as of 2026-05-26: a 15-image
+  snkrdunk Pokemon sealed-box benchmark scored qwen2.5vl:7b at 11/15 PASS vs
+  gemma3:12b at 0/15 PASS. gemma3 hallucinated generic series names
+  (`スカーレット&バイオレット`) on most boxes and fabricated English set names
+  (`MEGA Cosmic Guardians`, `MEGA ミラクルファイター`) on others. Re-add
+  `,gemma3:12b` to the model list only for comparison runs / second-opinion
+  experiments.
 - Avoid `mistral-small3.2:24b` on this machine even though it is newer, because the official Ollama build is `15GB` and leaves too little RAM headroom on a 16GB Windows host
 
 Example setup:
