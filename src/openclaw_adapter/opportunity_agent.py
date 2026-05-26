@@ -498,9 +498,17 @@ class WebOpportunityResearcher:
             "sources": [_source_to_metadata(source) for source in sources],
         }
 
-        reason = candidate.reason
+        # Dedup-on-append: each enrichment cycle was previously concatenating
+        # the same "網路佐證：…" sentence unconditionally onto the candidate's
+        # stored reason text. After N scans of the same candidate the reason
+        # field contained N copies of the same evidence string. Guard
+        # against that here AND let `opportunity_store._normalize_legacy_reason`
+        # heal already-polluted DB rows on the next read.
+        reason = candidate.reason or ""
         if assessment.reason:
-            reason = f"{reason} 網路佐證：{assessment.reason}"
+            fragment = f"網路佐證：{assessment.reason}"
+            if fragment not in reason:
+                reason = f"{reason} {fragment}".strip() if reason else fragment
 
         skip = (candidate.title, candidate.search_query)
         merged_aliases = merge_string_list(
@@ -553,6 +561,34 @@ class TcgFairValueChecker:
         if result.fair_value is None:
             logger.info("Opportunity price skipped no fair value title=%s offers=%d", candidate.title, len(result.offers))
             return None
+
+        # Outlier sanity guard. Opportunity recommendations drive push
+        # notifications and human attention — we'd rather skip a noisy
+        # candidate than surface a 100/100 score on shaky evidence.
+        # Conditions that suppress the recommendation:
+        #   (a) Fair value is backed by fewer than 2 raw (non-graded) offers
+        #   (b) Among the raw offers, the max price is more than 2× the
+        #       median — likely a PSA / BGS / CGC outlier that the cross-
+        #       source grading detection missed
+        raw_prices = sorted(
+            offer.price_jpy for offer in result.offers
+            if offer.attributes.get("is_graded") != "1"
+        )
+        if len(raw_prices) < 2:
+            logger.info(
+                "Opportunity skipped — fair value backed by <2 raw offers title=%s raw_count=%d",
+                candidate.title, len(raw_prices),
+            )
+            return None
+        median_price = raw_prices[len(raw_prices) // 2]
+        max_price = raw_prices[-1]
+        if median_price > 0 and max_price > 2 * median_price:
+            logger.info(
+                "Opportunity skipped — outlier dominates raw offers title=%s max=%d median=%d",
+                candidate.title, max_price, median_price,
+            )
+            return None
+
         return PriceCheck(
             candidate_id=candidate.candidate_id,
             fair_value_jpy=result.fair_value.amount_jpy,

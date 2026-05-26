@@ -328,6 +328,169 @@ def test_web_opportunity_researcher_keeps_candidate_when_search_finds_nothing() 
     assert enriched == candidate
 
 
+def test_web_opportunity_researcher_does_not_duplicate_evidence_on_repeat() -> None:
+    """Repeated enrichment of the same candidate with the same assessment
+    must NOT append the same '網路佐證：…' sentence multiple times.
+
+    Regression for the user-reported UNION ARENA 綾波レイ recommendation
+    that displayed "網路佐證：根據tcgfan.com的資訊…" repeated 40+ times."""
+    candidate = _candidate()
+    sources = (
+        WebSearchResult(
+            title="UNION ARENA price trend",
+            url="https://tcgfan.com/ua",
+            snippet="Daily and weekly price trends visible.",
+        ),
+    )
+    constant_assessment = (
+        '{"is_relevant":true,"demand_score":98,'
+        '"reason":"根據tcgfan.com的資訊，UNION ARENA TCG有每日和每週的價格趨勢。"}'
+    )
+
+    researcher = WebOpportunityResearcher(
+        endpoint="http://127.0.0.1:11434",
+        model="qwen3:4b",
+        timeout_seconds=30,
+        search_fn=lambda query, limit: sources,
+        json_call_fn=lambda **kwargs: constant_assessment,
+    )
+
+    enriched = candidate
+    for _ in range(5):
+        enriched = researcher.enrich(enriched)
+
+    # After 5 enrichment cycles, "網路佐證：" should appear EXACTLY ONCE in
+    # the reason field — previously it accumulated 5 copies.
+    assert enriched.reason.count("網路佐證：") == 1
+
+
+def test_normalize_legacy_reason_collapses_dupes() -> None:
+    """Retroactive cleanup for DB rows polluted by the old append-without-
+    dedup behaviour. The 40× duplicated reason from the user's report
+    should collapse to a single occurrence on read."""
+    from openclaw_adapter.opportunity_store import _normalize_legacy_reason
+
+    fragment = "網路佐證：根據tcgfan.com的資訊，UNION ARENA TCG有每日和每週的價格趨勢，顯示市場關注。"
+    polluted = "熱門卡排行 #1 " + (f"{fragment} " * 40)
+
+    cleaned = _normalize_legacy_reason(polluted)
+
+    assert cleaned.count("網路佐證：") == 1
+    # Original prefix is preserved
+    assert cleaned.startswith("熱門卡排行 #1 ")
+    # Length collapsed dramatically (40 dupes → 1)
+    assert len(cleaned) < len(polluted) // 10
+
+
+def test_normalize_legacy_reason_handles_none_and_empty() -> None:
+    """Helper must be safe on empty / None inputs (some DB rows may have
+    NULL or empty reason)."""
+    from openclaw_adapter.opportunity_store import _normalize_legacy_reason
+
+    assert _normalize_legacy_reason(None) == ""
+    assert _normalize_legacy_reason("") == ""
+    # Clean reason (no duplicates) passes through unchanged
+    clean = "熱門卡排行 #1 網路佐證：A B C"
+    assert _normalize_legacy_reason(clean) == clean
+
+
+def _build_fake_lookup_result(*, offers: list, fair_value_amount: int = 5000):
+    """Construct a TcgLookupResult-shape object for monkeypatching."""
+    from dataclasses import dataclass
+
+    @dataclass
+    class _FakeFV:
+        amount_jpy: int
+        confidence: float = 0.7
+        sample_count: int = 3
+    @dataclass
+    class _FakeResult:
+        spec: object = None
+        item: object = None
+        offers: tuple = ()
+        fair_value: object = None
+        notes: tuple = ()
+    return _FakeResult(offers=tuple(offers), fair_value=_FakeFV(amount_jpy=fair_value_amount))
+
+
+def _build_fake_offer(*, price: int, is_graded: bool = False):
+    from market_monitor.models import MarketOffer
+    return MarketOffer(
+        source="cardrush_pokemon", listing_id=f"x{price}",
+        url=f"https://example.com/{price}", title="test", price_jpy=price,
+        price_kind="ask", captured_at=datetime.now(timezone.utc),
+        source_category="specialty_store",
+        attributes={"is_graded": "1"} if is_graded else {},
+    )
+
+
+def test_price_checker_suppresses_single_offer_fair_value(monkeypatch, tmp_path: Path) -> None:
+    """When fair_value is backed by fewer than 2 raw offers, the checker
+    returns None (suppresses noisy recommendations) regardless of what
+    fair_value the calculator returned."""
+    from openclaw_adapter import opportunity_agent
+
+    # Fake lookup_card that returns 1 offer + a fair_value
+    fake_result = _build_fake_lookup_result(
+        offers=[_build_fake_offer(price=5000)],
+        fair_value_amount=5000,
+    )
+    monkeypatch.setattr(opportunity_agent, "lookup_card", lambda **kwargs: fake_result)
+
+    checker = opportunity_agent.TcgFairValueChecker(db_path=tmp_path / "fake.sqlite3")
+    candidate = _candidate(title="某張卡")
+    result = checker.check(candidate)
+
+    assert result is None  # suppressed by sanity guard
+
+
+def test_price_checker_suppresses_outlier_dominated_fair_value(monkeypatch, tmp_path: Path) -> None:
+    """When the max raw price is >2× the median, treat it as an outlier
+    (typically an undetected graded listing) and suppress."""
+    from openclaw_adapter import opportunity_agent
+
+    # 3 raw at ~5k + 1 raw outlier at 14k (no is_graded flag — simulates
+    # the PSA10 that slipped past cross-source detection)
+    fake_result = _build_fake_lookup_result(
+        offers=[
+            _build_fake_offer(price=4500),
+            _build_fake_offer(price=5000),
+            _build_fake_offer(price=5200),
+            _build_fake_offer(price=14000),  # outlier, not flagged graded
+        ],
+        fair_value_amount=7000,
+    )
+    monkeypatch.setattr(opportunity_agent, "lookup_card", lambda **kwargs: fake_result)
+
+    checker = opportunity_agent.TcgFairValueChecker(db_path=tmp_path / "fake.sqlite3")
+    result = checker.check(_candidate(title="某張卡"))
+
+    assert result is None
+
+
+def test_price_checker_returns_check_on_clean_data(monkeypatch, tmp_path: Path) -> None:
+    """Positive case: ≥2 raw offers, no outlier, fair_value not None — the
+    checker returns a PriceCheck. Verifies the sanity guard isn't
+    over-suppressing legitimate recommendations."""
+    from openclaw_adapter import opportunity_agent
+
+    fake_result = _build_fake_lookup_result(
+        offers=[
+            _build_fake_offer(price=4500),
+            _build_fake_offer(price=5000),
+            _build_fake_offer(price=5200),
+        ],
+        fair_value_amount=5000,
+    )
+    monkeypatch.setattr(opportunity_agent, "lookup_card", lambda **kwargs: fake_result)
+
+    checker = opportunity_agent.TcgFairValueChecker(db_path=tmp_path / "fake.sqlite3")
+    result = checker.check(_candidate(title="某張卡"))
+
+    assert result is not None
+    assert result.fair_value_jpy == 5000
+
+
 def test_web_opportunity_researcher_lowers_heat_when_sources_are_irrelevant() -> None:
     candidate = _candidate()
     sources = (

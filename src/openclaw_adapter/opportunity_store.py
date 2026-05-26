@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -532,6 +533,23 @@ def _decode_json_list(value: object) -> tuple[str, ...]:
     return tuple(str(item) for item in parsed if isinstance(item, str) and item.strip())
 
 
+# Pre-fix DB rows can contain the same "網路佐證：…" sentence appended N
+# times because WebOpportunityResearcher.enrich() previously concatenated
+# the assessment reason on every cycle without dedup. Heal those rows on
+# read so the next upsert writes a clean version. The forward fix in
+# opportunity_agent.py (dedup-on-append) prevents new duplicates from
+# accumulating, but legacy rows need this regex to recover.
+_LEGACY_NETWORK_PROOF_RE = re.compile(
+    r"(網路佐證：[^網]+?)(?:\s*\1)+",
+)
+
+
+def _normalize_legacy_reason(reason: str | None) -> str:
+    if not reason:
+        return reason or ""
+    return _LEGACY_NETWORK_PROOF_RE.sub(r"\1", reason)
+
+
 def _candidate_from_row(row: sqlite3.Row) -> OpportunityCandidate:
     metadata_raw = row["metadata_json"] or "{}"
     try:
@@ -554,7 +572,7 @@ def _candidate_from_row(row: sqlite3.Row) -> OpportunityCandidate:
         product_identifier=row["product_identifier"] if "product_identifier" in row_keys else None,
         search_query=row["search_query"],
         heat_score=float(row["heat_score"]),
-        reason=row["reason"],
+        reason=_normalize_legacy_reason(row["reason"]),
         source_kind=row["source_kind"],
         source_url=row["source_url"],
         metadata=metadata,
