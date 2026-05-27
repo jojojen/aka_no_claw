@@ -281,6 +281,112 @@ class KnowledgeDatabase:
             ).fetchall()
         return [_row_to_entry(r) for r in rows]
 
+    def append_observation(
+        self,
+        *,
+        entity_alias_or_canonical: str,
+        observed_at: str,
+        rationale: str,
+        suggested_action: str,
+        tweet_url: str,
+        deadline: str | None = None,
+    ) -> bool:
+        """Append a dated bullet to an existing entity's summary under the
+        ``最近觀察`` marker. Caller (typically sns_monitor_bot's silenced flow)
+        passes an alias OR canonical name.
+
+        Behavior:
+          - Resolve canonical via lookup_canonical(); fall back to treating
+            the input as canonical directly.
+          - If the entity has no entry yet, log + return False (no stub —
+            EntityResearcher owns entity creation).
+          - Otherwise append the bullet, FIFO-trim observations to keep
+            total summary ≤ ~2000 chars. The pre-marker head (condensed
+            canonical knowledge) is preserved verbatim.
+          - origin is NEVER changed (pedigree invariant). Only updates
+            summary, updated_at, last_referenced_at.
+        """
+        raw_input = (entity_alias_or_canonical or "").strip()
+        if not raw_input:
+            return False
+        canonical = self.lookup_canonical(raw_input) or _normalize_canonical(raw_input)
+        if not canonical:
+            return False
+        entry = self.get_entry(canonical)
+        if entry is None:
+            logger.warning(
+                "knowledge_db: append_observation skipped, unknown entity=%s (input=%s)",
+                canonical, raw_input,
+            )
+            return False
+
+        bullet = _build_observation_bullet(
+            observed_at=observed_at,
+            rationale=rationale,
+            suggested_action=suggested_action,
+            tweet_url=tweet_url,
+            deadline=deadline,
+        )
+        new_summary = _append_observation_to_summary(entry.summary or "", bullet)
+        now = _utc_now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE knowledge_entries "
+                "SET summary = ?, updated_at = ?, last_referenced_at = ? "
+                "WHERE entity_canonical = ?",
+                (new_summary, now, now, canonical),
+            )
+        return True
+
+
+OBSERVATION_MARKER = "\n---\n最近觀察：\n"
+OBSERVATION_SUMMARY_CAP = 2000
+
+
+def _build_observation_bullet(
+    *,
+    observed_at: str,
+    rationale: str,
+    suggested_action: str,
+    tweet_url: str,
+    deadline: str | None,
+) -> str:
+    date_str = (observed_at or "")[:10] or _utc_now_iso()[:10]
+    parts: list[str] = [f"- [{date_str}]"]
+    rationale_clean = (rationale or "").strip()
+    if rationale_clean:
+        parts.append(rationale_clean)
+    action_clean = (suggested_action or "").strip()
+    if action_clean:
+        parts.append(f"— {action_clean}")
+    url_clean = (tweet_url or "").strip()
+    if url_clean:
+        parts.append(f"({url_clean})")
+    if deadline:
+        parts.append(f"[~{str(deadline)[:10]}]")
+    return " ".join(parts)
+
+
+def _append_observation_to_summary(summary: str, bullet: str) -> str:
+    """Append ``bullet`` under the OBSERVATION_MARKER, FIFO-trim oldest bullets
+    if the total exceeds OBSERVATION_SUMMARY_CAP. The pre-marker head is
+    preserved verbatim — only observation bullets get rotated."""
+    if OBSERVATION_MARKER in summary:
+        head, _, tail = summary.partition(OBSERVATION_MARKER)
+        existing = [line for line in tail.splitlines() if line.strip()]
+    else:
+        head = summary.rstrip()
+        existing = []
+
+    bullets = existing + [bullet]
+    rendered = head + OBSERVATION_MARKER + "\n".join(bullets)
+    # FIFO-drop oldest bullets until under cap. Always keep at least the
+    # newest bullet so the just-appended observation isn't immediately lost.
+    while len(rendered) > OBSERVATION_SUMMARY_CAP and len(bullets) > 1:
+        bullets.pop(0)
+        rendered = head + OBSERVATION_MARKER + "\n".join(bullets)
+    return rendered
+
 
 def _row_to_entry(row: sqlite3.Row) -> KnowledgeEntry:
     try:
