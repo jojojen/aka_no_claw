@@ -378,10 +378,10 @@ def _build_web_trend_candidate_prompt(snippets: Sequence[WebSearchResult], *, li
     lines = [
         "你是 OpenClaw 的商品機會偵測器。以下是搜尋引擎回的 title + snippet，請從中找出真正能在二級市場交易的 TCG 商品。",
         f"只接受 {supported_game_hint()}。忽略不明確、不是商品、或沒有買賣價值的話題。",
-        "忽略明顯不在支援範圍的系列，例如デュエルマスターズ、ONE PIECE CARD GAME、Dragon Ball。",
+        "忽略明顯不在支援範圍的系列，例如デュエルマスターズ、Dragon Ball、MTG。",
         "",
         "每個候選必須描述「同一個」具體商品，並且帶上三層結構：",
-        "- game (IP)：pokemon / ws / yugioh / union_arena",
+        "- game (IP)：pokemon / ws / yugioh / union_arena / one_piece",
         "- product_type：single_card / booster_pack / sealed_box / starter_deck / promo / other",
         "- title：可在二級市場搜尋到的具體商品名（不要包含「抽選情報」「予約情報」等情報詞）",
         "- product_identifier：單張卡填卡號、整盒填 set code、其他可為 null",
@@ -821,7 +821,7 @@ def _normalize_target_query(
 
     prompt = (
         "你是 TCG 商品分類助手。請判斷以下使用者輸入屬於哪個遊戲與商品類型，並回規範化的 title 與 Mercari search_query。\n"
-        "game 只能是：pokemon / ws / yugioh / union_arena\n"
+        "game 只能是：pokemon / ws / yugioh / union_arena / one_piece\n"
         "product_type 只能是：single_card / booster_pack / sealed_box / starter_deck / promo / other\n"
         f"使用者輸入：「{cleaned}」\n"
         "不確定 game 預設 pokemon；不確定 product_type 用 other。\n"
@@ -1894,10 +1894,10 @@ def _build_sns_candidate_prompt(posts: Sequence[SnsPost], *, limit: int) -> str:
     lines = [
         "你是 OpenClaw 的商品機會偵測器。請從 SNS 貼文中找出有交易潛力的 TCG/收藏卡商品。",
         f"只接受 {supported_game_hint()}。忽略不明確、不是商品、或沒有買賣價值的話題。",
-        "忽略明顯不在支援範圍的系列，例如デュエルマスターズ、ONE PIECE CARD GAME、Dragon Ball。",
+        "忽略明顯不在支援範圍的系列，例如デュエルマスターズ、Dragon Ball、MTG。",
         "",
         "每個候選必須描述「同一個」具體商品，並且帶上三層結構：",
-        "- game (Layer 1, IP)：pokemon / ws / yugioh / union_arena",
+        "- game (Layer 1, IP)：pokemon / ws / yugioh / union_arena / one_piece",
         "- product_type (Layer 2, 商品類型)：必須是下列其中之一：",
         "    single_card  - 單張卡片（例：ピカチュウex SAR、青眼の白龍 QCCP-JP001）",
         "    booster_pack - 拆售或補充包（例：強化拡張パック 単品）",
