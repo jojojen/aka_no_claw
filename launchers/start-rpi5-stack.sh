@@ -2,8 +2,8 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORKSPACE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-AKA_DIR="${SCRIPT_DIR}"
+WORKSPACE_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+AKA_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PRICE_DIR="${WORKSPACE_DIR}/price_monitor_bot"
 REPUTATION_DIR="${WORKSPACE_DIR}/reputation_snapshot"
 

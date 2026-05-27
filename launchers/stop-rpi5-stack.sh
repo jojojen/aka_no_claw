@@ -2,10 +2,11 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORKSPACE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+WORKSPACE_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+AKA_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REPUTATION_DIR="${WORKSPACE_DIR}/reputation_snapshot"
-AKA_VENV="${SCRIPT_DIR}/.venv"
-PID_FILE="${SCRIPT_DIR}/run/rpi5-stack.pid"
+AKA_VENV="${AKA_DIR}/.venv"
+PID_FILE="${AKA_DIR}/run/rpi5-stack.pid"
 
 stop_orphaned_stack_processes() {
   found=0
@@ -40,7 +41,7 @@ while read -r pid; do
     printf '[rpi5-stack] Skipping stale PID %s\n' "${pid}"
     continue
   fi
-  if [[ "${command_line}" != *"${SCRIPT_DIR}"* && "${command_line}" != *"${REPUTATION_DIR}"* && "${command_line}" != *"openclaw_adapter"* && "${command_line}" != *"ollama serve"* ]]; then
+  if [[ "${command_line}" != *"${AKA_DIR}"* && "${command_line}" != *"${REPUTATION_DIR}"* && "${command_line}" != *"openclaw_adapter"* && "${command_line}" != *"ollama serve"* ]]; then
     printf '[rpi5-stack] Skipping stale or unrelated PID %s\n' "${pid}"
     continue
   fi

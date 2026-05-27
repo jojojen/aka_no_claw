@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import threading
 import time
 import webbrowser
+from dataclasses import replace
 from pathlib import Path
 
-from assistant_runtime import AssistantSettings, AssistantTool, ToolRegistry, get_settings
+from assistant_runtime import AssistantSettings, AssistantTool, ToolRegistry, build_ssl_context, get_settings
+from tcg_tracker.catalog import SUPPORTED_GAMES, normalize_game_key
 
 from .commands import list_reference_sources, lookup_card, seed_example_watchlist
 from .dashboard import serve_dashboard
@@ -17,12 +20,34 @@ from .formatters import (
     lookup_result_to_json,
     reference_sources_to_json,
 )
+from .opportunity_agent import format_opportunity_status, run_opportunity_agent
 from .reputation_agent import check_prerequisites, ensure_agent_thread, run_agent_loop
+from .sns_tools import (
+    _configure_sns_add_account_parser,
+    _configure_sns_add_keyword_parser,
+    _configure_sns_add_trend_parser,
+    _configure_sns_delete_parser,
+    _configure_sns_list_parser,
+    _configure_sns_toggle_parser,
+    _handle_sns_add_account,
+    _handle_sns_add_keyword,
+    _handle_sns_add_trend,
+    _handle_sns_delete,
+    _handle_sns_list,
+    _handle_sns_toggle,
+)
 from .telegram_bot import (
     default_board_loader,
     default_lookup_renderer,
+    _select_text_generation_model,
     run_telegram_polling,
     send_telegram_test_message,
+)
+from .web_search import (
+    build_web_research_answer,
+    format_web_research_answer,
+    search_duckduckgo,
+    summarize_web_sources_with_ollama,
 )
 
 logger = logging.getLogger(__name__)
@@ -87,11 +112,92 @@ def build_tool_registry(settings: AssistantSettings | None = None) -> ToolRegist
     )
     registry.register(
         AssistantTool(
+            name="assistant.web-search",
+            description="Search the web with DuckDuckGo and summarize the sources with the configured local LLM.",
+            configure_parser=_configure_web_search_parser,
+            handler=lambda args: _handle_web_search(args, settings),
+            aliases=("web-search", "research", "search-web"),
+        )
+    )
+    registry.register(
+        AssistantTool(
             name="assistant.reputation-agent",
             description="Run the reputation-snapshot polling agent (claims jobs from the server and executes Playwright captures).",
             configure_parser=lambda parser: _configure_reputation_agent_parser(parser, settings),
             handler=lambda args: _handle_reputation_agent(args, settings),
             aliases=("reputation-agent",),
+        )
+    )
+    registry.register(
+        AssistantTool(
+            name="assistant.opportunity-agent",
+            description="Run the SNS→price→reputation opportunity pipeline and recommend qualified Mercari listings via Telegram.",
+            configure_parser=lambda parser: _configure_opportunity_agent_parser(parser, settings),
+            handler=lambda args: _handle_opportunity_agent(args, settings),
+            aliases=("opportunity-agent", "hunt-agent"),
+        )
+    )
+    registry.register(
+        AssistantTool(
+            name="assistant.opportunity-status",
+            description="Show recent opportunity candidates and recommendation decisions.",
+            configure_parser=_configure_opportunity_status_parser,
+            handler=lambda args: _handle_opportunity_status(args, settings),
+            aliases=("opportunity-status", "hunt-status"),
+        )
+    )
+    registry.register(
+        AssistantTool(
+            name="sns.add-account",
+            description="Add an X (Twitter) account to the SNS watch list.",
+            configure_parser=lambda parser: _configure_sns_add_account_parser(parser, settings),
+            handler=lambda args: _handle_sns_add_account(args, settings),
+            aliases=("sns-add-account",),
+        )
+    )
+    registry.register(
+        AssistantTool(
+            name="sns.add-keyword",
+            description="Add a keyword search to the SNS watch list.",
+            configure_parser=lambda parser: _configure_sns_add_keyword_parser(parser, settings),
+            handler=lambda args: _handle_sns_add_keyword(args, settings),
+            aliases=("sns-add-keyword",),
+        )
+    )
+    registry.register(
+        AssistantTool(
+            name="sns.add-trend",
+            description="Add a trend category to the SNS watch list.",
+            configure_parser=lambda parser: _configure_sns_add_trend_parser(parser, settings),
+            handler=lambda args: _handle_sns_add_trend(args, settings),
+            aliases=("sns-add-trend",),
+        )
+    )
+    registry.register(
+        AssistantTool(
+            name="sns.list-rules",
+            description="List all SNS watch rules.",
+            configure_parser=lambda parser: _configure_sns_list_parser(parser, settings),
+            handler=lambda args: _handle_sns_list(args, settings),
+            aliases=("sns-list-rules", "sns-list"),
+        )
+    )
+    registry.register(
+        AssistantTool(
+            name="sns.toggle-rule",
+            description="Enable or disable a SNS watch rule.",
+            configure_parser=lambda parser: _configure_sns_toggle_parser(parser, settings),
+            handler=lambda args: _handle_sns_toggle(args, settings),
+            aliases=("sns-toggle-rule",),
+        )
+    )
+    registry.register(
+        AssistantTool(
+            name="sns.delete-rule",
+            description="Delete a SNS watch rule.",
+            configure_parser=lambda parser: _configure_sns_delete_parser(parser, settings),
+            handler=lambda args: _handle_sns_delete(args, settings),
+            aliases=("sns-delete-rule",),
         )
     )
     return registry
@@ -107,7 +213,7 @@ def render_tool_catalog(registry: ToolRegistry) -> str:
 
 def _configure_lookup_card_parser(parser: argparse.ArgumentParser, settings: AssistantSettings) -> None:
     parser.add_argument("--db", default=settings.monitor_db_path)
-    parser.add_argument("--game", choices=["pokemon", "ws"], required=True)
+    parser.add_argument("--game", choices=[*SUPPORTED_GAMES, "ygo", "ua"], required=True)
     parser.add_argument("--name", required=True)
     parser.add_argument("--card-number")
     parser.add_argument("--rarity")
@@ -125,7 +231,7 @@ def _configure_seed_watchlist_parser(parser: argparse.ArgumentParser, settings: 
 
 def _configure_reference_sources_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", default="config/reference_sources.json")
-    parser.add_argument("--game", choices=["pokemon", "ws"])
+    parser.add_argument("--game", choices=[*SUPPORTED_GAMES, "ygo", "ua"])
     parser.add_argument("--kind")
     parser.add_argument("--role")
     parser.add_argument("--json", action="store_true")
@@ -155,6 +261,13 @@ def _configure_telegram_send_test_parser(parser: argparse.ArgumentParser) -> Non
     parser.add_argument("--message", default="OpenClaw Telegram test successful.")
 
 
+def _configure_web_search_parser(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("query", nargs="+", help="Question or search query to research.")
+    parser.add_argument("--provider", choices=["duckduckgo"], default="duckduckgo")
+    parser.add_argument("--limit", type=int, default=5, help="Number of search results to use, 1-10.")
+    parser.add_argument("--json", action="store_true", help="Print structured answer JSON.")
+
+
 def _handle_lookup_card(args: argparse.Namespace) -> int:
     logger.info(
         "CLI lookup command received game=%s name=%s card_number=%s rarity=%s set_code=%s json=%s",
@@ -167,7 +280,7 @@ def _handle_lookup_card(args: argparse.Namespace) -> int:
     )
     result = lookup_card(
         db_path=args.db,
-        game=args.game,
+        game=normalize_game_key(args.game) or args.game,
         name=args.name,
         card_number=args.card_number,
         rarity=args.rarity,
@@ -198,11 +311,58 @@ def _handle_list_reference_sources(args: argparse.Namespace) -> int:
     )
     sources = list_reference_sources(
         config_path=Path(args.config),
-        game=args.game,
+        game=normalize_game_key(args.game) if args.game else None,
         source_kind=args.kind,
         reference_role=args.role,
     )
     print(reference_sources_to_json(sources) if args.json else format_reference_sources(sources))
+    return 0
+
+
+def _handle_web_search(args: argparse.Namespace, settings: AssistantSettings) -> int:
+    query = " ".join(args.query).strip()
+    model = _select_text_generation_model(settings)
+    backend = (settings.openclaw_local_text_backend or "").strip().lower()
+    endpoint = settings.openclaw_local_text_endpoint
+    if backend != "ollama" or not endpoint or not model:
+        print("ERROR: configure OPENCLAW_LOCAL_TEXT_BACKEND=ollama and OPENCLAW_LOCAL_TEXT_MODEL to summarize web results.")
+        return 1
+
+    ssl_ctx = build_ssl_context(settings) if endpoint.startswith("https://") else None
+    answer = build_web_research_answer(
+        query,
+        max_results=args.limit,
+        search_fn=lambda q, limit: search_duckduckgo(
+            q,
+            max_results=limit,
+            ssl_context=ssl_ctx,
+        ),
+        summarize_fn=lambda q, sources: summarize_web_sources_with_ollama(
+            q,
+            sources,
+            endpoint=endpoint,
+            model=model,
+            timeout_seconds=max(1, settings.openclaw_local_text_timeout_seconds),
+            ssl_context=ssl_ctx,
+        ),
+    )
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "query": answer.query,
+                    "summary": answer.summary,
+                    "sources": [
+                        {"title": source.title, "url": source.url, "snippet": source.snippet}
+                        for source in answer.sources
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    else:
+        print(format_web_research_answer(answer))
     return 0
 
 
@@ -345,6 +505,23 @@ def _configure_reputation_agent_parser(
     )
 
 
+def _configure_opportunity_agent_parser(
+    parser: argparse.ArgumentParser,
+    settings: AssistantSettings,
+) -> None:
+    parser.add_argument("--once", action="store_true", help="Run one opportunity pipeline tick and exit.")
+    parser.add_argument(
+        "--interval-seconds",
+        type=int,
+        default=settings.opportunity_interval_seconds,
+        help=f"Seconds between continuous opportunity scans (default: {settings.opportunity_interval_seconds})",
+    )
+
+
+def _configure_opportunity_status_parser(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--limit", type=int, default=10, help="Maximum candidates to show.")
+
+
 def _handle_reputation_agent(
     args: argparse.Namespace,
     settings: AssistantSettings,
@@ -364,4 +541,38 @@ def _handle_reputation_agent(
         api_key=token,
         poll_secs=args.poll_secs,
     )
+    return 0
+
+
+def _handle_opportunity_agent(
+    args: argparse.Namespace,
+    settings: AssistantSettings,
+) -> int:
+    effective_settings = replace(settings, opportunity_interval_seconds=args.interval_seconds)
+    logger.info(
+        "CLI opportunity-agent command received once=%s interval_seconds=%s db=%s sns_db=%s",
+        args.once,
+        effective_settings.opportunity_interval_seconds,
+        effective_settings.opportunity_db_path,
+        effective_settings.sns_db_path,
+    )
+    stats = run_opportunity_agent(settings=effective_settings, once=args.once)
+    if stats is not None:
+        print(
+            "opportunity-agent tick: "
+            f"discovered={stats.discovered} "
+            f"candidates_checked={stats.candidates_checked} "
+            f"price_checks={stats.price_checks} "
+            f"listings_checked={stats.listings_checked} "
+            f"recommendations_sent={stats.recommendations_sent} "
+            f"rejected={stats.rejected}"
+        )
+    return 0
+
+
+def _handle_opportunity_status(
+    args: argparse.Namespace,
+    settings: AssistantSettings,
+) -> int:
+    print(format_opportunity_status(settings, limit=max(1, min(30, args.limit))))
     return 0
