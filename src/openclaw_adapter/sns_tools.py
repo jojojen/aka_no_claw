@@ -114,11 +114,32 @@ def _build_classifier_deps(settings: AssistantSettings, ssl_context=None):
                 logger.exception("knowledge_retriever: mark_referenced failed for %s", canonical)
         return format_knowledge_block(entries, unknown_entities=tuple(unknown))
 
+    def knowledge_appender(payload: dict) -> None:
+        """Sink silenced-signal observations into the lobster knowledge base.
+
+        Payload contract (kept stable so sns_monitor_bot stays import-free):
+          {"entity": str, "observed_at": str (ISO8601),
+           "rationale": str, "suggested_action": str,
+           "tweet_url": str, "deadline": str | None}
+        """
+        try:
+            knowledge_db.append_observation(
+                entity_alias_or_canonical=payload["entity"],
+                observed_at=payload["observed_at"],
+                rationale=payload.get("rationale", ""),
+                suggested_action=payload.get("suggested_action", ""),
+                tweet_url=payload.get("tweet_url", ""),
+                deadline=payload.get("deadline"),
+            )
+        except Exception:
+            logger.exception("knowledge_appender failed payload=%s", payload)
+
     return {
         "classifier_llm_fn": llm_fn,
         "entity_extraction_llm_fn": llm_fn,
         "alias_source": knowledge_db,
         "knowledge_retriever": knowledge_retriever,
+        "knowledge_appender": knowledge_appender,
         "entity_research_fn": researcher.request,
         "monitor_db_path": settings.monitor_db_path,
         "opportunity_db_path": settings.opportunity_db_path,

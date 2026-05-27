@@ -164,3 +164,107 @@ def test_format_knowledge_block_truncates_long_summary():
     # Block headers/labels add some chars, so allow generous overhead.
     assert len(block) < 500
     assert "big (other)" in block
+
+
+# ── append_observation — silenced-signal sink ───────────────────────────────
+
+
+from openclaw_adapter.knowledge_db import (
+    OBSERVATION_MARKER,
+    OBSERVATION_SUMMARY_CAP,
+)
+
+
+def _seed_entity(db, *, canonical="union_arena", summary="UNION ARENA。Bandai 旗下 TCG。", origin="manual"):
+    db.upsert_entry(
+        entity_canonical=canonical, entity_type="tcg",
+        summary=summary, source_urls=(), confidence=0.7,
+        origin=origin, aliases=("UNION ARENA", "UA"),
+    )
+
+
+def test_append_observation_existing_entity_appends_with_marker(db):
+    _seed_entity(db)
+    ok = db.append_observation(
+        entity_alias_or_canonical="union_arena",
+        observed_at="2026-05-27T01:00:00+00:00",
+        rationale="新弾発表",
+        suggested_action="關注發售資訊",
+        tweet_url="https://x.com/UA_EN_TCG/status/1",
+        deadline="2026-06-27T00:00:00Z",
+    )
+    assert ok is True
+    entry = db.get_entry("union_arena")
+    assert OBSERVATION_MARKER in entry.summary
+    assert entry.summary.startswith("UNION ARENA")
+    assert "[2026-05-27]" in entry.summary
+    assert "新弾発表" in entry.summary
+    assert "https://x.com/UA_EN_TCG/status/1" in entry.summary
+    assert "[~2026-06-27]" in entry.summary
+
+
+def test_append_observation_unknown_entity_returns_false_no_write(db):
+    ok = db.append_observation(
+        entity_alias_or_canonical="totally_unknown_ip",
+        observed_at="2026-05-27T01:00:00+00:00",
+        rationale="x", suggested_action="y", tweet_url="https://x.com/a/status/1",
+    )
+    assert ok is False
+    assert db.get_entry("totally_unknown_ip") is None
+
+
+def test_append_observation_via_alias_resolves_to_canonical(db):
+    _seed_entity(db)
+    ok = db.append_observation(
+        entity_alias_or_canonical="UA",  # alias, not canonical
+        observed_at="2026-05-27T01:00:00+00:00",
+        rationale="alias 解析測試", suggested_action="z",
+        tweet_url="https://x.com/a/status/2",
+    )
+    assert ok is True
+    entry = db.get_entry("union_arena")
+    assert "alias 解析測試" in entry.summary
+
+
+def test_append_observation_fifo_drops_oldest_when_over_cap(db):
+    head = "UNION ARENA 簡介。" + "x" * (OBSERVATION_SUMMARY_CAP - 200)
+    _seed_entity(db, summary=head)
+    # Append several bullets — first will be FIFO-dropped to stay under cap.
+    for i in range(5):
+        db.append_observation(
+            entity_alias_or_canonical="union_arena",
+            observed_at=f"2026-05-2{i}T01:00:00+00:00",
+            rationale=f"觀察 #{i}",
+            suggested_action="x" * 80,
+            tweet_url=f"https://x.com/a/status/{i}",
+        )
+    entry = db.get_entry("union_arena")
+    assert entry.summary.startswith("UNION ARENA 簡介。"), "head must be preserved"
+    assert len(entry.summary) <= OBSERVATION_SUMMARY_CAP
+    # Newest bullet must survive; oldest one(s) must have been dropped.
+    assert "觀察 #4" in entry.summary
+    assert "觀察 #0" not in entry.summary
+
+
+def test_append_observation_does_not_change_origin(db):
+    _seed_entity(db, origin="manual")
+    db.append_observation(
+        entity_alias_or_canonical="union_arena",
+        observed_at="2026-05-27T01:00:00+00:00",
+        rationale="x", suggested_action="y", tweet_url="https://x.com/a/status/1",
+    )
+    assert db.get_entry("union_arena").origin == "manual"
+
+
+def test_append_observation_updates_timestamps(db):
+    _seed_entity(db)
+    before = db.get_entry("union_arena")
+    db.append_observation(
+        entity_alias_or_canonical="union_arena",
+        observed_at="2026-05-27T01:00:00+00:00",
+        rationale="x", suggested_action="y", tweet_url="https://x.com/a/status/1",
+    )
+    after = db.get_entry("union_arena")
+    assert after.updated_at >= before.updated_at
+    assert after.last_referenced_at is not None
+    assert after.last_referenced_at >= (before.last_referenced_at or "")
