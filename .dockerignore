@@ -1,0 +1,8 @@
+*
+
+!docker/
+!docker/**/
+!docker/**/Dockerfile
+
+!scripts/
+!scripts/*.sh

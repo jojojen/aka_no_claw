@@ -10,6 +10,7 @@ from tcg_tracker.hot_cards import HotCardBoard, HotCardEntry, HotCardReference
 from tcg_tracker.image_lookup import ParsedCardImage, TcgImageLookupOutcome
 from tcg_tracker.service import TcgLookupResult
 from tests.image_lookup_case_fixtures import get_image_lookup_live_case
+from price_monitor_bot.bot import TelegramPhotoIntentAnalysis, TelegramPhotoIntentOption
 
 from openclaw_adapter.formatters import format_lookup_result_telegram
 from openclaw_adapter.natural_language import TelegramNaturalLanguageIntent
@@ -17,6 +18,7 @@ from openclaw_adapter.telegram_bot import (
     TelegramCommandProcessor,
     TelegramFileAttachment,
     TelegramLookupQuery,
+    TelegramResearchQuery,
     TelegramReputationQuery,
     TelegramReputationDelivery,
     build_processing_ack,
@@ -28,8 +30,14 @@ from openclaw_adapter.telegram_bot import (
     handle_telegram_message,
     parse_lookup_command,
     parse_reputation_snapshot_command,
+    _build_status_text,
     _chromium_launch_options,
 )
+
+# Every call to handle_telegram_message now sends an immediate intake ack
+# before kicking off the real processing pipeline.
+PHOTO_INTAKE_ACK = "已收到圖片，開始解讀使用者意圖"
+TEXT_INTAKE_ACK = "已收到訊息，開始解讀使用者意圖"
 
 
 def _stub_board() -> HotCardBoard:
@@ -75,9 +83,15 @@ class FakeTelegramClient:
         self.sent_documents: list[tuple[str, str | None]] = []
         self.sent_photos: list[tuple[str, str | None]] = []
 
-    def send_message(self, *, chat_id: str | int, text: str) -> dict[str, object]:
+    def send_message(
+        self,
+        *,
+        chat_id: str | int,
+        text: str,
+        reply_markup: dict[str, object] | None = None,
+    ) -> dict[str, object]:
         self.sent_messages.append(text)
-        return {"chat_id": str(chat_id), "text": text}
+        return {"chat_id": str(chat_id), "text": text, "reply_markup": reply_markup}
 
     def send_document(self, *, chat_id: str | int, document_path: Path, caption: str | None = None) -> dict[str, object]:
         self.sent_documents.append((document_path.name, caption))
@@ -107,6 +121,19 @@ class StubNaturalLanguageRouter:
         return self.intent
 
 
+def _ambiguous_photo_analysis() -> TelegramPhotoIntentAnalysis:
+    return TelegramPhotoIntentAnalysis(
+        options=(
+            TelegramPhotoIntentOption(1, "pokemon_card_price", "要我查這張寶可夢卡市價嗎？", "/scan pokemon"),
+            TelegramPhotoIntentOption(2, "yugioh_card_price", "要我查這張遊戲王卡市價嗎？", "/scan yugioh"),
+            TelegramPhotoIntentOption(3, "pokemon_box_price", "要我查這個寶可夢卡盒市價嗎？", "/scan pokemon"),
+        ),
+        parsed_game="pokemon",
+        parsed_item_kind="card",
+        parsed_title="Pikachu ex",
+    )
+
+
 def test_parse_lookup_command_supports_pipe_format() -> None:
     query = parse_lookup_command("pokemon | Pikachu ex | 132/106 | SAR | sv08")
 
@@ -126,6 +153,20 @@ def test_parse_lookup_command_supports_simple_format() -> None:
         game="ws",
         name="Hatsune Miku",
     )
+
+
+def test_parse_lookup_command_supports_yugioh_and_union_arena_aliases() -> None:
+    ygo_query = parse_lookup_command("ygo | 青眼の白龍 | QCCP-JP001 | ウルトラ")
+    ua_query = parse_lookup_command("ua 綾波レイ")
+
+    assert ygo_query == TelegramLookupQuery(
+        game="yugioh",
+        name="青眼の白龍",
+        card_number="QCCP-JP001",
+        rarity="ウルトラ",
+        set_code="qccp",
+    )
+    assert ua_query == TelegramLookupQuery(game="union_arena", name="綾波レイ")
 
 
 def test_default_photo_renderer_tolerates_disabled_local_vision_backend(monkeypatch) -> None:
@@ -208,7 +249,128 @@ def test_command_processor_help_lists_trend_and_scan_commands() -> None:
     assert "/trend pokemon" in help_reply
     assert "/price pokemon | Pikachu ex | 132/106 | SAR | sv08" in help_reply
     assert "/snapshot https://jp.mercari.com/item/m123456789" in help_reply
+    assert "/search why Pikachu Pokemon cards are popular" in help_reply
     assert "Send a photo with caption: /scan pokemon" in help_reply
+    assert "/hunt status" in help_reply
+
+
+def test_command_processor_handles_hunt_status() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        opportunity_status_renderer=lambda: "targets: Umbreon",
+    )
+
+    assert processor.build_reply(chat_id="123", text="/hunt status") == "targets: Umbreon"
+
+
+def test_command_processor_handles_hunt_remove() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    seen: list[str] = []
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        opportunity_status_renderer=lambda: "targets: Umbreon",
+        opportunity_target_remover=lambda target: seen.append(target) or f"removed:{target}",
+    )
+
+    assert processor.build_reply(chat_id="123", text="/hunt remove 2") == "removed:2"
+    assert processor.build_reply(chat_id="123", text="/hunt delete Umbreon ex SAR") == "removed:Umbreon ex SAR"
+    assert seen == ["2", "Umbreon ex SAR"]
+
+
+def test_build_status_text_includes_feature_models_and_sizes(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    # .env.example sets configured text=qwen3:4b, vision=qwen2.5vl:7b,gemma3:12b
+    # No .env override, so configured stays as .env.example values.
+    (tmp_path / ".env.example").write_text(
+        "\n".join([
+            "OPENCLAW_LOCAL_TEXT_BACKEND=ollama",
+            "OPENCLAW_LOCAL_TEXT_MODEL=qwen3:4b",
+            "OPENCLAW_LOCAL_TEXT_TIMEOUT_SECONDS=75",
+            "OPENCLAW_LOCAL_TEXT_ENDPOINT=http://127.0.0.1:11434",
+            "OPENCLAW_LOCAL_VISION_BACKEND=ollama",
+            "OPENCLAW_LOCAL_VISION_MODEL=qwen2.5vl:7b,gemma3:12b",
+            "OPENCLAW_LOCAL_VISION_TIMEOUT_SECONDS=180",
+            "OPENCLAW_LOCAL_VISION_ENDPOINT=http://127.0.0.1:11434",
+        ]),
+        encoding="utf-8",
+    )
+    settings = AssistantSettings(
+        monitor_env="development",
+        monitor_db_path="data/monitor.sqlite3",
+        openclaw_telegram_chat_ids=("123", "456"),
+        openclaw_tesseract_path="/opt/homebrew/bin/tesseract",
+        openclaw_tessdata_dir="/opt/homebrew/share/tessdata",
+        openclaw_local_text_backend="ollama",
+        openclaw_local_text_model="qwen3:4b",
+        openclaw_local_text_endpoint="http://127.0.0.1:11434",
+        openclaw_local_text_timeout_seconds=75,
+        openclaw_local_vision_backend="ollama",
+        openclaw_local_vision_model="qwen2.5vl:7b,gemma3:12b",
+        openclaw_local_vision_endpoint="http://127.0.0.1:11434",
+        openclaw_local_vision_timeout_seconds=180,
+        reputation_agent_server_url="http://127.0.0.1:5055",
+        reputation_agent_poll_secs=5,
+    )
+
+    text = _build_status_text(settings)
+
+    # Active router model = gemma3:12b (strongest across text+vision models).
+    # Configured text model = qwen3:4b (from .env.example) → shows active vs configured.
+    assert "text routing: active=ollama / gemma3:12b (12B) | configured=ollama / qwen3:4b (4B) | timeout=75s" in text
+    assert "image scan vision: ollama / qwen2.5vl:7b (7B), gemma3:12b (12B) | timeout=180s" in text
+    assert "image scan OCR: engine=tesseract | binary=/opt/homebrew/bin/tesseract" in text
+    assert "price lookup / trend / watch: model=none" in text
+    assert "reputation snapshot: model=none | server=http://127.0.0.1:5055 | poll=5s" in text
+
+
+def test_build_status_text_shows_configured_models_when_runtime_is_disabled(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env.example").write_text(
+        "\n".join(
+            [
+                "OPENCLAW_LOCAL_TEXT_BACKEND=ollama",
+                "OPENCLAW_LOCAL_TEXT_MODEL=qwen3:4b",
+                "OPENCLAW_LOCAL_TEXT_TIMEOUT_SECONDS=75",
+                "OPENCLAW_LOCAL_TEXT_ENDPOINT=http://127.0.0.1:11434",
+                "OPENCLAW_LOCAL_VISION_BACKEND=ollama",
+                "OPENCLAW_LOCAL_VISION_MODEL=gemma3:4b",
+                "OPENCLAW_LOCAL_VISION_TIMEOUT_SECONDS=180",
+                "OPENCLAW_LOCAL_VISION_ENDPOINT=http://127.0.0.1:11434",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                "OPENCLAW_LOCAL_VISION_BACKEND=ollama",
+                "OPENCLAW_LOCAL_VISION_MODEL=qwen2.5vl:7b,gemma3:12b",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    settings = AssistantSettings(
+        openclaw_local_text_backend=None,
+        openclaw_local_text_model=None,
+        openclaw_local_text_endpoint="http://127.0.0.1:11434",
+        openclaw_local_text_timeout_seconds=45,
+        openclaw_local_vision_backend=None,
+        openclaw_local_vision_model=None,
+        openclaw_local_vision_endpoint="http://127.0.0.1:11434",
+        openclaw_local_vision_timeout_seconds=180,
+    )
+
+    text = _build_status_text(settings)
+
+    assert "text routing: active=disabled / none | configured=ollama / qwen3:4b (4B) | timeout=75s" in text
+    assert "image scan vision: active=disabled / none | configured=ollama / qwen2.5vl:7b (7B), gemma3:12b (12B) | timeout=180s" in text
 
 
 def test_parse_reputation_snapshot_command_requires_url() -> None:
@@ -230,6 +392,23 @@ def test_command_processor_handles_snapshot_command() -> None:
     reply = processor.build_reply(chat_id="123", text="/snapshot https://jp.mercari.com/item/m123456789")
 
     assert reply == "snapshot:https://jp.mercari.com/item/m123456789"
+
+
+def test_command_processor_handles_web_search_command() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    seen: list[TelegramResearchQuery] = []
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        research_renderer=lambda query: seen.append(query) or "已整理搜尋結果。\n參考來源：\nhttps://example.com/source",
+    )
+
+    reply = processor.build_reply(chat_id="123", text="/search why Pikachu Pokemon cards are popular")
+
+    assert reply == "已整理搜尋結果。\n參考來源：\nhttps://example.com/source"
+    assert seen == [TelegramResearchQuery(query="why Pikachu Pokemon cards are popular")]
 
 
 def test_format_reputation_snapshot_result_shows_proof_link() -> None:
@@ -337,12 +516,134 @@ def test_command_processor_builds_ack_for_natural_language_trend() -> None:
     assert router.seen_texts == ["ws 熱門前 5"]
 
 
+def test_command_processor_handles_natural_language_status_via_router() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    router = StubNaturalLanguageRouter(
+        TelegramNaturalLanguageIntent(
+            intent="status",
+            confidence=0.96,
+        )
+    )
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        natural_language_router=router,
+        status_renderer=lambda: "runtime ok",
+    )
+
+    reply = processor.build_reply(chat_id="123", text="你現在狀態如何")
+
+    assert reply == "runtime ok"
+    assert router.seen_texts == ["你現在狀態如何"]
+
+
+def test_command_processor_handles_natural_language_tools_via_router() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    router = StubNaturalLanguageRouter(
+        TelegramNaturalLanguageIntent(
+            intent="tools",
+            confidence=0.94,
+        )
+    )
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "tool catalog",
+        natural_language_router=router,
+    )
+
+    reply = processor.build_reply(chat_id="123", text="把所有工具列出來")
+
+    assert reply == "tool catalog"
+    assert router.seen_texts == ["把所有工具列出來"]
+
+
+def test_command_processor_handles_natural_language_scan_help_via_router() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    router = StubNaturalLanguageRouter(
+        TelegramNaturalLanguageIntent(
+            intent="scan_help",
+            confidence=0.93,
+        )
+    )
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        natural_language_router=router,
+    )
+
+    reply = processor.build_reply(chat_id="123", text="我要怎麼用照片查價")
+
+    assert reply == "Send a card photo with the caption /scan pokemon or /scan ws, and I will parse it and then look up the price."
+    assert router.seen_texts == ["我要怎麼用照片查價"]
+
+
+def test_command_processor_handles_natural_language_web_research_via_router() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    router = StubNaturalLanguageRouter(
+        TelegramNaturalLanguageIntent(
+            intent="web_research",
+            research_query="why Pikachu Pokemon cards are popular",
+            confidence=0.91,
+        )
+    )
+    seen: list[TelegramResearchQuery] = []
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        natural_language_router=router,
+        research_renderer=lambda query: seen.append(query) or "皮卡丘是寶可夢代表角色之一 [1]。\n\n參考來源：\n[1] Source\nhttps://example.com/source",
+    )
+
+    plan = processor.build_reply_plan(chat_id="123", text="why pokemon card pickachu card is so popular?")
+
+    assert plan.ack == "已理解：相當於 /search why Pikachu Pokemon cards are popular，正在搜尋資料來源並整理答案…"
+    assert plan.execute() == "皮卡丘是寶可夢代表角色之一 [1]。\n\n參考來源：\n[1] Source\nhttps://example.com/source"
+    assert seen == [TelegramResearchQuery(query="why Pikachu Pokemon cards are popular")]
+    assert router.seen_texts == ["why pokemon card pickachu card is so popular?"]
+
+
+def test_command_processor_handles_natural_language_opportunity_remove_via_router() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    router = StubNaturalLanguageRouter(
+        TelegramNaturalLanguageIntent(
+            intent="opportunity_remove",
+            opportunity_target="2",
+            confidence=0.92,
+        )
+    )
+    seen: list[str] = []
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        natural_language_router=router,
+        opportunity_target_remover=lambda target: seen.append(target) or f"removed:{target}",
+    )
+
+    plan = processor.build_reply_plan(chat_id="123", text="remove target 2 from the opportunity list")
+
+    assert plan.ack == "已理解：相當於 /hunt remove 2，正在移除。"
+    assert plan.execute() == "removed:2"
+    assert seen == ["2"]
+    assert router.seen_texts == ["remove target 2 from the opportunity list"]
+
+
 def test_build_processing_ack_for_heavy_actions() -> None:
     assert build_processing_ack(text="/price pokemon Pikachu ex") == "收到查價指令，開始處理。"
     assert build_processing_ack(text="/trend pokemon") == "收到趨勢榜查詢，開始整理資料。"
     assert build_processing_ack(text="/snapshot https://jp.mercari.com/item/m123456789") == (
         "收到信譽快照查詢，先檢查既有 proof，必要時建立新快照。"
     )
+    assert build_processing_ack(text="/search why Pikachu is popular") == "收到搜尋問題，正在找資料來源並整理答案。"
     assert build_processing_ack(has_photo=True) == "收到圖片，開始解析與查價。"
     assert build_processing_ack(text="/ping") is None
 
@@ -370,6 +671,7 @@ def test_handle_telegram_message_sends_ack_then_photo_result() -> None:
     )
 
     assert replies == (
+        PHOTO_INTAKE_ACK,
         "收到圖片，開始解析與查價。",
         "photo:pokemon:Pikachu ex:.jpg",
     )
@@ -397,10 +699,115 @@ def test_handle_telegram_message_sends_ack_then_text_result() -> None:
     )
 
     assert replies == (
+        TEXT_INTAKE_ACK,
         "收到查價指令，開始處理。",
         "pokemon:Pikachu ex",
     )
     assert client.sent_messages == list(replies)
+
+
+def test_handle_telegram_message_clarifies_image_without_caption() -> None:
+    sample_path = get_image_lookup_live_case("pokemon-pikachu-partial-s40").image_path
+    client = FakeTelegramClient(sample_path=sample_path)
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        photo_intent_analyzer=lambda query: _ambiguous_photo_analysis(),
+    )
+
+    replies = handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={
+            "chat": {"id": "123"},
+            "photo": [{"file_id": "photo-1", "file_size": 128}],
+        },
+    )
+
+    assert len(replies) == 2
+    assert replies[0] == PHOTO_INTAKE_ACK
+    assert "1. 要我查這張寶可夢卡市價嗎？" in replies[1]
+    assert "4. 都不是，請回答：否，[您的意圖]" in replies[1]
+
+
+def test_handle_telegram_message_runs_selected_photo_option_after_clarification() -> None:
+    sample_path = get_image_lookup_live_case("pokemon-pikachu-partial-s40").image_path
+    client = FakeTelegramClient(sample_path=sample_path)
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        photo_intent_analyzer=lambda query: _ambiguous_photo_analysis(),
+    )
+
+    handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={
+            "chat": {"id": "123"},
+            "photo": [{"file_id": "photo-1", "file_size": 128}],
+        },
+    )
+    replies = handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: f"resolved:{query.caption}:{query.game_hint}",
+        message={
+            "chat": {"id": "123"},
+            "text": "1",
+        },
+    )
+
+    assert replies == (
+        TEXT_INTAKE_ACK,
+        "收到，我就照第 1 個方式處理。",
+        "resolved:/scan pokemon:pokemon",
+    )
+
+
+def test_handle_telegram_message_supports_photo_override_text() -> None:
+    sample_path = get_image_lookup_live_case("pokemon-pikachu-partial-s40").image_path
+    client = FakeTelegramClient(sample_path=sample_path)
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        photo_intent_analyzer=lambda query: _ambiguous_photo_analysis(),
+    )
+
+    handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={
+            "chat": {"id": "123"},
+            "photo": [{"file_id": "photo-1", "file_size": 128}],
+        },
+    )
+    replies = handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: f"resolved:{query.caption}:{query.game_hint}:{query.item_kind_hint}",
+        message={
+            "chat": {"id": "123"},
+            "text": "否，查這張遊戲王卡市價",
+        },
+    )
+
+    assert replies == (
+        TEXT_INTAKE_ACK,
+        "收到，我改照你補充的意思處理：查這張遊戲王卡市價",
+        "resolved:/scan yugioh:yugioh:card",
+    )
 
 
 def test_handle_telegram_message_sends_snapshot_ack_then_result(tmp_path: Path) -> None:
@@ -436,6 +843,7 @@ def test_handle_telegram_message_sends_snapshot_ack_then_result(tmp_path: Path) 
     )
 
     assert replies == (
+        TEXT_INTAKE_ACK,
         "收到信譽快照查詢，先檢查既有 proof，必要時建立新快照。",
         "snapshot:https://jp.mercari.com/item/m123456789",
     )
@@ -533,8 +941,9 @@ def test_handle_telegram_message_sends_natural_language_ack_then_result() -> Non
         },
     )
 
-    assert replies[0] == "已理解查詢內容，相當於 /trend ws 5，開始整理資料。"
-    assert "WS Liquidity Board" in replies[1]
+    assert replies[0] == TEXT_INTAKE_ACK
+    assert replies[1] == "已理解查詢內容，相當於 /trend ws 5，開始整理資料。"
+    assert "WS Liquidity Board" in replies[2]
     assert client.sent_messages == list(replies)
 
 
@@ -551,7 +960,7 @@ def test_handle_telegram_message_sends_natural_language_ack_before_running_heavy
     )
 
     def board_loader() -> tuple[HotCardBoard, ...]:
-        assert client.sent_messages == ["已理解查詢內容，相當於 /trend ws 3，開始整理資料。"]
+        assert client.sent_messages == [TEXT_INTAKE_ACK, "已理解查詢內容，相當於 /trend ws 3，開始整理資料。"]
         return (
             HotCardBoard(
                 game="ws",
@@ -580,8 +989,38 @@ def test_handle_telegram_message_sends_natural_language_ack_before_running_heavy
         },
     )
 
-    assert replies[0] == "已理解查詢內容，相當於 /trend ws 3，開始整理資料。"
-    assert "WS Liquidity Board" in replies[1]
+    assert replies[0] == TEXT_INTAKE_ACK
+    assert replies[1] == "已理解查詢內容，相當於 /trend ws 3，開始整理資料。"
+    assert "WS Liquidity Board" in replies[2]
+
+
+def test_handle_telegram_message_sends_web_research_ack_then_result() -> None:
+    client = FakeTelegramClient()
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: f"{query.game}:{query.name}",
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        research_renderer=lambda query: "皮卡丘是寶可夢代表角色之一 [1]。\n\n參考來源：\n[1] Source\nhttps://example.com/source",
+    )
+
+    replies = handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={
+            "chat": {"id": "123"},
+            "text": "/search why Pikachu Pokemon cards are popular",
+        },
+    )
+
+    assert replies == (
+        TEXT_INTAKE_ACK,
+        "收到搜尋問題，正在找資料來源並整理答案。",
+        "皮卡丘是寶可夢代表角色之一 [1]。\n\n參考來源：\n[1] Source\nhttps://example.com/source",
+    )
+    assert client.sent_messages == list(replies)
 
 
 def _mixed_grade_lookup_result() -> TcgLookupResult:

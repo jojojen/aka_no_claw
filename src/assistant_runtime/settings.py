@@ -33,6 +33,37 @@ class AssistantSettings:
     log_level: str = "INFO"
     log_file_path: str = "logs/openclaw.log"
     log_raw_result_limit: int = 20
+    sns_db_path: str = "data/sns.sqlite3"
+    knowledge_db_path: str = "data/knowledge.sqlite3"
+    sns_classifier_enabled: bool = True
+    sns_classifier_min_score: int = 60
+    opportunity_agent_enabled: bool = False
+    opportunity_db_path: str = "data/opportunities.sqlite3"
+    opportunity_interval_seconds: int = 900
+    opportunity_llm_timeout_seconds: int = 180
+    opportunity_sns_lookback_hours: int = 24
+    opportunity_candidate_limit: int = 4
+    opportunity_listing_limit: int = 5
+    opportunity_candidate_check_interval_seconds: int = 1800
+    opportunity_min_heat_score: float = 70.0
+    opportunity_max_price_ratio: float = 0.85
+    opportunity_min_price_confidence: float = 0.60
+    opportunity_min_total_reviews: int = 30
+    opportunity_min_positive_rate: float = 97.0
+    # ── multi-source candidate providers ────────────────────────────────────
+    opportunity_hot_card_provider_enabled: bool = True
+    opportunity_hot_card_per_game_limit: int = 3
+    opportunity_hot_card_min_score: float = 60.0
+    opportunity_web_trend_provider_enabled: bool = True
+    opportunity_web_trend_queries: tuple[str, ...] = ()
+    opportunity_web_trend_results_per_query: int = 5
+    opportunity_official_store_provider_enabled: bool = True
+    # ── SNS rule domain backfill / auto-discovery (Provider E + backfill) ────
+    opportunity_sns_domain_backfill_enabled: bool = True
+    opportunity_sns_auto_discovery_enabled: bool = True
+    opportunity_sns_auto_discovery_interval_hours: int = 6
+    opportunity_sns_auto_discovery_max_new_per_run: int = 2
+    opportunity_sns_auto_discovery_min_confidence: float = 0.7
 
 
 def load_dotenv(path: str | Path = DEFAULT_ENV_PATH, *, override: bool = False) -> None:
@@ -94,6 +125,107 @@ def get_settings() -> AssistantSettings:
         log_level=os.getenv("LOG_LEVEL", "INFO"),
         log_file_path=os.getenv("LOG_FILE_PATH", "logs/openclaw.log"),
         log_raw_result_limit=_as_int(os.getenv("LOG_RAW_RESULT_LIMIT"), default=20),
+        sns_db_path=os.getenv("SNS_DB_PATH", "data/sns.sqlite3"),
+        knowledge_db_path=os.getenv("KNOWLEDGE_DB_PATH", "data/knowledge.sqlite3"),
+        sns_classifier_enabled=_as_bool(
+            os.getenv("OPENCLAW_SNS_CLASSIFIER_ENABLED", "true")
+        ),
+        sns_classifier_min_score=_as_int(
+            os.getenv("OPENCLAW_SNS_CLASSIFIER_MIN_SCORE"), default=60
+        ),
+        opportunity_agent_enabled=_as_bool(os.getenv("OPENCLAW_OPPORTUNITY_AGENT_ENABLED")),
+        opportunity_db_path=os.getenv("OPENCLAW_OPPORTUNITY_DB_PATH", "data/opportunities.sqlite3"),
+        opportunity_interval_seconds=_as_int(
+            os.getenv("OPENCLAW_OPPORTUNITY_INTERVAL_SECONDS"),
+            default=900,
+        ),
+        opportunity_llm_timeout_seconds=_as_int(
+            os.getenv("OPENCLAW_OPPORTUNITY_LLM_TIMEOUT_SECONDS"),
+            default=180,
+        ),
+        opportunity_sns_lookback_hours=_as_int(
+            os.getenv("OPENCLAW_OPPORTUNITY_SNS_LOOKBACK_HOURS"),
+            default=24,
+        ),
+        opportunity_candidate_limit=_as_int(
+            os.getenv("OPENCLAW_OPPORTUNITY_CANDIDATE_LIMIT"),
+            default=4,
+        ),
+        opportunity_listing_limit=_as_int(
+            os.getenv("OPENCLAW_OPPORTUNITY_LISTING_LIMIT"),
+            default=5,
+        ),
+        opportunity_candidate_check_interval_seconds=_as_int(
+            os.getenv("OPENCLAW_OPPORTUNITY_CANDIDATE_CHECK_INTERVAL_SECONDS"),
+            default=1800,
+        ),
+        opportunity_min_heat_score=_as_float(
+            os.getenv("OPENCLAW_OPPORTUNITY_MIN_HEAT_SCORE"),
+            default=70.0,
+        ),
+        opportunity_max_price_ratio=_as_float(
+            os.getenv("OPENCLAW_OPPORTUNITY_MAX_PRICE_RATIO"),
+            default=0.85,
+        ),
+        opportunity_min_price_confidence=_as_float(
+            os.getenv("OPENCLAW_OPPORTUNITY_MIN_PRICE_CONFIDENCE"),
+            default=0.60,
+        ),
+        opportunity_min_total_reviews=_as_int(
+            os.getenv("OPENCLAW_OPPORTUNITY_MIN_TOTAL_REVIEWS"),
+            default=30,
+        ),
+        opportunity_min_positive_rate=_as_float(
+            os.getenv("OPENCLAW_OPPORTUNITY_MIN_POSITIVE_RATE"),
+            default=97.0,
+        ),
+        opportunity_hot_card_provider_enabled=_as_bool(
+            os.getenv("OPENCLAW_OPPORTUNITY_HOT_CARD_PROVIDER_ENABLED"),
+            default=True,
+        ),
+        opportunity_hot_card_per_game_limit=_as_int(
+            os.getenv("OPENCLAW_OPPORTUNITY_HOT_CARD_PER_GAME_LIMIT"),
+            default=3,
+        ),
+        opportunity_hot_card_min_score=_as_float(
+            os.getenv("OPENCLAW_OPPORTUNITY_HOT_CARD_MIN_SCORE"),
+            default=60.0,
+        ),
+        opportunity_web_trend_provider_enabled=_as_bool(
+            os.getenv("OPENCLAW_OPPORTUNITY_WEB_TREND_PROVIDER_ENABLED"),
+            default=True,
+        ),
+        opportunity_web_trend_queries=_parse_csv(
+            os.getenv("OPENCLAW_OPPORTUNITY_WEB_TREND_QUERIES"),
+        ),
+        opportunity_web_trend_results_per_query=_as_int(
+            os.getenv("OPENCLAW_OPPORTUNITY_WEB_TREND_RESULTS_PER_QUERY"),
+            default=5,
+        ),
+        opportunity_official_store_provider_enabled=_as_bool(
+            os.getenv("OPENCLAW_OPPORTUNITY_OFFICIAL_STORE_PROVIDER_ENABLED"),
+            default=True,
+        ),
+        opportunity_sns_domain_backfill_enabled=_as_bool(
+            os.getenv("OPENCLAW_OPPORTUNITY_SNS_DOMAIN_BACKFILL_ENABLED"),
+            default=True,
+        ),
+        opportunity_sns_auto_discovery_enabled=_as_bool(
+            os.getenv("OPENCLAW_OPPORTUNITY_SNS_AUTO_DISCOVERY_ENABLED"),
+            default=True,
+        ),
+        opportunity_sns_auto_discovery_interval_hours=_as_int(
+            os.getenv("OPENCLAW_OPPORTUNITY_SNS_AUTO_DISCOVERY_INTERVAL_HOURS"),
+            default=6,
+        ),
+        opportunity_sns_auto_discovery_max_new_per_run=_as_int(
+            os.getenv("OPENCLAW_OPPORTUNITY_SNS_AUTO_DISCOVERY_MAX_NEW_PER_RUN"),
+            default=2,
+        ),
+        opportunity_sns_auto_discovery_min_confidence=_as_float(
+            os.getenv("OPENCLAW_OPPORTUNITY_SNS_AUTO_DISCOVERY_MIN_CONFIDENCE"),
+            default=0.7,
+        ),
     )
 
 
@@ -124,10 +256,21 @@ def _getenv_any(*keys: str) -> str | None:
     return None
 
 
-def _as_bool(value: str | None) -> bool:
+def _as_bool(value: str | None, *, default: bool = False) -> bool:
     if value is None:
+        return default
+    stripped = value.strip().lower()
+    if stripped in {"1", "true", "yes", "on"}:
+        return True
+    if stripped in {"0", "false", "no", "off"}:
         return False
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+    return default
+
+
+def _parse_csv(value: str | None) -> tuple[str, ...]:
+    if not value:
+        return ()
+    return tuple(item.strip() for item in value.split(",") if item.strip())
 
 
 def _as_int(value: str | None, *, default: int) -> int:
@@ -135,5 +278,14 @@ def _as_int(value: str | None, *, default: int) -> int:
         return default
     try:
         return int(value.strip())
+    except ValueError:
+        return default
+
+
+def _as_float(value: str | None, *, default: float) -> float:
+    if value is None:
+        return default
+    try:
+        return float(value.strip())
     except ValueError:
         return default

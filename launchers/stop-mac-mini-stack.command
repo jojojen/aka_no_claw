@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+AKA_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPUTATION_DIR="${WORKSPACE_DIR}/reputation_snapshot"
+AKA_VENV="${AKA_DIR}/.venv"
+PID_FILE="${AKA_DIR}/run/mac-mini-stack.pid"
+LAUNCHCTL_LABELS=(local.openclaw.ollama local.openclaw.reputation local.openclaw.telegram local.openclaw.opportunity)
+
+stop_launchctl_jobs() {
+  if ! command -v launchctl >/dev/null 2>&1; then
+    return
+  fi
+  for label in "${LAUNCHCTL_LABELS[@]}"; do
+    if launchctl print "gui/$(id -u)/${label}" >/dev/null 2>&1; then
+      printf '[mac-mini-stack] Stopping launchctl job %s\n' "${label}"
+      launchctl remove "${label}" >/dev/null 2>&1 || true
+    fi
+  done
+}
+
+stop_orphaned_stack_processes() {
+  found=0
+  while read -r pid command_line; do
+    [[ -z "${pid}" || -z "${command_line}" ]] && continue
+    if [[ "${command_line}" == *"${REPUTATION_DIR}/.venv/bin/python"* && "${command_line}" == *"app.py"* ]]; then
+      found=1
+      printf '[mac-mini-stack] Stopping orphaned reputation_snapshot server PID %s\n' "${pid}"
+      kill "${pid}" >/dev/null 2>&1 || true
+    elif [[ "${command_line}" == *"${AKA_VENV}/bin/python"* && "${command_line}" == *"openclaw_adapter"* ]]; then
+      found=1
+      printf '[mac-mini-stack] Stopping orphaned OpenClaw process PID %s\n' "${pid}"
+      kill "${pid}" >/dev/null 2>&1 || true
+    fi
+  done < <(ps -eo pid=,command= 2>/dev/null || true)
+  if [[ "${found}" == "1" ]]; then
+    sleep 1
+  fi
+}
+
+stop_launchctl_jobs
+
+if [[ ! -f "${PID_FILE}" ]]; then
+  printf '[mac-mini-stack] No PID file found at %s\n' "${PID_FILE}"
+  stop_orphaned_stack_processes
+  exit 0
+fi
+
+while read -r pid; do
+  pid="${pid//$'\r'/}"
+  [[ -z "${pid}" ]] && continue
+  command_line="$(ps -p "${pid}" -o command= 2>/dev/null || true)"
+  if [[ -z "${command_line}" ]]; then
+    printf '[mac-mini-stack] Skipping stale PID %s\n' "${pid}"
+    continue
+  fi
+  if [[ "${command_line}" != *"${AKA_DIR}"* && "${command_line}" != *"${REPUTATION_DIR}"* && "${command_line}" != *"openclaw_adapter"* && "${command_line}" != *"ollama serve"* ]]; then
+    printf '[mac-mini-stack] Skipping stale or unrelated PID %s\n' "${pid}"
+    continue
+  fi
+  if kill -0 "${pid}" >/dev/null 2>&1; then
+    printf '[mac-mini-stack] Stopping PID %s\n' "${pid}"
+    kill "${pid}" >/dev/null 2>&1 || true
+  fi
+done < "${PID_FILE}"
+
+rm -f "${PID_FILE}"
+stop_orphaned_stack_processes
+printf '[mac-mini-stack] Stopped.\n'
