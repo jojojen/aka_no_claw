@@ -59,8 +59,6 @@ _SEARCH_QUERY_NOISE_REPLACEMENTS: tuple[tuple[str, str], ...] = (
 _UNSUPPORTED_FRANCHISE_MARKERS: tuple[str, ...] = (
     "デュエルマスターズ",
     "デュエマ",
-    "one piece card game",
-    "ワンピースカード",
     "ドラゴンボール",
     "magic: the gathering",
 )
@@ -552,10 +550,12 @@ class TcgFairValueChecker:
         if game is None:
             logger.info("Opportunity price skipped unsupported game=%s title=%s", candidate.game, candidate.title)
             return None
+        item_kind = "sealed_box" if candidate.product_type in ("sealed_box", "booster_pack") else "card"
         result = lookup_card(
             db_path=self._db_path,
             game=game,
             name=candidate.title,
+            item_kind=item_kind,
             persist=True,
         )
         if result.fair_value is None:
@@ -1285,6 +1285,7 @@ def _build_official_store_provider(*, ssl_context):
     from market_monitor.pokecen_preorder import PokemonCenterPreorderCrawler
     from market_monitor.ua_official_preorder import UaOfficialPreorderCrawler
     from market_monitor.amiami_preorder import AmiAmiPreorderCrawler
+    from market_monitor.bandai_onepiece_preorder import BandaiOnepiecePreorderCrawler
     from .official_store_provider import OfficialStoreCandidateProvider
 
     http_client = HttpClient(
@@ -1299,6 +1300,7 @@ def _build_official_store_provider(*, ssl_context):
         PokemonCenterPreorderCrawler(http_client=http_client),
         UaOfficialPreorderCrawler(http_client=http_client),
         AmiAmiPreorderCrawler(http_client=http_client),
+        BandaiOnepiecePreorderCrawler(http_client=http_client),
     ]
 
     collab_store = None
