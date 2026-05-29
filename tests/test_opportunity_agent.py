@@ -259,13 +259,13 @@ def test_parse_sns_candidate_response_rejects_unsupported_franchises() -> None:
         SnsPost(
             tweet_id="t1",
             author_handle="@source",
-            text="ONE PIECE CARD GAME 新カード",
+            text="デュエルマスターズ 新カード SR",
             created_at="2026-05-13T00:00:00+00:00",
             rule_label="tcg",
         )
     ]
     raw = """
-    {"candidates":[{"game":"pokemon","title":"ONE PIECE CARD GAME 新カード","search_query":"ONE PIECE CARD GAME 新カード","heat_score":88,"reason":"話題。","source_tweet_ids":["t1"]}]}
+    {"candidates":[{"game":"pokemon","title":"デュエルマスターズ 新カード SR","search_query":"デュエルマスターズ 新カード","heat_score":88,"reason":"話題。","source_tweet_ids":["t1"]}]}
     """
 
     candidates = _parse_candidate_response(raw, posts=posts, limit=5)
