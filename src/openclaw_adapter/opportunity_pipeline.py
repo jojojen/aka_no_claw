@@ -17,6 +17,8 @@ from .opportunity_store import OpportunityStore, recommendation_id_for
 
 logger = logging.getLogger(__name__)
 
+SEALED_BOX_MIN_PROFIT_PCT: float = 10.0  # skip official-store notifications below this return %
+
 
 class CandidateProvider(Protocol):
     def discover(self, *, limit: int) -> Sequence[OpportunityCandidate]:
@@ -149,7 +151,26 @@ class OpportunityPipeline:
 
         official_price = candidate.metadata.get("official_price_jpy")
         price_jpy = int(official_price) if official_price is not None else 0
-        fair_value_jpy = int(price_jpy * 1.3) if price_jpy else 1  # notional fair value > retail
+
+        sample_note: str | None = None
+        if price_jpy and candidate.product_type in ("sealed_box", "booster_pack"):
+            market = self._price_checker.check(candidate)
+            if market and market.fair_value_jpy > price_jpy:
+                discount_pct = (market.fair_value_jpy - price_jpy) / price_jpy * 100
+                if discount_pct < SEALED_BOX_MIN_PROFIT_PCT:
+                    logger.info(
+                        "Official store sealed box skipped — profit below threshold candidate=%s "
+                        "lottery=%d fair_value=%d pct=%.1f",
+                        candidate.title, price_jpy, market.fair_value_jpy, discount_pct,
+                    )
+                    return
+                fair_value_jpy = market.fair_value_jpy
+                sample_note = f"二手参考価格 ¥{market.fair_value_jpy:,}（{market.sample_count}件）"
+            else:
+                fair_value_jpy = int(price_jpy * 1.3)
+                sample_note = "二手市場資料不足，以定価 ×1.3 估算"
+        else:
+            fair_value_jpy = int(price_jpy * 1.3) if price_jpy else 1
 
         synthetic_listing = ListingOffer(
             listing_id=build_listing_key(official_url),
@@ -162,6 +183,7 @@ class OpportunityPipeline:
             fair_value_jpy=fair_value_jpy,
             confidence=0.9,
             sample_count=0,
+            notes=(sample_note,) if sample_note else (),
         )
         synthetic_reputation = ReputationCheck(
             listing_url=official_url,

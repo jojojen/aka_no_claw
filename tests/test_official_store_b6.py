@@ -184,10 +184,12 @@ def test_pipeline_notifies_official_store_once(tmp_path):
         def notify(self, recommendation):
             notified.append(recommendation.candidate.title)
 
+    mock_price_checker = MagicMock()
+    mock_price_checker.check.return_value = None  # no market data → fallback 1.3×
     pipeline = OpportunityPipeline(
         store=store,
         candidate_provider=MagicMock(),
-        price_checker=MagicMock(),
+        price_checker=mock_price_checker,
         listing_finder=MagicMock(),
         reputation_checker=MagicMock(),
         notifier=_MockNotifier(),
