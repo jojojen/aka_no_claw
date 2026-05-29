@@ -21,6 +21,7 @@ dist/
 
 # Local databases and runtime data
 data/*.sqlite3
+data/*.sqlite3.bak*
 data/*.db
 data/*.log
 !data/.gitkeep
