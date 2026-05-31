@@ -50,8 +50,10 @@ def test_record_upserts_same_hour(store):
 
 
 def test_record_different_hours_creates_two_rows(store):
-    dt1 = datetime(2026, 5, 24, 10, 0, tzinfo=timezone.utc)
-    dt2 = datetime(2026, 5, 24, 11, 0, tzinfo=timezone.utc)
+    from datetime import timedelta
+    now = datetime.now(timezone.utc)
+    dt1 = now - timedelta(hours=2)
+    dt2 = now - timedelta(hours=1)
     store.record(ip_canonical="ip_b", source="x_mention", value=100, measured_at=dt1)
     store.record(ip_canonical="ip_b", source="x_mention", value=200, measured_at=dt2)
     history = store.history("ip_b", "x_mention", days=7)
@@ -68,7 +70,7 @@ def test_percentile_first_record_is_100(store):
 
 def test_percentile_below_all_is_low(store):
     from datetime import timedelta
-    base = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    base = datetime.now(timezone.utc) - timedelta(days=15)
     for i in range(5):
         store.record(
             ip_canonical="ip_d", source="x_mention", value=1000 + i * 100,
@@ -88,7 +90,7 @@ def test_percentile_below_all_is_low(store):
 
 def test_percentile_top_value_is_100(store):
     from datetime import timedelta
-    base = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    base = datetime.now(timezone.utc) - timedelta(days=15)
     for i in range(5):
         store.record(
             ip_canonical="ip_e", source="x_mention", value=100 * (i + 1),
@@ -150,7 +152,7 @@ def test_top_hot_ips_filters_below_threshold(store):
     # (both are first records so both get 100 — but they're different IPs, independent)
     # Let's add more history to cold_ip to make it low percentile
     from datetime import timedelta
-    base = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    base = datetime.now(timezone.utc) - timedelta(days=15)
     for i in range(5):
         store.record(
             ip_canonical="cold_ip", source="x_mention", value=1000 + i * 200,
