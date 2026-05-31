@@ -27,6 +27,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from hashlib import sha1
@@ -40,6 +41,8 @@ ANSWER_START = "===ANSWER==="
 ANSWER_END = "===END==="
 _CODE_MARK = "===CODE==="
 _PLAN_MARK = "===PLAN==="
+_API_STRUCT_START = "===API_STRUCT==="
+_API_STRUCT_END = "===END_STRUCT==="
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 _FENCE_RE = re.compile(r"```(?:python)?\s*(.*?)```", re.DOTALL)
 _REQUIRES_RE = re.compile(r"^#\s*requires:\s*(.+)$", re.MULTILINE)
@@ -175,6 +178,11 @@ class DynamicToolRunner:
 
     def _generate_with_repair(self, request: str) -> DynamicToolResult:
         knowledge_rows = self._retrieve_knowledge(request)
+
+        # Phase 0: API exploration — run a tiny discovery script to capture actual
+        # field names from the real API response before writing the real tool.
+        api_structure = self._explore_api(request, knowledge_rows)
+
         slug = self._make_slug(request)
         tool_dir = self.tools_dir / slug
         tool_dir.mkdir(parents=True, exist_ok=True)
@@ -197,7 +205,8 @@ class DynamicToolRunner:
                 # extend the HTTP timeout to 1200s.
                 self.client.num_predict = None
                 self.client.timeout_seconds = max(self.client.timeout_seconds, 1200)
-            code = self._generate_code(request, knowledge_rows, think=think)
+            code = self._generate_code(request, knowledge_rows, think=think,
+                                       api_structure=api_structure)
             phase_gen = 1
             while True:
                 generations += 1
@@ -216,7 +225,8 @@ class DynamicToolRunner:
                 if phase_gen >= phase_max:
                     break
                 phase_gen += 1
-                code = self._repair_code(request, code, last_error, knowledge_rows, think=think)
+                code = self._repair_code(request, code, last_error, knowledge_rows,
+                                         think=think, api_structure=api_structure)
 
         return DynamicToolResult(
             ok=False, slug=slug, generations=generations,
@@ -338,18 +348,96 @@ class DynamicToolRunner:
 
     # ── model prompts ───────────────────────────────────────────────────────
 
-    def _generate_code(self, request: str, knowledge_rows: list, *, think: bool = False) -> str:
-        prompt = self._build_codegen_prompt(request, knowledge_rows)
+    def _explore_api(self, request: str, knowledge_rows: list) -> str | None:
+        """Phase 0: generate + run a tiny discovery script to capture actual API
+        field names. Returns the captured structure text, or None if exploration
+        fails / is not needed (pure-computation requests)."""
+        explorer_prompt = (
+            "你是 Python 工程師。請為以下需求寫一個「API 探索腳本」（不是最終工具）。\n"
+            "目的：呼叫相關 API 一次，把回傳的 JSON 欄位結構印出，供後續正式腳本使用正確欄位名。\n\n"
+            f"需求：{request}\n\n"
+            "規則：\n"
+            f'1. 若需求需要外部 API（天氣、股票、匯率等）：呼叫 API，然後：\n'
+            f'   print("{_API_STRUCT_START}")\n'
+            '   print(json.dumps(response, indent=2, ensure_ascii=False)[:1200])\n'
+            f'   print("{_API_STRUCT_END}")\n'
+            '2. 若需求是純計算（不需外部 API，資料已在 request 中）：只 print("NO_EXTERNAL_API")\n'
+            "3. 失敗時 sys.exit(1)；不要 ===ANSWER=== 標記；只用 stdlib+urllib（不要 # requires）。\n"
+            "推薦端點（依需求選擇）：\n"
+            "  天氣：wttr.in/{city}?format=j1 —— 直接接受城市名（city 須 urllib.parse.quote 編碼）\n"
+            "        勿使用 Nominatim / open-meteo（Nominatim 403、open-meteo 需座標）\n"
+            "  股票：Yahoo Finance chart API（https://query1.finance.yahoo.com/v8/finance/chart/...）\n"
+            "直接輸出 Python 程式碼，不加說明："
+        )
+        saved_np = self.client.num_predict
+        saved_to = self.client.timeout_seconds
+        try:
+            self.client.num_predict = 500
+            self.client.timeout_seconds = max(120, saved_to // 4)
+            raw = self.client.generate(explorer_prompt, temperature=0.0, think=False)
+            explorer_code = _extract_code(raw)
+        except Exception as exc:
+            logger.info("dynamic_tools: explorer generation failed: %s", exc)
+            return None
+        finally:
+            self.client.num_predict = saved_np
+            self.client.timeout_seconds = saved_to
+
+        if not explorer_code.strip():
+            return None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir) / "explorer.py"
+            tmp_path.write_text(explorer_code, encoding="utf-8")
+            try:
+                venv_python = self._ensure_venv()
+                env = self._clean_env(Path(tmpdir))
+                proc = subprocess.run(
+                    [str(venv_python), str(tmp_path)],
+                    shell=False, cwd=tmpdir, timeout=35,
+                    capture_output=True, text=True, env=env,
+                )
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                logger.info("dynamic_tools: explorer execution failed: %s", exc)
+                return None
+
+            stdout = proc.stdout or ""
+            if "NO_EXTERNAL_API" in stdout:
+                logger.info("dynamic_tools: explorer says NO_EXTERNAL_API, skipping injection")
+                return None
+            if proc.returncode != 0 or _API_STRUCT_START not in stdout:
+                logger.info("dynamic_tools: explorer produced no struct (rc=%d, stderr=%s)",
+                            proc.returncode, _tail(proc.stderr or "", 200))
+                return None
+
+            struct = _extract_api_struct(stdout)
+            if struct:
+                logger.info("dynamic_tools: captured API structure (%d chars)", len(struct))
+                return struct
+        return None
+
+    def _generate_code(self, request: str, knowledge_rows: list, *, think: bool = False,
+                       api_structure: str | None = None) -> str:
+        prompt = self._build_codegen_prompt(request, knowledge_rows, api_structure=api_structure)
         response = self.client.generate(prompt, temperature=0.0, think=think)
         return _extract_code(response)
 
-    def _repair_code(self, request: str, code: str, error: str, knowledge_rows: list, *, think: bool = False) -> str:
+    def _repair_code(self, request: str, code: str, error: str, knowledge_rows: list, *,
+                     think: bool = False, api_structure: str | None = None) -> str:
         today = date.today().isoformat()
+        api_block = ""
+        if api_structure:
+            api_block = (
+                "\n<API實際回傳結構（請務必使用這些真實欄位名）>\n"
+                + api_structure
+                + "\n</API實際回傳結構>\n"
+            )
         prompt = (
             "你先前寫的 Python 腳本執行失敗，請修正後重寫整支腳本。\n\n"
             f"今天日期：{today}\n"
-            f"原始需求：{request}\n\n"
-            f"前一版原始碼：\n{code}\n\n"
+            f"原始需求：{request}\n"
+            + api_block
+            + f"\n前一版原始碼：\n{code}\n\n"
             f"執行錯誤/stderr：\n{_tail(error, 800)}\n\n"
             + self._rules_block(knowledge_rows)
             + "\n請重新輸出，先 " + _PLAN_MARK + " 再 " + _CODE_MARK
@@ -358,13 +446,22 @@ class DynamicToolRunner:
         response = self.client.generate(prompt, temperature=0.0, think=think)
         return _extract_code(response)
 
-    def _build_codegen_prompt(self, request: str, knowledge_rows: list) -> str:
+    def _build_codegen_prompt(self, request: str, knowledge_rows: list,
+                              api_structure: str | None = None) -> str:
         today = date.today().isoformat()
+        api_block = ""
+        if api_structure:
+            api_block = (
+                "\n<API實際回傳結構（以下是真實 API 回傳的欄位名稱，請務必使用，不要自創或猜測）>\n"
+                + api_structure
+                + "\n</API實際回傳結構>\n"
+            )
         return (
             "你是資深 Python 工程師。請為以下需求寫一支「單檔、可獨立執行」的 Python 3 腳本。\n\n"
             f"今天日期：{today}\n"
-            f"需求：{request}\n\n"
-            + self._rules_block(knowledge_rows)
+            f"需求：{request}\n"
+            + api_block
+            + "\n" + self._rules_block(knowledge_rows)
             + "\n請**先**輸出簡短 PLAN（資料源、會遇到的 edge case、輸出格式），再輸出完整程式碼，"
             "格式嚴格如下：\n"
             + _PLAN_MARK + "\n<你的計畫>\n" + _CODE_MARK + "\n<完整 python 程式碼>\n\n"
@@ -379,6 +476,17 @@ class DynamicToolRunner:
             "可用環境：Python 3 標準函式庫；需要第三方套件時，在檔案最上方用註解列出，"
             "例如：# requires: yfinance（會自動 pip install 到專屬 venv）。\n"
             "優先使用標準函式庫 urllib + 公開 JSON API 以減少相依與加快執行。\n\n"
+            "天氣查詢 → 使用 wttr.in（直接接受城市名，無需座標，免 API key）：\n"
+            "  import urllib.parse\n"
+            "  city_enc = urllib.parse.quote(city_name, safe='')\n"
+            "  url = f'https://wttr.in/{city_enc}?format=j1'\n"
+            "  # 帶 User-Agent header 避免 403\n"
+            "  req = urllib.request.Request(url, headers={'User-Agent': 'WeatherBot/1.0'})\n"
+            "  回傳結構：current_condition[0].temp_C（現在氣溫），\n"
+            "    weather[0].maxtempC / weather[0].mintempC（今日最高/最低），\n"
+            "    weather[0].hourly 各時段 chanceofrain → max() 取最高降雨機率，\n"
+            "    current_condition[0].weatherDesc[0].value（天氣描述文字）\n"
+            "  ⚠️ 勿使用 Nominatim（403 Forbidden）＋open-meteo 的二段式流程。\n\n"
             "Yahoo Finance chart API（台股/美股日線都可用，務必帶 User-Agent header）：\n"
             "  GET https://query1.finance.yahoo.com/v8/finance/chart/<symbol>"
             "?period1=<unix_ts>&period2=<unix_ts>&interval=1d&events=div\n"
@@ -578,6 +686,15 @@ def _load_json_object(raw: str) -> dict | None:
             return obj if isinstance(obj, dict) else None
         except ValueError:
             return None
+
+
+def _extract_api_struct(stdout: str) -> str:
+    if _API_STRUCT_START not in stdout:
+        return ""
+    after = stdout.split(_API_STRUCT_START, 1)[1]
+    if _API_STRUCT_END in after:
+        after = after.split(_API_STRUCT_END, 1)[0]
+    return after.strip()
 
 
 def _tail(text: str, limit: int) -> str:
