@@ -21,6 +21,7 @@ Pipeline (see DynamicToolRunner.run_detailed):
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import os
@@ -41,6 +42,7 @@ ANSWER_START = "===ANSWER==="
 ANSWER_END = "===END==="
 _CODE_MARK = "===CODE==="
 _PLAN_MARK = "===PLAN==="
+_META_MARK = "===META==="
 _API_STRUCT_START = "===API_STRUCT==="
 _API_STRUCT_END = "===END_STRUCT==="
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
@@ -50,6 +52,38 @@ _MODULE_NOT_FOUND_RE = re.compile(r"ModuleNotFoundError: No module named ['\"]([
 # Safe environment variables passed through to generated scripts. Everything
 # else (notably all OPENCLAW_* secrets and tokens) is stripped.
 _SAFE_ENV_KEYS = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR")
+
+# Lever 2: syntax gate. Pre-check code with ast.parse before paying for a full
+# subprocess run. Syntax-only repairs don't burn a generation (like the
+# ModuleNotFound auto-install special case).
+_MAX_SYNTAX_FIXES = 2
+# Lever 1: when truncation is detected, bump the Phase-1 num_predict cap and
+# regenerate rather than wasting a repair on half-written code.
+_NUM_PREDICT_BUMP = 3000
+# Truncation signatures: the model's output was cut mid-statement, so ast.parse
+# reports an unexpected end-of-file / unterminated construct.
+_TRUNCATION_MARKERS = (
+    "unexpected eof",
+    "unterminated",
+    "was never closed",
+    "expected an indented block",
+    "eof in multi-line",
+)
+
+
+def _syntax_error(code: str) -> str:
+    """Return a one-line SyntaxError description, or "" if the code parses."""
+    try:
+        ast.parse(code)
+    except SyntaxError as exc:
+        line = exc.lineno if exc.lineno is not None else "?"
+        return f"{exc.msg} (line {line})"
+    return ""
+
+
+def _is_truncation_error(msg: str) -> bool:
+    low = msg.lower()
+    return any(marker in low for marker in _TRUNCATION_MARKERS)
 
 
 def _utc_now_iso() -> str:
@@ -131,6 +165,7 @@ class DynamicToolRunner:
         exec_timeout_seconds: int = 90,
         max_repairs: int = 3,
         base_python: str | None = None,
+        distill_enabled: bool = False,
     ) -> None:
         self.client = client
         self.tools_dir = Path(tools_dir)
@@ -138,6 +173,11 @@ class DynamicToolRunner:
         self.exec_timeout_seconds = exec_timeout_seconds
         self.max_repairs = max_repairs
         self.base_python = base_python or sys.executable
+        # Auto-distillation writes the LOCAL model's own abstracted rules into the
+        # RAG. Off by default — the user wants Claude-taught/seed rules only.
+        self.distill_enabled = distill_enabled
+        # Last codegen META block (tool_type + param_schema), parsed per generation.
+        self._last_meta: dict | None = None
         self.tools_dir.mkdir(parents=True, exist_ok=True)
 
     # ── public ──────────────────────────────────────────────────────────────
@@ -159,20 +199,66 @@ class DynamicToolRunner:
 
     def run_detailed(self, request: str) -> DynamicToolResult:
         req = request.strip()
-        reused = self._pick_reusable(req)
-        if reused is not None:
-            slug = reused["slug"]
-            tool_path = self.tools_dir / slug / "tool.py"
-            if tool_path.exists():
-                logger.info("dynamic_tools: reusing slug=%s for request=%s", slug, req[:80])
-                code = tool_path.read_text(encoding="utf-8")
-                exec_result = self._install_and_execute(slug, tool_path, code)
-                if exec_result.ok:
-                    exec_result.reused = True
-                    return exec_result
-                logger.info("dynamic_tools: reuse failed, regenerating slug=%s", slug)
-
+        match = self._pick_reusable(req)
+        if match is not None:
+            reused = self._reuse(match, req)
+            if reused is not None and reused.ok:
+                return reused
+            logger.info("dynamic_tools: reuse failed, regenerating slug=%s", match.get("slug"))
         return self._generate_with_repair(req)
+
+    def _reuse(self, entry: dict, request: str) -> DynamicToolResult | None:
+        """Run an existing tool for a new request. For parameterized tools
+        (entry has param_schema) we extract fresh params from the request and
+        write params.json before running — so the same tool serves any same-type
+        question without regeneration. Legacy tools (no schema) run as-is."""
+        slug = entry.get("slug", "")
+        tool_path = self.tools_dir / slug / "tool.py"
+        if not tool_path.exists():
+            return None
+        schema = entry.get("param_schema")
+        if schema:
+            params = self._extract_params(schema, request)
+            if not params:
+                logger.info("dynamic_tools: param extraction failed for slug=%s, regenerating", slug)
+                return None
+            (self.tools_dir / slug / "params.json").write_text(
+                json.dumps(params, ensure_ascii=False), encoding="utf-8"
+            )
+            logger.info("dynamic_tools: reusing slug=%s with injected params=%s", slug, params)
+        else:
+            logger.info("dynamic_tools: reusing legacy slug=%s as-is for request=%s", slug, request[:80])
+        code = tool_path.read_text(encoding="utf-8")
+        result = self._install_and_execute(slug, tool_path, code)
+        if result.ok:
+            result.reused = True
+            return result
+        return None
+
+    def _extract_params(self, schema: list, request: str) -> dict | None:
+        """Ask the model to pull concrete parameter values out of the request,
+        constrained to the tool's declared param_schema. Returns {} -> None."""
+        names = [s.get("name") for s in schema if isinstance(s, dict) and s.get("name")]
+        if not names:
+            return None
+        prompt = (
+            "從下列需求中抽取參數值，只輸出一個 JSON 物件（key 為參數名，value 為數值或字串）。\n"
+            "參數定義（name/type/說明）：\n"
+            + json.dumps(schema, ensure_ascii=False)
+            + f"\n\n需求：{request}\n\n"
+            "規則：只輸出 JSON，不要任何解說；數值用純數字（不要逗號、不要單位）；"
+            "找不到的參數就省略該 key。"
+        )
+        try:
+            raw = self.client.generate(prompt, temperature=0.0)
+        except Exception:
+            logger.exception("dynamic_tools: param extraction call failed")
+            return None
+        data = _load_json_object(raw)
+        if not data:
+            return None
+        clean = {k: v for k, v in data.items() if k in names}
+        return clean or None
 
     # ── generation + self-repair ────────────────────────────────────────────
 
@@ -192,46 +278,95 @@ class DynamicToolRunner:
         last_error = ""
         last_stdout = ""
 
-        # Phase 1: think=False (fast).  Phase 2: think=True (escalation, 1 try).
-        for phase, think, phase_max in (
-            (1, False, self.max_repairs),
-            (2, True,  1),
-        ):
-            if phase == 2:
-                logger.info(
-                    "dynamic_tools: escalating to think=True for request=%s", request[:80]
-                )
-                # Think mode generates longer output; remove the num_predict cap and
-                # extend the HTTP timeout to 1200s.
-                self.client.num_predict = None
-                self.client.timeout_seconds = max(self.client.timeout_seconds, 1200)
-            code = self._generate_code(request, knowledge_rows, think=think,
-                                       api_structure=api_structure)
-            phase_gen = 1
-            while True:
-                generations += 1
-                tool_path.write_text(code, encoding="utf-8")
-                exec_result = self._install_and_execute(slug, tool_path, code)
-                last_stdout = exec_result.raw_stdout
-                if exec_result.ok:
-                    exec_result.slug = slug
-                    exec_result.generations = generations
-                    self._register_manifest(slug, request, code, self._parse_requires(code))
-                    if generations >= 2:
-                        self._distill_failure(request, code, last_error)
-                    self._mark_knowledge_applied(knowledge_rows)
-                    return exec_result
-                last_error = exec_result.error
-                if phase_gen >= phase_max:
-                    break
-                phase_gen += 1
-                code = self._repair_code(request, code, last_error, knowledge_rows,
-                                         think=think, api_structure=api_structure)
+        # The escalation path mutates client.num_predict / timeout; the syntax
+        # gate may also bump num_predict. Save and restore so a complex request
+        # doesn't leak a relaxed cap into the next, unrelated request.
+        saved_num_predict = self.client.num_predict
+        saved_timeout = self.client.timeout_seconds
+        try:
+            # Phase 1: think=False (fast).  Phase 2: think=True (escalation, 1 try).
+            for phase, think, phase_max in (
+                (1, False, self.max_repairs),
+                (2, True,  1),
+            ):
+                if phase == 2:
+                    logger.info(
+                        "dynamic_tools: escalating to think=True for request=%s", request[:80]
+                    )
+                    # Think mode generates longer output; remove the num_predict cap and
+                    # extend the HTTP timeout to 1200s.
+                    self.client.num_predict = None
+                    self.client.timeout_seconds = max(self.client.timeout_seconds, 1200)
+                code = self._generate_code(request, knowledge_rows, think=think,
+                                           api_structure=api_structure)
+                code = self._pass_syntax_gate(request, code, knowledge_rows,
+                                              think=think, api_structure=api_structure, phase=phase)
+                phase_gen = 1
+                while True:
+                    generations += 1
+                    tool_path.write_text(code, encoding="utf-8")
+                    exec_result = self._install_and_execute(slug, tool_path, code)
+                    last_stdout = exec_result.raw_stdout
+                    if exec_result.ok:
+                        exec_result.slug = slug
+                        exec_result.generations = generations
+                        meta = self._last_meta or {}
+                        self._register_manifest(
+                            slug, request, code, self._parse_requires(code),
+                            tool_type=meta.get("tool_type"),
+                            param_schema=meta.get("param_schema"),
+                        )
+                        if generations >= 2 and self.distill_enabled:
+                            self._distill_failure(request, code, last_error)
+                        self._mark_knowledge_applied(knowledge_rows)
+                        return exec_result
+                    last_error = exec_result.error
+                    if phase_gen >= phase_max:
+                        break
+                    phase_gen += 1
+                    code = self._repair_code(request, code, last_error, knowledge_rows,
+                                             think=think, api_structure=api_structure)
+                    code = self._pass_syntax_gate(request, code, knowledge_rows,
+                                                  think=think, api_structure=api_structure, phase=phase)
 
-        return DynamicToolResult(
-            ok=False, slug=slug, generations=generations,
-            error=_tail(last_error, 600), raw_stdout=last_stdout,
-        )
+            return DynamicToolResult(
+                ok=False, slug=slug, generations=generations,
+                error=_tail(last_error, 600), raw_stdout=last_stdout,
+            )
+        finally:
+            self.client.num_predict = saved_num_predict
+            self.client.timeout_seconds = saved_timeout
+
+    def _pass_syntax_gate(
+        self, request: str, code: str, knowledge_rows, *,
+        think: bool, api_structure: str | None, phase: int,
+    ) -> str:
+        """Lever 2: ast.parse the code before paying for a subprocess run.
+
+        Syntax-only repairs don't count as a generation. Lever 1: if the failure
+        looks like truncation (output cut mid-statement) and we're in the capped
+        Phase 1, bump num_predict and regenerate from scratch instead of trying
+        to "repair" half-written code.
+        """
+        for _ in range(_MAX_SYNTAX_FIXES):
+            err = _syntax_error(code)
+            if not err:
+                return code
+            logger.info("dynamic_tools: syntax gate caught: %s", err)
+            if (phase == 1 and _is_truncation_error(err)
+                    and self.client.num_predict is not None
+                    and self.client.num_predict < _NUM_PREDICT_BUMP):
+                logger.info(
+                    "dynamic_tools: truncation detected, bumping num_predict %s->%s and regenerating",
+                    self.client.num_predict, _NUM_PREDICT_BUMP,
+                )
+                self.client.num_predict = _NUM_PREDICT_BUMP
+                code = self._generate_code(request, knowledge_rows, think=think,
+                                           api_structure=api_structure)
+                continue
+            code = self._repair_code(request, code, f"SyntaxError: {err}", knowledge_rows,
+                                     think=think, api_structure=api_structure)
+        return code
 
     def _install_and_execute(self, slug: str, tool_path: Path, code: str) -> DynamicToolResult:
         """Install declared requires, execute, with one extra retry purely for an
@@ -420,6 +555,7 @@ class DynamicToolRunner:
                        api_structure: str | None = None) -> str:
         prompt = self._build_codegen_prompt(request, knowledge_rows, api_structure=api_structure)
         response = self.client.generate(prompt, temperature=0.0, think=think)
+        self._last_meta = _extract_meta(response)
         return _extract_code(response)
 
     def _repair_code(self, request: str, code: str, error: str, knowledge_rows: list, *,
@@ -440,10 +576,13 @@ class DynamicToolRunner:
             + f"\n前一版原始碼：\n{code}\n\n"
             f"執行錯誤/stderr：\n{_tail(error, 800)}\n\n"
             + self._rules_block(knowledge_rows)
-            + "\n請重新輸出，先 " + _PLAN_MARK + " 再 " + _CODE_MARK
-            + "，CODE 區塊是完整可獨立執行的 python，不要加 markdown 圍欄。"
+            + "\n請重新輸出三段：" + _PLAN_MARK + "、" + _META_MARK + "（tool_type+param_schema 的合法 JSON）、"
+            + _CODE_MARK + "。CODE 區塊是完整可獨立執行的 python，不要加 markdown 圍欄。"
         )
         response = self.client.generate(prompt, temperature=0.0, think=think)
+        new_meta = _extract_meta(response)
+        if new_meta:
+            self._last_meta = new_meta
         return _extract_code(response)
 
     def _build_codegen_prompt(self, request: str, knowledge_rows: list,
@@ -462,10 +601,14 @@ class DynamicToolRunner:
             f"需求：{request}\n"
             + api_block
             + "\n" + self._rules_block(knowledge_rows)
-            + "\n請**先**輸出簡短 PLAN（資料源、會遇到的 edge case、輸出格式），再輸出完整程式碼，"
-            "格式嚴格如下：\n"
-            + _PLAN_MARK + "\n<你的計畫>\n" + _CODE_MARK + "\n<完整 python 程式碼>\n\n"
-            "只輸出上述內容；CODE 區塊不要加 markdown 圍欄、不要其他解說。"
+            + "\n請依序輸出三段，格式嚴格如下：\n"
+            + _PLAN_MARK + "\n<簡短計畫：資料源、edge case、輸出格式、有哪些可被替換的輸入參數>\n"
+            + _META_MARK + "\n"
+            '{"tool_type": "<這支工具的抽象功能類型，例如：房貸等額本息月供、年金終值、城市天氣查詢>", '
+            '"param_schema": [{"name": "<與程式裡 DEFAULTS 的 key 完全一致>", '
+            '"type": "number|string", "desc": "<說明>"}]}\n'
+            + _CODE_MARK + "\n<完整 python 程式碼>\n\n"
+            "只輸出上述三段；META 必須是合法 JSON；CODE 區塊不要加 markdown 圍欄、不要其他解說。"
         )
 
     def _rules_block(self, knowledge_rows: list) -> str:
@@ -502,8 +645,25 @@ class DynamicToolRunner:
             "    start_price, end_price = prices[0], prices[-1]\n"
             "  千萬不要直接用 raw_prices[0] 或 raw_prices[-1]，那可能是 None。\n\n"
             "<代碼開發方法論>\n" + methodology + "\n</代碼開發方法論>\n\n"
+            "參數化（重要——讓工具能被重用）：\n"
+            "  把需求中『可替換的輸入值』（金額、利率、年期、城市、股票代碼、日期、清單資料等）"
+            "做成參數，不要散落寫死在計算式裡。在程式開頭這樣寫：\n"
+            "    import json, os\n"
+            "    DEFAULTS = {  # 本次需求的實際值\n"
+            "        # 例：'total_price': 10000000, 'down_payment': 4000000, 'annual_rate': 0.03, 'years': 20\n"
+            "    }\n"
+            "    params = dict(DEFAULTS)\n"
+            "    if os.path.exists('params.json'):\n"
+            "        params.update(json.load(open('params.json', encoding='utf-8')))\n"
+            "  之後所有計算都用 params[...]；不要再用字面值。\n"
+            "  META 的 param_schema 每個 name 必須與 DEFAULTS 的 key 完全一致。\n"
+            "  連『計算依據／計算方式』那句說明也必須用 f-string 帶入 params[...] 的實際值，"
+            "嚴禁把數字寫死在說明字串裡（例如不可寫『年利率3.5%、25年期』這種字面字串——"
+            "工具被重用換參數後那句會變成謊話；要寫成 "
+            "f\"年利率{params['annual_rate']*100}%、{params['years']}年期\"）。\n\n"
             "硬性規則：\n"
-            "1. 不可讀取任何祕密環境變數（OPENCLAW_*、API token 等）。\n"
+            "1. 不可讀取任何祕密環境變數（OPENCLAW_*、API token 等）；"
+            "讀取同目錄的 params.json 是允許且必要的（那不是祕密）。\n"
             "2. 不可刪除檔案、不可開 shell/subprocess。\n"
             f"3. 成功時最終答案必須印在標記之間：先 print(\"{ANSWER_START}\")，"
             f"接著 print 人類可讀答案（含數值與一句『怎麼算的』），最後 print(\"{ANSWER_END}\")。\n"
@@ -533,9 +693,10 @@ class DynamicToolRunner:
             json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
-    def _register_manifest(self, slug: str, request: str, code: str, requires: tuple[str, ...]) -> None:
+    def _register_manifest(self, slug: str, request: str, code: str, requires: tuple[str, ...],
+                           *, tool_type: str | None = None, param_schema: list | None = None) -> None:
         entries = [e for e in self._load_manifest() if e.get("slug") != slug]
-        entries.append({
+        entry = {
             "id": sha1(slug.encode("utf-8")).hexdigest()[:12],
             "slug": slug,
             "request": request,
@@ -543,35 +704,82 @@ class DynamicToolRunner:
             "requires": list(requires),
             "created_at": _utc_now_iso(),
             "path": str((self.tools_dir / slug / "tool.py").relative_to(self.tools_dir)),
-        })
+        }
+        if not (isinstance(param_schema, list) and param_schema):
+            param_schema = _defaults_schema_from_code(code)  # META unreliable → read code
+        if isinstance(param_schema, list) and param_schema:
+            entry["param_schema"] = param_schema
+            # A parameterized tool must carry a tool_type so it can be matched for
+            # reuse; if META omitted one, derive a stable label from its key shape.
+            if not tool_type:
+                tool_type = "params(" + ",".join(p["name"] for p in param_schema) + ")"
+        if tool_type:
+            entry["tool_type"] = str(tool_type)
+        entries.append(entry)
         self._save_manifest(entries)
 
     def _pick_reusable(self, request: str) -> dict | None:
+        """Decide which existing tool (if any) to reuse.
+
+        Two reliable stages instead of one flaky id-picker:
+          1. Deterministic short-circuit: identical request (whitespace/case
+             normalized) → reuse that exact tool, zero model calls.
+          2. Parameterized tools: classify the request into one of the existing
+             *tool_type* labels (a small single-choice task the local model
+             handles far more reliably than picking an id from a noisy catalog).
+             Legacy hardcoded tools (no param_schema) are only reused via stage 1,
+             since running them with different numbers would give a wrong answer.
+        """
         entries = self._load_manifest()
         if not entries:
             return None
-        catalog = "\n".join(
-            f"{i}. id={e.get('id')} | {e.get('description', '')}" for i, e in enumerate(entries)
+
+        norm_req = _normalize_request(request)
+        for e in entries:
+            if _normalize_request(e.get("request", "")) == norm_req:
+                logger.info("dynamic_tools: exact-match reuse slug=%s", e.get("slug"))
+                return e
+
+        param_entries = [e for e in entries if e.get("param_schema") and e.get("tool_type")]
+        if not param_entries:
+            return None
+        # One representative (newest) per tool_type, carrying an example request so
+        # the classifier matches on *function*, not on a fragile label that drifts
+        # between runs (e.g. "loan_calculator" vs "房貸等額本息月供計算").
+        rep: dict[str, dict] = {}
+        for e in sorted(param_entries, key=lambda x: x.get("created_at", "")):
+            rep[e["tool_type"]] = e  # later (newer) wins
+        candidates = [(t, _first_line(e.get("request", ""), 60)) for t, e in rep.items()]
+        choice = self._classify_tool_type(request, candidates)
+        if not choice:
+            return None
+        matches = [e for e in param_entries if e["tool_type"] == choice]
+        if not matches:
+            return None
+        return sorted(matches, key=lambda e: e.get("created_at", ""))[-1]
+
+    def _classify_tool_type(self, request: str, candidates: list[tuple[str, str]]) -> str | None:
+        listing = "\n".join(
+            f"{i + 1}. {t}（例如：{ex}）" for i, (t, ex) in enumerate(candidates)
         )
         prompt = (
-            "以下是既有工具清單。判斷是否有工具能『不修改程式碼』直接滿足新需求。\n"
-            "重用條件（全部符合才可回傳 id）：\n"
-            "  1. 功能類型完全一致（同樣的查詢目的）\n"
-            "  2. 所有具體參數完全相符——城市、股票代碼、日期範圍、任何專有名詞等\n"
-            "     若新需求指定的城市/標的/日期與工具不同，即使功能類似也必須回 NONE\n"
-            "若找到完全符合的，回覆該工具的 id（純文字）；否則回覆 NONE。只回 id 或 NONE。\n\n"
-            f"既有工具：\n{catalog}\n\n新需求：{request}\n"
+            "判斷下面的需求屬於哪一個既有『工具類型』。只有當需求的『功能』與某類型一致時"
+            "才選它（具體數值/城市/標的不同沒關係，會自動帶入新值）；用每項的範例判斷它的功能。"
+            "若都不符合就回 NEW。\n"
+            f"工具類型清單：\n{listing}\n\n需求：{request}\n\n"
+            "只回覆其中一個類型的完整名稱，或回 NEW。不要加任何解說。"
         )
         try:
-            answer = self.client.generate(prompt, temperature=0.0).strip()
+            ans = self.client.generate(prompt, temperature=0.0).strip()
         except Exception:
             return None
-        token = answer.split()[0].strip().strip(".") if answer else ""
-        if not token or token.upper() == "NONE":
+        ans = ans.splitlines()[0].strip() if ans else ""
+        if not ans or ans.upper() == "NEW":
             return None
-        for entry in entries:
-            if entry.get("id") == token:
-                return entry
+        types = [t for t, _ in candidates]
+        for t in types:
+            if ans == t or t in ans or ans in t:
+                return t
         return None
 
     # ── distillation ────────────────────────────────────────────────────────
@@ -649,6 +857,10 @@ def _is_safe_pkg(name: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._\-\[\]=<>]*", name))
 
 
+def _normalize_request(s: str) -> str:
+    return re.sub(r"\s+", "", (s or "")).strip().lower()
+
+
 def _extract_code(response: str) -> str:
     text = _THINK_RE.sub("", response or "").strip()
     if _CODE_MARK in text:
@@ -661,6 +873,52 @@ def _extract_code(response: str) -> str:
     # strip any stray leading marker lines
     code = code.replace(ANSWER_END, ANSWER_END)  # no-op keep
     return code.strip() + "\n"
+
+
+def _extract_meta(response: str) -> dict | None:
+    """Parse the ===META=== JSON block (tool_type + param_schema) if present."""
+    text = _THINK_RE.sub("", response or "")
+    if _META_MARK not in text:
+        return None
+    seg = text.split(_META_MARK, 1)[1]
+    if _CODE_MARK in seg:
+        seg = seg.split(_CODE_MARK, 1)[0]
+    return _load_json_object(seg)
+
+
+def _defaults_schema_from_code(code: str) -> list | None:
+    """Derive a param_schema from the tool's top-level ``DEFAULTS = {...}`` dict.
+
+    The model's ===META=== block is unreliable (it sometimes omits param_schema
+    entirely), but the parameterized code pattern always carries a literal
+    DEFAULTS dict. Reading the keys/types straight from the AST gives a
+    deterministic schema so any parameterized tool is reusable, regardless of
+    what the model did or didn't put in META.
+    """
+    try:
+        tree = ast.parse(code or "")
+    except SyntaxError:
+        return None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == "DEFAULTS" for t in node.targets):
+            continue
+        if not isinstance(node.value, ast.Dict):
+            return None
+        schema: list = []
+        for key_node, val_node in zip(node.value.keys, node.value.values):
+            if not isinstance(key_node, ast.Constant) or not isinstance(key_node.value, str):
+                continue
+            name = key_node.value
+            try:
+                val = ast.literal_eval(val_node)
+            except (ValueError, SyntaxError):
+                val = None
+            kind = "number" if isinstance(val, (int, float)) and not isinstance(val, bool) else "string"
+            schema.append({"name": name, "type": kind, "desc": name})
+        return schema or None
+    return None
 
 
 def _extract_answer(stdout: str) -> str:
