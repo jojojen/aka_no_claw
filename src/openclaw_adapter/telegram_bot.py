@@ -45,6 +45,7 @@ from price_monitor_bot.bot import (  # noqa: F401
 from price_monitor_bot.watch_monitor import ensure_monitor as _ensure_watch_monitor
 from tcg_tracker.image_lookup import TcgVisionSettings
 
+from .dynamic_tools import build_dynamic_tool_runner_from_settings
 from .knowledge_command import build_knowledge_handler
 from .natural_language import build_telegram_natural_language_router_from_settings
 from .opportunity_agent import (
@@ -370,6 +371,10 @@ def run_telegram_polling(
     research_renderer = default_web_research_renderer(settings)
     feedback_service = _build_feedback_service(watch_db)
     _start_card_image_crawler(watch_db)
+    dynamic_tool_runner = build_dynamic_tool_runner_from_settings(settings)
+    dynamic_tool_handler = (
+        (lambda req: dynamic_tool_runner.run(req)) if dynamic_tool_runner is not None else None
+    )
     return _base_run_telegram_polling(
         token=token,
         lookup_renderer=lookup_renderer,
@@ -392,6 +397,7 @@ def run_telegram_polling(
         opportunity_target_pinner=lambda name: pin_opportunity_target(settings, name),
         opportunity_target_unpinner=lambda selector: unpin_opportunity_target(settings, selector),
         knowledge_handler=build_knowledge_handler(settings),
+        dynamic_tool_handler=dynamic_tool_handler,
         watch_db=watch_db,
         sns_db=sns_db,
         sns_buzz_fn=sns_buzz_fn,
