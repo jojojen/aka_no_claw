@@ -14,6 +14,14 @@ The Telegram assistant can reach these tools:
   - Show the internal tool catalog.
   - Use when the user explicitly asks for all available tools or capabilities in catalog form.
 
+- `/new <request>`
+  - When no fixed tool covers a request, the bot uses the strongest local model
+    (qwen3:14b) to WRITE and run a one-off Python tool, reusing a prior generated
+    tool when one fits. Local-only, no paid API.
+  - Example: `/new 幫我查0050今年以來到5月的年化報酬`.
+  - This is an explicit command (handled before NL routing); a dedicated NL
+    intent is not yet wired.
+
 - `/price <game> <name>`
 - `/price <game> | <name> | <card_number> | <rarity> | <set_code>`
   - Look up the price/value of one card.

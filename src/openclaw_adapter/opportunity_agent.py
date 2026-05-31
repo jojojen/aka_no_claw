@@ -2133,6 +2133,7 @@ def _call_ollama_json(
         "prompt": prompt,
         "stream": False,
         "format": "json",
+        "think": False,  # disable qwen3 thinking mode; ignored by other models
         "options": {"temperature": 0, "num_predict": 700},
     }
     request = urllib.request.Request(
