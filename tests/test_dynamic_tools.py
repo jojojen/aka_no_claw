@@ -38,12 +38,16 @@ SECRET_PROBE = (
 class FakeClient:
     """Routes generate() by prompt markers to canned responses."""
 
-    def __init__(self, *, code_responses, pick_response="NONE", distill_response="{}"):
+    def __init__(self, *, code_responses, pick_response="NONE", distill_response="{}",
+                 explorer_response: str | None = None):
         self._code = list(code_responses)
         self._pick = pick_response
         self._distill = distill_response
-        self.calls = {"pick": 0, "code": 0, "repair": 0, "distill": 0}
+        # Default: declare no external API needed so exploration is a no-op in tests.
+        self._explorer = explorer_response if explorer_response is not None else 'print("NO_EXTERNAL_API")'
+        self.calls = {"pick": 0, "code": 0, "repair": 0, "distill": 0, "explore": 0}
         self.timeout_seconds = 420
+        self.num_predict = 1000  # mirrors OllamaTextClient attribute
 
     def generate(self, prompt: str, *, temperature: float = 0.0, think: bool = False) -> str:
         if "既有工具" in prompt:
@@ -52,6 +56,9 @@ class FakeClient:
         if "抽象成" in prompt:
             self.calls["distill"] += 1
             return self._distill
+        if "API 探索腳本" in prompt:
+            self.calls["explore"] += 1
+            return self._explorer
         if "執行失敗" in prompt:
             self.calls["repair"] += 1
         else:

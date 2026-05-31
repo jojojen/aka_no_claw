@@ -576,22 +576,49 @@ CODEGEN_SEED: tuple[dict, ...] = (
         "category": "data_fetch",
         "title": "天氣資料用免費免 API key 的端點",
         "technique": (
-            "查詢即時天氣（氣溫/濕度）不需 API key，兩個可靠端點：\n"
-            "【方法1 - wttr.in】url = 'https://wttr.in/台北?format=j1'\n"
-            "  d[\"current_condition\"][0][\"temp_C\"] → 攝氏；[\"humidity\"] → 濕度%\n"
-            "【方法2 - open-meteo（台北座標 25.04N/121.57E）】\n"
-            "  url = 'https://api.open-meteo.com/v1/forecast?"
-            "latitude=25.04&longitude=121.57"
-            "&current=temperature_2m,relative_humidity_2m,apparent_temperature"
-            "&timezone=Asia/Taipei'\n"
-            "  d[\"current\"][\"temperature_2m\"] → 攝氏；[\"relative_humidity_2m\"] → 濕度%；"
-            "[\"apparent_temperature\"] → 體感\n"
-            "絕對不要用假 placeholder token 呼叫需要授權的 API（如 CWA/氣象局）——"
-            "生成工具沒有合法 API key，呼叫必然失敗。優先用以上兩個免費端點。"
+            "查詢即時天氣不需 API key，兩個可靠端點：wttr.in 和 open-meteo.com。\n"
+            "wttr.in：url = https://wttr.in/<城市名>?format=j1，JSON 結構：current_condition[0]。\n"
+            "open-meteo：url = https://api.open-meteo.com/v1/forecast?"
+            "latitude=<緯度>&longitude=<經度>&current=<欄位>&daily=<欄位>&timezone=<時區>。\n"
+            "城市座標可用 nominatim.openstreetmap.org 或 geocode.maps.co 查詢，不要硬編碼。\n"
+            "絕對不要用假 placeholder token 呼叫需要授權的 API——生成工具沒有合法 API key。"
         ),
         "keywords": ["天氣", "氣溫", "濕度", "weather", "temperature", "humidity",
-                     "wttr", "open-meteo", "氣象", "台北", "taipei", "即時"],
+                     "wttr", "open-meteo", "氣象", "即時", "降雨", "forecast"],
         "confidence": 0.95,
+    },
+    {
+        "category": "data_fetch",
+        "title": "即時快照不能替代時間聚合——資料粒度語意合約",
+        "technique": (
+            "資料來源常有多種時間粒度：即時快照（current）vs 時間聚合（daily/weekly 的 max/min/avg）。"
+            "兩者語意不同、不可互換：\n"
+            "  即時快照：某一時刻的值（現在溫度、現在股價、現在 CPU 使用率）。\n"
+            "  時間聚合：一段時間內的統計（今日最高溫、日高低點、日成交量）。\n"
+            "常見錯誤：需要「今日最高/最低」時，用即時快照同時填入兩欄，"
+            "導致輸出「26°C – 26°C」或 high=low 這類明顯錯誤。\n"
+            "正確做法：輸出需要範圍（min–max）或聚合量時，找資料來源的 daily/aggregate 層；"
+            "不確定時先把頂層 key 印出來探索結構。\n"
+            "此原則適用於所有資料來源：天氣 API、金融 API、監控系統、資料庫查詢。"
+        ),
+        "keywords": ["current", "daily", "snapshot", "aggregate", "max", "min",
+                     "即時", "聚合", "粒度", "最高", "最低", "high", "low", "range"],
+        "confidence": 0.92,
+    },
+    {
+        "category": "data_fetch",
+        "title": "API 欄位名稱先探索再使用",
+        "technique": (
+            "使用第三方 REST API 時，不要靠猜測或記憶決定欄位名稱。正確做法：\n"
+            "1. 先用最小參數發一次探索請求，把回傳的 JSON key 印出來，確認實際欄位名稱後再寫完整邏輯。\n"
+            "2. 若 API 回傳錯誤（如「invalid field name」），仔細閱讀錯誤訊息——通常會直接告訴你問題欄位。\n"
+            "3. 聚合統計欄位（日最高/最低/累計）常有 _max / _min / _sum / _mean 後綴，和即時欄位不同；"
+            "找不到欄位時試加這些後綴。\n"
+            "4. 在正式查詢前加 assert 或 if key not in data: raise 提前捕捉欄位錯誤。"
+        ),
+        "keywords": ["api", "field", "key", "欄位", "json", "explore", "探索", "suffix",
+                     "_max", "_min", "error", "invalid"],
+        "confidence": 0.9,
     },
     {
         "category": "data_fetch",
