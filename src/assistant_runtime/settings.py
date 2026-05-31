@@ -35,6 +35,7 @@ class AssistantSettings:
     log_raw_result_limit: int = 20
     sns_db_path: str = "data/sns.sqlite3"
     knowledge_db_path: str = "data/knowledge.sqlite3"
+    openclaw_backup_dir: str = "/Volumes/JEN_SSD/claw_data"
     sns_classifier_enabled: bool = True
     sns_classifier_min_score: int = 60
     opportunity_agent_enabled: bool = False
@@ -127,6 +128,7 @@ def get_settings() -> AssistantSettings:
         log_raw_result_limit=_as_int(os.getenv("LOG_RAW_RESULT_LIMIT"), default=20),
         sns_db_path=os.getenv("SNS_DB_PATH", "data/sns.sqlite3"),
         knowledge_db_path=os.getenv("KNOWLEDGE_DB_PATH", "data/knowledge.sqlite3"),
+        openclaw_backup_dir=os.getenv("OPENCLAW_BACKUP_DIR", "/Volumes/JEN_SSD/claw_data"),
         sns_classifier_enabled=_as_bool(
             os.getenv("OPENCLAW_SNS_CLASSIFIER_ENABLED", "true")
         ),
