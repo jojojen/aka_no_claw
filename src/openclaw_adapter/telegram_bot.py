@@ -45,7 +45,7 @@ from price_monitor_bot.bot import (  # noqa: F401
 from price_monitor_bot.watch_monitor import ensure_monitor as _ensure_watch_monitor
 from tcg_tracker.image_lookup import TcgVisionSettings
 
-from .backup_command import build_backup_handler, build_recover_handler
+from .backup_command import BackupScheduler, build_backup_handler, build_recover_handler
 from .dynamic_tools import build_dynamic_tool_runner_from_settings
 from .knowledge_command import build_knowledge_handler
 from .natural_language import build_telegram_natural_language_router_from_settings
@@ -372,6 +372,7 @@ def run_telegram_polling(
     research_renderer = default_web_research_renderer(settings)
     feedback_service = _build_feedback_service(watch_db)
     _start_card_image_crawler(watch_db)
+    _start_backup_scheduler(settings)
     dynamic_tool_runner = build_dynamic_tool_runner_from_settings(settings)
     dynamic_tool_handler = (
         (lambda req: dynamic_tool_runner.run(req)) if dynamic_tool_runner is not None else None
@@ -420,6 +421,22 @@ def _build_feedback_service(watch_db: MonitorDatabase):
     except Exception:
         return None
     return TcgPriceFeedbackService(database=watch_db)
+
+
+def _start_backup_scheduler(settings) -> None:
+    """Start the periodic auto-backup daemon (every 6 h, 5 min initial delay)."""
+    data_dir = Path(settings.monitor_db_path).resolve().parent
+    project_root = data_dir.parent
+    generated_tools_dir = project_root / "generated_tools"
+    dest = Path(settings.openclaw_backup_dir)
+    interval_hours = getattr(settings, "openclaw_backup_interval_hours", 24)
+    scheduler = BackupScheduler(
+        data_dir=data_dir,
+        generated_tools_dir=generated_tools_dir if generated_tools_dir.is_dir() else None,
+        dest=dest,
+        interval_seconds=interval_hours * 3600.0,
+    )
+    scheduler.start()
 
 
 def _start_card_image_crawler(watch_db: MonitorDatabase):

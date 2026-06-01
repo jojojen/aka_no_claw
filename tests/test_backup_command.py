@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 from openclaw_adapter.backup_command import (
     DEFAULT_BACKUP_DIR,
+    BackupScheduler,
     build_backup_handler,
     build_recover_handler,
     run_backup,
@@ -195,3 +197,59 @@ def test_recover_handler_missing_source(tmp_path: Path) -> None:
 
     handler = build_recover_handler(_Settings())
     assert "備份來源不存在" in handler("")
+
+
+# ── BackupScheduler (A6) ────────────────────────────────────────────────────
+
+
+def test_backup_scheduler_skips_when_mount_missing(tmp_path: Path) -> None:
+    """_run_once must not call run_backup when dest parent is not mounted."""
+    dest = tmp_path / "no_such_volume" / "claw_data"
+    scheduler = BackupScheduler(
+        data_dir=tmp_path / "data",
+        generated_tools_dir=None,
+        dest=dest,
+    )
+    with patch("openclaw_adapter.backup_command.run_backup") as mock_backup:
+        scheduler._run_once()
+    mock_backup.assert_not_called()
+
+
+def test_backup_scheduler_runs_backup_when_mounted(tmp_path: Path) -> None:
+    """_run_once calls run_backup when dest parent exists."""
+    dest = tmp_path / "claw_data"
+    scheduler = BackupScheduler(
+        data_dir=tmp_path / "data",
+        generated_tools_dir=None,
+        dest=dest,
+    )
+    mock_report = MagicMock()
+    mock_report.errors = []
+    mock_report.databases = []
+    mock_report.total_db_bytes = 0
+    with patch("openclaw_adapter.backup_command.run_backup", return_value=mock_report) as mock_backup:
+        scheduler._run_once()
+    mock_backup.assert_called_once_with(
+        data_dir=tmp_path / "data",
+        generated_tools_dir=None,
+        dest=dest,
+    )
+
+
+def test_backup_scheduler_logs_warning_on_errors(tmp_path: Path) -> None:
+    """_run_once logs a warning (not exception) when run_backup returns errors."""
+    import logging
+    dest = tmp_path / "claw_data"
+    scheduler = BackupScheduler(
+        data_dir=tmp_path / "data",
+        generated_tools_dir=None,
+        dest=dest,
+    )
+    mock_report = MagicMock()
+    mock_report.errors = ["knowledge.sqlite3: disk full"]
+    mock_report.databases = []
+    mock_report.total_db_bytes = 0
+    with patch("openclaw_adapter.backup_command.run_backup", return_value=mock_report):
+        with patch("openclaw_adapter.backup_command.logger") as mock_logger:
+            scheduler._run_once()
+    mock_logger.warning.assert_called()
