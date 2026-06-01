@@ -497,6 +497,16 @@ class KnowledgeDatabase:
         """Idempotently insert the baseline abstract rules. Existing rows (by
         id) are left untouched unless seed confidence is higher. Returns count
         of seed rules processed."""
+        # Retire superseded seed rules so they stop being retrieved on every DB
+        # (seeding runs at each startup, so a renamed rule's old row must be
+        # explicitly deleted or it lingers forever with stale guidance).
+        for category, title in DEPRECATED_CODEGEN_SEED:
+            stale_id = build_codegen_knowledge_id(category=category, title=title)
+            with self.connect() as conn:
+                conn.execute(
+                    "DELETE FROM codegen_knowledge WHERE knowledge_id = ? AND origin = 'seed'",
+                    (stale_id,),
+                )
         for spec in CODEGEN_SEED:
             self.upsert_codegen_knowledge(
                 category=spec["category"],
@@ -546,6 +556,13 @@ def format_codegen_knowledge_block(rows: list[CodegenKnowledge], *, max_chars: i
 
 
 # Baseline abstract coding rules. All are entity-agnostic and transferable.
+# (category, title) of seed rules that have been renamed/superseded. Deleted at
+# seed time so their stale text stops being retrieved on already-populated DBs.
+DEPRECATED_CODEGEN_SEED: tuple[tuple[str, str], ...] = (
+    ("output_contract", "可變參數放腳本頂端，不要散落在程式碼中間"),
+)
+
+
 CODEGEN_SEED: tuple[dict, ...] = (
     {
         "category": "numeric_method",
@@ -670,19 +687,26 @@ CODEGEN_SEED: tuple[dict, ...] = (
     },
     {
         "category": "output_contract",
-        "title": "可變參數放腳本頂端，不要散落在程式碼中間",
+        "title": "可變參數放頂端 DEFAULTS 並讓輸出標的跟著參數走",
         "technique": (
-            "若請求涉及特定城市、股票代碼、日期、金額等可能隨新需求改變的參數，"
-            "把這些值定義在腳本最頂端的常數區（緊接在 import 之後）：\n"
-            "  CITY = \"台北\"       # ← 一眼就能看到\n"
-            "  TICKER = \"0050.TW\"\n"
-            "  START_DATE = \"2026-01-01\"\n"
-            "理由：(1) 重用判斷時閱讀者馬上看到工具的具體參數；"
-            "(2) 避免把「查台北天氣」的工具誤用於「查東京天氣」。\n"
-            "重要：頂端有常數不代表可以共用——不同城市/股票必須生成新工具。"
+            "若請求涉及特定城市、股票代碼、日期、金額等可能隨新需求改變的值，"
+            "把它們收進腳本頂端的 DEFAULTS dict（緊接 import 之後），並讀 params.json 覆寫：\n"
+            "  DEFAULTS = {'city': '台北'}\n"
+            "  params = dict(DEFAULTS)\n"
+            "  import os, json\n"
+            "  if os.path.exists('params.json'): params.update(json.load(open('params.json', encoding='utf-8')))\n"
+            "這樣同一支工具換個 params.json 就能服務不同城市/股票——這正是工具重用的機制，"
+            "不需要為每個城市另生成新工具。\n"
+            "關鍵：不只計算要用 params[...]，連『輸出文字裡的標的名稱』也必須用 params[...] 帶入。\n"
+            "  ❌ DEFAULTS={'city':'Paris'} 卻 print(f\"巴黎氣溫{t}°C\")："
+            "重用查倫敦時數據變了、標籤還是巴黎，答非所問。\n"
+            "  ✅ print(f\"{params['city']}氣溫{t}°C\")：標的與資料同源，重用永遠一致。\n"
+            "注意字面陷阱：DEFAULTS 存的英文 'Paris' 與輸出寫死的中文『巴黎』不會被字串比對抓到，"
+            "唯一可靠做法就是輸出一律 echo params[...]，不要自己另寫標的字面值。"
         ),
-        "keywords": ["參數", "常數", "城市", "city", "ticker", "頂端", "constant", "硬編碼"],
-        "confidence": 0.85,
+        "keywords": ["參數", "常數", "城市", "city", "ticker", "頂端", "constant", "硬編碼",
+                     "重用", "reuse", "標的", "params", "答非所問", "輸出"],
+        "confidence": 0.92,
     },
     {
         "category": "output_contract",

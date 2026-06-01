@@ -23,6 +23,9 @@ class AssistantSettings:
     openclaw_local_text_backend: str | None = None
     openclaw_local_text_endpoint: str = "http://127.0.0.1:11434"
     openclaw_local_text_model: str | None = None
+    # Fast, code-specialized tier-1 model for /new codegen. Escalates to the
+    # (larger) openclaw_local_text_model only when this tier exhausts repairs.
+    openclaw_codegen_fast_model: str | None = "qwen2.5-coder:7b"
     openclaw_local_text_timeout_seconds: int = 45
     openclaw_ca_bundle_path: str | None = None
     openclaw_tls_insecure_skip_verify: bool = False
@@ -111,6 +114,9 @@ def get_settings() -> AssistantSettings:
         openclaw_local_text_backend=_none_if_empty(os.getenv("OPENCLAW_LOCAL_TEXT_BACKEND")),
         openclaw_local_text_endpoint=os.getenv("OPENCLAW_LOCAL_TEXT_ENDPOINT", "http://127.0.0.1:11434"),
         openclaw_local_text_model=_none_if_empty(os.getenv("OPENCLAW_LOCAL_TEXT_MODEL")),
+        openclaw_codegen_fast_model=_none_if_empty(
+            os.getenv("OPENCLAW_CODEGEN_FAST_MODEL", "qwen2.5-coder:7b")
+        ),
         openclaw_local_text_timeout_seconds=_as_int(
             os.getenv("OPENCLAW_LOCAL_TEXT_TIMEOUT_SECONDS"),
             default=45,

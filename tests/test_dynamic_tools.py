@@ -20,6 +20,7 @@ from openclaw_adapter.dynamic_tools import (
     _syntax_error,
     _is_truncation_error,
     _defaults_schema_from_code,
+    _ensure_stdlib_imports,
 )
 from openclaw_adapter.knowledge_db import KnowledgeDatabase
 
@@ -57,6 +58,11 @@ class FakeClient:
         self.calls = {"pick": 0, "code": 0, "repair": 0, "distill": 0, "explore": 0, "params": 0}
         self.timeout_seconds = 420
         self.num_predict = 1000  # mirrors OllamaTextClient attribute
+        self.num_ctx = 8192      # mirrors OllamaTextClient attribute
+        self.model = "stub:1b"   # the cascade switches this per tier
+        # (model, think) recorded for every codegen / repair call, in order.
+        self.codegen_models: list[tuple[str, bool]] = []
+        self.num_ctx_seen: list[int | None] = []
 
     def generate(self, prompt: str, *, temperature: float = 0.0, think: bool = False) -> str:
         if "工具類型" in prompt:
@@ -75,6 +81,9 @@ class FakeClient:
             self.calls["repair"] += 1
         else:
             self.calls["code"] += 1
+        # Record which model/think/ctx the cascade used for this codegen call.
+        self.codegen_models.append((self.model, think))
+        self.num_ctx_seen.append(self.num_ctx)
         # both codegen and repair pull from the same queue
         return self._meta + "===CODE===\n" + self._code.pop(0)
 
@@ -120,16 +129,63 @@ def test_self_repair_succeeds_on_second(tmp_path):
 
 
 def test_repair_exhausts_and_fails(tmp_path):
-    # Phase 1: 3 attempts (think=False) + Phase 2: 1 escalation (think=True) = 4 total.
-    client = FakeClient(code_responses=[BAD_SCRIPT, BAD_SCRIPT, BAD_SCRIPT, BAD_SCRIPT])
+    # Cascade tiers: A fast (3) + B strong-fast (3) + C strong-think (1) = 7 total.
+    client = FakeClient(code_responses=[BAD_SCRIPT] * 7)
     runner = _make_runner(tmp_path, client)
     res = runner.run_detailed("總是失敗")
     assert not res.ok
-    assert res.generations == 4
+    assert res.generations == 7
     assert "boom" in res.error
-    # Escalation (Phase 2) mutates the client; must be restored afterwards.
+    # Tier C (think) mutates the client; must be restored afterwards.
     assert client.num_predict == 1000
     assert client.timeout_seconds == 420
+    # num_ctx must stay constant across every tier (changing it forces a reload).
+    assert set(client.num_ctx_seen) == {8192}
+
+
+def test_cascade_escalates_fast_model_to_strong(tmp_path):
+    # Tier A (fast model) fails 3x, then Tier B (strong model) succeeds on its
+    # first attempt. Verifies the model name climbs fast -> strong on failure and
+    # that the common case would never have touched the strong model.
+    client = FakeClient(code_responses=[BAD_SCRIPT, BAD_SCRIPT, BAD_SCRIPT, GOOD_SCRIPT])
+    runner = DynamicToolRunner(
+        client=client,
+        tools_dir=tmp_path / "generated_tools",
+        knowledge_db=None,
+        exec_timeout_seconds=30,
+        fast_model="coder:7b",
+        strong_model="big:14b",
+    )
+    runner._ensure_venv = lambda: Path(sys.executable)  # type: ignore[assignment]
+    runner._pip_install = lambda packages: None  # type: ignore[assignment]
+
+    res = runner.run_detailed("先失敗三次再升級")
+    assert res.ok
+    assert res.generations == 4
+    # First 3 codegen calls on the fast model (think=False), 4th on strong model.
+    assert client.codegen_models[:3] == [("coder:7b", False)] * 3
+    assert client.codegen_models[3] == ("big:14b", False)
+    # Client model is restored to the fast default after the run.
+    assert client.model == "coder:7b"
+
+
+def test_single_model_config_degenerates(tmp_path):
+    # When fast == strong (no separate fast model configured), the cascade still
+    # works and uses that one model for every tier.
+    client = FakeClient(code_responses=[GOOD_SCRIPT])
+    runner = DynamicToolRunner(
+        client=client,
+        tools_dir=tmp_path / "generated_tools",
+        knowledge_db=None,
+        exec_timeout_seconds=30,
+        fast_model="solo:14b",
+        strong_model="solo:14b",
+    )
+    runner._ensure_venv = lambda: Path(sys.executable)  # type: ignore[assignment]
+    runner._pip_install = lambda packages: None  # type: ignore[assignment]
+    res = runner.run_detailed("一個模型搞定")
+    assert res.ok and res.generations == 1
+    assert client.codegen_models[0] == ("solo:14b", False)
 
 
 def test_syntax_helpers():
@@ -287,6 +343,47 @@ def test_failure_distillation_writes_rule(tmp_path):
     after = db.all_codegen_knowledge()
     assert len(after) == before + 1
     assert any(r.title == "測試通則" and r.origin == "distilled" for r in after)
+
+
+def test_ensure_stdlib_imports_adds_missing():
+    # The exact failure mode observed live: os.path.exists used, os not imported.
+    code = "import json\nif os.path.exists('p.json'):\n    json.load(open('p.json'))\n"
+    fixed = _ensure_stdlib_imports(code)
+    assert fixed.startswith("import os\n")
+    assert _syntax_error(fixed) == ""
+    # Already-imported modules are not duplicated.
+    assert _ensure_stdlib_imports(fixed).count("import os") == 1
+
+
+def test_ensure_stdlib_imports_respects_aliases_and_bindings():
+    # `import urllib.request` binds `urllib`; must not re-add it.
+    assert "import urllib\n" not in _ensure_stdlib_imports(
+        "import urllib.request\nurllib.request.urlopen('x')\n"
+    )
+    # A local variable named like a module must not trigger an import.
+    assert _ensure_stdlib_imports("time = 5\nprint(time)\n") == "time = 5\nprint(time)\n"
+    # from-import binds the imported name.
+    assert _ensure_stdlib_imports("from os import path\npath.exists('x')\n").startswith("from os")
+
+
+def test_syntax_gate_injects_missing_import_without_burning_generation(tmp_path):
+    # Code parses fine but references `os` without importing it (runtime NameError).
+    # The gate must inject the import so the run succeeds on generation #1.
+    bad_import = (
+        "import json\n"
+        "params = {'city': 'London'}\n"
+        "if os.path.exists('params.json'):\n"
+        "    params.update(json.load(open('params.json', encoding='utf-8')))\n"
+        'print("===ANSWER===")\n'
+        'print(f"{params[\'city\']} ok")\n'
+        'print("===END===")\n'
+    )
+    client = FakeClient(code_responses=[bad_import])
+    runner = _make_runner(tmp_path, client)
+    res = runner.run_detailed("缺 import os 的任務")
+    assert res.ok
+    assert res.generations == 1
+    assert client.calls["repair"] == 0  # fixed statically, no repair call
 
 
 def test_numeric_check():
