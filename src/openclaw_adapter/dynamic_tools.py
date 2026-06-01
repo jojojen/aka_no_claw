@@ -265,13 +265,59 @@ class DynamicToolRunner:
 
     def run_detailed(self, request: str) -> DynamicToolResult:
         req = request.strip()
-        match = self._pick_reusable(req)
+        # Separate WHAT data to fetch from HOW to display it. The layout/template
+        # portion otherwise pollutes reuse-matching (the classifier sees a wall of
+        # template text and picks NEW, regenerating a tool that already exists) and
+        # gets baked into the tool. Matching/slug/codegen use the clean core; the
+        # format spec is applied once at the end, on either path.
+        core, format_spec = self._split_request_intent(req)
+
+        result: DynamicToolResult | None = None
+        match = self._pick_reusable(core)
         if match is not None:
-            reused = self._reuse(match, req)
+            reused = self._reuse(match, core)
             if reused is not None and reused.ok:
-                return reused
-            logger.info("dynamic_tools: reuse failed, regenerating slug=%s", match.get("slug"))
-        return self._generate_with_repair(req)
+                result = reused
+            else:
+                logger.info("dynamic_tools: reuse failed, regenerating slug=%s", match.get("slug"))
+        if result is None:
+            result = self._generate_with_repair(core)
+
+        if result.ok and format_spec:
+            result.answer = self._apply_presentation(format_spec, result.answer)
+        return result
+
+    def _split_request_intent(self, request: str) -> tuple[str, str]:
+        """Split a request into (core_data_request, format_spec). The format spec
+        is the user's layout/template text ("" when none). Keeping layout out of
+        the core lets reuse-matching, slug, and codegen see only the data need."""
+        prompt = (
+            "把下面的需求拆成兩部分，只輸出一個 JSON 物件：\n"
+            '{"core": "<要查什麼資料的精簡描述，去掉任何排版/格式/範例指示>", '
+            '"format": "<使用者指定的輸出格式或範例原文；沒有就空字串>"}\n'
+            "規則：core 只保留『要查的資料種類與標的』（例如城市、股票、日期），"
+            "不可包含任何『格式如下』『版型』『emoji 範例』等排版指示；"
+            "format 原樣保留使用者貼的版型/範例文字（含 emoji 與欄位），沒有就給空字串。\n"
+            "⚠️ 最重要：『格式範例』裡出現的地名／數字／日期只是版型示意，"
+            "不是使用者真正要查的標的；core 必須完整保留使用者真正要查的標的"
+            "（即使範例裡寫的是別的地名也一樣，不可被範例帶偏而把真正標的刪掉）。\n"
+            "範例：需求「幫我查 大阪 的天氣 格式如下\\n📍 札幌市\\n氣溫：17°C」"
+            "→ 正確拆法 core=\"大阪的天氣\"（保留大阪，不是範例裡的札幌），"
+            'format="📍 札幌市\\n氣溫：17°C"。\n'
+            "只輸出 JSON，不要解說。\n\n"
+            f"需求：{request}\n"
+        )
+        try:
+            raw = self.client.generate(prompt, temperature=0.0)
+            data = _load_json_object(raw)
+        except Exception:
+            logger.exception("dynamic_tools: intent split failed; using request as-is")
+            return request, ""
+        if not data:
+            return request, ""
+        core = str(data.get("core") or "").strip() or request
+        fmt = str(data.get("format") or "").strip()
+        return core, fmt
 
     def _reuse(self, entry: dict, request: str) -> DynamicToolResult | None:
         """Run an existing tool for a new request. For parameterized tools
@@ -298,13 +344,6 @@ class DynamicToolRunner:
         result = self._install_and_execute(slug, tool_path, code)
         if result.ok:
             result.reused = True
-            # The tool's output format is baked into its code. A reused request
-            # may ask for a *different layout* than the one the tool was born
-            # with; a presentation pass reshapes the (already-correct) data into
-            # the requested format. Only on parameterized + non-identical
-            # requests — an exact-match reuse wants the original format verbatim.
-            if schema and _normalize_request(entry.get("request", "")) != _normalize_request(request):
-                result.answer = self._apply_presentation(request, result.answer)
             return result
         return None
 
@@ -333,21 +372,20 @@ class DynamicToolRunner:
         clean = {k: v for k, v in data.items() if k in names}
         return clean or None
 
-    def _apply_presentation(self, request: str, data_text: str) -> str:
-        """Reshape a reused tool's raw output to match a format the request asks
-        for. The data is already correct — this pass only *re-arranges* it, never
-        invents values — so reuse can satisfy a new layout without regenerating
-        or mutating the shared tool. If the request names no format, returns the
-        data unchanged. Any failure falls back to the raw data (never worse)."""
+    def _apply_presentation(self, format_spec: str, data_text: str) -> str:
+        """Reshape a tool's raw output to match a requested layout. The data is
+        already correct — this pass only *re-arranges* it, never invents values —
+        so any path (reuse or fresh generation) can satisfy a new layout without
+        baking the format into the tool. Failure falls back to raw data."""
         prompt = (
-            "下面是一支工具產生的『正確資料』。請依使用者需求中指定的『輸出格式/範例』"
-            "把這些資料重新排版。\n"
+            "下面是一支工具產生的『正確資料』。請依指定的『輸出格式/範例』把這些資料重新排版。\n"
             "重新排版的嚴格規則：\n"
             "- 只能使用『資料』裡已有的數值/文字；絕對不可捏造、推算、或補資料沒有的欄位。\n"
-            "- 需求要的欄位若資料沒有，就略過該欄位，不要編造（寧缺勿假）。\n"
-            "- 需求若沒有指定任何格式或範例，原封不動回傳『資料』本身。\n"
+            "- 範例裡的示意值（日期、地名、數字、天氣描述）只是版型示範，必須換成『資料』裡的"
+            "真實值，絕不可照抄範例的值。\n"
+            "- 格式要求某欄位但資料沒有，就略過該欄位，不要編造（寧缺勿假）。\n"
             "- 只輸出最終排版結果，不要任何解說、前言或程式碼框。\n\n"
-            f"使用者需求：\n{request}\n\n資料：\n{data_text}\n"
+            f"輸出格式/範例：\n{format_spec}\n\n資料：\n{data_text}\n"
         )
         try:
             out = self.client.generate(prompt, temperature=0.0).strip()
@@ -774,6 +812,15 @@ class DynamicToolRunner:
             "    ❌ 反例：DEFAULTS={'city':'Paris'}，卻 print(f\"巴黎現在氣溫{temp}°C\")"
             "（換成倫敦重用時會抓倫敦的溫度、卻還是印『巴黎』）。\n"
             "    ✅ 正解：print(f\"{params['city']}現在氣溫{temp}°C\")——標的跟著參數走。\n\n"
+            "  ⚠️ 輸出乾淨的『資料值』，不要輸出原始結構或連結：\n"
+            "    - API 欄位常是巢狀物件或清單（例如 {'value':'晴天'} 或 [{'value':'Aichi'}]），"
+            "要取出裡面的純量值再輸出（data[...][0]['value']），絕不可直接 print 出 dict/list。\n"
+            "    - 要『天氣描述/狀態』就取描述文字欄位，不要輸出圖片連結或 URL 當描述"
+            "（weatherIconUrl 之類是圖檔網址，不是給人看的描述）。\n"
+            "    - 數字做比較或運算前先轉型：很多 API 把數字當字串回傳（\"0\"），"
+            "直接 \"0\"==0 會是 False，要先 int()/float() 再比較，否則判斷會相反。\n"
+            "  ⚠️ 不要把使用者的『輸出版型/emoji 範例』寫死進工具：工具只負責輸出乾淨的資料"
+            "（標的、數值、描述文字），排版由外層格式層處理；把一次性版型寫死會讓工具僵化又易錯。\n\n"
             "硬性規則：\n"
             "1. 不可讀取任何祕密環境變數（OPENCLAW_*、API token 等）；"
             "讀取同目錄的 params.json 是允許且必要的（那不是祕密）。\n"
