@@ -31,6 +31,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from hashlib import sha1
@@ -39,6 +40,9 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 logger = logging.getLogger(__name__)
+
+_OLLAMA_MAX_RETRIES = 3       # transient-error retries in generate()
+_OLLAMA_RETRY_BASE_SEC = 1.0  # first backoff; doubles each attempt (1, 2, 4 s)
 
 ANSWER_START = "===ANSWER==="
 ANSWER_END = "===END==="
@@ -154,6 +158,20 @@ class DynamicToolResult:
     raw_stdout: str = ""
 
 
+def probe_ollama(endpoint: str, *, timeout: float = 3.0) -> bool:
+    """Return True when Ollama's /api/tags endpoint responds within *timeout* s."""
+    base = endpoint.rstrip("/")
+    for suffix in ("/api/generate", "/api"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    try:
+        with urlopen(Request(f"{base}/api/tags", method="GET"), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
 class OllamaTextClient:
     """Minimal stdlib POST to Ollama /api/generate (non-streaming)."""
 
@@ -199,13 +217,31 @@ class OllamaTextClient:
             headers={"Content-Type": "application/json", "Accept": "application/json"},
             method="POST",
         )
-        try:
-            with urlopen(request, timeout=self.timeout_seconds) as response:
-                body = response.read().decode("utf-8", errors="replace")
-        except HTTPError as exc:
-            raise RuntimeError(f"Ollama HTTP {exc.code}") from exc
-        except URLError as exc:
-            raise RuntimeError(f"Ollama request failed: {exc.reason}") from exc
+        last_exc: RuntimeError | None = None
+        body = ""
+        for attempt in range(1, _OLLAMA_MAX_RETRIES + 1):
+            try:
+                with urlopen(request, timeout=self.timeout_seconds) as response:
+                    body = response.read().decode("utf-8", errors="replace")
+                last_exc = None
+                break
+            except HTTPError as exc:
+                if exc.code < 500:
+                    raise RuntimeError(f"Ollama HTTP {exc.code}") from exc
+                last_exc = RuntimeError(f"Ollama HTTP {exc.code}")
+            except URLError as exc:
+                last_exc = RuntimeError(f"Ollama request failed: {exc.reason}")
+            if attempt < _OLLAMA_MAX_RETRIES:
+                delay = _OLLAMA_RETRY_BASE_SEC * (2.0 ** (attempt - 1))
+                logger.warning(
+                    "Ollama transient error attempt %d/%d; retrying in %.0fs: %s",
+                    attempt, _OLLAMA_MAX_RETRIES, delay, last_exc,
+                )
+                time.sleep(delay)
+        if last_exc is not None:
+            raise RuntimeError(
+                f"Ollama 不在線或無回應（已重試 {_OLLAMA_MAX_RETRIES} 次）"
+            ) from last_exc
         parsed = json.loads(body)
         text = parsed.get("response", "")
         if not isinstance(text, str):
@@ -1144,9 +1180,16 @@ def build_dynamic_tool_runner_from_settings(settings) -> DynamicToolRunner | Non
     # num_ctx=8192: prevents 4096-default from leaving too few tokens for response.
     # num_predict=1000: caps Phase-1 at ~4KB (~667s at 1.5 tok/s) safely under timeout.
     #   1000 tokens is enough for any single-purpose script (Black-Scholes ~300 tok).
+    endpoint = settings.openclaw_local_text_endpoint
+    if not probe_ollama(endpoint):
+        logger.warning(
+            "dynamic_tools: Ollama not reachable at %s — /new will fail until it comes up",
+            endpoint,
+        )
+
     codegen_timeout = max(900, settings.openclaw_local_text_timeout_seconds * 12)
     client = OllamaTextClient(
-        endpoint=settings.openclaw_local_text_endpoint,
+        endpoint=endpoint,
         model=fast_model,
         timeout_seconds=codegen_timeout,
         num_ctx=8192,
