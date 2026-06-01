@@ -344,6 +344,14 @@ class KnowledgeDatabase:
             )
         return cursor.rowcount > 0
 
+    def delete_codegen(self, knowledge_id: str) -> bool:
+        """Delete a codegen knowledge row by knowledge_id. Returns True if deleted."""
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM codegen_knowledge WHERE knowledge_id = ?", (knowledge_id,)
+            )
+        return cursor.rowcount > 0
+
     def append_observation(
         self,
         *,
