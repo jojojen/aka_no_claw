@@ -99,6 +99,13 @@ def _build_classifier_deps(settings: AssistantSettings, ssl_context=None):
     researcher.start()
     logger.info("SNS classifier: EntityResearcher started")
 
+    from .knowledge_prewarmer import KnowledgePrewarmer
+    prewarmer = KnowledgePrewarmer(
+        research_fn=researcher.request,
+        monitor_db_path=settings.monitor_db_path,
+    )
+    prewarmer.start()
+
     def knowledge_retriever(canonicals: tuple[str, ...]) -> str:
         entries = []
         unknown: list[str] = []
