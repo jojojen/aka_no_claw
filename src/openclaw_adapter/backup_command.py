@@ -29,6 +29,8 @@ import json
 import logging
 import shutil
 import sqlite3
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -256,6 +258,77 @@ def _format_report(report: BackupReport) -> str:
         lines.append("⚠️ 部分項目失敗：")
         lines.extend(f"  - {e}" for e in report.errors)
     return "\n".join(lines)
+
+
+class BackupScheduler:
+    """Daemon thread that runs :func:`run_backup` at a fixed interval.
+
+    Checks whether the backup destination's parent directory is mounted before
+    each run. If it's absent (e.g. the SSD is unplugged), logs a warning and
+    skips — no silent failure.
+    """
+
+    def __init__(
+        self,
+        *,
+        data_dir: Path,
+        generated_tools_dir: Path | None,
+        dest: Path,
+        interval_seconds: float = 24.0 * 3600,
+        initial_delay_seconds: float = 300.0,
+    ) -> None:
+        self._data_dir = data_dir
+        self._generated_tools_dir = generated_tools_dir
+        self._dest = dest
+        self._interval = interval_seconds
+        self._initial_delay = initial_delay_seconds
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(
+            target=self._loop, name="backup-scheduler", daemon=True,
+        )
+        self._thread.start()
+        logger.info(
+            "BackupScheduler started dest=%s interval=%.0fh initial_delay=%.0fs",
+            self._dest, self._interval / 3600, self._initial_delay,
+        )
+
+    def _loop(self) -> None:
+        time.sleep(self._initial_delay)
+        while True:
+            self._run_once()
+            time.sleep(self._interval)
+
+    def _run_once(self) -> None:
+        if not self._dest.parent.exists():
+            logger.warning(
+                "BackupScheduler: backup destination parent not mounted — skipping "
+                "(dest=%s). Plug in the SSD or set OPENCLAW_BACKUP_DIR.",
+                self._dest,
+            )
+            return
+        try:
+            report = run_backup(
+                data_dir=self._data_dir,
+                generated_tools_dir=self._generated_tools_dir,
+                dest=self._dest,
+            )
+            if report.errors:
+                logger.warning(
+                    "BackupScheduler: backup completed with errors dest=%s errors=%s",
+                    self._dest, report.errors,
+                )
+            else:
+                logger.info(
+                    "BackupScheduler: backup OK dest=%s dbs=%d total=%s",
+                    self._dest, len(report.databases),
+                    _human_bytes(report.total_db_bytes),
+                )
+        except Exception:
+            logger.exception("BackupScheduler: backup failed dest=%s", self._dest)
 
 
 def build_backup_handler(settings) -> Callable[[str], str]:

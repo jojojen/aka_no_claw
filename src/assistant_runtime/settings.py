@@ -39,6 +39,7 @@ class AssistantSettings:
     sns_db_path: str = "data/sns.sqlite3"
     knowledge_db_path: str = "data/knowledge.sqlite3"
     openclaw_backup_dir: str = "/Volumes/JEN_SSD/claw_data"
+    openclaw_backup_interval_hours: int = 24
     sns_classifier_enabled: bool = True
     sns_classifier_min_score: int = 60
     opportunity_agent_enabled: bool = False
@@ -135,6 +136,9 @@ def get_settings() -> AssistantSettings:
         sns_db_path=os.getenv("SNS_DB_PATH", "data/sns.sqlite3"),
         knowledge_db_path=os.getenv("KNOWLEDGE_DB_PATH", "data/knowledge.sqlite3"),
         openclaw_backup_dir=os.getenv("OPENCLAW_BACKUP_DIR", "/Volumes/JEN_SSD/claw_data"),
+        openclaw_backup_interval_hours=_as_int(
+            os.getenv("OPENCLAW_BACKUP_INTERVAL_HOURS"), default=24
+        ),
         sns_classifier_enabled=_as_bool(
             os.getenv("OPENCLAW_SNS_CLASSIFIER_ENABLED", "true")
         ),
