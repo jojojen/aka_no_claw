@@ -327,6 +327,23 @@ class KnowledgeDatabase:
             ).fetchall()
         return [_row_to_entry(r) for r in rows]
 
+    def entries_since(self, since_iso: str) -> list[KnowledgeEntry]:
+        """Return entries whose created_at >= since_iso, newest first."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM knowledge_entries WHERE created_at >= ? ORDER BY created_at DESC",
+                (since_iso,),
+            ).fetchall()
+        return [_row_to_entry(r) for r in rows]
+
+    def delete_entry(self, entry_id: str) -> bool:
+        """Delete a knowledge entry by entry_id. Returns True if a row was deleted."""
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM knowledge_entries WHERE entry_id = ?", (entry_id,)
+            )
+        return cursor.rowcount > 0
+
     def append_observation(
         self,
         *,
