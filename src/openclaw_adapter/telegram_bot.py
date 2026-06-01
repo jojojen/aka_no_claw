@@ -47,6 +47,7 @@ from tcg_tracker.image_lookup import TcgVisionSettings
 
 from .backup_command import BackupScheduler, build_backup_handler, build_recover_handler
 from .opportunity_scorecard import build_scorecard_handler
+from .rag_daily_digest import RagDailyDigestScheduler, handle_ragdel_callback, handle_ragkeep_callback
 from .dynamic_tools import build_dynamic_tool_runner_from_settings
 from .knowledge_command import build_knowledge_handler
 from .natural_language import build_telegram_natural_language_router_from_settings
@@ -374,6 +375,7 @@ def run_telegram_polling(
     feedback_service = _build_feedback_service(watch_db)
     _start_card_image_crawler(watch_db)
     _start_backup_scheduler(settings)
+    rag_digest_scheduler = _start_rag_daily_digest(settings)
     dynamic_tool_runner = build_dynamic_tool_runner_from_settings(settings)
     dynamic_tool_handler = (
         (lambda req: dynamic_tool_runner.run(req)) if dynamic_tool_runner is not None else None
@@ -404,6 +406,7 @@ def run_telegram_polling(
         backup_handler=build_backup_handler(settings),
         recover_handler=build_recover_handler(settings),
         scorecard_handler=build_scorecard_handler(settings),
+        rag_callback_handler=_build_rag_callback_handler(settings),
         watch_db=watch_db,
         sns_db=sns_db,
         sns_buzz_fn=sns_buzz_fn,
@@ -423,6 +426,52 @@ def _build_feedback_service(watch_db: MonitorDatabase):
     except Exception:
         return None
     return TcgPriceFeedbackService(database=watch_db)
+
+
+def _start_rag_daily_digest(settings) -> RagDailyDigestScheduler | None:
+    """Start the daily RAG digest daemon (fires at 22:00 local time)."""
+    from price_monitor_bot.bot import TelegramBotClient
+    chat_ids = tuple(cid for cid in settings.openclaw_telegram_chat_ids if cid)
+    if not chat_ids:
+        logger.warning("_start_rag_daily_digest: no chat_ids configured — skipping")
+        return None
+    try:
+        token = require_telegram_token(settings)
+        ssl_ctx = build_ssl_context(settings)
+        client = TelegramBotClient(token, ssl_context=ssl_ctx)
+
+        def _send(chat_id: str, text: str, reply_markup: dict | None) -> None:
+            client.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+
+        scheduler = RagDailyDigestScheduler(
+            db_path=settings.knowledge_db_path,
+            chat_ids=chat_ids,
+            send_fn=_send,
+        )
+        scheduler.start()
+        return scheduler
+    except Exception:
+        logger.exception("_start_rag_daily_digest: failed to start")
+        return None
+
+
+def _build_rag_callback_handler(settings) -> "Callable[[str, str, str], tuple[str, object]]":
+    """Return a handler for ragkeep/ragdel callbacks.
+
+    Called by bot.py with (prefix, entry_id, original_text).
+    Returns (new_text, new_reply_markup).
+    """
+    from pathlib import Path as _Path
+    db_path = _Path(settings.knowledge_db_path)
+
+    def handler(prefix: str, entry_id: str, original_text: str) -> tuple[str, object]:
+        if prefix == "ragkeep":
+            return handle_ragkeep_callback(entry_id=entry_id, original_text=original_text)
+        if prefix == "ragdel":
+            return handle_ragdel_callback(entry_id=entry_id, original_text=original_text, db_path=db_path)
+        return original_text, None
+
+    return handler
 
 
 def _start_backup_scheduler(settings) -> None:
