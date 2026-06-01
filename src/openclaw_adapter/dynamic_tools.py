@@ -298,6 +298,13 @@ class DynamicToolRunner:
         result = self._install_and_execute(slug, tool_path, code)
         if result.ok:
             result.reused = True
+            # The tool's output format is baked into its code. A reused request
+            # may ask for a *different layout* than the one the tool was born
+            # with; a presentation pass reshapes the (already-correct) data into
+            # the requested format. Only on parameterized + non-identical
+            # requests — an exact-match reuse wants the original format verbatim.
+            if schema and _normalize_request(entry.get("request", "")) != _normalize_request(request):
+                result.answer = self._apply_presentation(request, result.answer)
             return result
         return None
 
@@ -325,6 +332,29 @@ class DynamicToolRunner:
             return None
         clean = {k: v for k, v in data.items() if k in names}
         return clean or None
+
+    def _apply_presentation(self, request: str, data_text: str) -> str:
+        """Reshape a reused tool's raw output to match a format the request asks
+        for. The data is already correct — this pass only *re-arranges* it, never
+        invents values — so reuse can satisfy a new layout without regenerating
+        or mutating the shared tool. If the request names no format, returns the
+        data unchanged. Any failure falls back to the raw data (never worse)."""
+        prompt = (
+            "下面是一支工具產生的『正確資料』。請依使用者需求中指定的『輸出格式/範例』"
+            "把這些資料重新排版。\n"
+            "重新排版的嚴格規則：\n"
+            "- 只能使用『資料』裡已有的數值/文字；絕對不可捏造、推算、或補資料沒有的欄位。\n"
+            "- 需求要的欄位若資料沒有，就略過該欄位，不要編造（寧缺勿假）。\n"
+            "- 需求若沒有指定任何格式或範例，原封不動回傳『資料』本身。\n"
+            "- 只輸出最終排版結果，不要任何解說、前言或程式碼框。\n\n"
+            f"使用者需求：\n{request}\n\n資料：\n{data_text}\n"
+        )
+        try:
+            out = self.client.generate(prompt, temperature=0.0).strip()
+        except Exception:
+            logger.exception("dynamic_tools: presentation pass failed; using raw data")
+            return data_text
+        return out or data_text
 
     # ── generation + self-repair ────────────────────────────────────────────
 

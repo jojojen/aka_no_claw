@@ -47,15 +47,17 @@ class FakeClient:
     """Routes generate() by prompt markers to canned responses."""
 
     def __init__(self, *, code_responses, pick_response="NONE", distill_response="{}",
-                 explorer_response: str | None = None, meta_response="", params_response="{}"):
+                 explorer_response: str | None = None, meta_response="", params_response="{}",
+                 presentation_response: str | None = None):
         self._code = list(code_responses)
         self._pick = pick_response
         self._distill = distill_response
         self._meta = meta_response          # prepended before ===CODE=== on codegen
         self._params = params_response       # returned for param-extraction calls
+        self._presentation = presentation_response  # returned for reformat calls
         # Default: declare no external API needed so exploration is a no-op in tests.
         self._explorer = explorer_response if explorer_response is not None else 'print("NO_EXTERNAL_API")'
-        self.calls = {"pick": 0, "code": 0, "repair": 0, "distill": 0, "explore": 0, "params": 0}
+        self.calls = {"pick": 0, "code": 0, "repair": 0, "distill": 0, "explore": 0, "params": 0, "present": 0}
         self.timeout_seconds = 420
         self.num_predict = 1000  # mirrors OllamaTextClient attribute
         self.num_ctx = 8192      # mirrors OllamaTextClient attribute
@@ -71,6 +73,12 @@ class FakeClient:
         if "抽取參數" in prompt:
             self.calls["params"] += 1
             return self._params
+        if "重新排版" in prompt:
+            self.calls["present"] += 1
+            # Default: behave like the model honoring "no format → return as-is".
+            if self._presentation is None:
+                return prompt.split("資料：\n", 1)[-1].strip()
+            return self._presentation
         if "抽象成" in prompt:
             self.calls["distill"] += 1
             return self._distill
@@ -270,6 +278,41 @@ def test_parameterized_tool_reuse_matches_by_type(tmp_path):
     assert client2.calls["pick"] == 1    # classification ran
     assert client2.calls["params"] == 1  # params extracted
     assert "77" in second.answer
+
+
+def test_reuse_applies_presentation_for_new_format(tmp_path):
+    # Reuse with a DIFFERENT request that asks for a new layout: the data tool
+    # runs as-is, then a presentation pass reshapes its output to the format.
+    client1 = FakeClient(code_responses=[PARAM_TOOL], meta_response=PARAM_META)
+    runner = _make_runner(tmp_path, client1)
+    runner.run_detailed("輸出 x=10")
+
+    client2 = FakeClient(
+        code_responses=[], pick_response="x輸出", params_response='{"x": 77}',
+        presentation_response="📊 x 的值：77",
+    )
+    runner.client = client2
+    second = runner.run_detailed("輸出 x=77，格式如下\n📊 x 的值：<數值>")
+    assert second.ok and second.reused
+    assert client2.calls["code"] == 0       # no regeneration
+    assert client2.calls["present"] == 1    # presentation pass ran
+    assert second.answer == "📊 x 的值：77"  # reshaped to the requested format
+
+
+def test_exact_match_reuse_skips_presentation(tmp_path):
+    # Identical request → exact-match reuse wants the original format verbatim,
+    # so the presentation pass must NOT run (and cost no model call).
+    client1 = FakeClient(code_responses=[PARAM_TOOL], meta_response=PARAM_META)
+    runner = _make_runner(tmp_path, client1)
+    runner.run_detailed("輸出 x=10")
+
+    client2 = FakeClient(code_responses=[], params_response='{"x": 10}',
+                         presentation_response="SHOULD_NOT_APPEAR")
+    runner.client = client2
+    second = runner.run_detailed("輸出 x=10")  # identical → exact-match path
+    assert second.ok and second.reused
+    assert client2.calls["present"] == 0
+    assert "SHOULD_NOT_APPEAR" not in second.answer
 
 
 PARAM_META = (
