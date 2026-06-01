@@ -1,8 +1,10 @@
 """Dynamic self-writing tools for the ``/new`` Telegram command.
 
-When a request isn't covered by a fixed tool, ``DynamicToolRunner`` asks the
-strongest local Ollama model (qwen3:14b) to WRITE a single-file Python tool,
-runs it under a lightweight guardrail, and returns the answer. Tools persist in
+When a request isn't covered by a fixed tool, ``DynamicToolRunner`` asks a local
+Ollama model to WRITE a single-file Python tool, runs it under a lightweight
+guardrail, and returns the answer. Codegen uses a model-tier cascade: a fast
+code-specialized model (qwen2.5-coder:7b) writes first, escalating to the
+stronger qwen3:14b (then its reasoning mode) only on repeated failure. Tools persist in
 a gitignored ``generated_tools/`` folder (+ ``manifest.json``) so similar
 requests can be reused instead of regenerated.
 
@@ -86,6 +88,57 @@ def _is_truncation_error(msg: str) -> bool:
     return any(marker in low for marker in _TRUNCATION_MARKERS)
 
 
+def _is_thinking_model(model: str) -> bool:
+    """qwen3 family supports /think /no_think prompt directives; others don't."""
+    return (model or "").strip().lower().startswith("qwen3")
+
+
+# Stdlib modules the generated tools routinely use. A missing import of one of
+# these is a runtime NameError (not ModuleNotFoundError, since they're built in),
+# which ast.parse can't catch and the repair loop wastes generations on. We add
+# the import deterministically instead.
+_AUTO_IMPORT_STDLIB = frozenset({
+    "os", "sys", "json", "re", "math", "datetime", "time", "random",
+    "statistics", "decimal", "collections", "itertools", "functools",
+    "csv", "html", "base64", "hashlib", "textwrap", "urllib",
+})
+
+
+def _ensure_stdlib_imports(code: str) -> str:
+    """Prepend `import <mod>` for any safelisted stdlib module that is used as a
+    bare `mod.<attr>` but never imported/bound. Deterministic, no model call."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code  # caller's syntax gate handles this
+    bound: set[str] = set()
+    used_roots: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                bound.add((alias.asname or alias.name).split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                bound.add(alias.asname or alias.name)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+        elif isinstance(node, ast.arg):
+            bound.add(node.arg)
+        elif isinstance(node, ast.Name):
+            if isinstance(node.ctx, ast.Store):
+                bound.add(node.id)
+            elif isinstance(node.ctx, ast.Load):
+                used_roots.add(node.id)
+    missing = sorted(
+        m for m in used_roots & _AUTO_IMPORT_STDLIB if m not in bound
+    )
+    if not missing:
+        return code
+    logger.info("dynamic_tools: auto-adding missing stdlib imports=%s", missing)
+    header = "".join(f"import {m}\n" for m in missing)
+    return header + code
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -123,7 +176,12 @@ class OllamaTextClient:
     def generate(self, prompt: str, *, temperature: float = 0.0, think: bool = False) -> str:
         # qwen3 respects /no_think / /think directives in the prompt prefix.
         # This is more reliable than the "think" API option across Ollama versions.
-        full_prompt = prompt if think else f"/no_think\n{prompt}"
+        # Non-thinking models (e.g. qwen2.5-coder) have no such mode, so the
+        # directive is just spurious prompt text there — only prepend for qwen3.
+        if think or not _is_thinking_model(self.model):
+            full_prompt = prompt
+        else:
+            full_prompt = f"/no_think\n{prompt}"
         options: dict = {"temperature": temperature}
         if self.num_ctx is not None:
             options["num_ctx"] = self.num_ctx
@@ -166,8 +224,16 @@ class DynamicToolRunner:
         max_repairs: int = 3,
         base_python: str | None = None,
         distill_enabled: bool = False,
+        fast_model: str | None = None,
+        strong_model: str | None = None,
     ) -> None:
         self.client = client
+        # Cascade: fast_model handles explore + tier-1 codegen; strong_model is
+        # only loaded on escalation. Both default to the client's own model, so
+        # a single-model config degenerates to the old single-tier behavior.
+        self.fast_model = fast_model or client.model
+        self.strong_model = strong_model or client.model
+        self.client.model = self.fast_model
         self.tools_dir = Path(tools_dir)
         self.knowledge_db = knowledge_db
         self.exec_timeout_seconds = exec_timeout_seconds
@@ -278,21 +344,29 @@ class DynamicToolRunner:
         last_error = ""
         last_stdout = ""
 
-        # The escalation path mutates client.num_predict / timeout; the syntax
-        # gate may also bump num_predict. Save and restore so a complex request
-        # doesn't leak a relaxed cap into the next, unrelated request.
+        # The escalation path mutates client.model / num_predict / timeout; the
+        # syntax gate may also bump num_predict. Save and restore so a complex
+        # request doesn't leak a relaxed cap or model name into the next one.
         saved_num_predict = self.client.num_predict
         saved_timeout = self.client.timeout_seconds
         try:
-            # Phase 1: think=False (fast).  Phase 2: think=True (escalation, 1 try).
-            for phase, think, phase_max in (
-                (1, False, self.max_repairs),
-                (2, True,  1),
+            # Model-tier cascade. Tier A: fast code-specialized model (think=False).
+            # Tier B: strong model, still fast. Tier C: strong model, reasoning.
+            # Only a real failure climbs a tier, so the common case never loads
+            # the heavy model. num_ctx stays constant across tiers (changing it
+            # forces an Ollama reload; num_predict does not).
+            for phase, model, think, phase_max in (
+                (1, self.fast_model,   False, self.max_repairs),
+                (2, self.strong_model, False, self.max_repairs),
+                (3, self.strong_model, True,  1),
             ):
-                if phase == 2:
+                self.client.model = model
+                if phase >= 2:
                     logger.info(
-                        "dynamic_tools: escalating to think=True for request=%s", request[:80]
+                        "dynamic_tools: escalating to tier %s model=%s think=%s for request=%s",
+                        phase, model, think, request[:80],
                     )
+                if phase == 3:
                     # Think mode generates longer output; remove the num_predict cap and
                     # extend the HTTP timeout to 1200s.
                     self.client.num_predict = None
@@ -336,6 +410,7 @@ class DynamicToolRunner:
         finally:
             self.client.num_predict = saved_num_predict
             self.client.timeout_seconds = saved_timeout
+            self.client.model = self.fast_model
 
     def _pass_syntax_gate(
         self, request: str, code: str, knowledge_rows, *,
@@ -351,7 +426,9 @@ class DynamicToolRunner:
         for _ in range(_MAX_SYNTAX_FIXES):
             err = _syntax_error(code)
             if not err:
-                return code
+                # Code parses; deterministically repair missing stdlib imports
+                # (a runtime NameError ast.parse can't see) before execution.
+                return _ensure_stdlib_imports(code)
             logger.info("dynamic_tools: syntax gate caught: %s", err)
             if (phase == 1 and _is_truncation_error(err)
                     and self.client.num_predict is not None
@@ -660,7 +737,13 @@ class DynamicToolRunner:
             "  連『計算依據／計算方式』那句說明也必須用 f-string 帶入 params[...] 的實際值，"
             "嚴禁把數字寫死在說明字串裡（例如不可寫『年利率3.5%、25年期』這種字面字串——"
             "工具被重用換參數後那句會變成謊話；要寫成 "
-            "f\"年利率{params['annual_rate']*100}%、{params['years']}年期\"）。\n\n"
+            "f\"年利率{params['annual_rate']*100}%、{params['years']}年期\"）。\n"
+            "  ⚠️ 最容易犯的錯：把『標的名稱』寫死在輸出文字裡。答案句子裡提到的『查的是什麼』"
+            "（城市名、股票名/代碼、公司名、日期）也是參數，必須用 params[...] 帶入，"
+            "絕不可寫死字面值——否則工具換參數重用後，數據對了但標的講錯，變成答非所問。\n"
+            "    ❌ 反例：DEFAULTS={'city':'Paris'}，卻 print(f\"巴黎現在氣溫{temp}°C\")"
+            "（換成倫敦重用時會抓倫敦的溫度、卻還是印『巴黎』）。\n"
+            "    ✅ 正解：print(f\"{params['city']}現在氣溫{temp}°C\")——標的跟著參數走。\n\n"
             "硬性規則：\n"
             "1. 不可讀取任何祕密環境變數（OPENCLAW_*、API token 等）；"
             "讀取同目錄的 params.json 是允許且必要的（那不是祕密）。\n"
@@ -973,9 +1056,12 @@ def build_dynamic_tool_runner_from_settings(settings) -> DynamicToolRunner | Non
         if backend:
             logger.warning("dynamic_tools: unsupported backend=%s", backend)
         return None
-    model = _select_model(settings.openclaw_local_text_model)
-    if not model:
+    strong_model = _select_model(settings.openclaw_local_text_model)
+    if not strong_model:
         return None
+    # Fast tier-1 model (code-specialized). Falls back to the strong model when
+    # unset, collapsing the cascade to single-tier (old) behavior.
+    fast_model = (getattr(settings, "openclaw_codegen_fast_model", None) or "").strip() or strong_model
 
     # Codegen needs more time + context than the NL router.
     # num_ctx=8192: prevents 4096-default from leaving too few tokens for response.
@@ -984,7 +1070,7 @@ def build_dynamic_tool_runner_from_settings(settings) -> DynamicToolRunner | Non
     codegen_timeout = max(900, settings.openclaw_local_text_timeout_seconds * 12)
     client = OllamaTextClient(
         endpoint=settings.openclaw_local_text_endpoint,
-        model=model,
+        model=fast_model,
         timeout_seconds=codegen_timeout,
         num_ctx=8192,
         num_predict=1000,
@@ -1000,7 +1086,10 @@ def build_dynamic_tool_runner_from_settings(settings) -> DynamicToolRunner | Non
         logger.exception("dynamic_tools: knowledge DB init failed; continuing without RAG")
 
     tools_dir = _resolve_tools_dir()
-    return DynamicToolRunner(client=client, tools_dir=tools_dir, knowledge_db=knowledge_db)
+    return DynamicToolRunner(
+        client=client, tools_dir=tools_dir, knowledge_db=knowledge_db,
+        fast_model=fast_model, strong_model=strong_model,
+    )
 
 
 def _select_model(raw_models: str | None) -> str | None:
