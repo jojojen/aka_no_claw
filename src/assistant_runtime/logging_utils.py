@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import logging.handlers
 from pathlib import Path
 
 from .settings import AssistantSettings
@@ -32,7 +33,9 @@ def configure_logging(settings: AssistantSettings) -> None:
     console_handler.setLevel(_level_from_name(settings.log_level))
     console_handler.setFormatter(formatter)
 
-    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_path, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
+    )
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
 
