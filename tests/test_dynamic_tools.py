@@ -13,6 +13,7 @@ import pytest
 
 from openclaw_adapter.dynamic_tools import (
     DynamicToolRunner,
+    OllamaTextClient,
     _extract_answer,
     _extract_code,
     _check_numeric,
@@ -21,6 +22,7 @@ from openclaw_adapter.dynamic_tools import (
     _is_truncation_error,
     _defaults_schema_from_code,
     _ensure_stdlib_imports,
+    probe_ollama,
 )
 from openclaw_adapter.knowledge_db import KnowledgeDatabase
 
@@ -465,3 +467,122 @@ def test_direction_check():
     assert ok
     bad, _ = _check_direction("營收成長", [["營收"], ["衰退", "下滑"]])
     assert not bad
+
+
+# ── Ollama resilience (A4) ─────────────────────────────────────────────────
+
+
+def test_probe_ollama_returns_true_when_server_responds() -> None:
+    from unittest.mock import patch, MagicMock
+    mock_response = MagicMock()
+    mock_response.__enter__ = lambda s: s
+    mock_response.__exit__ = MagicMock(return_value=False)
+    with patch("openclaw_adapter.dynamic_tools.urlopen", return_value=mock_response):
+        assert probe_ollama("http://127.0.0.1:11434/api") is True
+
+
+def test_probe_ollama_returns_false_when_server_unreachable() -> None:
+    assert probe_ollama("http://127.0.0.1:19999") is False
+
+
+def test_probe_ollama_strips_generate_suffix() -> None:
+    assert probe_ollama("http://127.0.0.1:19999/api/generate") is False
+
+
+def test_ollama_generate_retries_on_5xx_then_succeeds(tmp_path) -> None:
+    import time as _time
+    calls = [0]
+    slept: list[float] = []
+
+    class _FakeClient:
+        model = "q"
+        timeout_seconds = 30
+        num_predict = None
+        num_ctx = None
+
+        def generate(self, prompt, *, temperature=0.0, think=False):
+            calls[0] += 1
+            if calls[0] < 3:
+                raise RuntimeError("Ollama HTTP 503")
+            return f'===ANSWER===\nok\n===END==='
+
+    runner = DynamicToolRunner(
+        client=_FakeClient(),
+        tools_dir=tmp_path,
+        fast_model="q",
+        strong_model="q",
+    )
+    # The retry is inside OllamaTextClient.generate; test it directly.
+    import urllib.error
+    attempt = [0]
+    slept_vals: list[float] = []
+
+    client = OllamaTextClient(endpoint="http://localhost:11434", model="q", timeout_seconds=5)
+
+    original_sleep = __import__("time").sleep
+
+    def _fake_sleep(s):
+        slept_vals.append(s)
+
+    import unittest.mock as mock
+    responses = [
+        urllib.error.HTTPError("url", 503, "Service Unavailable", {}, None),
+        urllib.error.HTTPError("url", 503, "Service Unavailable", {}, None),
+        None,  # success on 3rd
+    ]
+    call_idx = [0]
+
+    def _fake_urlopen(req, timeout=None):
+        idx = call_idx[0]
+        call_idx[0] += 1
+        exc = responses[idx]
+        if exc is not None:
+            raise exc
+
+        class _FakeResp:
+            def read(self): return b'{"response": "hello"}'
+            def __enter__(self): return self
+            def __exit__(self, *_): pass
+
+        return _FakeResp()
+
+    with mock.patch("openclaw_adapter.dynamic_tools.urlopen", _fake_urlopen), \
+         mock.patch("openclaw_adapter.dynamic_tools.time.sleep", _fake_sleep):
+        result = client.generate("test prompt")
+
+    assert result == "hello"
+    assert call_idx[0] == 3
+    assert len(slept_vals) == 2
+
+
+def test_ollama_generate_raises_after_all_retries_exhausted() -> None:
+    import urllib.error
+    import unittest.mock as mock
+
+    client = OllamaTextClient(endpoint="http://localhost:11434", model="q", timeout_seconds=5)
+
+    def _always_fail(req, timeout=None):
+        raise urllib.error.URLError("Connection refused")
+
+    with mock.patch("openclaw_adapter.dynamic_tools.urlopen", _always_fail), \
+         mock.patch("openclaw_adapter.dynamic_tools.time.sleep", lambda _: None):
+        with pytest.raises(RuntimeError, match="Ollama 不在線"):
+            client.generate("test prompt")
+
+
+def test_ollama_generate_does_not_retry_on_4xx() -> None:
+    import urllib.error
+    import unittest.mock as mock
+
+    client = OllamaTextClient(endpoint="http://localhost:11434", model="q", timeout_seconds=5)
+    call_count = [0]
+
+    def _bad_request(req, timeout=None):
+        call_count[0] += 1
+        raise urllib.error.HTTPError("url", 400, "Bad Request", {}, None)
+
+    with mock.patch("openclaw_adapter.dynamic_tools.urlopen", _bad_request):
+        with pytest.raises(RuntimeError, match="400"):
+            client.generate("test prompt")
+
+    assert call_count[0] == 1  # no retry on 4xx

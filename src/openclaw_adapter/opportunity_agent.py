@@ -2142,9 +2142,29 @@ def _call_ollama_json(
         headers={"Content-Type": "application/json", "Accept": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=timeout_seconds, context=ssl_context) as response:
-        data = json.loads(response.read().decode("utf-8"))
-    return str(data.get("response") or "").strip()
+    _max_retries = 3
+    last_exc: Exception | None = None
+    for attempt in range(1, _max_retries + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout_seconds, context=ssl_context) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            return str(data.get("response") or "").strip()
+        except urllib.error.HTTPError as exc:
+            if exc.code < 500:
+                raise
+            last_exc = exc
+        except (urllib.error.URLError, OSError) as exc:
+            last_exc = exc
+        if attempt < _max_retries:
+            delay = 1.0 * (2.0 ** (attempt - 1))
+            logger.warning(
+                "_call_ollama_json transient error attempt %d/%d retrying in %.0fs: %s",
+                attempt, _max_retries, delay, last_exc,
+            )
+            time.sleep(delay)
+    raise RuntimeError(
+        f"Ollama 不在線或無回應（已重試 {_max_retries} 次）"
+    ) from last_exc
 
 
 def _parse_candidate_response(raw: str, *, posts: Sequence[SnsPost], limit: int) -> list[OpportunityCandidate]:
