@@ -1,0 +1,66 @@
+[
+  {
+    "id": "b3_tsla_option_bs",
+    "request": "用 Black-Scholes 模型計算一個 TSLA 歐式買權(call)的合理價格：標的現價 430 美元、履約價 450 美元、距到期 60 天（一年以 365 天計）、無風險年利率 4%、年化波動率 60%、不配息。",
+    "numeric_checks": [
+      {"label": "買權合理價格(美元)", "expected": 34.47, "tolerance_pct": 8.0, "is_pct": false}
+    ],
+    "direction_keywords": [
+      ["black-scholes", "black scholes", "bs"]
+    ],
+    "notes": "主判定指標。正解(Black-Scholes, math.erf 算常態CDF)：S=430,K=450,T=60/365,r=0.04,sigma=0.60,q=0 → d1=-0.038222,d2=-0.281487,CALL=34.4668(PUT=51.5176)。全參數寫死在 request 內以保證可重現，不依賴即時行情。8% 容差吃下 N(x) 近似與 day-count 細節。"
+  },
+  {
+    "id": "b1_0050",
+    "request": "幫我查0050今年以來到5月的年化報酬",
+    "numeric_checks": [
+      {"label": "今年以來報酬(%)", "expected": 59.7, "tolerance_pct": 9.0, "is_pct": true},
+      {"label": "年化報酬(%)", "expected": 219.5, "tolerance_pct": 9.0, "is_pct": true}
+    ],
+    "direction_keywords": [],
+    "notes": "正解(2026-05-31 抓 Yahoo 日線)：起點01-02收66.95、終點05-29收105.40、配息1.0(01-22)、147天。YTD價格+57.4%/含息+59.7%；複利年化價格+208.6%/含息+219.5%。9% 容差吃下價格vs含息與日數差異。"
+  },
+  {
+    "id": "b2_tsla_fy2025",
+    "request": "請用 yfinance 查詢 TSLA FY2025 年度損益表（income_stmt），回報：全年營收（十億美元）、淨利（十億美元）、稀釋EPS（美元/股，不要除以1e9），並與 2024 年做 YoY 比較，用繁體中文描述整體趨勢（例如：營收是成長還是下滑、獲利是大幅衰退還是改善）。",
+    "numeric_checks": [
+      {"label": "營收(十億美元)", "expected": 94.83, "tolerance_pct": 5.0, "is_pct": false},
+      {"label": "淨利(十億美元)", "expected": 3.79, "tolerance_pct": 10.0, "is_pct": false},
+      {"label": "稀釋EPS(美元)", "expected": 1.08, "tolerance_pct": 12.0, "is_pct": false}
+    ],
+    "direction_keywords": [
+      ["營收", "revenue"],
+      ["衰退", "下滑", "減少", "下降", "腰斬", "decline", "drop", "fell"]
+    ],
+    "notes": "正解(Yahoo timeseries, 2025-12-31)：營收$94.83B、淨利$3.79B、稀釋EPS$1.08、毛利率18.03%、營益率5.11%、淨利率4.00%；YoY營收-2.9%、淨利-46.8%、EPS-47%。方向性：營收小幅下滑、獲利大幅衰退。"
+  },
+  {
+    "id": "b4_expense_summary",
+    "request": "分析以下5月份消費紀錄，算出各分類總金額（四捨五入到整數），找出最大消費分類，並列出超過2000元的單筆消費項目（含金額）：\n餐飲,咖啡廳,350\n餐飲,午餐便當,120\n餐飲,晚餐餐廳,1800\n交通,捷運月票,1280\n交通,計程車,650\n娛樂,電影票,480\n娛樂,串流訂閱,330\n娛樂,KTV,2400\n購物,運動鞋,3200\n購物,書籍,450\n醫療,診所掛號,300",
+    "numeric_checks": [
+      {"label": "餐飲總計(元)", "expected": 2270, "tolerance_pct": 1.0, "is_pct": false},
+      {"label": "購物總計(元)", "expected": 3650, "tolerance_pct": 1.0, "is_pct": false}
+    ],
+    "direction_keywords": [
+      ["購物"],
+      ["3650"],
+      ["KTV", "ktv"],
+      ["3200", "運動鞋"]
+    ],
+    "notes": "確定性算術題（資料全硬編碼在 request 內，不需外部 API）。正解：餐飲=2270, 交通=1930, 娛樂=3210, 購物=3650, 醫療=300。最大分類=購物3650。超過2000元單筆：KTV 2400、運動鞋 3200。"
+  },
+  {
+    "id": "b5_dca_investment",
+    "request": "我每月月底定期定額投入新台幣 1 萬元，預期年化報酬率 6%（以每月複利計算），連續投入 30 年。請計算並分別列出：(1) 期末總資產、(2) 累積總投入本金、(3) 總投資獲利（期末總資產扣除本金），單位為新台幣元。",
+    "numeric_checks": [
+      {"label": "期末總資產(元)", "expected": 10045150, "tolerance_pct": 5.0, "is_pct": false},
+      {"label": "累積總投入本金(元)", "expected": 3600000, "tolerance_pct": 2.0, "is_pct": false},
+      {"label": "總投資獲利(元)", "expected": 6445150, "tolerance_pct": 8.0, "is_pct": false}
+    ],
+    "direction_keywords": [
+      ["本金", "投入"],
+      ["獲利", "報酬", "利息"]
+    ],
+    "notes": "定期定額年金終值，確定性題（參數全寫死、無外部 API）。正解：月底投入1萬、r=0.06/12、n=360。FV=PMT×((1+r)^n−1)/r=10,045,150（annuity-due變體10,095,376）；本金3,600,000；獲利6,445,150。鑑別軸：定期投入年金終值 vs 一次投入單筆成長、年利率→月利率換算、本金/獲利分離。容差±5%排除年投入bug(9,486,982,−5.56%)與單筆bug(20,676,568)，同時收annuity-due變體。"
+  }
+]

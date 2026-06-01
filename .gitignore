@@ -27,6 +27,9 @@ data/*.log
 !data/.gitkeep
 logs/
 run/
+
+# Dynamically self-written tools (/new) + their dedicated venv
+generated_tools/
 .openclaw_tmp/
 .openclaw_ocr/
 reports/
