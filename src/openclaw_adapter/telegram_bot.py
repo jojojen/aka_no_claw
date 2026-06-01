@@ -407,6 +407,7 @@ def run_telegram_polling(
         recover_handler=build_recover_handler(settings),
         scorecard_handler=build_scorecard_handler(settings),
         rag_callback_handler=_build_rag_callback_handler(settings),
+        knowledge_db_path=str(settings.knowledge_db_path),
         watch_db=watch_db,
         sns_db=sns_db,
         sns_buzz_fn=sns_buzz_fn,
