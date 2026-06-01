@@ -46,6 +46,7 @@ from price_monitor_bot.watch_monitor import ensure_monitor as _ensure_watch_moni
 from tcg_tracker.image_lookup import TcgVisionSettings
 
 from .backup_command import BackupScheduler, build_backup_handler, build_recover_handler
+from .opportunity_scorecard import build_scorecard_handler
 from .dynamic_tools import build_dynamic_tool_runner_from_settings
 from .knowledge_command import build_knowledge_handler
 from .natural_language import build_telegram_natural_language_router_from_settings
@@ -402,6 +403,7 @@ def run_telegram_polling(
         dynamic_tool_handler=dynamic_tool_handler,
         backup_handler=build_backup_handler(settings),
         recover_handler=build_recover_handler(settings),
+        scorecard_handler=build_scorecard_handler(settings),
         watch_db=watch_db,
         sns_db=sns_db,
         sns_buzz_fn=sns_buzz_fn,
