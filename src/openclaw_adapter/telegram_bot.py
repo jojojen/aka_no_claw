@@ -50,6 +50,11 @@ from .opportunity_scorecard import build_scorecard_handler
 from .rag_daily_digest import RagDailyDigestScheduler, handle_ragdel_callback, handle_ragkeep_callback
 from .dynamic_tools import build_dynamic_tool_runner_from_settings
 from .knowledge_command import build_knowledge_handler
+from .quiz_command import (
+    build_quiz_callback_handler,
+    build_quiz_handler,
+    start_quiz_daily_scheduler,
+)
 from .natural_language import build_telegram_natural_language_router_from_settings
 from .opportunity_agent import (
     dismiss_opportunity_target,
@@ -376,6 +381,7 @@ def run_telegram_polling(
     _start_card_image_crawler(watch_db)
     _start_backup_scheduler(settings)
     rag_digest_scheduler = _start_rag_daily_digest(settings)
+    quiz_daily_scheduler = start_quiz_daily_scheduler(settings)
     dynamic_tool_runner = build_dynamic_tool_runner_from_settings(settings)
     dynamic_tool_handler = (
         (lambda req: dynamic_tool_runner.run(req)) if dynamic_tool_runner is not None else None
@@ -407,6 +413,8 @@ def run_telegram_polling(
         recover_handler=build_recover_handler(settings),
         scorecard_handler=build_scorecard_handler(settings),
         rag_callback_handler=_build_rag_callback_handler(settings),
+        quiz_handler=build_quiz_handler(settings),
+        quiz_callback_handler=build_quiz_callback_handler(settings),
         knowledge_db_path=str(settings.knowledge_db_path),
         watch_db=watch_db,
         sns_db=sns_db,

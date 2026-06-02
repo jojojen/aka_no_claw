@@ -2124,6 +2124,7 @@ def _call_ollama_json(
     prompt: str,
     timeout_seconds: int,
     ssl_context: ssl.SSLContext | None,
+    temperature: float = 0,
 ) -> str:
     url = endpoint.rstrip("/")
     if not url.endswith("/api/generate"):
@@ -2134,7 +2135,7 @@ def _call_ollama_json(
         "stream": False,
         "format": "json",
         "think": False,  # disable qwen3 thinking mode; ignored by other models
-        "options": {"temperature": 0, "num_predict": 700},
+        "options": {"temperature": temperature, "num_predict": 700},
     }
     request = urllib.request.Request(
         url,
