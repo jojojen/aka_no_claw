@@ -7,6 +7,7 @@ from openclaw_adapter.quiz_db import (
     QuizDatabase,
     build_question_id,
     format_authoring_knowledge_block,
+    is_grounded,
 )
 
 
@@ -28,6 +29,7 @@ def _insert_sample(db, *, stem="次の___に入る語を選べ。", source_name=
         source_media_url="https://youtube.com/watch?v=x",
         source_excerpt="朝、目が覚めて…",
         verified=True,
+        allow_ungrounded=True,
     )
 
 
@@ -99,6 +101,7 @@ class TestQuestions:
             options=("a", "b", "c", "d"),
             answer_index=0,
             source_name="songB",
+            allow_ungrounded=True,
         )
         picked = db.random_question(level="JLPT N1")
         assert picked is not None and picked.level == "JLPT N1"
@@ -118,6 +121,119 @@ class TestQuestions:
         assert db.count_verified(level="JLPT N1") == 1
         assert db.delete_question(q.question_id) is True
         assert db.count_verified(level="JLPT N1") == 0
+
+
+class TestGrounding:
+    """The hard invariant: a question's user-visible real text must be a verbatim
+    substring of the real source_excerpt. Fabricated stems must be rejected."""
+
+    LYRIC = "悲しみの海に沈んだ私　このままどこまでも堕ちて行き"
+
+    def test_cloze_on_real_line_is_grounded(self):
+        # Stem IS the real lyric line with a grammatical element blanked → grounded.
+        assert is_grounded(
+            exam_point="文法形式の判断",
+            stem="悲しみの海に沈んだ私、このまま（　　）堕ちて行く。",
+            options=("どこまでも", "あえて", "しぶしぶ", "むやみに"),
+            answer_index=0,
+            source_excerpt=self.LYRIC,
+        )
+
+    def test_fabricated_stem_is_rejected(self):
+        # The 深海少女 bug: stem is a made-up sentence, not the real lyric.
+        assert not is_grounded(
+            exam_point="文法形式の判断",
+            stem="黒い海に行く手を阻まれ、少女は深く沈むこと（　　）。",
+            options=("には当たらない", "に堪えなかった", "を余儀なくされた", "をものともしなかった"),
+            answer_index=2,
+            source_excerpt=self.LYRIC,
+        )
+
+    def test_iikae_quotes_real_line_is_grounded(self):
+        # 言い換え: the real line sits inside the stem (excerpt ⊆ stem).
+        assert is_grounded(
+            exam_point="言い換え類義",
+            stem="「〈大胆不敵〉にハイカラ革命」の〈大胆不敵〉に最も近い意味はどれか。",
+            options=("恐れを知らず大胆な", "用心深く慎重な", "礼儀正しい", "おとなしい"),
+            answer_index=0,
+            source_excerpt="大胆不敵にハイカラ革命",
+        )
+
+    def test_youhou_correct_option_must_be_real_line(self):
+        # 用法: correct option = the real lyric line → grounded; otherwise rejected.
+        assert is_grounded(
+            exam_point="用法",
+            stem="「蔑む」の使い方として最も適切なものはどれか。",
+            options=(
+                "吐き出す様な暴力と蔑んだ目の毎日に",
+                "彼は努力を蔑んで合格した",
+                "蔑む音楽が好きだ",
+                "蔑んだ料理を食べた",
+            ),
+            answer_index=0,
+            source_excerpt="吐き出す様な暴力と　蔑んだ目の毎日に",
+        )
+        assert not is_grounded(
+            exam_point="用法",
+            stem="「蔑む」の使い方として最も適切なものはどれか。",
+            options=("彼を蔑む", "蔑む朝", "蔑む色", "蔑む音"),
+            answer_index=0,
+            source_excerpt="吐き出す様な暴力と　蔑んだ目の毎日に",
+        )
+
+    def test_reading_type_grounded_by_excerpt_presence(self):
+        # 内容理解: the 本文 (== excerpt) is rendered verbatim → grounded.
+        assert is_grounded(
+            exam_point="内容理解（短文）",
+            stem="次の文章を読み、語り手の心情として最も適切なものはどれか。",
+            options=("a", "b", "c", "d"),
+            answer_index=0,
+            source_excerpt="こんな僕が生きてるだけで　何万人のひとが悲しんで",
+        )
+
+    def test_explanation_citing_equivalent_line_is_grounded(self):
+        # Tier C: a constructed grammar stem is acceptable IF the explanation quotes
+        # the equivalent real lyric line verbatim (等価於哪句原歌詞).
+        assert is_grounded(
+            exam_point="文法形式の判断",
+            stem="本当の気持ちを素直に言え（　　）だった。",
+            options=("がてら", "なり", "そばから", "ずじまい"),
+            answer_index=3,
+            source_excerpt="まだ素直に言葉に出来ない僕は天性の弱虫さ",
+            explanation="原歌詞「まだ素直に言葉に出来ない僕は天性の弱虫さ」に対応。「ずじまい」が正解。",
+        )
+
+    def test_fabricated_without_citation_is_rejected(self):
+        assert not is_grounded(
+            exam_point="文法形式の判断",
+            stem="本当の気持ちを素直に言え（　　）だった。",
+            options=("がてら", "なり", "そばから", "ずじまい"),
+            answer_index=3,
+            source_excerpt="まだ素直に言葉に出来ない僕は天性の弱虫さ",
+            explanation="「ずじまい」は結局～しなかったの意。",
+        )
+
+    def test_empty_excerpt_is_rejected(self):
+        assert not is_grounded(
+            exam_point="文法形式の判断",
+            stem="何か（　　）。",
+            options=("a", "b", "c", "d"),
+            answer_index=0,
+            source_excerpt=None,
+        )
+
+    def test_insert_rejects_ungrounded(self, tmp_path):
+        db = _db(tmp_path)
+        with pytest.raises(ValueError):
+            db.insert_question(
+                level="JLPT N1",
+                exam_point="文法形式の判断",
+                stem="黒い海に行く手を阻まれ、少女は深く沈むこと（　　）。",
+                options=("には当たらない", "に堪えなかった", "を余儀なくされた", "をものともしなかった"),
+                answer_index=2,
+                source_name="深海少女",
+                source_excerpt="悲しみの海に沈んだ私　このままどこまでも堕ちて行き",
+            )
 
 
 class TestAuthoringKnowledge:

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -29,6 +30,137 @@ from pathlib import Path
 from typing import Iterator
 
 logger = logging.getLogger(__name__)
+
+
+# ── Source-grounding gate ──────────────────────────────────────────────────────
+# HARD INVARIANT (enforced here, not merely advised in the authoring KB): every
+# question's answer-bearing, user-visible text must come from real source text —
+# a real lyric line or a real article sentence — never a fabricated sentence
+# merely "themed on" a song. The KB can't enforce this (it's a soft RAG hint that
+# can be missed); this gate makes ungrounded questions impossible to insert.
+
+# exam_points whose 本文 (== source_excerpt) is itself rendered to the user.
+READING_MARKERS: tuple[str, ...] = ("内容理解", "主張", "統合", "情報検索", "読解")
+
+# Tokens we treat as a blank / reorder slot when splitting a stem.
+_BLANK_SPLIT = re.compile(r"[＿_]{1,}|★|[（(][\s　]*[）)]")
+# Whitespace, line separators and sentence punctuation to ignore when matching.
+_NOISE = re.compile(r"[\s　、。，．・…‥「」『』（）()〈〉【】！？!?～~／/＝=]+")
+# Quoted spans inside a stem — these hold the real line for 言い換え / quoted types.
+_QUOTED = re.compile(r"[「『]([^「『」』]+)[」』]")
+# Minimum verbatim run that counts as a real-text anchor (avoid trivial overlaps).
+_MIN_ANCHOR = 4
+# A cloze carrier must reproduce at least this fraction of the real line — a genuine
+# blank removes only one word, so coverage stays high; a fabricated paraphrase that
+# merely reuses a short fragment (e.g.「どれも不正解」) covers far less and is rejected.
+_MIN_COVERAGE = 0.6
+
+
+def is_reading_exam_point(exam_point: str | None) -> bool:
+    ep = exam_point or ""
+    return any(m in ep for m in READING_MARKERS)
+
+
+def _normalize_grounding(text: str | None) -> str:
+    return _NOISE.sub("", text or "")
+
+
+def _stem_segments(stem: str) -> list[str]:
+    """Split a stem on blank/reorder slots, keeping bracketed real words (the 〈〉
+    of a 言い換え target is part of the real line), then normalize each piece."""
+    pieces = _BLANK_SPLIT.split(stem or "")
+    return [seg for seg in (_normalize_grounding(p) for p in pieces) if len(seg) >= 2]
+
+
+def _longest_common_substring_len(a: str, b: str) -> int:
+    """Length of the longest contiguous run shared by ``a`` and ``b``. Used to
+    confirm a cloze carrier IS the real line even when meta boilerplate ("…の」の…")
+    bleeds into the carrier segment — a verbatim run survives, a paraphrase doesn't."""
+    if not a or not b:
+        return 0
+    prev = [0] * (len(b) + 1)
+    best = 0
+    for ch_a in a:
+        cur = [0] * (len(b) + 1)
+        for j, ch_b in enumerate(b):
+            if ch_a == ch_b:
+                cur[j + 1] = prev[j] + 1
+                if cur[j + 1] > best:
+                    best = cur[j + 1]
+        prev = cur
+    return best
+
+
+def is_grounded(
+    *,
+    exam_point: str,
+    stem: str,
+    options: tuple[str, ...],
+    answer_index: int,
+    source_excerpt: str | None,
+    explanation: str = "",
+) -> bool:
+    """True iff the question is anchored in real source text, so fabrication is
+    rejected. Grounding is satisfied by ANY of three tiers (the user's ruling):
+
+      A. the stem IS the real line (cloze carrier verbatim, or 言い換え/漢字読み quote),
+      B. the CORRECT OPTION is the real line (the only stem-side anchor for 用法),
+      C. the EXPLANATION quotes the equivalent real line verbatim (等価於哪句原歌詞) —
+         needed because N1 grammar rarely appears verbatim in lyrics; a constructed
+         stem is acceptable ONLY if it transparently cites the line it mirrors.
+
+    Reading types are grounded by presence (本文 == excerpt is rendered verbatim).
+    """
+    excerpt = _normalize_grounding(source_excerpt)
+    if len(excerpt) < _MIN_ANCHOR:
+        return False
+    ep = exam_point or ""
+
+    # Reading comp: the 本文 (== excerpt) is itself rendered to the user verbatim.
+    if is_reading_exam_point(ep):
+        return True
+
+    # Tier C — the explanation quotes the full equivalent real line.
+    if excerpt in _normalize_grounding(explanation):
+        return True
+
+    # 用法: the test sentences (options) are necessarily constructed, so the ONLY
+    # real-text anchor is the correct option being the actual lyric line. A mere
+    # headword match (e.g. quoted「ほろ苦い」appearing in the lyric) is NOT enough.
+    if "用法" in ep:
+        if 0 <= answer_index < len(options):
+            correct = _normalize_grounding(options[answer_index])
+            return len(correct) >= _MIN_ANCHOR and correct in excerpt
+        return False
+
+    # Cloze / grammar / 組み立て (stem carries a blank slot): the carrier sentence
+    # minus its blank must BE the real line. A genuine cloze removes only one word,
+    # so the surviving segments still cover MOST of the real line; a fabricated
+    # paraphrase that merely reuses a short fragment (LCS 6–11 chars) covers far
+    # less. We require coverage ≥ _MIN_COVERAGE of the excerpt, summing the verbatim
+    # run each stem segment contributes. Meta boilerplate ("…に入るものは…") shares no
+    # run with the excerpt, so it adds nothing and is naturally ignored.
+    if _BLANK_SPLIT.search(stem or ""):
+        segs = _stem_segments(stem)
+        covered = sum(
+            min(len(s), _longest_common_substring_len(s, excerpt)) for s in segs
+        )
+        return covered >= _MIN_COVERAGE * len(excerpt)
+
+    # No blank (言い換え / 漢字読み / quoted carriers): the real line is quoted in the
+    # stem, or the whole excerpt is embedded in the stem.
+    if excerpt in _normalize_grounding(stem):
+        return True
+    for span in _QUOTED.findall(stem or ""):
+        anchor = _normalize_grounding(span)
+        if len(anchor) >= _MIN_ANCHOR and anchor in excerpt:
+            return True
+    # Last resort: the correct option happens to be the real line.
+    if 0 <= answer_index < len(options):
+        correct = _normalize_grounding(options[answer_index])
+        if len(correct) >= _MIN_ANCHOR and correct in excerpt:
+            return True
+    return False
 
 
 _SCHEMA = """
@@ -167,9 +299,12 @@ class QuizDatabase:
         source_media_url: str | None = None,
         source_excerpt: str | None = None,
         verified: bool = True,
+        allow_ungrounded: bool = False,
     ) -> QuizQuestion:
         """Insert (or overwrite, keyed on question_id) one question. Validates the
-        multiple-choice shape so a malformed generation can't poison the pool."""
+        multiple-choice shape AND source-grounding so a fabricated or malformed
+        generation can't poison the pool. ``allow_ungrounded`` bypasses only the
+        grounding gate (for tests of unrelated DB mechanics)."""
         level = (level or "").strip()
         stem = (stem or "").strip()
         opts = tuple(str(o).strip() for o in options if str(o).strip())
@@ -179,6 +314,19 @@ class QuizDatabase:
             raise ValueError("question requires at least 2 options")
         if not (0 <= int(answer_index) < len(opts)):
             raise ValueError(f"answer_index {answer_index} out of range for {len(opts)} options")
+        if not allow_ungrounded and not is_grounded(
+            exam_point=exam_point or "",
+            stem=stem,
+            options=opts,
+            answer_index=int(answer_index),
+            source_excerpt=source_excerpt,
+            explanation=explanation or "",
+        ):
+            raise ValueError(
+                "question not grounded: the user-visible real text (stem minus "
+                "blanks, the quoted line, or the correct option) must be a verbatim "
+                "substring of source_excerpt — no fabricated sentences"
+            )
         now = _utc_now_iso()
         question_id = build_question_id(level=level, source_name=source_name, stem=stem)
         with self.connect() as conn:

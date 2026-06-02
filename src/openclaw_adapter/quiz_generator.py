@@ -256,20 +256,24 @@ class QuizGenerator:
             )
             return None
 
-        return self._db.insert_question(
-            level=level,
-            exam_point=exam_point or "unknown",
-            stem=stem,
-            options=tuple(options),
-            answer_index=answer_index,
-            explanation=explanation,
-            source_type=source.source_type,
-            source_name=source.name,
-            source_text_url=source.text_url,
-            source_media_url=source.media_url,
-            source_excerpt=source.excerpt,
-            verified=True,
-        )
+        try:
+            return self._db.insert_question(
+                level=level,
+                exam_point=exam_point or "unknown",
+                stem=stem,
+                options=tuple(options),
+                answer_index=answer_index,
+                explanation=explanation,
+                source_type=source.source_type,
+                source_name=source.name,
+                source_text_url=source.text_url,
+                source_media_url=source.media_url,
+                source_excerpt=source.excerpt,
+                verified=True,
+            )
+        except ValueError as exc:
+            logger.info("quiz: rejected generation (%s) — discarding", exc)
+            return None
 
 
 def _seconds_until_next(hour: int) -> float:
