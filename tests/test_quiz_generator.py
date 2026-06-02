@@ -32,10 +32,12 @@ class FakeProvider:
 
 
 def _author_payload(answer_index=2):
+    # Stem is a cloze on the FakeProvider excerpt ("これはテスト用の本文です。") so it
+    # passes the source-grounding gate — the gate is exercised end-to-end here.
     return json.dumps(
         {
             "exam_point": "文法",
-            "stem": "次の文の___に最も適切なものを選べ。",
+            "stem": "これはテスト用の___です。",
             "options": ["A案", "B案", "C案", "D案"],
             "answer_index": answer_index,
             "explanation": "C が正しい。",

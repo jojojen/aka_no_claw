@@ -28,6 +28,8 @@ from typing import Callable
 
 from assistant_runtime import AssistantSettings, build_ssl_context
 
+from .quiz_db import is_reading_exam_point as _is_reading
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_LEVEL = "JLPT N1"
@@ -38,13 +40,8 @@ _REVIEW_PAGE_SIZE = 3
 _LYRIC_SOURCE_TYPES = {"vocaloid_song", "jpop_song"}
 # Only reading-comprehension types get a 本文 block. Cloze types (漢字読み/文脈規定/
 # 文法…) are self-contained in the stem; showing their grounding line would leak
-# the answer (it IS the clozed/extracted sentence).
-_READING_MARKERS = ("内容理解", "主張", "統合", "情報検索", "読解")
-
-
-def _is_reading(exam_point: str | None) -> bool:
-    ep = exam_point or ""
-    return any(m in ep for m in _READING_MARKERS)
+# the answer (it IS the clozed/extracted sentence). The canonical predicate lives
+# in quiz_db so the insert-time grounding gate and this renderer never drift.
 
 
 # ── shared construction ───────────────────────────────────────────────────────
