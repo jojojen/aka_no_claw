@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from openclaw_adapter.quiz_command import _grade_view, _is_commentary_url
 
 
-def _q(*, source_type, text_url, exam_point="内容理解（中文）"):
+def _q(*, source_type, text_url, exam_point="内容理解（中文）", author="Claude"):
     return SimpleNamespace(
         level="JLPT N1",
         exam_point=exam_point,
@@ -16,6 +16,7 @@ def _q(*, source_type, text_url, exam_point="内容理解（中文）"):
         source_text_url=text_url,
         source_media_url="https://www.youtube.com/watch?v=dSw8CucthGc",
         source_excerpt="x",
+        author=author,
     )
 
 
@@ -44,3 +45,9 @@ def test_song_grounded_on_commentary_labeled_as_commentary():
     _, text = _grade_view(q, "orig", chosen=0)
     assert "📖 賞析・解説原文：" in text
     assert "歌詞原文" not in text
+
+
+def test_author_shown_in_reveal():
+    q = _q(source_type="vocaloid_song", text_url="https://utaten.com/lyric/jb1/", author="codex")
+    _, text = _grade_view(q, "orig", chosen=0)
+    assert "🖋️ 出題者：codex" in text

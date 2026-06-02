@@ -123,6 +123,37 @@ class TestQuestions:
         assert db.count_verified(level="JLPT N1") == 0
 
 
+class TestAuthorColumn:
+    def test_fresh_db_defaults_author_to_claude(self, tmp_path):
+        db = _db(tmp_path)
+        q = _insert_sample(db)
+        assert db.get_question(q.question_id).author == "Claude"
+
+    def test_bootstrap_is_idempotent(self, tmp_path):
+        db = _db(tmp_path)
+        q = _insert_sample(db)
+        # Re-running bootstrap (as happens on every startup) must not raise nor
+        # disturb existing rows — the PRAGMA guard skips a second ADD COLUMN.
+        db.bootstrap()
+        db.bootstrap()
+        assert db.count_verified(level="JLPT N1") == 1
+        assert db.get_question(q.question_id).author == "Claude"
+
+    def test_non_default_author_roundtrips(self, tmp_path):
+        db = _db(tmp_path)
+        q = db.insert_question(
+            level="JLPT N1",
+            exam_point="文法",
+            stem="codex authored",
+            options=("a", "b", "c", "d"),
+            answer_index=0,
+            source_name="codexsong",
+            author="codex",
+            allow_ungrounded=True,
+        )
+        assert db.get_question(q.question_id).author == "codex"
+
+
 class TestGrounding:
     """The hard invariant: a question's user-visible real text must be a verbatim
     substring of the real source_excerpt. Fabricated stems must be rejected."""
