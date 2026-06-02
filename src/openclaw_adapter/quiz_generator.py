@@ -1,0 +1,331 @@
+"""Quiz question generator with dual-LLM verification.
+
+Priority #1 is answer correctness, so generation has two independent LLM passes:
+  1. An *author* pass produces a question grounded in real source material, with
+     retrieved authoring-knowledge injected into the prompt (the self-improving RAG
+     loop — reviewer corrections accumulate there and steer future generations).
+  2. A *grader* pass re-solves the question seeing ONLY the stem + options (never
+     the intended answer). The question is accepted into the verified pool only if
+     the grader independently lands on the same answer. Otherwise it's discarded and
+     regenerated, up to a retry budget.
+
+The generator is source-agnostic: it only talks to the ``SourceProvider`` interface,
+so new themes (JPOP, essays, …) plug in with no change here.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import random
+import re
+import ssl
+import threading
+import time
+from datetime import datetime, timedelta
+from typing import Callable
+
+from .quiz_db import (
+    QuizDatabase,
+    QuizQuestion,
+    format_authoring_knowledge_block,
+)
+from .quiz_sources import QuizSource, SourceProvider, get_provider
+
+logger = logging.getLogger(__name__)
+
+
+def _strip_json_fence(raw: str) -> str:
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
+        text = re.sub(r"\n?```$", "", text).strip()
+    return text
+
+
+def _parse_json(raw: str) -> dict | None:
+    try:
+        parsed = json.loads(_strip_json_fence(raw))
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+_VOCAB_RULES = (
+    "本題型固定為「単語」（文字・語彙），不可改出文法／読解或其他題型。\n"
+    "最重要：答案必須『客觀唯一』，獨立的解題者只看題幹+選項也必能選到同一個答案。\n"
+    "因此一律採用 JLPT 官方文字・語彙的標準題型，三選一（不可自創主觀題型，"
+    "嚴禁問『最も適切な意味』『この歌の…』這類沒有唯一解的主觀題）：\n"
+    "\n"
+    "【A 漢字読み】句中有一個加〈〉標記的 N1 漢字詞，問它的讀音。\n"
+    "  例：stem「彼の発言で場が〈和〉んだ。『和んだ』の読み方は？」\n"
+    "      options=[\"なごんだ\",\"やわらんだ\",\"あえんだ\",\"わらんだ\"] 正解=0。\n"
+    "  四個選項皆為平假名讀音，只有一個是該詞真正讀法，其餘為似是而非的誤讀。\n"
+    "\n"
+    "【B 言い換え類義】句中有一個加〈〉標記的 N1 詞，問與它『意思最接近』的詞。\n"
+    "  例：stem「彼は仕事に〈没頭〉している。〈没頭〉に最も近い意味は？」\n"
+    "      options=[\"夢中になる\",\"飽きている\",\"困っている\",\"休んでいる\"] 正解=0。\n"
+    "  正解須為公認同義／近義；其餘三個語意明顯不同（不可模稜兩可）。\n"
+    "  ★鐵則：正解必須是『另一個不同的詞或片語』。被考的詞本身、或它換成純假名／"
+    "漢字的同一個詞，都【絕對不可】當成任何一個選項——那是同一個詞，不算言い換え。\n"
+    "  例（錯誤示範，禁止）：考〈躓いた〉卻把「つまずいた」當正解（那只是它的假名）。\n"
+    "\n"
+    "【C 文脈規定】給一個完整句子並挖空（用 ＿＿＿ 表示），問填入哪個 N1 詞最恰當。\n"
+    "  例：stem「徹夜続きで＿＿＿が溜まっている。」\n"
+    "      options=[\"疲労\",\"疲労感を解消\",\"健康\",\"睡眠\"] 正解=0。\n"
+    "  只有一個詞在語法與語意上都正確，其餘三個放進空格會明顯不通。\n"
+    "\n"
+    "共同規則（務必遵守）：\n"
+    "1. 只考一個 N1 等級的詞彙；考點詞請盡量取自下方素材片段中真實出現的詞，"
+    "若素材沒有合適的 N1 詞，可自選一個契合作品風格的 N1 詞，但絕不可杜撰歌詞。\n"
+    "2. 題幹必須『自足』——只看題幹與選項就能作答，絕不可要求讀過未提供的歌詞或文章，"
+    "也不可把『理解整首歌』當成考點；歌詞只是取詞來源。\n"
+    "3. 四個選項皆為同類（A 皆讀音／B 皆詞彙／C 皆詞彙），長度相近、看似合理，"
+    "但只有一個客觀正確，其餘三個必須是『明確錯誤』而非『也說得通』。\n"
+    "4. 解說(explanation)裡若提到選項，務必用與 options 相同的 0 起算順序，"
+    "且與 answer_index 完全一致，不可出現自相矛盾的編號；請直接引用選項文字而非只寫編號。\n"
+    "5. exam_point 請填該官方題型名稱：『漢字読み』或『言い換え類義』或『文脈規定』。\n"
+    "6. explanation 結尾務必附一行『【読み】』，把題幹與所有選項中出現的每個漢字詞都標上"
+    "正確平假名讀音，格式如：【読み】環状線（かんじょうせん）・東奔西走（とうほんせいそう）。"
+    "助詞、純假名不用標；但凡含漢字的詞都要標，且讀音必須正確。\n"
+)
+
+
+def _build_author_prompt(
+    *, level: str, source: QuizSource, authoring_block: str, question_type: str | None = "単語"
+) -> str:
+    material = source.excerpt or "(無可用歌詞片段，請改出不依賴特定歌詞、契合該作品風格的通用 N1 単語題，切勿杜撰歌詞)"
+    type_block = _VOCAB_RULES if (question_type or "").strip() == "単語" else (
+        f"本題型固定為「{question_type}」題型（考點），不可改出其他題型。\n"
+        if question_type else
+        "題型（考點）可自由選擇文法／單字／読解等任何單選題能表達的型別。\n"
+    )
+    exam_point_value = question_type or "文法|単語|読解|..."
+    return (
+        "你是嚴謹的日本語能力試驗（JLPT）出題老師。\n"
+        f"請出一題「{level}」等級的單選題，取材自以下日文作品。\n"
+        "最高原則：正解必須客觀、唯一、可驗證；干擾選項要看似合理但確實錯誤。\n"
+        "語言規則：題目與選項用日文；解說用台灣繁體中文（zh-TW）。\n"
+        f"{type_block}\n"
+        f"作品名稱：{source.name}\n"
+        f"素材片段：{material}\n\n"
+        "出題技巧（務必遵守，這是歷次校正累積的規則）：\n"
+        f"{authoring_block}\n\n"
+        "只輸出 JSON，格式如下（options 至少 4 個，answer_index 為 0 起算的正解索引）：\n"
+        f'{{"exam_point": "{exam_point_value}", "stem": "題目文", '
+        '"options": ["...", "...", "...", "..."], "answer_index": 0, '
+        '"explanation": "為何此為正解、其他為何錯（繁體中文）"}'
+    )
+
+
+def _build_grader_prompt(*, level: str, stem: str, options: list[str]) -> str:
+    lines = [f"{i}. {opt}" for i, opt in enumerate(options)]
+    return (
+        f"你是嚴格的 JLPT {level} 解題者。下面是一題單選題，請獨立作答。\n"
+        "只輸出 JSON：{\"answer_index\": <0起算的正解索引>, \"reason\": \"簡短理由\"}\n\n"
+        f"題目：{stem}\n選項：\n" + "\n".join(lines)
+    )
+
+
+class QuizGenerator:
+    def __init__(
+        self,
+        *,
+        db: QuizDatabase,
+        endpoint: str,
+        model: str,
+        timeout_seconds: int = 90,
+        ssl_context: ssl.SSLContext | None = None,
+        max_retries: int = 3,
+        json_call_fn: Callable | None = None,
+    ) -> None:
+        self._db = db
+        self._endpoint = endpoint
+        self._model = model
+        self._timeout_seconds = timeout_seconds
+        self._ssl_context = ssl_context
+        self._max_retries = max(1, max_retries)
+        if json_call_fn is not None:
+            self._json_call_fn = json_call_fn
+        else:
+            from .opportunity_agent import _call_ollama_json
+            self._json_call_fn = _call_ollama_json
+
+    def _llm_json(self, prompt: str, *, temperature: float = 0) -> dict | None:
+        try:
+            raw = self._json_call_fn(
+                endpoint=self._endpoint, model=self._model, prompt=prompt,
+                timeout_seconds=self._timeout_seconds, ssl_context=self._ssl_context,
+                temperature=temperature,
+            )
+        except TypeError:
+            # Custom json_call_fn (e.g. tests) may not accept temperature.
+            raw = self._json_call_fn(
+                endpoint=self._endpoint, model=self._model, prompt=prompt,
+                timeout_seconds=self._timeout_seconds, ssl_context=self._ssl_context,
+            )
+        except Exception:
+            logger.exception("quiz: LLM call failed")
+            return None
+        return _parse_json(raw)
+
+    def generate_one_question(
+        self,
+        *,
+        level: str,
+        theme: str,
+        provider: SourceProvider | None = None,
+        question_type: str | None = "単語",
+    ) -> QuizQuestion | None:
+        """Generate, verify, and store one question. Returns the stored
+        ``QuizQuestion`` or ``None`` if every attempt failed verification."""
+        provider = provider or get_provider(theme)
+        if provider is None:
+            logger.warning("quiz: no source provider for theme=%r", theme)
+            return None
+        try:
+            candidates = provider.fetch_candidates(limit=5)
+        except Exception:
+            logger.exception("quiz: provider.fetch_candidates failed theme=%r", theme)
+            return None
+        if not candidates:
+            logger.info("quiz: no source material for theme=%r", theme)
+            return None
+        # Shuffle so repeated calls don't all build questions from the single
+        # top-ranked song; attempt rotation then walks distinct sources.
+        random.shuffle(candidates)
+
+        for attempt in range(1, self._max_retries + 1):
+            source = candidates[(attempt - 1) % len(candidates)]
+            authoring = self._db.retrieve_authoring_knowledge(
+                f"{level} {source.name} {source.source_type}"
+            )
+            self._db.mark_authoring_applied(tuple(k.knowledge_id for k in authoring))
+            # First attempt deterministic; later attempts warm up so a rejected
+            # question isn't reproduced verbatim (the underlying call pins temp=0).
+            author_temperature = 0.0 if attempt == 1 else min(0.3 * (attempt - 1), 0.8)
+            author = self._llm_json(
+                _build_author_prompt(
+                    level=level,
+                    source=source,
+                    authoring_block=format_authoring_knowledge_block(authoring),
+                    question_type=question_type,
+                ),
+                temperature=author_temperature,
+            )
+            question = self._validate_and_verify(level=level, source=source, author=author)
+            if question is not None:
+                logger.info(
+                    "quiz: generated+verified question source=%s exam_point=%s (attempt %d)",
+                    source.name, question.exam_point, attempt,
+                )
+                return question
+            logger.info("quiz: attempt %d/%d rejected (verification)", attempt, self._max_retries)
+        return None
+
+    def _validate_and_verify(
+        self, *, level: str, source: QuizSource, author: dict | None
+    ) -> QuizQuestion | None:
+        if not author:
+            return None
+        stem = str(author.get("stem") or "").strip()
+        options = [str(o).strip() for o in (author.get("options") or []) if str(o).strip()]
+        explanation = str(author.get("explanation") or "").strip()
+        exam_point = str(author.get("exam_point") or "").strip()
+        try:
+            answer_index = int(author.get("answer_index"))
+        except (TypeError, ValueError):
+            return None
+        if not stem or len(options) < 4 or not (0 <= answer_index < len(options)):
+            return None
+
+        # Independent grader pass — never sees the intended answer.
+        grader = self._llm_json(
+            _build_grader_prompt(level=level, stem=stem, options=options)
+        )
+        if not grader:
+            return None
+        try:
+            grader_index = int(grader.get("answer_index"))
+        except (TypeError, ValueError):
+            return None
+        if grader_index != answer_index:
+            logger.info(
+                "quiz: grader disagreed (author=%d grader=%d) — discarding",
+                answer_index, grader_index,
+            )
+            return None
+
+        return self._db.insert_question(
+            level=level,
+            exam_point=exam_point or "unknown",
+            stem=stem,
+            options=tuple(options),
+            answer_index=answer_index,
+            explanation=explanation,
+            source_type=source.source_type,
+            source_name=source.name,
+            source_text_url=source.text_url,
+            source_media_url=source.media_url,
+            source_excerpt=source.excerpt,
+            verified=True,
+        )
+
+
+def _seconds_until_next(hour: int) -> float:
+    now = datetime.now()
+    target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return (target - now).total_seconds()
+
+
+class QuizDailyScheduler:
+    """Daemon that generates a few verified questions per day into the pool."""
+
+    def __init__(
+        self,
+        *,
+        generator: QuizGenerator,
+        level: str = "JLPT N1",
+        theme: str = "miku",
+        per_day: int = 2,
+        hour: int = 4,
+        question_type: str | None = "単語",
+    ) -> None:
+        self._generator = generator
+        self._level = level
+        self._theme = theme
+        self._per_day = max(1, per_day)
+        self._hour = hour
+        self._question_type = question_type
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._loop, name="quiz-daily-gen", daemon=True)
+        self._thread.start()
+        logger.info(
+            "QuizDailyScheduler started — generates %d question(s)/day at %02d:00",
+            self._per_day, self._hour,
+        )
+
+    def _loop(self) -> None:
+        while True:
+            time.sleep(_seconds_until_next(self._hour))
+            try:
+                self.generate_batch()
+            except Exception:
+                logger.exception("QuizDailyScheduler: batch failed")
+            time.sleep(23 * 3600)
+
+    def generate_batch(self) -> int:
+        made = 0
+        for _ in range(self._per_day):
+            if self._generator.generate_one_question(
+                level=self._level, theme=self._theme, question_type=self._question_type
+            ):
+                made += 1
+        logger.info("QuizDailyScheduler: produced %d/%d question(s)", made, self._per_day)
+        return made

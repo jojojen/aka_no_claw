@@ -38,6 +38,7 @@ class AssistantSettings:
     log_raw_result_limit: int = 20
     sns_db_path: str = "data/sns.sqlite3"
     knowledge_db_path: str = "data/knowledge.sqlite3"
+    quiz_db_path: str = "data/quiz.sqlite3"
     openclaw_backup_dir: str = "/Volumes/JEN_SSD/claw_data"
     openclaw_backup_interval_hours: int = 24
     sns_classifier_enabled: bool = True
@@ -135,6 +136,7 @@ def get_settings() -> AssistantSettings:
         log_raw_result_limit=_as_int(os.getenv("LOG_RAW_RESULT_LIMIT"), default=20),
         sns_db_path=os.getenv("SNS_DB_PATH", "data/sns.sqlite3"),
         knowledge_db_path=os.getenv("KNOWLEDGE_DB_PATH", "data/knowledge.sqlite3"),
+        quiz_db_path=os.getenv("OPENCLAW_QUIZ_DB_PATH", "data/quiz.sqlite3"),
         openclaw_backup_dir=os.getenv("OPENCLAW_BACKUP_DIR", "/Volumes/JEN_SSD/claw_data"),
         openclaw_backup_interval_hours=_as_int(
             os.getenv("OPENCLAW_BACKUP_INTERVAL_HOURS"), default=24
