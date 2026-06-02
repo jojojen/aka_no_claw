@@ -179,6 +179,7 @@ CREATE TABLE IF NOT EXISTS quiz_questions (
     source_excerpt   TEXT,
     verified         INTEGER NOT NULL DEFAULT 0,
     served_count     INTEGER NOT NULL DEFAULT 0,
+    author           TEXT NOT NULL DEFAULT 'Claude',
     created_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL
 );
@@ -242,6 +243,7 @@ class QuizQuestion:
     source_excerpt: str | None = None
     verified: bool = False
     served_count: int = 0
+    author: str = "Claude"
     created_at: str = ""
     updated_at: str = ""
 
@@ -281,6 +283,11 @@ class QuizDatabase:
     def bootstrap(self) -> None:
         with self.connect() as conn:
             conn.executescript(_SCHEMA)
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(quiz_questions)")}
+            if "author" not in cols:
+                conn.execute(
+                    "ALTER TABLE quiz_questions ADD COLUMN author TEXT NOT NULL DEFAULT 'Claude'"
+                )
 
     # ── Questions ─────────────────────────────────────────────────────────────
 
@@ -299,6 +306,7 @@ class QuizDatabase:
         source_media_url: str | None = None,
         source_excerpt: str | None = None,
         verified: bool = True,
+        author: str = "Claude",
         allow_ungrounded: bool = False,
     ) -> QuizQuestion:
         """Insert (or overwrite, keyed on question_id) one question. Validates the
@@ -341,9 +349,9 @@ class QuizDatabase:
                     question_id, level, exam_point, stem, options_json, answer_index,
                     explanation, source_type, source_name, source_text_url,
                     source_media_url, source_excerpt, verified, served_count,
-                    created_at, updated_at
+                    author, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
                 ON CONFLICT(question_id) DO UPDATE SET
                     exam_point = excluded.exam_point,
                     options_json = excluded.options_json,
@@ -354,6 +362,7 @@ class QuizDatabase:
                     source_media_url = excluded.source_media_url,
                     source_excerpt = excluded.source_excerpt,
                     verified = excluded.verified,
+                    author = excluded.author,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -361,7 +370,8 @@ class QuizDatabase:
                     json.dumps(list(opts), ensure_ascii=False), int(answer_index),
                     (explanation or "").strip(), (source_type or "other").strip(),
                     (source_name or "").strip(), source_text_url, source_media_url,
-                    source_excerpt, 1 if verified else 0, created_at, now,
+                    source_excerpt, 1 if verified else 0,
+                    (author or "Claude").strip(), created_at, now,
                 ),
             )
         loaded = self.get_question(question_id)
@@ -581,6 +591,7 @@ def _row_to_question(row: sqlite3.Row) -> QuizQuestion:
         source_excerpt=row["source_excerpt"],
         verified=bool(row["verified"]),
         served_count=int(row["served_count"]),
+        author=row["author"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )

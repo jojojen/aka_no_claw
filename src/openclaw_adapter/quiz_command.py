@@ -175,6 +175,8 @@ def _grade_view(q, original_text: str, chosen: int) -> tuple[str, str]:
         parts.append(f"📖 {text_label}：{q.source_text_url}")
     if q.source_media_url:
         parts.append(f"🎵 音檔：{q.source_media_url}")
+    if getattr(q, "author", None):
+        parts.append(f"🖋️ 出題者：{q.author}")
     toast = "✅ 答對了！" if ok else "❌ 答錯了"
     return toast, "\n".join(parts)
 
