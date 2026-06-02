@@ -36,8 +36,21 @@ _DEFAULT_LEVEL = "JLPT N1"
 _DEFAULT_THEME = "miku"
 _LETTERS = "ABCDEFGHIJ"
 _REVIEW_PAGE_SIZE = 3
-# source_text_url points to lyrics for these; to a commentary/essay article otherwise.
+# source_text_url usually points to lyrics for these source types — but a song item
+# can instead be grounded on a 賞析/解説 article (e.g. reading-comprehension items),
+# in which case the URL, not source_type, is the truthful signal. See _is_commentary_url.
 _LYRIC_SOURCE_TYPES = {"vocaloid_song", "jpop_song"}
+# Path markers that identify a commentary/解説/考察 article rather than a lyric page.
+# (utaten.com hosts BOTH /lyric/ and /specialArticle/, so we must look at the path.)
+_COMMENTARY_URL_MARKERS = (
+    "specialarticle", "dic.nicovideo", "hatenablog", "ameblo",
+    "note.com", "/blog", "blog.", "/v/", "考察", "解説",
+)
+
+
+def _is_commentary_url(url: str | None) -> bool:
+    u = (url or "").lower()
+    return any(m in u for m in _COMMENTARY_URL_MARKERS)
 # Only reading-comprehension types get a 本文 block. Cloze types (漢字読み/文脈規定/
 # 文法…) are self-contained in the stem; showing their grounding line would leak
 # the answer (it IS the clozed/extracted sentence). The canonical predicate lives
@@ -154,7 +167,11 @@ def _grade_view(q, original_text: str, chosen: int) -> tuple[str, str]:
     if q.explanation:
         parts.append(f"💡 {q.explanation}")
     if q.source_text_url:
-        text_label = "歌詞原文" if q.source_type in _LYRIC_SOURCE_TYPES else "賞析・解説原文"
+        is_lyric = (
+            q.source_type in _LYRIC_SOURCE_TYPES
+            and not _is_commentary_url(q.source_text_url)
+        )
+        text_label = "歌詞原文" if is_lyric else "賞析・解説原文"
         parts.append(f"📖 {text_label}：{q.source_text_url}")
     if q.source_media_url:
         parts.append(f"🎵 音檔：{q.source_media_url}")
