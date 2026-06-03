@@ -142,18 +142,26 @@ def is_grounded(
         return False
 
     # Cloze / grammar / 組み立て (stem carries a blank slot): the carrier sentence
-    # minus its blank must BE the real line. A genuine cloze removes only one word,
-    # so the surviving segments still cover MOST of the real line; a fabricated
-    # paraphrase that merely reuses a short fragment (LCS 6–11 chars) covers far
-    # less. We require coverage ≥ _MIN_COVERAGE of the excerpt, summing the verbatim
-    # run each stem segment contributes. Meta boilerplate ("…に入るものは…") shares no
-    # run with the excerpt, so it adds nothing and is naturally ignored.
+    # minus its blank must BE a real line. A genuine cloze removes only one word, so
+    # the surviving segments still cover MOST of that line; a fabricated paraphrase
+    # that merely reuses a short fragment (LCS 6–11 chars) covers far less.
+    # Coverage is measured against the CARRIER's own length, capped by the excerpt —
+    # a single-line cloze cannot span a multi-line excerpt, yet it is fully grounded
+    # as long as it reproduces a real line minus its one blank. The min(...) cap
+    # keeps this backward-compatible with short single-line excerpts (where the old
+    # excerpt-relative threshold was equivalent). An absolute floor rejects trivially
+    # short carriers.
     if _BLANK_SPLIT.search(stem or ""):
         segs = _stem_segments(stem)
         covered = sum(
             min(len(s), _longest_common_substring_len(s, excerpt)) for s in segs
         )
-        return covered >= _MIN_COVERAGE * len(excerpt)
+        carrier_len = sum(len(s) for s in segs)
+        return (
+            carrier_len > 0
+            and covered >= _MIN_ANCHOR
+            and covered >= _MIN_COVERAGE * min(len(excerpt), carrier_len)
+        )
 
     # No blank (言い換え / 漢字読み / quoted carriers): the real line is quoted in the
     # stem, or the whole excerpt is embedded in the stem.
