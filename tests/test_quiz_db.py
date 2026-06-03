@@ -339,3 +339,152 @@ class TestAuthoringKnowledge:
         )
         assert db.delete_authoring_knowledge(entry.knowledge_id) is True
         assert db.all_authoring_knowledge() == []
+
+
+def _insert_q(db, *, stem, exam_point, tested_point=None, source_name="S", answer_index=1):
+    return db.insert_question(
+        level="JLPT N1",
+        exam_point=exam_point,
+        stem=stem,
+        options=("a", "b", "c", "d"),
+        answer_index=answer_index,
+        explanation="x",
+        source_type="vocaloid_song",
+        source_name=source_name,
+        source_excerpt="朝、目が覚めて…",
+        tested_point=tested_point,
+        verified=True,
+        allow_ungrounded=True,
+    )
+
+
+class TestAdaptiveSelection:
+    def test_tested_point_roundtrips(self, tmp_path):
+        db = _db(tmp_path)
+        q = _insert_q(db, stem="q1", exam_point="用法", tested_point="操る")
+        got = db.get_question(q.question_id)
+        assert got.tested_point == "操る"
+
+    def test_record_attempt_and_mastery_stats(self, tmp_path):
+        db = _db(tmp_path)
+        q = _insert_q(db, stem="q1", exam_point="用法", tested_point="操る")
+        db.record_attempt(question_id=q.question_id, exam_point="用法",
+                          tested_point="操る", level="JLPT N1", chat_id="u1",
+                          chosen_index=0, correct=False)
+        db.record_attempt(question_id=q.question_id, exam_point="用法",
+                          tested_point="操る", level="JLPT N1", chat_id="u1",
+                          chosen_index=1, correct=True)
+        s = db.mastery_stats(chat_id="u1")
+        assert s["total"] == 2
+        ep = {r["key"]: r for r in s["by_type"]}["用法"]
+        assert ep["attempts"] == 2 and ep["corrects"] == 1
+        tp = {r["key"]: r for r in s["by_point"]}["操る"]
+        assert tp["attempts"] == 2 and tp["corrects"] == 1
+
+    def test_mastery_stats_isolated_per_chat(self, tmp_path):
+        db = _db(tmp_path)
+        q = _insert_q(db, stem="q1", exam_point="用法", tested_point="操る")
+        db.record_attempt(question_id=q.question_id, exam_point="用法",
+                          tested_point="操る", level="JLPT N1", chat_id="u1",
+                          chosen_index=0, correct=False)
+        assert db.mastery_stats(chat_id="u2")["total"] == 0
+
+    def test_weighted_question_biases_toward_weak_exam_point(self, tmp_path):
+        import random
+        db = _db(tmp_path)
+        strong = _insert_q(db, stem="strong", exam_point="漢字読み",
+                           tested_point="A", source_name="S1")
+        weak = _insert_q(db, stem="weak", exam_point="文法形式の判断",
+                         tested_point="B", source_name="S2")
+        # Build history: always right on 漢字読み, always wrong on 文法.
+        for _ in range(6):
+            db.record_attempt(question_id=strong.question_id, exam_point="漢字読み",
+                              tested_point="A", level="JLPT N1", chat_id="u1",
+                              chosen_index=1, correct=True)
+            db.record_attempt(question_id=weak.question_id, exam_point="文法形式の判断",
+                              tested_point="B", level="JLPT N1", chat_id="u1",
+                              chosen_index=0, correct=False)
+        rng = random.Random(42)
+        picks = [db.weighted_question(level="JLPT N1", chat_id="u1", rng=rng).question_id
+                 for _ in range(200)]
+        weak_n = picks.count(weak.question_id)
+        assert weak_n > picks.count(strong.question_id)
+
+    def test_weighted_question_biases_toward_weak_tested_point(self, tmp_path):
+        import random
+        db = _db(tmp_path)
+        # Same 題型, two specific 考点 — only one is weak.
+        easy = _insert_q(db, stem="easy", exam_point="用法",
+                         tested_point="操る", source_name="S1")
+        hard = _insert_q(db, stem="hard", exam_point="用法",
+                         tested_point="贖う", source_name="S2")
+        for _ in range(6):
+            db.record_attempt(question_id=easy.question_id, exam_point="用法",
+                              tested_point="操る", level="JLPT N1", chat_id="u1",
+                              chosen_index=1, correct=True)
+            db.record_attempt(question_id=hard.question_id, exam_point="用法",
+                              tested_point="贖う", level="JLPT N1", chat_id="u1",
+                              chosen_index=0, correct=False)
+        rng = random.Random(7)
+        picks = [db.weighted_question(level="JLPT N1", chat_id="u1", rng=rng).question_id
+                 for _ in range(200)]
+        assert picks.count(hard.question_id) > picks.count(easy.question_id)
+
+    def test_weighted_question_cold_start_returns_something(self, tmp_path):
+        import random
+        db = _db(tmp_path)
+        _insert_q(db, stem="q1", exam_point="用法", tested_point="操る")
+        got = db.weighted_question(level="JLPT N1", chat_id="u1", rng=random.Random(1))
+        assert got is not None
+
+    def test_weighted_question_exclude_id_skips_when_alternatives_exist(self, tmp_path):
+        import random
+        db = _db(tmp_path)
+        a = _insert_q(db, stem="qa", exam_point="用法", tested_point="操る", source_name="S1")
+        b = _insert_q(db, stem="qb", exam_point="用法", tested_point="贖う", source_name="S2")
+        for _ in range(20):
+            got = db.weighted_question(level="JLPT N1", chat_id="u1",
+                                       exclude_id=a.question_id, rng=random.Random(_))
+            assert got.question_id == b.question_id
+
+
+class TestDeriveTestedPoint:
+    def test_kanji_reading_word(self):
+        from openclaw_adapter.quiz_db import derive_tested_point
+        s = "「その〈断頭台〉で見下ろして」の〈断頭台〉の読み方として正しいものはどれか。"
+        assert derive_tested_point(exam_point="漢字読み", stem=s, options=[], answer_index=0) == "断頭台"
+
+    def test_kanji_reading_single_bracket_variant(self):
+        from openclaw_adapter.quiz_db import derive_tested_point
+        s = "「〈古今未曾有〉」の読み方として正しいものはどれか。"
+        assert derive_tested_point(exam_point="漢字読み", stem=s, options=[], answer_index=0) == "古今未曾有"
+
+    def test_iikae_meaning_variant_phrasings(self):
+        from openclaw_adapter.quiz_db import derive_tested_point
+        for s, want in [
+            ("「〈みっともない〉暮らしにもうバイバイ」の〈みっともない〉に最も近い意味はどれか。", "みっともない"),
+            ("「怒涛の時代を生きた日本人」の「怒涛」の意味に最も近いものはどれか。", "怒涛"),
+            ("「うまく周囲に溶け込めず悩んでいる」の「溶け込めず」に意味が最も近いものはどれか。", "溶け込めず"),
+        ]:
+            assert derive_tested_point(exam_point="言い換え類義", stem=s, options=[], answer_index=0) == want
+
+    def test_youhou_leading_word(self):
+        from openclaw_adapter.quiz_db import derive_tested_point
+        s = "「操る」の使い方として最も適切なものはどれか。"
+        assert derive_tested_point(exam_point="用法", stem=s, options=[], answer_index=0) == "操る"
+
+    def test_grammar_and_cloze_use_correct_option(self):
+        from openclaw_adapter.quiz_db import derive_tested_point
+        opts = ["だけあって", "がてら", "ばかりに", "とあって"]
+        assert derive_tested_point(exam_point="文法形式の判断", stem="…（　　）…",
+                                   options=opts, answer_index=2) == "ばかりに"
+        opts2 = ["わざとらしい", "初々しい", "たどたどしい", "さりげない"]
+        assert derive_tested_point(exam_point="文脈規定", stem="…（　　）…",
+                                   options=opts2, answer_index=0) == "わざとらしい"
+
+    def test_reading_and_kumitate_return_none(self):
+        from openclaw_adapter.quiz_db import derive_tested_point
+        assert derive_tested_point(exam_point="内容理解（短文）", stem="本文…",
+                                   options=["a", "b"], answer_index=0) is None
+        assert derive_tested_point(exam_point="文の組み立て", stem="並べ替え…",
+                                   options=["a", "b"], answer_index=0) is None

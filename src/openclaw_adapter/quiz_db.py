@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import re
 import sqlite3
 from contextlib import contextmanager
@@ -59,6 +60,52 @@ _MIN_COVERAGE = 0.6
 def is_reading_exam_point(exam_point: str | None) -> bool:
     ep = exam_point or ""
     return any(m in ep for m in READING_MARKERS)
+
+
+# 考点 = the specific knowledge item a question tests (one word / one grammar
+# pattern), as opposed to exam_point which is only the 題型 (question format).
+# Mastery is tracked at this grain so a learner weak on one specific item gets
+# it more often without inflating the whole 題型.
+# A 考点 word in these question types is bracketed in the stem — 〈…〉 / 「…」 / 『…』 —
+# and repeated just before a keyword (読み方 / 最も近い / 使い方). Phrasing varies
+# (の意味に / の語感に / に意味が…), so we take the LAST bracketed token preceding
+# the keyword rather than match one fixed template.
+_BRACKET_TOKEN = re.compile(r"[〈「『]([^〈「『〉」』]+)[〉」』]")
+# Cloze / grammar-form / passage-grammar: the blank's correct option IS the 考点.
+_ANSWER_IS_POINT = ("文脈規定", "文法形式の判断", "文章の文法")
+
+
+def _token_before(stem: str, keyword: str) -> str | None:
+    idx = stem.find(keyword)
+    if idx < 0:
+        return None
+    last = None
+    for m in _BRACKET_TOKEN.finditer(stem):
+        if m.end() <= idx:
+            last = m.group(1).strip()
+    return last or None
+
+
+def derive_tested_point(
+    *, exam_point: str | None, stem: str, options, answer_index: int
+) -> str | None:
+    """Deterministically extract the 考点 from a question's own text. Returns None
+    for types with no clean single point (文の組み立て / 読解), which then fall back
+    to 題型-grain weighting. Used both to backfill legacy rows and as a generator
+    fallback when the author LLM omits tested_point."""
+    ep = (exam_point or "").strip()
+    stem = stem or ""
+    if "漢字読み" in ep:
+        return _token_before(stem, "読み方")
+    if "言い換え" in ep or "類義" in ep:
+        return _token_before(stem, "最も近い")
+    if "用法" in ep:
+        return _token_before(stem, "使い方")
+    if any(k in ep for k in _ANSWER_IS_POINT):
+        opts = list(options or [])
+        if 0 <= answer_index < len(opts):
+            return str(opts[answer_index]).strip() or None
+    return None
 
 
 def _normalize_grounding(text: str | None) -> str:
@@ -258,6 +305,7 @@ CREATE TABLE IF NOT EXISTS quiz_questions (
     source_text_url  TEXT,
     source_media_url TEXT,
     source_excerpt   TEXT,
+    tested_point     TEXT,
     verified         INTEGER NOT NULL DEFAULT 0,
     served_count     INTEGER NOT NULL DEFAULT 0,
     author           TEXT NOT NULL DEFAULT 'Claude',
@@ -268,6 +316,25 @@ CREATE TABLE IF NOT EXISTS quiz_questions (
 CREATE INDEX IF NOT EXISTS idx_quiz_level ON quiz_questions(level);
 CREATE INDEX IF NOT EXISTS idx_quiz_source_type ON quiz_questions(source_type);
 CREATE INDEX IF NOT EXISTS idx_quiz_verified ON quiz_questions(verified);
+
+-- Per-answer log driving adaptive selection. Mastery is computed per learner
+-- (chat_id) at two grains: the specific 考点 (tested_point) when known, else the
+-- 題型 (exam_point). Both are denormalized here so aggregation needs no join.
+CREATE TABLE IF NOT EXISTS quiz_attempts (
+    attempt_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    question_id  TEXT NOT NULL,
+    exam_point   TEXT NOT NULL DEFAULT '',
+    tested_point TEXT,
+    level        TEXT NOT NULL DEFAULT '',
+    chat_id      TEXT NOT NULL DEFAULT '',
+    chosen_index INTEGER NOT NULL,
+    correct      INTEGER NOT NULL,
+    answered_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_attempt_chat_ep ON quiz_attempts(chat_id, exam_point);
+CREATE INDEX IF NOT EXISTS idx_attempt_chat_tp ON quiz_attempts(chat_id, tested_point);
+CREATE INDEX IF NOT EXISTS idx_attempt_chat_q ON quiz_attempts(chat_id, question_id);
 
 CREATE TABLE IF NOT EXISTS quiz_authoring_knowledge (
     knowledge_id  TEXT PRIMARY KEY,
@@ -322,6 +389,7 @@ class QuizQuestion:
     source_text_url: str | None = None
     source_media_url: str | None = None
     source_excerpt: str | None = None
+    tested_point: str | None = None
     verified: bool = False
     served_count: int = 0
     author: str = "Claude"
@@ -369,6 +437,8 @@ class QuizDatabase:
                 conn.execute(
                     "ALTER TABLE quiz_questions ADD COLUMN author TEXT NOT NULL DEFAULT 'Claude'"
                 )
+            if "tested_point" not in cols:
+                conn.execute("ALTER TABLE quiz_questions ADD COLUMN tested_point TEXT")
 
     # ── Questions ─────────────────────────────────────────────────────────────
 
@@ -386,6 +456,7 @@ class QuizDatabase:
         source_text_url: str | None = None,
         source_media_url: str | None = None,
         source_excerpt: str | None = None,
+        tested_point: str | None = None,
         verified: bool = True,
         author: str = "Claude",
         allow_ungrounded: bool = False,
@@ -429,10 +500,10 @@ class QuizDatabase:
                 INSERT INTO quiz_questions (
                     question_id, level, exam_point, stem, options_json, answer_index,
                     explanation, source_type, source_name, source_text_url,
-                    source_media_url, source_excerpt, verified, served_count,
-                    author, created_at, updated_at
+                    source_media_url, source_excerpt, tested_point, verified,
+                    served_count, author, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
                 ON CONFLICT(question_id) DO UPDATE SET
                     exam_point = excluded.exam_point,
                     options_json = excluded.options_json,
@@ -442,6 +513,7 @@ class QuizDatabase:
                     source_text_url = excluded.source_text_url,
                     source_media_url = excluded.source_media_url,
                     source_excerpt = excluded.source_excerpt,
+                    tested_point = excluded.tested_point,
                     verified = excluded.verified,
                     author = excluded.author,
                     updated_at = excluded.updated_at
@@ -451,7 +523,8 @@ class QuizDatabase:
                     json.dumps(list(opts), ensure_ascii=False), int(answer_index),
                     (explanation or "").strip(), (source_type or "other").strip(),
                     (source_name or "").strip(), source_text_url, source_media_url,
-                    source_excerpt, 1 if verified else 0,
+                    source_excerpt, (tested_point or "").strip() or None,
+                    1 if verified else 0,
                     (author or "Claude").strip(), created_at, now,
                 ),
             )
@@ -527,6 +600,118 @@ class QuizDatabase:
                 "WHERE question_id = ?",
                 (_utc_now_iso(), question_id),
             )
+
+    # ── Adaptive selection (answer history → mastery-weighted serving) ─────────
+    def record_attempt(
+        self,
+        *,
+        question_id: str,
+        exam_point: str,
+        tested_point: str | None,
+        level: str,
+        chat_id: str,
+        chosen_index: int,
+        correct: bool,
+    ) -> None:
+        """Log one graded answer. Drives weighted_question's mastery model."""
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO quiz_attempts (question_id, exam_point, tested_point, "
+                "level, chat_id, chosen_index, correct, answered_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    question_id, (exam_point or "").strip(),
+                    (tested_point or "").strip() or None, (level or "").strip(),
+                    str(chat_id or ""), int(chosen_index), 1 if correct else 0,
+                    _utc_now_iso(),
+                ),
+            )
+
+    def _mastery_maps(self, conn, chat_id: str | None):
+        """Return (ep_stats, tp_stats, q_last_correct) for one learner.
+
+        ep_stats / tp_stats: key → (attempts, corrects). q_last_correct:
+        question_id → bool of the most recent attempt's correctness."""
+        ep: dict[str, list[int]] = {}
+        tp: dict[str, list[int]] = {}
+        q_last: dict[str, bool] = {}
+        clause = "WHERE chat_id = ?" if chat_id is not None else ""
+        params = (str(chat_id),) if chat_id is not None else ()
+        for r in conn.execute(
+            "SELECT exam_point, tested_point, question_id, correct FROM quiz_attempts "
+            f"{clause} ORDER BY attempt_id",
+            params,
+        ):
+            c = int(r["correct"])
+            epk = r["exam_point"] or ""
+            slot = ep.setdefault(epk, [0, 0]); slot[0] += 1; slot[1] += c
+            tpk = (r["tested_point"] or "").strip()
+            if tpk:
+                slot = tp.setdefault(tpk, [0, 0]); slot[0] += 1; slot[1] += c
+            q_last[r["question_id"]] = bool(c)  # ordered → last write = newest
+        return ep, tp, q_last
+
+    def weighted_question(
+        self,
+        *,
+        level: str | None = None,
+        chat_id: str | None = None,
+        verified_only: bool = True,
+        exclude_id: str | None = None,
+        rng: random.Random | None = None,
+    ) -> QuizQuestion | None:
+        """Pick one question, biased toward the learner's weak points. Weight is
+        driven by per-考点 (tested_point) accuracy when that point has history,
+        else per-題型 (exam_point) accuracy; plus per-question freshness and
+        spaced-repetition adjustments. Falls back to least-served when there is
+        no history at all (cold start ≈ random_question)."""
+        picker = rng or random
+        clauses = ["verified = 1"] if verified_only else []
+        params: list[object] = []
+        if level:
+            clauses.append("level = ?")
+            params.append(level.strip())
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM quiz_questions{where}", tuple(params)
+            ).fetchall()
+            if not rows:
+                return None
+            ep_stats, tp_stats, q_last = self._mastery_maps(conn, chat_id)
+        candidates = [_row_to_question(r) for r in rows]
+        weights = [
+            _mastery_weight(q, ep_stats, tp_stats, q_last) for q in candidates
+        ]
+        if exclude_id and len(candidates) > 1:
+            for i, q in enumerate(candidates):
+                if q.question_id == exclude_id:
+                    weights[i] = 0.0
+        if sum(weights) <= 0:
+            weights = [1.0] * len(candidates)
+        return picker.choices(candidates, weights=weights, k=1)[0]
+
+    def mastery_stats(self, *, chat_id: str | None = None) -> dict:
+        """Aggregate this learner's history for /quiz stats. Returns per-題型 rows
+        and the weakest specific 考点 (tested_point) rows."""
+        with self.connect() as conn:
+            ep_stats, tp_stats, _ = self._mastery_maps(conn, chat_id)
+            total = conn.execute(
+                "SELECT COUNT(*) n FROM quiz_attempts "
+                + ("WHERE chat_id = ?" if chat_id is not None else ""),
+                (str(chat_id),) if chat_id is not None else (),
+            ).fetchone()["n"]
+
+        def _rows(d):
+            out = []
+            for k, (a, c) in d.items():
+                out.append({"key": k, "attempts": a, "corrects": c,
+                            "accuracy": c / a if a else 0.0})
+            return out
+
+        by_type = sorted(_rows(ep_stats), key=lambda r: r["accuracy"])
+        by_point = sorted(_rows(tp_stats), key=lambda r: (r["accuracy"], -r["attempts"]))
+        return {"total": int(total), "by_type": by_type, "by_point": by_point}
 
     def delete_question(self, question_id: str) -> bool:
         with self.connect() as conn:
@@ -671,6 +856,45 @@ class QuizDatabase:
         return cursor.rowcount > 0
 
 
+# Mastery-weighting knobs. Weight rises as accuracy falls, so weak points are
+# served more often; an untried point gets an exploration weight so it still
+# surfaces without dominating.
+_W_MIN = 0.5
+_W_MAX = 4.0
+_W_EXPLORE = 2.5
+_FRESH_BOOST = 1.5      # never answered by this learner → surface new material
+_RIGHT_DECAY = 0.25     # last answer was correct → rarely repeat
+_WRONG_BOOST = 1.3      # last answer was wrong → spaced repetition brings it back
+
+
+def _accuracy_weight(attempts: int, corrects: int) -> float:
+    if attempts <= 0:
+        return _W_EXPLORE
+    acc = (corrects + 1) / (attempts + 2)  # Laplace-smoothed: no 0%/100% from n=1
+    return _W_MIN + (_W_MAX - _W_MIN) * (1.0 - acc)
+
+
+def _mastery_weight(question, ep_stats, tp_stats, q_last_correct) -> float:
+    """Per-question serving weight from one learner's history. Prefers the
+    specific 考点 (tested_point) grain when that point has been seen, else the
+    題型 (exam_point) grain; then applies question-level freshness / spaced
+    repetition."""
+    tp = (getattr(question, "tested_point", None) or "").strip()
+    if tp and tp in tp_stats:
+        a, c = tp_stats[tp]
+    else:
+        a, c = ep_stats.get(question.exam_point, (0, 0))
+    w = _accuracy_weight(a, c)
+    last = q_last_correct.get(question.question_id)
+    if last is None:
+        w *= _FRESH_BOOST
+    elif last:
+        w *= _RIGHT_DECAY
+    else:
+        w *= _WRONG_BOOST
+    return max(w, 0.01)
+
+
 def _row_to_question(row: sqlite3.Row) -> QuizQuestion:
     try:
         opts = json.loads(row["options_json"] or "[]")
@@ -691,6 +915,7 @@ def _row_to_question(row: sqlite3.Row) -> QuizQuestion:
         source_text_url=row["source_text_url"],
         source_media_url=row["source_media_url"],
         source_excerpt=row["source_excerpt"],
+        tested_point=(row["tested_point"] if "tested_point" in row.keys() else None),
         verified=bool(row["verified"]),
         served_count=int(row["served_count"]),
         author=row["author"],

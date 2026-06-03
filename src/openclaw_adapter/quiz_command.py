@@ -181,6 +181,26 @@ def _grade_view(q, original_text: str, chosen: int) -> tuple[str, str]:
     return toast, "\n".join(parts)
 
 
+def _render_stats(db, chat_id: str | None) -> str:
+    """Show the learner's per-題型 accuracy and weakest specific 考点 so they can
+    see what the adaptive selector is now biasing toward."""
+    s = db.mastery_stats(chat_id=str(chat_id or ""))
+    if not s["total"]:
+        return "你還沒作答過任何題目。先 /quiz 出一題作答，之後就會依你的弱項調整出題機率。"
+    lines = [f"📊 你的答題統計（累計 {s['total']} 次作答）", "", "■ 各題型答對率（低→高，越前面越會被多出）："]
+    for r in s["by_type"]:
+        pct = round(r["accuracy"] * 100)
+        lines.append(f"　{pct:3d}%  {r['key']}（{r['corrects']}/{r['attempts']}）")
+    weak = [r for r in s["by_point"] if r["accuracy"] < 1.0][:12]
+    if weak:
+        lines.append("")
+        lines.append("■ 最弱的具體考點（會被優先重練）：")
+        for r in weak:
+            pct = round(r["accuracy"] * 100)
+            lines.append(f"　{pct:3d}%  {r['key']}（{r['corrects']}/{r['attempts']}）")
+    return "\n".join(lines)
+
+
 def _render_review_page(db, page: int) -> tuple[str, dict]:
     questions = db.recent_questions(limit=60)
     total = len(questions)
@@ -311,8 +331,10 @@ def build_quiz_handler(
                 if not rest:
                     return "用法：/quiz teach <要教它的出題知識點>"
                 return _distill_authoring(settings, db, rest)
+            if action == "stats":
+                return _render_stats(db, chat_id)
             # default: serve one question
-            return _do_serve(settings, db, text)
+            return _do_serve(settings, db, text, chat_id)
         except Exception as exc:
             logger.exception("quiz handler: action=%s failed", action)
             return f"測驗指令失敗：{exc}"
@@ -320,10 +342,10 @@ def build_quiz_handler(
     return handler
 
 
-def _do_serve(settings, db, text: str):
+def _do_serve(settings, db, text: str, chat_id: str | None = None):
     level, theme = _parse_serve_args(text)
     _ensure_provider_registered(theme)
-    question = db.random_question(level=level, prefer_unserved=True)
+    question = db.weighted_question(level=level, chat_id=chat_id)
     if question is None:
         # Pool empty → generate one on-demand (runs in background via bot.py).
         gen = _build_generator(settings, db)
@@ -357,7 +379,9 @@ def build_quiz_callback_handler(
 ) -> Callable[[str, str], "tuple[object, str, object]"]:
     db = _open_db(settings)
 
-    def handler(payload: str, original_text: str) -> "tuple[object, str, object]":
+    def handler(
+        payload: str, original_text: str, chat_id: str | None = None
+    ) -> "tuple[object, str, object]":
         action, _, rest = (payload or "").partition(":")
         try:
             if action == "a":
@@ -370,6 +394,18 @@ def build_quiz_callback_handler(
                 except ValueError:
                     return "答案格式錯誤", None, None
                 toast, new_text = _grade_view(question, original_text, chosen)
+                try:
+                    db.record_attempt(
+                        question_id=question.question_id,
+                        exam_point=question.exam_point,
+                        tested_point=question.tested_point,
+                        level=question.level,
+                        chat_id=str(chat_id or ""),
+                        chosen_index=chosen,
+                        correct=(chosen == question.answer_index),
+                    )
+                except Exception:
+                    logger.exception("quiz: record_attempt failed qid=%s", qid)
                 db.mark_served(qid)
                 return toast, new_text, None  # clear keyboard
             if action == "p":
