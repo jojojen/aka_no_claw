@@ -489,6 +489,93 @@ class TestAdaptiveSelection:
         assert "漢字読み" in eps and "用法" not in eps
 
 
+class TestWrongNotebook:
+    def test_wrong_only_serves_last_wrong_question(self, tmp_path):
+        import random
+        db = _db(tmp_path)
+        wrong = _insert_q(db, stem="qw", exam_point="用法", tested_point="操る", source_name="S1")
+        right = _insert_q(db, stem="qr", exam_point="用法", tested_point="贖う", source_name="S2")
+        db.record_attempt(question_id=wrong.question_id, exam_point="用法",
+                          tested_point="操る", level="JLPT N1", chat_id="u1",
+                          chosen_index=0, correct=False)
+        db.record_attempt(question_id=right.question_id, exam_point="用法",
+                          tested_point="贖う", level="JLPT N1", chat_id="u1",
+                          chosen_index=1, correct=True)
+        for _ in range(10):
+            got = db.weighted_question(level="JLPT N1", chat_id="u1",
+                                       wrong_only=True, rng=random.Random(_))
+            assert got is not None and got.question_id == wrong.question_id
+
+    def test_wrong_only_drops_after_correction(self, tmp_path):
+        import random
+        db = _db(tmp_path)
+        q = _insert_q(db, stem="qw", exam_point="用法", tested_point="操る")
+        db.record_attempt(question_id=q.question_id, exam_point="用法",
+                          tested_point="操る", level="JLPT N1", chat_id="u1",
+                          chosen_index=0, correct=False)
+        assert db.weighted_question(level="JLPT N1", chat_id="u1",
+                                    wrong_only=True, rng=random.Random(1)) is not None
+        # re-answer correctly → most recent attempt is right → drops out
+        db.record_attempt(question_id=q.question_id, exam_point="用法",
+                          tested_point="操る", level="JLPT N1", chat_id="u1",
+                          chosen_index=1, correct=True)
+        assert db.weighted_question(level="JLPT N1", chat_id="u1",
+                                    wrong_only=True, rng=random.Random(1)) is None
+
+    def test_wrong_only_isolated_per_chat(self, tmp_path):
+        import random
+        db = _db(tmp_path)
+        q = _insert_q(db, stem="qw", exam_point="用法", tested_point="操る")
+        db.record_attempt(question_id=q.question_id, exam_point="用法",
+                          tested_point="操る", level="JLPT N1", chat_id="u1",
+                          chosen_index=0, correct=False)
+        assert db.weighted_question(level="JLPT N1", chat_id="u2",
+                                    wrong_only=True, rng=random.Random(1)) is None
+
+
+class TestConfusionPairs:
+    def _q4(self, db, *, exam_point, opts, answer_index, source_name):
+        return db.insert_question(
+            level="JLPT N1", exam_point=exam_point, stem="s",
+            options=opts, answer_index=answer_index, explanation="x",
+            source_type="vocaloid_song", source_name=source_name,
+            source_excerpt="朝、目が覚めて…", tested_point="tp",
+            verified=True, allow_ungrounded=True,
+        )
+
+    def test_confusion_pair_counts_recurring_mistake(self, tmp_path):
+        db = _db(tmp_path)
+        q = self._q4(db, exam_point="文法形式の判断",
+                     opts=("にあって", "にして", "にいたって", "において"),
+                     answer_index=0, source_name="S1")
+        for _ in range(3):
+            db.record_attempt(question_id=q.question_id, exam_point="文法形式の判断",
+                              tested_point="tp", level="JLPT N1", chat_id="u1",
+                              chosen_index=1, correct=False)
+        pairs = db.confusion_pairs(chat_id="u1")
+        assert pairs and pairs[0]["correct"] == "にあって"
+        assert pairs[0]["chosen"] == "にして" and pairs[0]["count"] == 3
+
+    def test_confusion_skips_reading_types(self, tmp_path):
+        db = _db(tmp_path)
+        q = self._q4(db, exam_point="内容理解（短文）",
+                     opts=("長い文A", "長い文B", "長い文C", "長い文D"),
+                     answer_index=0, source_name="S1")
+        db.record_attempt(question_id=q.question_id, exam_point="内容理解（短文）",
+                          tested_point="tp", level="JLPT N1", chat_id="u1",
+                          chosen_index=1, correct=False)
+        assert db.confusion_pairs(chat_id="u1") == []
+
+    def test_confusion_ignores_correct_answers(self, tmp_path):
+        db = _db(tmp_path)
+        q = self._q4(db, exam_point="用法", opts=("a", "b", "c", "d"),
+                     answer_index=2, source_name="S1")
+        db.record_attempt(question_id=q.question_id, exam_point="用法",
+                          tested_point="tp", level="JLPT N1", chat_id="u1",
+                          chosen_index=2, correct=True)
+        assert db.confusion_pairs(chat_id="u1") == []
+
+
 class TestDeriveTestedPoint:
     def test_kanji_reading_word(self):
         from openclaw_adapter.quiz_db import derive_tested_point

@@ -12,13 +12,16 @@ Subcommands:
                                        from that type.
   /quiz [<level>] [<theme>] random   — skip the menu, serve one weighted question
                                        from any 題型 (generate on-demand if empty).
+  /quiz wrong [<level>]              — 錯題本: re-serve a question you last got wrong
+                                       (weighted); drops out once you re-answer right.
+  /quiz stats                        — per-題型 accuracy, weakest 考点, 混淆選項分析.
   /quiz review [page]                — answer-revealed paginated list (QA review).
   /quiz gen20 [n]                    — bootstrap: generate N (default 20) questions.
   /quiz teach <知識點>                — distil a reviewer correction into the KB.
 
 Callback payloads (prefix ``quiz`` is stripped by bot.py, so we see the rest):
   a:<question_id>:<choice>    — grade an answer
-  t:<level>:<exam_point>      — type-menu pick ('*' = random/all) → serve question
+  t:<level>:<exam_point>      — type-menu pick ('*' = random/all, '!' = 錯題本) → serve
   p:<page>                    — re-render review page
   d:<question_id>             — delete a question, re-render current page
 """
@@ -212,6 +215,13 @@ def _render_stats(db, chat_id: str | None) -> str:
         for r in weak:
             pct = round(r["accuracy"] * 100)
             lines.append(f"　{pct:3d}%  {r['key']}（{r['corrects']}/{r['attempts']}）")
+    pairs = db.confusion_pairs(chat_id=str(chat_id or ""))
+    if pairs:
+        lines.append("")
+        lines.append("■ 你最常混淆的選項（正解 ← 你誤選）：")
+        for p in pairs:
+            times = f"×{p['count']}" if p["count"] > 1 else ""
+            lines.append(f"　「{p['correct']}」← 你選了「{p['chosen']}」　[{p['exam_point']}]{times}")
     return "\n".join(lines)
 
 
@@ -241,7 +251,10 @@ def _render_type_menu(db, level: str, theme: str) -> tuple[str, dict]:
         for ep, n in counts
     ]
     rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
-    rows.append([{"text": "🎲 隨機（全部）", "callback_data": f"quiz:t:{level}:*"}])
+    rows.append([
+        {"text": "🎲 隨機（全部）", "callback_data": f"quiz:t:{level}:*"},
+        {"text": "📭 錯題本", "callback_data": f"quiz:t:{level}:!"},
+    ])
     return "\n".join(lines), {"inline_keyboard": rows}
 
 
@@ -377,6 +390,11 @@ def build_quiz_handler(
                 return _distill_authoring(settings, db, rest)
             if action == "stats":
                 return _render_stats(db, chat_id)
+            if action in ("wrong", "錯題", "錯題本"):
+                level, theme = _parse_serve_args(rest)
+                return _serve_question(
+                    settings, db, level, theme, None, chat_id, wrong_only=True
+                )
             # default: `/quiz <level> <theme> random` → serve immediately (any
             # 題型, weighted); without `random` → show the 題型 selection menu.
             level, theme = _parse_serve_args(text)
@@ -397,11 +415,20 @@ def _serve_question(
     theme: str,
     exam_point: str | None,
     chat_id: str | None,
+    wrong_only: bool = False,
 ):
-    """Serve one weighted question (optionally restricted to ``exam_point``).
-    Returns a ``(text, markup)`` view tuple, or an error string."""
+    """Serve one weighted question (optionally restricted to ``exam_point``, or to
+    the learner's previously-wrong 錯題 when ``wrong_only``). Returns a
+    ``(text, markup)`` view tuple, or an error string."""
     _ensure_provider_registered(theme)
-    question = db.weighted_question(level=level, chat_id=chat_id, exam_point=exam_point)
+    question = db.weighted_question(
+        level=level, chat_id=chat_id, exam_point=exam_point, wrong_only=wrong_only
+    )
+    if question is None and wrong_only:
+        return (
+            "📭 目前沒有錯題可複習：你還沒答錯過，或先前答錯的都已經訂正答對了。\n"
+            "去 /quiz 練幾題，答錯的會自動進錯題本；訂正答對後就會移出。"
+        )
     if question is None and not exam_point:
         # Pool empty → generate one on-demand (runs in background via bot.py).
         # Only for the unrestricted path: a type-filtered miss shouldn't trigger
@@ -469,12 +496,14 @@ def build_quiz_callback_handler(
                 db.mark_served(qid)
                 return toast, new_text, None  # clear keyboard
             if action == "t":
-                # type-menu selection: rest = "<level>:<exam_point>" ('*' = all).
+                # type-menu selection: rest = "<level>:<exam_point>"
+                # ('*' = random/all, '!' = 錯題本/wrong-only, else a specific 題型).
                 lvl, _, ep = rest.partition(":")
-                exam_point = None if ep in ("", "*") else ep
+                wrong_only = ep == "!"
+                exam_point = None if ep in ("", "*", "!") else ep
                 served = _serve_question(
                     settings, db, lvl or _DEFAULT_LEVEL, _DEFAULT_THEME,
-                    exam_point, str(chat_id or ""),
+                    exam_point, str(chat_id or ""), wrong_only=wrong_only,
                 )
                 if isinstance(served, tuple):
                     text, markup = served

@@ -678,6 +678,7 @@ class QuizDatabase:
         level: str | None = None,
         chat_id: str | None = None,
         exam_point: str | None = None,
+        wrong_only: bool = False,
         verified_only: bool = True,
         exclude_id: str | None = None,
         rng: random.Random | None = None,
@@ -687,7 +688,9 @@ class QuizDatabase:
         else per-題型 (exam_point) accuracy; plus per-question freshness and
         spaced-repetition adjustments. Falls back to least-served when there is
         no history at all (cold start ≈ random_question). ``exam_point`` restricts
-        the candidate pool to one 題型 (the type-menu path)."""
+        the candidate pool to one 題型 (the type-menu path). ``wrong_only`` keeps
+        only questions whose most-recent attempt by this learner was wrong (錯題本);
+        returns None when there is no such question."""
         picker = rng or random
         clauses = ["verified = 1"] if verified_only else []
         params: list[object] = []
@@ -706,6 +709,10 @@ class QuizDatabase:
                 return None
             ep_stats, tp_stats, q_last = self._mastery_maps(conn, chat_id)
         candidates = [_row_to_question(r) for r in rows]
+        if wrong_only:
+            candidates = [q for q in candidates if q_last.get(q.question_id) is False]
+            if not candidates:
+                return None
         weights = [
             _mastery_weight(q, ep_stats, tp_stats, q_last) for q in candidates
         ]
@@ -738,6 +745,47 @@ class QuizDatabase:
         by_type = sorted(_rows(ep_stats), key=lambda r: r["accuracy"])
         by_point = sorted(_rows(tp_stats), key=lambda r: (r["accuracy"], -r["attempts"]))
         return {"total": int(total), "by_type": by_type, "by_point": by_point}
+
+    def confusion_pairs(
+        self, *, chat_id: str | None = None, limit: int = 8
+    ) -> list[dict]:
+        """For the learner's wrong answers, which (正解選項 → 誤選選項) pairs recur —
+        e.g. always picking 「にして」 when the answer is 「にあって」. Skips reading
+        types (their options are full sentences, not a diagnosable confusion).
+        Returns rows {exam_point, correct, chosen, count} sorted by count desc."""
+        where = ["a.correct = 0"]
+        params: list[object] = []
+        if chat_id is not None:
+            where.append("a.chat_id = ?")
+            params.append(str(chat_id))
+        sql = (
+            "SELECT a.chosen_index AS ci, q.answer_index AS ai, "
+            "q.options_json AS oj, q.exam_point AS ep FROM quiz_attempts a "
+            "JOIN quiz_questions q ON q.question_id = a.question_id "
+            "WHERE " + " AND ".join(where)
+        )
+        counts: dict[tuple, int] = {}
+        with self.connect() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        for r in rows:
+            ep = (r["ep"] or "").strip()
+            if is_reading_exam_point(ep):
+                continue
+            try:
+                opts = json.loads(r["oj"] or "[]")
+            except (TypeError, ValueError):
+                continue
+            ci, ai = int(r["ci"]), int(r["ai"])
+            if not (0 <= ci < len(opts) and 0 <= ai < len(opts)) or ci == ai:
+                continue
+            key = (ep, str(opts[ai]).strip(), str(opts[ci]).strip())
+            counts[key] = counts.get(key, 0) + 1
+        out = [
+            {"exam_point": ep, "correct": cor, "chosen": cho, "count": n}
+            for (ep, cor, cho), n in counts.items()
+        ]
+        out.sort(key=lambda r: (-r["count"], r["exam_point"]))
+        return out[: max(0, int(limit))]
 
     def delete_question(self, question_id: str) -> bool:
         with self.connect() as conn:
