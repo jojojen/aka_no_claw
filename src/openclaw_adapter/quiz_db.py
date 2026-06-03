@@ -120,6 +120,14 @@ def is_grounded(
     if is_reading_exam_point(ep):
         return True
 
+    # 文の組み立て: the four options ARE the real sentence's fragments (the question
+    # is to reorder them), so the only fabrication risk is an invented fragment.
+    # Grounding is satisfied iff every option is a verbatim piece of the real line;
+    # correctness of the ordering is the grader's job, not grounding's.
+    if "組み立て" in ep or "組立て" in ep or "組立" in ep:
+        frags = [f for f in (_normalize_grounding(o) for o in options) if len(f) >= 2]
+        return len(frags) >= 2 and all(f in excerpt for f in frags)
+
     # Tier C — the explanation quotes the full equivalent real line.
     if excerpt in _normalize_grounding(explanation):
         return True
@@ -197,6 +205,35 @@ def correct_option_is_verbatim_copy(
         default=0.0,
     )
     return correct >= threshold and distractor < distractor_ceiling
+
+
+def options_have_duplicates(options: tuple[str, ...]) -> bool:
+    """True iff two options are the same after noise-stripping. A multiple-choice
+    item with identical options has zero discrimination (the grader 'agrees'
+    trivially); this catches that structurally, for ANY question type."""
+    seen: set[str] = set()
+    for opt in options:
+        key = _normalize_grounding(opt)
+        if not key:
+            continue
+        if key in seen:
+            return True
+        seen.add(key)
+    return False
+
+
+def answer_leaks_into_stem(
+    *, stem: str, options: tuple[str, ...], answer_index: int
+) -> bool:
+    """True iff the correct option appears verbatim inside the stem — the answer is
+    handed to the solver, so the item tests nothing. Measured on noise-stripped text
+    with a minimum length so an incidental short kana run isn't a false positive."""
+    if not (0 <= answer_index < len(options)):
+        return False
+    correct = _normalize_grounding(options[answer_index])
+    if len(correct) < _MIN_ANCHOR:
+        return False
+    return correct in _normalize_grounding(stem)
 
 
 _SCHEMA = """
