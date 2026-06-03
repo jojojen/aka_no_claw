@@ -4,7 +4,9 @@ from openclaw_adapter.quiz_command import (
     _grade_view,
     _is_commentary_url,
     _parse_serve_args,
+    _render_stats,
     _render_type_menu,
+    _serve_question,
     _wants_random,
 )
 
@@ -100,6 +102,8 @@ def test_render_type_menu_one_button_per_type_plus_random():
     assert "quiz:t:JLPT N1:漢字読み" in cbs
     assert "quiz:t:JLPT N1:用法" in cbs
     assert "quiz:t:JLPT N1:*" in cbs
+    assert "quiz:t:JLPT N1:!" in cbs  # 錯題本 button next to random
+    assert any(b["text"] == "📭 錯題本" for b in flat)
     # every callback fits Telegram's 64-byte limit
     assert all(len(c.encode("utf-8")) <= 64 for c in cbs)
     assert "選擇題型" in text
@@ -110,3 +114,58 @@ def test_render_type_menu_empty_pool_message():
     text, markup = _render_type_menu(db, "JLPT N1", "miku")
     assert markup["inline_keyboard"] == []
     assert "題庫是空的" in text
+
+
+# ── 錯題本 + 混淆分析 ──────────────────────────────────────────────────────────
+
+
+class _NoWrongDB:
+    def weighted_question(self, **kw):
+        assert kw.get("wrong_only") is True
+        return None
+
+
+def test_serve_question_wrong_only_empty_message():
+    out = _serve_question(None, _NoWrongDB(), "JLPT N1", "miku", None, "u1", wrong_only=True)
+    assert isinstance(out, str)
+    assert "沒有錯題" in out
+
+
+class _StatsDB:
+    def __init__(self, stats, pairs):
+        self._stats = stats
+        self._pairs = pairs
+
+    def mastery_stats(self, *, chat_id=None):
+        return self._stats
+
+    def confusion_pairs(self, *, chat_id=None, limit=8):
+        return list(self._pairs)
+
+
+def test_render_stats_shows_confusion_pairs():
+    stats = {
+        "total": 5,
+        "by_type": [{"key": "文法形式の判断", "accuracy": 0.4, "corrects": 2, "attempts": 5}],
+        "by_point": [],
+    }
+    pairs = [{"exam_point": "文法形式の判断", "correct": "にあって", "chosen": "にして", "count": 3}]
+    text = _render_stats(_StatsDB(stats, pairs), "u1")
+    assert "最常混淆的選項" in text
+    assert "「にあって」← 你選了「にして」" in text
+    assert "×3" in text
+
+
+def test_render_stats_no_history():
+    text = _render_stats(_StatsDB({"total": 0, "by_type": [], "by_point": []}, []), "u1")
+    assert "還沒作答" in text
+
+
+def test_callback_wrong_marker_routes_to_wrong_only(tmp_path):
+    from openclaw_adapter.quiz_command import build_quiz_callback_handler
+
+    settings = SimpleNamespace(quiz_db_path=tmp_path / "quiz.sqlite3")
+    handler = build_quiz_callback_handler(settings)
+    # empty DB → wrong-notebook is empty → the 錯題本 marker yields the empty message
+    toast, new_text, markup = handler("t:JLPT N1:!", "menu text", "u1")
+    assert new_text is not None and "沒有錯題" in new_text
