@@ -30,6 +30,7 @@ from .quiz_db import (
     QuizQuestion,
     answer_leaks_into_stem,
     correct_option_is_verbatim_copy,
+    derive_tested_point,
     format_authoring_knowledge_block,
     is_reading_exam_point,
     options_have_duplicates,
@@ -164,8 +165,13 @@ def _build_author_prompt(
         f"素材片段：{material}\n\n"
         "出題技巧（務必遵守，這是歷次校正累積的規則）：\n"
         f"{authoring_block}\n\n"
+        "tested_point 規則：填本題實際考的『具體知識點』，不是題型——\n"
+        "  ・漢字読み／言い換え／用法 → 填被考的那個詞（如「咽返る」「操る」）。\n"
+        "  ・文法系 → 填被考的那個句型／文法（如「〜ばかりに」「〜をよそに」）。\n"
+        "  ・読解系 → 填一個概括主旨的短語即可。\n"
         "只輸出 JSON，格式如下（options 至少 4 個，answer_index 為 0 起算的正解索引）：\n"
-        f'{{"exam_point": "{exam_point_value}", "stem": "題目文", '
+        f'{{"exam_point": "{exam_point_value}", "tested_point": "具體考點", '
+        '"stem": "題目文", '
         '"options": ["...", "...", "...", "..."], "answer_index": 0, '
         '"explanation": "為何此為正解、其他為何錯（繁體中文）"}'
     )
@@ -305,6 +311,7 @@ class QuizGenerator:
         options = [str(o).strip() for o in (author.get("options") or []) if str(o).strip()]
         explanation = str(author.get("explanation") or "").strip()
         exam_point = str(author.get("exam_point") or "").strip()
+        tested_point = str(author.get("tested_point") or "").strip() or None
         try:
             answer_index = int(author.get("answer_index"))
         except (TypeError, ValueError):
@@ -349,6 +356,11 @@ class QuizGenerator:
         ):
             return None
 
+        if not tested_point:
+            tested_point = derive_tested_point(
+                exam_point=exam_point, stem=stem,
+                options=options, answer_index=answer_index,
+            )
         try:
             return self._db.insert_question(
                 level=level,
@@ -362,6 +374,7 @@ class QuizGenerator:
                 source_text_url=source.text_url,
                 source_media_url=source.media_url,
                 source_excerpt=source.excerpt,
+                tested_point=tested_point,
                 verified=True,
             )
         except ValueError as exc:
