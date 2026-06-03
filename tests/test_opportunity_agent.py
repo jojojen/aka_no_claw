@@ -1029,30 +1029,46 @@ def test_scheduled_web_search_provider_runs_each_query_and_extracts_candidates()
         queries=("q1", "q2", "q3"),
         results_per_query=1,
     )
-    candidates = list(provider.discover(limit=5))
 
+    # Round-robin: each discover() tick issues exactly one query, advancing
+    # through the list, so the batch never bursts.
+    provider.discover(limit=5)
+    assert seen_queries == ["q1"]
+    provider.discover(limit=5)
+    assert seen_queries == ["q1", "q2"]
+    candidates = list(provider.discover(limit=5))
     assert seen_queries == ["q1", "q2", "q3"]
+
+    # Cursor wraps back to the start on the next tick.
+    provider.discover(limit=5)
+    assert seen_queries == ["q1", "q2", "q3", "q1"]
+
     assert len(candidates) == 1
     assert candidates[0].product_type == "sealed_box"
     assert candidates[0].title == "インフェルノX"
     assert candidates[0].source_kind == "web_trend_search"
 
 
-def test_scheduled_web_search_provider_throttles_ddg_between_runs() -> None:
+def test_scheduled_web_search_provider_issues_one_query_per_tick_and_replays_cache() -> None:
     from openclaw_adapter.web_search import WebSearchResult
 
     search_calls = {"n": 0}
-    clock = {"t": 1000.0}
+    # Simulate a budget-skipped tick: the second query returns no results (as a
+    # budgeted search_fn does once the hourly cap is hit).
+    responses = {
+        "q1": (WebSearchResult(title="A", url="https://example.com/a", snippet="s"),),
+        "q2": (),
+    }
 
     def fake_search(query, *, max_results):  # noqa: ARG001
         search_calls["n"] += 1
-        return (WebSearchResult(title="t", url="https://example.com/x", snippet="s"),)
+        return responses[query]
 
     def fake_llm(prompt):  # noqa: ARG001
         return (
             '{"candidates":[{"game":"pokemon","product_type":"sealed_box","title":"X",'
             '"product_identifier":null,"search_query":"X","heat_score":70,"reason":"web",'
-            '"source_tweet_ids":["https://example.com/x"]}]}'
+            '"source_tweet_ids":["https://example.com/a"]}]}'
         )
 
     provider = ScheduledWebSearchCandidateProvider(
@@ -1060,23 +1076,46 @@ def test_scheduled_web_search_provider_throttles_ddg_between_runs() -> None:
         llm_fn=fake_llm,
         queries=("q1", "q2"),
         results_per_query=1,
-        min_interval_seconds=3600,
-        time_fn=lambda: clock["t"],
     )
 
+    # Tick 1 hits q1 only (one query, not a batch) and caches the candidate.
     first = provider.discover(limit=5)
-    assert search_calls["n"] == 2  # 2 queries hit DDG on first run
+    assert search_calls["n"] == 1
+    assert len(first) == 1
 
-    # Within the interval: replays cache, no new DDG hits.
-    clock["t"] = 1000.0 + 600
+    # Tick 2 hits q2, which returns nothing (budget-skipped) → cache replayed.
     second = provider.discover(limit=5)
     assert search_calls["n"] == 2
     assert second == first
 
-    # After the interval elapses: DDG runs again.
-    clock["t"] = 1000.0 + 3601
-    provider.discover(limit=5)
-    assert search_calls["n"] == 4
+
+def test_daily_call_budget_caps_per_hour() -> None:
+    from openclaw_adapter.opportunity_agent import DailyCallBudget
+
+    clock = {"t": 0.0}
+    budget = DailyCallBudget(10, max_per_hour=1, time_fn=lambda: clock["t"])
+
+    # Only one call allowed within the clock-hour, even though the daily cap is 10.
+    assert budget.allow() is True
+    assert budget.allow() is False
+
+    # Next hour frees another single call.
+    clock["t"] = 3600.0
+    assert budget.allow() is True
+    assert budget.allow() is False
+
+
+def test_daily_call_budget_hourly_and_daily_both_bind() -> None:
+    from openclaw_adapter.opportunity_agent import DailyCallBudget
+
+    clock = {"t": 0.0}
+    budget = DailyCallBudget(2, max_per_hour=1, time_fn=lambda: clock["t"])
+
+    assert budget.allow() is True  # hour 0, day 0
+    clock["t"] = 3600.0
+    assert budget.allow() is True  # hour 1, day 0 — daily count now 2
+    clock["t"] = 7200.0
+    assert budget.allow() is False  # hour 2 fresh, but daily cap (2) reached
 
 
 def test_daily_call_budget_caps_per_day_and_resets() -> None:
