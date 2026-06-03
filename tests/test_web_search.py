@@ -5,7 +5,9 @@ import json
 from openclaw_adapter.web_search import (
     WebResearchAnswer,
     WebSearchResult,
+    build_web_fetch_answer,
     build_web_research_answer,
+    extract_readable_text,
     format_web_research_answer,
     parse_duckduckgo_html,
     search_duckduckgo,
@@ -174,4 +176,80 @@ def test_build_web_research_answer_uses_traditional_chinese_no_source_fallback()
         summarize_fn=lambda query, sources: "unused",
     )
 
-    assert answer.summary == "我找不到足夠有用的網路來源來回答：why are Pikachu cards popular"
+    assert answer.summary.startswith(
+        "我找不到足夠有用的網路來源來回答：why are Pikachu cards popular"
+    )
+    # When search yields nothing, point the user at the /fetch fallback.
+    assert "/fetch" in answer.summary
+
+
+def test_extract_readable_text_drops_boilerplate_keeps_article() -> None:
+    html = """
+    <html><head><title>T</title><style>.x{}</style></head>
+    <body><nav>HOME ABOUT</nav><script>var a=1;</script>
+    <article><h1>標題</h1><p>第一段內容。</p><p>第二段內容。</p></article>
+    <footer>copyright</footer></body></html>
+    """
+
+    text = extract_readable_text(html)
+
+    assert "標題" in text and "第一段內容。" in text
+    assert "var a" not in text and "HOME ABOUT" not in text and "copyright" not in text
+
+
+def test_build_web_research_answer_fetch_feeds_page_content_to_summarizer() -> None:
+    seen: dict[str, object] = {}
+
+    def summarize(query: str, sources: tuple[WebSearchResult, ...]) -> str:
+        seen["has_content"] = bool(sources[0].content)
+        return "OK"
+
+    answer = build_web_research_answer(
+        "q",
+        search_fn=lambda q, limit: (WebSearchResult("A", "https://a.com", snippet="s"),),
+        summarize_fn=summarize,
+        fetch_page_fn=lambda url: "FULL PAGE BODY",
+    )
+
+    assert seen["has_content"] is True
+    assert answer.summary == "OK"
+
+
+def test_build_web_research_answer_reformulate_merges_and_dedupes() -> None:
+    table = {
+        "q": (WebSearchResult("A", "https://a.com/x"),),
+        "alt": (WebSearchResult("A2", "https://a.com/x/"), WebSearchResult("B", "https://b.com")),
+    }
+
+    def summarize(query: str, sources: tuple[WebSearchResult, ...]) -> str:
+        return ",".join(s.url for s in sources)
+
+    answer = build_web_research_answer(
+        "q",
+        search_fn=lambda q, limit: table.get(q, ()),
+        summarize_fn=summarize,
+        reformulate_fn=lambda q: ["q", "alt"],
+    )
+
+    assert [s.url for s in answer.sources] == ["https://a.com/x", "https://b.com"]
+
+
+def test_build_web_fetch_answer_success_and_validation() -> None:
+    ok = build_web_fetch_answer(
+        "https://a.com/article",
+        "重點是什麼",
+        fetch_page_fn=lambda u: "PAGE TEXT",
+        answer_fn=lambda u, p, content: f"ANS<{p}|{content}>",
+    )
+    assert ok.summary == "ANS<重點是什麼|PAGE TEXT>"
+    assert ok.sources[0].url == "https://a.com/article"
+
+    bad = build_web_fetch_answer(
+        "notaurl", "x", fetch_page_fn=lambda u: "y", answer_fn=lambda u, p, c: "z",
+    )
+    assert "有效網址" in bad.summary
+
+    empty = build_web_fetch_answer(
+        "https://a.com", "x", fetch_page_fn=lambda u: "", answer_fn=lambda u, p, c: "z",
+    )
+    assert "抓不到" in empty.summary
