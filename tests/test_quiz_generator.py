@@ -356,6 +356,131 @@ class TestVerbatimCopyHelper:
         )
 
 
+class TestStructuralGuards:
+    """Universal (all-type) guards that fire BEFORE the grader, so a degenerate
+    item never even costs a grader call."""
+
+    def test_duplicate_options_rejected(self, tmp_path):
+        author = _reading_author_payload(
+            exam_point="文の組み立て",
+            stem="＿＿　＿＿　＿★＿　＿＿。",
+            options=["同じ片", "同じ片", "別片い", "別片ろ"],  # two identical → no discrimination
+            answer_index=0,
+        )
+        db, gen = _make_gen(tmp_path, lambda **kw: author)
+        q = gen.generate_one_question(
+            level="JLPT N1", theme="fake",
+            provider=ReadingProvider("同じ片別片い別片ろ"), question_type="文の組み立て",
+        )
+        assert q is None
+        assert db.count_verified(level="JLPT N1") == 0
+
+    def test_answer_leaked_in_stem_rejected(self, tmp_path):
+        author = _reading_author_payload(
+            exam_point="文脈規定",
+            stem="正解はこれは重要な情報だから選べ。",  # correct option sits in the stem
+            options=["これは重要な情報", "無関係な選択ろ", "無関係な選択は", "無関係な選択に"],
+            answer_index=0,
+        )
+        db, gen = _make_gen(tmp_path, lambda **kw: author)
+        q = gen.generate_one_question(
+            level="JLPT N1", theme="fake",
+            provider=ReadingProvider("これは重要な情報を伝える本文。"), question_type="文脈規定",
+        )
+        assert q is None
+        assert db.count_verified(level="JLPT N1") == 0
+
+    def test_clean_kumitate_passes(self, tmp_path):
+        line = "君のことをいつまでも忘れないと誓う"
+        author = _reading_author_payload(
+            exam_point="文の組み立て",
+            stem="＿＿　＿＿　＿★＿　＿＿。",
+            options=["と誓う", "君のことを", "忘れない", "いつまでも"],
+            answer_index=2,
+        )
+
+        def call(**kw):
+            prompt = kw.get("prompt", "")
+            # Detect the author prompt first: _KUMITATE_RULES itself contains the
+            # word 解題者, which would otherwise fool a grader-keyword check.
+            if "出題老師" in prompt:
+                return author
+            return _grader_payload(2)
+
+        db, gen = _make_gen(tmp_path, call)
+        q = gen.generate_one_question(
+            level="JLPT N1", theme="fake",
+            provider=ReadingProvider(line), question_type="文の組み立て",
+        )
+        assert q is not None and q.answer_index == 2
+        assert q.exam_point == "文の組み立て"
+
+
+class TestVocabSubtypeSteer:
+    def test_subtype_pins_vocab_rules_and_steer(self):
+        from openclaw_adapter.quiz_generator import _select_type_block, _VOCAB_RULES
+
+        block = _select_type_block("漢字読み")
+        assert _VOCAB_RULES in block            # full 単語 ruleset is used
+        assert "固定只出「漢字読み」" in block      # plus the pin to that subtype
+
+    def test_plain_tango_has_no_pin(self):
+        from openclaw_adapter.quiz_generator import _select_type_block, _VOCAB_RULES
+
+        assert _select_type_block("単語") == _VOCAB_RULES
+
+
+class TestStructuralHelpers:
+    def test_options_have_duplicates(self):
+        from openclaw_adapter.quiz_db import options_have_duplicates
+
+        assert options_have_duplicates(("A", "A", "B", "C"))
+        assert options_have_duplicates(("海。", "海", "山", "空"))  # noise-stripped equal
+        assert not options_have_duplicates(("海", "山", "空", "森"))
+
+    def test_answer_leaks_into_stem(self):
+        from openclaw_adapter.quiz_db import answer_leaks_into_stem
+
+        assert answer_leaks_into_stem(
+            stem="主人公が選んだのは海辺の町だった。",
+            options=("海辺の町", "山間の村", "都会の街", "森の小屋"),
+            answer_index=0,
+        )
+        assert not answer_leaks_into_stem(
+            stem="主人公が最後に選んだものはどれか。",
+            options=("海辺の町", "山間の村", "都会の街", "森の小屋"),
+            answer_index=0,
+        )
+        # too-short correct option never trips the guard (incidental kana)
+        assert not answer_leaks_into_stem(
+            stem="海を見た。", options=("海", "山", "空", "森"), answer_index=0
+        )
+
+
+class TestKumitateGrounding:
+    def test_real_fragments_are_grounded(self):
+        from openclaw_adapter.quiz_db import is_grounded
+
+        assert is_grounded(
+            exam_point="文の組み立て",
+            stem="＿＿　＿＿　＿★＿　＿＿。",
+            options=("と誓う", "君のことを", "忘れない", "いつまでも"),
+            answer_index=2,
+            source_excerpt="君のことを いつまでも 忘れないと誓う、夜空の下で。",
+        )
+
+    def test_fabricated_fragment_not_grounded(self):
+        from openclaw_adapter.quiz_db import is_grounded
+
+        assert not is_grounded(
+            exam_point="文の組み立て",
+            stem="＿＿　＿＿　＿★＿　＿＿。",
+            options=("と誓う", "君のことを", "捏造された詞", "いつまでも"),
+            answer_index=0,
+            source_excerpt="君のことを いつまでも 忘れないと誓う、夜空の下で。",
+        )
+
+
 class TestSourceAgnostic:
     def test_works_for_non_song_source_type(self, tmp_path):
         # Swapping the provider to an essay source needs zero generator changes;

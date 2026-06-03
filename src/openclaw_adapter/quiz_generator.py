@@ -28,9 +28,11 @@ from typing import Callable
 from .quiz_db import (
     QuizDatabase,
     QuizQuestion,
+    answer_leaks_into_stem,
     correct_option_is_verbatim_copy,
     format_authoring_knowledge_block,
     is_reading_exam_point,
+    options_have_duplicates,
 )
 from .quiz_sources import QuizSource, SourceProvider, get_provider
 
@@ -93,15 +95,60 @@ _VOCAB_RULES = (
 )
 
 
+_KUMITATE_RULES = (
+    "本題型固定為「文の組み立て」（文の並べ替え），不可改出其他題型。\n"
+    "最重要：答案必須客觀唯一，獨立解題者只看題幹＋四個片段就能排出同一答案。\n"
+    "\n"
+    "【格式】從下方素材片段中挑『一整句真實存在的歌詞』L（務必逐字取自素材，不可杜撰）。\n"
+    "把 L 自然地切成『四個連續詞組片段』，這四個片段拼回去剛好等於 L。\n"
+    "題幹是四個空格的句子，其中一格標上 ★，例如：「＿＿　＿＿　＿★＿　＿＿。」；\n"
+    "把四個片段『打亂順序』放進 options，問『★ 那一格應填入哪一個片段』。\n"
+    "  - options＝那四個被打亂的片段本身（每個都是 L 的真實片段，不可加入 L 沒有的詞）。\n"
+    "  - answer_index＝排好正確語順後，落在 ★ 那一格的片段在 options 中的索引。\n"
+    "  - 範例：L=「君のことを　いつまでも　忘れない　と誓う」，四片段切為\n"
+    "    ［君のことを］［いつまでも］［忘れない］［と誓う］。\n"
+    "    題幹「＿＿　＿＿　＿★＿　＿＿。」（★在第三格），\n"
+    "    options=[\"と誓う\",\"君のことを\",\"忘れない\",\"いつまでも\"]，\n"
+    "    正確語順 君のことを→いつまでも→忘れない→と誓う，★(第三格)=「忘れない」→ answer_index=2。\n"
+    "\n"
+    "【鐵則】\n"
+    "1. 題幹『絕對不可』出現組合後的整句 L，也不可把正解片段直接寫進題幹——否則沒有鑑別度。\n"
+    "2. 四個選項必須『互不相同』；嚴禁出現兩個一模一樣的選項。\n"
+    "3. 四個片段必須能且只能拼回 L 這一種自然語順；其餘排列在文法或語意上明顯不通。\n"
+    "4. explanation 用繁體中文說明正確語順，並寫出組合後的完整句子 L（逐字）。\n"
+    "5. exam_point 請填「文の組み立て」。\n"
+    "6. explanation 結尾附一行【読み】，把題幹與選項中所有含漢字的詞標上正確平假名讀音。\n"
+)
+
+
+# The three official 文字・語彙 subtypes — all share _VOCAB_RULES; naming one as the
+# question_type pins the generator to it (so we can fill an under-target subtype
+# without spending tokens on a subtype that's already met its quota).
+_VOCAB_SUBTYPES = ("漢字読み", "言い換え類義", "文脈規定")
+
+
+def _select_type_block(question_type: str | None) -> str:
+    qt = (question_type or "").strip()
+    if qt == "単語" or qt in _VOCAB_SUBTYPES:
+        block = _VOCAB_RULES
+        if qt in _VOCAB_SUBTYPES:
+            block += (
+                f"\n★本回合務必固定只出「{qt}」這一種官方題型，"
+                f"exam_point 請填「{qt}」，不可改出其他兩種 文字・語彙 題型。\n"
+            )
+        return block
+    if "組み立て" in qt or "組立" in qt:
+        return _KUMITATE_RULES
+    if qt:
+        return f"本題型固定為「{qt}」題型（考點），不可改出其他題型。\n"
+    return "題型（考點）可自由選擇文法／單字／読解等任何單選題能表達的型別。\n"
+
+
 def _build_author_prompt(
     *, level: str, source: QuizSource, authoring_block: str, question_type: str | None = "単語"
 ) -> str:
     material = source.excerpt or "(無可用歌詞片段，請改出不依賴特定歌詞、契合該作品風格的通用 N1 単語題，切勿杜撰歌詞)"
-    type_block = _VOCAB_RULES if (question_type or "").strip() == "単語" else (
-        f"本題型固定為「{question_type}」題型（考點），不可改出其他題型。\n"
-        if question_type else
-        "題型（考點）可自由選擇文法／單字／読解等任何單選題能表達的型別。\n"
-    )
+    type_block = _select_type_block(question_type)
     exam_point_value = question_type or "文法|単語|読解|..."
     return (
         "你是嚴謹的日本語能力試驗（JLPT）出題老師。\n"
@@ -259,6 +306,16 @@ class QuizGenerator:
         except (TypeError, ValueError):
             return None
         if not stem or len(options) < 4 or not (0 <= answer_index < len(options)):
+            return None
+
+        # Universal structural guards (every question type): a duplicated option or
+        # an answer copied verbatim into the stem means zero discrimination — the
+        # grader would 'agree' trivially. Reject before spending a grader call.
+        if options_have_duplicates(tuple(options)):
+            logger.info("quiz: rejected — duplicate options (no discrimination)")
+            return None
+        if answer_leaks_into_stem(stem=stem, options=tuple(options), answer_index=answer_index):
+            logger.info("quiz: rejected — correct option appears verbatim in stem (answer leak)")
             return None
 
         is_reading = is_reading_exam_point(exam_point)
