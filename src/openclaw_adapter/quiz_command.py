@@ -7,14 +7,18 @@ multiple-choice option buttons). The callback handler grades the answer and also
 serves the QA loop (``review`` / delete / paging).
 
 Subcommands:
-  /quiz [<level>] [<theme>]   — serve one verified question (generate on-demand
-                                if the pool is empty), with option buttons.
-  /quiz review [page]         — answer-revealed paginated list (the QA review).
-  /quiz gen20 [n]             — bootstrap: generate N (default 20) questions.
-  /quiz teach <知識點>         — distil a reviewer correction into the authoring KB.
+  /quiz [<level>] [<theme>]          — show the 題型 (exam_point) selection menu;
+                                       picking a type serves a weighted question
+                                       from that type.
+  /quiz [<level>] [<theme>] random   — skip the menu, serve one weighted question
+                                       from any 題型 (generate on-demand if empty).
+  /quiz review [page]                — answer-revealed paginated list (QA review).
+  /quiz gen20 [n]                    — bootstrap: generate N (default 20) questions.
+  /quiz teach <知識點>                — distil a reviewer correction into the KB.
 
 Callback payloads (prefix ``quiz`` is stripped by bot.py, so we see the rest):
   a:<question_id>:<choice>    — grade an answer
+  t:<level>:<exam_point>      — type-menu pick ('*' = random/all) → serve question
   p:<page>                    — re-render review page
   d:<question_id>             — delete a question, re-render current page
 """
@@ -108,18 +112,28 @@ def _normalize_level(token: str, default: str = _DEFAULT_LEVEL) -> str:
 
 def _parse_serve_args(text: str) -> tuple[str, str]:
     """Split free-form args into (level, theme). A token containing N1–N5 (or
-    starting with 'jlpt') is the level; the first remaining token is the theme."""
+    starting with 'jlpt') is the level; the first remaining token is the theme.
+    A bare ``random`` token is a serve-mode flag, not a theme — it's ignored here
+    (the handler strips/detects it separately via _wants_random)."""
     level = _DEFAULT_LEVEL
     theme = _DEFAULT_THEME
     remaining: list[str] = []
     for part in (text or "").split():
         if part.lower().startswith("jlpt") or re.search(r"[nN][1-5]", part):
             level = _normalize_level(part)
+        elif part.lower() == "random":
+            continue
         else:
             remaining.append(part)
     if remaining:
         theme = remaining[0].lower()
     return level, theme
+
+
+def _wants_random(text: str) -> bool:
+    """True if the args contain a bare ``random`` token → serve immediately from
+    any 題型 (weighted), skipping the type-selection menu."""
+    return any(p.lower() == "random" for p in (text or "").split())
 
 
 # ── question rendering ─────────────────────────────────────────────────────────
@@ -199,6 +213,36 @@ def _render_stats(db, chat_id: str | None) -> str:
             pct = round(r["accuracy"] * 100)
             lines.append(f"　{pct:3d}%  {r['key']}（{r['corrects']}/{r['attempts']}）")
     return "\n".join(lines)
+
+
+def _render_type_menu(db, level: str, theme: str) -> tuple[str, dict]:
+    """Show one button per official 題型 (exam_point) present in the pool, plus a
+    🎲 random-all button. Picking one serves a weighted question from that 題型.
+    callback_data: ``quiz:t:<level>:<exam_point>`` (``*`` = random across all)."""
+    counts = db.exam_point_counts(level=level)
+    if not counts:
+        # No verified questions yet → fall back to immediate (weighted) serve path.
+        return (
+            f"目前 {level} 題庫是空的，無法列出題型。先跑 /quiz gen20 產題，"
+            "或用 /quiz {0} {1} random 立即出一題。".format(level, theme),
+            {"inline_keyboard": []},
+        )
+    lines = [
+        f"🎴 {level} 測驗 — 選擇題型",
+        "",
+        "點一個題型，我會從你該題型的弱點優先出題；或選「🎲 隨機（全部）」。",
+        "（小技巧：直接打 /quiz {0} {1} random 可跳過此選單）".format(level, theme),
+    ]
+    buttons = [
+        {
+            "text": f"{ep}（{n}）",
+            "callback_data": f"quiz:t:{level}:{ep}",
+        }
+        for ep, n in counts
+    ]
+    rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+    rows.append([{"text": "🎲 隨機（全部）", "callback_data": f"quiz:t:{level}:*"}])
+    return "\n".join(lines), {"inline_keyboard": rows}
 
 
 def _render_review_page(db, page: int) -> tuple[str, dict]:
@@ -333,8 +377,12 @@ def build_quiz_handler(
                 return _distill_authoring(settings, db, rest)
             if action == "stats":
                 return _render_stats(db, chat_id)
-            # default: serve one question
-            return _do_serve(settings, db, text, chat_id)
+            # default: `/quiz <level> <theme> random` → serve immediately (any
+            # 題型, weighted); without `random` → show the 題型 selection menu.
+            level, theme = _parse_serve_args(text)
+            if _wants_random(text):
+                return _serve_question(settings, db, level, theme, None, chat_id)
+            return _render_type_menu(db, level, theme)
         except Exception as exc:
             logger.exception("quiz handler: action=%s failed", action)
             return f"測驗指令失敗：{exc}"
@@ -342,15 +390,27 @@ def build_quiz_handler(
     return handler
 
 
-def _do_serve(settings, db, text: str, chat_id: str | None = None):
-    level, theme = _parse_serve_args(text)
+def _serve_question(
+    settings,
+    db,
+    level: str,
+    theme: str,
+    exam_point: str | None,
+    chat_id: str | None,
+):
+    """Serve one weighted question (optionally restricted to ``exam_point``).
+    Returns a ``(text, markup)`` view tuple, or an error string."""
     _ensure_provider_registered(theme)
-    question = db.weighted_question(level=level, chat_id=chat_id)
-    if question is None:
+    question = db.weighted_question(level=level, chat_id=chat_id, exam_point=exam_point)
+    if question is None and not exam_point:
         # Pool empty → generate one on-demand (runs in background via bot.py).
+        # Only for the unrestricted path: a type-filtered miss shouldn't trigger
+        # an unrelated 単語 generation that ignores the chosen 題型.
         gen = _build_generator(settings, db)
         question = gen.generate_one_question(level=level, theme=theme, question_type="単語")
     if question is None:
+        if exam_point:
+            return f"目前 {level} 的「{exam_point}」題型沒有可出的題目，換個題型或用 random 試試。"
         return (
             f"目前 {level} 題庫是空的，且即時出題失敗（地端模型或素材來源可能暫時不可用）。"
             "稍後再試，或先跑 /quiz gen20 批次產題。"
@@ -408,6 +468,18 @@ def build_quiz_callback_handler(
                     logger.exception("quiz: record_attempt failed qid=%s", qid)
                 db.mark_served(qid)
                 return toast, new_text, None  # clear keyboard
+            if action == "t":
+                # type-menu selection: rest = "<level>:<exam_point>" ('*' = all).
+                lvl, _, ep = rest.partition(":")
+                exam_point = None if ep in ("", "*") else ep
+                served = _serve_question(
+                    settings, db, lvl or _DEFAULT_LEVEL, _DEFAULT_THEME,
+                    exam_point, str(chat_id or ""),
+                )
+                if isinstance(served, tuple):
+                    text, markup = served
+                    return None, text, markup
+                return None, served, None  # error string → replace menu text
             if action == "p":
                 try:
                     page = max(0, int(rest))
