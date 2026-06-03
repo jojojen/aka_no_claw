@@ -163,6 +163,42 @@ def is_grounded(
     return False
 
 
+def correct_option_is_verbatim_copy(
+    *,
+    options: tuple[str, ...],
+    answer_index: int,
+    source_excerpt: str | None,
+    threshold: float = 0.9,
+    distractor_ceiling: float = 0.7,
+) -> bool:
+    """True iff the CORRECT option is a (near-)verbatim span of 本文 while the
+    distractors are not — i.e. a reading question degenerates to 'spot the copied
+    sentence', requiring no comprehension. Enforces the 内容理解 逐字コピー禁止 rule
+    structurally (the prompt-level reminder alone doesn't stop the model copying).
+
+    Coverage = longest shared run / option length, measured on noise-stripped text
+    (the same normalization is_grounded uses), so punctuation/spacing differences
+    don't hide a verbatim lift. Scoped by the caller to reading types only — for
+    用法 the correct option being the real line is the *required* grounding anchor.
+    """
+    excerpt = _normalize_grounding(source_excerpt)
+    if len(excerpt) < _MIN_ANCHOR or not (0 <= answer_index < len(options)):
+        return False
+
+    def coverage(opt: str) -> float:
+        normalized = _normalize_grounding(opt)
+        if len(normalized) < _MIN_ANCHOR:
+            return 0.0
+        return _longest_common_substring_len(normalized, excerpt) / len(normalized)
+
+    correct = coverage(options[answer_index])
+    distractor = max(
+        (coverage(o) for i, o in enumerate(options) if i != answer_index),
+        default=0.0,
+    )
+    return correct >= threshold and distractor < distractor_ceiling
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS quiz_questions (
     question_id      TEXT PRIMARY KEY,
