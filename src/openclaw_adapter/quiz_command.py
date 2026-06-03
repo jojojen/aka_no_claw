@@ -408,6 +408,7 @@ def start_quiz_daily_scheduler(settings: AssistantSettings):
     """Start the daemon that generates a few verified questions per day.
     Best-effort: returns None (and logs) if anything needed is unavailable."""
     try:
+        from .miku_ranking import backfill_song_media
         from .quiz_generator import QuizDailyScheduler
 
         _ensure_provider_registered(_DEFAULT_THEME)
@@ -419,6 +420,7 @@ def start_quiz_daily_scheduler(settings: AssistantSettings):
             theme=_DEFAULT_THEME,
             per_day=2,
             hour=4,
+            media_backfill_fn=lambda: backfill_song_media(db),
         )
         scheduler.start()
         return scheduler

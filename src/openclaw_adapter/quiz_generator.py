@@ -365,6 +365,7 @@ class QuizDailyScheduler:
         per_day: int = 2,
         hour: int = 4,
         question_type: str | None = "単語",
+        media_backfill_fn: Callable[[], object] | None = None,
     ) -> None:
         self._generator = generator
         self._level = level
@@ -372,6 +373,9 @@ class QuizDailyScheduler:
         self._per_day = max(1, per_day)
         self._hour = hour
         self._question_type = question_type
+        # Optional post-batch hook that heals any song question missing its 音檔 URL
+        # (injected in production; left None in tests so they stay offline).
+        self._media_backfill_fn = media_backfill_fn
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
@@ -401,4 +405,9 @@ class QuizDailyScheduler:
             ):
                 made += 1
         logger.info("QuizDailyScheduler: produced %d/%d question(s)", made, self._per_day)
+        if self._media_backfill_fn is not None:
+            try:
+                self._media_backfill_fn()
+            except Exception:
+                logger.exception("QuizDailyScheduler: media backfill failed")
         return made
