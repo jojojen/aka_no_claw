@@ -28,7 +28,9 @@ from typing import Callable
 from .quiz_db import (
     QuizDatabase,
     QuizQuestion,
+    correct_option_is_verbatim_copy,
     format_authoring_knowledge_block,
+    is_reading_exam_point,
 )
 from .quiz_sources import QuizSource, SourceProvider, get_provider
 
@@ -118,11 +120,31 @@ def _build_author_prompt(
     )
 
 
-def _build_grader_prompt(*, level: str, stem: str, options: list[str]) -> str:
+def _build_grader_prompt(
+    *, level: str, stem: str, options: list[str], passage: str | None = None
+) -> str:
     lines = [f"{i}. {opt}" for i, opt in enumerate(options)]
+    # Reading questions are only answerable WITH 本文, so the correctness grader
+    # must see it; self-contained types (vocab/grammar) pass passage=None.
+    passage_block = f"本文：{passage}\n\n" if passage else ""
     return (
         f"你是嚴格的 JLPT {level} 解題者。下面是一題單選題，請獨立作答。\n"
         "只輸出 JSON：{\"answer_index\": <0起算的正解索引>, \"reason\": \"簡短理由\"}\n\n"
+        f"{passage_block}題目：{stem}\n選項：\n" + "\n".join(lines)
+    )
+
+
+def _build_leak_probe_prompt(*, level: str, stem: str, options: list[str]) -> str:
+    """Stem-leak probe: a reading question should be UNANSWERABLE without 本文.
+    The grader is told it cannot see 本文 and to return -1 when the answer can't be
+    pinned down from stem+options alone. If it still lands on the intended answer,
+    the answer leaked into the stem → no discrimination → reject."""
+    lines = [f"{i}. {opt}" for i, opt in enumerate(options)]
+    return (
+        f"你是嚴格的 JLPT {level} 解題者，但這次你【看不到本文】。\n"
+        "請只憑下面的題幹與選項作答。如果『沒有本文就無法確定唯一答案』，請回 answer_index: -1；\n"
+        "只有在不需本文、光看題幹與選項就能確定唯一答案時，才給出該索引。\n"
+        "只輸出 JSON：{\"answer_index\": <0起算索引，或 -1 表示需要本文才能判斷>, \"reason\": \"簡短理由\"}\n\n"
         f"題目：{stem}\n選項：\n" + "\n".join(lines)
     )
 
@@ -198,7 +220,7 @@ class QuizGenerator:
         for attempt in range(1, self._max_retries + 1):
             source = candidates[(attempt - 1) % len(candidates)]
             authoring = self._db.retrieve_authoring_knowledge(
-                f"{level} {source.name} {source.source_type}"
+                f"{level} {question_type or ''} {source.name} {source.source_type}"
             )
             self._db.mark_authoring_applied(tuple(k.knowledge_id for k in authoring))
             # First attempt deterministic; later attempts warm up so a rejected
@@ -239,9 +261,13 @@ class QuizGenerator:
         if not stem or len(options) < 4 or not (0 <= answer_index < len(options)):
             return None
 
-        # Independent grader pass — never sees the intended answer.
+        is_reading = is_reading_exam_point(exam_point)
+        # Correctness grader — never sees the intended answer. Reading questions are
+        # only answerable WITH 本文 (the excerpt rendered to the user), so the grader
+        # must see it; self-contained vocab/grammar types carry everything in the stem.
+        passage = source.excerpt if is_reading else None
         grader = self._llm_json(
-            _build_grader_prompt(level=level, stem=stem, options=options)
+            _build_grader_prompt(level=level, stem=stem, options=options, passage=passage)
         )
         if not grader:
             return None
@@ -254,6 +280,12 @@ class QuizGenerator:
                 "quiz: grader disagreed (author=%d grader=%d) — discarding",
                 answer_index, grader_index,
             )
+            return None
+
+        if is_reading and not self._passes_reading_discrimination(
+            level=level, stem=stem, options=options,
+            answer_index=answer_index, excerpt=source.excerpt,
+        ):
             return None
 
         try:
@@ -274,6 +306,43 @@ class QuizGenerator:
         except ValueError as exc:
             logger.info("quiz: rejected generation (%s) — discarding", exc)
             return None
+
+    def _passes_reading_discrimination(
+        self, *, level: str, stem: str, options: list[str],
+        answer_index: int, excerpt: str | None,
+    ) -> bool:
+        """Two complementary anti-leak guards for reading types, each catching a
+        different leak topology (a passing correctness grader can't see either):
+
+          1. verbatim-copy — the correct option is a 本文 sentence lifted verbatim,
+             so the question is 'spot the copied line', not comprehension. Caught
+             deterministically by string overlap.
+          2. stem-leak — the answer is derivable from stem+options WITHOUT 本文, so
+             a reading question that should require 本文 has none. Caught by an
+             inverted grader that is denied 本文 and must NOT land on the answer.
+        """
+        if correct_option_is_verbatim_copy(
+            options=tuple(options), answer_index=answer_index, source_excerpt=excerpt,
+        ):
+            logger.info("quiz: reading question rejected — correct option is a verbatim 本文 copy")
+            return False
+
+        leak = self._llm_json(
+            _build_leak_probe_prompt(level=level, stem=stem, options=options)
+        )
+        # Fail-open on a probe error: correctness is already verified, so don't
+        # discard a good question over a transient LLM hiccup.
+        if leak is not None:
+            try:
+                leak_index = int(leak.get("answer_index"))
+            except (TypeError, ValueError):
+                leak_index = -1
+            if leak_index == answer_index:
+                logger.info(
+                    "quiz: reading question rejected — answer derivable without 本文 (stem-leak)"
+                )
+                return False
+        return True
 
 
 def _seconds_until_next(hour: int) -> float:

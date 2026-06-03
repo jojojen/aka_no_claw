@@ -126,6 +126,46 @@ class TestAuthoringKnowledgeInjection:
         assert author_prompts, "author prompt was never issued"
         assert "干擾項同詞性" in author_prompts[0]
 
+    def test_question_type_drives_knowledge_retrieval(self, tmp_path):
+        # Regression: the retrieval query must include the question_type, so a
+        # type-specific rule (e.g. the 内容理解 "don't copy the answer verbatim"
+        # lesson) is injected even when its keywords don't match the song name.
+        # Crowd the KB with higher-confidence generic rules so the type rule
+        # only makes the top-k cut when the question_type token boosts it.
+        seen_prompts = []
+
+        def call(**kw):
+            prompt = kw.get("prompt", "")
+            seen_prompts.append(prompt)
+            if "解題者" in prompt or "獨立作答" in prompt:
+                return _grader_payload(2)
+            return _author_payload(2)
+
+        db, gen = _make_gen(tmp_path, call)
+        for i in range(6):
+            db.upsert_authoring_knowledge(
+                category="level_calibration",
+                title=f"無關規則{i}",
+                technique="一般規則。",
+                keywords=("無關",),
+                origin="seed",
+                confidence=0.99,
+            )
+        db.upsert_authoring_knowledge(
+            category="reading",
+            title="内容理解は逐字コピー禁止",
+            technique="内容理解の正解を本文から逐字コピーしてはいけない。",
+            keywords=("内容理解", "逐字コピー"),
+            origin="seed",
+            confidence=0.5,  # lower than the generic rules
+        )
+        gen.generate_one_question(
+            level="JLPT N1", theme="fake", provider=FakeProvider(), question_type="内容理解"
+        )
+        author_prompts = [p for p in seen_prompts if "出題老師" in p]
+        assert author_prompts, "author prompt was never issued"
+        assert "内容理解は逐字コピー禁止" in author_prompts[0]
+
     def test_applied_count_increments(self, tmp_path):
         seq = iter([_author_payload(2), _grader_payload(2)])
         db, gen = _make_gen(tmp_path, lambda **kw: next(seq))
@@ -141,6 +181,179 @@ class TestAuthoringKnowledgeInjection:
         refreshed = db.all_authoring_knowledge()[0]
         assert refreshed.knowledge_id == entry.knowledge_id
         assert refreshed.times_applied >= 1
+
+
+class ReadingProvider:
+    """Provider whose excerpt is multi-sentence 本文 (essay/評論), so reading-type
+    discrimination guards can be exercised end-to-end."""
+
+    theme = "fake"
+
+    def __init__(self, excerpt):
+        self._excerpt = excerpt
+
+    def fetch_candidates(self, limit=10):
+        return [
+            QuizSource(
+                source_type="essay",
+                name="テスト評論",
+                text_url="https://example.com/text",
+                media_url=None,
+                excerpt=self._excerpt,
+            )
+        ]
+
+
+def _reading_author_payload(*, exam_point, stem, options, answer_index, explanation="解説"):
+    return json.dumps(
+        {
+            "exam_point": exam_point,
+            "stem": stem,
+            "options": options,
+            "answer_index": answer_index,
+            "explanation": explanation,
+        }
+    )
+
+
+def _is_leak_probe(prompt):
+    return "看不到本文" in prompt
+
+
+def _is_grader(prompt):
+    return ("解題者" in prompt or "獨立作答" in prompt) and not _is_leak_probe(prompt)
+
+
+class TestReadingDiscriminationGuards:
+    EXCERPT_VERBATIM = "猫は窓辺で静かに眠っていた。外では冷たい雨が降り続いていた。"
+
+    def test_verbatim_copy_correct_option_is_rejected(self, tmp_path):
+        # 内容理解 where the correct option is a 本文 sentence copied verbatim. The
+        # correctness grader agrees (it can see 本文), but the question is just
+        # 'spot the copied line' → the verbatim guard must discard it.
+        author = _reading_author_payload(
+            exam_point="内容理解",
+            stem="本文の内容に合うものはどれか。",
+            options=[
+                "猫は窓辺で静かに眠っていた",
+                "犬が広い庭を駆け回っていた",
+                "小鳥が高い空を飛んでいた",
+                "魚が清い川を泳いでいた",
+            ],
+            answer_index=0,
+        )
+
+        def call(**kw):
+            prompt = kw.get("prompt", "")
+            if _is_leak_probe(prompt):
+                return _grader_payload(-1)
+            if _is_grader(prompt):
+                return _grader_payload(0)  # grader agrees with author
+            return author
+
+        db, gen = _make_gen(tmp_path, call)
+        q = gen.generate_one_question(
+            level="JLPT N1", theme="fake",
+            provider=ReadingProvider(self.EXCERPT_VERBATIM), question_type="内容理解",
+        )
+        assert q is None
+        assert db.count_verified(level="JLPT N1") == 0
+
+    def test_stem_leak_rejected_by_inverted_grader(self, tmp_path):
+        # The answer is leaked into the stem itself (not a verbatim 本文 copy, so the
+        # copy guard passes). The inverted grader, denied 本文, still lands on it →
+        # the question needs no 本文 → reject.
+        author = _reading_author_payload(
+            exam_point="内容理解",
+            stem="本文によれば、主人公が最後に選んだのは『海』だった。主人公が最後に選んだものはどれか。",
+            options=["海", "山", "空", "森"],
+            answer_index=0,
+        )
+
+        def call(**kw):
+            prompt = kw.get("prompt", "")
+            if _is_leak_probe(prompt):
+                return _grader_payload(0)  # determinable WITHOUT 本文 → leak
+            if _is_grader(prompt):
+                return _grader_payload(0)
+            return author
+
+        db, gen = _make_gen(tmp_path, call)
+        q = gen.generate_one_question(
+            level="JLPT N1", theme="fake",
+            provider=ReadingProvider("主人公は長い旅の末、ある決断を下した。"),
+            question_type="内容理解",
+        )
+        assert q is None
+        assert db.count_verified(level="JLPT N1") == 0
+
+    def test_clean_reading_question_passes_both_guards(self, tmp_path):
+        # Paraphrased correct option (not verbatim) + answer needs 本文 → both guards
+        # pass and the question is stored.
+        excerpt = (
+            "筆者は、技術の進歩が必ずしも幸福をもたらすとは限らないと述べている。"
+            "便利さの裏で人間関係が希薄になることを懸念している。"
+        )
+        author = _reading_author_payload(
+            exam_point="主張",
+            stem="本文における筆者の主張に最も近いものはどれか。",
+            options=[
+                "技術の進歩は人間関係を損なう恐れがある",
+                "技術の進歩は常に幸福をもたらす",
+                "技術の進歩は不要である",
+                "技術の進歩は人間関係を必ず深める",
+            ],
+            answer_index=0,
+        )
+
+        def call(**kw):
+            prompt = kw.get("prompt", "")
+            if _is_leak_probe(prompt):
+                return _grader_payload(-1)  # cannot determine without 本文 → clean
+            if _is_grader(prompt):
+                return _grader_payload(0)
+            return author
+
+        db, gen = _make_gen(tmp_path, call)
+        q = gen.generate_one_question(
+            level="JLPT N1", theme="fake",
+            provider=ReadingProvider(excerpt), question_type="主張",
+        )
+        assert q is not None
+        assert q.verified is True
+        assert q.answer_index == 0
+        assert db.count_verified(level="JLPT N1") == 1
+
+
+class TestVerbatimCopyHelper:
+    def test_detects_verbatim_lift(self):
+        from openclaw_adapter.quiz_db import correct_option_is_verbatim_copy
+
+        excerpt = "猫は窓辺で静かに眠っていた。外では雨が降り続いていた。"
+        assert correct_option_is_verbatim_copy(
+            options=("猫は窓辺で静かに眠っていた", "犬が庭を走っていた", "鳥が飛んでいた", "魚が泳いでいた"),
+            answer_index=0,
+            source_excerpt=excerpt,
+        )
+
+    def test_paraphrase_is_not_flagged(self):
+        from openclaw_adapter.quiz_db import correct_option_is_verbatim_copy
+
+        excerpt = "筆者は技術の進歩が幸福をもたらすとは限らないと述べている。"
+        assert not correct_option_is_verbatim_copy(
+            options=("技術の進歩は必ずしも幸福に繋がらない", "技術は常に幸福を生む", "技術は無意味だ", "技術は害だ"),
+            answer_index=0,
+            source_excerpt=excerpt,
+        )
+
+    def test_short_options_never_flagged(self):
+        from openclaw_adapter.quiz_db import correct_option_is_verbatim_copy
+
+        assert not correct_option_is_verbatim_copy(
+            options=("海", "山", "空", "森"),
+            answer_index=0,
+            source_excerpt="主人公は海を選んだ。",
+        )
 
 
 class TestSourceAgnostic:
