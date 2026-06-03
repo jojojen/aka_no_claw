@@ -490,6 +490,27 @@ class QuizDatabase:
             )
         return cursor.rowcount > 0
 
+    def missing_media_song_questions(self) -> list[tuple[str, str]]:
+        """(question_id, source_name) for song-typed questions lacking a 音檔 URL —
+        the backfill worklist. Reading-comprehension items built from 賞析 articles
+        never carried a PV, so they show up here even though the song has one."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT question_id, source_name FROM quiz_questions "
+                "WHERE source_type LIKE '%song%' "
+                "AND (source_media_url IS NULL OR source_media_url = '')"
+            ).fetchall()
+        return [(r["question_id"], r["source_name"] or "") for r in rows]
+
+    def set_media_url(self, question_id: str, url: str) -> bool:
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "UPDATE quiz_questions SET source_media_url = ?, updated_at = ? "
+                "WHERE question_id = ?",
+                (url, _utc_now_iso(), question_id),
+            )
+        return cursor.rowcount > 0
+
     # ── Authoring knowledge (self-improving) ──────────────────────────────────
 
     def upsert_authoring_knowledge(

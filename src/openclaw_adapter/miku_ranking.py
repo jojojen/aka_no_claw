@@ -38,13 +38,149 @@ _SOURCE_TYPE = "vocaloid_song"
 _EXCERPT_MAX_CHARS = 600
 
 
-def _extract_youtube_url(pvs: list) -> str | None:
+# 音檔 link preference: a clickable PV in this order. YouTube first (most Miku PVs
+# carry one), then NicoNico — many Vocaloid songs live ONLY on ニコニコ, which is why
+# a Youtube-only extractor used to leave media_url empty for them.
+_PV_SERVICE_PREFERENCE = ("youtube", "niconico", "bilibili", "soundcloud", "piapro", "vimeo")
+
+
+def _service_rank(service: str) -> int:
+    s = (service or "").lower()
+    for i, pref in enumerate(_PV_SERVICE_PREFERENCE):
+        if pref in s:
+            return i
+    return len(_PV_SERVICE_PREFERENCE)
+
+
+def _extract_pv_url(pvs: list) -> str | None:
+    """Best playable PV URL: prefer YouTube, then NicoNico/others; within a service
+    prefer the Original PV over reprints. Returns None only if no PV has a URL."""
+    best_url: str | None = None
+    best_key: tuple[int, int] | None = None
     for pv in pvs:
-        if not isinstance(pv, dict):
+        if not isinstance(pv, dict) or not pv.get("url"):
             continue
-        if str(pv.get("service", "")).lower() == "youtube" and pv.get("url"):
-            return str(pv["url"])
+        is_original = str(pv.get("pvType", "")).lower() == "original"
+        key = (_service_rank(str(pv.get("service", ""))), 0 if is_original else 1)
+        if best_key is None or key < best_key:
+            best_key, best_url = key, str(pv["url"])
+    return best_url
+
+
+def _vocadb_songs_get(
+    params: dict,
+    *,
+    timeout_seconds: int = 15,
+    ssl_context: ssl.SSLContext | None = None,
+) -> list:
+    """GET vocadb.net/api/songs and return the ``items`` list ([] on any failure)."""
+    url = f"{VOCADB_SONGS_API}?{urlencode(params)}"
+    request = Request(
+        url,
+        headers={"Accept": "application/json", "User-Agent": "OpenClawQuiz/0.1 (+https://local-dev)"},
+        method="GET",
+    )
+    try:
+        with urlopen(request, timeout=timeout_seconds, context=ssl_context) as response:
+            body = response.read().decode("utf-8", errors="replace")
+    except (HTTPError, URLError, TimeoutError) as exc:
+        logger.warning("VocaDB fetch failed: %s", exc)
+        return []
+    try:
+        return json.loads(body).get("items") or []
+    except (ValueError, AttributeError) as exc:
+        logger.warning("VocaDB response not parseable: %s", exc)
+        return []
+
+
+def _norm_name(s: str) -> str:
+    """Normalize a song title for matching: unify the sharp variants (＃/♯/#) and
+    drop spaces, so 『心拍数 #0822』 (our DB) matches 『心拍数♯0822』 (VocaDB). Kept tight
+    — this only erases punctuation/spacing noise, never collapses distinct titles."""
+    out = (s or "")
+    for ch in ("＃", "♯"):
+        out = out.replace(ch, "#")
+    return out.replace(" ", "").replace("　", "").strip().lower()
+
+
+def _select_song_pv(items: list, name: str) -> str | None:
+    """Pick the PV URL for the entry whose name EXACTLY equals ``name`` (primary or
+    alias) after light normalization. Exactness matters: a substring match drifts to
+    parodies/remixes — e.g. 『ロキ』 fuzzy-matched 『ロキソプロフェン…』, attaching the wrong
+    audio. Items arrive sorted by RatingScore, so the first match is canonical."""
+    target = _norm_name(name)
+    if not target:
+        return None
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        names = {str(item.get("name") or "")}
+        names |= {
+            str(n.get("value") or "")
+            for n in (item.get("names") or [])
+            if isinstance(n, dict)
+        }
+        if target not in {_norm_name(n) for n in names}:
+            continue
+        url = _extract_pv_url(item.get("pvs") or [])
+        if url:
+            return url
     return None
+
+
+def resolve_song_media_url(
+    name: str,
+    *,
+    timeout_seconds: int = 15,
+    ssl_context: ssl.SSLContext | None = None,
+) -> str | None:
+    """Resolve a song's official 音檔/PV URL from VocaDB by EXACT name. Returns None
+    when VocaDB has no exactly-named song with a playable PV (we never guess)."""
+    if not (name or "").strip():
+        return None
+    items = _vocadb_songs_get(
+        {
+            "query": name,
+            "sort": "RatingScore",
+            "onlyWithPVs": "true",
+            "maxResults": 10,
+            "getTotalCount": "false",
+            "fields": "PVs,Names",
+            "nameMatchMode": "Exact",
+        },
+        timeout_seconds=timeout_seconds,
+        ssl_context=ssl_context,
+    )
+    return _select_song_pv(items, name)
+
+
+def backfill_song_media(db, *, resolver=resolve_song_media_url) -> tuple[int, int]:
+    """Fill missing 音檔 URLs on song-typed questions by resolving each song name
+    against VocaDB. Idempotent, best-effort (network failures skip a name), cached
+    per name so duplicate songs cost one lookup. Returns (rows_filled, rows_missing).
+
+    This heals gaps from ANY creation path (e.g. reading-comprehension items built
+    from a 賞析 article never carried a PV), so 『一律附音檔』 holds pool-wide."""
+    missing = db.missing_media_song_questions()
+    if not missing:
+        return (0, 0)
+    cache: dict[str, str | None] = {}
+    filled = 0
+    for question_id, name in missing:
+        key = (name or "").strip()
+        if not key:
+            continue
+        if key not in cache:
+            try:
+                cache[key] = resolver(key)
+            except Exception:
+                logger.exception("backfill_song_media: resolver failed for %r", key)
+                cache[key] = None
+        url = cache[key]
+        if url and db.set_media_url(question_id, url):
+            filled += 1
+    logger.info("backfill_song_media: filled %d/%d missing media URLs", filled, len(missing))
+    return (filled, len(missing))
 
 
 def _extract_original_lyrics(lyrics: list) -> tuple[str | None, str | None]:
@@ -78,33 +214,19 @@ def fetch_miku_song_sources(
 
     Returns ``[]`` on any failure (network, non-JSON, schema drift) — callers
     treat an empty list as "no material this round", never as an error."""
-    params = {
-        "artistId[]": HATSUNE_MIKU_ARTIST_ID,
-        "songTypes": "Original",
-        "sort": "RatingScore",
-        "onlyWithPVs": "true",
-        "maxResults": max(1, min(100, limit)),
-        "getTotalCount": "false",
-        "fields": "PVs,Lyrics",
-    }
-    url = f"{VOCADB_SONGS_API}?{urlencode(params)}"
-    request = Request(
-        url,
-        headers={"Accept": "application/json", "User-Agent": "OpenClawQuiz/0.1 (+https://local-dev)"},
-        method="GET",
+    items = _vocadb_songs_get(
+        {
+            "artistId[]": HATSUNE_MIKU_ARTIST_ID,
+            "songTypes": "Original",
+            "sort": "RatingScore",
+            "onlyWithPVs": "true",
+            "maxResults": max(1, min(100, limit)),
+            "getTotalCount": "false",
+            "fields": "PVs,Lyrics",
+        },
+        timeout_seconds=timeout_seconds,
+        ssl_context=ssl_context,
     )
-    try:
-        with urlopen(request, timeout=timeout_seconds, context=ssl_context) as response:
-            body = response.read().decode("utf-8", errors="replace")
-    except (HTTPError, URLError, TimeoutError) as exc:
-        logger.warning("VocaDB fetch failed: %s", exc)
-        return []
-    try:
-        data = json.loads(body)
-        items = data.get("items") or []
-    except (ValueError, AttributeError) as exc:
-        logger.warning("VocaDB response not parseable: %s", exc)
-        return []
 
     sources: list[QuizSource] = []
     for item in items:
@@ -115,14 +237,14 @@ def fetch_miku_song_sources(
         if not name or song_id is None:
             continue
         vocadb_url = f"https://vocadb.net/S/{song_id}"
-        youtube_url = _extract_youtube_url(item.get("pvs") or [])
+        media_url = _extract_pv_url(item.get("pvs") or [])
         excerpt, lyrics_url = _extract_original_lyrics(item.get("lyrics") or [])
         sources.append(
             QuizSource(
                 source_type=_SOURCE_TYPE,
                 name=name,
                 text_url=lyrics_url or vocadb_url,
-                media_url=youtube_url,
+                media_url=media_url,
                 excerpt=excerpt,
             )
         )
