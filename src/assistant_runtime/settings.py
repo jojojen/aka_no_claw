@@ -63,6 +63,16 @@ class AssistantSettings:
     opportunity_web_trend_provider_enabled: bool = True
     opportunity_web_trend_queries: tuple[str, ...] = ()
     opportunity_web_trend_results_per_query: int = 5
+    # Throttle DuckDuckGo-backed discovery (trend sweep + per-candidate
+    # enrichment) so the 15-min pipeline tick doesn't re-run searches every
+    # tick; default 24h = one sweep/day. Between runs the providers replay
+    # their cached candidates without issuing any HTTP search.
+    opportunity_web_search_min_interval_seconds: int = 86400
+    # Hard cap on the number of automated DuckDuckGo searches per UTC day,
+    # shared across all entry points (trend sweep, candidate enrichment, SNS
+    # account discovery). Keeps automated search volume to a single-digit
+    # daily count regardless of tick frequency or candidate counts.
+    opportunity_web_search_daily_budget: int = 8
     opportunity_official_store_provider_enabled: bool = True
     # ── SNS rule domain backfill / auto-discovery (Provider E + backfill) ────
     opportunity_sns_domain_backfill_enabled: bool = True
@@ -215,6 +225,14 @@ def get_settings() -> AssistantSettings:
         opportunity_web_trend_results_per_query=_as_int(
             os.getenv("OPENCLAW_OPPORTUNITY_WEB_TREND_RESULTS_PER_QUERY"),
             default=5,
+        ),
+        opportunity_web_search_min_interval_seconds=_as_int(
+            os.getenv("OPENCLAW_OPPORTUNITY_WEB_SEARCH_MIN_INTERVAL_SECONDS"),
+            default=86400,
+        ),
+        opportunity_web_search_daily_budget=_as_int(
+            os.getenv("OPENCLAW_OPPORTUNITY_WEB_SEARCH_DAILY_BUDGET"),
+            default=8,
         ),
         opportunity_official_store_provider_enabled=_as_bool(
             os.getenv("OPENCLAW_OPPORTUNITY_OFFICIAL_STORE_PROVIDER_ENABLED"),

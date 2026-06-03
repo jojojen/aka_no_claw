@@ -1038,6 +1038,99 @@ def test_scheduled_web_search_provider_runs_each_query_and_extracts_candidates()
     assert candidates[0].source_kind == "web_trend_search"
 
 
+def test_scheduled_web_search_provider_throttles_ddg_between_runs() -> None:
+    from openclaw_adapter.web_search import WebSearchResult
+
+    search_calls = {"n": 0}
+    clock = {"t": 1000.0}
+
+    def fake_search(query, *, max_results):  # noqa: ARG001
+        search_calls["n"] += 1
+        return (WebSearchResult(title="t", url="https://example.com/x", snippet="s"),)
+
+    def fake_llm(prompt):  # noqa: ARG001
+        return (
+            '{"candidates":[{"game":"pokemon","product_type":"sealed_box","title":"X",'
+            '"product_identifier":null,"search_query":"X","heat_score":70,"reason":"web",'
+            '"source_tweet_ids":["https://example.com/x"]}]}'
+        )
+
+    provider = ScheduledWebSearchCandidateProvider(
+        search_fn=fake_search,
+        llm_fn=fake_llm,
+        queries=("q1", "q2"),
+        results_per_query=1,
+        min_interval_seconds=3600,
+        time_fn=lambda: clock["t"],
+    )
+
+    first = provider.discover(limit=5)
+    assert search_calls["n"] == 2  # 2 queries hit DDG on first run
+
+    # Within the interval: replays cache, no new DDG hits.
+    clock["t"] = 1000.0 + 600
+    second = provider.discover(limit=5)
+    assert search_calls["n"] == 2
+    assert second == first
+
+    # After the interval elapses: DDG runs again.
+    clock["t"] = 1000.0 + 3601
+    provider.discover(limit=5)
+    assert search_calls["n"] == 4
+
+
+def test_daily_call_budget_caps_per_day_and_resets() -> None:
+    from openclaw_adapter.opportunity_agent import DailyCallBudget
+
+    clock = {"t": 0.0}
+    budget = DailyCallBudget(3, time_fn=lambda: clock["t"])
+
+    # First 3 allowed, 4th denied within the same UTC day.
+    assert [budget.allow() for _ in range(5)] == [True, True, True, False, False]
+
+    # Crossing into the next day resets the count.
+    clock["t"] = 86400.0
+    assert budget.allow() is True
+    assert budget.allow() is True
+
+
+def test_daily_call_budget_zero_blocks_everything() -> None:
+    from openclaw_adapter.opportunity_agent import DailyCallBudget
+
+    budget = DailyCallBudget(0, time_fn=lambda: 0.0)
+    assert budget.allow() is False
+
+
+def test_web_research_candidate_provider_throttles_enrichment() -> None:
+    enrich_calls = {"n": 0}
+    clock = {"t": 500.0}
+    candidate = _candidate()
+
+    class CountingResearcher:
+        def enrich(self, c: OpportunityCandidate) -> OpportunityCandidate:
+            enrich_calls["n"] += 1
+            return c
+
+    provider = WebResearchCandidateProvider(
+        base_provider=_FakeCandidateProvider([candidate]),
+        researcher=CountingResearcher(),
+        min_interval_seconds=3600,
+        time_fn=lambda: clock["t"],
+    )
+
+    provider.discover(limit=5)
+    assert enrich_calls["n"] == 1
+
+    clock["t"] = 500.0 + 600  # within interval → no enrichment DDG
+    out = provider.discover(limit=5)
+    assert enrich_calls["n"] == 1
+    assert out == (candidate,)
+
+    clock["t"] = 500.0 + 3601  # interval elapsed → enrich again
+    provider.discover(limit=5)
+    assert enrich_calls["n"] == 2
+
+
 def test_chained_candidate_provider_dedupes_by_candidate_id() -> None:
     from openclaw_adapter.opportunity_models import build_candidate_id
 

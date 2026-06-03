@@ -6,6 +6,7 @@ import logging
 import re
 import sqlite3
 import ssl
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -186,12 +187,25 @@ class WebResearchCandidateProvider:
         *,
         base_provider,
         researcher: "WebOpportunityResearcher",
+        min_interval_seconds: int = 0,
+        time_fn=time.time,
     ) -> None:
         self._base_provider = base_provider
         self._researcher = researcher
+        self._min_interval_seconds = max(0, min_interval_seconds)
+        self._time_fn = time_fn
+        self._last_enrich_at = 0.0
 
     def discover(self, *, limit: int) -> Sequence[OpportunityCandidate]:
         candidates = self._base_provider.discover(limit=limit)
+        now = self._time_fn()
+        if (
+            self._min_interval_seconds > 0
+            and self._last_enrich_at > 0.0
+            and now - self._last_enrich_at < self._min_interval_seconds
+        ):
+            return tuple(candidates)
+        self._last_enrich_at = now
         enriched: list[OpportunityCandidate] = []
         for candidate in candidates:
             try:
@@ -295,15 +309,33 @@ class ScheduledWebSearchCandidateProvider:
         llm_fn,
         queries: Sequence[str] = DEFAULT_WEB_TREND_QUERIES,
         results_per_query: int = 5,
+        min_interval_seconds: int = 0,
+        time_fn=time.time,
     ) -> None:
         self._search_fn = search_fn
         self._llm_fn = llm_fn
         self._queries = tuple(queries)
         self._results_per_query = max(1, results_per_query)
+        self._min_interval_seconds = max(0, min_interval_seconds)
+        self._time_fn = time_fn
+        self._last_run_at = 0.0
+        self._cached: tuple[OpportunityCandidate, ...] = ()
 
     def discover(self, *, limit: int) -> Sequence[OpportunityCandidate]:
         if not self._queries:
             return ()
+        now = self._time_fn()
+        if (
+            self._min_interval_seconds > 0
+            and self._last_run_at > 0.0
+            and now - self._last_run_at < self._min_interval_seconds
+        ):
+            return self._cached
+        self._last_run_at = now
+        self._cached = self._run_discovery(limit=limit)
+        return self._cached
+
+    def _run_discovery(self, *, limit: int) -> tuple[OpportunityCandidate, ...]:
         snippets: list[WebSearchResult] = []
         for query in self._queries:
             try:
@@ -1110,6 +1142,32 @@ class OpportunityAgent:
             time.sleep(max(10, self._interval_seconds))
 
 
+class DailyCallBudget:
+    """Hard cap on automated external calls per UTC day, shared across every
+    DuckDuckGo entry point (trend sweep, candidate enrichment, SNS account
+    discovery). Keeps the opportunity agent's daily search volume to a small,
+    fixed count regardless of tick frequency or how many candidates surface.
+    """
+
+    def __init__(self, max_per_day: int, *, time_fn=time.time) -> None:
+        self._max_per_day = max(0, max_per_day)
+        self._time_fn = time_fn
+        self._lock = threading.Lock()
+        self._day: int | None = None
+        self._count = 0
+
+    def allow(self) -> bool:
+        day = int(self._time_fn() // 86400)
+        with self._lock:
+            if day != self._day:
+                self._day = day
+                self._count = 0
+            if self._count >= self._max_per_day:
+                return False
+            self._count += 1
+            return True
+
+
 def build_opportunity_agent(settings: AssistantSettings | None = None) -> OpportunityAgent:
     settings = settings or get_settings()
     thresholds = OpportunityThresholds(
@@ -1120,6 +1178,21 @@ def build_opportunity_agent(settings: AssistantSettings | None = None) -> Opport
         min_positive_rate=settings.opportunity_min_positive_rate,
     )
     ssl_context = build_ssl_context(settings)
+
+    # One daily search budget shared by every automated DuckDuckGo path so the
+    # agent issues at most `opportunity_web_search_daily_budget` searches/day.
+    _ddg_budget = DailyCallBudget(settings.opportunity_web_search_daily_budget)
+
+    def _budgeted_ddg_search(query, *, max_results: int = 5):
+        if not _ddg_budget.allow():
+            logger.info(
+                "Opportunity agent: daily web-search budget (%d) reached; skipping query=%s",
+                settings.opportunity_web_search_daily_budget,
+                query,
+            )
+            return ()
+        return search_duckduckgo(query, max_results=max_results, ssl_context=ssl_context)
+
     store = OpportunityStore(settings.opportunity_db_path)
     store.bootstrap()
     text_model = (settings.openclaw_local_text_model or "").split(",")[0].strip()
@@ -1187,10 +1260,11 @@ def build_opportunity_agent(settings: AssistantSettings | None = None) -> Opport
         queries = settings.opportunity_web_trend_queries or DEFAULT_WEB_TREND_QUERIES
         sub_providers.append(
             ScheduledWebSearchCandidateProvider(
-                search_fn=search_duckduckgo,
+                search_fn=_budgeted_ddg_search,
                 llm_fn=_llm_fn,
                 queries=queries,
                 results_per_query=settings.opportunity_web_trend_results_per_query,
+                min_interval_seconds=settings.opportunity_web_search_min_interval_seconds,
             )
         )
         logger.info(
@@ -1217,7 +1291,9 @@ def build_opportunity_agent(settings: AssistantSettings | None = None) -> Opport
                 model=text_model,
                 timeout_seconds=settings.opportunity_llm_timeout_seconds,
                 ssl_context=ssl_context,
+                search_fn=lambda query, limit: _budgeted_ddg_search(query, max_results=limit),
             ),
+            min_interval_seconds=settings.opportunity_web_search_min_interval_seconds,
         )
     pipeline = OpportunityPipeline(
         store=store,
@@ -1239,7 +1315,9 @@ def build_opportunity_agent(settings: AssistantSettings | None = None) -> Opport
         candidate_check_interval_seconds=settings.opportunity_candidate_check_interval_seconds,
     )
 
-    preflight_fn = _build_preflight_callable(settings=settings, ssl_context=ssl_context)
+    preflight_fn = _build_preflight_callable(
+        settings=settings, ssl_context=ssl_context, search_fn=_budgeted_ddg_search
+    )
 
     # Build CollabProfitBackfiller (D4) — price_fetcher left None for now;
     # the playwright-based fetcher lives in price_monitor_bot and is wired in
@@ -1318,7 +1396,7 @@ def _build_official_store_provider(*, ssl_context):
     return OfficialStoreCandidateProvider(crawlers=crawlers, collab_store=collab_store)
 
 
-def _build_preflight_callable(*, settings: AssistantSettings, ssl_context):
+def _build_preflight_callable(*, settings: AssistantSettings, ssl_context, search_fn=search_duckduckgo):
     """Return a callable that the opportunity-agent invokes before every tick:
 
     - Backfill domains for one untagged SNS rule (LLM-driven).
@@ -1395,7 +1473,7 @@ def _build_preflight_callable(*, settings: AssistantSettings, ssl_context):
                 try:
                     discover_tcg_sns_accounts(
                         sns_db=sns_db,
-                        search_fn=search_duckduckgo,
+                        search_fn=search_fn,
                         llm_fn=_llm_fn,
                         telegram_notify_fn=_telegram_notify,
                         chat_id=primary_chat_id,
