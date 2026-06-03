@@ -593,6 +593,27 @@ class QuizDatabase:
             ).fetchone()
         return int(row["n"]) if row else 0
 
+    def exam_point_counts(
+        self, *, level: str | None = None, verified_only: bool = True
+    ) -> list[tuple[str, int]]:
+        """List distinct 題型 (exam_point) and how many questions each has, for the
+        type-selection menu. Ordered by count desc then name so the menu is stable."""
+        clauses: list[str] = []
+        params: list[object] = []
+        if verified_only:
+            clauses.append("verified = 1")
+        if level:
+            clauses.append("level = ?")
+            params.append(level.strip())
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT exam_point AS ep, COUNT(*) AS n FROM quiz_questions{where} "
+                "GROUP BY exam_point ORDER BY n DESC, exam_point ASC",
+                tuple(params),
+            ).fetchall()
+        return [((r["ep"] or "").strip(), int(r["n"])) for r in rows if (r["ep"] or "").strip()]
+
     def mark_served(self, question_id: str) -> None:
         with self.connect() as conn:
             conn.execute(
@@ -656,6 +677,7 @@ class QuizDatabase:
         *,
         level: str | None = None,
         chat_id: str | None = None,
+        exam_point: str | None = None,
         verified_only: bool = True,
         exclude_id: str | None = None,
         rng: random.Random | None = None,
@@ -664,13 +686,17 @@ class QuizDatabase:
         driven by per-考点 (tested_point) accuracy when that point has history,
         else per-題型 (exam_point) accuracy; plus per-question freshness and
         spaced-repetition adjustments. Falls back to least-served when there is
-        no history at all (cold start ≈ random_question)."""
+        no history at all (cold start ≈ random_question). ``exam_point`` restricts
+        the candidate pool to one 題型 (the type-menu path)."""
         picker = rng or random
         clauses = ["verified = 1"] if verified_only else []
         params: list[object] = []
         if level:
             clauses.append("level = ?")
             params.append(level.strip())
+        if exam_point:
+            clauses.append("exam_point = ?")
+            params.append(exam_point.strip())
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         with self.connect() as conn:
             rows = conn.execute(

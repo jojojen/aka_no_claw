@@ -1,6 +1,12 @@
 from types import SimpleNamespace
 
-from openclaw_adapter.quiz_command import _grade_view, _is_commentary_url
+from openclaw_adapter.quiz_command import (
+    _grade_view,
+    _is_commentary_url,
+    _parse_serve_args,
+    _render_type_menu,
+    _wants_random,
+)
 
 
 def _q(*, source_type, text_url, exam_point="内容理解（中文）", author="Claude"):
@@ -51,3 +57,56 @@ def test_author_shown_in_reveal():
     q = _q(source_type="vocaloid_song", text_url="https://utaten.com/lyric/jb1/", author="codex")
     _, text = _grade_view(q, "orig", chosen=0)
     assert "🖋️ 出題者：codex" in text
+
+
+# ── type-selection feature ────────────────────────────────────────────────────
+
+
+def test_wants_random_detects_flag():
+    assert _wants_random("JLPTN1 miku random")
+    assert _wants_random("random")
+    assert not _wants_random("JLPTN1 miku")
+    assert not _wants_random("")
+
+
+def test_parse_serve_args_ignores_random_token():
+    # 'random' is a serve-mode flag, not a theme — must not become the theme.
+    level, theme = _parse_serve_args("JLPTN1 miku random")
+    assert level == "JLPT N1"
+    assert theme == "miku"
+
+
+def test_parse_serve_args_random_only_keeps_defaults():
+    level, theme = _parse_serve_args("random")
+    assert level == "JLPT N1"
+    assert theme == "miku"
+
+
+class _FakeDB:
+    def __init__(self, counts):
+        self._counts = counts
+
+    def exam_point_counts(self, *, level=None, verified_only=True):
+        return list(self._counts)
+
+
+def test_render_type_menu_one_button_per_type_plus_random():
+    db = _FakeDB([("漢字読み", 29), ("文脈規定", 15), ("用法", 6)])
+    text, markup = _render_type_menu(db, "JLPT N1", "miku")
+    rows = markup["inline_keyboard"]
+    flat = [b for row in rows for b in row]
+    cbs = [b["callback_data"] for b in flat]
+    # one button per type + a random-all button
+    assert "quiz:t:JLPT N1:漢字読み" in cbs
+    assert "quiz:t:JLPT N1:用法" in cbs
+    assert "quiz:t:JLPT N1:*" in cbs
+    # every callback fits Telegram's 64-byte limit
+    assert all(len(c.encode("utf-8")) <= 64 for c in cbs)
+    assert "選擇題型" in text
+
+
+def test_render_type_menu_empty_pool_message():
+    db = _FakeDB([])
+    text, markup = _render_type_menu(db, "JLPT N1", "miku")
+    assert markup["inline_keyboard"] == []
+    assert "題庫是空的" in text

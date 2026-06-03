@@ -447,6 +447,47 @@ class TestAdaptiveSelection:
                                        exclude_id=a.question_id, rng=random.Random(_))
             assert got.question_id == b.question_id
 
+    def test_weighted_question_restricts_to_exam_point(self, tmp_path):
+        import random
+        db = _db(tmp_path)
+        _insert_q(db, stem="kanji", exam_point="漢字読み", tested_point="A", source_name="S1")
+        target = _insert_q(db, stem="bunpou", exam_point="文法形式の判断",
+                           tested_point="B", source_name="S2")
+        for _ in range(30):
+            got = db.weighted_question(level="JLPT N1", chat_id="u1",
+                                       exam_point="文法形式の判断", rng=random.Random(_))
+            assert got.question_id == target.question_id
+
+    def test_weighted_question_exam_point_no_match_returns_none(self, tmp_path):
+        import random
+        db = _db(tmp_path)
+        _insert_q(db, stem="kanji", exam_point="漢字読み", tested_point="A")
+        got = db.weighted_question(level="JLPT N1", chat_id="u1",
+                                   exam_point="情報検索", rng=random.Random(1))
+        assert got is None
+
+    def test_exam_point_counts_groups_and_orders(self, tmp_path):
+        db = _db(tmp_path)
+        _insert_q(db, stem="k1", exam_point="漢字読み", tested_point="A", source_name="S1")
+        _insert_q(db, stem="k2", exam_point="漢字読み", tested_point="B", source_name="S2")
+        _insert_q(db, stem="g1", exam_point="文法形式の判断", tested_point="C", source_name="S3")
+        counts = db.exam_point_counts(level="JLPT N1")
+        assert counts[0] == ("漢字読み", 2)  # most-populous first
+        assert ("文法形式の判断", 1) in counts
+
+    def test_exam_point_counts_excludes_unverified(self, tmp_path):
+        db = _db(tmp_path)
+        _insert_q(db, stem="k1", exam_point="漢字読み", tested_point="A")
+        db.insert_question(
+            level="JLPT N1", exam_point="用法", stem="u1",
+            options=("a", "b", "c", "d"), answer_index=0, explanation="x",
+            source_type="vocaloid_song", source_name="S9",
+            source_excerpt="朝、目が覚めて…", tested_point="Z",
+            verified=False, allow_ungrounded=True,
+        )
+        eps = dict(db.exam_point_counts(level="JLPT N1"))
+        assert "漢字読み" in eps and "用法" not in eps
+
 
 class TestDeriveTestedPoint:
     def test_kanji_reading_word(self):
