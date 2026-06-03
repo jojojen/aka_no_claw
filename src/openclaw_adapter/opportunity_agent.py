@@ -309,44 +309,57 @@ class ScheduledWebSearchCandidateProvider:
         llm_fn,
         queries: Sequence[str] = DEFAULT_WEB_TREND_QUERIES,
         results_per_query: int = 5,
-        min_interval_seconds: int = 0,
-        time_fn=time.time,
     ) -> None:
         self._search_fn = search_fn
         self._llm_fn = llm_fn
         self._queries = tuple(queries)
         self._results_per_query = max(1, results_per_query)
-        self._min_interval_seconds = max(0, min_interval_seconds)
-        self._time_fn = time_fn
-        self._last_run_at = 0.0
+        self._cursor = 0
         self._cached: tuple[OpportunityCandidate, ...] = ()
 
     def discover(self, *, limit: int) -> Sequence[OpportunityCandidate]:
+        # One query per tick, round-robin through the list, instead of firing
+        # the whole batch at once. Combined with the shared per-hour search
+        # budget this spreads the trend sweep out (≈1 query/hour) so it never
+        # bursts an upstream IP rate-limit. Newly found candidates are merged
+        # into a rolling cache that is replayed when a tick is budget-skipped or
+        # returns nothing.
         if not self._queries:
             return ()
-        now = self._time_fn()
-        if (
-            self._min_interval_seconds > 0
-            and self._last_run_at > 0.0
-            and now - self._last_run_at < self._min_interval_seconds
-        ):
-            return self._cached
-        self._last_run_at = now
-        self._cached = self._run_discovery(limit=limit)
+        query = self._queries[self._cursor % len(self._queries)]
+        self._cursor += 1
+        fresh = self._discover_one(query, limit=limit)
+        if fresh:
+            self._cached = self._merge_candidates(self._cached, fresh, limit=limit)
         return self._cached
 
-    def _run_discovery(self, *, limit: int) -> tuple[OpportunityCandidate, ...]:
-        snippets: list[WebSearchResult] = []
-        for query in self._queries:
-            try:
-                results = self._search_fn(query, max_results=self._results_per_query)
-            except Exception:
-                logger.exception("ScheduledWebSearchCandidateProvider search failed query=%s", query)
+    @staticmethod
+    def _merge_candidates(
+        existing: tuple[OpportunityCandidate, ...],
+        fresh: tuple[OpportunityCandidate, ...],
+        *,
+        limit: int,
+    ) -> tuple[OpportunityCandidate, ...]:
+        merged: list[OpportunityCandidate] = []
+        seen: set[str] = set()
+        for candidate in (*fresh, *existing):
+            if candidate.candidate_id in seen:
                 continue
-            if results:
-                snippets.extend(results)
-        if not snippets:
+            seen.add(candidate.candidate_id)
+            merged.append(candidate)
+            if len(merged) >= max(1, limit):
+                break
+        return tuple(merged)
+
+    def _discover_one(self, query: str, *, limit: int) -> tuple[OpportunityCandidate, ...]:
+        try:
+            results = self._search_fn(query, max_results=self._results_per_query)
+        except Exception:
+            logger.exception("ScheduledWebSearchCandidateProvider search failed query=%s", query)
             return ()
+        if not results:
+            return ()
+        snippets: list[WebSearchResult] = list(results)
         pseudo_posts = _snippets_as_pseudo_posts(snippets)
         prompt = _build_web_trend_candidate_prompt(snippets, limit=limit)
         try:
@@ -1143,28 +1156,44 @@ class OpportunityAgent:
 
 
 class DailyCallBudget:
-    """Hard cap on automated external calls per UTC day, shared across every
-    DuckDuckGo entry point (trend sweep, candidate enrichment, SNS account
-    discovery). Keeps the opportunity agent's daily search volume to a small,
-    fixed count regardless of tick frequency or how many candidates surface.
+    """Hard cap on automated external calls, shared across every web-search
+    entry point (trend sweep, candidate enrichment, SNS account discovery).
+
+    Two independent windows must both have room for a call to be allowed:
+    at most ``max_per_hour`` per clock-hour (``None`` = no hourly limit) AND at
+    most ``max_per_day`` per UTC day. The hourly cap is what stops a burst (the
+    trend sweep's query list, or many candidates enriched in one tick) from
+    firing back-to-back and tripping an upstream IP rate-limit — extra calls in
+    the same hour are denied and the caller degrades gracefully.
     """
 
-    def __init__(self, max_per_day: int, *, time_fn=time.time) -> None:
+    def __init__(self, max_per_day: int, *, max_per_hour: int | None = None, time_fn=time.time) -> None:
         self._max_per_day = max(0, max_per_day)
+        self._max_per_hour = None if max_per_hour is None else max(0, max_per_hour)
         self._time_fn = time_fn
         self._lock = threading.Lock()
         self._day: int | None = None
-        self._count = 0
+        self._day_count = 0
+        self._hour: int | None = None
+        self._hour_count = 0
 
     def allow(self) -> bool:
-        day = int(self._time_fn() // 86400)
+        now = self._time_fn()
+        day = int(now // 86400)
+        hour = int(now // 3600)
         with self._lock:
             if day != self._day:
                 self._day = day
-                self._count = 0
-            if self._count >= self._max_per_day:
+                self._day_count = 0
+            if hour != self._hour:
+                self._hour = hour
+                self._hour_count = 0
+            if self._day_count >= self._max_per_day:
                 return False
-            self._count += 1
+            if self._max_per_hour is not None and self._hour_count >= self._max_per_hour:
+                return False
+            self._day_count += 1
+            self._hour_count += 1
             return True
 
 
@@ -1179,14 +1208,20 @@ def build_opportunity_agent(settings: AssistantSettings | None = None) -> Opport
     )
     ssl_context = build_ssl_context(settings)
 
-    # One daily search budget shared by every automated DuckDuckGo path so the
-    # agent issues at most `opportunity_web_search_daily_budget` searches/day.
-    _ddg_budget = DailyCallBudget(settings.opportunity_web_search_daily_budget)
+    # One search budget shared by every automated search path so the agent
+    # issues at most `hourly_budget` searches/hour AND `daily_budget`/day. The
+    # hourly cap turns the trend sweep's round-robin into ≈1 query/hour, which
+    # is what keeps a small upstream engine from IP-rate-limiting us.
+    _ddg_budget = DailyCallBudget(
+        settings.opportunity_web_search_daily_budget,
+        max_per_hour=settings.opportunity_web_search_hourly_budget,
+    )
 
     def _budgeted_ddg_search(query, *, max_results: int = 5):
         if not _ddg_budget.allow():
             logger.info(
-                "Opportunity agent: daily web-search budget (%d) reached; skipping query=%s",
+                "Opportunity agent: web-search budget reached (%d/hour, %d/day); skipping query=%s",
+                settings.opportunity_web_search_hourly_budget,
                 settings.opportunity_web_search_daily_budget,
                 query,
             )
@@ -1264,7 +1299,6 @@ def build_opportunity_agent(settings: AssistantSettings | None = None) -> Opport
                 llm_fn=_llm_fn,
                 queries=queries,
                 results_per_query=settings.opportunity_web_trend_results_per_query,
-                min_interval_seconds=settings.opportunity_web_search_min_interval_seconds,
             )
         )
         logger.info(
