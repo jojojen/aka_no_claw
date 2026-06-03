@@ -180,6 +180,38 @@ class TestGrounding:
             source_excerpt=self.LYRIC,
         )
 
+    def test_single_line_cloze_against_multiline_excerpt_is_grounded(self):
+        # Regression: a single blanked lyric line must ground even when the excerpt
+        # spans many lines. The old check required the carrier to cover 60% of the
+        # WHOLE excerpt, so multi-line excerpts rejected every genuine 文脈規定 cloze.
+        multiline = (
+            "悲しみの海に沈んだ私　このままどこまでも堕ちて行き／"
+            "夜空に光る星を数えて　明日が来るのを待ち続ける／"
+            "君の声が遠くで響いて　眠れない夜を越えていく"
+        )
+        assert is_grounded(
+            exam_point="文脈規定",
+            stem="夜空に光る星を（　　）、明日が来るのを待ち続ける。",
+            options=("数えて", "忘れて", "壊して", "投げて"),
+            answer_index=0,
+            source_excerpt=multiline,
+        )
+
+    def test_fabricated_cloze_against_multiline_excerpt_is_rejected(self):
+        # The fix must NOT open a fabrication hole: a made-up carrier that only shares
+        # a short fragment with a multi-line excerpt is still rejected.
+        multiline = (
+            "悲しみの海に沈んだ私　このままどこまでも堕ちて行き／"
+            "夜空に光る星を数えて　明日が来るのを待ち続ける"
+        )
+        assert not is_grounded(
+            exam_point="文脈規定",
+            stem="未来への希望を胸に抱いて、彼は新たな一歩を（　　）。",
+            options=("踏み出した", "諦めた", "見失った", "忘れた"),
+            answer_index=0,
+            source_excerpt=multiline,
+        )
+
     def test_iikae_quotes_real_line_is_grounded(self):
         # 言い換え: the real line sits inside the stem (excerpt ⊆ stem).
         assert is_grounded(
