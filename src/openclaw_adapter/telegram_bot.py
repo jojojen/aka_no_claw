@@ -8,6 +8,7 @@ import shutil
 import threading
 import uuid
 from pathlib import Path
+from typing import Callable
 
 from assistant_runtime import AssistantSettings, build_ssl_context
 from assistant_runtime.logging_utils import trim_for_log
@@ -71,8 +72,12 @@ from .reputation_snapshot import (
     request_reputation_snapshot,
 )
 from .web_search import (
+    answer_page_with_ollama,
+    build_web_fetch_answer,
     build_web_research_answer,
+    fetch_page_text,
     format_web_research_answer,
+    reformulate_queries_with_ollama,
     search_duckduckgo,
     summarize_web_sources_with_ollama,
 )
@@ -184,6 +189,12 @@ def default_reputation_renderer(settings: AssistantSettings) -> ReputationRender
     return render
 
 
+_LLM_NOT_CONFIGURED_MESSAGE = (
+    "網路搜尋摘要功能已可使用，但本地文字 LLM 尚未設定。"
+    "請設定 OPENCLAW_LOCAL_TEXT_BACKEND=ollama 與 OPENCLAW_LOCAL_TEXT_MODEL。"
+)
+
+
 def default_web_research_renderer(settings: AssistantSettings) -> ResearchRenderer:
     backend = (settings.openclaw_local_text_backend or "").strip().lower()
     endpoint = settings.openclaw_local_text_endpoint
@@ -193,10 +204,7 @@ def default_web_research_renderer(settings: AssistantSettings) -> ResearchRender
 
     def render(query: TelegramResearchQuery) -> str:
         if backend != "ollama" or not endpoint or not model:
-            return (
-                "網路搜尋摘要功能已可使用，但本地文字 LLM 尚未設定。"
-                "請設定 OPENCLAW_LOCAL_TEXT_BACKEND=ollama 與 OPENCLAW_LOCAL_TEXT_MODEL。"
-            )
+            return _LLM_NOT_CONFIGURED_MESSAGE
         answer = build_web_research_answer(
             query.query,
             max_results=5,
@@ -205,9 +213,49 @@ def default_web_research_renderer(settings: AssistantSettings) -> ResearchRender
                 max_results=limit,
                 ssl_context=ssl_ctx,
             ),
+            # Item 4: turn the question into a few focused search queries first.
+            reformulate_fn=lambda q: reformulate_queries_with_ollama(
+                q,
+                endpoint=endpoint,
+                model=model,
+                timeout_seconds=timeout,
+                ssl_context=ssl_ctx,
+            ),
+            # Item 1: download the top results so the summary reads article text.
+            fetch_page_fn=lambda url: fetch_page_text(url, ssl_context=ssl_ctx),
             summarize_fn=lambda q, sources: summarize_web_sources_with_ollama(
                 q,
                 sources,
+                endpoint=endpoint,
+                model=model,
+                timeout_seconds=timeout,
+                ssl_context=ssl_ctx,
+            ),
+        )
+        return format_web_research_answer(answer)
+
+    return render
+
+
+def default_web_fetch_renderer(settings: AssistantSettings) -> "Callable[[str, str], str]":
+    """Item 3: WebFetch equivalent — read one URL and answer a focused prompt."""
+    backend = (settings.openclaw_local_text_backend or "").strip().lower()
+    endpoint = settings.openclaw_local_text_endpoint
+    model = _select_text_generation_model(settings)
+    timeout = max(1, settings.openclaw_local_text_timeout_seconds)
+    ssl_ctx = build_ssl_context(settings) if endpoint.startswith("https://") else None
+
+    def render(url: str, prompt: str) -> str:
+        if backend != "ollama" or not endpoint or not model:
+            return _LLM_NOT_CONFIGURED_MESSAGE
+        answer = build_web_fetch_answer(
+            url,
+            prompt,
+            fetch_page_fn=lambda u: fetch_page_text(u, ssl_context=ssl_ctx),
+            answer_fn=lambda u, p, content: answer_page_with_ollama(
+                u,
+                p,
+                content,
                 endpoint=endpoint,
                 model=model,
                 timeout_seconds=timeout,
@@ -395,6 +443,7 @@ def run_telegram_polling(
         photo_intent_analyzer=default_photo_intent_analyzer(settings),
         reputation_renderer=default_reputation_renderer(settings),
         research_renderer=research_renderer,
+        fetch_renderer=default_web_fetch_renderer(settings),
         natural_language_router=build_telegram_natural_language_router_from_settings(settings),
         ssl_context=build_ssl_context(settings),
         allowed_chat_ids=frozenset(settings.openclaw_telegram_chat_ids),

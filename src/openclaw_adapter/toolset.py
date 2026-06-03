@@ -45,7 +45,9 @@ from .telegram_bot import (
 )
 from .web_search import (
     build_web_research_answer,
+    fetch_page_text,
     format_web_research_answer,
+    reformulate_queries_with_ollama,
     search_duckduckgo,
     summarize_web_sources_with_ollama,
 )
@@ -329,6 +331,7 @@ def _handle_web_search(args: argparse.Namespace, settings: AssistantSettings) ->
         return 1
 
     ssl_ctx = build_ssl_context(settings) if endpoint.startswith("https://") else None
+    timeout = max(1, settings.openclaw_local_text_timeout_seconds)
     answer = build_web_research_answer(
         query,
         max_results=args.limit,
@@ -337,6 +340,14 @@ def _handle_web_search(args: argparse.Namespace, settings: AssistantSettings) ->
             max_results=limit,
             ssl_context=ssl_ctx,
         ),
+        reformulate_fn=lambda q: reformulate_queries_with_ollama(
+            q,
+            endpoint=endpoint,
+            model=model,
+            timeout_seconds=timeout,
+            ssl_context=ssl_ctx,
+        ),
+        fetch_page_fn=lambda url: fetch_page_text(url, ssl_context=ssl_ctx),
         summarize_fn=lambda q, sources: summarize_web_sources_with_ollama(
             q,
             sources,
