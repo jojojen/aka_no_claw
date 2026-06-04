@@ -106,3 +106,15 @@ def test_get_settings_reads_local_text_router_environment_keys(monkeypatch) -> N
     assert settings.openclaw_local_text_endpoint == "http://127.0.0.1:11434"
     assert settings.openclaw_local_text_model == "gemma3:4b"
     assert settings.openclaw_local_text_timeout_seconds == 30
+
+
+def test_get_settings_reads_local_tts_environment_keys(monkeypatch) -> None:
+    monkeypatch.setenv("OPENCLAW_LOCAL_TTS_ENDPOINT", "http://127.0.0.1:10101")
+    monkeypatch.setenv("OPENCLAW_LOCAL_TTS_TIMEOUT_SECONDS", "25")
+    monkeypatch.setenv("OPENCLAW_LOCAL_TTS_SPEAKER_ID", "888753760")
+
+    settings = get_settings()
+
+    assert settings.openclaw_local_tts_endpoint == "http://127.0.0.1:10101"
+    assert settings.openclaw_local_tts_timeout_seconds == 25
+    assert settings.openclaw_local_tts_speaker_id == 888753760
