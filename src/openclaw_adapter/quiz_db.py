@@ -55,6 +55,14 @@ _MIN_ANCHOR = 4
 # blank removes only one word, so coverage stays high; a fabricated paraphrase that
 # merely reuses a short fragment (e.g.「どれも不正解」) covers far less and is rejected.
 _MIN_COVERAGE = 0.6
+SOURCE_EXCERPT_TYPES: tuple[str, ...] = ("lyric", "title", "article", "commentary", "other")
+_LYRIC_URL_MARKERS: tuple[str, ...] = (
+    "/lyric/",
+    "lyrics.php",
+    "uta-net.com/song/",
+    "atwiki.jp/hmiku/pages/",
+    "miraheze.org/wiki/",
+)
 
 
 def is_reading_exam_point(exam_point: str | None) -> bool:
@@ -110,6 +118,63 @@ def derive_tested_point(
 
 def _normalize_grounding(text: str | None) -> str:
     return _NOISE.sub("", text or "")
+
+
+def _normalize_source_excerpt_type(source_excerpt_type: str | None) -> str:
+    kind = (source_excerpt_type or "").strip().lower()
+    return kind if kind in SOURCE_EXCERPT_TYPES else "other"
+
+
+def infer_source_excerpt_type(
+    *,
+    source_text_url: str | None,
+    source_excerpt: str | None,
+    source_name: str | None,
+    source_excerpt_type: str | None = None,
+) -> str:
+    """Return the best-known source excerpt kind.
+
+    Explicit stored values win. Otherwise infer conservatively from exact title
+    matches and well-known lyric/article URL patterns.
+    """
+    explicit = (source_excerpt_type or "").strip().lower()
+    if explicit in SOURCE_EXCERPT_TYPES and explicit != "other":
+        return explicit
+
+    excerpt = _normalize_grounding(source_excerpt)
+    name = _normalize_grounding(source_name)
+    if excerpt and name and excerpt == name:
+        return "title"
+
+    url = (source_text_url or "").strip().lower()
+    if any(marker in url for marker in _LYRIC_URL_MARKERS):
+        return "lyric"
+    if "mitchie-m.com/blog/" in url and "/lyrics/" in url:
+        return "lyric"
+    if "specialarticle" in url:
+        return "article"
+    if "vocadb.net/s/" in url:
+        return "commentary"
+    return "other"
+
+
+def source_excerpt_type_conflicts_with_exam_point(
+    *, exam_point: str | None, source_excerpt_type: str | None
+) -> bool:
+    """Known-bad pairings between excerpt kind and question type.
+
+    This intentionally rejects only combinations that have already produced bad
+    questions in practice, keeping compatibility with older ambiguous rows.
+    """
+    ep = (exam_point or "").strip()
+    kind = _normalize_source_excerpt_type(source_excerpt_type)
+    if is_reading_exam_point(ep):
+        return False
+    if kind in {"article", "commentary"}:
+        return True
+    if kind == "title" and "漢字読み" not in ep:
+        return True
+    return False
 
 
 def _stem_segments(stem: str) -> list[str]:
@@ -291,6 +356,39 @@ def answer_leaks_into_stem(
     return correct in _normalize_grounding(stem)
 
 
+def youhou_target_word_presence_leaks(
+    *, exam_point: str | None, stem: str, options: tuple[str, ...], answer_index: int
+) -> bool:
+    """True iff a 用法 item is answerable just by spotting the target word.
+
+    The common failure mode is: only the correct option contains the asked word,
+    while every distractor swaps it out for a near-synonym. That tests visual
+    presence, not usage.
+    """
+    ep = (exam_point or "").strip()
+    if "用法" not in ep or not (0 <= answer_index < len(options)):
+        return False
+    target = _normalize_grounding(_token_before(stem or "", "使い方"))
+    if len(target) < 2:
+        return False
+
+    def _contains_target_form(opt: str) -> bool:
+        normalized = _normalize_grounding(opt)
+        if not normalized:
+            return False
+        overlap = _longest_common_substring_len(target, normalized)
+        needed = max(2, int(len(target) * 0.6))
+        return overlap >= needed
+
+    if not _contains_target_form(options[answer_index]):
+        return False
+    distractor_hits = sum(
+        1 for i, opt in enumerate(options)
+        if i != answer_index and _contains_target_form(opt)
+    )
+    return distractor_hits == 0
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS quiz_questions (
     question_id      TEXT PRIMARY KEY,
@@ -305,6 +403,7 @@ CREATE TABLE IF NOT EXISTS quiz_questions (
     source_text_url  TEXT,
     source_media_url TEXT,
     source_excerpt   TEXT,
+    source_excerpt_type TEXT NOT NULL DEFAULT 'other',
     tested_point     TEXT,
     verified         INTEGER NOT NULL DEFAULT 0,
     served_count     INTEGER NOT NULL DEFAULT 0,
@@ -389,6 +488,7 @@ class QuizQuestion:
     source_text_url: str | None = None
     source_media_url: str | None = None
     source_excerpt: str | None = None
+    source_excerpt_type: str = "other"
     tested_point: str | None = None
     verified: bool = False
     served_count: int = 0
@@ -439,6 +539,45 @@ class QuizDatabase:
                 )
             if "tested_point" not in cols:
                 conn.execute("ALTER TABLE quiz_questions ADD COLUMN tested_point TEXT")
+            if "source_excerpt_type" not in cols:
+                conn.execute(
+                    "ALTER TABLE quiz_questions ADD COLUMN source_excerpt_type TEXT "
+                    "NOT NULL DEFAULT 'other'"
+                )
+            # "other" is only a fallback bucket, not a trustworthy explicit value.
+            # Re-infer it on every startup so previously migrated rows converge.
+            self._backfill_source_excerpt_types(conn, overwrite_other=True)
+
+    def _backfill_source_excerpt_types(
+        self, conn: sqlite3.Connection, *, overwrite_other: bool
+    ) -> None:
+        where = [
+            "source_excerpt_type IS NULL",
+            "TRIM(source_excerpt_type) = ''",
+        ]
+        if overwrite_other:
+            where.append("source_excerpt_type = 'other'")
+        rows = conn.execute(
+            "SELECT question_id, source_text_url, source_excerpt, source_name, "
+            "source_excerpt_type FROM quiz_questions WHERE " + " OR ".join(where)
+        ).fetchall()
+        if not rows:
+            return
+        now = _utc_now_iso()
+        for row in rows:
+            inferred = infer_source_excerpt_type(
+                source_text_url=row["source_text_url"],
+                source_excerpt=row["source_excerpt"],
+                source_name=row["source_name"],
+                source_excerpt_type=None,
+            )
+            if inferred == _normalize_source_excerpt_type(row["source_excerpt_type"]):
+                continue
+            conn.execute(
+                "UPDATE quiz_questions SET source_excerpt_type = ?, updated_at = ? "
+                "WHERE question_id = ?",
+                (inferred, now, row["question_id"]),
+            )
 
     # ── Questions ─────────────────────────────────────────────────────────────
 
@@ -456,6 +595,7 @@ class QuizDatabase:
         source_text_url: str | None = None,
         source_media_url: str | None = None,
         source_excerpt: str | None = None,
+        source_excerpt_type: str | None = None,
         tested_point: str | None = None,
         verified: bool = True,
         author: str = "Claude",
@@ -468,12 +608,33 @@ class QuizDatabase:
         level = (level or "").strip()
         stem = (stem or "").strip()
         opts = tuple(str(o).strip() for o in options if str(o).strip())
+        excerpt_kind = infer_source_excerpt_type(
+            source_text_url=source_text_url,
+            source_excerpt=source_excerpt,
+            source_name=source_name,
+            source_excerpt_type=source_excerpt_type,
+        )
         if not level or not stem:
             raise ValueError("question requires level and stem")
         if len(opts) < 2:
             raise ValueError("question requires at least 2 options")
         if not (0 <= int(answer_index) < len(opts)):
             raise ValueError(f"answer_index {answer_index} out of range for {len(opts)} options")
+        if source_excerpt_type_conflicts_with_exam_point(
+            exam_point=exam_point, source_excerpt_type=excerpt_kind
+        ):
+            raise ValueError(
+                "source_excerpt_type conflicts with exam_point: non-reading questions "
+                "must not ground on commentary/article text, and title-only grounding "
+                "is limited to 漢字読み"
+            )
+        if youhou_target_word_presence_leaks(
+            exam_point=exam_point, stem=stem, options=opts, answer_index=int(answer_index)
+        ):
+            raise ValueError(
+                "youhou item leaks by target-word presence: at least one distractor "
+                "must also use the target word form"
+            )
         if not allow_ungrounded and not is_grounded(
             exam_point=exam_point or "",
             stem=stem,
@@ -500,10 +661,11 @@ class QuizDatabase:
                 INSERT INTO quiz_questions (
                     question_id, level, exam_point, stem, options_json, answer_index,
                     explanation, source_type, source_name, source_text_url,
-                    source_media_url, source_excerpt, tested_point, verified,
+                    source_media_url, source_excerpt, source_excerpt_type,
+                    tested_point, verified,
                     served_count, author, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
                 ON CONFLICT(question_id) DO UPDATE SET
                     exam_point = excluded.exam_point,
                     options_json = excluded.options_json,
@@ -513,6 +675,7 @@ class QuizDatabase:
                     source_text_url = excluded.source_text_url,
                     source_media_url = excluded.source_media_url,
                     source_excerpt = excluded.source_excerpt,
+                    source_excerpt_type = excluded.source_excerpt_type,
                     tested_point = excluded.tested_point,
                     verified = excluded.verified,
                     author = excluded.author,
@@ -523,7 +686,7 @@ class QuizDatabase:
                     json.dumps(list(opts), ensure_ascii=False), int(answer_index),
                     (explanation or "").strip(), (source_type or "other").strip(),
                     (source_name or "").strip(), source_text_url, source_media_url,
-                    source_excerpt, (tested_point or "").strip() or None,
+                    source_excerpt, excerpt_kind, (tested_point or "").strip() or None,
                     1 if verified else 0,
                     (author or "Claude").strip(), created_at, now,
                 ),
@@ -1019,6 +1182,15 @@ def _row_to_question(row: sqlite3.Row) -> QuizQuestion:
         source_text_url=row["source_text_url"],
         source_media_url=row["source_media_url"],
         source_excerpt=row["source_excerpt"],
+        source_excerpt_type=(
+            row["source_excerpt_type"]
+            if "source_excerpt_type" in row.keys()
+            else infer_source_excerpt_type(
+                source_text_url=row["source_text_url"],
+                source_excerpt=row["source_excerpt"],
+                source_name=row["source_name"],
+            )
+        ),
         tested_point=(row["tested_point"] if "tested_point" in row.keys() else None),
         verified=bool(row["verified"]),
         served_count=int(row["served_count"]),
