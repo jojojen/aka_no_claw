@@ -11,6 +11,7 @@ from openclaw_adapter.quiz_command import (
     _render_stats,
     _render_type_menu,
     _render_vocab_lookup,
+    _vocab_audio_enabled,
     _serve_question,
     _wants_byauthor,
     _wants_random,
@@ -376,6 +377,48 @@ def test_quiz_vocab_handler_exact_lookup(tmp_path):
     )
 
 
+def test_render_vocab_card_shows_audio_button_for_trial_headword():
+    from openclaw_adapter.quiz_command import _render_vocab_card
+
+    card = SimpleNamespace(
+        level="JLPT N1",
+        headword="いがみ合って",
+        reading_hiragana="いがみあって",
+        zh_gloss_short="互相爭執",
+        example_ja="二人はいがみ合っていた。",
+        exam_points=("表記",),
+        source_name="source",
+        source_media_url="https://example.com/song",
+        source_text_url="https://example.com/text",
+        vocab_id="vid1",
+    )
+    assert _vocab_audio_enabled(card) is True
+    _, markup = _render_vocab_card(card, mode="all", index=0, total=1)
+    flat = [b for row in markup["inline_keyboard"] for b in row]
+    assert any(b["callback_data"] == "quiz:va:vid1" for b in flat)
+
+
+def test_render_vocab_card_shows_audio_button_for_any_headword_with_example():
+    from openclaw_adapter.quiz_command import _render_vocab_card
+
+    card = SimpleNamespace(
+        level="JLPT N1",
+        headword="範疇",
+        reading_hiragana="はんちゅう",
+        zh_gloss_short="範圍、類別",
+        example_ja="それは議論の範疇だ。",
+        exam_points=("漢字読み",),
+        source_name="source",
+        source_media_url=None,
+        source_text_url=None,
+        vocab_id="vid2",
+    )
+    assert _vocab_audio_enabled(card) is True
+    _, markup = _render_vocab_card(card, mode="all", index=0, total=1)
+    flat = [b for row in markup["inline_keyboard"] for b in row]
+    assert any(b["callback_data"] == "quiz:va:vid2" for b in flat)
+
+
 def test_vocab_related_question_callback_serves_matching_question(tmp_path):
     from openclaw_adapter.quiz_command import build_quiz_callback_handler
     from openclaw_adapter.quiz_db import QuizDatabase
@@ -405,3 +448,116 @@ def test_vocab_related_question_callback_serves_matching_question(tmp_path):
     assert toast is None
     assert q.stem in new_text
     assert markup is not None
+
+
+def test_vocab_audio_callback_sends_document_for_vocab_card(tmp_path, monkeypatch):
+    from openclaw_adapter.quiz_command import build_quiz_callback_handler
+    from openclaw_adapter.quiz_db import QuizDatabase
+
+    class _FakeSynth:
+        def synthesize_to_path(self, *, text, output_path):
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(f"audio:{text}".encode("utf-8"))
+            return output_path
+
+        def synthesize_to_cache(self, *, text, cache_dir, vocab_id):
+            out = cache_dir / f"{vocab_id}--fake.wav"
+            self.synthesize_to_path(text=text, output_path=out)
+            return SimpleNamespace(
+                output_path=out,
+                engine_tag="fake",
+                engine_label="Fake Engine",
+            )
+
+    sent = {}
+
+    class _FakeClient:
+        def __init__(self, token, *, ssl_context=None):
+            sent["token"] = token
+
+        def send_document(self, *, chat_id, document_path, caption=None):
+            sent["chat_id"] = chat_id
+            sent["document_path"] = str(document_path)
+            sent["caption"] = caption
+
+    monkeypatch.setattr("openclaw_adapter.quiz_command.build_vocab_synthesizer", lambda settings: _FakeSynth())
+    monkeypatch.setattr("openclaw_adapter.quiz_command.TelegramBotClient", _FakeClient)
+
+    dbp = tmp_path / "quiz.sqlite3"
+    db = QuizDatabase(dbp)
+    db.insert_question(
+        level="JLPT N1",
+        exam_point="用法",
+        stem="「いがみ合って」の使い方として最も適切なものはどれか。",
+        options=("二人はいがみ合っていた。", "春はいがみ合って咲く。"),
+        answer_index=0,
+        explanation="人どうしが反目して争う文脈で使う。",
+        source_type="vocaloid_song",
+        source_name="Just Be Friends",
+        source_text_url="https://example.com/text",
+        source_media_url="https://example.com/song",
+        source_excerpt="いがみ合って",
+        tested_point="いがみ合って",
+        author="codex",
+        verified=True,
+        allow_ungrounded=True,
+    )
+    card = db.get_vocab_card(headword="いがみ合って", level="JLPT N1")
+    assert card is not None
+    settings = SimpleNamespace(
+        quiz_db_path=dbp,
+        openclaw_telegram_bot_token="token123",
+        openclaw_local_tts_endpoint="http://127.0.0.1:10101",
+        openclaw_local_tts_timeout_seconds=20,
+        openclaw_local_tts_speaker_id=None,
+        openclaw_tls_insecure_skip_verify=False,
+        openclaw_ca_bundle_path=None,
+    )
+    handler = build_quiz_callback_handler(settings)
+    toast, new_text, markup = handler(f"va:{card.vocab_id}", "card text", "u1")
+    assert toast == "已送出例句音檔"
+    assert new_text is None
+    assert markup is None
+    assert sent["chat_id"] == "u1"
+    assert "Fake Engine" in sent["caption"]
+    assert "いがみ合って" in sent["caption"]
+    assert sent["document_path"].endswith(f"{card.vocab_id}--fake.wav")
+
+
+def test_vocab_audio_callback_rejects_missing_example(tmp_path):
+    from openclaw_adapter.quiz_command import build_quiz_callback_handler
+
+    class _FakeDB:
+        def get_vocab_card(self, *, vocab_id=None, level=None):
+            return SimpleNamespace(
+                vocab_id="vid-missing-example",
+                level="JLPT N1",
+                headword="範疇",
+                reading_hiragana="はんちゅう",
+                zh_gloss_short="範圍、類別",
+                example_ja="",
+                source_name="ダンスロボットダンス",
+                source_media_url=None,
+                source_text_url=None,
+                author="codex",
+            )
+
+    monkeypatch = __import__("pytest").MonkeyPatch()
+    monkeypatch.setattr("openclaw_adapter.quiz_command._open_db", lambda settings: _FakeDB())
+    settings = SimpleNamespace(
+        quiz_db_path=tmp_path / "quiz.sqlite3",
+        openclaw_telegram_bot_token="token123",
+        openclaw_local_tts_endpoint="http://127.0.0.1:10101",
+        openclaw_local_tts_timeout_seconds=20,
+        openclaw_local_tts_speaker_id=None,
+        openclaw_tls_insecure_skip_verify=False,
+        openclaw_ca_bundle_path=None,
+    )
+    try:
+        handler = build_quiz_callback_handler(settings)
+        toast, new_text, markup = handler("va:vid-missing-example", "card text", "u1")
+        assert toast == "這張單字卡目前沒有開放例句音檔"
+        assert new_text is None
+        assert markup is None
+    finally:
+        monkeypatch.undo()

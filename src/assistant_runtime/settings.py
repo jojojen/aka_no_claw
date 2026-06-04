@@ -23,6 +23,9 @@ class AssistantSettings:
     openclaw_local_text_backend: str | None = None
     openclaw_local_text_endpoint: str = "http://127.0.0.1:11434"
     openclaw_local_text_model: str | None = None
+    openclaw_local_tts_endpoint: str = "http://127.0.0.1:10101"
+    openclaw_local_tts_timeout_seconds: int = 20
+    openclaw_local_tts_speaker_id: int | None = None
     # Fast, code-specialized tier-1 model for /new codegen. Escalates to the
     # (larger) openclaw_local_text_model only when this tier exhausts repairs.
     openclaw_codegen_fast_model: str | None = "qwen2.5-coder:7b"
@@ -128,6 +131,12 @@ def get_settings() -> AssistantSettings:
         openclaw_local_text_backend=_none_if_empty(os.getenv("OPENCLAW_LOCAL_TEXT_BACKEND")),
         openclaw_local_text_endpoint=os.getenv("OPENCLAW_LOCAL_TEXT_ENDPOINT", "http://127.0.0.1:11434"),
         openclaw_local_text_model=_none_if_empty(os.getenv("OPENCLAW_LOCAL_TEXT_MODEL")),
+        openclaw_local_tts_endpoint=os.getenv("OPENCLAW_LOCAL_TTS_ENDPOINT", "http://127.0.0.1:10101"),
+        openclaw_local_tts_timeout_seconds=_as_int(
+            os.getenv("OPENCLAW_LOCAL_TTS_TIMEOUT_SECONDS"),
+            default=20,
+        ),
+        openclaw_local_tts_speaker_id=_as_optional_int(os.getenv("OPENCLAW_LOCAL_TTS_SPEAKER_ID")),
         openclaw_codegen_fast_model=_none_if_empty(
             os.getenv("OPENCLAW_CODEGEN_FAST_MODEL", "qwen2.5-coder:7b")
         ),
@@ -318,6 +327,15 @@ def _as_int(value: str | None, *, default: int) -> int:
         return int(value.strip())
     except ValueError:
         return default
+
+
+def _as_optional_int(value: str | None) -> int | None:
+    if value is None or not value.strip():
+        return None
+    try:
+        return int(value.strip())
+    except ValueError:
+        return None
 
 
 def _as_float(value: str | None, *, default: float) -> float:

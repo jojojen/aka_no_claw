@@ -47,8 +47,14 @@ import re
 from typing import Callable
 
 from assistant_runtime import AssistantSettings, build_ssl_context
+from price_monitor_bot.bot import TelegramBotClient
 
 from .quiz_db import is_reading_exam_point as _is_reading
+from .quiz_vocab_audio import (
+    QuizVocabAudioError,
+    build_vocab_audio_cache_dir,
+    build_vocab_synthesizer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +96,36 @@ def _open_db(settings: AssistantSettings):
     from .quiz_db import QuizDatabase
 
     return QuizDatabase(settings.quiz_db_path)
+
+
+def _vocab_audio_enabled(card) -> bool:
+    return bool((card.example_ja or "").strip())
+
+
+def _send_vocab_audio(settings: AssistantSettings, *, card, chat_id: str | None) -> None:
+    token = getattr(settings, "openclaw_telegram_bot_token", None)
+    if not token:
+        raise QuizVocabAudioError("telegram bot token missing")
+    if not (chat_id or "").strip():
+        raise QuizVocabAudioError("chat_id missing")
+    cache_dir = build_vocab_audio_cache_dir(settings=settings)
+    synth = build_vocab_synthesizer(settings)
+    audio = synth.synthesize_to_cache(
+        text=card.example_ja,
+        cache_dir=cache_dir,
+        vocab_id=card.vocab_id,
+    )
+    client = TelegramBotClient(token, ssl_context=build_ssl_context(settings))
+    caption = (
+        f"{card.headword}（{card.reading_hiragana}）\n"
+        f"音源：{audio.engine_label}\n"
+        f"例句：{card.example_ja}"
+    )
+    client.send_document(
+        chat_id=str(chat_id),
+        document_path=audio.output_path,
+        caption=caption[:1024],
+    )
 
 
 def _build_generator(settings: AssistantSettings, db):
@@ -322,6 +358,8 @@ def _render_vocab_card(card, *, mode: str, index: int, total: int) -> tuple[str,
                 {"text": "下一張 ➡️", "callback_data": f"quiz:vb:{card.level}:{mode}:{index + 1}"}
             )
         buttons.append(nav)
+    if _vocab_audio_enabled(card):
+        buttons.append([{"text": "🔊 播放例句", "callback_data": f"quiz:va:{card.vocab_id}"}])
     buttons.append([{"text": "📝 出相關題", "callback_data": f"quiz:vr:{card.vocab_id}"}])
     return "\n".join(lines), {"inline_keyboard": buttons}
 
@@ -789,6 +827,21 @@ def build_quiz_callback_handler(
                 db.mark_served(question.question_id)
                 text, markup = _question_view(question)
                 return None, text, markup
+            if action == "va":
+                card = db.get_vocab_card(vocab_id=rest, level=_DEFAULT_LEVEL)
+                if card is None:
+                    return "找不到這張單字卡", None, None
+                if not _vocab_audio_enabled(card):
+                    return "這張單字卡目前沒有開放例句音檔", None, None
+                try:
+                    _send_vocab_audio(settings, card=card, chat_id=chat_id)
+                except QuizVocabAudioError as exc:
+                    logger.warning("quiz vocab audio failed vocab_id=%s: %s", rest, exc)
+                    return "音檔生成失敗", None, None
+                except Exception:
+                    logger.exception("quiz vocab audio unexpected failure vocab_id=%s", rest)
+                    return "音檔生成失敗", None, None
+                return "已送出例句音檔", None, None
             if action == "p":
                 try:
                     page = max(0, int(rest))
