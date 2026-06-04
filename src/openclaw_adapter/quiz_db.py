@@ -447,6 +447,7 @@ CREATE TABLE IF NOT EXISTS quiz_vocab_cards (
     example_source_kind       TEXT NOT NULL DEFAULT 'adapted',
     source_name               TEXT NOT NULL DEFAULT '',
     source_text_url           TEXT,
+    source_media_url          TEXT,
     primary_question_id       TEXT NOT NULL,
     support_question_ids_json TEXT NOT NULL DEFAULT '[]',
     exam_points_json          TEXT NOT NULL DEFAULT '[]',
@@ -557,6 +558,7 @@ class QuizVocabCard:
     example_source_kind: str = "adapted"
     source_name: str = ""
     source_text_url: str | None = None
+    source_media_url: str | None = None
     primary_question_id: str = ""
     support_question_ids: tuple[str, ...] = ()
     exam_points: tuple[str, ...] = ()
@@ -598,6 +600,9 @@ class QuizDatabase:
                     "ALTER TABLE quiz_questions ADD COLUMN source_excerpt_type TEXT "
                     "NOT NULL DEFAULT 'other'"
                 )
+            vocab_cols = {r["name"] for r in conn.execute("PRAGMA table_info(quiz_vocab_cards)")}
+            if "source_media_url" not in vocab_cols:
+                conn.execute("ALTER TABLE quiz_vocab_cards ADD COLUMN source_media_url TEXT")
             # "other" is only a fallback bucket, not a trustworthy explicit value.
             # Re-infer it on every startup so previously migrated rows converge.
             self._backfill_source_excerpt_types(conn, overwrite_other=True)
@@ -655,7 +660,19 @@ class QuizDatabase:
         seen_ids: set[str] = set()
         now = _utc_now_iso()
         for headword, group in groups.items():
+            vocab_id = build_vocab_card_id(level="JLPT N1", headword=headword)
+            existing = conn.execute(
+                "SELECT * FROM quiz_vocab_cards WHERE vocab_id = ?",
+                (vocab_id,),
+            ).fetchone()
             seed = QUIZ_VOCAB_SEED.get(headword)
+            if not seed and existing is not None:
+                seed = {
+                    "reading_hiragana": existing["reading_hiragana"],
+                    "zh_gloss_short": existing["zh_gloss_short"],
+                    "example_ja": existing["example_ja"],
+                    "example_source_kind": existing["example_source_kind"] or "adapted",
+                }
             if not seed:
                 continue
             group.sort(
@@ -677,22 +694,18 @@ class QuizDatabase:
                     key=lambda pair: (pair[1], pair[0]),
                 )
             )
-            vocab_id = build_vocab_card_id(level="JLPT N1", headword=headword)
             seen_ids.add(vocab_id)
-            existing = conn.execute(
-                "SELECT created_at FROM quiz_vocab_cards WHERE vocab_id = ?",
-                (vocab_id,),
-            ).fetchone()
             created_at = existing["created_at"] if existing else now
             conn.execute(
                 """
                 INSERT INTO quiz_vocab_cards (
                     vocab_id, level, headword, reading_hiragana, zh_gloss_short,
                     example_ja, example_source_kind, source_name, source_text_url,
+                    source_media_url,
                     primary_question_id, support_question_ids_json, exam_points_json,
                     author, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(vocab_id) DO UPDATE SET
                     reading_hiragana = excluded.reading_hiragana,
                     zh_gloss_short = excluded.zh_gloss_short,
@@ -700,6 +713,7 @@ class QuizDatabase:
                     example_source_kind = excluded.example_source_kind,
                     source_name = excluded.source_name,
                     source_text_url = excluded.source_text_url,
+                    source_media_url = excluded.source_media_url,
                     primary_question_id = excluded.primary_question_id,
                     support_question_ids_json = excluded.support_question_ids_json,
                     exam_points_json = excluded.exam_points_json,
@@ -716,6 +730,7 @@ class QuizDatabase:
                     seed.get("example_source_kind", "adapted"),
                     (primary["source_name"] or "").strip(),
                     primary["source_text_url"],
+                    primary["source_media_url"],
                     (primary["question_id"] or "").strip(),
                     json.dumps(list(support_ids), ensure_ascii=False),
                     json.dumps(list(exam_points), ensure_ascii=False),
@@ -1547,6 +1562,7 @@ def _row_to_vocab_card(row: sqlite3.Row) -> QuizVocabCard:
         example_source_kind=row["example_source_kind"] or "adapted",
         source_name=row["source_name"] or "",
         source_text_url=row["source_text_url"],
+        source_media_url=row["source_media_url"],
         primary_question_id=row["primary_question_id"] or "",
         support_question_ids=tuple(str(x).strip() for x in support_ids if str(x).strip()),
         exam_points=tuple(str(x).strip() for x in exam_points if str(x).strip()),
