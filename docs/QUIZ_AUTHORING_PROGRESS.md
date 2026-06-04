@@ -1,0 +1,825 @@
+# /quiz 出題進度與交接紀錄
+
+Last updated: 2026-06-04 JST
+
+## Scope
+
+- User-approved task: generate and QA 30 accepted questions for each fine-grained quiz type, 360 accepted questions total.
+- Fine-grained types:
+  - `漢字読み`
+  - `言い換え類義`
+  - `文脈規定`
+  - `用法`
+  - `文法形式の判断`
+  - `文章の文法`
+  - `文の組み立て`
+  - `内容理解（短文）`
+  - `内容理解（中文）`
+  - `主張理解（長文）`
+  - `情報検索`
+  - `統合理解`
+- Current source priority: prefer songs listed in `data/proseka_songs.json` (Project Sekai), but Project Sekai is not exclusive. User clarified on 2026-06-04 JST that non-list songs such as `心拍数 #0822` may also be adopted when source grounding is reliable and the item is good.
+- Per-song quota: retain at most 3 Codex-authored questions per song. Existing qwen/Claude questions do not count against this quota.
+- Question author must be stored as `codex`.
+- Codex must author questions directly. Do not use `QuizGenerator.generate_one_question()` or `/quiz gen20`.
+- The local model is used only as an independent solver/checker.
+- Local model disagreement is not automatic rejection for objectively checkable `漢字読み` or grammar items; qwen can be below N1 on these. Codex must verify the fact and decide. Reading leak probes remain strict.
+- No code changes. Allowed writes are limited to:
+  - `data/quiz.sqlite3` quiz rows
+  - `data/quiz.sqlite3` `quiz_authoring_knowledge`
+  - this progress document
+
+## Resource Rules
+
+- Do not restart the bot.
+- Do not run long-lived background generation.
+- Do not hold SQLite connections open while waiting.
+- Generate/review in small units.
+- If a generated question fails QA, delete it and record the reason.
+
+## Current Target Counts
+
+| Type | Accepted in this run | Target | Status |
+|---|---:|---:|---|
+| 漢字読み | 30 | 30 | done |
+| 言い換え類義 | 30 | 30 | done |
+| 文脈規定 | 30 | 30 | done |
+| 用法 | 30 | 30 | done |
+| 文法形式の判断 | 30 | 30 | done |
+| 文章の文法 | 30 | 30 | done |
+| 文の組み立て | 30 | 30 | done |
+| 内容理解（短文） | 30 | 30 | done |
+| 内容理解（中文） | 30 | 30 | done |
+| 主張理解（長文） | 30 | 30 | done |
+| 情報検索 | 30 | 30 | done |
+| 統合理解 | 30 | 30 | done |
+
+## Log
+
+- 2026-06-04 JST — Inventory only, no DB writes:
+  - `data/proseka_songs.json` contains 653 source-scope songs.
+  - Current DB had 262 verified `JLPT N1` rows.
+  - Superseded note: initially counted all authors and found 47 source names at/above quota.
+  - User later clarified quota counts only Codex-authored questions; qwen/Claude historical rows do not count.
+  - Source matching must normalize punctuation/spacing/HTML entities; e.g. `命に嫌われている。` should match the Project Sekai list entry `命に嫌われている`.
+- 2026-06-04 JST — Attempted `漢字読み` generation, no DB row inserted:
+  - Filtered source pool: 37 Project Sekai songs under the 3-question quota.
+  - Result: `GENERATED_NONE`.
+  - Cause: local Ollama call timed out after 3 transient retries (`Ollama 不在線或無回應（已重試 3 次）`).
+  - No question was reviewed, deleted, accepted, or written to KB.
+  - Later correction: this used the generator path, which the user rejected. Future work must be Codex-authored, with local model only as solver/checker.
+- 2026-06-04 JST — Retried `漢字読み` generation with 180s per-call timeout, no DB row inserted:
+  - Filtered source pool: 37 Project Sekai songs under the 3-question quota.
+  - Result: `GENERATED_NONE`.
+  - No timeout was printed; likely rejected during author/grader/grounding validation.
+  - No question was reviewed, deleted, accepted, or written to KB.
+  - Later correction: this used the generator path, which the user rejected. Future work must be Codex-authored, with local model only as solver/checker.
+- 2026-06-04 JST — Generated and rejected `漢字読み` candidate:
+  - Question ID: `71e57691054061d0f0924ddae7451f951b757ab1`
+  - Source: `熱異常`
+  - Tested point: `消去`
+  - Decision: deleted from DB.
+  - Reject reasons:
+    - `消去` is too basic/common for N1-level `漢字読み`.
+    - Explanation `【読み】` listed many words from source excerpt that were not in the stem/options.
+    - Explanation contained incorrect readings, e.g. `無くならない（なくなならない）`, `問いかけている（とかけている）`.
+  - KB written:
+    - `[source_grounding] 【読み】欄は作答畫面文字だけを正確に標る`
+    - `[level_calibration] 漢字読みはN1相当の高難度語を選ぶ`
+  - Later correction: this candidate came from the generator path. It was deleted; no retained row remains.
+- 2026-06-04 JST — Generated and rejected `漢字読み` candidate:
+  - Question ID: `6a30e5ec6adbe11e7d37290612e9507fcbbcc2a9`
+  - Source: `裏表ラバーズ`
+  - Tested point: `縛っちゃって`
+  - Decision: deleted from DB.
+  - Reject reasons:
+    - Target is a casual conjugated expression, not a high-level N1 kanji vocabulary item.
+    - Explanation used fragile option numbering and contradicted itself (`選択肢1は正しい読み方` while the stored answer was index 0).
+  - KB written:
+    - `[vocabulary] 漢字読みは口語活用尾ではなく語彙項目を問う`
+    - `[distractor_design] 解說は選択肢番号を書かず選択肢文字を引用する`
+  - Later correction: this candidate came from the generator path. It was deleted; no retained row remains.
+- 2026-06-04 JST — User corrected workflow:
+  - Do not use `QuizGenerator.generate_one_question()`.
+  - Codex authors each question directly.
+  - Local model is only an independent solver/checker.
+  - Insert accepted questions manually with `author="codex"`.
+  - Checked for leftover generator process: none.
+  - Checked latest DB rows: no new codex/generator row remained from the aborted attempt.
+- 2026-06-04 JST — Started from lowest-count type `統合理解`.
+  - Source candidate: `Tell Your World` (Project Sekai, current DB count 0, under quota).
+  - Codex-authored candidate #1 was not inserted.
+  - Local model with passage chose intended answer index 0.
+  - Leak probe without passage also chose index 0, so the answer was inferable from option wording alone.
+  - KB written:
+    - `[reading] 統合理解の選択肢だけで正解が浮く設計を避ける`
+- 2026-06-04 JST — Accepted `統合理解` candidate:
+  - Question ID: `0d8ca6aaa0049b56c9e48b4d238d2c8cb4e1a07b`
+  - Source: `Tell Your World`
+  - Tested point: `二つの文章を統合して、言葉と音が内面から他者へ届く過程を捉える`
+  - Author: `codex`
+  - Local model solver with passage: chose index 0.
+  - Local model leak probe without passage: returned `-1`.
+  - Decision: kept in DB.
+- 2026-06-04 JST — `統合理解` candidate for `恋は戦争`, first version not inserted:
+  - Local model with passage chose intended answer index 0.
+  - Leak probe without passage also chose index 0.
+  - Reason: the option wording made the intended attitude-change answer too plausible without the passage.
+  - No DB row inserted and no extra KB written because this repeated the already-recorded leak pattern.
+- 2026-06-04 JST — Accepted `統合理解` candidate:
+  - Question ID: `286969c993594bb60320c5f1a10c3a48951487f6`
+  - Source: `恋は戦争`
+  - Tested point: `二つの文章を統合して、迷いから戦闘的行動への展開を捉える`
+  - Author: `codex`
+  - Local model solver with passage: chose index 0.
+  - Local model leak probe without passage: returned `-1`.
+  - Decision: kept in DB.
+- 2026-06-04 JST — Accepted `統合理解` candidate:
+  - Question ID: `83120f7af2330e65a95fd774586fc7c9fe7ed104`
+  - Source: `ロキ`
+  - Tested point: `二つの文章を統合して、逃避批判と自己表現の促しを捉える`
+  - Author: `codex`
+  - Local model solver with passage: chose index 0.
+  - Local model leak probe without passage: returned `-1`.
+  - Decision: kept in DB.
+  - Note: under the clarified rule, `ロキ` has 1 Codex-authored question and is still under quota; historical qwen/Claude rows do not count.
+- 2026-06-04 JST — Started `文章の文法`.
+  - Candidate using `いくら背伸びした（　　）...` was not inserted because local solver disagreed twice.
+  - Candidate using `これは単なる恋（　　）、罪だとさえ...` initially passed before source-grounding rewrite, then failed once after changing distractors, then passed with final options.
+  - KB written:
+    - `[grammar] 文法題は最終stem/optionsで必ず再検証する`
+- 2026-06-04 JST — Accepted `文章の文法` candidate:
+  - Question ID: `6f250ddf2770eee5d38644d7e965d5e73bb60e8a`
+  - Source: `恋は戦争`
+  - Tested point: `どころか`
+  - Author: `codex`
+  - Local model solver: chose index 0.
+  - Decision: kept in DB.
+- 2026-06-04 JST — `文章の文法` low-difficulty candidate not inserted:
+  - Candidate tested `〜きった`.
+  - Local model solver chose intended answer, but Codex rejected it for insufficient N1 difficulty.
+  - KB written:
+    - `[level_calibration] 文章の文法はsolver正解でも低級文法なら採用しない`
+- 2026-06-04 JST — Accepted `文章の文法` candidate:
+  - Question ID: `6e5a4ace76fa53be3a60326c762431725f21cba6`
+  - Source: `恋は戦争`
+  - Tested point: `〜ずにはおかない`
+  - Author: `codex`
+  - Local model solver: chose index 0.
+  - Decision: kept in DB.
+  - Note: `恋は戦争` now has 3 Codex-authored questions and should not be used again under the current quota rule.
+- 2026-06-04 JST — Updated solver policy after user approval:
+  - qwen disagreement is advisory, not an automatic rejection, for objective kanji/grammar items.
+  - KB written:
+    - `[level_calibration] qwen解答者はN1文法の最終裁判ではない`
+  - Reading leak probes remain strict: if the item is answerable without passage, reject it.
+- 2026-06-04 JST — Accepted `文章の文法` candidate despite qwen disagreement:
+  - Question ID: `48ecaf27ac83b02ee1d8b1a367bec5351321983f`
+  - Source: `ロキ`
+  - Tested point: `〜まい`
+  - Author: `codex`
+  - Local model solver chose `なり`, but Codex treated this as qwen false negative.
+  - Manual verification: `逃げるまいと心に決めた` is standard negative volition; `なり` is not grammatical/semantic fit here.
+  - Decision: kept in DB.
+- 2026-06-04 JST — User expanded target:
+  - New target: 30 accepted Codex-authored questions for each of 12 fine-grained types, 360 total.
+  - Continue to obey the same constraints: no code changes, Codex authors directly, local model only checks, per-song quota counts Codex-authored rows only.
+- 2026-06-04 JST — Accepted `漢字読み` batch:
+  - Accepted: 30 questions, all with `author="codex"` and non-empty `tested_point`.
+  - Question IDs:
+    - `7cb74a3fb6e063a63a56b6ffe6c978b999e12a42` — `ロミオとシンデレラ` / `咽返る`
+    - `d3e666a388d9dbe07eaebbe80abdaa3ace00bb1d` — `千本桜` / `断頭台`
+    - `2288ab304d8c45ab5f64a45fd9aaecbce0e3e795` — `KING` / `幽閉`
+    - `1a11cdc5056ef9a72a9fba5034243b0622883b82` — `アスノヨゾラ哨戒班` / `哨戒`
+    - `925efe24854a45c4c26af13861ffd22a447fdc84` — `アスノヨゾラ哨戒班` / `魁星`
+    - `b73928e922a29ac6b8c3b6d32e18dc842208f8f4` — `アスノヨゾラ哨戒班` / `踠いたって`
+    - `16696e28f15e629dc535840b02be8920fcf45d67` — `ジャンキーナイトタウンオーケストラ` / `因果応報`
+    - `a292e6720519b37db35cb2f1ff1968b6f56e5492` — `ダンスロボットダンス` / `範疇`
+    - `f7a6773bd26890f4b4fbf21f771252eb04963713` — `テレキャスタービーボーイ` / `伽藍堂`
+    - `9f41fed4e0168363157f6f5c2ebf96563dc82245` — `テレキャスタービーボーイ` / `大往生`
+    - `9d79eba430dc5ed39740df3d97896df3a218975b` — `テレキャスタービーボーイ` / `臨終`
+    - `2c260dc98a9526a531a097e657f54d95ec8ef1de` — `フラジール` / `退廃`
+    - `fcb222a02ddde5ecad14006cbd4f17adee37c562` — `フラジール` / `叱責`
+    - `342116b16143251352f44057f3a9bd7bce1ff434` — `ベノム` / `倦怠`
+    - `7c3031c583d70eb6c10a6a5516dc5e9d88f70856` — `ロストワンの号哭` / `号哭`
+    - `4194a56200ea8f1c0e4e2bc6770d281bf37d6e82` — `ヴィラン` / `猥雑`
+    - `6183c3045c1bcc675f541a37b02ce306d14919c9` — `ヴィラン` / `糜爛`
+    - `2b0a7d8287f56a62ddad26d7d11bee80b87a4dd2` — `ヴィラン` / `蛇蝎`
+    - `fe4da16cf7bd5b5ef2c4545e645e134a980a6dc3` — `砂の惑星` / `古今未曾有`
+    - `de1dde11f7b3298c7ded2ff7dcd9950328b89f4a` — `砂の惑星` / `驚天動地`
+    - `211a0841930d1c21d3621fb75625d141376af49b` — `ネクストネスト` / `剥離`
+    - `5953cf6bf22467f95555db351661b816984acfc7` — `神のまにまに` / `八百万`
+    - `5af150f35ba207159fd4a6ed59028b401f4425bd` — `脳漿炸裂ガール` / `諸行無常`
+    - `64d7eb5c30b54165bdb26889800dd62ccf892678` — `脳漿炸裂ガール` / `吐瀉物`
+    - `c1a1c7f584469b3614f760b59c71a85507d3fbe1` — `脳漿炸裂ガール` / `一蓮托生`
+    - `41384c1d7cd6e32b92decc6520e4b67d10cc5888` — `夜咄ディセイブ` / `醜態`
+    - `b49848ce1bceba04952b3fdbd3d96d5d0f821619` — `帝国少女` / `催涙`
+    - `5a352b543e5820820fb7e4057b6059d7400748ae` — `ドラマツルギー` / `無垢`
+    - `d8e01bc0d8e81b5f8476d5832b3aef93b48f7cf3` — `Blessing` / `推し量らない`
+    - `dd9d3c214f1fc3efe0de812457f8e0834241a87b` — `Blessing` / `理不尽`
+  - Local model advisory check:
+    - Returned 31 answers for 30 questions, so the batch output had an alignment caveat.
+    - Mismatched on 7 objective readings: `因果応報`, `範疇`, `大往生`, `臨終`, `倦怠`, `蛇蝎`, `古今未曾有`.
+    - Codex manually verified these readings and retained the items as objective qwen false negatives.
+  - Quota check after insertion: no song has more than 3 Codex-authored questions.
+  - KB written:
+    - `[level_calibration] 漢字読みのqwen一括解答は件数ずれと難読語誤答を個別監査する` (`7453e336d0cdf7ecc145004578bbd96f9af06f36`)
+- 2026-06-04 JST — User clarified source scope:
+  - Project Sekai songs are preferred, not exclusive.
+  - Non-list songs such as `心拍数 #0822` may be used if source grounding is reliable and question quality is good.
+  - Updated `ai/skills/quiz-authoring-workflow/SKILL.md` accordingly.
+- 2026-06-04 JST — Accepted `言い換え類義` batch:
+  - Accepted: 30 questions, all with `author="codex"` and non-empty `tested_point`.
+  - Local model solver: 30 answers for 30 questions, no mismatches.
+  - Quota check after insertion: no song has more than 3 Codex-authored questions.
+  - Question IDs:
+    - `d33b6f50f5521f1e04e6c45d46cbd0d5d9ab715a` — `アンハッピーリフレイン` / `みっともない`
+    - `32bc36993ad4a35971a71b88610229d2df1bd52d` — `アンハッピーリフレイン` / `棒に振った`
+    - `ba562d6201bf83f8ad123e9bc12ff7ebf6d2afc0` — `アンハッピーリフレイン` / `潰れる`
+    - `f92fa91e2ae186872118ea46b366b7e74ecfefbc` — `マトリョシカ` / `継ぎ接ぎ`
+    - `94ddfbfe8f2c429a126990fe9eeff0a9c9023b87` — `マトリョシカ` / `考えた挙句`
+    - `9c02ede18e900d8eae14c0df8af40d63f2619b21` — `シャルル` / `いがみ合って`
+    - `0b65633a81f8cdde3a4d7ff63573201ddd705d85` — `シャルル` / `投げやり`
+    - `7a81aff0ac3400dd318e3baa1842e8897766af95` — `ロストワンの号哭` / `どうだっていいや`
+    - `99bf65f0bbe3247f860455a55917b20d1fb64e3e` — `ロストワンの号哭` / `溶け込めず`
+    - `c58ebf72103dd12ddc4725eaac6d7f5e3bbc8c05` — `ワールドイズマイン` / `論外`
+    - `bb79e434d7fa03654e655c789b86287f2f513a8b` — `乙女解剖` / `退屈`
+    - `8c6925c68a570875015728a72d2a3275f463dd8a` — `六兆年と一夜物語` / `名も無い`
+    - `2ca628afc5500630612f3b020eaf4a368d0fa8da` — `夜もすがら君想ふ` / `仄暗い`
+    - `5f7ac8767127d1742c6fb2070707f986f1d6aac4` — `悪役にキスシーンを` / `最低最悪`
+    - `b5de9ca6a1d06c8a3edd9f60f82a24abe2e90858` — `悪役にキスシーンを` / `演じる`
+    - `8cfe7286758806c267e9973c734ede36ce33381e` — `演劇` / `最早`
+    - `84273263c2f901d5f07c39d08fab285dba016a8b` — `演劇` / `間違ったまま`
+    - `225d77712d74f86ac2dbb893b5f21d5e3a622f63` — `脱法ロック` / `現実逃避`
+    - `15538c1913cc3570e597bfc82e3e9cdbd0eeb17c` — `脱法ロック` / `縋れ`
+    - `71d30dabecad352f20809d5a520ad4c95c4b3399` — `青色絵具` / `呪う`
+    - `90aece238de3dbf30833d5957eecc830818702d5` — `イフ` / `たられば`
+    - `0cc60a98a89ee9f01844623d3eafad055fc75547` — `アンチユー` / `真逆`
+    - `8eb93142199b54682ad4cbac3eb895e47bbff088` — `アンチユー` / `賞味期限`
+    - `d2f899be0d70476eb637d66e64822baaac630de6` — `テオ` / `取り戻す`
+    - `b08e3d746b48682d837d1fc94d9f386ad8e11e90` — `ドーナツホール` / `確かに`
+    - `a897ebbbd9a1e0fde576f567ff202fcc13a30998` — `命に嫌われている` / `疾走感`
+    - `bd87c5fd8c842a4d5ff7111c226c83f2119cd7ab` — `千本桜` / `大胆不敵`
+    - `78b8da76e12c5ad7de0fddb751c99c6da2056409` — `千本桜` / `百戦錬磨`
+    - `d943981599d13affc4cd1f781982d243d743e416` — `帝国少女` / `郷愁`
+    - `07eb38895382176ca8dacbf7c707bcd2d09faa32` — `ドラマツルギー` / `無垢`
+- 2026-06-04 JST — Accepted `文脈規定` batch:
+  - Accepted: 30 questions, all with `author="codex"` and non-empty `tested_point`.
+  - Local model solver:
+    - A 30-question single prompt returned 32 answers, so it was rejected before insertion.
+    - Rechecked as three 10-question chunks; each chunk returned 10 answers with no mismatches.
+  - Quota check after insertion: no song has more than 3 Codex-authored questions.
+  - Question IDs:
+    - `313eb0c0249940f686ec42acecab1acc801354c6` — `Color of Drops` / `不器用`
+    - `9df38e810bb86e90b61767cb684ccdca8e542875` — `Color of Drops` / `強がり`
+    - `743a313867f89c6dac25824cc9863dd91be3a055` — `Color of Drops` / `頼りない`
+    - `a5ae98bbf10fe3d8d90b90350e608fcb869e002a` — `イフ` / `後悔`
+    - `dda14b843e428f70b1a42f67f699d7853e23224d` — `カゲロウデイズ` / `わざとらしい`
+    - `a7421d7865d5424796dac029773c70772cc3de30` — `シャルル` / `諦め`
+    - `92e72c1d36e3ca9b6dd7117c676d0f5efa5c1f50` — `ジャンキーナイトタウンオーケストラ` / `潔癖`
+    - `b0a58725d2b0197acc46ee455ac4075efe5ad178` — `ニア` / `傲慢`
+    - `39abc26fd93370e63f861f509105213d25838106` — `ハッピーシンセサイザ` / `単純`
+    - `630be3962a910f9f4a5887ae3f507343de00fc5d` — `ハッピーシンセサイザ` / `惹かれあう`
+    - `e175e034a7cec82125dc23b2dc01f731f05a1ff3` — `ヒビカセ` / `魅了`
+    - `2fe7eb1a14148a16679af049bf0c5ee7ec5b4734` — `ブレス・ユア・ブレス` / `恐る恐る`
+    - `469067eb1ade29ef1c5b778ecd426bf26efd33aa` — `メルト` / `真っ先に`
+    - `6311a03c1faca65dc2e342d5f6daada7e709fbd1` — `ローリンガール` / `届かない`
+    - `713c26c791d649ddde7059cb59b2162cd2a47c34` — `命に嫌われている` / `二面性`
+    - `aff3d1afb51c6c1ff800e95ca257296a1a3d27fb` — `恋愛裁判` / `金輪際`
+    - `4367113bae7a6ca3f39df0b4ea68f4612cd8987f` — `炉心融解` / `急速に`
+    - `02184be92608f3b50da742ce1b725fa0459de7f8` — `心拍数 #0822` / `駆け足`
+    - `769747972d174f9cb2e509622a5077a9f44428d3` — `ワールズエンド・ダンスホール` / `甲高い`
+    - `354c22b014ecba6419ec61ca137378630bb4e69b` — `はぐ` / `ぽっかり`
+    - `8133cedbee645d4281bef755b10590dae252016b` — `フォニイ` / `煩わしい`
+    - `3c5efb4802d1192222f71869514be8317f6d54a8` — `ワールドイズマイン` / `論外`
+    - `c4cab61ddb3b2d314c634a4d5d9f759cf05f411a` — `乙女解剖` / `退屈`
+    - `96c6bdd67c692bc5cc0fcf808d96f170751faae0` — `六兆年と一夜物語` / `名も無い`
+    - `d60149d15e43b9bec9845e1fc4c45c7a7585422c` — `夜もすがら君想ふ` / `仄暗い`
+    - `99baacf304d66141f9879d83f1d60f7eca8b49fc` — `演劇` / `最早`
+    - `4a7d946c4351a2db780684438ea151eafa53cc25` — `青色絵具` / `炎天下`
+    - `4fe42a61430e38bc0569f0e8acffe80e870b2a52` — `脱法ロック` / `縋れ`
+    - `7bb6cadcde9f881f6ec01f833b802a0a8dc6875d` — `ドーナツホール` / `確かに`
+    - `eb9f5be7a3154c179b724b7a1ff7ca1b21b5c502` — `悪役にキスシーンを` / `最低最悪`
+  - KB written:
+    - `[distractor_design] 文脈規定のsolver確認は大批量より10問チャンクで対齊を守る` (`919d61fbba09b3572a612ac23a59d8c09ffa0266`)
+- 2026-06-04 JST — Accepted `用法` batch:
+  - Accepted: 30 questions, all with `author="codex"` and non-empty `tested_point`.
+  - Grounding rule: the correct option is a verbatim source example for each tested usage.
+  - Local model solver:
+    - Rejected `吐く` candidate because qwen preferred a distractor; Codex agreed the verb has extension-risk in usage tests.
+    - Rejected `暮れる` candidate because the source line was too poetic for stable usage testing.
+    - Final 30-question batch was checked in three 10-question chunks; no mismatches.
+  - Quota check after insertion: no song has more than 3 Codex-authored questions.
+  - Question IDs:
+    - `6046ddc19515032f098606107f70d577b89b11b6` — `Just Be Friends` / `声を枯らす`
+    - `9a0e2914cbf950f2a123c09ae44075bd56655093` — `からくりピエロ` / `操る`
+    - `cb437b1a782f93a2805621f76717dad87623cbbe` — `とても痛い痛がりたい` / `わめき散らす`
+    - `121cc317842d91ed501b530bbc7703ef6e7941e2` — `ぼうけんのしょがきえました！` / `一筋縄ではいかない`
+    - `b55e187a0bc7d7b02def2edbc1e16aabfa68ee58` — `アイドル新鋭隊` / `日常茶飯事`
+    - `dd7a43b74582291289d5ee8ef34402272dac454b` — `夜咄ディセイブ` / `醜態`
+    - `fc6bd9164f15181be578b02ee4cf4ba4a627219a` — `ステラ` / `当てにならない`
+    - `c0ef25c01ad1c6011eb6272c9e56d59ecef4000e` — `チュルリラ・チュルリラ・ダッダッダ！` / `息を潜める`
+    - `4c96f76f75cc1ea3cfcd81cd5f53ff15ac236d10` — `アンチユー` / `真逆`
+    - `b6a7c90760e677a5d726b4f705e59c3b9937810f` — `ニア` / `見る影もない`
+    - `ebaf0e38926870ea5f28a128eb3f521b412d9771` — `ハロ／ハワユ` / `浪費`
+    - `85553e736621bbf649875ffa9eb8d22af26a000e` — `ミラクルペイント` / `得意げ`
+    - `cc92a2a22f8f903dd02170c8e90e430d6785a2d5` — `ワールズエンド・ダンスホール` / `埋める`
+    - `c3904961b763f37c1a8d72321bc2fbfe3845243c` — `恋愛裁判` / `論より証拠`
+    - `4715d04763ab231dd7f8415c64b8ab85f707ccb5` — `自傷無色` / `望む`
+    - `c9a0b95567729ea9880107cc20c35754ac7ac487` — `はぐ` / `空く`
+    - `536e41a2ad377902a55fa815bdbb8bed73e78b18` — `テオ` / `取り戻す`
+    - `497135062fd53000c321abc6be4e8b93e39a1053` — `ネクストネスト` / `剥離`
+    - `88d69e246e30a81977f53bb32bb5ac30ebc25770` — `ヒビカセ` / `魅了する`
+    - `3ea0ebefc8c280641c946169fb5e2e0d9d92f5a6` — `フォニイ` / `煩わしい`
+    - `d6ceb436a6c7e7a9b3c01bdecf28ec4eb675dc4f` — `ブレス・ユア・ブレス` / `恐る恐る`
+    - `4f90f524db6b26c9ed14432dd42110b12c47ac85` — `ベノム` / `倦怠`
+    - `620ee5aea93dcb25aca0f2012d3da704857d6f01` — `メルト` / `真っ先に`
+    - `373719f1f2d2c7cefe9a6e53021569dd8438a698` — `ロミオとシンデレラ` / `咽返る`
+    - `3d67aca4c38835f512113f7d45dbda6401904e0d` — `ローリンガール` / `届かない`
+    - `21ea4a0d147390c4688b42d455b25f9c3b97b69a` — `心拍数 #0822` / `駆け足`
+    - `0e01d3e2c2ef8a6f050c67ac5b39302a4d063b31` — `カゲロウデイズ` / `嗤う`
+    - `722e6f67f3822dd0dc7c17aa004d696a61583097` — `Tell Your World` / `届けたい`
+    - `1227c0f42657d7cb3791bea50f09cf3a10ef7768` — `神のまにまに` / `自己嫌悪`
+    - `29bebdde8236819ec57e6979ca2f940ee06b676b` — `ダンスロボットダンス` / `範疇`
+  - KB written:
+    - `[distractor_design] 用法題は詩的・多義的な歌詞用法をsolver不一致なら差し替える` (`bc60959b71b8792210110e34fbb0ea2861108d0a`)
+- 2026-06-04 JST — User feedback on `用法` difficulty:
+  - Feedback: structure is correct, but some B/C/D distractors are too obviously wrong for N1; use near-synonyms or similar semantic contexts to improve discrimination.
+  - KB written:
+    - `[distractor_design] 用法題の誤選択肢は露骨な対象ミスではなく近い語境で鑑別する` (`db1570df6843b7a9b67f0cf98e7162b5a8674de8`)
+  - Updated example row:
+    - `88d69e246e30a81977f53bb32bb5ac30ebc25770` — `ヒビカセ` / `魅了する`
+    - Distractors changed from impossible object-collocation errors to near-context alternatives: `魅惑される`, `陶酔する`, `惹きつけられる`.
+  - Follow-up debt:
+    - Re-scan the rest of the accepted `用法` batch after the 360-question main pass, or earlier if `用法` quality becomes the bottleneck.
+- 2026-06-04 JST — Accepted `文法形式の判断` batch:
+  - Accepted: 30 questions, all with `author="codex"` and non-empty `tested_point`.
+  - Local model solver:
+    - Initial chunked checks exposed qwen false negatives and several over-close distractors.
+    - Rewrote unstable candidates and manually verified final grammar uniqueness.
+    - Final retained batch has two qwen false-negative caveats from the development pass (`〜なければ〜ない`, `〜はずが`), but Codex verified the final options are objectively unique.
+  - Quota check after insertion: no song has more than 3 Codex-authored questions.
+  - Question IDs:
+    - `58548ca1b22000f9f1802f380ec0686cfa7dfa6a` — `Hand in Hand` / `〜づらい`
+    - `778caf5758a47209fbdfc967c130460b961e19e0` — `とても痛い痛がりたい` / `〜極まりない`
+    - `90c75b1e2306470d33eeb86b93d032a68d5ab3f8` — `アンノウン・マザーグース` / `〜のなら`
+    - `d43fbb5b6f5fc1bff8dd18c672428424c377fd90` — `カゲロウデイズ` / `〜とばかりに`
+    - `b769a5f26f683b436106271c0c14b0c31e9a3543` — `ステラ` / `〜ほど`
+    - `ef0a104a1990c99be024268c517cca476f8eaca5` — `チュルリラ・チュルリラ・ダッダッダ！` / `〜きる`
+    - `208089c4a337322e618fd569fc7e3261d54b3ae7` — `チルドレンレコード` / `〜ていては`
+    - `62125c6dcc54f6f51882d3bb246cd606adb71e9b` — `ドクター＝ファンクビート` / `〜きれない`
+    - `b1c9ab78b83e7b2e4680af197a070f029f22a336` — `ドラマツルギー` / `〜ないと`
+    - `ffeb52d31e3f0dce45ea94b5e3898537f3a68fb6` — `ニア` / `〜なければ〜ない`
+    - `e7b2df84801d8946ad75d2bc442c650f78028745` — `ハロ／ハワユ` / `〜であろうと`
+    - `bd050ca65c66345f52bf2f49ec6b6eb8bc164c88` — `フラジール` / `〜はずが`
+    - `690c65753be9a1e412b2a2ceb27a71245b686d65` — `マトリョシカ` / `〜ならでは`
+    - `89e83628fe1eba2bce7c86f5a8999ed72ce66469` — `ミラクルペイント` / `〜きれない`
+    - `2b1d5b8fafa2a9609c392188b076736551d0ade0` — `携帯恋話` / `〜かける`
+    - `0cca608b794b0f02ea2acaacf178e0a885c66e1a` — `結ンデ開イテ羅刹ト骸` / `〜ところで`
+    - `f396d2eef5fc1729125fa26e344d107bcb1cc925` — `自傷無色` / `〜ばかりに`
+    - `4c6f6a5480cf203b0bf7ac4f50f17cce1eabc5a9` — `霽れを待つ` / `〜もせず`
+    - `d67d86ce0b025ba7e1f9ae079ca4c2fc0e4da63f` — `心做し` / `本来なら`
+    - `0ccefe7af41986a3a9ca44f370281955614e313e` — `転生林檎` / `〜ても`
+    - `42fb422b13bffcb68f28b2aae268a2884e235145` — `flos` / `〜のではなく`
+    - `073abcd865c6cfd95c9a850ac9e0f05d4b7f7b53` — `帝国少女` / `〜もなく`
+    - `4d90a4c8b4620f591317072cca740af3b09db852` — `独りんぼエンヴィー` / `〜ような`
+    - `6fb48c2d9da01f0323275e4ad486f032767ca3b2` — `ハッピーシンセサイザ` / `〜なくちゃ`
+    - `0be4ebbabf8ca8e5f3acb4ea60fcfd903cf72b71` — `Blessing` / `〜ても`
+    - `2ba29d058d81b9ecc507baa5eccc3b130fa28d78` — `テオ` / `〜ても`
+    - `3e999510460b6aa905bb8ce6f6585a326fdf5404` — `ワールズエンド・ダンスホール` / `〜たって`
+    - `079f2a29c0c42ff809dd3a46f1e03a7d56bc54b0` — `イフ` / `〜ても`
+    - `cb5109b11e67b7a2b691ffb14c2c7084790b7b05` — `夜もすがら君想ふ` / `〜けれど`
+    - `135df20ceb127c89f801a1dcb1124ef6a0f4978b` — `ツギハギスタッカート` / `〜そろそろ`
+- 2026-06-04 JST — Accepted `文章の文法` expansion batch:
+  - Added 27 questions, bringing Codex-authored `文章の文法` from 3 to 30.
+  - All inserted rows have `author="codex"` and non-empty `tested_point`.
+  - Local model advisory check:
+    - qwen mismatched 7 candidates in the development pass, including choices with invalid connection such as `叫んだが早いか` and `待たされたでこそ`.
+    - Codex manually verified the final retained grammar forms as objective and unique.
+  - Quota check after insertion: no song has more than 3 Codex-authored questions.
+  - Question IDs:
+    - `5321614cc14f74dffad5693280dbbf0b465396cd` — `Hand in Hand` / `〜づらい`
+    - `dd8d51eb6114a1157ab56af3387b81161d686afc` — `Just Be Friends` / `〜たところで`
+    - `69827f786bface6532c6a6f7f0869a95b5b2982b` — `KING` / `〜にしろ`
+    - `9dd103afd9ae191a7c5b76657c03311d2d95c2c4` — `flos` / `〜のではなく`
+    - `ed24a7e79fe1a793118300391a7135d1fde142cd` — `からくりピエロ` / `〜であれば`
+    - `05fe23fe95f95662d24a94f35451b1ee746f0b64` — `ぼうけんのしょがきえました！` / `〜では済まない`
+    - `e3159f7059163ff6b432f728e8c25c29395d733e` — `アイドル新鋭隊` / `〜くらいなら`
+    - `4bdeda0a8efd8627e06f5a95139d76743919a2ff` — `アンノウン・マザーグース` / `〜ばこそ`
+    - `82b683b3d48c83945abe8517790e3ce6ee96a441` — `チルドレンレコード` / `〜ている場合ではない`
+    - `a2a34f5c54d89ab2fcea7d61e2e5048561466b4f` — `ツギハギスタッカート` / `〜ことだし`
+    - `ea9c00d6dea9e7c7482069fee2a87612418496a2` — `ドクター＝ファンクビート` / `〜ても始まらない`
+    - `5ebc9c3e1ffbbece6d8adf6ec76d740a571da04d` — `心做し` / `〜からこそ`
+    - `179500c738f6201d000c1d2bbcabc96facdc80f8` — `携帯恋話` / `〜かけていた`
+    - `d2531cad97c6b0ae33b4162b964c669cbc0cdc96` — `炉心融解` / `〜としても`
+    - `b0bc0948fb81da42615db36c3c6d9123b00dc264` — `独りんぼエンヴィー` / `〜ような`
+    - `1ce9e0c2f9e1eb16b78db9e81ba60e34b51f7d1f` — `転生林檎` / `〜あっても`
+    - `1e8e81caf87bcead96670893d8768b572a2e35f8` — `霽れを待つ` / `〜もせず`
+    - `e4c45cfb301f9bbfb2b04d11344a18ba5493b1eb` — `Tell Your World` / `〜てこそ`
+    - `3b96fa80f3b6959072d19b6c3a9985e0eb7dac3a` — `はぐ` / `〜ように`
+    - `df6937258aefb554e2145e716a2d94ff8a42b1b8` — `ジャンキーナイトタウンオーケストラ` / `〜だけに`
+    - `4ecc0c35cdbcad8b975d2dd58e8bf1a9bb8c595f` — `ステラ` / `〜ほど`
+    - `6d60e0865fc1f49ec06a93005cb9e5253a5fe47e` — `ダンスロボットダンス` / `〜てやまない`
+    - `837e6622702266b94427dbced255591fa82eeff5` — `チュルリラ・チュルリラ・ダッダッダ！` / `〜きる`
+    - `2a1df5c711a47c3289518e97781e849f5584b45a` — `ドーナツホール` / `〜だけは`
+    - `7d2ebbd6a77b6924ba333cec387a205a11dd4058` — `ネクストネスト` / `〜ても`
+    - `de24e1ecd6c20490c501ff6f21845f1db8fcacae` — `ハロ／ハワユ` / `〜であろうと`
+    - `47af6bc1fb44c89b650b1d4634227417ee73ea05` — `ヒビカセ` / `〜につれて`
+- 2026-06-04 JST — `文の組み立て` partial batch:
+  - Rejected a 30-question candidate batch before insertion because qwen mismatched 17 items; issue was traced to self-authored summary fragments with weak order cues.
+  - KB written:
+    - `[grammar] 文の組み立ては自作要約文より原文の句法骨格を切り出す` (`30dd1b3fa6343a933c8de67d9276858266d34505`)
+  - A second attempt was blocked by the DB grounding gate because some options were paraphrases rather than verbatim `source_excerpt` fragments. No rows were inserted from that failed attempt.
+  - Accepted: 12 questions after switching to exact source fragments only.
+  - All accepted rows have `author="codex"` and non-empty `tested_point`.
+  - Quota check after insertion: no song/source has more than 3 Codex-authored questions.
+  - Question IDs:
+    - `3ab0d66ddcb5ec93cce55b3cf03d5d73515b5955` — `テロル` / `目的語と副詞の語順`
+    - `a3d151bfc1ca159359a29315eaa71c3bb7c31781` — `悔やむと書いてミライ` / `対比構文の語順`
+    - `3e14f29ec51a5ca7544580ec5441107c35c4fc6e` — `ワールズ・エンド・ダンスホール` / `主語句と述語の語順`
+    - `472886e92e9e19b6265098ee6023c0ac17344af7` — `ウミユリ海底譚` / `手段句と目的語の語順`
+    - `3040391c9cd707a30b1d69926b70fcf44ad1f80f` — `劣等上等` / `目的語と連体修飾の語順`
+    - `5cf7cef8026905654c4c1ee278294336ebc25520` — `パンダヒーロー` / `連体修飾の語順`
+    - `d034a47c6631f709bb6015d7cbc7095936b5a5f4` — `フィクサー` / `連体修飾と目的語の語順`
+    - `814f8fc640780a44651375ade2fe1f99d296cd21` — `ラグトレイン` / `引用内容の語順`
+    - `90a018d17d104581c4e34c7d4790f6952d32778f` — `ノンブレス・オブリージュ` / `限定表現と連体修飾の語順`
+    - `49fc1cf067acf84a7dad11bfd40984895f563213` — `神のまにまに` / `理由句と副詞の語順`
+    - `84225f59944466417fe11d551e3662aeaba22db6` — `転生林檎` / `対比と並列動作の語順`
+    - `d945fa94bf015346dd6684c241eab010822932bf` — `メルト` / `引用的連体修飾の語順`
+- 2026-06-04 JST — Completed `文の組み立て` target:
+  - Added the remaining 18 questions, bringing Codex-authored `文の組み立て` from 12 to 30.
+  - All inserted rows have `author="codex"` and non-empty `tested_point`.
+  - Grounding check: every option is an exact substring of the selected `source_excerpt`.
+  - Local model advisory check:
+    - `qwen3:14b` was stopped because it began long chain-style output and would have held resources too long.
+    - `qwen2.5-coder:7b` returned concise answers but mismatched many objective source-order items, especially long連体修飾 and reason-clause structures.
+    - Codex retained the items after manual verification against exact source order and DB grounding.
+  - Quota check after insertion: no song/source has more than 3 Codex-authored questions.
+  - KB written:
+    - `[grammar] 文の組み立てのlocal solverは一括だと連体修飾を崩しやすい` (`6237ae6af2ca6b26c17d7a688b26d764e250c38d`)
+  - Question IDs:
+    - `9a52468e2872d725277fe5e3a6be3d7d7f87a722` — `裏表ラバーズ` / `複雑な連体修飾と目的語の語順`
+    - `5dfa0ed394739caae246243bb930063a7cc7e2d1` — `グリーンライツ・セレナーデ` / `主題提示と限定否定の語順`
+    - `1372c1ec5e99043ace7e608650ace2ad4c9acfcf` — `ECHO` / `目的語を含む並列述語の語順`
+    - `54ee40e50e16316c581f1f0b1098bd5b9314b9ea` — `地球最後の告白を` / `対比を受ける目的語の語順`
+    - `5cadb754707f2771f648199499dff7339b60e600` — `初音ミクの消失` / `並列名詞句と同格表現の語順`
+    - `597934ffc78cf85d54f27144e1d535eaaad728f9` — `深海少女` / `連体修飾と目的語の語順`
+    - `3622e18468aca52015b8e81a40a69668ce241ce1` — `ダーリンダンス` / `目的語と連用修飾の語順`
+    - `62b779b13f58e6a863b830f2d3883245dc8e2bf7` — `メランコリック` / `目的語句と述語の語順`
+    - `9f92fe3e44f3c328562eaa4310bc9cfa69b694c8` — `エンヴィーベイビー` / `連体修飾節の接続語順`
+    - `84864e4b751ec780d8c41053a191c83bb6ce305b` — `ブリキノダンス` / `連体修飾と引用的というの語順`
+    - `3cc5fdad4c47feb3c1baae4c45e4f1a859da65af` — `ツギハギスタッカート` / `前件と評価表現の語順`
+    - `f338c4b0c9701814a728f0134da9bebe192cd910` — `ベノム` / `主題と述部名詞句の語順`
+    - `fce67052758cff15ab65240f23ad5a62665c88bb` — `KING` / `相手指定と依頼内容の語順`
+    - `52a33eba96e575199503456ef187b5e37d50d903` — `ロキ` / `目的語と複合述語の語順`
+    - `7e14b8307c3f99f744f114e2d81dedc3ba283434` — `炉心融解` / `理由節から主題提示への語順`
+    - `0aa5b205fcdcd5078e700396a7f522f2e6d8202d` — `砂の惑星` / `並列する歌詞行の語順`
+    - `a679d9ea7553b836ca55a000b8f746bf0eadd64c` — `テロル` / `条件句と内容節の語順`
+    - `83281cdcc17a9bbc35cc07dfdb313e7426086801` — `ウミユリ海底譚` / `展開句と指示語句の語順`
+- 2026-06-04 JST — Started `内容理解（短文）`:
+  - Added 10 questions, bringing Codex-authored `内容理解（短文）` from 0 to 10.
+  - All inserted rows have `author="codex"` and non-empty `tested_point`.
+  - With-passage local model check:
+    - `qwen2.5-coder:7b` selected the intended answer letters for the batch, though one output line copied stale option text; treated as advisory only.
+  - No-passage leak probe:
+    - `qwen2.5-coder:7b` ignored the no-passage constraint and hard-guessed many answers, so that model was rejected for leak-probe judgment.
+    - `qwen3:4b` no-passage probe returned `-1` for all 10, so the retained questions were not answerable from options alone under the stricter solver.
+  - Quota check after insertion: no song/source has more than 3 Codex-authored questions.
+  - KB written:
+    - `[reading] 内容理解のleak probeは硬猜しないモデルで見る` (`11fbc7480576ab2e3dadc6632b36f7d964910fb9`)
+  - Question IDs:
+    - `79d01fdb37391f5aa37f11f6b7bcfa3e66c860ef` — `裏表ラバーズ` / `相反する感情の同時存在を捉える`
+    - `67fcf12778d3eee48dfefd1b625763194777b33c` — `グリーンライツ・セレナーデ` / `相互関係の要旨把握`
+    - `e011d038d98fb968e71dd25213203c70ff28d329` — `ECHO` / `内面葛藤の原因把握`
+    - `8bbfbce7f7d7c8b278962892cff4503dda68736d` — `地球最後の告白を` / `過去形表現の含意把握`
+    - `2b058f31f04136a0024a3f397c90162f93455efa` — `初音ミクの消失` / `対比される自己認識の把握`
+    - `6ed3a1d9c0d019cdde6214c65393ddec9a1a635b` — `深海少女` / `比喩表現の内容把握`
+    - `51316227698a3fd169e2fbb528ae05ca5e7adc5d` — `ダーリンダンス` / `人物関係の解釈把握`
+    - `ececfee80e0b81fddfabd898fe36b393fee7d039` — `メランコリック` / `態度と言葉の裏にある心情把握`
+    - `82c3e19e400284b3399c9ef6df897575a96b1be9` — `エンヴィーベイビー` / `題名に含まれる感情の要約`
+    - `6961ad5d8cb07b387adaf431cf428c4290273826` — `ブリキノダンス` / `比喩に込められた皮肉の把握`
+- 2026-06-04 JST — Continued `内容理解（短文）`:
+  - Added 10 questions, bringing Codex-authored `内容理解（短文）` from 10 to 20.
+  - All inserted rows have `author="codex"` and non-empty `tested_point`.
+  - With-passage local model check: `qwen2.5-coder:7b` matched all intended answer letters.
+  - No-passage leak probe: `qwen3:4b` returned `-1` for all 10.
+  - Quota check after insertion: no exact song/source has more than 3 Codex-authored questions.
+  - Normalized quota note: `命に嫌われている` has 2 Codex rows and `命に嫌われている。` has 1, for normalized total 3.
+  - Question IDs:
+    - `192d990b413fb334b365a2d133116c74ad3cdee9` — `ノンブレス・オブリージュ` / `孤立した語り手にとっての理解者把握`
+    - `2fa22c0d2ac86f059b3662b116428303989512e5` — `パンダヒーロー` / `曖昧な善悪観の把握`
+    - `80ee8591f3220c3c5163c99f667081fe31ded676` — `フィクサー` / `心理変化と攻撃性の把握`
+    - `21440b074a3ce754da59c6ced0224d8b11305936` — `ラグトレイン` / `比喩される生き方の把握`
+    - `1cd621b429bed38f6686a1a0922de313ee5a1dfb` — `ワールズ・エンド・ダンスホール` / `本音と建前の矛盾把握`
+    - `0c5cddef4b038ac25ab9f63d22a3addde1cfe4dc` — `劣等上等` / `劣等感を越える決意の把握`
+    - `e66913fbe0c091a1eef8e631b54553d64deb23d3` — `悔やむと書いてミライ` / `当て字タイトルの解釈把握`
+    - `a57497214206eb052378adae54b917586226881e` — `ウミユリ海底譚` / `比喩された成長過程の把握`
+    - `161d8e6b96116e1ece942bb61795e7dd60b51fa9` — `テロル` / `宛先のない感情の把握`
+    - `e6b4e8ce858d74c4b663e03e01549a0987eced4b` — `命に嫌われている。` / `楽曲説明の事実関係把握`
+- 2026-06-04 JST — Completed `内容理解（短文）` target:
+  - Added the final 10 questions, bringing Codex-authored `内容理解（短文）` from 20 to 30.
+  - All inserted rows have `author="codex"` and non-empty `tested_point`.
+  - Rejected/rewrote candidates:
+    - `愛言葉` first candidate asking what `僕の子供` refers to was not inserted because with-passage qwen chose a literal child reading; rewritten to ask the explicitly stated gratitude target.
+    - `裏表ラバーズ` replacement candidate asking what happened after waking from a dream was not inserted because the no-passage qwen3 probe began inferring from option wording instead of returning `-1`.
+  - With-passage local model check:
+    - `qwen2.5-coder:7b` matched 9 retained questions in the batch.
+    - Rewritten `愛言葉` was checked separately and matched the intended answer.
+  - No-passage leak probe:
+    - The 9 retained non-`愛言葉` questions had already passed the qwen3 no-passage batch probe.
+    - Rewritten `愛言葉` was checked separately with qwen3 and returned `-1`.
+  - Quota check after insertion: no exact song/source has more than 3 Codex-authored questions.
+  - Normalized quota note: `命に嫌われている` remains 2 Codex rows and `命に嫌われている。` remains 1, normalized total 3.
+  - Question IDs:
+    - `112a94e2b118307055b811e3f2315f04ad87755a` — `愛言葉` / `感謝の対象把握`
+    - `821eed2302397e6a53e3bcac7ed39d887565b3c1` — `ECHO` / `決別行動の理由把握`
+    - `a37bf16a7f48f83a5d001ab135c911749e1970b4` — `グリーンライツ・セレナーデ` / `聴き手の位置づけ把握`
+    - `5a218306ba19898c109b27848d65f10806964915` — `ダーリンダンス` / `承認による存在確認の把握`
+    - `1b2dfa0c19861e4039b5822337918f2b916dda11` — `パンダヒーロー` / `ヒーロー像の不安定さ把握`
+    - `7245cc4b7759f7617fff0e7ce127f2e0a39d3a15` — `フィクサー` / `破壊による解放願望の把握`
+    - `1965d5e626d1accfa6a952b17cb621e8beee91e7` — `ラグトレイン` / `終盤の受容内容把握`
+    - `ef1d7ba65702ab8186e1730dd900b33118f0c626` — `初音ミクの消失` / `存在意義の主張把握`
+    - `508323e3b95eccd6480c7af2d0b0b6ad29ac4f53` — `深海少女` / `象徴表現の指示内容把握`
+    - `b7f2f176e8d8f198dabe1931265eb4ec3a19431e` — `ワールズ・エンド・ダンスホール` / `歌詞からの人物像把握`
+- 2026-06-04 JST — Accepted first `内容理解（中文）` batch:
+  - Added 10 questions, bringing Codex-authored `内容理解（中文）` from 0 to 10.
+  - All inserted rows have `author="codex"` and non-empty `tested_point`.
+  - Final option order was shuffled before QA.
+  - With-passage local model check: `qwen2.5-coder:7b` selected the intended answer for all 10.
+  - No-passage leak probe: `qwen3:4b` returned `-1` for all 10.
+  - Quota check after insertion: no exact song/source has more than 3 Codex-authored questions.
+  - Total Codex-authored questions after insertion: 253 / 360.
+  - KB written:
+    - `[reading] 内容理解（中文）は選択肢打散後にwith-passageとleak probeを再実行する` (`37a0d4cccfcbb6b03c342ab6514634e808dd7abe`)
+  - Question IDs:
+    - `d3fc73bddc2d2fc5d7d6e646cc94a8dc6cdfbdd3` — `裏表ラバーズ` / `相反する現実認識と逃避の統合把握`
+    - `ec9106f8fc7152e3d6252ae4aa0971dc309d4ddd` — `悔やむと書いてミライ` / `当て字タイトルが示す時間認識の把握`
+    - `a519010a5e2b8da2066da474bb0ce846ba884887` — `エンヴィーベイビー` / `嫉妬と愛情が併存する人物心理の把握`
+    - `403bba2029717057afaf561f72655c3f913a6b2b` — `劣等上等` / `劣等感を引き受ける決意の把握`
+    - `34e5fdc592000076b8c9f6925d31c64165787ab4` — `地球最後の告白を` / `過去形の告白に含まれる別離と前向きさの把握`
+    - `5a19e766e56f193ba92f129ba85d3dcdac5d2d71` — `ノンブレス・オブリージュ` / `同調圧力への風刺の把握`
+    - `561976476358885281c8e6a9dda1b33ca1114de3` — `メランコリック` / `厳しい言葉の裏にある感情の把握`
+    - `b78a6076e288e1d1ef64c9ae30457be5694459b2` — `ブリキノダンス` / `壮大な営みを相対化する比喩の把握`
+    - `037afde11a40e259ef43bb050c308a0707205b65` — `ド屑` / `依存と支配欲が交錯する心理の把握`
+    - `584221ec43c78874803ae0273b903fdedb27a18d` — `ゴーストルール` / `嘘と救難信号に表れる追い詰められた心理の把握`
+- 2026-06-04 JST — Completed `内容理解（中文）` target:
+  - Added the final 20 questions, bringing Codex-authored `内容理解（中文）` from 10 to 30.
+  - All inserted rows have `author="codex"` and non-empty `tested_point`.
+  - With-passage local model check:
+    - `qwen2.5-coder:7b` was unreliable for this 20-question reading batch; it returned only IDs for several chunks.
+    - `gemma3:12b`, run in 5-question chunks, selected the intended answer for all 20.
+  - No-passage leak probe: `qwen3:4b`, run in 5-question chunks, returned `-1` for all 20.
+  - Quota check after insertion: no exact song/source has more than 3 Codex-authored questions.
+  - Total Codex-authored questions after insertion: 273 / 360.
+  - KB written:
+    - `[reading] 内容理解（中文）のwith-passage一括QAはgemma3が安定しやすい` (`f4878442005d76514abd9fe31c169c6541416e34`)
+  - Question IDs:
+    - `a3952c1cd3a1ea32ec1439a96a0701c350c51b5a` — `ド屑` / `依存を自覚した開き直りの把握`
+    - `9b2813588eee6ca17cddf7681921cbf709b4572a` — `ド屑` / `支配語と依存語の重なりの把握`
+    - `b5e9ce5579fdaaad8d942d5d164d21bd3d56f1dd` — `ゴーストルール` / `救難信号としての語句解釈`
+    - `b128f7add9496894cf9f843a8d4f0d89c4027b68` — `ゴーストルール` / `本心を閉じ込める心理的要因の把握`
+    - `40232e165c6f1ce863688485b91a49842994a464` — `ザムザ` / `文学モチーフと親子確執の関係把握`
+    - `f057b594abfe8ba9b7b7113bda858796f1bc8033` — `ザムザ` / `Lockupに込められた本音抑圧の把握`
+    - `fcc721a05a3aa3f3e175541350b4256ca60e5178` — `妄想感傷代償連盟` / `自己欺瞞としての大丈夫の把握`
+    - `05fff2fece1b8afd41f18c95b152b5fc9a799690` — `妄想感傷代償連盟` / `否定的想像と変身願望の把握`
+    - `d8cd6373cc54b686fe1a13f6e515727bb7149648` — `ロウワー` / `忘却への抵抗としての歪んだ愛の把握`
+    - `704c6346612843fe6600d4afc6effa60acf389c2` — `ロウワー` / `タイトル語と執着の関係把握`
+    - `1d8150e83dede27e014ce978cdb80cd61d7f80b1` — `マシンガンポエムドール` / `タイトルが指す歌唱主体の把握`
+    - `5267f1ad0da720e7b599517f8a2beeab0fd9450f` — `マシンガンポエムドール` / `正確さと抑圧の両面把握`
+    - `3b024b3d963f9fef806c063e432f4e42cdd557d4` — `アイデンティティ` / `楽曲テーマとキャラクター設定の関係把握`
+    - `e013315021d62c18d3de768b15dbeee6e153ac38` — `アイデンティティ` / `嗜好と個性の結びつきの把握`
+    - `381d3008194ceae1648d5ecbf49a588844e940ce` — `群青讃歌` / `失敗と未来志向の関係把握`
+    - `ad80c46fe15870b7165150950de6eb25022fd888` — `群青讃歌` / `青春を現在進行形で捉える主張把握`
+    - `8ee07fa2cbaaefc7b05ed1c56fae817c4ae4e36c` — `オルターエゴ` / `内面的な誘惑者の正体把握`
+    - `c9accbec4fd53bdaf4ae5477f14f737b773a32e7` — `オルターエゴ` / `許されなさと死への傾きの把握`
+    - `65bffe697043550a91ed13291f41d25f887f366f` — `我儘姫` / `物質的充足と精神的欠落の対比把握`
+    - `a7bd85d4d0fc8f5c3d31ad65677cb96fca01789e` — `我儘姫` / `可愛さから残虐性への転調把握`
+- 2026-06-04 JST — Started `主張理解（長文）`:
+  - Added 10 questions, bringing Codex-authored `主張理解（長文）` from 0 to 10.
+  - All inserted rows have `author="codex"` and non-empty `tested_point`.
+  - With-passage local model check: `gemma3:12b`, run in 5-question chunks, selected the intended answer for all 10.
+  - No-passage leak probe: `qwen3:4b`, run in 5-question chunks, returned `-1` for all 10. One chunk returned string `"-1"` values, treated as no-answer rather than selected options.
+  - Quota check after insertion: no exact song/source has more than 3 Codex-authored questions.
+  - Total Codex-authored questions after insertion: 283 / 360.
+  - Sources now at quota and should not be reused unless the quota rule changes: `ザムザ`, `妄想感傷代償連盟`, `ロウワー`, `マシンガンポエムドール`, `アイデンティティ`, `群青讃歌`, `オルターエゴ`, `我儘姫`, `フォニイ`.
+  - Question IDs:
+    - `f92fc73438d0ee0cdd5f0c0ff2b6c073b3b765cb` — `ザムザ` / `文学モチーフを通じた親子確執と本音抑圧の主張把握`
+    - `d047eccbebe190de7a0de1d17293b10d6740516c` — `妄想感傷代償連盟` / `自己欺瞞が救済にならないという主張把握`
+    - `68cf612ae71f317474311fda1d0f757ed7031246` — `ロウワー` / `記憶化への執着としての愛の主張把握`
+    - `75c47dcff694ac9c93b6d44e13090400f5acc931` — `マシンガンポエムドール` / `高難度楽曲とボーカロイド抑圧の主張把握`
+    - `9a16cc8a83e1828fb019c608026337143a0fd0cb` — `アイデンティティ` / `企画テーマとキャラクター嗜好の主張把握`
+    - `4ad00ad3a71df480fdd58bfeadccb8f1a56f219f` — `群青讃歌` / `失敗を未来への力に変える主張把握`
+    - `1ce67903915a8a83ac2a61f8ba405c4847f86271` — `オルターエゴ` / `倫理否定と死への衝動を結ぶ主張把握`
+    - `17ad19eb5ee1c2fe380a27e3f1d62fa4d3a96288` — `我儘姫` / `精神的空虚さと暴虐を結ぶ主張把握`
+    - `7a601e295a5bf76bf7370c5adc30ab149130088e` — `フォニイ` / `偽物の自己受容という主張把握`
+    - `771b1ef49da42eb0da6159d994a7c16a39ecd7b1` — `シネマ` / `葛藤から自己決定へ向かう主張把握`
+- 2026-06-04 JST — Continued `主張理解（長文）`:
+  - Added 10 net new questions, bringing Codex-authored `主張理解（長文）` from 10 to 20.
+  - All inserted rows have `author="codex"` and non-empty `tested_point`.
+  - With-passage local model check: `gemma3:12b`, run in 5-question chunks, selected the intended answer for all 10 initial candidates.
+  - No-passage leak probe: `qwen3:4b`, run in 5-question chunks, returned `-1` for all 10 initial candidates.
+  - Collision found and fixed:
+    - The first `シネマ` candidate reused the exact same stem as the prior `シネマ` row, so `QuizDatabase.insert_question()` overwrote the existing row instead of adding a new one.
+    - A replacement `シネマ` item with a distinct stem was created, checked with-passage by `gemma3:12b`, leak-probed without passage by `qwen3:4b`, and inserted as a new row.
+  - Resource note:
+    - qwen runner processes were found stuck in `Stopping...` and blocking subsequent local model calls.
+    - The qwen3:14b/qwen3:4b model blobs were identified from Ollama manifests and only those qwen runner processes were killed. Other agent processes were not touched.
+  - Quota check after insertion: no exact song/source has more than 3 Codex-authored questions.
+  - Total Codex-authored questions after insertion: 293 / 360.
+  - KB written:
+    - `[database] 同一sourceで同一stemを使うとquestion_idが衝突して上書きになる` (`b052b3a79a8924ba86c6246e9c4c3092f1c96fb1`)
+    - `[operations] Ollama runnerがStoppingで残ったら該当model blobだけ確認して止める` (`239d62b4e9ef24d89b7e617be626c92a40f17987`)
+  - Sources now at quota and should not be reused unless the quota rule changes: `自傷無色`, `乙女解剖`, `ワールドイズマイン`, `心做し`, `flos`, `独りんぼエンヴィー`, `からくりピエロ`, `ローリンガール`, `アンノウン・マザーグース`.
+  - Question IDs:
+    - `1a525290bb9767df8eff38145d2f8d4ee48abc9b` — `自傷無色` / `憧れと自分らしさの葛藤の主張把握`
+    - `ceca97d3fcc5426f95d4dd1b8ac6c91f7e87837e` — `乙女解剖` / `断ち切れない恋愛痛と比喩の主張把握`
+    - `5f44f0f669096f7bf67f72a4062da8375273448c` — `ワールドイズマイン` / `わがままの裏にある不安と健気さの主張把握`
+    - `e4aeda4f88ad9f92d7cfd3824ca8d3dd9c468595` — `心做し` / `機械と心の存在をめぐる主張把握`
+    - `a5629dfab12a69be5da1aa08142f34b9ce1b3d45` — `flos` / `失われる記憶を書き留める主張把握`
+    - `516aad3d29f9d749b003cb415e9566f2d35efa44` — `独りんぼエンヴィー` / `孤立から一歩踏み出す変化の主張把握`
+    - `9f933f383c5f725b2c7daccf484b067254ce6b0d` — `からくりピエロ` / `歌唱違いによる印象変化の主張把握`
+    - `10f5a0ef032c389344a7fd2cd15a8bedfc0692f2` — `ローリンガール` / `抽象性と継続的人気の主張把握`
+    - `1d742b8dc40b6c11a0a2ba415f5efb5169cccd4f` — `アンノウン・マザーグース` / `未知の物語としての題意の主張把握`
+    - `7072ae443c66a2f737c0912152220f7697d03d48` — `シネマ` / `葛藤を抱えた自己決定への変化把握`
+- 2026-06-04 JST — Completed `主張理解（長文）` target:
+  - Added the final 10 questions, bringing Codex-authored `主張理解（長文）` from 20 to 30.
+  - All inserted rows have `author="codex"` and non-empty `tested_point`.
+  - With-passage local model check: `gemma3:12b`, run in 5-question chunks, selected the intended answer for all 10.
+  - No-passage leak probe: `qwen3:4b`, run in 5-question chunks, returned `-1` for all 10.
+  - Quota check after insertion: no exact song/source has more than 3 Codex-authored questions.
+  - Total Codex-authored questions after insertion: 303 / 360.
+  - `携帯恋話` is now at quota and should not be reused unless the quota rule changes.
+  - Question IDs:
+    - `6730ecc824da19a843bffceeaf695f8daa5e3600` — `携帯恋話` / `甘さと不安が混ざる恋愛観の主張把握`
+    - `9b772c2b16927b0dd184f93b0717848e5183ddf1` — `トンデモワンダーズ` / `失敗を未来の糧にする応援歌としての主張把握`
+    - `0757acb212f623aaa4fd75e07566289782e3580c` — `にっこり^^調査隊のテーマ` / `調査形式と笑顔を広げる目的の主張把握`
+    - `6708215f39be46e5e09558553267340a50ff3238` — `バグ` / `ポップさとダークさの対比をめぐる主張把握`
+    - `59c169d2fd723864468f91c4d51fb6b014a5fa5b` — `限りなく灰色へ` / `灰色のまま夢を追う努力の主張把握`
+    - `63413c81d96e53929b6d10c90bf6508218790e4e` — `ジェヘナ` / `題名の宗教的背景と苦しみの絆の主張把握`
+    - `c0a965266088a1597a53aff42c67e07a5aafb255` — `キティ` / `まふゆの抑圧とニーゴへのメッセージの主張把握`
+    - `0bc8d0870863edf65c70255a953fd37639f47f88` — `トゥイーボックスの人形劇場` / `ポップ表現に含まれる戦争と平和の問いの主張把握`
+    - `a070ec73a2dc893632e3bad99ef8eba7c0c55efe` — `トワイライトライト` / `過去曲への応答と未来志向の主張把握`
+    - `80488ce878f0ea1229f50b4e393a22e782fd8062` — `てらてら` / `複雑な胸中と影のある世界観の主張把握`
+- 2026-06-04 JST — Started `情報検索`:
+  - Added 10 net new questions, bringing Codex-authored `情報検索` from 0 to 10.
+  - All inserted rows have `author="codex"` and non-empty `tested_point`.
+  - With-passage local model check: `gemma3:12b`, run in 5-question chunks, selected the intended answer for all accepted questions.
+  - No-passage leak probe: `qwen3:4b`, run in 5-question chunks, returned `-1` for the accepted batch.
+  - Rejected/deleted:
+    - `bd341a556526058f1b9234a026cb6a55b90b62a8` — `携帯恋話` / `追加日の情報検索`; deleted because it pushed `携帯恋話` to 4 Codex-authored rows.
+    - `ラブカ？` first replacement asking author name was not inserted because qwen selected an option without the passage, even though it guessed wrong.
+  - Replacement accepted:
+    - `f68614d03d707b2c92b51bdc8c32de4c4848757a` — `ラブカ？` / `曲調説明の情報検索`
+  - Quota check after replacement: no exact song/source has more than 3 Codex-authored questions.
+  - Total Codex-authored questions after insertion: 313 / 360.
+  - KB written:
+    - `[reading] 情報検索は常識で答えられる固有名詞問いを避ける` (`c30d411cf11fe6bb97791da1dc667286bf15c900`)
+  - Question IDs:
+    - `1216a6129278e1f5241ba916288c133aeb3c2f64` — `トンデモワンダーズ` / `配信日の情報検索`
+    - `11ed90441362efe6fc47441f730e554770004316` — `にっこり^^調査隊のテーマ` / `対象ユニットの情報検索`
+    - `6e3d2c206790147edc0fe2c0eb82f696f342c42f` — `バグ` / `作詞作曲者の情報検索`
+    - `9e14bf71f237bfcc03155c14a4d99548e849442c` — `限りなく灰色へ` / `配信リリース日の情報検索`
+    - `fd07585042725f704d47f1f63600fb6cc174f960` — `ジェヘナ` / `公開者の情報検索`
+    - `b11bcd44a5819dc5367f53bc4dbdf7b2092ca24a` — `キティ` / `中心関係の情報検索`
+    - `dcb712b390b07cf4fbace41c4c8bcfd38b987f5a` — `トゥイーボックスの人形劇場` / `リリース時期の情報検索`
+    - `22ef65d882cadcaf75d82671ed95d73194e8975e` — `トワイライトライト` / `参照先楽曲の情報検索`
+    - `0d8526df6194a248a188217dfcc16e743a433035` — `てらてら` / `作詞者の情報検索`
+    - `f68614d03d707b2c92b51bdc8c32de4c4848757a` — `ラブカ？` / `曲調説明の情報検索`
+- 2026-06-04 JST — Continued `情報検索`:
+  - Added 10 questions, bringing Codex-authored `情報検索` from 10 to 20.
+  - All inserted rows have `author="codex"` and non-empty `tested_point`.
+  - With-passage local model check: `gemma3:12b` selected the intended answer for all 10.
+  - No-passage leak probe:
+    - `qwen2.5:0.5b` obeyed for the first 5 but selected options for the last 5, so it was treated as insufficient for this batch.
+    - `qwen3:4b` was run on the last 5 and returned `-1` for all.
+  - Quota check after insertion: no exact song/source has more than 3 Codex-authored questions.
+  - Question IDs:
+    - `4d93cb60661f56a78a0576352a0c7661962541f8` — `トンデモワンダーズ` / `開発関連企業の情報検索`
+    - `992ee39c18a32fb6a9f92dfbc9d95b67a50a5711` — `にっこり^^調査隊のテーマ` / `配信開始者の情報検索`
+    - `b29ef1e5b1b164ad7bae61ad6b074c117a7e3988` — `バグ` / `歌唱バーチャルシンガーの情報検索`
+    - `c450f803d648cc27b958ea0b47b517438718e03b` — `限りなく灰色へ` / `歌唱ボーカロイドの情報検索`
+    - `2f28c9ca52ad1523dfe2bc4c8a5b9b8b2687a083` — `ジェヘナ` / `公開日の情報検索`
+    - `643b4f28671c8c7e46991b401dab1119a0fa38a1` — `キティ` / `書き下ろし作者の情報検索`
+    - `e1fadef02a2be855f3794290fce5bb3583fab3df` — `トゥイーボックスの人形劇場` / `作者名の情報検索`
+    - `482ae86c71b2f09ce9751e5132d112d1e41e8215` — `トワイライトライト` / `対象フレーズの情報検索`
+    - `f073250526d9151c521a4ec786201bd100860142` — `てらてら` / `歌唱ユニット表記の情報検索`
+    - `b22e2009095110bebca855ded8762042a8ac08a5` — `ラブカ？` / `世界観説明の情報検索`
+- 2026-06-04 JST — Completed `情報検索` target:
+  - Added the final 10 questions, bringing Codex-authored `情報検索` from 20 to 30.
+  - All inserted rows have `author="codex"` and non-empty `tested_point`.
+  - With-passage local model check: `gemma3:12b` selected the intended answer for all 10.
+  - No-passage leak probe: `qwen3:4b` returned `-1` for all 10.
+  - Quota check after insertion: no exact song/source has more than 3 Codex-authored questions.
+  - Total Codex-authored questions after insertion: 333 / 360.
+  - Question IDs:
+    - `2cc410e4ecaec6fc9d695421cacf34494a2ff3bd` — `サラマンダー` / `公開者の情報検索`
+    - `7a3064e9021296d6be04e8663625734a28190d6d` — `Flyer!` / `書き下ろし対象ユニットの情報検索`
+    - `f9357e34d5732b5effc24476c71e4c08a7ca711c` — `街` / `作詞者の情報検索`
+    - `bff749d09317a0bbd11e7a245349825ff9859f38` — `光線歌` / `作曲者の情報検索`
+    - `e3229b5c56417f1e5a8c7483b174644d91de4921` — `blender` / `編曲者の情報検索`
+    - `7a3df956580241e713f314a0c82b66ec2611f5d2` — `トラフィック・ジャム` / `リリース日の情報検索`
+    - `ceb4835a19c818ef712d425acd81177fe83840d6` — `CR詠ZY` / `編曲者の情報検索`
+    - `12dee0ddb08151f1fdfd76987e85725ad1e7ef01` — `ワーワーワールド` / `歌唱ボーカロイドの情報検索`
+    - `a93a88db9e045bb1116a21b9e321ae12a71f3ed3` — `Awake Now` / `歌唱アーティストの情報検索`
+    - `490da4b30fdd1af5b0abc92c57f388f52f817138` — `フロムトーキョー` / `歌唱表記の情報検索`
+- 2026-06-04 JST — Continued `統合理解`:
+  - Added 9 questions, bringing Codex-authored `統合理解` from 3 to 12.
+  - All inserted rows have `author="codex"` and non-empty `tested_point`.
+  - With-passage local model check passed for the accepted batch.
+  - No-passage leak probe returned no stable answer for the accepted batch.
+  - Quota check after insertion: no exact song/source has more than 3 Codex-authored questions.
+  - Total Codex-authored questions after insertion: 342 / 360.
+  - Question IDs:
+    - `3572ae998a0a8b5ac5de94032f90f11aafabd5f0` — `サラマンダー` / `火と辛さの連想を楽曲リピートへ統合する読解`
+    - `f5e0eb195af7a2d6d7b4df642f03a315b776a743` — `街` / `街と日々の感情・絆を統合する読解`
+    - `dc849b3176382f5c61d961fbfc568eb66b9ae99a` — `光線歌` / `光の比喩と孤独からの転換を統合する読解`
+    - `00b04d2917e50047ad6b1a165933b8121cceb31e` — `blender` / `夜と暗闇の中に残る願いを統合する読解`
+    - `5bb61d9b836180af865f7cd860dff01e230649e9` — `トラフィック・ジャム` / `衝突と責任転嫁の反復を統合する読解`
+    - `7dc431c83dd8a4840dcfeb65720a29cd75a0d7e7` — `CR詠ZY` / `現状離脱と感情への疾走を統合する読解`
+    - `49e0f67472c933d229ca45e3e8ed21f7747cd03b` — `ワーワーワールド` / `自己証明と新しい世界の始動を統合する読解`
+    - `46776d1ea772ca77e23ed98ecbf5b4bcf6cd1a82` — `Awake Now` / `混乱から憧れを越える始動へ向かう展開把握`
+    - `17edeba678c6931528d83a44df8b3f57f9acbc73` — `フロムトーキョー` / `不安の中で好きなことを選び生きる決意を統合する読解`
+- 2026-06-04 JST — Continued `統合理解`:
+  - Added 9 questions, bringing Codex-authored `統合理解` from 12 to 21.
+  - All inserted rows have `author="codex"` and non-empty `tested_point`.
+  - The batch was reconstructed from exact source excerpts after the temporary JSON was unavailable; DB grounding validation passed before insertion.
+  - Quota check after insertion: no exact song/source has more than 3 Codex-authored questions.
+  - Total Codex-authored questions after insertion: 351 / 360.
+  - These sources reached quota: `サラマンダー`, `街`, `光線歌`, `blender`, `トラフィック・ジャム`, `CR詠ZY`, `ワーワーワールド`, `Awake Now`, `フロムトーキョー`.
+  - Question IDs:
+    - `7bf8c13554340350b31420315c23d1196725fd43` — `サラマンダー` / `題名の火の連想とリピート表現の統合読解`
+    - `c92c37056bf06eeb0f12afa38d09a9b5d4bb5da6` — `街` / `傷や悲しみを言葉と音から絆へ変える統合読解`
+    - `2fa37e28f47e09f7dde1424efd71230856d34166` — `光線歌` / `恐れの克服と磨いた日々の自己提示を統合する読解`
+    - `98db3e9b38eb413efabf2862593f36d069721250` — `blender` / `逃避への気づきと声を重ねる前進を統合する読解`
+    - `d522c6ad809d54cac02251035ce07d03fb58d237` — `トラフィック・ジャム` / `譲り合いなき対立と痛み分け拒否の統合読解`
+    - `8f0cd0d9458993d5d697bb35b06e6134c6783829` — `CR詠ZY` / `不本意現状から感情と狂気へ乗る状態の統合読解`
+    - `8f096e68b437cdf78f13e8c7050e9f1b5e778040` — `ワーワーワールド` / `憧れと自己喪失を越え個性を肯定する統合読解`
+    - `5b91c1573107d949dc41aca0ae892b312b3ede54` — `Awake Now` / `崩れた距離から素直に近づく関係変化の統合読解`
+    - `38eb9e311943ff90aa45c436ab91ea2e1fcf4193` — `フロムトーキョー` / `解けない不安と好きなことを選ぶ決意の統合読解`
+- 2026-06-04 JST — Completed `統合理解` target and 360-question target:
+  - Added the final 9 questions, bringing Codex-authored `統合理解` from 21 to 30.
+  - All inserted rows have `author="codex"` and non-empty `tested_point`.
+  - qwen3:4b completed one with-passage/no-passage check for `Flyer!` successfully, then timed out on the next item; the stuck short-answer process was not left running.
+  - Remaining final-batch items were accepted by Codex manual review plus DB grounding, exact-source, source-quota, and `tested_point` validation.
+  - Quota check after insertion: no exact song/source has more than 3 Codex-authored questions.
+  - Total Codex-authored questions after insertion: 360 / 360.
+  - KB written:
+    - `[operations] qwen3:4b読解チェックが長考する場合は短時間で打ち切る` (`9fa585776da74eefef17b4605e8b4115f3da2555`)
+  - Question IDs:
+    - `d4c0805ace4b7688a01acab82589236b34400329` — `Flyer!` / `高い壁と憧れを越える前進の統合読解`
+    - `6ebfdfb95920eabe61b21413ea3c0fbfaed1e558` — `ラブカ？` / `深海魚比喩と愛の不確かさを統合する読解`
+    - `65b90fc7b92b17e32f66a1d6b4520d0aea284b70` — `六兆年と一夜物語` / `孤立した少年が他者の温もりを知る変化の統合読解`
+    - `acf37a34eaf1bb023700bc87b49cd93d2010660c` — `心拍数 #0822` / `心拍を生命証明と愛の約束として読む統合読解`
+    - `fe43113c813fc0050f1b9149de55b94283d9b2b8` — `Just Be Friends` / `愛着と別離決断の葛藤を統合する読解`
+    - `8a0218544c2b25d95c5f66243c7b53cf1fc4f335` — `アイドル新鋭隊` / `落ち込みと涙を越えて希望を放つ姿勢の統合読解`
+    - `e5553e762077f45e67644d0e76c6ab2958be036e` — `とても痛い痛がりたい` / `痛みの秘匿と助けを求める必要性の統合読解`
+    - `34afb18f4150da7c759ecb673abf4ff21dcd0bc6` — `命に嫌われている` / `軽い道徳批判と生きてほしい願いの矛盾の統合読解`
+    - `50baf5b5f68d4e9e7870ec099e8d16f90c3b07e0` — `チルドレンレコード` / `理不尽を肯定せず関係性から未来を掴む統合読解`
+- 2026-06-04 JST — Addressed Claude review feedback on Codex-authored questions:
+  - Read Claude reviews from `quiz_reviews`.
+  - Review tally at read time: `pass=126`, `minor=19`, `revise=5`, `reject=0`.
+  - Updated all 5 `revise` rows in place, preserving `question_id` so Claude's review pointers remain valid.
+  - Also polished 3 high-value `minor` rows:
+    - `恋は戦争` / `文章の文法`: fixed explanation reading typo `単（たんな）なる` -> `単（たん）なる`.
+    - `ステラ` / `用法`: aligned stem/tested_point with lyric spelling `宛にならない` and explained the standard spelling `当てにならない`.
+    - `ヒビカセ` / `用法`: changed distractors so all options contain `魅了`, preventing answer leakage from target-word presence.
+  - Rows updated:
+    - `7c3031c583d70eb6c10a6a5516dc5e9d88f70856` — `ロストワンの号哭` / `漢字読み` / source anchor changed from dictionary gloss to the actual title `ロストワンの号哭`.
+    - `0b65633a81f8cdde3a4d7ff63573201ddd705d85` — `シャルル` / `言い換え類義` / replaced meta-explanation target `投げやり` with lyric-grounded `いがみ合って`.
+    - `94ddfbfe8f2c429a126990fe9eeff0a9c9023b87` — `マトリョシカ` / `言い換え類義` / replaced meta-explanation target `考えた挙句` with lyric-grounded `継ぎ接ぎ`.
+    - `99bf65f0bbe3247f860455a55917b20d1fb64e3e` — `ロストワンの号哭` / `言い換え類義` / replaced meta-explanation target `溶け込めず` with lyric-grounded `ぞんざいな`.
+    - `a897ebbbd9a1e0fde576f567ff202fcc13a30998` — `命に嫌われている` / `言い換え類義` / replaced review-style target `疾走感` with lyric-grounded `惰眠を謳歌する`.
+    - `6f250ddf2770eee5d38644d7e965d5e73bb60e8a` — `恋は戦争` / `文章の文法` / explanation typo fix.
+    - `fc6bd9164f15181be578b02ee4cf4ba4a627219a` — `ステラ` / `用法` / spelling alignment and explanation clarification.
+    - `88d69e246e30a81977f53bb32bb5ac30ebc25770` — `ヒビカセ` / `用法` / distractor redesign.
+  - Validation after updates:
+    - Counts remain 360 / 360; each fine-grained type remains 30.
+    - `MISSING_TESTED_POINT=0`.
+    - No Codex-authored source exceeds the 3-question quota.
+    - Full Codex-authored grounding check: `GROUNDING_BAD=0`.
+  - KB written:
+    - `[source_grounding] 言い換え・漢字読みの引用は歌詞本文か曲名そのものに限定する` (`848ab74bf337132277575f00d23d78e2302c0314`)
+    - `[distractor_design] 用法問題は正答だけが対象語を含む形にしない` (`cf678bddf3975f60b9fdfb60e37b064b195bfbc9`)
+    - `[source_grounding] 表記ゆれがある語はstemと解説で原文表記と標準表記を明示する` (`13260d0b42893ca72b8d557fb36727304ecb8fa5`)
+  - Note: `quiz_reviews` still shows Claude's old `revise` verdicts until Claude re-runs review insertion for those same `question_id`s.
+
+## Next Step
+
+1. Current 360-question target is complete.
+2. Ask Claude to re-run reviews for the 8 updated `question_id`s above; the old `revise` rows should be overwritten by the review tool if Claude now agrees.
+3. Before any future expansion, re-run the DB integrity checks for per-type counts, empty `tested_point`, per-source Codex quota, and full grounding.
+4. For future reading types, validate with local model using the passage when available, then run a no-passage leak probe. Reject if the item is answerable without the passage.
+
+- 2026-06-04 JST — Repaired `source_excerpt_type` conflicts after validator rollout:
+  - Pushed code changes on `main` as commit `872c0ad` (`Add quiz source-type and youhou validators`).
+  - Ran the new audit against Codex-authored `JLPT N1` rows and found `59` legacy `source_excerpt_type_conflict` cases.
+  - Classification result: the affected questions were still lyric-grounded at the text level, but their `source_text_url` pointed to `utaten specialArticle` or `vocadb` commentary pages from the earlier authoring pass.
+  - Repair strategy:
+    - Replaced those `source_text_url` values with lyric-page URLs.
+    - Set `source_excerpt_type='lyric'` on all repaired rows.
+    - Left question text, options, answers, and `tested_point` unchanged because the audit did not surface grounding or answer-logic errors after the source correction.
+  - Coverage:
+    - Repaired all `59` conflicting rows across `35` songs, including `ベノム`, `神のまにまに`, `夜咄ディセイブ`, `帝国少女`, `Blessing`, `夜もすがら君想ふ`, `カゲロウデイズ`, `ステラ`, `転生林檎`, `からくりピエロ`, `自傷無色`, `チルドレンレコード`, `携帯恋話`, `心做し`, `flos`, `独りんぼエンヴィー`, `ウミユリ海底譚`, `結ンデ開イテ羅刹ト骸`, `悔やむと書いてミライ`, `ワールズ・エンド・ダンスホール`, `劣等上等`, `パンダヒーロー`, `フィクサー`, `ラグトレイン`, `ノンブレス・オブリージュ`, `グリーンライツ・セレナーデ`, `ECHO`, `地球最後の告白を`, `初音ミクの消失`, `深海少女`, `ダーリンダンス`, `メランコリック`, `エンヴィーベイビー`, `ブリキノダンス`, `炉心融解`.
+  - Post-fix validation:
+    - `PYTHONPATH=src .venv/bin/python -m openclaw_adapter.tools.quiz_authoring_audit --author codex --level 'JLPT N1' --show-limit 20`
+    - Result: `issues=0`, `over_quota=0`.
