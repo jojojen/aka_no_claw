@@ -36,6 +36,53 @@
   （`quiz_generator.generate_one_question`、`QuizDailyScheduler`、`quiz_command` 都已帶入）。
   要改題型只需改這個參數，schema 不用動（`exam_point` 是自由欄位）。
 
+## Favorite Songs 快取優先原則
+
+新增 `/quiz like song <youtube_url>` 後，歌曲蒐藏與分析流程改成「先重分析一次，之後重用 SQLite」。
+
+### 收藏時要做的事
+
+1. 解析 YouTube URL，取 `title / artist / youtube_short_url`
+2. 優先找可用歌詞全文來源：
+   - `VocaDB`
+   - `歌ネット`
+   - `UtaTen`
+3. 抓歌詞全文後切句
+4. 用 `SudachiPy + SudachiDict Full` 做形態素分析
+5. 寫入 `data/quiz.sqlite3`：
+   - `favorite_songs`
+   - `lyrics`
+   - `sentences`
+   - `vocabulary_tokens`
+6. 完成後標記 `favorite_songs.status = 'ready'`
+
+### 之後出題 / 單字卡的資料優先順序
+
+1. **先查 favorite-song 快取**
+   - 先從 `favorite_songs.status='ready'` 的歌曲找可用 token / sentence / full lyrics
+   - 先以「歌曲清單優先」為原則輪流出題，不是直接跳到一般歌曲池
+   - 在單一 favorite song 內，再優先選 `used_quiz_count = 0`、`used_flashcard_count = 0` 的詞
+2. **不要重新 fetch 網頁**
+3. **要讀整首歌詞時，讀 SQLite 快取裡的 `lyrics.full_text`**
+4. **必要時也可讀已快取的背景介紹 / 賞析文**
+5. **不要重新跑 Sudachi**
+6. 只有在下列情況才回到 LLM 或外部抓取：
+   - 使用者剛收藏一首新歌
+   - SQLite 裡沒有符合條件的 token
+   - JLPT 等級無法用現有規則資料判斷
+   - 需要生成題幹文案或解說文案
+
+### 出題實務規則
+
+- 若 favorite-song cache 中已有可用素材，**優先從你的 Favorite Songs 清單出題**。
+- 在轉向一般歌曲來源前，應先確認目前 `status='ready'` 的 favorite songs 都至少已經出過題。
+- 只有在 favorite songs 全部都已有覆蓋、或當前 favorite-song cache 找不到可用素材時，才回到一般歌曲池。
+- 若 favorite-song cache 中已有原句，出題時應直接用該句或該句抽出的 tested point，不要再重新抓歌詞頁。
+- 若題目品質需要更大的語境，應先讀該歌在 SQLite 中快取的**整首歌詞**，而不是只看 token。
+- 若題目需要背景、主題或賞析層級的支撐，應優先讀取已快取的背景介紹 / 賞析文，而不是臨時重新上網抓。
+- `used_quiz_count` / `used_flashcard_count` 是後續重複利用節流的基礎；新流程應先消耗未用過的詞。
+- Favorite Songs 是**來源優先權**，不是正確性豁免。所有題目仍要滿足本文件前述的「自足、唯一解、N1 難度、grounded」要求。
+
 ## 合格標準（審題檢查清單）
 
 一題**單語題**要全部通過才算合格：

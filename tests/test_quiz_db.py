@@ -54,7 +54,15 @@ class TestSchemaAndPragmas:
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 ).fetchall()
             }
-        assert {"quiz_questions", "quiz_authoring_knowledge", "quiz_vocab_cards"} <= names
+        assert {
+            "quiz_questions",
+            "quiz_authoring_knowledge",
+            "quiz_vocab_cards",
+            "favorite_songs",
+            "lyrics",
+            "sentences",
+            "vocabulary_tokens",
+        } <= names
 
     def test_source_excerpt_type_column_exists(self, tmp_path):
         db = _db(tmp_path)
@@ -255,6 +263,93 @@ class TestQuestions:
         assert db.count_verified(level="JLPT N1") == 1
         assert db.delete_question(q.question_id) is True
         assert db.count_verified(level="JLPT N1") == 0
+
+
+class TestFavoriteSongs:
+    def test_upsert_and_replace_analysis_roundtrip(self, tmp_path):
+        from types import SimpleNamespace
+
+        db = _db(tmp_path)
+        song_id = db.upsert_favorite_song(
+            title="勇者",
+            artist="YOASOBI",
+            youtube_url="https://www.youtube.com/watch?v=OIBODIPC_8Y",
+            youtube_short_url="https://youtu.be/OIBODIPC_8Y",
+            status="fetching",
+            youtube_title_raw="YOASOBI「勇者」 Official Music Video",
+            video_id="OIBODIPC_8Y",
+        )
+        db.replace_favorite_song_analysis(
+            song_id=song_id,
+            lyrics_url="https://www.uta-net.com/song/344130/",
+            lyrics_text="まるで御伽の話\n終わり迎えた証",
+            sentences=["まるで御伽の話", "終わり迎えた証"],
+            tokens=[
+                SimpleNamespace(
+                    sentence_index=0,
+                    surface="御伽",
+                    dictionary_form="御伽",
+                    reading="おとぎ",
+                    pos="名詞,普通名詞,一般",
+                    jlpt_level="N1",
+                ),
+                SimpleNamespace(
+                    sentence_index=1,
+                    surface="証",
+                    dictionary_form="証",
+                    reading="あかし",
+                    pos="名詞,普通名詞,一般",
+                    jlpt_level=None,
+                ),
+            ],
+            status="ready",
+        )
+        row = db.get_favorite_song_by_youtube_short_url("https://youtu.be/OIBODIPC_8Y")
+        assert row is not None
+        assert row["status"] == "ready"
+        assert row["lyrics_url"] == "https://www.uta-net.com/song/344130/"
+        counts = db.favorite_song_analysis_counts(song_id)
+        assert counts == {"sentences": 2, "tokens": 2, "n1_tokens": 1}
+        picked = db.pick_favorite_song_token(jlpt_level="N1")
+        assert picked is not None
+        assert picked.song_title == "勇者"
+        assert picked.dictionary_form == "御伽"
+        assert picked.jlpt_level == "N1"
+
+    def test_mark_favorite_token_used(self, tmp_path):
+        from types import SimpleNamespace
+
+        db = _db(tmp_path)
+        song_id = db.upsert_favorite_song(
+            title="勇者",
+            artist="YOASOBI",
+            youtube_url="https://www.youtube.com/watch?v=OIBODIPC_8Y",
+            youtube_short_url="https://youtu.be/OIBODIPC_8Y",
+            status="fetching",
+        )
+        db.replace_favorite_song_analysis(
+            song_id=song_id,
+            lyrics_url="https://www.uta-net.com/song/344130/",
+            lyrics_text="まるで御伽の話",
+            sentences=["まるで御伽の話"],
+            tokens=[
+                SimpleNamespace(
+                    sentence_index=0,
+                    surface="御伽",
+                    dictionary_form="御伽",
+                    reading="おとぎ",
+                    pos="名詞,普通名詞,一般",
+                    jlpt_level="N1",
+                ),
+            ],
+            status="ready",
+        )
+        picked = db.pick_favorite_song_token(jlpt_level="N1")
+        assert picked is not None
+        assert db.mark_favorite_token_used(token_id=picked.token_id, usage="quiz") is True
+        picked_after = db.pick_favorite_song_token(jlpt_level="N1", unused_only=False)
+        assert picked_after is not None
+        assert picked_after.used_quiz_count == 1
 
 
 class TestAuthorColumn:
