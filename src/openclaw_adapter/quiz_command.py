@@ -19,6 +19,7 @@ Subcommands:
                                        (weighted); drops out once you re-answer right.
   /quiz stats                        — per-題型 accuracy, weakest 考点, 混淆選項分析.
   /quiz vocab [mode|word]            — 單字卡：弱點/全部/錯題/隨機/查詞.
+  /quiz like song <youtube_url>      — 收藏歌曲並預先抓歌詞/NLP.
   /quiz review [page]                — answer-revealed paginated list (QA review).
   /quiz gen20 [n]                    — bootstrap: generate N (default 20) questions.
   /quiz teach <知識點>                — distil a reviewer correction into the KB.
@@ -139,6 +140,33 @@ def _build_generator(settings: AssistantSettings, db):
         model=_select_model(settings),
         timeout_seconds=max(1, settings.openclaw_local_text_timeout_seconds),
         ssl_context=ssl_ctx,
+    )
+
+
+def _like_song(settings: AssistantSettings, db, youtube_url: str) -> str:
+    from .quiz_favorite_songs import FavoriteSongError, FavoriteSongIngestor
+
+    url = (youtube_url or "").strip()
+    if not url:
+        return "用法：/quiz like song <youtube_url>"
+    try:
+        result = FavoriteSongIngestor(settings=settings, db=db).ingest_youtube_song(url)
+    except FavoriteSongError as exc:
+        return f"收藏歌曲失敗：{exc}"
+    except Exception as exc:
+        logger.exception("quiz like song failed url=%s", url)
+        return f"收藏歌曲失敗：{exc}"
+    reused = "（已存在，直接重用）" if result.reused_existing else ""
+    return (
+        f"❤️ 已加入最愛曲目{reused}\n"
+        f"歌曲：{result.title}\n"
+        f"歌手：{result.artist or '—'}\n"
+        f"YouTube：{result.youtube_short_url}\n"
+        f"歌詞：{result.lyrics_url}\n"
+        f"狀態：{result.status}\n"
+        f"句子數：{result.sentence_count}\n"
+        f"詞元數：{result.token_count}\n"
+        f"N1 詞元：{result.n1_token_count}"
     )
 
 
@@ -642,6 +670,11 @@ def build_quiz_handler(
                 if mode == "source":
                     return _render_vocab_source_list(db, level=level, source_name=query)
                 return _render_vocab_lookup(db, level=level, query=query)
+            if action == "like":
+                kind, _, target = rest.partition(" ")
+                if kind.lower().strip() != "song":
+                    return "用法：/quiz like song <youtube_url>"
+                return _like_song(settings, db, target)
             if action in ("wrong", "錯題", "錯題本"):
                 level, theme = _parse_serve_args(rest)
                 return _serve_question(

@@ -561,3 +561,47 @@ def test_vocab_audio_callback_rejects_missing_example(tmp_path):
         assert markup is None
     finally:
         monkeypatch.undo()
+
+
+def test_quiz_like_song_usage(tmp_path):
+    from openclaw_adapter.quiz_command import build_quiz_handler
+
+    settings = SimpleNamespace(quiz_db_path=tmp_path / "quiz.sqlite3")
+    handler = build_quiz_handler(settings)
+    got = handler("like", "u1")
+    assert got == "用法：/quiz like song <youtube_url>"
+
+
+def test_quiz_like_song_success(tmp_path, monkeypatch):
+    from openclaw_adapter.quiz_command import build_quiz_handler
+    from openclaw_adapter.quiz_favorite_songs import FavoriteSongIngestResult
+
+    def _fake_ingest(self, youtube_url):
+        assert youtube_url == "https://youtu.be/OIBODIPC_8Y"
+        return FavoriteSongIngestResult(
+            song_id=1,
+            title="勇者",
+            artist="YOASOBI",
+            youtube_short_url="https://youtu.be/OIBODIPC_8Y",
+            lyrics_url="https://www.uta-net.com/song/344130/",
+            status="ready",
+            sentence_count=12,
+            token_count=88,
+            n1_token_count=4,
+        )
+
+    monkeypatch.setattr(
+        "openclaw_adapter.quiz_favorite_songs.FavoriteSongIngestor.ingest_youtube_song",
+        _fake_ingest,
+    )
+    settings = SimpleNamespace(
+        quiz_db_path=tmp_path / "quiz.sqlite3",
+        openclaw_tls_insecure_skip_verify=False,
+        openclaw_ca_bundle_path=None,
+    )
+    handler = build_quiz_handler(settings)
+    got = handler("like song https://youtu.be/OIBODIPC_8Y", "u1")
+    assert isinstance(got, str)
+    assert "已加入最愛曲目" in got
+    assert "歌曲：勇者" in got
+    assert "N1 詞元：4" in got

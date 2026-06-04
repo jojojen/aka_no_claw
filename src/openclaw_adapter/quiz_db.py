@@ -460,6 +460,64 @@ CREATE INDEX IF NOT EXISTS idx_vocab_level_author ON quiz_vocab_cards(level, aut
 CREATE INDEX IF NOT EXISTS idx_vocab_headword ON quiz_vocab_cards(headword);
 CREATE INDEX IF NOT EXISTS idx_vocab_source_name ON quiz_vocab_cards(source_name);
 
+CREATE TABLE IF NOT EXISTS favorite_songs (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    title             TEXT NOT NULL,
+    artist            TEXT NOT NULL DEFAULT '',
+    youtube_url       TEXT NOT NULL,
+    youtube_short_url TEXT NOT NULL UNIQUE,
+    lyrics_url        TEXT,
+    youtube_title_raw TEXT,
+    video_id          TEXT,
+    status            TEXT NOT NULL DEFAULT 'pending',
+    last_error        TEXT,
+    created_at        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_favorite_songs_status ON favorite_songs(status);
+CREATE INDEX IF NOT EXISTS idx_favorite_songs_title ON favorite_songs(title);
+
+CREATE TABLE IF NOT EXISTS lyrics (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    song_id    INTEGER NOT NULL UNIQUE,
+    full_text  TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(song_id) REFERENCES favorite_songs(id)
+);
+
+CREATE TABLE IF NOT EXISTS sentences (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    song_id        INTEGER NOT NULL,
+    sentence_text  TEXT NOT NULL,
+    sentence_index INTEGER NOT NULL,
+    created_at     TEXT NOT NULL,
+    FOREIGN KEY(song_id) REFERENCES favorite_songs(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sentences_song_idx ON sentences(song_id, sentence_index);
+
+CREATE TABLE IF NOT EXISTS vocabulary_tokens (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    song_id              INTEGER NOT NULL,
+    sentence_id          INTEGER NOT NULL,
+    surface              TEXT NOT NULL,
+    dictionary_form      TEXT NOT NULL,
+    reading              TEXT NOT NULL DEFAULT '',
+    pos                  TEXT NOT NULL DEFAULT '',
+    jlpt_level           TEXT,
+    used_quiz_count      INTEGER NOT NULL DEFAULT 0,
+    used_flashcard_count INTEGER NOT NULL DEFAULT 0,
+    created_at           TEXT NOT NULL,
+    FOREIGN KEY(song_id) REFERENCES favorite_songs(id),
+    FOREIGN KEY(sentence_id) REFERENCES sentences(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vocab_tokens_song ON vocabulary_tokens(song_id);
+CREATE INDEX IF NOT EXISTS idx_vocab_tokens_jlpt ON vocabulary_tokens(jlpt_level, used_quiz_count);
+CREATE INDEX IF NOT EXISTS idx_vocab_tokens_dict_form ON vocabulary_tokens(dictionary_form);
+
 CREATE TABLE IF NOT EXISTS quiz_authoring_knowledge (
     knowledge_id  TEXT PRIMARY KEY,
     category      TEXT NOT NULL,
@@ -565,6 +623,25 @@ class QuizVocabCard:
     author: str = "codex"
     created_at: str = ""
     updated_at: str = ""
+
+
+@dataclass(frozen=True)
+class FavoriteSongToken:
+    token_id: int
+    song_id: int
+    sentence_id: int
+    song_title: str
+    song_artist: str
+    youtube_short_url: str
+    lyrics_url: str | None
+    sentence_text: str
+    surface: str
+    dictionary_form: str
+    reading: str
+    pos: str
+    jlpt_level: str | None
+    used_quiz_count: int = 0
+    used_flashcard_count: int = 0
 
 
 class QuizDatabase:
@@ -1318,6 +1395,237 @@ class QuizDatabase:
             )
         return cursor.rowcount > 0
 
+    # ── Favorite songs / pre-analyzed lyrics ─────────────────────────────────
+
+    def upsert_favorite_song(
+        self,
+        *,
+        title: str,
+        artist: str,
+        youtube_url: str,
+        youtube_short_url: str,
+        status: str,
+        youtube_title_raw: str | None = None,
+        video_id: str | None = None,
+    ) -> int:
+        now = _utc_now_iso()
+        with self.connect() as conn:
+            existing = conn.execute(
+                "SELECT id, created_at FROM favorite_songs WHERE youtube_short_url = ?",
+                ((youtube_short_url or "").strip(),),
+            ).fetchone()
+            created_at = existing["created_at"] if existing else now
+            conn.execute(
+                """
+                INSERT INTO favorite_songs (
+                    title, artist, youtube_url, youtube_short_url, lyrics_url,
+                    youtube_title_raw, video_id, status, last_error, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, NULL, ?, ?, ?, NULL, ?, ?)
+                ON CONFLICT(youtube_short_url) DO UPDATE SET
+                    title = excluded.title,
+                    artist = excluded.artist,
+                    youtube_url = excluded.youtube_url,
+                    youtube_title_raw = excluded.youtube_title_raw,
+                    video_id = excluded.video_id,
+                    status = excluded.status,
+                    last_error = NULL,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    (title or "").strip(),
+                    (artist or "").strip(),
+                    (youtube_url or "").strip(),
+                    (youtube_short_url or "").strip(),
+                    (youtube_title_raw or "").strip() or None,
+                    (video_id or "").strip() or None,
+                    (status or "pending").strip(),
+                    created_at,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT id FROM favorite_songs WHERE youtube_short_url = ?",
+                ((youtube_short_url or "").strip(),),
+            ).fetchone()
+        assert row is not None
+        return int(row["id"])
+
+    def get_favorite_song_by_youtube_short_url(self, youtube_short_url: str) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM favorite_songs WHERE youtube_short_url = ? LIMIT 1",
+                ((youtube_short_url or "").strip(),),
+            ).fetchone()
+
+    def mark_favorite_song_status(
+        self,
+        *,
+        song_id: int,
+        status: str,
+        lyrics_url: str | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE favorite_songs
+                SET status = ?, lyrics_url = COALESCE(?, lyrics_url), last_error = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    (status or "pending").strip(),
+                    (lyrics_url or "").strip() or None,
+                    (last_error or "").strip() or None,
+                    _utc_now_iso(),
+                    int(song_id),
+                ),
+            )
+
+    def replace_favorite_song_analysis(
+        self,
+        *,
+        song_id: int,
+        lyrics_url: str,
+        lyrics_text: str,
+        sentences: list[str],
+        tokens,
+        status: str = "ready",
+    ) -> None:
+        now = _utc_now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE favorite_songs SET lyrics_url = ?, status = ?, last_error = NULL, updated_at = ? WHERE id = ?",
+                ((lyrics_url or "").strip(), (status or "ready").strip(), now, int(song_id)),
+            )
+            existing_lyrics = conn.execute(
+                "SELECT created_at FROM lyrics WHERE song_id = ?",
+                (int(song_id),),
+            ).fetchone()
+            lyrics_created_at = existing_lyrics["created_at"] if existing_lyrics else now
+            conn.execute("DELETE FROM vocabulary_tokens WHERE song_id = ?", (int(song_id),))
+            conn.execute("DELETE FROM sentences WHERE song_id = ?", (int(song_id),))
+            conn.execute(
+                """
+                INSERT INTO lyrics (song_id, full_text, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(song_id) DO UPDATE SET
+                    full_text = excluded.full_text,
+                    updated_at = excluded.updated_at
+                """,
+                (int(song_id), (lyrics_text or "").strip(), lyrics_created_at, now),
+            )
+            sentence_ids: list[int] = []
+            for idx, sentence in enumerate(sentences):
+                cursor = conn.execute(
+                    """
+                    INSERT INTO sentences (song_id, sentence_text, sentence_index, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (int(song_id), (sentence or "").strip(), int(idx), now),
+                )
+                sentence_ids.append(int(cursor.lastrowid))
+            for token in tokens:
+                if not (0 <= int(token.sentence_index) < len(sentence_ids)):
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO vocabulary_tokens (
+                        song_id, sentence_id, surface, dictionary_form, reading, pos,
+                        jlpt_level, used_quiz_count, used_flashcard_count, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
+                    """,
+                    (
+                        int(song_id),
+                        sentence_ids[int(token.sentence_index)],
+                        (token.surface or "").strip(),
+                        (token.dictionary_form or "").strip(),
+                        (token.reading or "").strip(),
+                        (token.pos or "").strip(),
+                        (token.jlpt_level or "").strip() or None,
+                        now,
+                    ),
+                )
+
+    def favorite_song_analysis_counts(self, song_id: int) -> dict[str, int]:
+        with self.connect() as conn:
+            song_row = conn.execute(
+                "SELECT COUNT(*) AS n FROM sentences WHERE song_id = ?",
+                (int(song_id),),
+            ).fetchone()
+            token_row = conn.execute(
+                "SELECT COUNT(*) AS n FROM vocabulary_tokens WHERE song_id = ?",
+                (int(song_id),),
+            ).fetchone()
+            n1_row = conn.execute(
+                "SELECT COUNT(*) AS n FROM vocabulary_tokens WHERE song_id = ? AND jlpt_level = 'N1'",
+                (int(song_id),),
+            ).fetchone()
+        return {
+            "sentences": int(song_row["n"]) if song_row else 0,
+            "tokens": int(token_row["n"]) if token_row else 0,
+            "n1_tokens": int(n1_row["n"]) if n1_row else 0,
+        }
+
+    def pick_favorite_song_token(
+        self,
+        *,
+        jlpt_level: str = "N1",
+        unused_only: bool = True,
+        song_status: str = "ready",
+    ) -> FavoriteSongToken | None:
+        clauses = ["f.status = ?"]
+        params: list[object] = [(song_status or "ready").strip()]
+        if jlpt_level:
+            clauses.append("t.jlpt_level = ?")
+            params.append((jlpt_level or "").strip())
+        if unused_only:
+            clauses.append("t.used_quiz_count = 0")
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    t.id AS token_id,
+                    t.song_id AS song_id,
+                    t.sentence_id AS sentence_id,
+                    f.title AS song_title,
+                    f.artist AS song_artist,
+                    f.youtube_short_url AS youtube_short_url,
+                    f.lyrics_url AS lyrics_url,
+                    s.sentence_text AS sentence_text,
+                    t.surface AS surface,
+                    t.dictionary_form AS dictionary_form,
+                    t.reading AS reading,
+                    t.pos AS pos,
+                    t.jlpt_level AS jlpt_level,
+                    t.used_quiz_count AS used_quiz_count,
+                    t.used_flashcard_count AS used_flashcard_count
+                FROM vocabulary_tokens t
+                JOIN favorite_songs f ON f.id = t.song_id
+                JOIN sentences s ON s.id = t.sentence_id
+                WHERE """ + " AND ".join(clauses) + """
+                ORDER BY RANDOM()
+                LIMIT 1
+                """,
+                tuple(params),
+            ).fetchone()
+        return _row_to_favorite_song_token(row) if row else None
+
+    def mark_favorite_token_used(self, *, token_id: int, usage: str) -> bool:
+        column = {
+            "quiz": "used_quiz_count",
+            "flashcard": "used_flashcard_count",
+        }.get((usage or "").strip().lower())
+        if column is None:
+            raise ValueError("usage must be 'quiz' or 'flashcard'")
+        with self.connect() as conn:
+            cursor = conn.execute(
+                f"UPDATE vocabulary_tokens SET {column} = {column} + 1 WHERE id = ?",
+                (int(token_id),),
+            )
+        return cursor.rowcount > 0
+
     # ── Authoring knowledge (self-improving) ──────────────────────────────────
 
     def upsert_authoring_knowledge(
@@ -1569,6 +1877,26 @@ def _row_to_vocab_card(row: sqlite3.Row) -> QuizVocabCard:
         author=row["author"] or "codex",
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+    )
+
+
+def _row_to_favorite_song_token(row: sqlite3.Row) -> FavoriteSongToken:
+    return FavoriteSongToken(
+        token_id=int(row["token_id"]),
+        song_id=int(row["song_id"]),
+        sentence_id=int(row["sentence_id"]),
+        song_title=(row["song_title"] or "").strip(),
+        song_artist=(row["song_artist"] or "").strip(),
+        youtube_short_url=(row["youtube_short_url"] or "").strip(),
+        lyrics_url=row["lyrics_url"],
+        sentence_text=(row["sentence_text"] or "").strip(),
+        surface=(row["surface"] or "").strip(),
+        dictionary_form=(row["dictionary_form"] or "").strip(),
+        reading=(row["reading"] or "").strip(),
+        pos=(row["pos"] or "").strip(),
+        jlpt_level=(row["jlpt_level"] or "").strip() or None,
+        used_quiz_count=int(row["used_quiz_count"] or 0),
+        used_flashcard_count=int(row["used_flashcard_count"] or 0),
     )
 
 
