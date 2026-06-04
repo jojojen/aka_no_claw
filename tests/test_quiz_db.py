@@ -1,13 +1,18 @@
 """Unit tests for the independent quiz DB — no network, no Ollama."""
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from openclaw_adapter.quiz_db import (
     QuizDatabase,
     build_question_id,
     format_authoring_knowledge_block,
+    infer_source_excerpt_type,
     is_grounded,
+    source_excerpt_type_conflicts_with_exam_point,
+    youhou_target_word_presence_leaks,
 )
 
 
@@ -51,6 +56,134 @@ class TestSchemaAndPragmas:
             }
         assert {"quiz_questions", "quiz_authoring_knowledge"} <= names
 
+    def test_source_excerpt_type_column_exists(self, tmp_path):
+        db = _db(tmp_path)
+        with db.connect() as conn:
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(quiz_questions)")}
+        assert "source_excerpt_type" in cols
+
+    def test_bootstrap_backfills_source_excerpt_type_for_legacy_rows(self, tmp_path):
+        path = tmp_path / "quiz.sqlite3"
+        conn = sqlite3.connect(path)
+        conn.executescript(
+            """
+            CREATE TABLE quiz_questions (
+                question_id TEXT PRIMARY KEY,
+                level TEXT NOT NULL,
+                exam_point TEXT NOT NULL,
+                stem TEXT NOT NULL,
+                options_json TEXT NOT NULL DEFAULT '[]',
+                answer_index INTEGER NOT NULL,
+                explanation TEXT NOT NULL DEFAULT '',
+                source_type TEXT NOT NULL DEFAULT 'other',
+                source_name TEXT NOT NULL DEFAULT '',
+                source_text_url TEXT,
+                source_media_url TEXT,
+                source_excerpt TEXT,
+                verified INTEGER NOT NULL DEFAULT 0,
+                served_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                author TEXT NOT NULL DEFAULT 'Claude',
+                tested_point TEXT
+            );
+            INSERT INTO quiz_questions (
+                question_id, level, exam_point, stem, options_json, answer_index,
+                explanation, source_type, source_name, source_text_url,
+                source_media_url, source_excerpt, verified, served_count,
+                created_at, updated_at, author, tested_point
+            ) VALUES (
+                'legacy-q',
+                'JLPT N1',
+                '漢字読み',
+                '「ロストワンの号哭」の「号哭」の読み方として最も適切なものはどれか。',
+                '["ごうこく","ごうきゅう","こうこく","こうきゅう"]',
+                0,
+                '',
+                'vocaloid_song',
+                'ロストワンの号哭',
+                'https://www.uta-net.com/song/145551/',
+                NULL,
+                'ロストワンの号哭',
+                1,
+                0,
+                '2026-01-01T00:00:00+00:00',
+                '2026-01-01T00:00:00+00:00',
+                'codex',
+                '号哭'
+            );
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        db = QuizDatabase(path)
+        row = db.get_question("legacy-q")
+        assert row is not None
+        assert row.source_excerpt_type == "title"
+
+    def test_bootstrap_reinfers_existing_other_source_excerpt_type(self, tmp_path):
+        path = tmp_path / "quiz.sqlite3"
+        conn = sqlite3.connect(path)
+        conn.executescript(
+            """
+            CREATE TABLE quiz_questions (
+                question_id TEXT PRIMARY KEY,
+                level TEXT NOT NULL,
+                exam_point TEXT NOT NULL,
+                stem TEXT NOT NULL,
+                options_json TEXT NOT NULL DEFAULT '[]',
+                answer_index INTEGER NOT NULL,
+                explanation TEXT NOT NULL DEFAULT '',
+                source_type TEXT NOT NULL DEFAULT 'other',
+                source_name TEXT NOT NULL DEFAULT '',
+                source_text_url TEXT,
+                source_media_url TEXT,
+                source_excerpt TEXT,
+                verified INTEGER NOT NULL DEFAULT 0,
+                served_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                author TEXT NOT NULL DEFAULT 'Claude',
+                tested_point TEXT,
+                source_excerpt_type TEXT NOT NULL DEFAULT 'other'
+            );
+            INSERT INTO quiz_questions (
+                question_id, level, exam_point, stem, options_json, answer_index,
+                explanation, source_type, source_name, source_text_url,
+                source_media_url, source_excerpt, verified, served_count,
+                created_at, updated_at, author, tested_point, source_excerpt_type
+            ) VALUES (
+                'legacy-q-other',
+                'JLPT N1',
+                '内容理解（短文）',
+                '本文の内容として最も適切なものはどれか。',
+                '["a","b","c","d"]',
+                0,
+                '',
+                'vocaloid_song',
+                '夜もすがら君想ふ',
+                'https://utaten.com/specialArticle/index/5017',
+                NULL,
+                '仄暗い話題多い世の中',
+                1,
+                0,
+                '2026-01-01T00:00:00+00:00',
+                '2026-01-01T00:00:00+00:00',
+                'codex',
+                NULL,
+                'other'
+            );
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        db = QuizDatabase(path)
+        row = db.get_question("legacy-q-other")
+        assert row is not None
+        assert row.source_excerpt_type == "article"
+
 
 class TestQuestions:
     def test_insert_and_get_roundtrip(self, tmp_path):
@@ -63,6 +196,7 @@ class TestQuestions:
         assert again.answer_index == 1
         assert again.verified is True
         assert again.source_media_url == "https://youtube.com/watch?v=x"
+        assert again.source_excerpt_type == "other"
 
     def test_question_id_is_deterministic(self):
         a = build_question_id(level="JLPT N1", source_name="メルト", stem="X")
@@ -296,6 +430,105 @@ class TestGrounding:
                 answer_index=2,
                 source_name="深海少女",
                 source_excerpt="悲しみの海に沈んだ私　このままどこまでも堕ちて行き",
+            )
+
+
+class TestSourceExcerptType:
+    def test_title_is_inferred_from_exact_source_name_match(self):
+        assert infer_source_excerpt_type(
+            source_text_url="https://example.com/anything",
+            source_excerpt="ロストワンの号哭",
+            source_name="ロストワンの号哭",
+        ) == "title"
+
+    def test_lyric_and_article_urls_are_inferred(self):
+        assert infer_source_excerpt_type(
+            source_text_url="https://utaten.com/lyric/iz16122110/",
+            source_excerpt="いがみ合ってきりがないな",
+            source_name="シャルル",
+        ) == "lyric"
+        assert infer_source_excerpt_type(
+            source_text_url="https://utaten.com/specialArticle/index/7343",
+            source_excerpt="ビビバスへの書き下ろし楽曲です。",
+            source_name="Flyer!",
+        ) == "article"
+
+    def test_conflict_rules_are_conservative(self):
+        assert source_excerpt_type_conflicts_with_exam_point(
+            exam_point="言い換え類義", source_excerpt_type="article"
+        )
+        assert source_excerpt_type_conflicts_with_exam_point(
+            exam_point="用法", source_excerpt_type="commentary"
+        )
+        assert source_excerpt_type_conflicts_with_exam_point(
+            exam_point="文脈規定", source_excerpt_type="title"
+        )
+        assert not source_excerpt_type_conflicts_with_exam_point(
+            exam_point="漢字読み", source_excerpt_type="title"
+        )
+        assert not source_excerpt_type_conflicts_with_exam_point(
+            exam_point="内容理解（短文）", source_excerpt_type="article"
+        )
+
+    def test_insert_rejects_commentary_grounding_for_non_reading(self, tmp_path):
+        db = _db(tmp_path)
+        with pytest.raises(ValueError, match="source_excerpt_type conflicts"):
+            db.insert_question(
+                level="JLPT N1",
+                exam_point="言い換え類義",
+                stem="次の一節「疾走感溢れる四つ打ちのタイトなリズム」にある〈疾走感〉の意味として最も近いものはどれか。",
+                options=("速く走るような勢い", "遅い感じ", "静けさ", "懐かしさ"),
+                answer_index=0,
+                source_name="命に嫌われている",
+                source_text_url="https://utaten.com/specialArticle/index/9999",
+                source_excerpt="疾走感溢れる四つ打ちのタイトなリズム",
+            )
+
+
+class TestYouhouLeakGuard:
+    def test_detects_target_word_presence_leak(self):
+        assert youhou_target_word_presence_leaks(
+            exam_point="用法",
+            stem="次のうち、語句「魅了する」の使い方として最も適切な文はどれか。",
+            options=(
+                "重なる波形に魅了されていく",
+                "甘い香りに魅惑されて、しばらくその場を離れられなかった",
+                "観客は演奏に陶酔して、終演後もしばらく席を立てなかった",
+                "不思議な光に惹きつけられて、彼は思わず足を止めた",
+            ),
+            answer_index=0,
+        )
+
+    def test_clean_youhou_not_flagged(self):
+        assert not youhou_target_word_presence_leaks(
+            exam_point="用法",
+            stem="次のうち、語句「魅了する」の使い方として最も適切な文はどれか。",
+            options=(
+                "重なる波形に魅了されていく",
+                "観客は演奏を魅了されて、終演後もしばらく席を立てなかった",
+                "甘い香りが彼に魅了して、店先で足を止めさせた",
+                "その演説は聴衆に魅了され、多くの支持を集めた",
+            ),
+            answer_index=0,
+        )
+
+    def test_insert_rejects_youhou_presence_leak(self, tmp_path):
+        db = _db(tmp_path)
+        with pytest.raises(ValueError, match="youhou item leaks"):
+            db.insert_question(
+                level="JLPT N1",
+                exam_point="用法",
+                stem="次のうち、語句「魅了する」の使い方として最も適切な文はどれか。",
+                options=(
+                    "重なる波形に魅了されていく",
+                    "甘い香りに魅惑されて、しばらくその場を離れられなかった",
+                    "観客は演奏に陶酔して、終演後もしばらく席を立てなかった",
+                    "不思議な光に惹きつけられて、彼は思わず足を止めた",
+                ),
+                answer_index=0,
+                source_name="ヒビカセ",
+                source_text_url="http://vgperson.com/lyrics.php?song=hibikase",
+                source_excerpt="重なる波形に魅了されていく",
             )
 
 
