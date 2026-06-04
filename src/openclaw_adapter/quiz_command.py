@@ -170,6 +170,35 @@ def _like_song(settings: AssistantSettings, db, youtube_url: str) -> str:
     )
 
 
+def build_like_song_confirmation(settings: AssistantSettings, youtube_url: str):
+    from .quiz_favorite_songs import FavoriteSongError, fetch_youtube_song_metadata
+
+    url = (youtube_url or "").strip()
+    if not url:
+        return None
+    try:
+        meta = fetch_youtube_song_metadata(settings=settings, youtube_url=url)
+    except FavoriteSongError:
+        return None
+    except Exception:
+        logger.exception("quiz like-song confirmation failed url=%s", url)
+        return None
+    text = (
+        "🎵 偵測到 YouTube 歌曲連結\n\n"
+        f"歌曲：{meta.title}\n"
+        f"歌手：{meta.artist or '—'}\n"
+        f"YouTube：{meta.youtube_short_url}\n\n"
+        "要加入最愛曲目清單嗎？"
+    )
+    markup = {
+        "inline_keyboard": [[
+            {"text": "❤️ 加入最愛", "callback_data": f"quiz:ls:{meta.video_id}"},
+            {"text": "先不要", "callback_data": f"quiz:lx:{meta.video_id}"},
+        ]]
+    }
+    return text, markup
+
+
 def _ensure_provider_registered(theme: str) -> None:
     """Register the provider backing ``theme`` (idempotent). Today only miku."""
     from .quiz_sources import get_provider
@@ -875,6 +904,13 @@ def build_quiz_callback_handler(
                     logger.exception("quiz vocab audio unexpected failure vocab_id=%s", rest)
                     return "音檔生成失敗", None, None
                 return "已送出例句音檔", None, None
+            if action == "ls":
+                if not rest.strip():
+                    return "無法辨識歌曲", None, None
+                text = _like_song(settings, db, f"https://youtu.be/{rest.strip()}")
+                return "已加入最愛" if text.startswith("❤️") else "加入失敗", text, None
+            if action == "lx":
+                return "已取消", original_text + "\n\n（已取消加入最愛）", None
             if action == "p":
                 try:
                     page = max(0, int(rest))

@@ -1486,6 +1486,8 @@ class QuizDatabase:
         self,
         *,
         song_id: int,
+        title: str | None = None,
+        artist: str | None = None,
         lyrics_url: str,
         lyrics_text: str,
         sentences: list[str],
@@ -1495,8 +1497,25 @@ class QuizDatabase:
         now = _utc_now_iso()
         with self.connect() as conn:
             conn.execute(
-                "UPDATE favorite_songs SET lyrics_url = ?, status = ?, last_error = NULL, updated_at = ? WHERE id = ?",
-                ((lyrics_url or "").strip(), (status or "ready").strip(), now, int(song_id)),
+                """
+                UPDATE favorite_songs
+                SET
+                    title = COALESCE(NULLIF(?, ''), title),
+                    artist = COALESCE(NULLIF(?, ''), artist),
+                    lyrics_url = ?,
+                    status = ?,
+                    last_error = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    (title or "").strip(),
+                    (artist or "").strip(),
+                    (lyrics_url or "").strip(),
+                    (status or "ready").strip(),
+                    now,
+                    int(song_id),
+                ),
             )
             existing_lyrics = conn.execute(
                 "SELECT created_at FROM lyrics WHERE song_id = ?",

@@ -605,3 +605,72 @@ def test_quiz_like_song_success(tmp_path, monkeypatch):
     assert "已加入最愛曲目" in got
     assert "歌曲：勇者" in got
     assert "N1 詞元：4" in got
+
+
+def test_build_like_song_confirmation_success(monkeypatch):
+    from openclaw_adapter.quiz_command import build_like_song_confirmation
+    from openclaw_adapter.quiz_favorite_songs import YoutubeSongMetadata
+
+    monkeypatch.setattr(
+        "openclaw_adapter.quiz_favorite_songs.fetch_youtube_song_metadata",
+        lambda **kwargs: YoutubeSongMetadata(
+            video_id="OIBODIPC_8Y",
+            youtube_url="https://www.youtube.com/watch?v=OIBODIPC_8Y",
+            youtube_short_url="https://youtu.be/OIBODIPC_8Y",
+            title="勇者",
+            artist="YOASOBI",
+            raw_title="YOASOBI「勇者」 Official Music Video",
+        ),
+    )
+
+    rendered = build_like_song_confirmation(SimpleNamespace(), "https://youtu.be/OIBODIPC_8Y")
+    assert rendered is not None
+    text, markup = rendered
+    assert "歌曲：勇者" in text
+    flat = [b for row in markup["inline_keyboard"] for b in row]
+    assert any(b["callback_data"] == "quiz:ls:OIBODIPC_8Y" for b in flat)
+    assert any(b["callback_data"] == "quiz:lx:OIBODIPC_8Y" for b in flat)
+
+
+def test_like_song_confirm_callback_runs_ingest(tmp_path, monkeypatch):
+    from openclaw_adapter.quiz_command import build_quiz_callback_handler
+    from openclaw_adapter.quiz_favorite_songs import FavoriteSongIngestResult
+
+    monkeypatch.setattr(
+        "openclaw_adapter.quiz_favorite_songs.FavoriteSongIngestor.ingest_youtube_song",
+        lambda self, youtube_url: FavoriteSongIngestResult(
+            song_id=1,
+            title="勇者",
+            artist="YOASOBI",
+            youtube_short_url="https://youtu.be/OIBODIPC_8Y",
+            lyrics_url="https://www.uta-net.com/song/344130/",
+            status="ready",
+            sentence_count=63,
+            token_count=337,
+            n1_token_count=3,
+        ),
+    )
+    settings = SimpleNamespace(
+        quiz_db_path=tmp_path / "quiz.sqlite3",
+        openclaw_tls_insecure_skip_verify=False,
+        openclaw_ca_bundle_path=None,
+    )
+    handler = build_quiz_callback_handler(settings)
+    toast, new_text, markup = handler(
+        "ls:OIBODIPC_8Y",
+        "🎵 偵測到 YouTube 歌曲連結",
+        "u1",
+    )
+    assert toast == "已加入最愛"
+    assert "歌曲：勇者" in new_text
+    assert markup is None
+
+
+def test_like_song_cancel_callback_clears_keyboard(tmp_path):
+    from openclaw_adapter.quiz_command import build_quiz_callback_handler
+
+    handler = build_quiz_callback_handler(SimpleNamespace(quiz_db_path=tmp_path / "quiz.sqlite3"))
+    toast, new_text, markup = handler("lx:OIBODIPC_8Y", "proposal", "u1")
+    assert toast == "已取消"
+    assert "已取消加入最愛" in new_text
+    assert markup is None
