@@ -30,6 +30,8 @@ from hashlib import sha1
 from pathlib import Path
 from typing import Iterator
 
+from .quiz_vocab_seed import QUIZ_VOCAB_SEED
+
 logger = logging.getLogger(__name__)
 
 
@@ -435,6 +437,28 @@ CREATE INDEX IF NOT EXISTS idx_attempt_chat_ep ON quiz_attempts(chat_id, exam_po
 CREATE INDEX IF NOT EXISTS idx_attempt_chat_tp ON quiz_attempts(chat_id, tested_point);
 CREATE INDEX IF NOT EXISTS idx_attempt_chat_q ON quiz_attempts(chat_id, question_id);
 
+CREATE TABLE IF NOT EXISTS quiz_vocab_cards (
+    vocab_id                  TEXT PRIMARY KEY,
+    level                     TEXT NOT NULL,
+    headword                  TEXT NOT NULL,
+    reading_hiragana          TEXT NOT NULL,
+    zh_gloss_short            TEXT NOT NULL,
+    example_ja                TEXT NOT NULL,
+    example_source_kind       TEXT NOT NULL DEFAULT 'adapted',
+    source_name               TEXT NOT NULL DEFAULT '',
+    source_text_url           TEXT,
+    primary_question_id       TEXT NOT NULL,
+    support_question_ids_json TEXT NOT NULL DEFAULT '[]',
+    exam_points_json          TEXT NOT NULL DEFAULT '[]',
+    author                    TEXT NOT NULL DEFAULT 'codex',
+    created_at                TEXT NOT NULL,
+    updated_at                TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_vocab_level_author ON quiz_vocab_cards(level, author);
+CREATE INDEX IF NOT EXISTS idx_vocab_headword ON quiz_vocab_cards(headword);
+CREATE INDEX IF NOT EXISTS idx_vocab_source_name ON quiz_vocab_cards(source_name);
+
 CREATE TABLE IF NOT EXISTS quiz_authoring_knowledge (
     knowledge_id  TEXT PRIMARY KEY,
     category      TEXT NOT NULL,
@@ -459,6 +483,13 @@ AUTHORING_CATEGORIES: tuple[str, ...] = (
     "level_calibration", "source_grounding",
 )
 AUTHORING_ORIGINS: tuple[str, ...] = ("seed", "distilled")
+VOCAB_CARD_EXAM_POINTS: tuple[str, ...] = ("漢字読み", "言い換え類義", "文脈規定", "用法")
+_VOCAB_PRIMARY_PRIORITY: dict[str, int] = {
+    "用法": 0,
+    "文脈規定": 1,
+    "言い換え類義": 2,
+    "漢字読み": 3,
+}
 
 
 def _utc_now_iso() -> str:
@@ -472,6 +503,10 @@ def build_question_id(*, level: str, source_name: str, stem: str) -> str:
 
 def build_authoring_knowledge_id(*, category: str, title: str) -> str:
     return sha1(f"{category}|{title}".encode("utf-8")).hexdigest()
+
+
+def build_vocab_card_id(*, level: str, headword: str) -> str:
+    return sha1(f"{level}|{headword}".encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -507,6 +542,25 @@ class AuthoringKnowledge:
     origin: str = "seed"
     confidence: float = 0.5
     times_applied: int = 0
+    created_at: str = ""
+    updated_at: str = ""
+
+
+@dataclass(frozen=True)
+class QuizVocabCard:
+    vocab_id: str
+    level: str
+    headword: str
+    reading_hiragana: str
+    zh_gloss_short: str
+    example_ja: str
+    example_source_kind: str = "adapted"
+    source_name: str = ""
+    source_text_url: str | None = None
+    primary_question_id: str = ""
+    support_question_ids: tuple[str, ...] = ()
+    exam_points: tuple[str, ...] = ()
+    author: str = "codex"
     created_at: str = ""
     updated_at: str = ""
 
@@ -547,6 +601,7 @@ class QuizDatabase:
             # "other" is only a fallback bucket, not a trustworthy explicit value.
             # Re-infer it on every startup so previously migrated rows converge.
             self._backfill_source_excerpt_types(conn, overwrite_other=True)
+            self._backfill_vocab_cards(conn)
 
     def _backfill_source_excerpt_types(
         self, conn: sqlite3.Connection, *, overwrite_other: bool
@@ -577,6 +632,107 @@ class QuizDatabase:
                 "UPDATE quiz_questions SET source_excerpt_type = ?, updated_at = ? "
                 "WHERE question_id = ?",
                 (inferred, now, row["question_id"]),
+            )
+
+    def _backfill_vocab_cards(self, conn: sqlite3.Connection) -> None:
+        rows = conn.execute(
+            """
+            SELECT * FROM quiz_questions
+            WHERE verified = 1
+              AND author = 'codex'
+              AND level = 'JLPT N1'
+              AND tested_point IS NOT NULL
+              AND TRIM(tested_point) <> ''
+              AND exam_point IN (?, ?, ?, ?)
+            ORDER BY created_at ASC, question_id ASC
+            """,
+            VOCAB_CARD_EXAM_POINTS,
+        ).fetchall()
+        groups: dict[str, list[sqlite3.Row]] = {}
+        for row in rows:
+            groups.setdefault((row["tested_point"] or "").strip(), []).append(row)
+
+        seen_ids: set[str] = set()
+        now = _utc_now_iso()
+        for headword, group in groups.items():
+            seed = QUIZ_VOCAB_SEED.get(headword)
+            if not seed:
+                continue
+            group.sort(
+                key=lambda r: (
+                    _VOCAB_PRIMARY_PRIORITY.get((r["exam_point"] or "").strip(), 99),
+                    r["created_at"] or "",
+                    r["question_id"] or "",
+                )
+            )
+            primary = group[0]
+            support_ids = tuple(dict.fromkeys((r["question_id"] or "").strip() for r in group if (r["question_id"] or "").strip()))
+            exam_points = tuple(
+                ep for ep, _ in sorted(
+                    {
+                        ((r["exam_point"] or "").strip(), _VOCAB_PRIMARY_PRIORITY.get((r["exam_point"] or "").strip(), 99))
+                        for r in group
+                        if (r["exam_point"] or "").strip()
+                    },
+                    key=lambda pair: (pair[1], pair[0]),
+                )
+            )
+            vocab_id = build_vocab_card_id(level="JLPT N1", headword=headword)
+            seen_ids.add(vocab_id)
+            existing = conn.execute(
+                "SELECT created_at FROM quiz_vocab_cards WHERE vocab_id = ?",
+                (vocab_id,),
+            ).fetchone()
+            created_at = existing["created_at"] if existing else now
+            conn.execute(
+                """
+                INSERT INTO quiz_vocab_cards (
+                    vocab_id, level, headword, reading_hiragana, zh_gloss_short,
+                    example_ja, example_source_kind, source_name, source_text_url,
+                    primary_question_id, support_question_ids_json, exam_points_json,
+                    author, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(vocab_id) DO UPDATE SET
+                    reading_hiragana = excluded.reading_hiragana,
+                    zh_gloss_short = excluded.zh_gloss_short,
+                    example_ja = excluded.example_ja,
+                    example_source_kind = excluded.example_source_kind,
+                    source_name = excluded.source_name,
+                    source_text_url = excluded.source_text_url,
+                    primary_question_id = excluded.primary_question_id,
+                    support_question_ids_json = excluded.support_question_ids_json,
+                    exam_points_json = excluded.exam_points_json,
+                    author = excluded.author,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    vocab_id,
+                    "JLPT N1",
+                    headword,
+                    seed["reading_hiragana"],
+                    seed["zh_gloss_short"],
+                    seed["example_ja"],
+                    seed.get("example_source_kind", "adapted"),
+                    (primary["source_name"] or "").strip(),
+                    primary["source_text_url"],
+                    (primary["question_id"] or "").strip(),
+                    json.dumps(list(support_ids), ensure_ascii=False),
+                    json.dumps(list(exam_points), ensure_ascii=False),
+                    "codex",
+                    created_at,
+                    now,
+                ),
+            )
+        if seen_ids:
+            placeholders = ", ".join("?" for _ in seen_ids)
+            conn.execute(
+                f"DELETE FROM quiz_vocab_cards WHERE author = 'codex' AND level = 'JLPT N1' AND vocab_id NOT IN ({placeholders})",
+                tuple(seen_ids),
+            )
+        else:
+            conn.execute(
+                "DELETE FROM quiz_vocab_cards WHERE author = 'codex' AND level = 'JLPT N1'"
             )
 
     # ── Questions ─────────────────────────────────────────────────────────────
@@ -691,6 +847,7 @@ class QuizDatabase:
                     (author or "Claude").strip(), created_at, now,
                 ),
             )
+            self._backfill_vocab_cards(conn)
         loaded = self.get_question(question_id)
         assert loaded is not None
         return loaded
@@ -867,6 +1024,7 @@ class QuizDatabase:
         level: str | None = None,
         chat_id: str | None = None,
         exam_point: str | None = None,
+        tested_point: str | None = None,
         wrong_only: bool = False,
         verified_only: bool = True,
         exclude_id: str | None = None,
@@ -890,6 +1048,9 @@ class QuizDatabase:
         if exam_point:
             clauses.append("exam_point = ?")
             params.append(exam_point.strip())
+        if tested_point:
+            clauses.append("tested_point = ?")
+            params.append(tested_point.strip())
         if author:
             clauses.append("author = ?")
             params.append(author.strip())
@@ -939,6 +1100,139 @@ class QuizDatabase:
         by_point = sorted(_rows(tp_stats), key=lambda r: (r["accuracy"], -r["attempts"]))
         return {"total": int(total), "by_type": by_type, "by_point": by_point}
 
+    # ── Vocabulary cards ─────────────────────────────────────────────────────
+
+    def get_vocab_card(
+        self,
+        *,
+        vocab_id: str | None = None,
+        headword: str | None = None,
+        level: str | None = None,
+        author: str = "codex",
+    ) -> QuizVocabCard | None:
+        if not vocab_id and not headword:
+            raise ValueError("get_vocab_card requires vocab_id or headword")
+        clauses = ["author = ?"]
+        params: list[object] = [(author or "codex").strip()]
+        if level:
+            clauses.append("level = ?")
+            params.append(level.strip())
+        if vocab_id:
+            clauses.append("vocab_id = ?")
+            params.append(vocab_id.strip())
+        else:
+            clauses.append("headword = ?")
+            params.append((headword or "").strip())
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM quiz_vocab_cards WHERE " + " AND ".join(clauses) + " LIMIT 1",
+                tuple(params),
+            ).fetchone()
+        return _row_to_vocab_card(row) if row else None
+
+    def list_vocab_cards(
+        self,
+        *,
+        level: str,
+        chat_id: str | None = None,
+        author: str = "codex",
+        mode: str = "weak",
+    ) -> list[QuizVocabCard]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM quiz_vocab_cards
+                WHERE level = ? AND author = ?
+                ORDER BY headword ASC
+                """,
+                ((level or "").strip(), (author or "codex").strip()),
+            ).fetchall()
+            tp_stats, tp_last = self._vocab_progress_maps(conn, chat_id)
+        cards = [_row_to_vocab_card(r) for r in rows]
+        mode = (mode or "weak").strip().lower()
+        if mode == "wrong":
+            cards = [c for c in cards if tp_last.get(c.headword) is False]
+            cards.sort(key=lambda c: (tp_stats.get(c.headword, (0, 0))[1] / max(tp_stats.get(c.headword, (0, 0))[0], 1), -tp_stats.get(c.headword, (0, 0))[0], c.headword))
+            return cards
+        if mode == "all":
+            return cards
+        if mode == "random":
+            if not cards:
+                return []
+            return [random.choice(cards)]
+        cards.sort(
+            key=lambda c: (
+                _vocab_mastery_sort_key(c.headword, tp_stats, tp_last),
+                c.headword,
+            )
+        )
+        return cards
+
+    def find_vocab_cards(
+        self,
+        *,
+        level: str,
+        query: str,
+        author: str = "codex",
+    ) -> list[QuizVocabCard]:
+        q = f"%{(query or '').strip()}%"
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM quiz_vocab_cards
+                WHERE level = ? AND author = ?
+                  AND (headword LIKE ? OR reading_hiragana LIKE ? OR zh_gloss_short LIKE ?)
+                ORDER BY headword ASC
+                """,
+                ((level or "").strip(), (author or "codex").strip(), q, q, q),
+            ).fetchall()
+        return [_row_to_vocab_card(r) for r in rows]
+
+    def vocab_cards_for_source(
+        self,
+        *,
+        level: str,
+        source_name: str,
+        author: str = "codex",
+    ) -> list[QuizVocabCard]:
+        q = f"%{(source_name or '').strip()}%"
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM quiz_vocab_cards
+                WHERE level = ? AND author = ? AND source_name LIKE ?
+                ORDER BY headword ASC
+                """,
+                ((level or "").strip(), (author or "codex").strip(), q),
+            ).fetchall()
+        return [_row_to_vocab_card(r) for r in rows]
+
+    def _vocab_progress_maps(self, conn, chat_id: str | None):
+        attempts: dict[str, list[int]] = {}
+        last: dict[str, bool] = {}
+        params: tuple[object, ...]
+        if chat_id is not None:
+            sql = (
+                "SELECT tested_point, correct FROM quiz_attempts "
+                "WHERE chat_id = ? AND tested_point IS NOT NULL ORDER BY attempt_id"
+            )
+            params = (str(chat_id),)
+        else:
+            sql = (
+                "SELECT tested_point, correct FROM quiz_attempts "
+                "WHERE tested_point IS NOT NULL ORDER BY attempt_id"
+            )
+            params = ()
+        for row in conn.execute(sql, params):
+            tp = (row["tested_point"] or "").strip()
+            if not tp:
+                continue
+            slot = attempts.setdefault(tp, [0, 0])
+            slot[0] += 1
+            slot[1] += int(row["correct"])
+            last[tp] = bool(int(row["correct"]))
+        return attempts, last
+
     def confusion_pairs(
         self, *, chat_id: str | None = None, limit: int = 8
     ) -> list[dict]:
@@ -985,6 +1279,7 @@ class QuizDatabase:
             cursor = conn.execute(
                 "DELETE FROM quiz_questions WHERE question_id = ?", (question_id,)
             )
+            self._backfill_vocab_cards(conn)
         return cursor.rowcount > 0
 
     def missing_media_song_questions(self) -> list[tuple[str, str]]:
@@ -1162,6 +1457,14 @@ def _mastery_weight(question, ep_stats, tp_stats, q_last_correct) -> float:
     return max(w, 0.01)
 
 
+def _vocab_mastery_sort_key(headword: str, tp_stats, tp_last) -> tuple[float, int, int]:
+    attempts, corrects = tp_stats.get(headword, (0, 0))
+    accuracy = corrects / attempts if attempts else 2.0
+    last = tp_last.get(headword)
+    last_rank = 0 if last is False else 1 if last is None else 2
+    return (accuracy, -attempts, last_rank)
+
+
 def _row_to_question(row: sqlite3.Row) -> QuizQuestion:
     try:
         opts = json.loads(row["options_json"] or "[]")
@@ -1216,6 +1519,38 @@ def _row_to_authoring(row: sqlite3.Row) -> AuthoringKnowledge:
         origin=row["origin"],
         confidence=float(row["confidence"]),
         times_applied=int(row["times_applied"]),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _row_to_vocab_card(row: sqlite3.Row) -> QuizVocabCard:
+    try:
+        support_ids = json.loads(row["support_question_ids_json"] or "[]")
+        if not isinstance(support_ids, list):
+            support_ids = []
+    except (TypeError, ValueError, json.JSONDecodeError):
+        support_ids = []
+    try:
+        exam_points = json.loads(row["exam_points_json"] or "[]")
+        if not isinstance(exam_points, list):
+            exam_points = []
+    except (TypeError, ValueError, json.JSONDecodeError):
+        exam_points = []
+    return QuizVocabCard(
+        vocab_id=row["vocab_id"],
+        level=row["level"],
+        headword=row["headword"],
+        reading_hiragana=row["reading_hiragana"],
+        zh_gloss_short=row["zh_gloss_short"],
+        example_ja=row["example_ja"],
+        example_source_kind=row["example_source_kind"] or "adapted",
+        source_name=row["source_name"] or "",
+        source_text_url=row["source_text_url"],
+        primary_question_id=row["primary_question_id"] or "",
+        support_question_ids=tuple(str(x).strip() for x in support_ids if str(x).strip()),
+        exam_points=tuple(str(x).strip() for x in exam_points if str(x).strip()),
+        author=row["author"] or "codex",
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )

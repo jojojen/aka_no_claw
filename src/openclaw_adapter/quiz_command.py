@@ -18,6 +18,7 @@ Subcommands:
   /quiz wrong [<level>]              — 錯題本: re-serve a question you last got wrong
                                        (weighted); drops out once you re-answer right.
   /quiz stats                        — per-題型 accuracy, weakest 考点, 混淆選項分析.
+  /quiz vocab [mode|word]            — 單字卡：弱點/全部/錯題/隨機/查詞.
   /quiz review [page]                — answer-revealed paginated list (QA review).
   /quiz gen20 [n]                    — bootstrap: generate N (default 20) questions.
   /quiz teach <知識點>                — distil a reviewer correction into the KB.
@@ -28,6 +29,8 @@ Callback payloads (prefix ``quiz`` is stripped by bot.py, so we see the rest):
   au:<level>:<author_code>    — byauthor author pick → show that author's 題型 menu
   ta:<level>:<exam_point>:<author_code>
                               — author-scoped type pick → serve (author-filtered)
+  vb:<level>:<mode>:<index>   — vocabulary-card browsing
+  vr:<vocab_id>               — serve one question related to the vocabulary card
   p:<page>                    — re-render review page
   d:<question_id>             — delete a question, re-render current page
 
@@ -256,6 +259,118 @@ def _render_stats(db, chat_id: str | None) -> str:
     return "\n".join(lines)
 
 
+def _parse_vocab_args(text: str) -> tuple[str, str, str]:
+    """Return (level, mode, query) for `/quiz vocab ...`.
+
+    Modes:
+      weak   - default personalized ordering
+      all    - full browse
+      wrong  - only points whose latest tested_point attempt is wrong
+      random - one random card
+      lookup - exact/substring word lookup
+      source - filter by source name
+    """
+    level = _DEFAULT_LEVEL
+    tokens: list[str] = []
+    for part in (text or "").split():
+        if part.lower().startswith("jlpt") or re.search(r"[nN][1-5]", part):
+            level = _normalize_level(part)
+        else:
+            tokens.append(part)
+    if not tokens:
+        return level, "weak", ""
+    head = tokens[0].lower()
+    if head in {"all", "wrong", "random"}:
+        return level, head, " ".join(tokens[1:]).strip()
+    if head == "source":
+        return level, "source", " ".join(tokens[1:]).strip()
+    return level, "lookup", " ".join(tokens).strip()
+
+
+def _render_vocab_card(card, *, mode: str, index: int, total: int) -> tuple[str, dict]:
+    mode_label = {
+        "weak": "弱點單字卡",
+        "all": "全部單字卡",
+        "wrong": "錯題單字卡",
+        "random": "隨機單字卡",
+        "lookup": "單字查詢",
+    }.get(mode, "單字卡")
+    lines = [
+        f"📘 {card.level} {mode_label}　{index + 1}/{total}",
+        "",
+        f"{card.headword}（{card.reading_hiragana}）",
+        f"中文：{card.zh_gloss_short}",
+        f"例句：{card.example_ja}",
+    ]
+    if card.exam_points:
+        lines.append(f"題型：{' / '.join(card.exam_points)}")
+    lines.append(f"來源：{card.source_name or '—'}")
+    if card.source_text_url:
+        lines.append(f"原文：{card.source_text_url}")
+    buttons: list[list[dict]] = []
+    if mode in {"weak", "all", "wrong"} and total > 1:
+        nav: list[dict] = []
+        if index > 0:
+            nav.append(
+                {"text": "⬅️ 上一張", "callback_data": f"quiz:vb:{card.level}:{mode}:{index - 1}"}
+            )
+        nav.append({"text": f"{index + 1}/{total}", "callback_data": "noop"})
+        if index < total - 1:
+            nav.append(
+                {"text": "下一張 ➡️", "callback_data": f"quiz:vb:{card.level}:{mode}:{index + 1}"}
+            )
+        buttons.append(nav)
+    buttons.append([{"text": "📝 出相關題", "callback_data": f"quiz:vr:{card.vocab_id}"}])
+    return "\n".join(lines), {"inline_keyboard": buttons}
+
+
+def _render_vocab_browser(db, *, level: str, mode: str, chat_id: str | None, index: int = 0):
+    cards = db.list_vocab_cards(level=level, chat_id=str(chat_id or ""), mode=mode)
+    if not cards:
+        if mode == "wrong":
+            return "📘 目前沒有可看的錯題單字卡。先去 /quiz 練題，答錯後這裡才會有內容。"
+        return "📘 目前沒有可用的單字卡。"
+    index = max(0, min(index, len(cards) - 1))
+    return _render_vocab_card(cards[index], mode=mode, index=index, total=len(cards))
+
+
+def _render_vocab_lookup(db, *, level: str, query: str):
+    query = (query or "").strip()
+    if not query:
+        return "用法：/quiz vocab <單字>　或　/quiz vocab source <歌曲名>"
+    exact = db.get_vocab_card(headword=query, level=level)
+    if exact is not None:
+        return _render_vocab_card(exact, mode="lookup", index=0, total=1)
+    hits = db.find_vocab_cards(level=level, query=query)
+    if not hits:
+        return f"📘 找不到「{query}」的單字卡。"
+    if len(hits) == 1:
+        return _render_vocab_card(hits[0], mode="lookup", index=0, total=1)
+    lines = [f"📘 找到 {len(hits)} 張相關單字卡：", ""]
+    for card in hits[:12]:
+        lines.append(f"・{card.headword}（{card.reading_hiragana}）— {card.zh_gloss_short}")
+    lines.append("")
+    lines.append("可直接用 /quiz vocab <單字> 查看其中一張。")
+    return "\n".join(lines)
+
+
+def _render_vocab_source_list(db, *, level: str, source_name: str):
+    source_name = (source_name or "").strip()
+    if not source_name:
+        return "用法：/quiz vocab source <歌曲名>"
+    cards = db.vocab_cards_for_source(level=level, source_name=source_name)
+    if not cards:
+        return f"📘 找不到來源包含「{source_name}」的單字卡。"
+    lines = [f"📘 來源包含「{source_name}」的單字卡（{len(cards)}）", ""]
+    for card in cards[:20]:
+        lines.append(f"・{card.headword}（{card.reading_hiragana}）— {card.zh_gloss_short}")
+    if len(cards) > 20:
+        lines.append("…")
+    lines.append("")
+    lines.append("可直接用 /quiz vocab <單字> 查看某一張卡。")
+    return "\n".join(lines)
+
+
 def _render_author_menu(db, level: str, theme: str) -> tuple[str, dict]:
     """Show one button per 出題者 (author) present in the pool. Picking one leads
     to that author's 題型 menu. callback_data: ``quiz:au:<level>:<author_code>``."""
@@ -473,6 +588,20 @@ def build_quiz_handler(
                 return _distill_authoring(settings, db, rest)
             if action == "stats":
                 return _render_stats(db, chat_id)
+            if action == "vocab":
+                level, mode, query = _parse_vocab_args(rest)
+                if mode in {"weak", "all", "wrong"}:
+                    return _render_vocab_browser(
+                        db, level=level, mode=mode, chat_id=chat_id, index=0
+                    )
+                if mode == "random":
+                    cards = db.list_vocab_cards(level=level, chat_id=str(chat_id or ""), mode="random")
+                    if not cards:
+                        return "📘 目前沒有可用的單字卡。"
+                    return _render_vocab_card(cards[0], mode="random", index=0, total=1)
+                if mode == "source":
+                    return _render_vocab_source_list(db, level=level, source_name=query)
+                return _render_vocab_lookup(db, level=level, query=query)
             if action in ("wrong", "錯題", "錯題本"):
                 level, theme = _parse_serve_args(rest)
                 return _serve_question(
@@ -628,6 +757,36 @@ def build_quiz_callback_handler(
                     text, markup = served
                     return None, text, markup
                 return None, served, None
+            if action == "vb":
+                lvl, _, tail = rest.partition(":")
+                mode, _, idx_str = tail.partition(":")
+                lvl = lvl or _DEFAULT_LEVEL
+                try:
+                    index = max(0, int(idx_str))
+                except ValueError:
+                    index = 0
+                rendered = _render_vocab_browser(
+                    db, level=lvl, mode=mode or "weak", chat_id=chat_id, index=index
+                )
+                if isinstance(rendered, tuple):
+                    text, markup = rendered
+                    return None, text, markup
+                return None, rendered, None
+            if action == "vr":
+                card = db.get_vocab_card(vocab_id=rest, level=_DEFAULT_LEVEL)
+                if card is None:
+                    return "找不到這張單字卡", None, None
+                question = db.weighted_question(
+                    level=card.level,
+                    chat_id=str(chat_id or ""),
+                    tested_point=card.headword,
+                    author=card.author,
+                )
+                if question is None:
+                    return "這張單字卡目前沒有可出的相關題目", None, None
+                db.mark_served(question.question_id)
+                text, markup = _question_view(question)
+                return None, text, markup
             if action == "p":
                 try:
                     page = max(0, int(rest))
