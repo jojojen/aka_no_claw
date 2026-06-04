@@ -10,7 +10,11 @@ from tcg_tracker.hot_cards import HotCardBoard, HotCardEntry, HotCardReference
 from tcg_tracker.image_lookup import ParsedCardImage, TcgImageLookupOutcome
 from tcg_tracker.service import TcgLookupResult
 from tests.image_lookup_case_fixtures import get_image_lookup_live_case
-from price_monitor_bot.bot import TelegramPhotoIntentAnalysis, TelegramPhotoIntentOption
+from price_monitor_bot.bot import (
+    PendingTelegramTextClarification,
+    TelegramPhotoIntentAnalysis,
+    TelegramPhotoIntentOption,
+)
 
 from openclaw_adapter.formatters import format_lookup_result_telegram
 from openclaw_adapter.natural_language import TelegramNaturalLanguageIntent
@@ -211,6 +215,82 @@ def test_command_processor_restricts_unconfigured_chat() -> None:
     )
 
     assert processor.build_reply(chat_id="123", text="/ping") is None
+
+
+def test_plain_youtube_url_offers_like_song_confirmation(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "openclaw_adapter.telegram_bot.build_like_song_confirmation",
+        lambda settings, url: (
+            "🎵 偵測到 YouTube 歌曲連結\n\n歌曲：勇者\n歌手：YOASOBI\n\n要加入最愛曲目清單嗎？",
+            {
+                "inline_keyboard": [[
+                    {"text": "❤️ 加入最愛", "callback_data": "quiz:ls:OIBODIPC_8Y"},
+                    {"text": "先不要", "callback_data": "quiz:lx:OIBODIPC_8Y"},
+                ]]
+            },
+        ),
+    )
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+    )
+
+    plan = processor.build_reply_plan(
+        chat_id="123",
+        text="https://youtu.be/OIBODIPC_8Y?si=XzdzDFGtCRQoXH7T",
+    )
+
+    text, _ = plan._execute_unpacked()
+    markup = plan.reply_markup
+    assert "要加入最愛曲目清單嗎？" in text
+    assert markup is not None
+    assert processor.get_pending_text_clarification("123") is None
+    flat = [b for row in markup["inline_keyboard"] for b in row]
+    assert any(b["callback_data"] == "quiz:ls:OIBODIPC_8Y" for b in flat)
+    assert any(b["callback_data"] == "quiz:lx:OIBODIPC_8Y" for b in flat)
+
+
+def test_plain_youtube_url_clears_existing_text_clarification(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "openclaw_adapter.telegram_bot.build_like_song_confirmation",
+        lambda settings, url: (
+            "🎵 偵測到 YouTube 歌曲連結\n\n歌曲：例えば\n歌手：花譜 -KAF-\n\n要加入最愛曲目清單嗎？",
+            {
+                "inline_keyboard": [[
+                    {"text": "❤️ 加入最愛", "callback_data": "quiz:ls:4_fvGiulqk8"},
+                    {"text": "先不要", "callback_data": "quiz:lx:4_fvGiulqk8"},
+                ]]
+            },
+        ),
+    )
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+    )
+    processor.set_pending_text_clarification(
+        PendingTelegramTextClarification(
+            chat_id="123",
+            original_text="舊的澄清",
+            options=(),
+            top_intent=None,
+        )
+    )
+
+    plan = processor.build_pending_text_reply_plan(
+        chat_id="123",
+        text="https://youtu.be/4_fvGiulqk8?si=m8R6kh9a3GzpeSWV",
+    )
+
+    assert plan is not None
+    text, _ = plan._execute_unpacked()
+    assert "要加入最愛曲目清單嗎？" in text
+    assert processor.get_pending_text_clarification("123") is None
 
 
 def test_command_processor_handles_price_and_trend_aliases() -> None:

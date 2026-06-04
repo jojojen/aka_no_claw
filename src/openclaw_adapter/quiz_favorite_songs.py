@@ -24,6 +24,7 @@ from urllib.parse import parse_qs, quote, urlparse
 
 import requests
 from bs4 import BeautifulSoup, NavigableString, Tag
+from assistant_runtime import build_ssl_context
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,7 @@ _TITLE_NOISE = (
 )
 _POS_JOIN_COUNT = 4
 _JAPANESE_CHAR = r"一-龥々ぁ-ゖァ-ヺーｦ-ﾟ"
+_YOUTUBE_URL_RE = re.compile(r"https?://(?:www\.)?(?:youtube\.com|youtu\.be)/\S+", re.I)
 
 
 class FavoriteSongError(RuntimeError):
@@ -112,6 +114,13 @@ def extract_youtube_video_id(url: str) -> str | None:
     return None
 
 
+def extract_first_youtube_url(text: str) -> str | None:
+    match = _YOUTUBE_URL_RE.search(text or "")
+    if match is None:
+        return None
+    return match.group(0).rstrip(")>]，。,.!！?？")
+
+
 def build_youtube_short_url(video_id: str) -> str:
     return f"https://youtu.be/{video_id}"
 
@@ -142,7 +151,15 @@ def _katakana_to_hiragana(text: str) -> str:
 
 def _guess_song_title(raw_title: str, artist: str) -> str:
     text = unicodedata.normalize("NFKC", raw_title or "").strip()
-    for pattern in (r"「([^」]+)」", r"『([^』]+)』", r"\"([^\"]+)\""):
+    text = re.sub(r"^(?:\[[^\]]+\]|【[^】]+】|\([^)]*\)|＜[^＞]+＞|<[^>]+>|\s)+", "", text).strip()
+    for pattern in (
+        r"「([^」]+)」",
+        r"『([^』]+)』",
+        r"\"([^\"]+)\"",
+        r"'([^']+)'",
+        r"‘([^’]+)’",
+        r"'([^’]+)’",
+    ):
         m = re.search(pattern, text)
         if m:
             picked = m.group(1).strip()
@@ -155,14 +172,102 @@ def _guess_song_title(raw_title: str, artist: str) -> str:
         idx = text.lower().find(noise)
         if idx > 0:
             text = text[:idx].strip(" 　-–—:：/／|")
-    for sep in ("／", " / ", " - ", "｜", "|", "　-　"):
+    artist_key = _normalize_title(artist_norm)
+    for sep in ("／", " / ", " - ", " – ", " — ", "｜", "|", "　-　"):
         if sep in text:
-            left = text.split(sep, 1)[0].strip()
-            if left:
+            left, right = (part.strip() for part in text.split(sep, 1))
+            left_key = _normalize_title(left)
+            if left and right and artist_key and left_key and left_key in artist_key:
+                text = right
+            elif left:
                 text = left
                 break
+    text = re.sub(r"\s+(?:feat\.?|ft\.?)\s+.+$", "", text, flags=re.I)
+    text = re.sub(r"\s+#\d+\s*$", "", text, flags=re.I)
+    text = re.sub(r"\s*(?:\[[^\]]+\]|【[^】]+】|＜[^＞]+＞|<[^>]+>)\s*$", "", text)
     text = re.sub(r"\s+\([^)]*?(official|mv|music video|lyric).*?\)\s*$", "", text, flags=re.I)
+    text = re.sub(r"\s*[(（]\s*$", "", text)
     return text.strip(" 　-–—:：/／|") or raw_title.strip()
+
+
+def _select_text_model(settings) -> str | None:
+    raw = getattr(settings, "openclaw_local_text_model", "") or ""
+    return next((part.strip() for part in raw.split(",") if part.strip()), None)
+
+
+def _metadata_looks_suspicious(*, title: str, artist: str, raw_title: str | None = None) -> bool:
+    title_key = _normalize_title(title)
+    artist_key = _normalize_title(artist)
+    raw = unicodedata.normalize("NFKC", raw_title or "").strip()
+    title_lc = (title or "").lower()
+    artist_lc = (artist or "").lower()
+    if not title_key:
+        return True
+    if artist_key and title_key == artist_key:
+        return True
+    if "official" in artist_lc:
+        return True
+    if any(noise in title_lc for noise in _TITLE_NOISE):
+        return True
+    if "【" in (title or "") or "[" in (title or ""):
+        return True
+    if raw and any(sep in raw for sep in (" - ", " – ", " — ", "／", " / ", "|")):
+        left = next((part.strip() for part in re.split(r"\s+(?:-|–|—)\s+|／| / |\|", raw, maxsplit=1) if part.strip()), "")
+        left_key = _normalize_title(left)
+        if left_key and title_key == left_key:
+            return True
+    return False
+
+
+def _repair_youtube_metadata_with_llm(settings, metadata: YoutubeSongMetadata) -> YoutubeSongMetadata | None:
+    backend = (getattr(settings, "openclaw_local_text_backend", "") or "").strip().lower()
+    endpoint = getattr(settings, "openclaw_local_text_endpoint", "") or ""
+    model = _select_text_model(settings)
+    if backend != "ollama" or not endpoint or not model:
+        return None
+    from .opportunity_agent import _call_ollama_json
+
+    ssl_ctx = build_ssl_context(settings) if endpoint.startswith("https://") else None
+    prompt = (
+        "你是音樂 metadata 正規化器。請根據 YouTube 標題與頻道名，抽出真正的歌曲名稱與歌手。\n"
+        "規則：\n"
+        "1. title 要是歌曲名，不要保留 Official/MV/LIVE/TOUR/feat. 標籤。\n"
+        "2. artist 要是歌手/團體名，不要保留 Official、頻道描述、製作人宣傳字串。\n"
+        "3. 不確定時，優先保守沿用原本較可信的一欄。\n"
+        '只輸出 JSON：{"title":"...","artist":"..."}\n\n'
+        f"youtube_title_raw: {metadata.raw_title}\n"
+        f"youtube_author_name: {metadata.artist}\n"
+        f"current_guess_title: {metadata.title}\n"
+        f"current_guess_artist: {metadata.artist}\n"
+    )
+    try:
+        raw = _call_ollama_json(
+            endpoint=endpoint,
+            model=model,
+            prompt=prompt,
+            timeout_seconds=max(1, getattr(settings, "openclaw_local_text_timeout_seconds", 45)),
+            ssl_context=ssl_ctx,
+        )
+        payload = json.loads(raw or "{}")
+    except Exception:
+        logger.exception(
+            "Favorite-song metadata LLM repair failed raw_title=%s",
+            metadata.raw_title,
+        )
+        return None
+    title = str(payload.get("title") or "").strip() or metadata.title
+    artist = str(payload.get("artist") or "").strip() or metadata.artist
+    repaired = YoutubeSongMetadata(
+        video_id=metadata.video_id,
+        youtube_url=metadata.youtube_url,
+        youtube_short_url=metadata.youtube_short_url,
+        title=title,
+        artist=artist,
+        raw_title=metadata.raw_title,
+    )
+    if _normalize_title(repaired.title) == _normalize_title(metadata.title) and _normalize_title(repaired.artist) == _normalize_title(metadata.artist):
+        return None
+    return repaired
 
 
 def split_lyrics_sentences(text: str) -> list[str]:
@@ -264,18 +369,17 @@ class FavoriteSongIngestor:
     def __init__(self, *, settings, db) -> None:
         self._settings = settings
         self._db = db
-        self._session = requests.Session()
-        self._session.headers.update({"User-Agent": _USER_AGENT})
-        if getattr(settings, "openclaw_tls_insecure_skip_verify", False):
-            self._session.verify = False
-        elif getattr(settings, "openclaw_ca_bundle_path", None):
-            self._session.verify = settings.openclaw_ca_bundle_path
+        self._session = _build_requests_session(settings)
         self._analyzer = SudachiLyricsAnalyzer(jlpt_lexicon=RuleBasedJlptLexicon(db))
 
     def ingest_youtube_song(self, youtube_url: str) -> FavoriteSongIngestResult:
         metadata = self._fetch_youtube_metadata(youtube_url)
         existing = self._db.get_favorite_song_by_youtube_short_url(metadata.youtube_short_url)
-        if existing is not None and (existing["status"] or "") == "ready":
+        if existing is not None and (existing["status"] or "") == "ready" and not _metadata_looks_suspicious(
+            title=str(existing["title"] or ""),
+            artist=str(existing["artist"] or ""),
+            raw_title=str(existing["youtube_title_raw"] or ""),
+        ):
             counts = self._db.favorite_song_analysis_counts(int(existing["id"]))
             return FavoriteSongIngestResult(
                 song_id=int(existing["id"]),
@@ -300,13 +404,17 @@ class FavoriteSongIngestor:
             video_id=metadata.video_id,
         )
         try:
-            lyrics = self._find_lyrics(title=metadata.title, artist=metadata.artist, video_id=metadata.video_id)
+            lyrics, metadata = self._find_lyrics_with_metadata_fallback(metadata)
             sentences = split_lyrics_sentences(lyrics.lyrics_text)
             if not sentences:
                 raise FavoriteSongError("歌詞切句後沒有可用句子")
             tokens = self._analyzer.analyze(sentences)
+            final_title = (lyrics.title or metadata.title).strip() or metadata.title
+            final_artist = (lyrics.artist or metadata.artist).strip() or metadata.artist
             self._db.replace_favorite_song_analysis(
                 song_id=song_id,
+                title=final_title,
+                artist=final_artist,
                 lyrics_url=lyrics.lyrics_url,
                 lyrics_text=lyrics.lyrics_text,
                 sentences=sentences,
@@ -316,8 +424,8 @@ class FavoriteSongIngestor:
             n1_count = sum(1 for token in tokens if token.jlpt_level == "N1")
             return FavoriteSongIngestResult(
                 song_id=song_id,
-                title=metadata.title,
-                artist=metadata.artist,
+                title=final_title,
+                artist=final_artist,
                 youtube_short_url=metadata.youtube_short_url,
                 lyrics_url=lyrics.lyrics_url,
                 status="ready",
@@ -330,34 +438,62 @@ class FavoriteSongIngestor:
             raise
 
     def _fetch_youtube_metadata(self, youtube_url: str) -> YoutubeSongMetadata:
-        video_id = extract_youtube_video_id(youtube_url)
-        if not video_id:
-            raise FavoriteSongError("無法辨識 YouTube 影片網址")
-        canonical_url = f"https://www.youtube.com/watch?v={video_id}"
-        short_url = build_youtube_short_url(video_id)
-        res = self._session.get(
-            _YOUTUBE_OEMBED.format(url=quote(canonical_url, safe="")),
-            timeout=_HTTP_TIMEOUT_SECONDS,
-        )
-        res.raise_for_status()
-        payload = res.json()
-        raw_title = str(payload.get("title") or "").strip()
-        artist = str(payload.get("author_name") or "").strip()
-        title = _guess_song_title(raw_title, artist)
-        if not title:
-            raise FavoriteSongError("YouTube metadata 缺歌曲標題")
-        return YoutubeSongMetadata(
-            video_id=video_id,
-            youtube_url=canonical_url,
-            youtube_short_url=short_url,
-            title=title,
-            artist=artist,
-            raw_title=raw_title,
-        )
+        return _fetch_youtube_metadata(self._session, youtube_url)
+
+    def _find_lyrics_with_metadata_fallback(
+        self, metadata: YoutubeSongMetadata
+    ) -> tuple[LyricsMatch, YoutubeSongMetadata]:
+        try:
+            return (
+                self._find_lyrics(
+                    title=metadata.title,
+                    artist=metadata.artist,
+                    video_id=metadata.video_id,
+                ),
+                metadata,
+            )
+        except FavoriteSongError as original_exc:
+            repaired = _repair_youtube_metadata_with_llm(self._settings, metadata)
+            if repaired is None:
+                raise original_exc
+            logger.info(
+                "Favorite-song metadata repaired via LLM video_id=%s title=%s -> %s artist=%s -> %s",
+                metadata.video_id,
+                metadata.title,
+                repaired.title,
+                metadata.artist,
+                repaired.artist,
+            )
+            return (
+                self._find_lyrics(
+                    title=repaired.title,
+                    artist=repaired.artist,
+                    video_id=repaired.video_id,
+                ),
+                repaired,
+            )
 
     def _find_lyrics(self, *, title: str, artist: str, video_id: str) -> LyricsMatch:
         for finder in (self._find_vocadb_lyrics, self._find_utanet_lyrics, self._find_utaten_lyrics):
-            result = finder(title=title, artist=artist, video_id=video_id)
+            try:
+                result = finder(title=title, artist=artist, video_id=video_id)
+            except requests.RequestException as exc:
+                logger.warning(
+                    "Favorite-song lyrics finder request failed finder=%s title=%s artist=%s error=%s",
+                    finder.__name__,
+                    title,
+                    artist,
+                    exc,
+                )
+                continue
+            except Exception:
+                logger.exception(
+                    "Favorite-song lyrics finder crashed finder=%s title=%s artist=%s",
+                    finder.__name__,
+                    title,
+                    artist,
+                )
+                continue
             if result is not None:
                 return result
         raise FavoriteSongError("找不到可用的歌詞全文來源")
@@ -517,7 +653,11 @@ class FavoriteSongIngestor:
             soup = BeautifulSoup(res.text, "html.parser")
             title_node = soup.select_one(".newLyricTitle") or soup.select_one("h1")
             artist_node = soup.select_one('a[href*="/artist/"]')
-            lyrics_node = soup.select_one(".hiragana") or soup.select_one(".medium") or soup.select_one(".lyricBody")
+            lyrics_node = (
+                soup.select_one(".lyricBody")
+                or soup.select_one(".medium")
+                or soup.select_one(".hiragana")
+            )
             if title_node is None or artist_node is None or lyrics_node is None:
                 continue
             raw_title = " ".join(title_node.get_text(" ", strip=True).split())
@@ -549,9 +689,51 @@ class FavoriteSongIngestor:
         return best[1] if best else None
 
 
+def _build_requests_session(settings) -> requests.Session:
+    session = requests.Session()
+    session.headers.update({"User-Agent": _USER_AGENT})
+    if getattr(settings, "openclaw_tls_insecure_skip_verify", False):
+        session.verify = False
+    elif getattr(settings, "openclaw_ca_bundle_path", None):
+        session.verify = settings.openclaw_ca_bundle_path
+    return session
+
+
+def fetch_youtube_song_metadata(*, settings, youtube_url: str) -> YoutubeSongMetadata:
+    session = _build_requests_session(settings)
+    return _fetch_youtube_metadata(session, youtube_url)
+
+
+def _fetch_youtube_metadata(session: requests.Session, youtube_url: str) -> YoutubeSongMetadata:
+    video_id = extract_youtube_video_id(youtube_url)
+    if not video_id:
+        raise FavoriteSongError("無法辨識 YouTube 影片網址")
+    canonical_url = f"https://www.youtube.com/watch?v={video_id}"
+    short_url = build_youtube_short_url(video_id)
+    res = session.get(
+        _YOUTUBE_OEMBED.format(url=quote(canonical_url, safe="")),
+        timeout=_HTTP_TIMEOUT_SECONDS,
+    )
+    res.raise_for_status()
+    payload = res.json()
+    raw_title = str(payload.get("title") or "").strip()
+    artist = str(payload.get("author_name") or "").strip()
+    title = _guess_song_title(raw_title, artist)
+    if not title:
+        raise FavoriteSongError("YouTube metadata 缺歌曲標題")
+    return YoutubeSongMetadata(
+        video_id=video_id,
+        youtube_url=canonical_url,
+        youtube_short_url=short_url,
+        title=title,
+        artist=artist,
+        raw_title=raw_title,
+    )
+
+
 def _extract_utaten_song_title(raw_title: str) -> str:
     text = unicodedata.normalize("NFKC", raw_title or "")
-    text = re.sub(r"^よみ：.*?\s+", "", text)
+    text = re.sub(r"^よみ[:：].*?\s+", "", text)
     text = re.sub(r"\s+歌詞.*$", "", text)
     return text.strip()
 

@@ -10,6 +10,7 @@ import uuid
 from pathlib import Path
 from typing import Callable
 
+import price_monitor_bot.bot as _price_bot_module
 from assistant_runtime import AssistantSettings, build_ssl_context
 from assistant_runtime.logging_utils import trim_for_log
 
@@ -52,11 +53,13 @@ from .rag_daily_digest import RagDailyDigestScheduler, handle_ragdel_callback, h
 from .dynamic_tools import build_dynamic_tool_runner_from_settings
 from .knowledge_command import build_knowledge_handler
 from .quiz_command import (
+    build_like_song_confirmation,
     build_quiz_callback_handler,
     build_quiz_handler,
     start_quiz_daily_scheduler,
 )
 from .natural_language import build_telegram_natural_language_router_from_settings
+from .quiz_favorite_songs import extract_first_youtube_url
 from .opportunity_agent import (
     dismiss_opportunity_target,
     format_opportunity_status,
@@ -81,6 +84,7 @@ from .web_search import (
     search_duckduckgo,
     summarize_web_sources_with_ollama,
 )
+from price_monitor_bot.bot import TelegramTextReplyPlan
 
 logger = logging.getLogger(__name__)
 
@@ -101,9 +105,53 @@ class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
         allowed_chat_ids: frozenset[str] | None = None,
         **kwargs,
     ) -> None:
+        self._settings = settings
         if allowed_chat_ids is None and settings is not None and settings.openclaw_telegram_chat_id:
             allowed_chat_ids = frozenset({settings.openclaw_telegram_chat_id})
         super().__init__(allowed_chat_ids=allowed_chat_ids, **kwargs)
+
+    def _build_youtube_like_song_plan(
+        self,
+        *,
+        chat_id: str | int,
+        text: str | None,
+    ) -> TelegramTextReplyPlan | None:
+        if not self.is_allowed_chat(chat_id):
+            return None
+        if text is None or text.strip().startswith("/"):
+            return None
+        if self._settings is None:
+            return None
+        youtube_url = extract_first_youtube_url(text)
+        if not youtube_url:
+            return None
+        proposal = build_like_song_confirmation(self._settings, youtube_url)
+        if proposal is None:
+            return None
+        self.clear_pending_text_clarification(chat_id)
+        proposal_text, proposal_markup = proposal
+        return TelegramTextReplyPlan(
+            ack=None,
+            reply=proposal_text,
+            reply_markup=proposal_markup,
+        )
+
+    def build_pending_text_reply_plan(
+        self,
+        *,
+        chat_id: str | int,
+        text: str | None,
+    ) -> TelegramTextReplyPlan | None:
+        youtube_plan = self._build_youtube_like_song_plan(chat_id=chat_id, text=text)
+        if youtube_plan is not None:
+            return youtube_plan
+        return super().build_pending_text_reply_plan(chat_id=chat_id, text=text)
+
+    def build_reply_plan(self, *, chat_id: str | int, text: str | None) -> TelegramTextReplyPlan:
+        youtube_plan = self._build_youtube_like_song_plan(chat_id=chat_id, text=text)
+        if youtube_plan is not None:
+            return youtube_plan
+        return super().build_reply_plan(chat_id=chat_id, text=text)
 
 
 def default_lookup_renderer(settings: AssistantSettings) -> LookupRenderer:
@@ -433,6 +481,9 @@ def run_telegram_polling(
     dynamic_tool_runner = build_dynamic_tool_runner_from_settings(settings)
     dynamic_tool_handler = (
         (lambda req: dynamic_tool_runner.run(req)) if dynamic_tool_runner is not None else None
+    )
+    _price_bot_module.TelegramCommandProcessor = (
+        lambda **kwargs: TelegramCommandProcessor(settings=settings, **kwargs)
     )
     return _base_run_telegram_polling(
         token=token,
