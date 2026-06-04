@@ -10,6 +10,9 @@ Subcommands:
   /quiz [<level>] [<theme>]          — show the 題型 (exam_point) selection menu;
                                        picking a type serves a weighted question
                                        from that type.
+  /quiz [<level>] [<theme>] byauthor — show the 出題者 (author) selection menu first;
+                                       picking an author then shows that author's
+                                       題型 menu, and serving stays scoped to them.
   /quiz [<level>] [<theme>] random   — skip the menu, serve one weighted question
                                        from any 題型 (generate on-demand if empty).
   /quiz wrong [<level>]              — 錯題本: re-serve a question you last got wrong
@@ -22,8 +25,15 @@ Subcommands:
 Callback payloads (prefix ``quiz`` is stripped by bot.py, so we see the rest):
   a:<question_id>:<choice>    — grade an answer
   t:<level>:<exam_point>      — type-menu pick ('*' = random/all, '!' = 錯題本) → serve
+  au:<level>:<author_code>    — byauthor author pick → show that author's 題型 menu
+  ta:<level>:<exam_point>:<author_code>
+                              — author-scoped type pick → serve (author-filtered)
   p:<page>                    — re-render review page
   d:<question_id>             — delete a question, re-render current page
+
+``author_code`` is a colon-free ASCII token (_author_code) so it survives the
+':'-split of callback_data; it's reversed against the live author list at click
+time (_author_from_code), so no author tag is hardcoded.
 """
 
 from __future__ import annotations
@@ -124,8 +134,8 @@ def _parse_serve_args(text: str) -> tuple[str, str]:
     for part in (text or "").split():
         if part.lower().startswith("jlpt") or re.search(r"[nN][1-5]", part):
             level = _normalize_level(part)
-        elif part.lower() == "random":
-            continue
+        elif part.lower() in ("random", "byauthor"):
+            continue  # serve-mode flags, not themes
         else:
             remaining.append(part)
     if remaining:
@@ -137,6 +147,27 @@ def _wants_random(text: str) -> bool:
     """True if the args contain a bare ``random`` token → serve immediately from
     any 題型 (weighted), skipping the type-selection menu."""
     return any(p.lower() == "random" for p in (text or "").split())
+
+
+def _wants_byauthor(text: str) -> bool:
+    """True if the args contain a bare ``byauthor`` token → show the 出題者
+    selection menu first; picking an author then leads to that author's 題型 menu."""
+    return any(p.lower() == "byauthor" for p in (text or "").split())
+
+
+def _author_code(author: str) -> str:
+    """A colon-free, ASCII-only short token for an author, safe to embed in
+    Telegram callback_data (which we split on ':'). ``qwen3:14b`` → ``qwen314b``."""
+    return re.sub(r"[^A-Za-z0-9]", "", author or "")[:16] or "x"
+
+
+def _author_from_code(db, level: str, code: str) -> str | None:
+    """Reverse a callback author code back to the real author tag by matching
+    against the live author list (no hardcoded map — survives new authors)."""
+    for author, _ in db.author_counts(level=level):
+        if _author_code(author) == code:
+            return author
+    return None
 
 
 # ── question rendering ─────────────────────────────────────────────────────────
@@ -225,18 +256,70 @@ def _render_stats(db, chat_id: str | None) -> str:
     return "\n".join(lines)
 
 
-def _render_type_menu(db, level: str, theme: str) -> tuple[str, dict]:
+def _render_author_menu(db, level: str, theme: str) -> tuple[str, dict]:
+    """Show one button per 出題者 (author) present in the pool. Picking one leads
+    to that author's 題型 menu. callback_data: ``quiz:au:<level>:<author_code>``."""
+    authors = db.author_counts(level=level)
+    if not authors:
+        return (
+            f"目前 {level} 題庫是空的，無法列出出題者。先跑 /quiz gen20 產題。",
+            {"inline_keyboard": []},
+        )
+    lines = [
+        f"🎴 {level} 測驗 — 選擇出題者",
+        "",
+        "先選一位出題者，下一步再選題型；之後只會出這位出題者的題目。",
+    ]
+    buttons = [
+        {
+            "text": f"🖋️ {author}（{n}）",
+            "callback_data": f"quiz:au:{level}:{_author_code(author)}",
+        }
+        for author, n in authors
+    ]
+    rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def _render_type_menu(
+    db, level: str, theme: str, author: str | None = None
+) -> tuple[str, dict]:
     """Show one button per official 題型 (exam_point) present in the pool, plus a
     🎲 random-all button. Picking one serves a weighted question from that 題型.
-    callback_data: ``quiz:t:<level>:<exam_point>`` (``*`` = random across all)."""
-    counts = db.exam_point_counts(level=level)
+    callback_data: ``quiz:t:<level>:<exam_point>`` (``*`` = random across all).
+    When ``author`` is set (the byauthor path), the tally and the served questions
+    are restricted to that 出題者, and callbacks carry the author code:
+    ``quiz:ta:<level>:<exam_point>:<author_code>``."""
+    counts = db.exam_point_counts(level=level, author=author)
     if not counts:
+        if author:
+            return (
+                f"出題者「{author}」在 {level} 沒有題目。回 /quiz {theme} byauthor 換一位。",
+                {"inline_keyboard": []},
+            )
         # No verified questions yet → fall back to immediate (weighted) serve path.
         return (
             f"目前 {level} 題庫是空的，無法列出題型。先跑 /quiz gen20 產題，"
             "或用 /quiz {0} {1} random 立即出一題。".format(level, theme),
             {"inline_keyboard": []},
         )
+    if author:
+        code = _author_code(author)
+        lines = [
+            f"🎴 {level} 測驗 — 出題者：{author} — 選擇題型",
+            "",
+            "點一個題型，只會出這位出題者該題型的題目；或選「🎲 隨機（全部）」。",
+        ]
+        buttons = [
+            {"text": f"{ep}（{n}）", "callback_data": f"quiz:ta:{level}:{ep}:{code}"}
+            for ep, n in counts
+        ]
+        rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+        rows.append([
+            {"text": "🎲 隨機（全部）", "callback_data": f"quiz:ta:{level}:*:{code}"},
+            {"text": "📭 錯題本", "callback_data": f"quiz:ta:{level}:!:{code}"},
+        ])
+        return "\n".join(lines), {"inline_keyboard": rows}
     lines = [
         f"🎴 {level} 測驗 — 選擇題型",
         "",
@@ -398,6 +481,8 @@ def build_quiz_handler(
             # default: `/quiz <level> <theme> random` → serve immediately (any
             # 題型, weighted); without `random` → show the 題型 selection menu.
             level, theme = _parse_serve_args(text)
+            if _wants_byauthor(text):
+                return _render_author_menu(db, level, theme)
             if _wants_random(text):
                 return _serve_question(settings, db, level, theme, None, chat_id)
             return _render_type_menu(db, level, theme)
@@ -416,19 +501,24 @@ def _serve_question(
     exam_point: str | None,
     chat_id: str | None,
     wrong_only: bool = False,
+    author: str | None = None,
 ):
-    """Serve one weighted question (optionally restricted to ``exam_point``, or to
-    the learner's previously-wrong 錯題 when ``wrong_only``). Returns a
-    ``(text, markup)`` view tuple, or an error string."""
+    """Serve one weighted question (optionally restricted to ``exam_point``, to a
+    specific ``author``/出題者, or to the learner's previously-wrong 錯題 when
+    ``wrong_only``). Returns a ``(text, markup)`` view tuple, or an error string."""
     _ensure_provider_registered(theme)
     question = db.weighted_question(
-        level=level, chat_id=chat_id, exam_point=exam_point, wrong_only=wrong_only
+        level=level, chat_id=chat_id, exam_point=exam_point,
+        wrong_only=wrong_only, author=author,
     )
     if question is None and wrong_only:
         return (
             "📭 目前沒有錯題可複習：你還沒答錯過，或先前答錯的都已經訂正答對了。\n"
             "去 /quiz 練幾題，答錯的會自動進錯題本；訂正答對後就會移出。"
         )
+    if question is None and author:
+        scope = f"「{exam_point}」" if exam_point else ""
+        return f"出題者「{author}」的{scope}題目目前出不來，換個題型或換一位出題者試試。"
     if question is None and not exam_point:
         # Pool empty → generate one on-demand (runs in background via bot.py).
         # Only for the unrestricted path: a type-filtered miss shouldn't trigger
@@ -509,6 +599,35 @@ def build_quiz_callback_handler(
                     text, markup = served
                     return None, text, markup
                 return None, served, None  # error string → replace menu text
+            if action == "au":
+                # byauthor author-menu pick: rest = "<level>:<author_code>" → show
+                # that author's 題型 menu.
+                lvl, _, code = rest.partition(":")
+                lvl = lvl or _DEFAULT_LEVEL
+                author = _author_from_code(db, lvl, code)
+                if author is None:
+                    return "找不到該出題者（題庫可能已變動）", None, None
+                text, markup = _render_type_menu(db, lvl, _DEFAULT_THEME, author=author)
+                return None, text, markup
+            if action == "ta":
+                # author-scoped type pick: rest = "<level>:<exam_point>:<author_code>"
+                # (peel the trailing code with rpartition — ep never contains ':').
+                head, _, code = rest.rpartition(":")
+                lvl, _, ep = head.partition(":")
+                lvl = lvl or _DEFAULT_LEVEL
+                author = _author_from_code(db, lvl, code)
+                if author is None:
+                    return "找不到該出題者（題庫可能已變動）", None, None
+                wrong_only = ep == "!"
+                exam_point = None if ep in ("", "*", "!") else ep
+                served = _serve_question(
+                    settings, db, lvl, _DEFAULT_THEME, exam_point,
+                    str(chat_id or ""), wrong_only=wrong_only, author=author,
+                )
+                if isinstance(served, tuple):
+                    text, markup = served
+                    return None, text, markup
+                return None, served, None
             if action == "p":
                 try:
                     page = max(0, int(rest))

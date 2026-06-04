@@ -594,10 +594,36 @@ class QuizDatabase:
         return int(row["n"]) if row else 0
 
     def exam_point_counts(
-        self, *, level: str | None = None, verified_only: bool = True
+        self, *, level: str | None = None, verified_only: bool = True,
+        author: str | None = None,
     ) -> list[tuple[str, int]]:
         """List distinct 題型 (exam_point) and how many questions each has, for the
-        type-selection menu. Ordered by count desc then name so the menu is stable."""
+        type-selection menu. Ordered by count desc then name so the menu is stable.
+        ``author`` restricts the tally to one 出題者 (the /quiz byauthor path)."""
+        clauses: list[str] = []
+        params: list[object] = []
+        if verified_only:
+            clauses.append("verified = 1")
+        if level:
+            clauses.append("level = ?")
+            params.append(level.strip())
+        if author:
+            clauses.append("author = ?")
+            params.append(author.strip())
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT exam_point AS ep, COUNT(*) AS n FROM quiz_questions{where} "
+                "GROUP BY exam_point ORDER BY n DESC, exam_point ASC",
+                tuple(params),
+            ).fetchall()
+        return [((r["ep"] or "").strip(), int(r["n"])) for r in rows if (r["ep"] or "").strip()]
+
+    def author_counts(
+        self, *, level: str | None = None, verified_only: bool = True
+    ) -> list[tuple[str, int]]:
+        """List distinct 出題者 (author) and how many questions each has, for the
+        /quiz byauthor author-selection menu. Ordered by count desc then name."""
         clauses: list[str] = []
         params: list[object] = []
         if verified_only:
@@ -608,11 +634,11 @@ class QuizDatabase:
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         with self.connect() as conn:
             rows = conn.execute(
-                f"SELECT exam_point AS ep, COUNT(*) AS n FROM quiz_questions{where} "
-                "GROUP BY exam_point ORDER BY n DESC, exam_point ASC",
+                f"SELECT author AS a, COUNT(*) AS n FROM quiz_questions{where} "
+                "GROUP BY author ORDER BY n DESC, author ASC",
                 tuple(params),
             ).fetchall()
-        return [((r["ep"] or "").strip(), int(r["n"])) for r in rows if (r["ep"] or "").strip()]
+        return [((r["a"] or "").strip(), int(r["n"])) for r in rows if (r["a"] or "").strip()]
 
     def mark_served(self, question_id: str) -> None:
         with self.connect() as conn:
@@ -681,6 +707,7 @@ class QuizDatabase:
         wrong_only: bool = False,
         verified_only: bool = True,
         exclude_id: str | None = None,
+        author: str | None = None,
         rng: random.Random | None = None,
     ) -> QuizQuestion | None:
         """Pick one question, biased toward the learner's weak points. Weight is
@@ -700,6 +727,9 @@ class QuizDatabase:
         if exam_point:
             clauses.append("exam_point = ?")
             params.append(exam_point.strip())
+        if author:
+            clauses.append("author = ?")
+            params.append(author.strip())
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         with self.connect() as conn:
             rows = conn.execute(
