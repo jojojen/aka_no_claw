@@ -305,6 +305,8 @@ def _render_vocab_card(card, *, mode: str, index: int, total: int) -> tuple[str,
     if card.exam_points:
         lines.append(f"題型：{' / '.join(card.exam_points)}")
     lines.append(f"來源：{card.source_name or '—'}")
+    if card.source_media_url:
+        lines.append(f"歌曲：{card.source_media_url}")
     if card.source_text_url:
         lines.append(f"原文：{card.source_text_url}")
     buttons: list[list[dict]] = []

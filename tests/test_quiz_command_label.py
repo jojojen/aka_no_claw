@@ -356,6 +356,7 @@ def test_quiz_vocab_handler_exact_lookup(tmp_path):
         source_type="vocaloid_song",
         source_name="ダンスロボットダンス",
         source_text_url="http://www5.atwiki.jp/hmiku/pages/35673.html",
+        source_media_url="https://www.youtube.com/watch?v=g7dvpD_zlIM",
         source_excerpt="プログラムの範疇さ",
         tested_point="範疇",
         author="codex",
@@ -366,6 +367,8 @@ def test_quiz_vocab_handler_exact_lookup(tmp_path):
     text, markup = handler("vocab 範疇", "u1")
     assert "範疇（はんちゅう）" in text
     assert "中文：範圍、類別" in text
+    assert "歌曲：https://www.youtube.com/watch?v=g7dvpD_zlIM" in text
+    assert "原文：http://www5.atwiki.jp/hmiku/pages/35673.html" in text
     assert any(
         b["callback_data"].startswith("quiz:vr:")
         for row in markup["inline_keyboard"]

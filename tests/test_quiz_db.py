@@ -301,6 +301,7 @@ class TestVocabCards:
             source_type="vocaloid_song",
             source_name="ダンスロボットダンス",
             source_text_url="http://www5.atwiki.jp/hmiku/pages/35673.html",
+            source_media_url="https://www.youtube.com/watch?v=g7dvpD_zlIM",
             source_excerpt="プログラムの範疇さ",
             tested_point="範疇",
             author="codex",
@@ -313,6 +314,7 @@ class TestVocabCards:
         assert card.zh_gloss_short == "範圍、類別"
         assert card.example_ja == "これは私の範疇ではありません。"
         assert card.source_name == "ダンスロボットダンス"
+        assert card.source_media_url == "https://www.youtube.com/watch?v=g7dvpD_zlIM"
         assert card.exam_points == ("漢字読み",)
 
     def test_vocab_card_prefers_youhou_as_primary_when_same_headword_repeats(self, tmp_path):
