@@ -54,7 +54,7 @@ class TestSchemaAndPragmas:
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 ).fetchall()
             }
-        assert {"quiz_questions", "quiz_authoring_knowledge"} <= names
+        assert {"quiz_questions", "quiz_authoring_knowledge", "quiz_vocab_cards"} <= names
 
     def test_source_excerpt_type_column_exists(self, tmp_path):
         db = _db(tmp_path)
@@ -286,6 +286,74 @@ class TestAuthorColumn:
             allow_ungrounded=True,
         )
         assert db.get_question(q.question_id).author == "codex"
+
+
+class TestVocabCards:
+    def test_insert_codex_lexical_question_backfills_vocab_card(self, tmp_path):
+        db = _db(tmp_path)
+        db.insert_question(
+            level="JLPT N1",
+            exam_point="漢字読み",
+            stem="次の一節「プログラムの範疇さ」にある〈範疇〉の読み方として最も適切なものはどれか。",
+            options=("はんじゅう", "はんちゅう", "ばんちゅう", "はんとう"),
+            answer_index=1,
+            explanation="〈範疇〉は「はんちゅう」と読む。",
+            source_type="vocaloid_song",
+            source_name="ダンスロボットダンス",
+            source_text_url="http://www5.atwiki.jp/hmiku/pages/35673.html",
+            source_excerpt="プログラムの範疇さ",
+            tested_point="範疇",
+            author="codex",
+            verified=True,
+            allow_ungrounded=True,
+        )
+        card = db.get_vocab_card(headword="範疇", level="JLPT N1")
+        assert card is not None
+        assert card.reading_hiragana == "はんちゅう"
+        assert card.zh_gloss_short == "範圍、類別"
+        assert card.example_ja == "これは私の範疇ではありません。"
+        assert card.source_name == "ダンスロボットダンス"
+        assert card.exam_points == ("漢字読み",)
+
+    def test_vocab_card_prefers_youhou_as_primary_when_same_headword_repeats(self, tmp_path):
+        db = _db(tmp_path)
+        read_q = db.insert_question(
+            level="JLPT N1",
+            exam_point="漢字読み",
+            stem="「プログラムの範疇さ」の〈範疇〉の読み方として最も適切なものはどれか。",
+            options=("はんじゅう", "はんちゅう", "ばんちゅう", "はんとう"),
+            answer_index=1,
+            explanation="〈範疇〉は「はんちゅう」と読む。",
+            source_type="vocaloid_song",
+            source_name="ダンスロボットダンス",
+            source_text_url="http://www5.atwiki.jp/hmiku/pages/35673.html",
+            source_excerpt="プログラムの範疇さ",
+            tested_point="範疇",
+            author="codex",
+            verified=True,
+            allow_ungrounded=True,
+        )
+        youhou_q = db.insert_question(
+            level="JLPT N1",
+            exam_point="用法",
+            stem="〈範疇〉の使い方として最も適切なものはどれか。",
+            options=("彼の態度は範疇だ。", "これは業務の範疇だ。", "範疇が速く走る。", "範疇を飲んだ。"),
+            answer_index=1,
+            explanation="「範疇」は物事の範囲・カテゴリーを表す。",
+            source_type="vocaloid_song",
+            source_name="ダンスロボットダンス",
+            source_text_url="http://www5.atwiki.jp/hmiku/pages/35673.html",
+            source_excerpt="プログラムの範疇さ",
+            tested_point="範疇",
+            author="codex",
+            verified=True,
+            allow_ungrounded=True,
+        )
+        card = db.get_vocab_card(headword="範疇", level="JLPT N1")
+        assert card is not None
+        assert card.primary_question_id == youhou_q.question_id
+        assert card.support_question_ids == (youhou_q.question_id, read_q.question_id)
+        assert card.exam_points == ("用法", "漢字読み")
 
 
 class TestGrounding:

@@ -5,10 +5,12 @@ from openclaw_adapter.quiz_command import (
     _author_from_code,
     _grade_view,
     _is_commentary_url,
+    _parse_vocab_args,
     _parse_serve_args,
     _render_author_menu,
     _render_stats,
     _render_type_menu,
+    _render_vocab_lookup,
     _serve_question,
     _wants_byauthor,
     _wants_random,
@@ -86,6 +88,15 @@ def test_parse_serve_args_random_only_keeps_defaults():
     level, theme = _parse_serve_args("random")
     assert level == "JLPT N1"
     assert theme == "miku"
+
+
+def test_parse_vocab_args_modes_and_query():
+    assert _parse_vocab_args("") == ("JLPT N1", "weak", "")
+    assert _parse_vocab_args("all") == ("JLPT N1", "all", "")
+    assert _parse_vocab_args("wrong") == ("JLPT N1", "wrong", "")
+    assert _parse_vocab_args("random") == ("JLPT N1", "random", "")
+    assert _parse_vocab_args("source 夜もすがら君想ふ") == ("JLPT N1", "source", "夜もすがら君想ふ")
+    assert _parse_vocab_args("範疇") == ("JLPT N1", "lookup", "範疇")
 
 
 class _FakeDB:
@@ -310,3 +321,84 @@ def test_callback_wrong_marker_routes_to_wrong_only(tmp_path):
     # empty DB → wrong-notebook is empty → the 錯題本 marker yields the empty message
     toast, new_text, markup = handler("t:JLPT N1:!", "menu text", "u1")
     assert new_text is not None and "沒有錯題" in new_text
+
+
+def test_render_vocab_lookup_multiple_hits_lists_suggestions():
+    class _LookupDB:
+        def get_vocab_card(self, **kwargs):
+            return None
+
+        def find_vocab_cards(self, **kwargs):
+            return [
+                SimpleNamespace(headword="魅了", reading_hiragana="みりょう", zh_gloss_short="魅惑"),
+                SimpleNamespace(headword="魅了する", reading_hiragana="みりょうする", zh_gloss_short="使著迷"),
+            ]
+
+    text = _render_vocab_lookup(_LookupDB(), level="JLPT N1", query="魅了")
+    assert "找到 2 張相關單字卡" in text
+    assert "魅了（みりょう）" in text
+    assert "魅了する（みりょうする）" in text
+
+
+def test_quiz_vocab_handler_exact_lookup(tmp_path):
+    from openclaw_adapter.quiz_command import build_quiz_handler
+    from openclaw_adapter.quiz_db import QuizDatabase
+
+    dbp = tmp_path / "quiz.sqlite3"
+    db = QuizDatabase(dbp)
+    db.insert_question(
+        level="JLPT N1",
+        exam_point="漢字読み",
+        stem="次の一節「プログラムの範疇さ」にある〈範疇〉の読み方として最も適切なものはどれか。",
+        options=("はんじゅう", "はんちゅう", "ばんちゅう", "はんとう"),
+        answer_index=1,
+        explanation="〈範疇〉は「はんちゅう」と読む。",
+        source_type="vocaloid_song",
+        source_name="ダンスロボットダンス",
+        source_text_url="http://www5.atwiki.jp/hmiku/pages/35673.html",
+        source_excerpt="プログラムの範疇さ",
+        tested_point="範疇",
+        author="codex",
+        verified=True,
+        allow_ungrounded=True,
+    )
+    handler = build_quiz_handler(SimpleNamespace(quiz_db_path=dbp))
+    text, markup = handler("vocab 範疇", "u1")
+    assert "範疇（はんちゅう）" in text
+    assert "中文：範圍、類別" in text
+    assert any(
+        b["callback_data"].startswith("quiz:vr:")
+        for row in markup["inline_keyboard"]
+        for b in row
+    )
+
+
+def test_vocab_related_question_callback_serves_matching_question(tmp_path):
+    from openclaw_adapter.quiz_command import build_quiz_callback_handler
+    from openclaw_adapter.quiz_db import QuizDatabase
+
+    dbp = tmp_path / "quiz.sqlite3"
+    db = QuizDatabase(dbp)
+    q = db.insert_question(
+        level="JLPT N1",
+        exam_point="漢字読み",
+        stem="次の一節「プログラムの範疇さ」にある〈範疇〉の読み方として最も適切なものはどれか。",
+        options=("はんじゅう", "はんちゅう", "ばんちゅう", "はんとう"),
+        answer_index=1,
+        explanation="〈範疇〉は「はんちゅう」と読む。",
+        source_type="vocaloid_song",
+        source_name="ダンスロボットダンス",
+        source_text_url="http://www5.atwiki.jp/hmiku/pages/35673.html",
+        source_excerpt="プログラムの範疇さ",
+        tested_point="範疇",
+        author="codex",
+        verified=True,
+        allow_ungrounded=True,
+    )
+    card = db.get_vocab_card(headword="範疇", level="JLPT N1")
+    assert card is not None
+    handler = build_quiz_callback_handler(SimpleNamespace(quiz_db_path=dbp))
+    toast, new_text, markup = handler(f"vr:{card.vocab_id}", "card text", "u1")
+    assert toast is None
+    assert q.stem in new_text
+    assert markup is not None
