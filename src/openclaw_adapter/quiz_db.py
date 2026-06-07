@@ -1469,6 +1469,9 @@ class QuizDatabase:
             return cards
         if mode == "all":
             return cards
+        if mode == "recent":
+            cards.sort(key=lambda c: (c.created_at or "", c.vocab_id), reverse=True)
+            return cards
         if mode == "random":
             if not cards:
                 return []
