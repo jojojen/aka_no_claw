@@ -1111,3 +1111,131 @@ class TestDeriveTestedPoint:
                                    options=["a", "b"], answer_index=0) is None
         assert derive_tested_point(exam_point="文の組み立て", stem="並べ替え…",
                                    options=["a", "b"], answer_index=0) is None
+
+
+class TestKanjiReadingDistractorAudit:
+    def test_flags_zero_overlap_distractors(self):
+        from openclaw_adapter.quiz_db import audit_kanji_reading_distractors
+        # 【創造】そうぞう with けいばつ / やきめ — the systematic codex failure mode
+        opts = ("だみんをおうかする", "やきめ", "そうぞう", "けいばつ")
+        flagged = {o for _, o, _ in audit_kanji_reading_distractors(options=opts, answer_index=2)}
+        assert "けいばつ" in flagged
+        assert "やきめ" in flagged
+
+    def test_flags_phrase_length_reading(self):
+        from openclaw_adapter.quiz_db import audit_kanji_reading_distractors
+        opts = ("そうぞう", "むせかえるようなにおい", "そうさく", "さくぞう")
+        reasons = [r for _, _, r in audit_kanji_reading_distractors(options=opts, answer_index=0)]
+        assert any("long" in r for r in reasons)
+
+    def test_plausible_misreadings_pass(self):
+        from openclaw_adapter.quiz_db import audit_kanji_reading_distractors
+        # All distractors share sound with the answer — no obvious garbage
+        good = ("そうぞう", "そうさく", "さくぞう", "そうきょう")
+        assert audit_kanji_reading_distractors(options=good, answer_index=0) == []
+
+    def test_katakana_folds_to_hiragana(self):
+        from openclaw_adapter.quiz_db import _to_hiragana
+        assert _to_hiragana("ソウゾウ") == "そうぞう"
+        assert _to_hiragana("創造そうぞうabc123") == "そうぞう"
+
+    def test_out_of_range_answer_index_is_safe(self):
+        from openclaw_adapter.quiz_db import audit_kanji_reading_distractors
+        assert audit_kanji_reading_distractors(options=("a", "b"), answer_index=9) == []
+
+
+class TestQuestionDedup:
+    def test_identical_stem_same_point_is_duplicate(self):
+        from openclaw_adapter.quiz_db import questions_are_near_duplicate
+        assert questions_are_near_duplicate(
+            a_stem="次の文の「創造」の読みとして正しいものはどれか。",
+            b_stem="次の文の「創造」の読みとして正しいものはどれか。",
+            a_tested_point="創造", b_tested_point="創造",
+        )
+
+    def test_different_point_and_stem_not_duplicate(self):
+        from openclaw_adapter.quiz_db import questions_are_near_duplicate
+        assert not questions_are_near_duplicate(
+            a_stem="「創造」の読みは何か。",
+            b_stem="まったく別の文脈規定の長い問題文でありこれは本当に違う内容だ。",
+            a_tested_point="創造", b_tested_point="批判",
+        )
+
+    def test_similarity_bounds(self):
+        from openclaw_adapter.quiz_db import question_similarity
+        assert question_similarity("あいうえお", "あいうえお") == pytest.approx(1.0)
+        assert question_similarity("", "x") == 0.0
+
+    def test_find_duplicate_questions_db(self, tmp_path):
+        db = _db(tmp_path)
+        stem = "次の文の「矜持」の読みとして正しいものはどれか。"
+        db.insert_question(
+            level="JLPT N1", exam_point="漢字読み", stem=stem,
+            options=("きょうじ", "きんじ", "けいじ", "きょうじゃく"),
+            answer_index=0, source_type="vocaloid_song", source_name="テスト曲",
+            source_excerpt="矜持を胸に進む", tested_point="矜持",
+            verified=True, allow_ungrounded=True,
+        )
+        dups = db.find_duplicate_questions(
+            stem=stem, tested_point="矜持", exam_point="漢字読み",
+        )
+        assert len(dups) == 1
+        # An unrelated stem finds nothing
+        assert db.find_duplicate_questions(
+            stem="完全に無関係なべつの問題文である", tested_point="他",
+            exam_point="漢字読み",
+        ) == []
+
+
+class TestSongCandidatePack:
+    def _seed_song(self, db):
+        with db.connect() as conn:
+            conn.execute(
+                "INSERT INTO favorite_songs (title, artist, youtube_url, youtube_short_url, "
+                "lyrics_url, youtube_title_raw, video_id, status, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                ("テスト曲", "テスト歌手", "https://youtu.be/abc", "https://youtu.be/abc",
+                 "https://example.com/l", "raw", "abc", "ready", "t", "t"),
+            )
+            song_id = conn.execute("SELECT id FROM favorite_songs WHERE video_id='abc'").fetchone()["id"]
+            conn.execute(
+                "INSERT INTO sentences (song_id, sentence_text, sentence_index, created_at) "
+                "VALUES (?,?,?,?)", (song_id, "矜持を胸に進む夜", 0, "t"),
+            )
+            sid = conn.execute("SELECT id FROM sentences WHERE song_id=?", (song_id,)).fetchone()["id"]
+            conn.execute(
+                "INSERT INTO vocabulary_tokens (song_id, sentence_id, surface, dictionary_form, "
+                "reading, pos, jlpt_level, used_quiz_count, used_flashcard_count, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (song_id, sid, "矜持", "矜持", "きょうじ", "名詞", "N1", 0, 0, "t"),
+            )
+            conn.execute(
+                "INSERT INTO vocabulary_tokens (song_id, sentence_id, surface, dictionary_form, "
+                "reading, pos, jlpt_level, used_quiz_count, used_flashcard_count, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (song_id, sid, "胸", "胸", "むね", "名詞", "N3", 0, 0, "t"),
+            )
+        return song_id
+
+    def test_build_pack_contains_only_unused_n1_tokens(self, tmp_path):
+        db = _db(tmp_path)
+        song_id = self._seed_song(db)
+        pack = db.build_song_candidate_pack(song_id)
+        assert pack["title"] == "テスト曲"
+        assert pack["candidate_token_count"] == 1  # only the N1 token, not the N3 one
+        cand = pack["sentences"][0]["candidates"][0]
+        assert cand["surface"] == "矜持" and cand["reading"] == "きょうじ"
+        assert pack["sentences"][0]["sentence_text"] == "矜持を胸に進む夜"
+
+    def test_pack_is_cached_to_disk_and_loaded(self, tmp_path):
+        db = _db(tmp_path)
+        song_id = self._seed_song(db)
+        db.build_song_candidate_pack(song_id)
+        assert db._song_pack_path(song_id).exists()
+        loaded = db.load_song_candidate_pack(song_id)
+        assert loaded["song_id"] == song_id
+
+    def test_missing_song_raises(self, tmp_path):
+        db = _db(tmp_path)
+        with pytest.raises(ValueError):
+            db.build_song_candidate_pack(999999)

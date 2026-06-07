@@ -29,6 +29,39 @@ If the user asks only for analysis, explain findings without changing code or DB
 - Do not treat existing DB quantity as quality. Stability requires self-review and feedback.
 - Do not lock resources: no long-running daemon, no bot restart, no background generation loop, no long SQLite transaction, no held DB connection.
 
+## Token-Efficient Authoring (cost discipline)
+
+These three mechanisms cut cloud-model token cost **without** lowering quality. They
+are safe because every correctness gate still runs at 100%; only mechanical work and
+re-reading are removed.
+
+1. **Stable spec is cached, not re-inlined.** The JLPT format, output schema, per-type
+   rules, and worked examples live in `authoring_spec.md` (this skill's folder). Read
+   it once as a fixed prefix; do not paraphrase those rules into each authoring turn
+   (paraphrasing busts the prompt cache). Only the variable half — this song's
+   candidate pack + the RAG lessons for this source — changes per call.
+
+2. **Read the per-song candidate pack, not the full lyrics, by default.**
+   `db.load_song_candidate_pack(song_id)` returns a compact JSON: the song's unused N1
+   tokens grouped by their verbatim sentence (which doubles as `source_excerpt`). Built
+   once from already-cached tables (no fetch, no morphology), then reused. This is a
+   **soft cache**: when a question genuinely needs wider context (often 文脈規定 /
+   言い換え / reading types), still read the cached full lyrics / commentary — the pack
+   never forbids that, it just saves the common cheap case. Call with `rebuild=True`
+   after marking tokens used.
+
+3. **Mechanical checks are pure Python — never spend an LLM on them.** Use the
+   `quiz_db.py` helpers: `options_have_duplicates`, `answer_leaks_into_stem`,
+   `audit_kanji_reading_distractors` (additive advisory filter for 漢字読み distractors),
+   and `questions_are_near_duplicate` / `db.find_duplicate_questions` for dedup. Run
+   **dedup once at the final-output stage**, not on every step. `audit_…` flags obvious
+   garbage cheaply but is NOT an oracle — an empty result does not certify distractor
+   quality; that judgment stays with the strong model.
+
+What stays on the strong model (do NOT offload to the local solver to save tokens):
+difficulty / N1-level judgment, and distractor plausibility in the subtle band. The
+local solver runs the blind correctness solve at **100%, never sampled**.
+
 ## Source And Quota Checks
 
 Before accepting a generated question:
@@ -39,36 +72,24 @@ Before accepting a generated question:
 4. Reject/delete if the source cannot be grounded to a reliable text/media source.
 5. Reject/delete if retaining it would exceed 3 Codex-authored questions for that song.
 
-For favorite-song sourced work, read from the cached tables in `data/quiz.sqlite3`:
-
-- `favorite_songs`
-- `lyrics`
-- `sentences`
-- `vocabulary_tokens`
-
-After choosing a favorite song as the current source, prefer unused tokens within that song:
-
-```sql
-SELECT *
-FROM vocabulary_tokens
-WHERE jlpt_level = 'N1'
-  AND used_quiz_count = 0
-ORDER BY RANDOM()
-LIMIT 1;
-```
-
-Then resolve `sentence_id` back to the cached original sentence. Do not re-fetch the lyric site just to get the same line again.
-
-If a token-level view is too narrow for the current authoring task, step up in this order:
-
-1. cached sentence
-2. cached full lyrics
-3. cached commentary/appreciation text
-4. only then consider new external fetches if the cache genuinely lacks the needed context
+Source selection uses the candidate pack, not a hand-written token query:
+`db.load_song_candidate_pack(song_id)` returns the song's unused N1 tokens already
+grouped by their verbatim cached sentence (the sentence doubles as `source_excerpt`).
+It is built from the cached tables (`favorite_songs`, `lyrics`, `sentences`,
+`vocabulary_tokens`) with no fetch and no re-morphology. See mechanism #2 under
+[Token-Efficient Authoring](#token-efficient-authoring-cost-discipline) for the
+soft-cache rule and when to step up to full lyrics / commentary. Call with
+`rebuild=True` after marking tokens used. Do not re-fetch the lyric site to get a
+line the cache already holds.
 
 ## Author One Question
 
 Codex writes the question content directly after selecting a valid source and real grounding text. Insert only after passing checks.
+
+The JSON output schema, per-type rules, universal hard gates, and worked examples
+live in `authoring_spec.md` (this skill's folder) — read it once as the stable
+cached prefix; do not paraphrase it here. This section only covers the two
+workflow-specific steps that the spec does not.
 
 **Step 0 — Register vocab seed** (required for lexical types: 漢字読み, 言い換え類義, 文脈規定, 用法):
 
@@ -84,28 +105,10 @@ db.upsert_vocab_seed(
 
 `quiz_vocab_seed.py` no longer exists. The `vocab_seed` table in `data/quiz.sqlite3` is the sole source. Do not attempt to import or edit a Python seed file.
 
-Use existing DB APIs for insertion and deletion. Keep each operation short-lived.
-
-```python
-q = db.insert_question(
-    level="JLPT N1",
-    exam_point="<fine-grained type>",
-    stem="<question stem>",
-    options=("<A>", "<B>", "<C>", "<D>"),
-    answer_index=<0-based index>,
-    explanation="<zh-TW explanation plus readings where relevant>",
-    source_type="vocaloid_song",
-    source_name="<song name>",
-    source_text_url="<lyrics/commentary url>",
-    source_media_url="<PV/audio url>",
-    source_excerpt="<real grounding text shown or cited>",
-    tested_point="<specific point>",
-    verified=True,
-    author="codex",
-)
-```
-
-The inserted row's `author` must be `codex`.
+**Step 1 — Insert.** Use `db.insert_question(...)` with the fields from the
+`authoring_spec.md` schema, plus the workflow constants: `level="JLPT N1"`,
+`source_type="vocaloid_song"`, `verified=True`, and `author="codex"`. The inserted
+row's `author` must be `codex`. Keep each DB operation short-lived.
 
 ## Local Model Solver Checks
 
@@ -125,6 +128,14 @@ Important calibration:
 - For reading items, the leak probe remains strict: if the model can answer correctly without the passage, reject the question.
 
 ## Review Checklist
+
+Run the pure-Python mechanical checks first (they are free — never spend an LLM on
+them): `options_have_duplicates`, `answer_leaks_into_stem`,
+`audit_kanji_reading_distractors` for 漢字読み distractors, and
+`db.find_duplicate_questions` / `questions_are_near_duplicate` for dedup at the
+final-output stage. These flag obvious garbage cheaply but are NOT oracles — an
+empty result does not certify quality. The judgment items below stay with the
+strong model.
 
 Keep a question only if all pass:
 

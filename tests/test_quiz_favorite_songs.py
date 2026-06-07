@@ -74,32 +74,34 @@ def test_find_lyrics_continues_after_single_site_http_error():
     ingestor = object.__new__(FavoriteSongIngestor)
     calls: list[str] = []
 
+    # Finder order is utanet → utaten → vocadb. Put the HTTP error on the
+    # first-tried finder so this still exercises "continue past a single-site error".
     def boom(**kwargs):
-        calls.append("vocadb")
+        calls.append("utanet")
         raise requests.HTTPError("404")
 
     def nope(**kwargs):
-        calls.append("utanet")
+        calls.append("utaten")
         return None
 
     def ok(**kwargs):
-        calls.append("utaten")
+        calls.append("vocadb")
         return LyricsMatch(
             title="Sunday Morning",
             artist="ILLIT",
             lyrics_url="https://example.com/lyrics",
             lyrics_text="hello world",
-            source_kind="utaten",
+            source_kind="vocadb",
         )
 
-    ingestor._find_vocadb_lyrics = boom
-    ingestor._find_utanet_lyrics = nope
-    ingestor._find_utaten_lyrics = ok
+    ingestor._find_utanet_lyrics = boom
+    ingestor._find_utaten_lyrics = nope
+    ingestor._find_vocadb_lyrics = ok
 
     got = ingestor._find_lyrics(title="Sunday Morning", artist="ILLIT", video_id="vid")
 
-    assert got.source_kind == "utaten"
-    assert calls == ["vocadb", "utanet", "utaten"]
+    assert got.source_kind == "vocadb"
+    assert calls == ["utanet", "utaten", "vocadb"]
 
 
 class _FakeFavoriteSongDb:
