@@ -26,6 +26,7 @@ Author a single JSON object, then insert with `db.insert_question(...)`:
   "answer_index": 0,
   "explanation": "<zh-TW explanation; quote the option text, never bare indices>",
   "tested_point": "<the specific word/point being tested>",
+  "tested_jlpt_level": "<N1 | N2 — the ITEM's true difficulty; NULL/omit = N1>",
   "source_name": "<song name>",
   "source_text_url": "<lyrics/commentary url>",
   "source_media_url": "<PV/audio url>",
@@ -80,6 +81,16 @@ Difficulty/N1-level judgment is a **strong-model** call. Do not delegate it to t
 local solver (it is sub-N1; its agreement/rejection is advisory evidence only, never
 the deciding vote). The local model's job is the blind correctness solve, run at
 100% — never sampled.
+
+**N1-preferred, N2 fallback + `tested_jlpt_level`.** Prefer genuine N1 vocabulary.
+When a song has no further suitable N1 word, a genuine N2 word is allowed (never
+N3/N4). Record the item's TRUE difficulty in `tested_jlpt_level` (`N1`/`N2`; NULL = N1)
+— `level` stays `JLPT N1` (the study pool). Judge by type:
+- **漢字読み**: question difficulty equals the word's reading difficulty. N2 word ⇒
+  N2 item; tag `N2`. It cannot be made N1 by framing.
+- **言い換え類義 / 文脈規定**: difficulty may come from the options/context. An N2
+  surface headword can still be an N1 item if choosing the answer needs N1-level
+  synonyms or N1-level context — tag `N1` then; otherwise `N2`.
 
 ## Worked examples
 

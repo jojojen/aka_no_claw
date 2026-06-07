@@ -390,8 +390,11 @@ def _render_vocab_card(card, *, mode: str, index: int, total: int) -> tuple[str,
         "recent": "最新加入單字卡",
         "lookup": "單字查詢",
     }.get(mode, "單字卡")
+    # tested_jlpt_level is the item's true difficulty; NULL/blank means N1.
+    difficulty = (getattr(card, "tested_jlpt_level", None) or "").strip().upper() or "N1"
+    head = f"📘 {card.level} {mode_label}　{index + 1}/{total}　〔難度 {difficulty}〕"
     lines = [
-        f"📘 {card.level} {mode_label}　{index + 1}/{total}",
+        head,
         "",
         f"{card.headword}（{card.reading_hiragana}）",
         f"中文：{card.zh_gloss_short}",

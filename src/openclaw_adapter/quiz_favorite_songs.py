@@ -372,7 +372,9 @@ class FavoriteSongIngestor:
         self._session = _build_requests_session(settings)
         self._analyzer = SudachiLyricsAnalyzer(jlpt_lexicon=RuleBasedJlptLexicon(db))
 
-    def ingest_youtube_song(self, youtube_url: str) -> FavoriteSongIngestResult:
+    def ingest_youtube_song(
+        self, youtube_url: str, *, favorite: bool = True
+    ) -> FavoriteSongIngestResult:
         metadata = self._fetch_youtube_metadata(youtube_url)
         existing = self._db.get_favorite_song_by_youtube_short_url(metadata.youtube_short_url)
         if existing is not None and (existing["status"] or "") == "ready" and not _metadata_looks_suspicious(
@@ -431,6 +433,7 @@ class FavoriteSongIngestor:
             status="fetching",
             youtube_title_raw=metadata.raw_title,
             video_id=metadata.video_id,
+            favorite=favorite,
         )
         try:
             try:

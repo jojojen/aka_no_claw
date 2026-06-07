@@ -553,6 +553,7 @@ CREATE TABLE IF NOT EXISTS quiz_questions (
     source_excerpt   TEXT,
     source_excerpt_type TEXT NOT NULL DEFAULT 'other',
     tested_point     TEXT,
+    tested_jlpt_level TEXT,
     verified         INTEGER NOT NULL DEFAULT 0,
     served_count     INTEGER NOT NULL DEFAULT 0,
     author           TEXT NOT NULL DEFAULT 'Claude',
@@ -597,6 +598,7 @@ CREATE TABLE IF NOT EXISTS quiz_vocab_cards (
     primary_question_id       TEXT NOT NULL,
     support_question_ids_json TEXT NOT NULL DEFAULT '[]',
     exam_points_json          TEXT NOT NULL DEFAULT '[]',
+    tested_jlpt_level         TEXT,
     author                    TEXT NOT NULL DEFAULT 'codex',
     created_at                TEXT NOT NULL,
     updated_at                TEXT NOT NULL
@@ -606,7 +608,10 @@ CREATE INDEX IF NOT EXISTS idx_vocab_level_author ON quiz_vocab_cards(level, aut
 CREATE INDEX IF NOT EXISTS idx_vocab_headword ON quiz_vocab_cards(headword);
 CREATE INDEX IF NOT EXISTS idx_vocab_source_name ON quiz_vocab_cards(source_name);
 
-CREATE TABLE IF NOT EXISTS favorite_songs (
+-- Song corpus the quiz system pulls lyrics/vocab from. `favorite` (1/0) separates
+-- songs the user explicitly hearted (1) from songs ingested purely as quiz
+-- material (0). The user-facing 最愛 views must filter favorite = 1.
+CREATE TABLE IF NOT EXISTS quiz_songs (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     title             TEXT NOT NULL,
     artist            TEXT NOT NULL DEFAULT '',
@@ -616,13 +621,15 @@ CREATE TABLE IF NOT EXISTS favorite_songs (
     youtube_title_raw TEXT,
     video_id          TEXT,
     status            TEXT NOT NULL DEFAULT 'pending',
+    favorite          INTEGER NOT NULL DEFAULT 1,
     last_error        TEXT,
     created_at        TEXT NOT NULL,
     updated_at        TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_favorite_songs_status ON favorite_songs(status);
-CREATE INDEX IF NOT EXISTS idx_favorite_songs_title ON favorite_songs(title);
+CREATE INDEX IF NOT EXISTS idx_quiz_songs_status ON quiz_songs(status);
+CREATE INDEX IF NOT EXISTS idx_quiz_songs_title ON quiz_songs(title);
+CREATE INDEX IF NOT EXISTS idx_quiz_songs_favorite ON quiz_songs(favorite);
 
 CREATE TABLE IF NOT EXISTS lyrics (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -630,7 +637,7 @@ CREATE TABLE IF NOT EXISTS lyrics (
     full_text  TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    FOREIGN KEY(song_id) REFERENCES favorite_songs(id)
+    FOREIGN KEY(song_id) REFERENCES quiz_songs(id)
 );
 
 CREATE TABLE IF NOT EXISTS sentences (
@@ -639,7 +646,7 @@ CREATE TABLE IF NOT EXISTS sentences (
     sentence_text  TEXT NOT NULL,
     sentence_index INTEGER NOT NULL,
     created_at     TEXT NOT NULL,
-    FOREIGN KEY(song_id) REFERENCES favorite_songs(id)
+    FOREIGN KEY(song_id) REFERENCES quiz_songs(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_sentences_song_idx ON sentences(song_id, sentence_index);
@@ -656,7 +663,7 @@ CREATE TABLE IF NOT EXISTS vocabulary_tokens (
     used_quiz_count      INTEGER NOT NULL DEFAULT 0,
     used_flashcard_count INTEGER NOT NULL DEFAULT 0,
     created_at           TEXT NOT NULL,
-    FOREIGN KEY(song_id) REFERENCES favorite_songs(id),
+    FOREIGN KEY(song_id) REFERENCES quiz_songs(id),
     FOREIGN KEY(sentence_id) REFERENCES sentences(id)
 );
 
@@ -736,6 +743,7 @@ class QuizQuestion:
     source_excerpt: str | None = None
     source_excerpt_type: str = "other"
     tested_point: str | None = None
+    tested_jlpt_level: str | None = None
     verified: bool = False
     served_count: int = 0
     author: str = "Claude"
@@ -772,6 +780,7 @@ class QuizVocabCard:
     primary_question_id: str = ""
     support_question_ids: tuple[str, ...] = ()
     exam_points: tuple[str, ...] = ()
+    tested_jlpt_level: str | None = None
     author: str = "codex"
     created_at: str = ""
     updated_at: str = ""
@@ -816,6 +825,27 @@ class QuizDatabase:
 
     def bootstrap(self) -> None:
         with self.connect() as conn:
+            # Must run BEFORE _SCHEMA: otherwise CREATE TABLE IF NOT EXISTS quiz_songs
+            # would make a fresh empty table beside the real data still in favorite_songs.
+            tables = {
+                r["name"]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            if "favorite_songs" in tables and "quiz_songs" not in tables:
+                conn.execute("ALTER TABLE favorite_songs RENAME TO quiz_songs")
+                conn.execute("DROP INDEX IF EXISTS idx_favorite_songs_status")
+                conn.execute("DROP INDEX IF EXISTS idx_favorite_songs_title")
+                tables.add("quiz_songs")
+            # `favorite` must exist before _SCHEMA, which builds an index on it.
+            # Pre-existing rows are genuine user favorites → default 1.
+            if "quiz_songs" in tables:
+                song_cols = {r["name"] for r in conn.execute("PRAGMA table_info(quiz_songs)")}
+                if "favorite" not in song_cols:
+                    conn.execute(
+                        "ALTER TABLE quiz_songs ADD COLUMN favorite INTEGER NOT NULL DEFAULT 1"
+                    )
             conn.executescript(_SCHEMA)
             cols = {r["name"] for r in conn.execute("PRAGMA table_info(quiz_questions)")}
             if "author" not in cols:
@@ -829,9 +859,13 @@ class QuizDatabase:
                     "ALTER TABLE quiz_questions ADD COLUMN source_excerpt_type TEXT "
                     "NOT NULL DEFAULT 'other'"
                 )
+            if "tested_jlpt_level" not in cols:
+                conn.execute("ALTER TABLE quiz_questions ADD COLUMN tested_jlpt_level TEXT")
             vocab_cols = {r["name"] for r in conn.execute("PRAGMA table_info(quiz_vocab_cards)")}
             if "source_media_url" not in vocab_cols:
                 conn.execute("ALTER TABLE quiz_vocab_cards ADD COLUMN source_media_url TEXT")
+            if "tested_jlpt_level" not in vocab_cols:
+                conn.execute("ALTER TABLE quiz_vocab_cards ADD COLUMN tested_jlpt_level TEXT")
             # "other" is only a fallback bucket, not a trustworthy explicit value.
             # Re-infer it on every startup so previously migrated rows converge.
             self._backfill_source_excerpt_types(conn, overwrite_other=True)
@@ -959,9 +993,9 @@ class QuizDatabase:
                     example_ja, example_source_kind, source_name, source_text_url,
                     source_media_url,
                     primary_question_id, support_question_ids_json, exam_points_json,
-                    author, created_at, updated_at
+                    tested_jlpt_level, author, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(vocab_id) DO UPDATE SET
                     reading_hiragana = excluded.reading_hiragana,
                     zh_gloss_short = excluded.zh_gloss_short,
@@ -973,6 +1007,7 @@ class QuizDatabase:
                     primary_question_id = excluded.primary_question_id,
                     support_question_ids_json = excluded.support_question_ids_json,
                     exam_points_json = excluded.exam_points_json,
+                    tested_jlpt_level = excluded.tested_jlpt_level,
                     author = excluded.author,
                     updated_at = excluded.updated_at
                 """,
@@ -990,6 +1025,11 @@ class QuizDatabase:
                     (primary["question_id"] or "").strip(),
                     json.dumps(list(support_ids), ensure_ascii=False),
                     json.dumps(list(exam_points), ensure_ascii=False),
+                    (
+                        primary["tested_jlpt_level"]
+                        if "tested_jlpt_level" in primary.keys()
+                        else None
+                    ),
                     "codex",
                     created_at,
                     now,
@@ -1024,6 +1064,7 @@ class QuizDatabase:
         source_excerpt: str | None = None,
         source_excerpt_type: str | None = None,
         tested_point: str | None = None,
+        tested_jlpt_level: str | None = None,
         verified: bool = True,
         author: str = "Claude",
         allow_ungrounded: bool = False,
@@ -1089,10 +1130,10 @@ class QuizDatabase:
                     question_id, level, exam_point, stem, options_json, answer_index,
                     explanation, source_type, source_name, source_text_url,
                     source_media_url, source_excerpt, source_excerpt_type,
-                    tested_point, verified,
+                    tested_point, tested_jlpt_level, verified,
                     served_count, author, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
                 ON CONFLICT(question_id) DO UPDATE SET
                     exam_point = excluded.exam_point,
                     options_json = excluded.options_json,
@@ -1104,6 +1145,7 @@ class QuizDatabase:
                     source_excerpt = excluded.source_excerpt,
                     source_excerpt_type = excluded.source_excerpt_type,
                     tested_point = excluded.tested_point,
+                    tested_jlpt_level = excluded.tested_jlpt_level,
                     verified = excluded.verified,
                     author = excluded.author,
                     updated_at = excluded.updated_at
@@ -1114,6 +1156,7 @@ class QuizDatabase:
                     (explanation or "").strip(), (source_type or "other").strip(),
                     (source_name or "").strip(), source_text_url, source_media_url,
                     source_excerpt, excerpt_kind, (tested_point or "").strip() or None,
+                    (tested_jlpt_level or "").strip() or None,
                     1 if verified else 0,
                     (author or "Claude").strip(), created_at, now,
                 ),
@@ -1631,21 +1674,23 @@ class QuizDatabase:
         status: str,
         youtube_title_raw: str | None = None,
         video_id: str | None = None,
+        favorite: bool = True,
     ) -> int:
         now = _utc_now_iso()
         with self.connect() as conn:
             existing = conn.execute(
-                "SELECT id, created_at FROM favorite_songs WHERE youtube_short_url = ?",
+                "SELECT id, created_at FROM quiz_songs WHERE youtube_short_url = ?",
                 ((youtube_short_url or "").strip(),),
             ).fetchone()
             created_at = existing["created_at"] if existing else now
             conn.execute(
                 """
-                INSERT INTO favorite_songs (
+                INSERT INTO quiz_songs (
                     title, artist, youtube_url, youtube_short_url, lyrics_url,
-                    youtube_title_raw, video_id, status, last_error, created_at, updated_at
+                    youtube_title_raw, video_id, status, favorite, last_error,
+                    created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, NULL, ?, ?, ?, NULL, ?, ?)
+                VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, NULL, ?, ?)
                 ON CONFLICT(youtube_short_url) DO UPDATE SET
                     title = excluded.title,
                     artist = excluded.artist,
@@ -1653,6 +1698,9 @@ class QuizDatabase:
                     youtube_title_raw = excluded.youtube_title_raw,
                     video_id = excluded.video_id,
                     status = excluded.status,
+                    -- favorite is sticky: once hearted, a later quiz_source
+                    -- re-ingest must not silently un-favorite it.
+                    favorite = MAX(quiz_songs.favorite, excluded.favorite),
                     last_error = NULL,
                     updated_at = excluded.updated_at
                 """,
@@ -1664,12 +1712,13 @@ class QuizDatabase:
                     (youtube_title_raw or "").strip() or None,
                     (video_id or "").strip() or None,
                     (status or "pending").strip(),
+                    1 if favorite else 0,
                     created_at,
                     now,
                 ),
             )
             row = conn.execute(
-                "SELECT id FROM favorite_songs WHERE youtube_short_url = ?",
+                "SELECT id FROM quiz_songs WHERE youtube_short_url = ?",
                 ((youtube_short_url or "").strip(),),
             ).fetchone()
         assert row is not None
@@ -1678,14 +1727,14 @@ class QuizDatabase:
     def get_favorite_song_by_youtube_short_url(self, youtube_short_url: str) -> sqlite3.Row | None:
         with self.connect() as conn:
             return conn.execute(
-                "SELECT * FROM favorite_songs WHERE youtube_short_url = ? LIMIT 1",
+                "SELECT * FROM quiz_songs WHERE youtube_short_url = ? LIMIT 1",
                 ((youtube_short_url or "").strip(),),
             ).fetchone()
 
     def update_favorite_song_artist(self, *, song_id: int, artist: str) -> None:
         with self.connect() as conn:
             conn.execute(
-                "UPDATE favorite_songs SET artist = ?, updated_at = ? WHERE id = ?",
+                "UPDATE quiz_songs SET artist = ?, updated_at = ? WHERE id = ?",
                 ((artist or "").strip(), _utc_now_iso(), int(song_id)),
             )
 
@@ -1700,7 +1749,7 @@ class QuizDatabase:
         with self.connect() as conn:
             conn.execute(
                 """
-                UPDATE favorite_songs
+                UPDATE quiz_songs
                 SET status = ?, lyrics_url = COALESCE(?, lyrics_url), last_error = ?, updated_at = ?
                 WHERE id = ?
                 """,
@@ -1729,7 +1778,7 @@ class QuizDatabase:
         with self.connect() as conn:
             conn.execute(
                 """
-                UPDATE favorite_songs
+                UPDATE quiz_songs
                 SET
                     title = COALESCE(NULLIF(?, ''), title),
                     artist = COALESCE(NULLIF(?, ''), artist),
@@ -1852,7 +1901,7 @@ class QuizDatabase:
                     t.used_quiz_count AS used_quiz_count,
                     t.used_flashcard_count AS used_flashcard_count
                 FROM vocabulary_tokens t
-                JOIN favorite_songs f ON f.id = t.song_id
+                JOIN quiz_songs f ON f.id = t.song_id
                 JOIN sentences s ON s.id = t.sentence_id
                 WHERE """ + " AND ".join(clauses) + """
                 ORDER BY RANDOM()
@@ -1898,7 +1947,7 @@ class QuizDatabase:
         with self.connect() as conn:
             song = conn.execute(
                 "SELECT id, title, artist, youtube_short_url, lyrics_url, status "
-                "FROM favorite_songs WHERE id = ?",
+                "FROM quiz_songs WHERE id = ?",
                 (int(song_id),),
             ).fetchone()
             if song is None:
@@ -2170,6 +2219,9 @@ def _row_to_question(row: sqlite3.Row) -> QuizQuestion:
             )
         ),
         tested_point=(row["tested_point"] if "tested_point" in row.keys() else None),
+        tested_jlpt_level=(
+            row["tested_jlpt_level"] if "tested_jlpt_level" in row.keys() else None
+        ),
         verified=bool(row["verified"]),
         served_count=int(row["served_count"]),
         author=row["author"],
@@ -2226,6 +2278,9 @@ def _row_to_vocab_card(row: sqlite3.Row) -> QuizVocabCard:
         primary_question_id=row["primary_question_id"] or "",
         support_question_ids=tuple(str(x).strip() for x in support_ids if str(x).strip()),
         exam_points=tuple(str(x).strip() for x in exam_points if str(x).strip()),
+        tested_jlpt_level=(
+            row["tested_jlpt_level"] if "tested_jlpt_level" in row.keys() else None
+        ),
         author=row["author"] or "codex",
         created_at=row["created_at"],
         updated_at=row["updated_at"],
