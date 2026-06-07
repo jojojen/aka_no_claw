@@ -19,7 +19,7 @@ Subcommands:
                                        (weighted); drops out once you re-answer right.
   /quiz stats                        — per-題型 accuracy, weakest 考点, 混淆選項分析.
   /quiz vocab [mode|word]            — 單字卡：弱點/全部/錯題/隨機/查詞.
-  /quiz like song <youtube_url>      — 收藏歌曲並預先抓歌詞/NLP.
+  /quizlikesong <youtube_url>         — 收藏歌曲並預先抓歌詞/NLP.
   /quiz review [page]                — answer-revealed paginated list (QA review).
   /quiz gen20 [n]                    — bootstrap: generate N (default 20) questions.
   /quiz teach <知識點>                — distil a reviewer correction into the KB.
@@ -148,7 +148,7 @@ def _like_song(settings: AssistantSettings, db, youtube_url: str) -> str:
 
     url = (youtube_url or "").strip()
     if not url:
-        return "用法：/quiz like song <youtube_url>"
+        return "用法：/quizlikesong <youtube_url>"
     try:
         result = FavoriteSongIngestor(settings=settings, db=db).ingest_youtube_song(url)
     except FavoriteSongError as exc:
@@ -702,7 +702,7 @@ def build_quiz_handler(
             if action == "like":
                 kind, _, target = rest.partition(" ")
                 if kind.lower().strip() != "song":
-                    return "用法：/quiz like song <youtube_url>"
+                    return "用法：/quizlikesong <youtube_url>"
                 return _like_song(settings, db, target)
             if action in ("wrong", "錯題", "錯題本"):
                 level, theme = _parse_serve_args(rest)
