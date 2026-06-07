@@ -11,7 +11,10 @@ from openclaw_adapter.quiz_db import (
     format_authoring_knowledge_block,
     infer_source_excerpt_type,
     is_grounded,
+    source_excerpt_vocab_example,
     source_excerpt_type_conflicts_with_exam_point,
+    vocab_example_is_low_value,
+    vocab_seed_is_placeholder_example,
     youhou_target_word_presence_leaks,
 )
 
@@ -384,6 +387,80 @@ class TestAuthorColumn:
 
 
 class TestVocabCards:
+    def test_placeholder_seed_examples_are_not_vocab_cards(self, tmp_path, monkeypatch):
+        db = _db(tmp_path)
+        monkeypatch.setitem(
+            __import__(
+                "openclaw_adapter.quiz_db", fromlist=["QUIZ_VOCAB_SEED"]
+            ).QUIZ_VOCAB_SEED,
+            "25時の情熱",
+            {
+                "reading_hiragana": "にごじのじょうねつ",
+                "zh_gloss_short": "25時の情熱",
+                "example_ja": "「25時の情熱」という言葉が心に残った。",
+            },
+        )
+        db.insert_question(
+            level="JLPT N1",
+            exam_point="漢字読み",
+            stem="次の一節「25時の情熱」にある〈25時の情熱〉の読み方として最も適切なものはどれか。",
+            options=("にごじのじょうねつ", "にじゅうごじのじょうねつ", "にごときのねつ", "ごじのじょうねつ"),
+            answer_index=0,
+            explanation="〈25時の情熱〉は「にごじのじょうねつ」と読む。",
+            source_type="vocaloid_song",
+            source_name="25時の情熱",
+            source_text_url="https://vocadb.net/Search?searchType=Song&filter=Songs&query=25%E6%99%82%E3%81%AE%E6%83%85%E7%86%B1",
+            source_media_url="https://youtu.be/RifILHUOV_w",
+            source_excerpt="25時の情熱",
+            source_excerpt_type="title",
+            tested_point="25時の情熱",
+            author="codex",
+            verified=True,
+            allow_ungrounded=True,
+        )
+        assert db.get_vocab_card(headword="25時の情熱", level="JLPT N1") is None
+
+    def test_placeholder_seed_detection_allows_real_examples(self):
+        assert vocab_seed_is_placeholder_example(
+            "25時の情熱",
+            {
+                "reading_hiragana": "にごじのじょうねつ",
+                "zh_gloss_short": "25時の情熱",
+                "example_ja": "「25時の情熱」という言葉が心に残った。",
+            },
+        )
+        assert not vocab_seed_is_placeholder_example(
+            "お気に召すまま",
+            {
+                "reading_hiragana": "おきにめすまま",
+                "zh_gloss_short": "隨您喜歡、任您高興",
+                "example_ja": "お気に召すまま選んでください。",
+            },
+        )
+        assert vocab_example_is_low_value(
+            "退路", "「退路」の意味を調べた。"
+        )
+        assert not vocab_example_is_low_value(
+            "退路", "退路を断たれた。"
+        )
+
+    def test_source_excerpt_example_requires_real_non_title_sentence(self):
+        assert source_excerpt_vocab_example(
+            headword="範疇",
+            source_excerpt="プログラムの範疇さ",
+            source_excerpt_type="lyric",
+        ) == "プログラムの範疇さ"
+        assert source_excerpt_vocab_example(
+            headword="威風堂々",
+            source_excerpt="威風堂々",
+            source_excerpt_type="title",
+        ) is None
+        assert source_excerpt_vocab_example(
+            headword="周年",
+            source_excerpt="プロセカ1周年曲『",
+            source_excerpt_type="article",
+        ) is None
+
     def test_insert_codex_lexical_question_backfills_vocab_card(self, tmp_path):
         db = _db(tmp_path)
         db.insert_question(
@@ -407,10 +484,61 @@ class TestVocabCards:
         assert card is not None
         assert card.reading_hiragana == "はんちゅう"
         assert card.zh_gloss_short == "範圍、類別"
-        assert card.example_ja == "これは私の範疇ではありません。"
+        assert card.example_ja == "プログラムの範疇さ"
+        assert card.example_source_kind == "source_excerpt"
         assert card.source_name == "ダンスロボットダンス"
         assert card.source_media_url == "https://www.youtube.com/watch?v=g7dvpD_zlIM"
         assert card.exam_points == ("漢字読み",)
+
+    def test_vocab_cards_do_not_share_same_example_sentence(self, tmp_path, monkeypatch):
+        quiz_db_module = __import__(
+            "openclaw_adapter.quiz_db", fromlist=["QUIZ_VOCAB_SEED"]
+        )
+        monkeypatch.setitem(
+            quiz_db_module.QUIZ_VOCAB_SEED,
+            "範疇A",
+            {
+                "reading_hiragana": "はんちゅうえー",
+                "zh_gloss_short": "範疇A",
+                "example_ja": "範疇Aの例。",
+            },
+        )
+        monkeypatch.setitem(
+            quiz_db_module.QUIZ_VOCAB_SEED,
+            "範疇B",
+            {
+                "reading_hiragana": "はんちゅうびー",
+                "zh_gloss_short": "範疇B",
+                "example_ja": "範疇Bの例。",
+            },
+        )
+
+        db = _db(tmp_path)
+        for term, answer in (("範疇A", 0), ("範疇B", 1)):
+            db.insert_question(
+                level="JLPT N1",
+                exam_point="漢字読み",
+                stem=f"次の一節「範疇Aと範疇Bを比べる」にある〈{term}〉の読み方として最も適切なものはどれか。",
+                options=("はんちゅうえー", "はんちゅうびー", "ばんちゅうえー", "ばんちゅうびー"),
+                answer_index=answer,
+                explanation=f"〈{term}〉の読みを問う。",
+                source_type="vocaloid_song",
+                source_name="テスト曲",
+                source_text_url="https://example.com/article",
+                source_media_url="https://youtu.be/example",
+                source_excerpt="範疇Aと範疇Bを比べる",
+                source_excerpt_type="article",
+                tested_point=term,
+                author="codex",
+                verified=True,
+                allow_ungrounded=True,
+            )
+
+        cards = [
+            db.get_vocab_card(headword="範疇A", level="JLPT N1"),
+            db.get_vocab_card(headword="範疇B", level="JLPT N1"),
+        ]
+        assert sum(card is not None for card in cards) == 1
 
     def test_vocab_card_prefers_youhou_as_primary_when_same_headword_repeats(self, tmp_path):
         db = _db(tmp_path)
@@ -619,10 +747,10 @@ class TestSourceExcerptType:
         ) == "article"
 
     def test_conflict_rules_are_conservative(self):
-        assert source_excerpt_type_conflicts_with_exam_point(
+        assert not source_excerpt_type_conflicts_with_exam_point(
             exam_point="言い換え類義", source_excerpt_type="article"
         )
-        assert source_excerpt_type_conflicts_with_exam_point(
+        assert not source_excerpt_type_conflicts_with_exam_point(
             exam_point="用法", source_excerpt_type="commentary"
         )
         assert source_excerpt_type_conflicts_with_exam_point(
@@ -635,18 +763,36 @@ class TestSourceExcerptType:
             exam_point="内容理解（短文）", source_excerpt_type="article"
         )
 
-    def test_insert_rejects_commentary_grounding_for_non_reading(self, tmp_path):
+    def test_insert_accepts_verbatim_article_grounding_for_vocabulary(self, tmp_path):
         db = _db(tmp_path)
-        with pytest.raises(ValueError, match="source_excerpt_type conflicts"):
+        q = db.insert_question(
+            level="JLPT N1",
+            exam_point="言い換え類義",
+            stem="次の一節「疾走感溢れる四つ打ちのタイトなリズム」にある〈疾走感〉の意味として最も近いものはどれか。",
+            options=("速く走るような勢い", "遅い感じ", "静けさ", "懐かしさ"),
+            answer_index=0,
+            source_name="命に嫌われている",
+            source_text_url="https://utaten.com/specialArticle/index/9999",
+            source_excerpt="疾走感溢れる四つ打ちのタイトなリズム",
+            tested_point="疾走感",
+            author="codex",
+        )
+        assert q.source_excerpt_type == "article"
+
+    def test_insert_still_rejects_fabricated_article_grounding_for_vocabulary(self, tmp_path):
+        db = _db(tmp_path)
+        with pytest.raises(ValueError, match="question not grounded"):
             db.insert_question(
                 level="JLPT N1",
                 exam_point="言い換え類義",
-                stem="次の一節「疾走感溢れる四つ打ちのタイトなリズム」にある〈疾走感〉の意味として最も近いものはどれか。",
+                stem="次の一節「疾走するような勢いがある曲」にある〈疾走感〉の意味として最も近いものはどれか。",
                 options=("速く走るような勢い", "遅い感じ", "静けさ", "懐かしさ"),
                 answer_index=0,
                 source_name="命に嫌われている",
                 source_text_url="https://utaten.com/specialArticle/index/9999",
                 source_excerpt="疾走感溢れる四つ打ちのタイトなリズム",
+                tested_point="疾走感",
+                author="codex",
             )
 
 

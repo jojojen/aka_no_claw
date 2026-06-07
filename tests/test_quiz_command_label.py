@@ -496,7 +496,7 @@ def test_vocab_audio_callback_sends_document_for_vocab_card(tmp_path, monkeypatc
         source_name="Just Be Friends",
         source_text_url="https://example.com/text",
         source_media_url="https://example.com/song",
-        source_excerpt="いがみ合って",
+        source_excerpt="二人はいがみ合っていた。",
         tested_point="いがみ合って",
         author="codex",
         verified=True,

@@ -172,11 +172,85 @@ def source_excerpt_type_conflicts_with_exam_point(
     kind = _normalize_source_excerpt_type(source_excerpt_type)
     if is_reading_exam_point(ep):
         return False
-    if kind in {"article", "commentary"}:
-        return True
+    # Article/commentary excerpts may ground vocabulary questions when the stem
+    # quotes the real sentence verbatim. The grounding gate below still rejects
+    # fabricated or merely themed-on-source stems.
     if kind == "title" and "漢字読み" not in ep:
         return True
     return False
+
+
+def vocab_seed_is_placeholder_example(
+    headword: str, seed: dict[str, str] | None
+) -> bool:
+    """Detect seed rows that were placeholders, not real vocabulary cards."""
+    if not seed:
+        return False
+    example = (seed.get("example_ja") or "").strip()
+    return example in {
+        f"「{headword}」という言葉が心に残った。",
+        f"{headword}という言葉を覚えた。",
+    }
+
+
+def vocab_example_is_low_value(headword: str, example_ja: str | None) -> bool:
+    """Reject generic examples that do not help remember real usage."""
+    headword = (headword or "").strip()
+    example = (example_ja or "").strip()
+    if not headword or not example:
+        return True
+    quoted = f"「{headword}」"
+    generic_examples = {
+        f"{headword}という言葉を覚えた。",
+        f"{quoted}という言葉を覚えた。",
+        f"{quoted}という言葉が心に残った。",
+        f"{headword}について考えた。",
+        f"{quoted}について考えた。",
+        f"{headword}の意味を調べた。",
+        f"{quoted}の意味を調べた。",
+        f"{headword}を調べた。",
+        f"{quoted}を調べた。",
+        f"{headword}を学んだ。",
+        f"{quoted}を学んだ。",
+    }
+    return example in generic_examples
+
+
+def source_excerpt_vocab_example(
+    *, headword: str, source_excerpt: str | None, source_excerpt_type: str | None
+) -> str | None:
+    """Pick a real source sentence containing the headword for a vocab card."""
+    headword = (headword or "").strip()
+    excerpt = re.sub(r"\s+", " ", (source_excerpt or "").strip())
+    if not headword or not excerpt or headword not in excerpt:
+        return None
+    if _normalize_source_excerpt_type(source_excerpt_type) == "title":
+        # A title can ground a reading question, but it is not a memory-helpful
+        # example sentence by itself.
+        return None
+    pieces = [
+        p.strip()
+        for p in re.split(r"(?<=[。！？!?])\s+|[\r\n]+", excerpt)
+        if p.strip()
+    ]
+    candidates = [p for p in pieces if headword in p]
+    if not candidates:
+        candidates = [excerpt]
+    candidates = [
+        p for p in candidates
+        if not p.endswith(("「", "『", "（", "(", "、", ","))
+    ]
+    usable = [
+        p for p in candidates
+        if headword in p and len(_normalize_grounding(p)) > len(_normalize_grounding(headword)) + 2
+    ]
+    if not usable:
+        return None
+    return min(usable, key=len)
+
+
+def _normalize_vocab_example_identity(example: str | None) -> str:
+    return _normalize_grounding(example or "")
 
 
 def _stem_segments(stem: str) -> list[str]:
@@ -735,6 +809,7 @@ class QuizDatabase:
             groups.setdefault((row["tested_point"] or "").strip(), []).append(row)
 
         seen_ids: set[str] = set()
+        used_example_identities: set[str] = set()
         now = _utc_now_iso()
         for headword, group in groups.items():
             vocab_id = build_vocab_card_id(level="JLPT N1", headword=headword)
@@ -760,6 +835,18 @@ class QuizDatabase:
                 )
             )
             primary = group[0]
+            example_ja = source_excerpt_vocab_example(
+                headword=headword,
+                source_excerpt=primary["source_excerpt"],
+                source_excerpt_type=primary["source_excerpt_type"],
+            )
+            example_source_kind = "source_excerpt"
+            if not example_ja:
+                continue
+            example_identity = _normalize_vocab_example_identity(example_ja)
+            if not example_identity or example_identity in used_example_identities:
+                continue
+            used_example_identities.add(example_identity)
             support_ids = tuple(dict.fromkeys((r["question_id"] or "").strip() for r in group if (r["question_id"] or "").strip()))
             exam_points = tuple(
                 ep for ep, _ in sorted(
@@ -803,8 +890,8 @@ class QuizDatabase:
                     headword,
                     seed["reading_hiragana"],
                     seed["zh_gloss_short"],
-                    seed["example_ja"],
-                    seed.get("example_source_kind", "adapted"),
+                    example_ja,
+                    example_source_kind,
                     (primary["source_name"] or "").strip(),
                     primary["source_text_url"],
                     primary["source_media_url"],
@@ -873,8 +960,8 @@ class QuizDatabase:
         ):
             raise ValueError(
                 "source_excerpt_type conflicts with exam_point: non-reading questions "
-                "must not ground on commentary/article text, and title-only grounding "
-                "is limited to 漢字読み"
+                "may use article/commentary text only when the quoted source text is "
+                "verbatim grounded, and title-only grounding is limited to 漢字読み"
             )
         if youhou_target_word_presence_leaks(
             exam_point=exam_point, stem=stem, options=opts, answer_index=int(answer_index)
