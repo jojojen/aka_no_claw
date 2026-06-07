@@ -419,6 +419,7 @@ def _render_vocab_card(card, *, mode: str, index: int, total: int) -> tuple[str,
     if _vocab_audio_enabled(card):
         buttons.append([{"text": "🔊 播放例句", "callback_data": f"quiz:va:{card.vocab_id}"}])
     buttons.append([{"text": "📝 出相關題", "callback_data": f"quiz:vr:{card.vocab_id}"}])
+    buttons.append([{"text": "🎲 下一張隨機", "callback_data": f"quiz:vrnd:{card.level}"}])
     return "\n".join(lines), {"inline_keyboard": buttons}
 
 
@@ -911,6 +912,15 @@ def build_quiz_callback_handler(
                 if card is None:
                     return "找不到這張單字卡", None, None
                 text, markup = _render_vocab_card(card, mode="lookup", index=0, total=1)
+                return None, text, markup
+            if action == "vrnd":
+                level = rest or _DEFAULT_LEVEL
+                cards = db.list_vocab_cards(
+                    level=level, chat_id=str(chat_id or ""), mode="random"
+                )
+                if not cards:
+                    return "目前沒有可用的單字卡", None, None
+                text, markup = _render_vocab_card(cards[0], mode="random", index=0, total=1)
                 return None, text, markup
             if action == "va":
                 card = db.get_vocab_card(vocab_id=rest, level=_DEFAULT_LEVEL)
