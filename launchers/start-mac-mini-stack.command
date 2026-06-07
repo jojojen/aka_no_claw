@@ -31,6 +31,13 @@ LAUNCHCTL_OLLAMA_LABEL="local.openclaw.ollama"
 LAUNCHCTL_REPUTATION_LABEL="local.openclaw.reputation"
 LAUNCHCTL_TELEGRAM_LABEL="local.openclaw.telegram"
 LAUNCHCTL_OPPORTUNITY_LABEL="local.openclaw.opportunity"
+LAUNCHCTL_AIVIS_LABEL="local.openclaw.aivis"
+
+AIVIS_HOST="${AIVIS_HOST:-127.0.0.1}"
+AIVIS_PORT="${AIVIS_PORT:-10101}"
+AIVIS_APP_PATH="${AIVIS_APP_PATH:-${HOME}/Applications/AivisSpeech.app}"
+AIVIS_ENGINE_RUN="${AIVIS_APP_PATH}/Contents/Resources/AivisSpeech-Engine/run"
+AIVIS_READY_TIMEOUT_SECONDS="${AIVIS_READY_TIMEOUT_SECONDS:-60}"
 
 mkdir -p "${RUN_DIR}" "${LOG_DIR}"
 
@@ -669,6 +676,59 @@ start_ollama_if_available() {
   return 1
 }
 
+aivis_endpoint_ready() {
+  curl -fsS -m 3 "http://${AIVIS_HOST}:${AIVIS_PORT}/version" >/dev/null 2>&1
+}
+
+start_aivis_engine() {
+  # AivisSpeech is the preferred /quiz vocab-card TTS; the bot falls back to
+  # macOS `say` (Kyoko) only when this engine is unreachable. Keep it supervised
+  # so cards always get the AivisSpeech voice. TTS is non-critical: never fail the
+  # whole stack here, just warn and let the Kyoko fallback cover the gap.
+  if aivis_endpoint_ready; then
+    log "AivisSpeech already serving on ${AIVIS_HOST}:${AIVIS_PORT}."
+    return 0
+  fi
+  if [[ ! -x "${AIVIS_ENGINE_RUN}" ]]; then
+    log "AivisSpeech engine binary not found at ${AIVIS_ENGINE_RUN}; skipping (run launchers/install-aivis-speech.command to install). /quiz audio will use macOS Kyoko."
+    return 0
+  fi
+  if ! have_command curl; then
+    log "curl not available to probe AivisSpeech; skipping engine supervision."
+    return 0
+  fi
+
+  log "Starting AivisSpeech engine on ${AIVIS_HOST}:${AIVIS_PORT}..."
+  if use_launchctl_services; then
+    if launchctl_job_exists "${LAUNCHCTL_AIVIS_LABEL}"; then
+      launchctl remove "${LAUNCHCTL_AIVIS_LABEL}" >/dev/null 2>&1 || true
+    fi
+    launchctl submit -l "${LAUNCHCTL_AIVIS_LABEL}" \
+      -o "${LOG_DIR}/aivis_speech.log" \
+      -e "${LOG_DIR}/aivis_speech.log" \
+      -- "${AIVIS_ENGINE_RUN}" --host "${AIVIS_HOST}" --port "${AIVIS_PORT}" --output_log_utf8
+    local pid
+    pid="$(launchctl_job_pid "${LAUNCHCTL_AIVIS_LABEL}")"
+    [[ -n "${pid}" ]] && echo "${pid}" >> "${PID_FILE}"
+  else
+    nohup "${AIVIS_ENGINE_RUN}" --host "${AIVIS_HOST}" --port "${AIVIS_PORT}" --output_log_utf8 \
+      >> "${LOG_DIR}/aivis_speech.log" 2>&1 &
+    echo $! >> "${PID_FILE}"
+  fi
+
+  local waited=0
+  while (( waited < AIVIS_READY_TIMEOUT_SECONDS )); do
+    if aivis_endpoint_ready; then
+      log "AivisSpeech is ready on ${AIVIS_HOST}:${AIVIS_PORT}."
+      return 0
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+  log "AivisSpeech did not become ready within ${AIVIS_READY_TIMEOUT_SECONDS}s; /quiz audio will fall back to macOS Kyoko until it comes up. See ${LOG_DIR}/aivis_speech.log"
+  return 0
+}
+
 model_list_from_env() {
   local raw="$1"
   local fallback="$2"
@@ -922,7 +982,7 @@ stop_launchctl_jobs() {
     return
   fi
   local label
-  for label in "${LAUNCHCTL_OLLAMA_LABEL}" "${LAUNCHCTL_REPUTATION_LABEL}" "${LAUNCHCTL_TELEGRAM_LABEL}" "${LAUNCHCTL_OPPORTUNITY_LABEL}"; do
+  for label in "${LAUNCHCTL_OLLAMA_LABEL}" "${LAUNCHCTL_AIVIS_LABEL}" "${LAUNCHCTL_REPUTATION_LABEL}" "${LAUNCHCTL_TELEGRAM_LABEL}" "${LAUNCHCTL_OPPORTUNITY_LABEL}"; do
     if launchctl_job_exists "${label}"; then
       log "Stopping launchctl job ${label}."
       launchctl remove "${label}" >/dev/null 2>&1 || true
@@ -1153,6 +1213,7 @@ main() {
   init_reputation_runtime
   ensure_configured_ollama_runtime
   setup_ollama_if_requested
+  start_aivis_engine
   start_reputation_server
   wait_for_reputation_server
   start_openclaw_telegram
@@ -1164,6 +1225,7 @@ main() {
   log "  ${LOG_DIR}/reputation_snapshot.log"
   log "  ${LOG_DIR}/openclaw_telegram.log"
   log "  ${LOG_DIR}/opportunity_agent.log"
+  log "  ${LOG_DIR}/aivis_speech.log"
   if use_launchctl_services; then
     log "macOS Terminal may show '[Process completed]' after this; the services keep running in the background."
   fi
