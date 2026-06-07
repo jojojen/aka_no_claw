@@ -387,6 +387,7 @@ def _render_vocab_card(card, *, mode: str, index: int, total: int) -> tuple[str,
         "all": "全部單字卡",
         "wrong": "錯題單字卡",
         "random": "隨機單字卡",
+        "recent": "最新加入單字卡",
         "lookup": "單字查詢",
     }.get(mode, "單字卡")
     lines = [
@@ -404,7 +405,7 @@ def _render_vocab_card(card, *, mode: str, index: int, total: int) -> tuple[str,
     if card.source_text_url:
         lines.append(f"原文：{card.source_text_url}")
     buttons: list[list[dict]] = []
-    if mode in {"weak", "all", "wrong"} and total > 1:
+    if mode in {"weak", "all", "wrong", "recent"} and total > 1:
         nav: list[dict] = []
         if index > 0:
             nav.append(
@@ -419,6 +420,7 @@ def _render_vocab_card(card, *, mode: str, index: int, total: int) -> tuple[str,
     if _vocab_audio_enabled(card):
         buttons.append([{"text": "🔊 播放例句", "callback_data": f"quiz:va:{card.vocab_id}"}])
     buttons.append([{"text": "📝 出相關題", "callback_data": f"quiz:vr:{card.vocab_id}"}])
+    buttons.append([{"text": "🆕 最新加入", "callback_data": f"quiz:vb:{card.level}:recent:0"}])
     buttons.append([{"text": "🎲 下一張隨機", "callback_data": f"quiz:vrnd:{card.level}"}])
     return "\n".join(lines), {"inline_keyboard": buttons}
 
