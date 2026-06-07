@@ -163,7 +163,7 @@ def _like_song(settings: AssistantSettings, db, youtube_url: str) -> str:
         f"歌曲：{result.title}\n"
         f"歌手：{result.artist or '—'}\n"
         f"YouTube：{result.youtube_short_url}\n"
-        f"歌詞：{result.lyrics_url}\n"
+        f"歌詞：{result.lyrics_url or '無'}\n"
         f"狀態：{result.status}\n"
         f"句子數：{result.sentence_count}\n"
         f"詞元數：{result.token_count}\n"

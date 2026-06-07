@@ -1551,6 +1551,13 @@ class QuizDatabase:
                 ((youtube_short_url or "").strip(),),
             ).fetchone()
 
+    def update_favorite_song_artist(self, *, song_id: int, artist: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE favorite_songs SET artist = ?, updated_at = ? WHERE id = ?",
+                ((artist or "").strip(), _utc_now_iso(), int(song_id)),
+            )
+
     def mark_favorite_song_status(
         self,
         *,
