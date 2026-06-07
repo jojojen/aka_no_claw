@@ -380,19 +380,48 @@ class FavoriteSongIngestor:
             artist=str(existing["artist"] or ""),
             raw_title=str(existing["youtube_title_raw"] or ""),
         ):
-            counts = self._db.favorite_song_analysis_counts(int(existing["id"]))
-            return FavoriteSongIngestResult(
-                song_id=int(existing["id"]),
-                title=(existing["title"] or metadata.title).strip(),
-                artist=(existing["artist"] or metadata.artist).strip(),
-                youtube_short_url=metadata.youtube_short_url,
-                lyrics_url=(existing["lyrics_url"] or "").strip(),
-                status="ready",
-                sentence_count=counts["sentences"],
-                token_count=counts["tokens"],
-                n1_token_count=counts["n1_tokens"],
-                reused_existing=True,
+            # If the YouTube title changed the stored song is wrong — re-ingest.
+            stored_title_key = _normalize_title(str(existing["title"] or ""))
+            fresh_title_key = _normalize_title(metadata.title)
+            title_mismatch = bool(
+                stored_title_key and fresh_title_key and stored_title_key != fresh_title_key
             )
+            if title_mismatch:
+                logger.warning(
+                    "Favorite-song title mismatch video_id=%s stored=%r fresh=%r — re-ingesting",
+                    metadata.video_id,
+                    existing["title"],
+                    metadata.title,
+                )
+            else:
+                # VocaDB stores the producer's number alias (e.g. "98 feat. 可不") while
+                # YouTube uses the human-readable channel name (e.g. "ロクデナシ"). Refresh
+                # the stored artist whenever the YouTube author is a better display name.
+                display_artist = str(existing["artist"] or "").strip()
+                fresh_artist = metadata.artist
+                if (
+                    fresh_artist
+                    and not _metadata_looks_suspicious(title=metadata.title, artist=fresh_artist)
+                    and _normalize_title(fresh_artist) != _normalize_title(display_artist)
+                ):
+                    self._db.update_favorite_song_artist(
+                        song_id=int(existing["id"]), artist=fresh_artist
+                    )
+                    display_artist = fresh_artist
+                counts = self._db.favorite_song_analysis_counts(int(existing["id"]))
+                return FavoriteSongIngestResult(
+                    song_id=int(existing["id"]),
+                    title=(existing["title"] or metadata.title).strip(),
+                    artist=display_artist or metadata.artist,
+                    youtube_short_url=metadata.youtube_short_url,
+                    lyrics_url=(existing["lyrics_url"] or "").strip(),
+                    status="ready",
+                    sentence_count=counts["sentences"],
+                    token_count=counts["tokens"],
+                    n1_token_count=counts["n1_tokens"],
+                    reused_existing=True,
+                )
+            # title_mismatch=True falls through to full re-ingest below
 
         song_id = self._db.upsert_favorite_song(
             title=metadata.title,
@@ -404,10 +433,35 @@ class FavoriteSongIngestor:
             video_id=metadata.video_id,
         )
         try:
-            lyrics, metadata = self._find_lyrics_with_metadata_fallback(metadata)
-            sentences = split_lyrics_sentences(lyrics.lyrics_text)
-            if not sentences:
-                raise FavoriteSongError("歌詞切句後沒有可用句子")
+            try:
+                lyrics, metadata = self._find_lyrics_with_metadata_fallback(metadata)
+                sentences = split_lyrics_sentences(lyrics.lyrics_text)
+                if not sentences:
+                    raise FavoriteSongError("歌詞切句後沒有可用句子")
+            except FavoriteSongError:
+                # No usable lyrics found — store the song as ready with 無 rather
+                # than leaving it as failed and blocking future use.
+                self._db.replace_favorite_song_analysis(
+                    song_id=song_id,
+                    title=metadata.title,
+                    artist=metadata.artist,
+                    lyrics_url="",
+                    lyrics_text="",
+                    sentences=[],
+                    tokens=[],
+                    status="ready",
+                )
+                return FavoriteSongIngestResult(
+                    song_id=song_id,
+                    title=metadata.title,
+                    artist=metadata.artist,
+                    youtube_short_url=metadata.youtube_short_url,
+                    lyrics_url="",
+                    status="ready",
+                    sentence_count=0,
+                    token_count=0,
+                    n1_token_count=0,
+                )
             tokens = self._analyzer.analyze(sentences)
             final_title = (lyrics.title or metadata.title).strip() or metadata.title
             final_artist = (lyrics.artist or metadata.artist).strip() or metadata.artist
@@ -474,7 +528,10 @@ class FavoriteSongIngestor:
             )
 
     def _find_lyrics(self, *, title: str, artist: str, video_id: str) -> LyricsMatch:
-        for finder in (self._find_vocadb_lyrics, self._find_utanet_lyrics, self._find_utaten_lyrics):
+        # uta-net/utaten first: they cover mainstream J-pop/anime correctly.
+        # VocaDB last: fallback for indie Vocaloid tracks not on lyric sites, but
+        # it can return wrong Vocaloid covers for non-Vocaloid songs of the same name.
+        for finder in (self._find_utanet_lyrics, self._find_utaten_lyrics, self._find_vocadb_lyrics):
             try:
                 result = finder(title=title, artist=artist, video_id=video_id)
             except requests.RequestException as exc:
@@ -541,7 +598,25 @@ class FavoriteSongIngestor:
                 best = (score, item)
         if best is None:
             return None
-        item = best[1]
+        best_score, item = best
+        # Only use VocaDB when the video ID is confirmed in the entry's PV list.
+        # A title-only match is unreliable: the same title can exist as a Vocaloid
+        # track on VocaDB *and* as an unrelated human-vocal song not in VocaDB, and
+        # VocaDB would then return lyrics for the wrong version.
+        pv_ids = {
+            str(pv.get("pvId") or "").strip()
+            for pv in (item.get("pvs") or [])
+            if isinstance(pv, dict)
+        }
+        if video_id not in pv_ids:
+            return None
+        # Reject if YouTube artist and VocaDB artistString share no common token —
+        # this blocks Vocaloid covers from matching human-vocal songs of the same name.
+        yt_artist_key = _normalize_title(artist)
+        vdb_artist_key = _normalize_title(str(item.get("artistString") or ""))
+        if yt_artist_key and vdb_artist_key:
+            if yt_artist_key not in vdb_artist_key and vdb_artist_key not in yt_artist_key:
+                return None
         lyric_entry = _pick_vocadb_lyric_entry(item.get("lyrics") or [])
         if lyric_entry is None:
             return None
