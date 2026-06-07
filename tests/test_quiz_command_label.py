@@ -569,7 +569,7 @@ def test_quiz_like_song_usage(tmp_path):
     settings = SimpleNamespace(quiz_db_path=tmp_path / "quiz.sqlite3")
     handler = build_quiz_handler(settings)
     got = handler("like", "u1")
-    assert got == "用法：/quiz like song <youtube_url>"
+    assert got == "用法：/quizlikesong <youtube_url>"
 
 
 def test_quiz_like_song_success(tmp_path, monkeypatch):
