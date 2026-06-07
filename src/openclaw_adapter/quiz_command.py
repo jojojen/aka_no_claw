@@ -32,6 +32,7 @@ Callback payloads (prefix ``quiz`` is stripped by bot.py, so we see the rest):
                               — author-scoped type pick → serve (author-filtered)
   vb:<level>:<mode>:<index>   — vocabulary-card browsing
   vr:<vocab_id>               — serve one question related to the vocabulary card
+  vc:<vocab_id>               — show a specific vocab card directly (from grade result)
   p:<page>                    — re-render review page
   d:<question_id>             — delete a question, re-render current page
 
@@ -815,7 +816,22 @@ def build_quiz_callback_handler(
                 except Exception:
                     logger.exception("quiz: record_attempt failed qid=%s", qid)
                 db.mark_served(qid)
-                return toast, new_text, None  # clear keyboard
+                buttons: list[list[dict]] = [
+                    [{"text": "🎲 下一題（隨機）", "callback_data": f"quiz:t:{question.level}:*"}]
+                ]
+                if question.tested_point:
+                    try:
+                        vcard = db.get_vocab_card(
+                            headword=question.tested_point, level=question.level
+                        )
+                    except Exception:
+                        vcard = None
+                    if vcard is not None:
+                        buttons.append([{
+                            "text": f"📚 查「{question.tested_point}」單字卡",
+                            "callback_data": f"quiz:vc:{vcard.vocab_id}",
+                        }])
+                return toast, new_text, {"inline_keyboard": buttons}
             if action == "t":
                 # type-menu selection: rest = "<level>:<exam_point>"
                 # ('*' = random/all, '!' = 錯題本/wrong-only, else a specific 題型).
@@ -888,6 +904,13 @@ def build_quiz_callback_handler(
                     return "這張單字卡目前沒有可出的相關題目", None, None
                 db.mark_served(question.question_id)
                 text, markup = _question_view(question)
+                return None, text, markup
+            if action == "vc":
+                # Direct vocab-card view by vocab_id (jumped from grade result).
+                card = db.get_vocab_card(vocab_id=rest, level=_DEFAULT_LEVEL)
+                if card is None:
+                    return "找不到這張單字卡", None, None
+                text, markup = _render_vocab_card(card, mode="lookup", index=0, total=1)
                 return None, text, markup
             if action == "va":
                 card = db.get_vocab_card(vocab_id=rest, level=_DEFAULT_LEVEL)
