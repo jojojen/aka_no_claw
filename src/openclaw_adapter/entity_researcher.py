@@ -14,6 +14,7 @@ entity gets the freshly-backfilled context.
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import re
@@ -126,6 +127,7 @@ class EntityResearcher:
         search_fn: Callable | None = None,
         json_call_fn: Callable | None = None,
         recent_dedup_size: int = 200,
+        max_per_day: int = 15,
     ) -> None:
         self._db = knowledge_db
         self._endpoint = endpoint
@@ -149,6 +151,9 @@ class EntityResearcher:
         self._lock = threading.Lock()
         self._worker: threading.Thread | None = None
         self._stop = threading.Event()
+        self._max_per_day = max(1, max_per_day)
+        self._daily_count: int = 0
+        self._daily_date: str = ""
 
     # ── Queue API ──────────────────────────────────────────────────────────
 
@@ -169,8 +174,22 @@ class EntityResearcher:
                 return False
             if canonical in self._queue:
                 return False
+            today = datetime.date.today().isoformat()
+            if self._daily_date != today:
+                self._daily_date = today
+                self._daily_count = 0
+            if self._daily_count >= self._max_per_day:
+                logger.debug(
+                    "EntityResearcher: daily budget %d reached — skipping %s",
+                    self._max_per_day, canonical,
+                )
+                return False
+            self._daily_count += 1
             self._queue.append(canonical)
-        logger.info("EntityResearcher: enqueued %s (queue_size=%d)", canonical, len(self._queue))
+        logger.info(
+            "EntityResearcher: enqueued %s (queue_size=%d, today=%d/%d)",
+            canonical, len(self._queue), self._daily_count, self._max_per_day,
+        )
         return True
 
     # ── Worker lifecycle ────────────────────────────────────────────────────
