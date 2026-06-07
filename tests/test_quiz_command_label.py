@@ -347,6 +347,7 @@ def test_quiz_vocab_handler_exact_lookup(tmp_path):
 
     dbp = tmp_path / "quiz.sqlite3"
     db = QuizDatabase(dbp)
+    db.upsert_vocab_seed("範疇", "はんちゅう", "範圍、類別")
     db.insert_question(
         level="JLPT N1",
         exam_point="漢字読み",
@@ -425,6 +426,7 @@ def test_vocab_related_question_callback_serves_matching_question(tmp_path):
 
     dbp = tmp_path / "quiz.sqlite3"
     db = QuizDatabase(dbp)
+    db.upsert_vocab_seed("範疇", "はんちゅう", "範圍、類別")
     q = db.insert_question(
         level="JLPT N1",
         exam_point="漢字読み",
@@ -485,6 +487,7 @@ def test_vocab_audio_callback_sends_document_for_vocab_card(tmp_path, monkeypatc
 
     dbp = tmp_path / "quiz.sqlite3"
     db = QuizDatabase(dbp)
+    db.upsert_vocab_seed("いがみ合って", "いがみあって", "互相爭執")
     db.insert_question(
         level="JLPT N1",
         exam_point="用法",

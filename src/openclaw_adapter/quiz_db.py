@@ -30,8 +30,6 @@ from hashlib import sha1
 from pathlib import Path
 from typing import Iterator
 
-from .quiz_vocab_seed import QUIZ_VOCAB_SEED
-
 logger = logging.getLogger(__name__)
 
 
@@ -179,18 +177,6 @@ def source_excerpt_type_conflicts_with_exam_point(
         return True
     return False
 
-
-def vocab_seed_is_placeholder_example(
-    headword: str, seed: dict[str, str] | None
-) -> bool:
-    """Detect seed rows that were placeholders, not real vocabulary cards."""
-    if not seed:
-        return False
-    example = (seed.get("example_ja") or "").strip()
-    return example in {
-        f"「{headword}」という言葉が心に残った。",
-        f"{headword}という言葉を覚えた。",
-    }
 
 
 def vocab_example_is_low_value(headword: str, example_ja: str | None) -> bool:
@@ -606,6 +592,12 @@ CREATE TABLE IF NOT EXISTS quiz_authoring_knowledge (
 );
 
 CREATE INDEX IF NOT EXISTS idx_quiz_authoring_category ON quiz_authoring_knowledge(category);
+
+CREATE TABLE IF NOT EXISTS vocab_seed (
+    headword         TEXT PRIMARY KEY,
+    reading_hiragana TEXT NOT NULL,
+    zh_gloss_short   TEXT NOT NULL
+);
 """
 
 
@@ -759,6 +751,20 @@ class QuizDatabase:
             self._backfill_source_excerpt_types(conn, overwrite_other=True)
             self._backfill_vocab_cards(conn)
 
+    def upsert_vocab_seed(
+        self, headword: str, reading_hiragana: str, zh_gloss_short: str
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO vocab_seed (headword, reading_hiragana, zh_gloss_short)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(headword) DO UPDATE SET
+                       reading_hiragana = excluded.reading_hiragana,
+                       zh_gloss_short = excluded.zh_gloss_short""",
+                (headword, reading_hiragana, zh_gloss_short),
+            )
+            self._backfill_vocab_cards(conn)
+
     def _backfill_source_excerpt_types(
         self, conn: sqlite3.Connection, *, overwrite_other: bool
     ) -> None:
@@ -817,15 +823,15 @@ class QuizDatabase:
                 "SELECT * FROM quiz_vocab_cards WHERE vocab_id = ?",
                 (vocab_id,),
             ).fetchone()
-            seed = QUIZ_VOCAB_SEED.get(headword)
-            if not seed and existing is not None:
-                seed = {
-                    "reading_hiragana": existing["reading_hiragana"],
-                    "zh_gloss_short": existing["zh_gloss_short"],
-                    "example_ja": existing["example_ja"],
-                    "example_source_kind": existing["example_source_kind"] or "adapted",
-                }
-            if not seed:
+            seed_row = conn.execute(
+                "SELECT reading_hiragana, zh_gloss_short FROM vocab_seed WHERE headword = ?",
+                (headword,),
+            ).fetchone()
+            if seed_row:
+                seed = {"reading_hiragana": seed_row["reading_hiragana"], "zh_gloss_short": seed_row["zh_gloss_short"]}
+            elif existing is not None:
+                seed = {"reading_hiragana": existing["reading_hiragana"], "zh_gloss_short": existing["zh_gloss_short"]}
+            else:
                 continue
             group.sort(
                 key=lambda r: (

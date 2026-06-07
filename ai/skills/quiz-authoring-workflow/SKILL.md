@@ -70,6 +70,20 @@ If a token-level view is too narrow for the current authoring task, step up in t
 
 Codex writes the question content directly after selecting a valid source and real grounding text. Insert only after passing checks.
 
+**Step 0 — Register vocab seed** (required for lexical types: 漢字読み, 言い換え類義, 文脈規定, 用法):
+
+Before inserting, register the headword's reading and Chinese gloss in the `vocab_seed` table. Without this, `_backfill_vocab_cards()` will silently skip the headword and no card will be created.
+
+```python
+db.upsert_vocab_seed(
+    headword="<tested_point surface form>",
+    reading_hiragana="<hiragana reading>",
+    zh_gloss_short="<short zh-TW gloss>",
+)
+```
+
+`quiz_vocab_seed.py` no longer exists. The `vocab_seed` table in `data/quiz.sqlite3` is the sole source. Do not attempt to import or edit a Python seed file.
+
 Use existing DB APIs for insertion and deletion. Keep each operation short-lived.
 
 ```python
@@ -128,7 +142,7 @@ Common reject examples:
 
 - `漢字読み` tests a basic word such as `最高` or `味方`.
 - `漢字読み` treats a pure song title or full title phrase as a vocabulary item, such as `25時の情熱`.
-- Vocabulary-card examples are not traceable to real lyric/article/commentary source text, reuse the same sentence across multiple cards, or use the same template for similar words with only the target word swapped. Do not count seed/adapted template examples such as `「X」という言葉が心に残った。`, `Xという言葉を覚えた。`, `Xの意味を調べた。`, or `Xについて考えた。`; examples should distinguish the word's actual nuance or context.
+- Vocabulary-card examples are not traceable to real lyric/article/commentary source text, reuse the same sentence across multiple cards, or use the same template for similar words with only the target word swapped. Template examples such as `「X」という言葉が心に残った。`, `Xという言葉を覚えた。`, `Xの意味を調べた。`, or `Xについて考えた。` are rejected; the card's `example_ja` must be a verbatim substring of `source_excerpt`.
 - The correct reading is wrong or a real alternative reading appears as a distractor.
 - `言い換え類義` uses the same word in kana/kanji as the answer.
 - `文脈規定` is only answerable by remembering the lyric, not by language context.

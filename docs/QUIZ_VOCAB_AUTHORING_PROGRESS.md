@@ -1,6 +1,6 @@
 # /quiz vocabulary-card expansion progress
 
-Last updated: 2026-06-05 JST
+Last updated: 2026-06-07 JST
 
 ## Goal
 
@@ -14,13 +14,13 @@ Last updated: 2026-06-05 JST
 
 ## Current Status
 
-- Current clean `quiz_vocab_cards` count after source-excerpt example enforcement: 254.
-- Current eligible missing-card count: 0.
-- Current placeholder-card count: 0.
-- Current Codex lexical question-row count: 784, including legacy non-card rows whose seed/card metadata was placeholder, missing, not traceable to a source excerpt, or would reuse an example sentence.
-- Current ready `favorite_songs` count: 22.
+- Current clean `quiz_vocab_cards` count after source-excerpt example enforcement: 271.
+- Current Codex lexical question-row count: 853.
+- Current distinct `tested_point` count: 827.
+- Current `vocab_seed` table count: 630 (DB-backed, `quiz_vocab_seed.py` has been deleted).
+- Current ready `favorite_songs` count: 28.
 - Current target floor: 800 cards.
-- Remaining clean vocabulary cards needed from the current baseline: 546.
+- Remaining clean vocabulary cards needed from the current baseline: 529.
 - Status: in progress.
 
 ## Reverse Plan
@@ -66,11 +66,16 @@ Last updated: 2026-06-05 JST
 
 - Use `漢字読み` title-grounded rows only when the song title contains a natural standalone vocabulary item that a learner could use outside the song title.
 - Do not use mechanical title slices merely to increase the count. Reject pure song titles, full title phrases, kana-particle fragments, connective fragments, basic words, and title chunks that are not natural standalone vocabulary items. If the song title or lyric line does not provide enough good vocabulary, switch to cached or reliable background/commentary/appreciation material and use a question type that can be legally grounded by that source.
-- Do not create vocabulary-card seeds with placeholder examples such as `「X」という言葉が心に残った。` or `Xという言葉を覚えた。`. These are evidence that `X` has not been validated as an actual usable vocabulary item. Current DB backfill skips such placeholder seeds, so they no longer count toward the vocabulary-card target.
-- Current DB backfill requires the primary quiz row's real `source_excerpt` as `quiz_vocab_cards.example_ja` and marks it `example_source_kind='source_excerpt'`. Seed/adapted examples are not counted as vocabulary-card examples.
+- Before inserting a question for a new headword, register it in the `vocab_seed` table:
+  ```python
+  db.upsert_vocab_seed(headword, reading_hiragana, zh_gloss_short)
+  ```
+  `quiz_vocab_seed.py` has been deleted; the `vocab_seed` table is the sole source of reading/gloss for backfill. Without a seed row, no vocab card will be created for that headword.
+- Current DB backfill requires the primary quiz row's real `source_excerpt` as `quiz_vocab_cards.example_ja` and marks it `example_source_kind='source_excerpt'`. Adapted/template examples are not counted.
+- Do not create placeholder Chinese glosses or readings. Placeholder seed rows (empty gloss, empty reading) will cause backfill to skip the headword silently.
 - Use lyric-grounded rows when a reliable lyric URL and excerpt are available.
 - Avoid adding vocabulary-card rows without a corresponding quiz row; the vocabulary book must remain quiz-backed.
-- Current DB backfill behavior should preserve existing quiz-backed vocab-card rows even when their card metadata is stored in `quiz_vocab_cards` rather than in code seed data.
+- The backfill fallback (when no seed row exists) reads reading/gloss from the existing card in `quiz_vocab_cards`, so existing cards are preserved across re-backfills even without a seed row.
 - Favorite-song cache is now the first source layer. While `favorite_songs.status='ready'` still has under-quota items, author from that pool first before falling back to the general song pool.
 
 ## Progress Log
@@ -184,3 +189,15 @@ Last updated: 2026-06-05 JST
     - `帰り道は遠回りしたくなる = 1`
   - Next exact step:
     - continue with untouched or still-under-quota ready favorite songs first, preferring reliable lyric URLs and strong N1 candidates from `例えば`, `そんなもんね`, `君はロックを聴かない`, `スピカ`, `だから僕は音楽を辞めた`, and other remaining cached songs before returning to the general pool.
+- 2026-06-07 JST — Under-quota favorite-song fill + vocab_seed design fix:
+  - Filled under-quota ready favorite songs: `恋するフォーチュンクッキー`, `ray`, `MARIGOLD`, `携帯恋話`, `例えば` — 3 questions each (12 net new questions).
+  - All 12 passed independent `qwen3:14b` solver check.
+  - 12 new vocab cards created via backfill with source_excerpt examples.
+  - Skipped `アイドル` (wrong lyrics in DB — parody, 137 chars), `私は、わたしの事が好き。` (inline furigana format).
+  - **Architecture change**: `quiz_vocab_seed.py` deleted. All 630 seed entries migrated to `vocab_seed` DB table. `_backfill_vocab_cards()` now queries `vocab_seed` instead of the Python dict. New public API: `db.upsert_vocab_seed(headword, reading_hiragana, zh_gloss_short)`. Tests and SKILL updated accordingly.
+  - End state:
+    - `quiz_vocab_cards = 271`
+    - `distinct codex lexical tested_point = 827`
+    - `codex lexical question rows = 853`
+    - `vocab_seed table = 630`
+  - **Next exact step**: Task 2 — fill 44 genuine missing vocab cards (headwords that have lexical questions but no card). These are `言い換え類義`, `用法`, and `文脈規定` tested_points whose source_excerpt doesn't contain the headword verbatim, so `source_excerpt_vocab_example()` returns None. Fix options: (a) change tested_point to the surface form that appears in the excerpt, or (b) rewrite the question with an excerpt that contains the headword verbatim.
