@@ -216,7 +216,18 @@ class EntityResearcher:
                         len(result.aliases), len(result.source_urls),
                     )
                 else:
-                    logger.info("EntityResearcher: insufficient data for %s — skipping", canonical)
+                    # Cache the negative result so request() short-circuits on
+                    # future encounters and never retriggers a search.  confidence=0
+                    # is intentionally below any real result (0.5+), so a later
+                    # successful research will overwrite this stub.
+                    self._db.upsert_entry(
+                        entity_canonical=canonical,
+                        entity_type="other",
+                        summary="資料不足",
+                        confidence=0.0,
+                        origin="web_research",
+                    )
+                    logger.info("EntityResearcher: insufficient data for %s — cached as no-data stub", canonical)
             except Exception:
                 logger.exception("EntityResearcher: research failed for %s", canonical)
 
