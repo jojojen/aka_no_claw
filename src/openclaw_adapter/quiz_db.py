@@ -451,6 +451,92 @@ def youhou_target_word_presence_leaks(
     return distractor_hits == 0
 
 
+def _to_hiragana(text: str | None) -> str:
+    """Keep only kana, folding katakana → hiragana so '読み' comparisons are
+    script-insensitive. Everything else (kanji, latin, punctuation, the prolonged
+    mark) is dropped. Used by the 漢字読み distractor audit below."""
+    out: list[str] = []
+    for ch in text or "":
+        code = ord(ch)
+        if 0x3041 <= code <= 0x3096:           # hiragana
+            out.append(ch)
+        elif 0x30A1 <= code <= 0x30F6:          # katakana → hiragana
+            out.append(chr(code - 0x60))
+    return "".join(out)
+
+
+def audit_kanji_reading_distractors(
+    *,
+    options: tuple[str, ...],
+    answer_index: int,
+    max_reading_len: int = 9,
+) -> list[tuple[int, str, str]]:
+    """ADDITIVE, ADVISORY cheap filter for 漢字読み distractors. Returns a list of
+    ``(index, option, reason)`` for distractors that are almost certainly wrong
+    readings of an *unrelated* word rather than a plausible misreading of the
+    target — the systematic codex failure mode (e.g. 【創造】そうぞう with distractors
+    けいばつ / やきめ that share no sound with the answer).
+
+    Two deterministic red flags:
+      * the distractor shares ZERO kana with the correct reading, or
+      * the distractor is longer than ``max_reading_len`` (a phrase reading, not a
+        single-word reading).
+
+    This is a *filter to catch obvious garbage cheaply*, NOT an oracle: a distractor
+    that shares one incidental kana with the answer still passes here. Distractor
+    plausibility in the subtle band stays the author model's job. An empty list
+    means "no obvious garbage", not "distractors are good".
+    """
+    if not (0 <= answer_index < len(options)):
+        return []
+    correct_kana = set(_to_hiragana(options[answer_index]))
+    suspects: list[tuple[int, str, str]] = []
+    for i, opt in enumerate(options):
+        if i == answer_index:
+            continue
+        opt_kana = _to_hiragana(opt)
+        if len(opt_kana) > max_reading_len:
+            suspects.append((i, opt, f"reading too long ({len(opt_kana)} kana) — phrase, not a word"))
+        elif correct_kana and opt_kana and not (correct_kana & set(opt_kana)):
+            suspects.append((i, opt, f"shares no kana with correct reading {options[answer_index]!r}"))
+    return suspects
+
+
+def question_similarity(a_stem: str, b_stem: str) -> float:
+    """Normalized longest-common-substring ratio over the shorter noise-stripped
+    stem, in [0, 1]. Cheap, deterministic, no LLM. Two near-identical stems
+    (same cloze line, trivial wording change) score near 1.0."""
+    a = _normalize_grounding(a_stem)
+    b = _normalize_grounding(b_stem)
+    if not a or not b:
+        return 0.0
+    shortest = min(len(a), len(b))
+    if shortest == 0:
+        return 0.0
+    return _longest_common_substring_len(a, b) / shortest
+
+
+def questions_are_near_duplicate(
+    *,
+    a_stem: str,
+    b_stem: str,
+    a_tested_point: str | None = None,
+    b_tested_point: str | None = None,
+    threshold: float = 0.85,
+) -> bool:
+    """True iff two questions are near-duplicates. A shared tested_point lowers the
+    bar (same word, near-same stem = dup); otherwise pure stem similarity must clear
+    ``threshold``. Deterministic — runs at final-output dedup, never an LLM step."""
+    same_point = bool(
+        a_tested_point and b_tested_point
+        and _normalize_grounding(a_tested_point) == _normalize_grounding(b_tested_point)
+    )
+    sim = question_similarity(a_stem, b_stem)
+    if same_point and sim >= threshold - 0.15:
+        return True
+    return sim >= threshold
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS quiz_questions (
     question_id      TEXT PRIMARY KEY,
@@ -1043,6 +1129,48 @@ class QuizDatabase:
                 "SELECT * FROM quiz_questions WHERE question_id = ?", (question_id,)
             ).fetchone()
         return _row_to_question(row) if row else None
+
+    def find_duplicate_questions(
+        self,
+        *,
+        stem: str,
+        tested_point: str | None = None,
+        exam_point: str | None = None,
+        source_name: str | None = None,
+        threshold: float = 0.85,
+        limit: int = 5,
+    ) -> list[QuizQuestion]:
+        """Return existing questions that are near-duplicates of a candidate, using
+        the deterministic ``questions_are_near_duplicate`` helper (no LLM). Scope the
+        comparison set by exam_point and/or source_name to stay cheap — duplicates
+        only ever arise within the same type+source anyway. Call this ONCE at the
+        final-output stage, not on every authoring step."""
+        clauses: list[str] = []
+        params: list[object] = []
+        if exam_point:
+            clauses.append("exam_point = ?")
+            params.append(exam_point.strip())
+        if source_name:
+            clauses.append("source_name = ?")
+            params.append(source_name.strip())
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM quiz_questions{where}", tuple(params)
+            ).fetchall()
+        matches: list[QuizQuestion] = []
+        for row in rows:
+            if questions_are_near_duplicate(
+                a_stem=stem,
+                b_stem=row["stem"],
+                a_tested_point=tested_point,
+                b_tested_point=row["tested_point"],
+                threshold=threshold,
+            ):
+                matches.append(_row_to_question(row))
+                if len(matches) >= limit:
+                    break
+        return matches
 
     def random_question(
         self,
@@ -1744,6 +1872,108 @@ class QuizDatabase:
                 (int(token_id),),
             )
         return cursor.rowcount > 0
+
+    # ── Per-song candidate pack (soft cache for cheap authoring) ───────────────
+
+    def _song_pack_path(self, song_id: int) -> Path:
+        return self.path.parent / "quiz_song_packs" / f"{int(song_id)}.json"
+
+    def build_song_candidate_pack(
+        self, song_id: int, *, jlpt_level: str = "N1", unused_only: bool = True
+    ) -> dict:
+        """Build and cache a COMPACT authoring pack for one song, so the author model
+        reads a small JSON instead of re-ingesting full lyrics + re-deriving tokens
+        on every question. Pulls only from already-cached tables (no fetch, no
+        morphology). Contains: song meta, and the unused N1 tokens grouped by the
+        sentence they came from (surface/reading/pos + the verbatim sentence that
+        doubles as grounding source_excerpt).
+
+        This is a SOFT cache / fast default. The full lyrics stay in the ``lyrics``
+        table; when a question needs wider context the author still reads it. The
+        pack never replaces that path, it just saves the common cheap case.
+        """
+        with self.connect() as conn:
+            song = conn.execute(
+                "SELECT id, title, artist, youtube_short_url, lyrics_url, status "
+                "FROM favorite_songs WHERE id = ?",
+                (int(song_id),),
+            ).fetchone()
+            if song is None:
+                raise ValueError(f"no favorite_song with id={song_id}")
+            clauses = ["t.song_id = ?"]
+            params: list[object] = [int(song_id)]
+            if jlpt_level:
+                clauses.append("t.jlpt_level = ?")
+                params.append(jlpt_level.strip())
+            if unused_only:
+                clauses.append("t.used_quiz_count = 0")
+            token_rows = conn.execute(
+                """
+                SELECT t.id AS token_id, t.sentence_id AS sentence_id,
+                       t.surface AS surface, t.dictionary_form AS dictionary_form,
+                       t.reading AS reading, t.pos AS pos, t.jlpt_level AS jlpt_level,
+                       s.sentence_text AS sentence_text, s.sentence_index AS sentence_index
+                FROM vocabulary_tokens t
+                JOIN sentences s ON s.id = t.sentence_id
+                WHERE """ + " AND ".join(clauses) + """
+                ORDER BY s.sentence_index, t.id
+                """,
+                tuple(params),
+            ).fetchall()
+
+        by_sentence: dict[int, dict] = {}
+        for r in token_rows:
+            sid = int(r["sentence_id"])
+            bucket = by_sentence.setdefault(
+                sid,
+                {
+                    "sentence_id": sid,
+                    "sentence_index": int(r["sentence_index"]),
+                    "sentence_text": r["sentence_text"],
+                    "candidates": [],
+                },
+            )
+            bucket["candidates"].append(
+                {
+                    "token_id": int(r["token_id"]),
+                    "surface": r["surface"],
+                    "dictionary_form": r["dictionary_form"],
+                    "reading": r["reading"],
+                    "pos": r["pos"],
+                    "jlpt_level": r["jlpt_level"],
+                }
+            )
+
+        pack = {
+            "song_id": int(song["id"]),
+            "title": song["title"],
+            "artist": song["artist"],
+            "youtube_short_url": song["youtube_short_url"],
+            "lyrics_url": song["lyrics_url"],
+            "jlpt_level": jlpt_level,
+            "unused_only": unused_only,
+            "built_at": _utc_now_iso(),
+            "candidate_token_count": len(token_rows),
+            "sentences": [by_sentence[k] for k in sorted(by_sentence)],
+        }
+
+        path = self._song_pack_path(int(song["id"]))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(pack, ensure_ascii=False, indent=2), encoding="utf-8")
+        return pack
+
+    def load_song_candidate_pack(
+        self, song_id: int, *, rebuild: bool = False, jlpt_level: str = "N1"
+    ) -> dict:
+        """Return the cached candidate pack, building it on first use (or when
+        ``rebuild`` is set, e.g. after tokens were marked used)."""
+        path = self._song_pack_path(int(song_id))
+        if rebuild or not path.exists():
+            return self.build_song_candidate_pack(song_id, jlpt_level=jlpt_level)
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return self.build_song_candidate_pack(song_id, jlpt_level=jlpt_level)
 
     # ── Authoring knowledge (self-improving) ──────────────────────────────────
 
