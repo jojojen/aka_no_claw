@@ -81,7 +81,7 @@ from .web_search import (
     fetch_page_text,
     format_web_research_answer,
     reformulate_queries_with_ollama,
-    search_duckduckgo,
+    search_yahoo_japan_playwright,
     summarize_web_sources_with_ollama,
 )
 from price_monitor_bot.bot import TelegramTextReplyPlan
@@ -248,6 +248,10 @@ def default_web_research_renderer(settings: AssistantSettings) -> ResearchRender
     endpoint = settings.openclaw_local_text_endpoint
     model = _select_text_generation_model(settings)
     timeout = max(1, settings.openclaw_local_text_timeout_seconds)
+    # The grounded summarise step reads several fetched pages, so it is the
+    # slowest LLM call in the pipeline. Give it extra headroom to survive
+    # Ollama queue contention from background workers (entity researcher etc.).
+    summarize_timeout = max(timeout, 120)
     ssl_ctx = build_ssl_context(settings) if endpoint.startswith("https://") else None
 
     def render(query: TelegramResearchQuery) -> str:
@@ -256,10 +260,9 @@ def default_web_research_renderer(settings: AssistantSettings) -> ResearchRender
         answer = build_web_research_answer(
             query.query,
             max_results=5,
-            search_fn=lambda q, limit: search_duckduckgo(
+            search_fn=lambda q, limit: search_yahoo_japan_playwright(
                 q,
                 max_results=limit,
-                ssl_context=ssl_ctx,
             ),
             # Item 4: turn the question into a few focused search queries first.
             reformulate_fn=lambda q: reformulate_queries_with_ollama(
@@ -276,7 +279,7 @@ def default_web_research_renderer(settings: AssistantSettings) -> ResearchRender
                 sources,
                 endpoint=endpoint,
                 model=model,
-                timeout_seconds=timeout,
+                timeout_seconds=summarize_timeout,
                 ssl_context=ssl_ctx,
             ),
         )

@@ -28,7 +28,7 @@ from .knowledge_db import (
     KnowledgeDatabase,
     _normalize_canonical,
 )
-from .web_search import WebSearchResult, search_duckduckgo
+from .web_search import WebSearchResult, search_yahoo_japan_playwright
 
 logger = logging.getLogger(__name__)
 
@@ -134,9 +134,7 @@ class EntityResearcher:
         self._ssl_context = ssl_context
         self._max_search_results = max(1, min(8, max_search_results))
         self._search_fn = search_fn or (
-            lambda query, limit: search_duckduckgo(
-                query, max_results=limit, ssl_context=ssl_context,
-            )
+            lambda query, limit: search_yahoo_japan_playwright(query, max_results=limit)
         )
         # Lazy import to avoid circular dependency with opportunity_agent
         # (which already houses the canonical _call_ollama_json helper).

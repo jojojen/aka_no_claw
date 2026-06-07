@@ -39,7 +39,7 @@ from .opportunity_models import (
 from .opportunity_pipeline import CandidateProvider, OpportunityPipeline, OpportunityPipelineStats
 from .opportunity_scoring import OpportunityThresholds, reputation_passes
 from .opportunity_store import OpportunityStore
-from .web_search import WebSearchResult, search_duckduckgo
+from .web_search import WebSearchResult, search_yahoo_japan_playwright
 
 logger = logging.getLogger(__name__)
 
@@ -296,7 +296,7 @@ DEFAULT_WEB_TREND_QUERIES: tuple[str, ...] = (
 
 
 class ScheduledWebSearchCandidateProvider:
-    """Run a small batch of TCG-trend queries via DuckDuckGo, then feed the
+    """Run a small batch of TCG-trend queries via web search, then feed the
     snippets to the existing SNS-extraction LLM prompt (lightly adapted) to
     pull out structured candidates. Surfaces sealed_box / starter_deck /
     booster_pack / promo signals that don't show up on the hot-card board.
@@ -498,11 +498,7 @@ class WebOpportunityResearcher:
         self._max_results = max(1, min(5, max_results))
         self._ssl_context = ssl_context
         self._search_fn = search_fn or (
-            lambda query, limit: search_duckduckgo(
-                query,
-                max_results=limit,
-                ssl_context=ssl_context,
-            )
+            lambda query, limit: search_yahoo_japan_playwright(query, max_results=limit)
         )
         self._json_call_fn = json_call_fn or _call_ollama_json
 
@@ -1226,7 +1222,7 @@ def build_opportunity_agent(settings: AssistantSettings | None = None) -> Opport
                 query,
             )
             return ()
-        return search_duckduckgo(query, max_results=max_results, ssl_context=ssl_context)
+        return search_yahoo_japan_playwright(query, max_results=max_results)
 
     store = OpportunityStore(settings.opportunity_db_path)
     store.bootstrap()
@@ -1430,7 +1426,7 @@ def _build_official_store_provider(*, ssl_context):
     return OfficialStoreCandidateProvider(crawlers=crawlers, collab_store=collab_store)
 
 
-def _build_preflight_callable(*, settings: AssistantSettings, ssl_context, search_fn=search_duckduckgo):
+def _build_preflight_callable(*, settings: AssistantSettings, ssl_context, search_fn=search_yahoo_japan_playwright):
     """Return a callable that the opportunity-agent invokes before every tick:
 
     - Backfill domains for one untagged SNS rule (LLM-driven).
@@ -2081,7 +2077,7 @@ def _build_opportunity_research_query(candidate: OpportunityCandidate) -> str:
     topic = candidate.search_query or candidate.title
     alias_segment = ""
     if candidate.aliases:
-        # Two best aliases only — DuckDuckGo handles OR-groups well but long
+        # Two best aliases only — long
         # queries get truncated.
         joined = " OR ".join(f'"{a}"' for a in candidate.aliases[:2])
         alias_segment = f" OR ({joined})"
