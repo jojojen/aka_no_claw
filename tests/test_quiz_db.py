@@ -430,6 +430,66 @@ class TestVocabCards:
             source_excerpt_type="article",
         ) is None
 
+    def test_source_excerpt_example_rejects_whole_lyric_blob(self):
+        # A lyric excerpt with no sentence delimiters collapses into one giant
+        # blob; that is not a usable single-line card example.
+        blob = "あ" * 40 + "矛盾" + "い" * 40
+        assert source_excerpt_vocab_example(
+            headword="矛盾",
+            source_excerpt=blob,
+            source_excerpt_type="lyric",
+        ) is None
+        assert source_excerpt_vocab_example(
+            headword="矛盾",
+            source_excerpt="矛盾を抱えて生きてくなんて怒られてしまう。",
+            source_excerpt_type="lyric",
+        ) == "矛盾を抱えて生きてくなんて怒られてしまう。"
+
+    def test_backfill_skips_no_example_question_and_keeps_example_author(self, tmp_path):
+        # An article question (yields no card example) must not sink the card
+        # when a lyric question for the same headword yields a real example.
+        # The card's author badge follows the example actually shown.
+        db = _db(tmp_path)
+        db.upsert_vocab_seed("矛盾", "むじゅん", "矛盾、自相矛盾")
+        db.insert_question(
+            level="JLPT N1",
+            exam_point="漢字読み",
+            stem="解説中の〈矛盾〉の読み方として最も適切なものはどれか。",
+            options=("むじゅん", "ぼうじゅん", "ほこじゅん", "むとん"),
+            answer_index=0,
+            explanation="〈矛盾〉は「むじゅん」と読む。",
+            source_type="vocaloid_song",
+            source_name="命に嫌われている。",
+            source_text_url="https://example.com/article",
+            source_excerpt="この曲の前半部分の矛盾や見えない敵の存在を合わせて考えると主題が見える。",
+            source_excerpt_type="article",
+            tested_point="矛盾",
+            author="codex",
+            verified=True,
+            allow_ungrounded=True,
+        )
+        db.insert_question(
+            level="JLPT N1",
+            exam_point="漢字読み",
+            stem="「矛盾を抱えて生きてくなんて怒られてしまう。」の〈矛盾〉の読み方はどれか。",
+            options=("むじゅん", "ぼうじゅん", "ほこじゅん", "むとん"),
+            answer_index=0,
+            explanation="〈矛盾〉は「むじゅん」と読む。",
+            source_type="vocaloid_song",
+            source_name="命に嫌われている。",
+            source_text_url="https://example.com/lyric",
+            source_excerpt="矛盾を抱えて生きてくなんて怒られてしまう。",
+            source_excerpt_type="lyric",
+            tested_point="矛盾",
+            author="Claude",
+            verified=True,
+            allow_ungrounded=True,
+        )
+        card = db.get_vocab_card(headword="矛盾", level="JLPT N1")
+        assert card is not None
+        assert card.example_ja == "矛盾を抱えて生きてくなんて怒られてしまう。"
+        assert card.author == "Claude"
+
     def test_insert_codex_lexical_question_backfills_vocab_card(self, tmp_path):
         db = _db(tmp_path)
         db.upsert_vocab_seed("範疇", "はんちゅう", "範圍、類別")

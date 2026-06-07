@@ -202,6 +202,12 @@ def vocab_example_is_low_value(headword: str, example_ja: str | None) -> bool:
     return example in generic_examples
 
 
+# A vocab card example must be a single readable line. Lyric excerpts that have
+# no sentence delimiters to split on collapse into one giant blob; anything past
+# this length is a blob, not an example, and is rejected.
+_MAX_VOCAB_EXAMPLE_CHARS = 70
+
+
 def source_excerpt_vocab_example(
     *, headword: str, source_excerpt: str | None, source_excerpt_type: str | None
 ) -> str | None:
@@ -232,7 +238,10 @@ def source_excerpt_vocab_example(
     ]
     if not usable:
         return None
-    return min(usable, key=len)
+    best = min(usable, key=len)
+    if len(best) > _MAX_VOCAB_EXAMPLE_CHARS:
+        return None
+    return best
 
 
 def _normalize_vocab_example_identity(example: str | None) -> str:
@@ -921,7 +930,7 @@ class QuizDatabase:
             """
             SELECT * FROM quiz_questions
             WHERE verified = 1
-              AND author = 'codex'
+              AND author IN ('codex', 'Claude')
               AND level = 'JLPT N1'
               AND tested_point IS NOT NULL
               AND TRIM(tested_point) <> ''
@@ -960,14 +969,30 @@ class QuizDatabase:
                     r["question_id"] or "",
                 )
             )
-            primary = group[0]
-            example_ja = source_excerpt_vocab_example(
-                headword=headword,
-                source_excerpt=primary["source_excerpt"],
-                source_excerpt_type=primary["source_excerpt_type"],
-            )
+            # The primary is the first priority-ordered question that actually
+            # yields a usable example; questions whose excerpt is an article/
+            # title (no card example) must not sink the whole card. This keeps
+            # the card's author badge consistent with the example shown.
+            primary = None
+            example_ja = None
+            for cand in group:
+                ex = source_excerpt_vocab_example(
+                    headword=headword,
+                    source_excerpt=cand["source_excerpt"],
+                    source_excerpt_type=cand["source_excerpt_type"],
+                )
+                if ex:
+                    primary = cand
+                    example_ja = ex
+                    break
             example_source_kind = "source_excerpt"
             if not example_ja:
+                # The length cap blocks NEW long-example cards but must not
+                # retroactively delete a card that already shipped: keep any
+                # existing card untouched until its source question is fixed.
+                # The cap therefore applies to future cards, not old ones.
+                if existing is not None:
+                    seen_ids.add(vocab_id)
                 continue
             example_identity = _normalize_vocab_example_identity(example_ja)
             if not example_identity or example_identity in used_example_identities:
@@ -1030,7 +1055,7 @@ class QuizDatabase:
                         if "tested_jlpt_level" in primary.keys()
                         else None
                     ),
-                    "codex",
+                    (primary["author"] or "codex").strip(),
                     created_at,
                     now,
                 ),
@@ -1038,12 +1063,12 @@ class QuizDatabase:
         if seen_ids:
             placeholders = ", ".join("?" for _ in seen_ids)
             conn.execute(
-                f"DELETE FROM quiz_vocab_cards WHERE author = 'codex' AND level = 'JLPT N1' AND vocab_id NOT IN ({placeholders})",
+                f"DELETE FROM quiz_vocab_cards WHERE author IN ('codex', 'Claude') AND level = 'JLPT N1' AND vocab_id NOT IN ({placeholders})",
                 tuple(seen_ids),
             )
         else:
             conn.execute(
-                "DELETE FROM quiz_vocab_cards WHERE author = 'codex' AND level = 'JLPT N1'"
+                "DELETE FROM quiz_vocab_cards WHERE author IN ('codex', 'Claude') AND level = 'JLPT N1'"
             )
 
     # ── Questions ─────────────────────────────────────────────────────────────
@@ -1464,12 +1489,15 @@ class QuizDatabase:
         vocab_id: str | None = None,
         headword: str | None = None,
         level: str | None = None,
-        author: str = "codex",
+        author: str | None = None,
     ) -> QuizVocabCard | None:
         if not vocab_id and not headword:
             raise ValueError("get_vocab_card requires vocab_id or headword")
-        clauses = ["author = ?"]
-        params: list[object] = [(author or "codex").strip()]
+        clauses: list[str] = []
+        params: list[object] = []
+        if author:
+            clauses.append("author = ?")
+            params.append(author.strip())
         if level:
             clauses.append("level = ?")
             params.append(level.strip())
@@ -1491,17 +1519,20 @@ class QuizDatabase:
         *,
         level: str,
         chat_id: str | None = None,
-        author: str = "codex",
+        author: str | None = None,
         mode: str = "weak",
     ) -> list[QuizVocabCard]:
+        clauses = ["level = ?"]
+        params: list[object] = [(level or "").strip()]
+        if author:
+            clauses.append("author = ?")
+            params.append(author.strip())
         with self.connect() as conn:
             rows = conn.execute(
-                """
-                SELECT * FROM quiz_vocab_cards
-                WHERE level = ? AND author = ?
-                ORDER BY headword ASC
-                """,
-                ((level or "").strip(), (author or "codex").strip()),
+                "SELECT * FROM quiz_vocab_cards WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY headword ASC",
+                tuple(params),
             ).fetchall()
             tp_stats, tp_last = self._vocab_progress_maps(conn, chat_id)
         cards = [_row_to_vocab_card(r) for r in rows]
@@ -1532,18 +1563,22 @@ class QuizDatabase:
         *,
         level: str,
         query: str,
-        author: str = "codex",
+        author: str | None = None,
     ) -> list[QuizVocabCard]:
         q = f"%{(query or '').strip()}%"
+        clauses = ["level = ?"]
+        params: list[object] = [(level or "").strip()]
+        if author:
+            clauses.append("author = ?")
+            params.append(author.strip())
+        clauses.append("(headword LIKE ? OR reading_hiragana LIKE ? OR zh_gloss_short LIKE ?)")
+        params.extend([q, q, q])
         with self.connect() as conn:
             rows = conn.execute(
-                """
-                SELECT * FROM quiz_vocab_cards
-                WHERE level = ? AND author = ?
-                  AND (headword LIKE ? OR reading_hiragana LIKE ? OR zh_gloss_short LIKE ?)
-                ORDER BY headword ASC
-                """,
-                ((level or "").strip(), (author or "codex").strip(), q, q, q),
+                "SELECT * FROM quiz_vocab_cards WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY headword ASC",
+                tuple(params),
             ).fetchall()
         return [_row_to_vocab_card(r) for r in rows]
 
@@ -1552,17 +1587,22 @@ class QuizDatabase:
         *,
         level: str,
         source_name: str,
-        author: str = "codex",
+        author: str | None = None,
     ) -> list[QuizVocabCard]:
         q = f"%{(source_name or '').strip()}%"
+        clauses = ["level = ?"]
+        params: list[object] = [(level or "").strip()]
+        if author:
+            clauses.append("author = ?")
+            params.append(author.strip())
+        clauses.append("source_name LIKE ?")
+        params.append(q)
         with self.connect() as conn:
             rows = conn.execute(
-                """
-                SELECT * FROM quiz_vocab_cards
-                WHERE level = ? AND author = ? AND source_name LIKE ?
-                ORDER BY headword ASC
-                """,
-                ((level or "").strip(), (author or "codex").strip(), q),
+                "SELECT * FROM quiz_vocab_cards WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY headword ASC",
+                tuple(params),
             ).fetchall()
         return [_row_to_vocab_card(r) for r in rows]
 
