@@ -26,6 +26,24 @@ If the user asks only for analysis, explain findings without changing code or DB
 - Retain at most 3 Codex-authored questions per song. Existing qwen/Claude questions do not count against this quota.
 - Prefer current scope `JLPT N1` and `question_type="単語"` unless the user explicitly changes scope.
 - Current `単語` subtypes are `漢字読み`, `言い換え類義`, and `文脈規定`.
+- **N1-preferred, N2 fallback (2026-06-07).** Genuine N1 vocabulary is the first
+  choice. But N1 words are scarce per song, so requiring N1-only is too strict: when
+  a song has no further suitable genuine-N1 word, you MAY author from a genuine **N2**
+  word rather than skip the song or force a weak N1. Do NOT drop below N2 (no N3/N4
+  basics). Order within a song: genuine N1 → genuine N2 → next song.
+- **`tested_jlpt_level` = the ITEM's true difficulty, not the headword's auto-tag.**
+  Pass `tested_jlpt_level="N1"` or `"N2"` to `insert_question(...)`. `level` stays
+  `"JLPT N1"` (exam pool / review stream); `tested_jlpt_level` is the honest
+  difficulty badge (cards show `〔難度 N2〕`). Judge it by type, with your own
+  strong-model judgment:
+  - **漢字読み**: question difficulty = the word's reading difficulty. An N2 word is
+    an N2 item — cannot be dressed up as N1. Tag `N2`.
+  - **言い換え類義 / 文脈規定**: difficulty can come from the options/context, not just
+    the headword. If the surface headword is N2 but selecting the answer genuinely
+    requires N1-level synonyms or N1-level context/語感, the item is N1 — tag `N1`
+    even though the tested word is N2. If the discrimination is also only N2, tag `N2`.
+  - Leave `tested_jlpt_level` unset (NULL) only for genuine N1 (NULL is treated as N1).
+    Always set it explicitly to `N2` for fallback items so the badge renders.
 - Do not treat existing DB quantity as quality. Stability requires self-review and feedback.
 - Do not lock resources: no long-running daemon, no bot restart, no background generation loop, no long SQLite transaction, no held DB connection.
 

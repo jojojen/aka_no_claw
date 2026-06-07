@@ -60,7 +60,7 @@ class TestSchemaAndPragmas:
             "quiz_questions",
             "quiz_authoring_knowledge",
             "quiz_vocab_cards",
-            "favorite_songs",
+            "quiz_songs",
             "lyrics",
             "sentences",
             "vocabulary_tokens",
@@ -1191,13 +1191,13 @@ class TestSongCandidatePack:
     def _seed_song(self, db):
         with db.connect() as conn:
             conn.execute(
-                "INSERT INTO favorite_songs (title, artist, youtube_url, youtube_short_url, "
+                "INSERT INTO quiz_songs (title, artist, youtube_url, youtube_short_url, "
                 "lyrics_url, youtube_title_raw, video_id, status, created_at, updated_at) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?)",
                 ("テスト曲", "テスト歌手", "https://youtu.be/abc", "https://youtu.be/abc",
                  "https://example.com/l", "raw", "abc", "ready", "t", "t"),
             )
-            song_id = conn.execute("SELECT id FROM favorite_songs WHERE video_id='abc'").fetchone()["id"]
+            song_id = conn.execute("SELECT id FROM quiz_songs WHERE video_id='abc'").fetchone()["id"]
             conn.execute(
                 "INSERT INTO sentences (song_id, sentence_text, sentence_index, created_at) "
                 "VALUES (?,?,?,?)", (song_id, "矜持を胸に進む夜", 0, "t"),
@@ -1239,3 +1239,204 @@ class TestSongCandidatePack:
         db = _db(tmp_path)
         with pytest.raises(ValueError):
             db.build_song_candidate_pack(999999)
+
+
+class TestTestedJlptLevel:
+    def test_question_stores_and_returns_tested_jlpt_level(self, tmp_path):
+        db = _db(tmp_path)
+        q = db.insert_question(
+            level="JLPT N1",
+            exam_point="漢字読み",
+            stem="〈乙女〉の読みは？",
+            options=("おとめ", "おつじょ", "いつめ", "おとな"),
+            answer_index=0,
+            explanation="〈乙女〉は「おとめ」。",
+            source_type="vocaloid_song",
+            source_name="テスト曲",
+            source_excerpt="愛らしい乙女なんだが",
+            tested_point="乙女",
+            tested_jlpt_level="N2",
+            author="codex",
+            verified=True,
+            allow_ungrounded=True,
+        )
+        assert q.tested_jlpt_level == "N2"
+        assert q.level == "JLPT N1"  # stays in the N1 pool
+        assert db.get_question(q.question_id).tested_jlpt_level == "N2"
+
+    def test_tested_jlpt_level_defaults_null_treated_as_n1(self, tmp_path):
+        db = _db(tmp_path)
+        q = _insert_sample(db)
+        assert q.tested_jlpt_level is None
+
+    def test_vocab_card_inherits_tested_jlpt_level_from_primary(self, tmp_path):
+        db = _db(tmp_path)
+        db.upsert_vocab_seed("乙女", "おとめ", "少女")
+        db.insert_question(
+            level="JLPT N1",
+            exam_point="漢字読み",
+            stem="次の一節「愛らしい乙女なんだが」の〈乙女〉の読みは？",
+            options=("おとめ", "おつじょ", "いつめ", "おとな"),
+            answer_index=0,
+            explanation="〈乙女〉は「おとめ」。",
+            source_type="vocaloid_song",
+            source_name="テスト曲",
+            source_excerpt="愛らしい乙女なんだが",
+            tested_point="乙女",
+            tested_jlpt_level="N2",
+            author="codex",
+            verified=True,
+            allow_ungrounded=True,
+        )
+        card = db.get_vocab_card(headword="乙女", level="JLPT N1")
+        assert card is not None
+        assert card.tested_jlpt_level == "N2"
+
+    def test_migration_adds_columns_to_legacy_db(self, tmp_path):
+        import sqlite3
+        path = tmp_path / "legacy.sqlite3"
+        # Minimal legacy tables WITHOUT the new column.
+        conn = sqlite3.connect(path)
+        conn.executescript(
+            """
+            CREATE TABLE quiz_questions (
+                question_id TEXT PRIMARY KEY, level TEXT NOT NULL,
+                exam_point TEXT NOT NULL, stem TEXT NOT NULL,
+                options_json TEXT NOT NULL DEFAULT '[]', answer_index INTEGER NOT NULL,
+                explanation TEXT NOT NULL DEFAULT '', source_type TEXT NOT NULL DEFAULT 'other',
+                source_name TEXT NOT NULL DEFAULT '', source_text_url TEXT,
+                source_media_url TEXT, source_excerpt TEXT,
+                source_excerpt_type TEXT NOT NULL DEFAULT 'other', tested_point TEXT,
+                verified INTEGER NOT NULL DEFAULT 0, served_count INTEGER NOT NULL DEFAULT 0,
+                author TEXT NOT NULL DEFAULT 'Claude',
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE quiz_vocab_cards (
+                vocab_id TEXT PRIMARY KEY, level TEXT NOT NULL, headword TEXT NOT NULL,
+                reading_hiragana TEXT NOT NULL, zh_gloss_short TEXT NOT NULL,
+                example_ja TEXT NOT NULL, example_source_kind TEXT NOT NULL DEFAULT 'adapted',
+                source_name TEXT NOT NULL DEFAULT '', source_text_url TEXT,
+                primary_question_id TEXT NOT NULL,
+                support_question_ids_json TEXT NOT NULL DEFAULT '[]',
+                exam_points_json TEXT NOT NULL DEFAULT '[]',
+                author TEXT NOT NULL DEFAULT 'codex',
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.commit()
+        conn.close()
+        # Opening via QuizDatabase must additively migrate without error.
+        db = QuizDatabase(path)
+        with db.connect() as conn:
+            qcols = {r["name"] for r in conn.execute("PRAGMA table_info(quiz_questions)")}
+            vcols = {r["name"] for r in conn.execute("PRAGMA table_info(quiz_vocab_cards)")}
+        assert "tested_jlpt_level" in qcols
+        assert "tested_jlpt_level" in vcols
+
+
+class TestQuizSongsRenameAndFavorite:
+    def test_fresh_db_has_quiz_songs_with_favorite(self, tmp_path):
+        db = _db(tmp_path)
+        with db.connect() as conn:
+            tables = {
+                r["name"]
+                for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(quiz_songs)")}
+        assert "quiz_songs" in tables
+        assert "favorite_songs" not in tables
+        assert "favorite" in cols
+
+    def test_upsert_defaults_favorite_and_is_sticky(self, tmp_path):
+        db = _db(tmp_path)
+        sid = db.upsert_favorite_song(
+            title="t", artist="a", youtube_url="https://youtu.be/x",
+            youtube_short_url="https://youtu.be/x", status="ready",
+        )
+        with db.connect() as conn:
+            fav = conn.execute(
+                "SELECT favorite FROM quiz_songs WHERE id = ?", (sid,)
+            ).fetchone()["favorite"]
+        assert fav == 1
+        # A later quiz_source re-ingest must NOT un-favorite a hearted song.
+        db.upsert_favorite_song(
+            title="t", artist="a", youtube_url="https://youtu.be/x",
+            youtube_short_url="https://youtu.be/x", status="ready",
+            favorite=False,
+        )
+        with db.connect() as conn:
+            fav2 = conn.execute(
+                "SELECT favorite FROM quiz_songs WHERE id = ?", (sid,)
+            ).fetchone()["favorite"]
+        assert fav2 == 1
+
+    def test_quiz_source_stored_as_not_favorite(self, tmp_path):
+        db = _db(tmp_path)
+        sid = db.upsert_favorite_song(
+            title="t", artist="a", youtube_url="https://youtu.be/y",
+            youtube_short_url="https://youtu.be/y", status="ready",
+            favorite=False,
+        )
+        with db.connect() as conn:
+            fav = conn.execute(
+                "SELECT favorite FROM quiz_songs WHERE id = ?", (sid,)
+            ).fetchone()["favorite"]
+        assert fav == 0
+
+    def test_legacy_favorite_songs_renamed_preserving_data(self, tmp_path):
+        import sqlite3
+        path = tmp_path / "legacy_songs.sqlite3"
+        conn = sqlite3.connect(path)
+        conn.executescript(
+            """
+            CREATE TABLE favorite_songs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL,
+                artist TEXT NOT NULL DEFAULT '', youtube_url TEXT NOT NULL,
+                youtube_short_url TEXT NOT NULL UNIQUE, lyrics_url TEXT,
+                youtube_title_raw TEXT, video_id TEXT,
+                status TEXT NOT NULL DEFAULT 'pending', last_error TEXT,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            INSERT INTO favorite_songs
+                (title, artist, youtube_url, youtube_short_url, status, created_at, updated_at)
+                VALUES ('旧曲', '歌手', 'https://youtu.be/z', 'https://youtu.be/z', 'ready', 't', 't');
+            """
+        )
+        conn.commit()
+        conn.close()
+        db = QuizDatabase(path)
+        with db.connect() as conn:
+            tables = {
+                r["name"]
+                for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            row = conn.execute(
+                "SELECT title, favorite FROM quiz_songs WHERE youtube_short_url='https://youtu.be/z'"
+            ).fetchone()
+        assert "quiz_songs" in tables
+        assert "favorite_songs" not in tables
+        assert row["title"] == "旧曲"
+        # Pre-existing rows are genuine user favorites → default 1.
+        assert row["favorite"] == 1
+
+
+class TestVocabCardDifficultyBadge:
+    def test_render_always_shows_difficulty_badge(self, tmp_path):
+        from types import SimpleNamespace
+        from openclaw_adapter.quiz_command import _render_vocab_card
+
+        def _card(level_tag):
+            return SimpleNamespace(
+                level="JLPT N1", headword="乙女", reading_hiragana="おとめ",
+                zh_gloss_short="少女", example_ja="愛らしい乙女なんだが",
+                exam_points=("漢字読み",), source_name="テスト曲",
+                source_media_url=None, source_text_url=None, vocab_id="v1",
+                tested_jlpt_level=level_tag,
+            )
+
+        text_n2, _ = _render_vocab_card(_card("N2"), mode="all", index=0, total=3)
+        assert "難度 N2" in text_n2.splitlines()[0]
+        # NULL/blank tag is treated as N1 and still shows a badge.
+        text_n1, _ = _render_vocab_card(_card(None), mode="all", index=0, total=3)
+        assert "難度 N1" in text_n1.splitlines()[0]
