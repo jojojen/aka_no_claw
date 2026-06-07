@@ -14,13 +14,13 @@ Last updated: 2026-06-07 JST
 
 ## Current Status
 
-- Current clean `quiz_vocab_cards` count after source-excerpt example enforcement: 271.
+- Current clean `quiz_vocab_cards` count after source-excerpt example enforcement: 300.
 - Current Codex lexical question-row count: 853.
 - Current distinct `tested_point` count: 827.
-- Current `vocab_seed` table count: 630 (DB-backed, `quiz_vocab_seed.py` has been deleted).
+- Current `vocab_seed` table count: 666 (DB-backed, `quiz_vocab_seed.py` has been deleted).
 - Current ready `favorite_songs` count: 28.
 - Current target floor: 800 cards.
-- Remaining clean vocabulary cards needed from the current baseline: 529.
+- Remaining clean vocabulary cards needed from the current baseline: 500.
 - Status: in progress.
 
 ## Reverse Plan
@@ -200,4 +200,10 @@ Last updated: 2026-06-07 JST
     - `distinct codex lexical tested_point = 827`
     - `codex lexical question rows = 853`
     - `vocab_seed table = 630`
-  - **Next exact step**: Task 2 — fill 44 genuine missing vocab cards (headwords that have lexical questions but no card). These are `言い換え類義`, `用法`, and `文脈規定` tested_points whose source_excerpt doesn't contain the headword verbatim, so `source_excerpt_vocab_example()` returns None. Fix options: (a) change tested_point to the surface form that appears in the excerpt, or (b) rewrite the question with an excerpt that contains the headword verbatim.
+  - **Next exact step**: Continue authoring new lexical questions and registering seeds (via `db.upsert_vocab_seed`) until 800 cards. Current gap: 500 cards. Sources: under-quota ready favorite songs first, then general `data/proseka_songs.json` pool. Existing 386 title-type 漢字読み questions cannot generate vocab cards (source_excerpt_type='title'); those headwords need fresh questions with lyric/article grounding to get cards.
+- 2026-06-07 JST — Seed batch fill to 300 cards:
+  - Added 36 seed rows to `vocab_seed` table for existing questions that had no seed.
+  - All 36 entries verified to have non-title source_excerpt with headword verbatim AND memory-helpful examples.
+  - Criteria: N2+ vocabulary only; excluded N3/N4 basics; excluded meta-commentary article examples longer than useful; preferred short lyric-line examples.
+  - Backfill ran once after batch insert. Result: `quiz_vocab_cards = 300`.
+  - Examples: つま先, 一筋縄, 交わす, 共鳴, 尽きる, 彗星, 得体, 憧れ, 来世, 盲動, 陽炎, 炎天, etc.
