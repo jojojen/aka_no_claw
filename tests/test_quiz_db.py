@@ -14,7 +14,6 @@ from openclaw_adapter.quiz_db import (
     source_excerpt_vocab_example,
     source_excerpt_type_conflicts_with_exam_point,
     vocab_example_is_low_value,
-    vocab_seed_is_placeholder_example,
     youhou_target_word_presence_leaks,
 )
 
@@ -387,19 +386,9 @@ class TestAuthorColumn:
 
 
 class TestVocabCards:
-    def test_placeholder_seed_examples_are_not_vocab_cards(self, tmp_path, monkeypatch):
+    def test_title_source_excerpt_does_not_backfill_vocab_card(self, tmp_path):
         db = _db(tmp_path)
-        monkeypatch.setitem(
-            __import__(
-                "openclaw_adapter.quiz_db", fromlist=["QUIZ_VOCAB_SEED"]
-            ).QUIZ_VOCAB_SEED,
-            "25時の情熱",
-            {
-                "reading_hiragana": "にごじのじょうねつ",
-                "zh_gloss_short": "25時の情熱",
-                "example_ja": "「25時の情熱」という言葉が心に残った。",
-            },
-        )
+        db.upsert_vocab_seed("25時の情熱", "にごじのじょうねつ", "25時の情熱")
         db.insert_question(
             level="JLPT N1",
             exam_point="漢字読み",
@@ -420,29 +409,9 @@ class TestVocabCards:
         )
         assert db.get_vocab_card(headword="25時の情熱", level="JLPT N1") is None
 
-    def test_placeholder_seed_detection_allows_real_examples(self):
-        assert vocab_seed_is_placeholder_example(
-            "25時の情熱",
-            {
-                "reading_hiragana": "にごじのじょうねつ",
-                "zh_gloss_short": "25時の情熱",
-                "example_ja": "「25時の情熱」という言葉が心に残った。",
-            },
-        )
-        assert not vocab_seed_is_placeholder_example(
-            "お気に召すまま",
-            {
-                "reading_hiragana": "おきにめすまま",
-                "zh_gloss_short": "隨您喜歡、任您高興",
-                "example_ja": "お気に召すまま選んでください。",
-            },
-        )
-        assert vocab_example_is_low_value(
-            "退路", "「退路」の意味を調べた。"
-        )
-        assert not vocab_example_is_low_value(
-            "退路", "退路を断たれた。"
-        )
+    def test_vocab_example_low_value_detection(self):
+        assert vocab_example_is_low_value("退路", "「退路」の意味を調べた。")
+        assert not vocab_example_is_low_value("退路", "退路を断たれた。")
 
     def test_source_excerpt_example_requires_real_non_title_sentence(self):
         assert source_excerpt_vocab_example(
@@ -463,6 +432,7 @@ class TestVocabCards:
 
     def test_insert_codex_lexical_question_backfills_vocab_card(self, tmp_path):
         db = _db(tmp_path)
+        db.upsert_vocab_seed("範疇", "はんちゅう", "範圍、類別")
         db.insert_question(
             level="JLPT N1",
             exam_point="漢字読み",
@@ -490,30 +460,10 @@ class TestVocabCards:
         assert card.source_media_url == "https://www.youtube.com/watch?v=g7dvpD_zlIM"
         assert card.exam_points == ("漢字読み",)
 
-    def test_vocab_cards_do_not_share_same_example_sentence(self, tmp_path, monkeypatch):
-        quiz_db_module = __import__(
-            "openclaw_adapter.quiz_db", fromlist=["QUIZ_VOCAB_SEED"]
-        )
-        monkeypatch.setitem(
-            quiz_db_module.QUIZ_VOCAB_SEED,
-            "範疇A",
-            {
-                "reading_hiragana": "はんちゅうえー",
-                "zh_gloss_short": "範疇A",
-                "example_ja": "範疇Aの例。",
-            },
-        )
-        monkeypatch.setitem(
-            quiz_db_module.QUIZ_VOCAB_SEED,
-            "範疇B",
-            {
-                "reading_hiragana": "はんちゅうびー",
-                "zh_gloss_short": "範疇B",
-                "example_ja": "範疇Bの例。",
-            },
-        )
-
+    def test_vocab_cards_do_not_share_same_example_sentence(self, tmp_path):
         db = _db(tmp_path)
+        db.upsert_vocab_seed("範疇A", "はんちゅうえー", "範疇A")
+        db.upsert_vocab_seed("範疇B", "はんちゅうびー", "範疇B")
         for term, answer in (("範疇A", 0), ("範疇B", 1)):
             db.insert_question(
                 level="JLPT N1",
@@ -542,6 +492,7 @@ class TestVocabCards:
 
     def test_vocab_card_prefers_youhou_as_primary_when_same_headword_repeats(self, tmp_path):
         db = _db(tmp_path)
+        db.upsert_vocab_seed("範疇", "はんちゅう", "範圍、類別")
         read_q = db.insert_question(
             level="JLPT N1",
             exam_point="漢字読み",
