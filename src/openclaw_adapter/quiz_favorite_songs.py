@@ -232,8 +232,11 @@ def _repair_youtube_metadata_with_llm(settings, metadata: YoutubeSongMetadata) -
         "你是音樂 metadata 正規化器。請根據 YouTube 標題與頻道名，抽出真正的歌曲名稱與歌手。\n"
         "規則：\n"
         "1. title 要是歌曲名，不要保留 Official/MV/LIVE/TOUR/feat. 標籤。\n"
-        "2. artist 要是歌手/團體名，不要保留 Official、頻道描述、製作人宣傳字串。\n"
-        "3. 不確定時，優先保守沿用原本較可信的一欄。\n"
+        "2. title 只保留原曲日文／原文歌名；移除括號內的英文或羅馬拼音翻譯"
+        "（例如「ロストワンの号哭(Lost One's Weeping)」→「ロストワンの号哭」），"
+        "也移除任何位置的【】製作標籤（如【IAオリジナル曲・PV付】）。\n"
+        "3. artist 要是歌手/團體名，不要保留 Official、頻道描述、製作人宣傳字串。\n"
+        "4. 不確定時，優先保守沿用原本較可信的一欄。\n"
         '只輸出 JSON：{"title":"...","artist":"..."}\n\n'
         f"youtube_title_raw: {metadata.raw_title}\n"
         f"youtube_author_name: {metadata.artist}\n"
