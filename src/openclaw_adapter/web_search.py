@@ -9,21 +9,23 @@ from html import unescape
 from html.parser import HTMLParser
 from typing import Callable, Sequence
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import urlencode, urlparse
+
 from urllib.request import Request, urlopen
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_WEB_SEARCH_LIMIT = 5
-DUCKDUCKGO_HTML_URL = "https://html.duckduckgo.com/html/"
 
 # How many top results to actually download + read (item 1), and how much of
-# each page to keep when feeding the summariser.
-DEFAULT_FETCH_PAGE_COUNT = 3
+# each page to keep when feeding the summariser. Kept small because the local
+# qwen3:14b on the Mac Mini generates at ~11 tok/s — a large grounding prompt
+# pushes the summarise call past its timeout under Ollama queue contention.
+DEFAULT_FETCH_PAGE_COUNT = 2
 DEFAULT_PAGE_CHARS = 8000
 # Per-source budget inside the multi-source summary prompt; smaller than a
 # single-page fetch so several articles fit in the local model's context.
-DEFAULT_SUMMARY_CONTENT_CHARS = 4000
+DEFAULT_SUMMARY_CONTENT_CHARS = 2000
 DEFAULT_REFORMULATED_QUERY_COUNT = 3
 
 # Tags whose text content is boilerplate / non-readable and should be dropped
@@ -58,31 +60,128 @@ class WebResearchAnswer:
     sources: tuple[WebSearchResult, ...]
 
 
-def search_duckduckgo(
+YAHOO_JAPAN_SEARCH_URL = "https://search.yahoo.co.jp/search"
+_YAHOO_PROFILE_DEFAULT = "~/.openclaw/browser_profile/yahoo_jp"
+_PLAYWRIGHT_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+_YAHOO_WAIT_MS = 3500  # wait after domcontentloaded for JS to render results
+
+# --- Persistent browser session (singleton per process) ---
+# Keeping the Playwright context alive across calls avoids 2-3s browser startup
+# overhead on every search query, making multi-query reformulated searches fast
+# enough to stay within the 45s Ollama timeout budget.
+
+_pw_instance = None   # Playwright handle
+_pw_ctx = None        # BrowserContext (persistent, keeps cookies/session)
+_pw_lock = None       # threading.Lock — lazy-init below
+
+
+def _get_yahoo_context(profile_dir: str | None = None):
+    """Return the shared persistent BrowserContext, launching it if needed."""
+    import pathlib
+    import threading
+
+    global _pw_instance, _pw_ctx, _pw_lock
+
+    if _pw_lock is None:
+        _pw_lock = threading.Lock()
+
+    with _pw_lock:
+        if _pw_ctx is not None:
+            try:
+                # Probe that the context is still alive
+                _pw_ctx.pages  # noqa: B018 — raises if context is closed
+                return _pw_ctx
+            except Exception:
+                logger.warning("Yahoo Japan browser context died; restarting")
+                _pw_ctx = None
+                try:
+                    _pw_instance.stop()
+                except Exception:
+                    pass
+                _pw_instance = None
+
+        from playwright.sync_api import sync_playwright
+
+        profile = pathlib.Path(
+            profile_dir or pathlib.Path(_YAHOO_PROFILE_DEFAULT).expanduser()
+        )
+        profile.mkdir(parents=True, exist_ok=True)
+
+        pw = sync_playwright().start()
+        ctx = pw.chromium.launch_persistent_context(
+            str(profile),
+            headless=True,
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+            user_agent=_PLAYWRIGHT_UA,
+        )
+        _pw_instance = pw
+        _pw_ctx = ctx
+        logger.info("Yahoo Japan browser context started profile=%s", profile)
+        return ctx
+
+
+def search_yahoo_japan_playwright(
     query: str,
     *,
     max_results: int = DEFAULT_WEB_SEARCH_LIMIT,
-    timeout_seconds: int = 20,
-    user_agent: str = "OpenClawWebResearch/0.1 (+https://local-dev)",
-    ssl_context: ssl.SSLContext | None = None,
-    fetch_url: FetchUrl | None = None,
+    profile_dir: str | None = None,
 ) -> tuple[WebSearchResult, ...]:
+    """Yahoo Japan web search via a persistent Playwright Chromium session.
+
+    The browser context is started once and reused across calls so multi-query
+    reformulated searches don't pay browser-startup cost on every query.
+    """
+    from playwright.sync_api import TimeoutError as PlaywrightTimeout
+
     cleaned_query = " ".join(query.split()).strip()
     if not cleaned_query:
         return ()
 
-    limit = max(1, min(10, max_results))
-    fetch = fetch_url or _fetch_url
-    url = f"{DUCKDUCKGO_HTML_URL}?{urlencode({'q': cleaned_query})}"
-    logger.info("DuckDuckGo search query=%s limit=%s", cleaned_query, limit)
-    html = fetch(url, timeout_seconds, user_agent, ssl_context)
-    return parse_duckduckgo_html(html, max_results=limit)
+    url = f"{YAHOO_JAPAN_SEARCH_URL}?{urlencode({'p': cleaned_query})}"
+    logger.info("Yahoo Japan search query=%s", cleaned_query)
+
+    ctx = _get_yahoo_context(profile_dir)
+    page = ctx.new_page()
+    try:
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        except PlaywrightTimeout:
+            logger.warning("Yahoo Japan goto timeout; reading current DOM")
+        page.wait_for_timeout(_YAHOO_WAIT_MS)
+        results = _extract_yahoo_japan_results(page, max_results)
+    finally:
+        page.close()
+
+    if not results:
+        logger.warning("Yahoo Japan returned 0 results query=%s", cleaned_query)
+    return results
 
 
-def parse_duckduckgo_html(html: str, *, max_results: int = DEFAULT_WEB_SEARCH_LIMIT) -> tuple[WebSearchResult, ...]:
-    parser = _DuckDuckGoResultParser()
-    parser.feed(html)
-    return _dedupe_results(parser.results, max_results=max_results)
+def _extract_yahoo_japan_results(page: object, max_results: int) -> tuple[WebSearchResult, ...]:
+    results: list[WebSearchResult] = []
+    for card in page.query_selector_all("div.sw-Card"):  # type: ignore[attr-defined]
+        if len(results) >= max_results:
+            break
+        title_el = card.query_selector(".sw-Card__title a")
+        if not title_el:
+            continue
+        href = (title_el.get_attribute("href") or "").strip()
+        if not _is_external_http_url(href):
+            continue
+        raw_title = title_el.inner_text().strip()
+        title = raw_title.splitlines()[0].strip() if raw_title else ""
+        if not title:
+            continue
+        snip_el = card.query_selector("p")
+        snippet = (snip_el.inner_text().strip() if snip_el else "").replace("\xa0", " ")
+        results.append(WebSearchResult(title=title, url=href, snippet=snippet))
+    return tuple(results)
+
+
 
 
 def build_web_research_answer(
@@ -213,6 +312,7 @@ def summarize_web_sources_with_ollama(
         "model": model,
         "prompt": _build_summary_prompt(query, sources),
         "stream": False,
+        "think": False,
         "options": {"temperature": 0.2},
     }
     request = Request(
@@ -366,7 +466,7 @@ def reformulate_queries_with_ollama(
         "(Japanese/English) rather than translating them.\n\n"
         f"Question: {cleaned}\n\nQueries:"
     )
-    payload = {"model": model, "prompt": prompt, "stream": False, "options": {"temperature": 0.2}}
+    payload = {"model": model, "prompt": prompt, "stream": False, "think": False, "options": {"temperature": 0.2}}
     request = Request(
         _resolve_ollama_generate_url(endpoint),
         data=json.dumps(payload).encode("utf-8"),
@@ -454,7 +554,7 @@ def answer_page_with_ollama(
         "Page content:\n"
         f"{body}\n\nAnswer:"
     )
-    request_payload = {"model": model, "prompt": full_prompt, "stream": False, "options": {"temperature": 0.2}}
+    request_payload = {"model": model, "prompt": full_prompt, "stream": False, "think": False, "options": {"temperature": 0.2}}
     request = Request(
         _resolve_ollama_generate_url(endpoint),
         data=json.dumps(request_payload).encode("utf-8"),
@@ -501,73 +601,6 @@ def _resolve_ollama_generate_url(endpoint: str) -> str:
     return f"{stripped}/api/generate"
 
 
-class _DuckDuckGoResultParser(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.results: list[WebSearchResult] = []
-        self._title_parts: list[str] | None = None
-        self._title_depth = 0
-        self._title_url: str | None = None
-        self._snippet_parts: list[str] | None = None
-        self._snippet_depth = 0
-        self._last_result_index: int | None = None
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        attrs_dict = {name.lower(): value or "" for name, value in attrs}
-        class_name = attrs_dict.get("class", "")
-
-        if self._title_parts is not None:
-            self._title_depth += 1
-            return
-        if self._snippet_parts is not None:
-            self._snippet_depth += 1
-            return
-
-        if tag.lower() == "a" and _has_class(class_name, "result__a"):
-            self._title_parts = []
-            self._title_depth = 1
-            self._title_url = _normalize_result_url(attrs_dict.get("href", ""))
-            return
-
-        if _has_class(class_name, "result__snippet"):
-            self._snippet_parts = []
-            self._snippet_depth = 1
-
-    def handle_endtag(self, tag: str) -> None:
-        if self._title_parts is not None:
-            self._title_depth -= 1
-            if self._title_depth <= 0:
-                title = _compact_whitespace("".join(self._title_parts))
-                url = self._title_url or ""
-                if title and _is_external_http_url(url):
-                    self.results.append(WebSearchResult(title=title, url=url))
-                    self._last_result_index = len(self.results) - 1
-                self._title_parts = None
-                self._title_url = None
-                self._title_depth = 0
-            return
-
-        if self._snippet_parts is not None:
-            self._snippet_depth -= 1
-            if self._snippet_depth <= 0:
-                snippet = _compact_whitespace("".join(self._snippet_parts))
-                if snippet and self._last_result_index is not None:
-                    result = self.results[self._last_result_index]
-                    self.results[self._last_result_index] = WebSearchResult(
-                        title=result.title,
-                        url=result.url,
-                        snippet=snippet,
-                    )
-                self._snippet_parts = None
-                self._snippet_depth = 0
-
-    def handle_data(self, data: str) -> None:
-        if self._title_parts is not None:
-            self._title_parts.append(data)
-        elif self._snippet_parts is not None:
-            self._snippet_parts.append(data)
-
-
 class _ReadableTextParser(HTMLParser):
     """Collect human-readable text from a page, dropping scripts/nav/etc."""
 
@@ -611,43 +644,11 @@ def _compact_lines(value: str) -> str:
     return "\n".join(line for line in lines if line).strip()
 
 
-def _has_class(class_name: str, expected: str) -> bool:
-    return expected in class_name.split()
-
-
-def _normalize_result_url(href: str) -> str:
-    href = unescape(href).strip()
-    if href.startswith("//"):
-        href = f"https:{href}"
-    if href.startswith("/l/"):
-        href = f"https://duckduckgo.com{href}"
-
-    parsed = urlparse(href)
-    if parsed.netloc.endswith("duckduckgo.com") and parsed.path == "/l/":
-        target = parse_qs(parsed.query).get("uddg", [""])[0]
-        return target.strip()
-    return href
-
-
 def _is_external_http_url(url: str) -> bool:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"}:
         return False
     return not parsed.netloc.endswith("duckduckgo.com")
-
-
-def _dedupe_results(results: list[WebSearchResult], *, max_results: int) -> tuple[WebSearchResult, ...]:
-    deduped: list[WebSearchResult] = []
-    seen: set[str] = set()
-    for result in results:
-        key = _canonical_url_key(result.url)
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(result)
-        if len(deduped) >= max_results:
-            break
-    return tuple(deduped)
 
 
 def _canonical_url_key(url: str) -> str:

@@ -48,7 +48,7 @@ from .web_search import (
     fetch_page_text,
     format_web_research_answer,
     reformulate_queries_with_ollama,
-    search_duckduckgo,
+    search_yahoo_japan_playwright,
     summarize_web_sources_with_ollama,
 )
 
@@ -115,7 +115,7 @@ def build_tool_registry(settings: AssistantSettings | None = None) -> ToolRegist
     registry.register(
         AssistantTool(
             name="assistant.web-search",
-            description="Search the web with DuckDuckGo and summarize the sources with the configured local LLM.",
+            description="Search the web with Yahoo Japan and summarize the sources with the configured local LLM.",
             configure_parser=_configure_web_search_parser,
             handler=lambda args: _handle_web_search(args, settings),
             aliases=("web-search", "research", "search-web"),
@@ -265,7 +265,7 @@ def _configure_telegram_send_test_parser(parser: argparse.ArgumentParser) -> Non
 
 def _configure_web_search_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("query", nargs="+", help="Question or search query to research.")
-    parser.add_argument("--provider", choices=["duckduckgo"], default="duckduckgo")
+    parser.add_argument("--provider", choices=["yahoo_japan"], default="yahoo_japan")
     parser.add_argument("--limit", type=int, default=5, help="Number of search results to use, 1-10.")
     parser.add_argument("--json", action="store_true", help="Print structured answer JSON.")
 
@@ -335,10 +335,9 @@ def _handle_web_search(args: argparse.Namespace, settings: AssistantSettings) ->
     answer = build_web_research_answer(
         query,
         max_results=args.limit,
-        search_fn=lambda q, limit: search_duckduckgo(
+        search_fn=lambda q, limit: search_yahoo_japan_playwright(
             q,
             max_results=limit,
-            ssl_context=ssl_ctx,
         ),
         reformulate_fn=lambda q: reformulate_queries_with_ollama(
             q,
