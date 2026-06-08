@@ -427,6 +427,34 @@ def answer_leaks_into_stem(
     return correct in _normalize_grounding(stem)
 
 
+def synonym_answer_restates_headword(
+    *, headword: str, reading: str | None, option: str
+) -> bool:
+    """True iff a 言い換え類義 correct option just RESTATES the asked word — so the
+    item is solvable by spotting the word inside its own 'synonym'. The structural
+    ``answer_leaks_into_stem`` gate misses this because the leak is in the OPTION,
+    not the stem (e.g. 【建前】→「表向きの方針やたてまえ」, 【喚く】→「大声でわめき叫ぶ」,
+    【塊】→「一つにかたまったもの」).
+
+    Deliberately CONSERVATIVE — only fires on a whole-word restatement, never on an
+    incidental single shared kanji, so a genuine paraphrase that reuses one
+    character (【転移】→「他の場所へ移り広がること」 reuses 移) is NOT flagged:
+      * the contiguous headword kanji string appears verbatim in the option, OR
+      * the headword's reading (minus trailing okurigana for inflected words)
+        appears as a kana run inside the option.
+    """
+    hw = (headword or "").strip()
+    if hw and len(hw) >= 2 and hw in option:
+        return True
+    r = _to_hiragana(reading)
+    if len(r) < 2:
+        return False
+    stem = r[:-1] if len(r) > 2 else r          # drop okurigana on verbs/adjs
+    if len(stem) < 2:
+        return False
+    return stem in _to_hiragana(option)
+
+
 def youhou_target_word_presence_leaks(
     *, exam_point: str | None, stem: str, options: tuple[str, ...], answer_index: int
 ) -> bool:
