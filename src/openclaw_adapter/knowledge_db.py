@@ -390,6 +390,15 @@ class KnowledgeDatabase:
                 canonical, raw_input,
             )
             return False
+        if is_insufficient_entry(entry):
+            # The entity is a 資料不足 no-data stub (internal negative cache). Don't
+            # accrete observations onto it — that would launder junk into a
+            # user-visible 'knowledge' entry. Drop the observation silently.
+            logger.info(
+                "knowledge_db: append_observation skipped — entity=%s is a no-data stub (資料不足)",
+                canonical,
+            )
+            return False
 
         bullet = _build_observation_bullet(
             observed_at=observed_at,
@@ -817,6 +826,30 @@ CODEGEN_SEED: tuple[dict, ...] = (
 
 OBSERVATION_MARKER = "\n---\n最近觀察：\n"
 OBSERVATION_SUMMARY_CAP = 2000
+
+# A no-data stub: EntityResearcher couldn't find enough to describe an entity, so it
+# cached a 資料不足 / confidence~0 placeholder ONLY to stop future encounters from
+# re-hammering web search (a negative cache). Such stubs are NOT real knowledge —
+# they must never be surfaced in the daily digest nor accrete 最近觀察 observations.
+NO_DATA_SUMMARY = "資料不足"
+INSUFFICIENT_CONFIDENCE = 0.1
+
+
+def _summary_head(summary: str) -> str:
+    """The canonical-knowledge head of a summary, stripped of appended 最近觀察 bullets."""
+    return (summary or "").partition(OBSERVATION_MARKER)[0].strip()
+
+
+def is_insufficient_entry(entry: KnowledgeEntry) -> bool:
+    """True iff *entry* is a no-data stub carrying no real knowledge. Detected by
+    near-zero confidence (only the no-data path writes <0.1; real research writes
+    0.5+) OR an empty / 資料不足 knowledge head. Appended 最近觀察 bullets do NOT
+    flip the verdict — the head stays 資料不足, so a stub can't be laundered into a
+    'real' entry just by logging observations onto it."""
+    if float(entry.confidence) < INSUFFICIENT_CONFIDENCE:
+        return True
+    head = _summary_head(entry.summary)
+    return head == "" or head == NO_DATA_SUMMARY
 
 
 def _build_observation_bullet(
