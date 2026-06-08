@@ -488,6 +488,16 @@ def youhou_target_word_presence_leaks(
     return distractor_hits == 0
 
 
+def _contains_kana(text: str | None) -> bool:
+    """True if the text holds any hiragana/katakana. A Chinese gloss must be
+    Han-only; any kana means a Japanese paraphrase leaked into the 中文 field."""
+    for ch in text or "":
+        code = ord(ch)
+        if 0x3041 <= code <= 0x3096 or 0x30A1 <= code <= 0x30F6:
+            return True
+    return False
+
+
 def _to_hiragana(text: str | None) -> str:
     """Keep only kana, folding katakana → hiragana so '読み' comparisons are
     script-insensitive. Everything else (kanji, latin, punctuation, the prolonged
@@ -911,6 +921,11 @@ class QuizDatabase:
     def upsert_vocab_seed(
         self, headword: str, reading_hiragana: str, zh_gloss_short: str
     ) -> None:
+        if _contains_kana(zh_gloss_short):
+            raise ValueError(
+                f"zh_gloss_short must be Chinese (Han-only), not Japanese: "
+                f"headword={headword!r} gloss={zh_gloss_short!r}"
+            )
         with self.connect() as conn:
             conn.execute(
                 """INSERT INTO vocab_seed (headword, reading_hiragana, zh_gloss_short)

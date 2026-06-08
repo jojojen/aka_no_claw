@@ -389,7 +389,7 @@ class TestAuthorColumn:
 class TestVocabCards:
     def test_title_source_excerpt_does_not_backfill_vocab_card(self, tmp_path):
         db = _db(tmp_path)
-        db.upsert_vocab_seed("25時の情熱", "にごじのじょうねつ", "25時の情熱")
+        db.upsert_vocab_seed("25時の情熱", "にごじのじょうねつ", "歌曲名稱")
         db.insert_question(
             level="JLPT N1",
             exam_point="漢字読み",
