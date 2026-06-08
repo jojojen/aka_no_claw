@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import Callable, Sequence
 
 from .knowledge_db import (
+    COMMON_KNOWLEDGE_SUMMARY,
     ENTITY_TYPES,
     KnowledgeDatabase,
     NO_DATA_SUMMARY,
@@ -47,6 +48,22 @@ class ResearchResult:
 def _build_research_query(entity_name: str) -> str:
     """Bilingual JP/EN query optimised for TCG collector context."""
     return f'"{entity_name}" TCG カード IP 客群 市場'
+
+
+def _build_common_knowledge_prompt(entity_name: str) -> str:
+    """Ask the local model whether an entity is general public knowledge it already
+    grounds on its own — in which case researching + storing it adds nothing to the
+    TCG relevance classifier (which uses the same model) and only clutters the digest."""
+    return (
+        "你是 TCG / 收藏品知識庫的守門員。這個知識庫只該收錄『niche、需要特別查證才知道』"
+        "的 TCG 相關 entity：特定卡包 / 系列、角色 / 創作者、店鋪、限時活動、冷門 IP。\n\n"
+        "如果某個名稱是『廣為人知的大眾常識』——例如大型企業（Amazon / Sony）、國家地名、"
+        "知名平台（YouTube / Twitter）、通用詞彙——那麼分類器本來就認得，存進知識庫毫無 grounding 價值。\n\n"
+        f"名稱：{entity_name}\n\n"
+        "你『本來就有把握、不需要查證』就知道這是什麼嗎？也就是它屬於大眾常識，而非需要查的 niche TCG entity？\n"
+        "嚴格只回 JSON：\n"
+        '{"common_knowledge": true/false, "reason": "一句話"}'
+    )
 
 
 def _build_condensation_prompt(
@@ -219,37 +236,80 @@ class EntityResearcher:
                 canonical = self._queue.popleft()
                 self._recent.append(canonical)
             try:
-                result = self.research(canonical)
-                if result is not None:
-                    self._db.upsert_entry(
-                        entity_canonical=result.entity_canonical,
-                        entity_type=result.entity_type,
-                        summary=result.summary,
-                        source_urls=result.source_urls,
-                        confidence=0.5,
-                        origin="web_research",
-                        aliases=result.aliases,
-                    )
-                    logger.info(
-                        "EntityResearcher: backfilled %s (type=%s, %d aliases, %d sources)",
-                        result.entity_canonical, result.entity_type,
-                        len(result.aliases), len(result.source_urls),
-                    )
-                else:
-                    # Cache the negative result so request() short-circuits on
-                    # future encounters and never retriggers a search.  confidence=0
-                    # is intentionally below any real result (0.5+), so a later
-                    # successful research will overwrite this stub.
-                    self._db.upsert_entry(
-                        entity_canonical=canonical,
-                        entity_type="other",
-                        summary=NO_DATA_SUMMARY,
-                        confidence=0.0,
-                        origin="web_research",
-                    )
-                    logger.info("EntityResearcher: insufficient data for %s — cached as no-data stub", canonical)
+                self._handle(canonical)
             except Exception:
                 logger.exception("EntityResearcher: research failed for %s", canonical)
+
+    def _handle(self, canonical: str) -> None:
+        """Process one queued entity: common-knowledge gate → research → cache.
+        Extracted from the worker loop so it can be unit-tested synchronously."""
+        if self._is_common_knowledge(canonical):
+            # The local model already grounds this entity (general common
+            # knowledge), so storing a research summary adds nothing to the
+            # classifier. Cache a hidden stub (confidence 0 → never surfaced,
+            # filtered by is_insufficient_entry) so request() short-circuits
+            # future encounters and we skip the web search entirely.
+            self._db.upsert_entry(
+                entity_canonical=canonical,
+                entity_type="other",
+                summary=COMMON_KNOWLEDGE_SUMMARY,
+                confidence=0.0,
+                origin="web_research",
+            )
+            logger.info(
+                "EntityResearcher: %s is common knowledge — skipped research, cached as hidden stub",
+                canonical,
+            )
+            return
+        result = self.research(canonical)
+        if result is not None:
+            self._db.upsert_entry(
+                entity_canonical=result.entity_canonical,
+                entity_type=result.entity_type,
+                summary=result.summary,
+                source_urls=result.source_urls,
+                confidence=0.5,
+                origin="web_research",
+                aliases=result.aliases,
+            )
+            logger.info(
+                "EntityResearcher: backfilled %s (type=%s, %d aliases, %d sources)",
+                result.entity_canonical, result.entity_type,
+                len(result.aliases), len(result.source_urls),
+            )
+        else:
+            # Cache the negative result so request() short-circuits on
+            # future encounters and never retriggers a search.  confidence=0
+            # is intentionally below any real result (0.5+), so a later
+            # successful research will overwrite this stub.
+            self._db.upsert_entry(
+                entity_canonical=canonical,
+                entity_type="other",
+                summary=NO_DATA_SUMMARY,
+                confidence=0.0,
+                origin="web_research",
+            )
+            logger.info("EntityResearcher: insufficient data for %s — cached as no-data stub", canonical)
+
+    # ── Pre-store gate ──────────────────────────────────────────────────────
+
+    def _is_common_knowledge(self, entity_name: str) -> bool:
+        """Ask the local model whether *entity_name* is general public knowledge it
+        already grounds. Fail-open: any error / non-JSON returns False so we fall
+        through to normal research rather than silently dropping a real entity."""
+        try:
+            raw = self._json_call_fn(
+                endpoint=self._endpoint, model=self._model,
+                prompt=_build_common_knowledge_prompt(entity_name),
+                timeout_seconds=self._timeout_seconds, ssl_context=self._ssl_context,
+            )
+        except Exception:
+            logger.exception("EntityResearcher: common-knowledge check failed for %s", entity_name)
+            return False
+        parsed = _parse_research_response(raw)
+        if not isinstance(parsed, dict):
+            return False
+        return bool(parsed.get("common_knowledge", False))
 
     # ── Synchronous research (called by worker, also unit-testable) ────────
 

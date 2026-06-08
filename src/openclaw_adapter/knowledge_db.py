@@ -832,6 +832,12 @@ OBSERVATION_SUMMARY_CAP = 2000
 # re-hammering web search (a negative cache). Such stubs are NOT real knowledge —
 # they must never be surfaced in the daily digest nor accrete 最近觀察 observations.
 NO_DATA_SUMMARY = "資料不足"
+# A common-knowledge stub: the entity is general public knowledge the local model
+# already grounds on its own (Amazon / 日本 / YouTube …), so researching + storing it
+# adds nothing to the classifier and only clutters the digest. Like a no-data stub it
+# is cached at confidence~0 purely as a negative cache (stop re-research) and must
+# never be surfaced nor accrete 最近觀察 observations.
+COMMON_KNOWLEDGE_SUMMARY = "一般常識（地端模型已知，無需 grounding）"
 INSUFFICIENT_CONFIDENCE = 0.1
 
 
@@ -841,15 +847,16 @@ def _summary_head(summary: str) -> str:
 
 
 def is_insufficient_entry(entry: KnowledgeEntry) -> bool:
-    """True iff *entry* is a no-data stub carrying no real knowledge. Detected by
-    near-zero confidence (only the no-data path writes <0.1; real research writes
-    0.5+) OR an empty / 資料不足 knowledge head. Appended 最近觀察 bullets do NOT
-    flip the verdict — the head stays 資料不足, so a stub can't be laundered into a
-    'real' entry just by logging observations onto it."""
+    """True iff *entry* carries no surfaceable knowledge — either a no-data stub
+    (資料不足) or a common-knowledge stub (一般常識). Detected by near-zero confidence
+    (only the stub paths write <0.1; real research writes 0.5+) OR a stub knowledge
+    head. Appended 最近觀察 bullets do NOT flip the verdict — the head stays a stub
+    marker, so a stub can't be laundered into a 'real' entry just by logging
+    observations onto it."""
     if float(entry.confidence) < INSUFFICIENT_CONFIDENCE:
         return True
     head = _summary_head(entry.summary)
-    return head == "" or head == NO_DATA_SUMMARY
+    return head == "" or head in (NO_DATA_SUMMARY, COMMON_KNOWLEDGE_SUMMARY)
 
 
 def _build_observation_bullet(
