@@ -27,6 +27,7 @@ from typing import Callable, Sequence
 from .knowledge_db import (
     ENTITY_TYPES,
     KnowledgeDatabase,
+    NO_DATA_SUMMARY,
     _normalize_canonical,
 )
 from .web_search import WebSearchResult, search_yahoo_japan_playwright
@@ -242,7 +243,7 @@ class EntityResearcher:
                     self._db.upsert_entry(
                         entity_canonical=canonical,
                         entity_type="other",
-                        summary="資料不足",
+                        summary=NO_DATA_SUMMARY,
                         confidence=0.0,
                         origin="web_research",
                     )

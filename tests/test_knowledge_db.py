@@ -170,8 +170,10 @@ def test_format_knowledge_block_truncates_long_summary():
 
 
 from openclaw_adapter.knowledge_db import (
+    NO_DATA_SUMMARY,
     OBSERVATION_MARKER,
     OBSERVATION_SUMMARY_CAP,
+    is_insufficient_entry,
 )
 
 
@@ -268,3 +270,54 @@ def test_append_observation_updates_timestamps(db):
     assert after.updated_at >= before.updated_at
     assert after.last_referenced_at is not None
     assert after.last_referenced_at >= (before.last_referenced_at or "")
+
+
+# ── 資料不足 no-data stubs — never store onto / never surface ─────────────────
+
+
+def _seed_no_data_stub(db, canonical="pokeca_new_card"):
+    db.upsert_entry(
+        entity_canonical=canonical, entity_type="other",
+        summary=NO_DATA_SUMMARY, confidence=0.0, origin="web_research",
+    )
+
+
+def test_is_insufficient_entry_flags_no_data_stub(db):
+    _seed_no_data_stub(db)
+    assert is_insufficient_entry(db.get_entry("pokeca_new_card")) is True
+
+
+def test_is_insufficient_entry_passes_real_entry(db):
+    _seed_entity(db)
+    assert is_insufficient_entry(db.get_entry("union_arena")) is False
+
+
+def test_is_insufficient_entry_stays_true_even_with_appended_observation(db):
+    # An appended 最近觀察 bullet must NOT launder a stub into a 'real' entry:
+    # the 資料不足 head + zero confidence still mark it insufficient.
+    _seed_no_data_stub(db)
+    entry = db.get_entry("pokeca_new_card")
+    laundered = KnowledgeEntry(
+        entry_id=entry.entry_id,
+        entity_canonical=entry.entity_canonical,
+        entity_type=entry.entity_type,
+        summary=NO_DATA_SUMMARY + OBSERVATION_MARKER + "- [2026-06-08] 推文提及抽選",
+        confidence=0.0,
+    )
+    assert is_insufficient_entry(laundered) is True
+
+
+def test_append_observation_refuses_to_grow_no_data_stub(db):
+    _seed_no_data_stub(db)
+    ok = db.append_observation(
+        entity_alias_or_canonical="pokeca_new_card",
+        observed_at="2026-06-08T01:00:00+00:00",
+        rationale="推文提及抽選與阿比斯眼",
+        suggested_action="無需行動",
+        tweet_url="https://x.com/pokeca_new_card/status/1",
+    )
+    assert ok is False
+    # Summary must remain the bare stub — no observation marker accreted.
+    entry = db.get_entry("pokeca_new_card")
+    assert entry.summary == NO_DATA_SUMMARY
+    assert OBSERVATION_MARKER not in entry.summary

@@ -16,7 +16,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
-from .knowledge_db import KnowledgeDatabase as KnowledgeDB, KnowledgeEntry
+from .knowledge_db import (
+    KnowledgeDatabase as KnowledgeDB,
+    KnowledgeEntry,
+    is_insufficient_entry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +112,9 @@ class RagDailyDigestScheduler:
             return
         db = KnowledgeDB(self._db_path)
         entries = db.entries_since(_today_start_iso())
+        # Never push 資料不足 no-data stubs (confidence~0 placeholders): they carry no
+        # real knowledge and only exist as an internal negative cache.
+        entries = [e for e in entries if not is_insufficient_entry(e)]
         if not entries:
             logger.info("RagDailyDigestScheduler: no new entries today — silent")
             return
