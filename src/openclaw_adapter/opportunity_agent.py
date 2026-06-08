@@ -38,7 +38,7 @@ from .opportunity_models import (
 )
 from .opportunity_pipeline import CandidateProvider, OpportunityPipeline, OpportunityPipelineStats
 from .opportunity_scoring import OpportunityThresholds, reputation_passes
-from .opportunity_store import OpportunityStore
+from .opportunity_store import OpportunityStore, _normalize_legacy_reason
 from .web_search import WebSearchResult, search_yahoo_japan_playwright
 
 logger = logging.getLogger(__name__)
@@ -517,7 +517,10 @@ class WebOpportunityResearcher:
         query = _build_opportunity_research_query(candidate)
         sources = tuple(self._search_fn(query, self._max_results))
         if not sources:
-            return candidate
+            healed = _normalize_legacy_reason(candidate.reason)
+            if healed == candidate.reason:
+                return candidate
+            return replace(candidate, reason=healed)
 
         assessment = _default_web_assessment(candidate, query=query, sources=sources)
         if self._endpoint and self._model:
@@ -555,7 +558,7 @@ class WebOpportunityResearcher:
         # (see _base_reason), each cycle produced a novel nested "網路佐證：網路佐證：…"
         # string that slipped past the guard and piled up 40+ copies. Stripping the
         # base and any echoed markers makes this idempotent.
-        reason = candidate.reason or ""
+        reason = _normalize_legacy_reason(candidate.reason or "")
         if assessment.reason:
             base = _base_reason(candidate.reason)
             core = assessment.reason.strip()
@@ -1625,7 +1628,7 @@ def format_opportunity_recommendation(recommendation: OpportunityRecommendation)
         "",
         f"商品：{c.title}",
         f"熱度：{c.heat_score:.0f}/100",
-        f"理由：{c.reason}",
+        f"理由：{_normalize_legacy_reason(c.reason)}",
     ]
     if c.aliases:
         lines.append(f"別名：{_truncate_string_list(c.aliases, 3)}")
