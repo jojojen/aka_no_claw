@@ -54,7 +54,12 @@ Last updated: 2026-06-07 JST
   - related song/source URL
 - Card examples must come from a real, traceable lyric/article/commentary `source_excerpt`. Do not count a card if the example sentence cannot be tied back to actual source text.
 - Do not reuse the same example sentence across multiple cards. Even for similar words, do not use the same sentence template with only the target word swapped. Choose real source excerpts that distinguish each word's actual usage, nuance, or context.
-- Do not accept low-value examples that merely say the learner remembered, heard, searched, studied, or thought about the word, such as `「X」という言葉が心に残った。`, `Xという言葉を覚えた。`, `Xの意味を調べた。`, or `Xについて考えた。`.
+- Do not accept low-value examples that merely say the learner remembered, heard, searched, studied, or thought about the word, such as `「X」という言葉が心に残った。`, `Xという言葉を覚えた。`, `Xの意味を調べた。`, or `Xについて考えた。`. That blocked list is the FLOOR, not the bar — judge memorability yourself.
+- **The example must teach REAL USAGE — no fragmentary, context-broken (文意破碎), memory-worthless sentences (user directive 2026-06-08).** Quality/correctness is NOT only the question being right — the example itself is part of the bar: it must actively AID MEMORY, and ideally pin down the word's 語感 so the learner can distinguish it from its 類義語 (e.g. 妥協 vs 譲歩, 凶暴 vs 乱暴, 偽装 vs 偽造). A bland "X happened" sentence is a MISS even when grounded and grammatical. Concretely:
+  - DEFAULT: use the FULL lyric line / couplet as `source_excerpt`, never a 3–4 char bare word fragment. BAD: `「妥協大好き」`, `「此処は宴」`, `「生真面目そうな」`. GOOD: `「此処は宴　鋼の檻　その断頭台で見下ろして」`.
+  - CRYPTIC FALLBACK: when even the full lyric line is too cryptic to show standard usage, author a natural N1 sentence with concrete, memorable context (e.g. `「双方が一歩も妥協せず、交渉は決裂した。」`), kept to a single clause; `source_name` still cites the song.
+  - `example_ja` is auto-derived from the primary question's `source_excerpt` (shortest usable line) and OVERWRITTEN every bootstrap, so fix the example by fixing the excerpt, not the card row.
+  - Full rationale + worked examples: see `ai/skills/quiz-authoring-workflow/authoring_spec.md` → "Vocab-card example QUALITY".
 - Local model and web/API tools may help generate candidates, but final acceptance is based on Codex review plus DB validation.
 - qwen solver-check stability rule:
   - Prefer local `qwen3:14b` as the independent solver for objective `漢字読み` items.

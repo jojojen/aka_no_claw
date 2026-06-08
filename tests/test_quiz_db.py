@@ -13,6 +13,7 @@ from openclaw_adapter.quiz_db import (
     is_grounded,
     source_excerpt_vocab_example,
     source_excerpt_type_conflicts_with_exam_point,
+    synonym_answer_restates_headword,
     vocab_example_is_low_value,
     youhou_target_word_presence_leaks,
 )
@@ -1500,3 +1501,39 @@ class TestVocabCardDifficultyBadge:
         # NULL/blank tag is treated as N1 and still shows a badge.
         text_n1, _ = _render_vocab_card(_card(None), mode="all", index=0, total=3)
         assert "難度 N1" in text_n1.splitlines()[0]
+
+
+def test_synonym_answer_restates_headword_flags_kana_restatement():
+    # answer contains the headword reading in kana → restatement
+    assert synonym_answer_restates_headword(
+        headword="建前", reading="たてまえ", option="表向きの方針やたてまえ"
+    )
+    # inflected verb: reading minus okurigana still matches (わめく → わめ in わめき)
+    assert synonym_answer_restates_headword(
+        headword="喚く", reading="わめく", option="大声でわめき叫ぶ"
+    )
+    # cognate kana run (かたまり → かたま in かたまった)
+    assert synonym_answer_restates_headword(
+        headword="塊", reading="かたまり", option="一つにかたまったもの"
+    )
+
+
+def test_synonym_answer_restates_headword_flags_kanji_restatement():
+    assert synonym_answer_restates_headword(
+        headword="建前", reading="たてまえ", option="建前ばかりの方針"
+    )
+
+
+def test_synonym_answer_restates_headword_allows_clean_paraphrase():
+    # a real paraphrase with different words is fine
+    assert not synonym_answer_restates_headword(
+        headword="建前", reading="たてまえ", option="表向きに示す名目や方針"
+    )
+    # incidental single shared kanji (移) in an otherwise-different paraphrase is OK
+    assert not synonym_answer_restates_headword(
+        headword="転移", reading="てんい", option="病巣などが他の場所へ移り広がること"
+    )
+    # short-reading word not present in the option
+    assert not synonym_answer_restates_headword(
+        headword="慈悲", reading="じひ", option="いつくしみ哀れむ思いやりの心"
+    )

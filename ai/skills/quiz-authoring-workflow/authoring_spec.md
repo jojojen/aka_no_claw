@@ -46,6 +46,38 @@ These run in `quiz_db.py` before any LLM grader. Author so they pass:
 - `source_excerpt` must be real grounding text; for vocab cards `example_ja` must be
   a verbatim substring of `source_excerpt`.
 
+## Vocab-card example QUALITY (beyond the verbatim gate)
+
+`example_ja` is the sentence the learner actually studies, so it must teach REAL
+USAGE — not a bare fragment, not a memoryless template. "Quality/correctness" is
+NOT just the question being right: the example is itself part of the quality bar.
+It must (1) actively AID MEMORY and (2) ideally pin down the word's 語感 so the
+learner can tell it apart from its 類義語. Choose a context that makes the nuance
+unmistakable — 妥協 in a give-and-take negotiation that collapses (vs 譲歩 = one-sided
+yielding), 凶暴 as a savage dangerous animal (vs 乱暴 = merely rough), 偽装 as
+camouflage to deceive the eye (vs 偽造 = forging a fake). A bland "X happened"
+sentence is a MISS even when grammatically correct and grounded. It is auto-derived by
+`_backfill_vocab_cards` from the **primary question's `source_excerpt`** (it takes
+the SHORTEST usable line containing the headword and OVERWRITES the card on every
+bootstrap), so you control it entirely through the excerpt you author:
+
+- DEFAULT — use the FULL lyric line / couplet as `source_excerpt`, never a 3–4 char
+  word fragment. BAD: 「妥協大好き」, 「此処は宴」, 「生真面目そうな」. GOOD: the whole
+  line 「此処は宴　鋼の檻　その断頭台で見下ろして」.
+- CRYPTIC FALLBACK — when even the full lyric line is too cryptic to show standard
+  usage (Vocaloid lyrics often drop a word in as a bare noun), author a natural N1
+  sentence as the excerpt instead. It MUST carry concrete, memorable context.
+  - GOOD: 「双方が一歩も妥協せず、交渉は決裂した。」 / 「初めての告白に、彼女は恥じらいを隠せなかった。」
+  - BANNED (memoryless templates): 「〜という言葉を覚えた」「〜について考えた」「〜を学んだ」
+    「〜の意味を調べた」, or any cookie-cutter frame that could slot ANY word.
+    `vocab_example_is_low_value()` blocks a few literal strings, but the user's bar
+    is BROADER — judge memorability yourself, don't just dodge the blocked list.
+  - Keep an authored sentence a SINGLE clause (no 。！？ mid-split) so the whole
+    sentence shows; `source_name` still cites the song the word was found in.
+- ONE CARD PER NORMALIZED LINE — don't set an excerpt whose headword-line another
+  headword already cards (e.g. 恥じらい and 素足 share 「恥じらいの素足をからめる」), or
+  the dedup silently drops one card. Give each headword a distinct line/sentence.
+
 ## Per-type rules
 
 ### 漢字読み
@@ -63,7 +95,20 @@ These run in `quiz_db.py` before any LLM grader. Author so they pass:
   no obvious garbage.
 
 ### 言い換え類義
-- The answer must not be the same word in kana/kanji as the stem target.
+- The answer must not be the same word in kana/kanji as the stem target. This means
+  the correct option may NOT contain the headword's reading (in kana) NOR the
+  headword's own kanji string — that hands the answer to the solver (the word is
+  inside its own "synonym"). BAD: 【建前】→「表向きの方針やたてまえ」(restates たてまえ),
+  【喚く】→「大声でわめき叫ぶ」(restates わめく), 【塊】→「一つにかたまったもの」. GOOD:
+  paraphrase with DIFFERENT words — 【建前】→「表向きに示す名目や方針」. (Reusing ONE
+  incidental kanji in an otherwise-different paraphrase is fine: 【転移】→「他の場所へ
+  移り広がる」.) Run `synonym_answer_restates_headword(headword, reading, option)` —
+  True = the answer restates the word; rewrite it. `answer_leaks_into_stem` does NOT
+  catch this (the leak is in the OPTION, not the stem).
+- Also avoid pre-stating the answer in the EXCERPT: if the example sentence already
+  contains the answer's key words (【喚く】excerpt「大声で喚く」 + answer「大声で…」), the
+  lexical overlap gives it away — pick an excerpt that shows the word in context
+  WITHOUT lexically defining it.
 - All four options same register/length.
 
 ### 文脈規定
