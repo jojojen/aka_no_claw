@@ -382,6 +382,66 @@ def test_normalize_legacy_reason_collapses_dupes() -> None:
     assert len(cleaned) < len(polluted) // 10
 
 
+def test_normalize_legacy_reason_collapses_nested_marker() -> None:
+    """The real UNION ARENA 綾波レイ pollution nested the marker
+    ("網路佐證：網路佐證：…") because the LLM echoed the stored reason back. The old
+    regex could not heal this (its "[^網]+?" capture cannot span the 網 inside the
+    nested marker). Splitting on the marker must collapse the repeats while keeping
+    each DISTINCT evidence sentence once."""
+    from openclaw_adapter.opportunity_store import _normalize_legacy_reason
+
+    tcgfan = "根據tcgfan.com的資訊，UNION ARENA TCG有每日和每週的價格趨勢，顯示市場關注。"
+    rakuten = "露天市集上有UNION ARENA 綾波 レイ的販售紀錄，顯示有市場需求。"
+    polluted = (
+        "Mercari watchlist: UNION ARENA 綾波レイ (threshold ¥4,500) "
+        + ("網路佐證：網路佐證：" + tcgfan + " ") * 39
+        + "網路佐證：網路佐證：" + rakuten
+    )
+
+    cleaned = _normalize_legacy_reason(polluted)
+
+    assert "網路佐證：網路佐證：" not in cleaned
+    assert cleaned.count("網路佐證：") == 2  # two DISTINCT evidence sentences
+    assert cleaned.count(tcgfan) == 1
+    assert cleaned.count(rakuten) == 1
+    assert cleaned.startswith("Mercari watchlist: UNION ARENA 綾波レイ (threshold ¥4,500) ")
+    assert len(cleaned) < len(polluted) // 10
+
+
+def test_web_opportunity_researcher_strips_echoed_marker() -> None:
+    """When the LLM echoes the stored "網路佐證：" marker back inside its own
+    assessment reason, enrich() must not nest it — repeated cycles stay at a
+    single, un-nested marker."""
+    candidate = _candidate()
+    sources = (
+        WebSearchResult(
+            title="UNION ARENA price trend",
+            url="https://tcgfan.com/ua",
+            snippet="Daily and weekly price trends visible.",
+        ),
+    )
+    # Note the marker already inside the model's reason (the echo).
+    echoed_assessment = (
+        '{"is_relevant":true,"demand_score":98,'
+        '"reason":"網路佐證：根據tcgfan.com的資訊，UNION ARENA TCG有每日和每週的價格趨勢。"}'
+    )
+
+    researcher = WebOpportunityResearcher(
+        endpoint="http://127.0.0.1:11434",
+        model="qwen3:4b",
+        timeout_seconds=30,
+        search_fn=lambda query, limit: sources,
+        json_call_fn=lambda **kwargs: echoed_assessment,
+    )
+
+    enriched = candidate
+    for _ in range(5):
+        enriched = researcher.enrich(enriched)
+
+    assert enriched.reason.count("網路佐證：") == 1
+    assert "網路佐證：網路佐證：" not in enriched.reason
+
+
 def test_normalize_legacy_reason_handles_none_and_empty() -> None:
     """Helper must be safe on empty / None inputs (some DB rows may have
     NULL or empty reason)."""

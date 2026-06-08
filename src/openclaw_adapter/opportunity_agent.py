@@ -480,6 +480,17 @@ class ChainedCandidateProvider:
         return tuple(ranked[:limit])
 
 
+_WEB_EVIDENCE_MARKER = "網路佐證："
+
+
+def _base_reason(reason: str | None) -> str:
+    """The candidate reason with any appended web-evidence sentence(s) removed —
+    everything from the first 網路佐證 marker on. Web evidence is re-derived every
+    scan, so it must neither be fed back into the LLM prompt (the model echoes the
+    marker, yielding nested "網路佐證：網路佐證：…") nor accumulated across cycles."""
+    return (reason or "").split(_WEB_EVIDENCE_MARKER, 1)[0].strip()
+
+
 class WebOpportunityResearcher:
     def __init__(
         self,
@@ -537,17 +548,24 @@ class WebOpportunityResearcher:
             "sources": [_source_to_metadata(source) for source in sources],
         }
 
-        # Dedup-on-append: each enrichment cycle was previously concatenating
-        # the same "網路佐證：…" sentence unconditionally onto the candidate's
-        # stored reason text. After N scans of the same candidate the reason
-        # field contained N copies of the same evidence string. Guard
-        # against that here AND let `opportunity_store._normalize_legacy_reason`
-        # heal already-polluted DB rows on the next read.
+        # Replace-on-write, not append: each scan re-derives the web evidence, so
+        # the reason field is always "<base rationale> 網路佐證：<latest evidence>".
+        # The old code appended a fresh fragment every cycle guarded only by
+        # `fragment not in reason`; because the LLM echoes the stored marker back
+        # (see _base_reason), each cycle produced a novel nested "網路佐證：網路佐證：…"
+        # string that slipped past the guard and piled up 40+ copies. Stripping the
+        # base and any echoed markers makes this idempotent.
         reason = candidate.reason or ""
         if assessment.reason:
-            fragment = f"網路佐證：{assessment.reason}"
-            if fragment not in reason:
-                reason = f"{reason} {fragment}".strip() if reason else fragment
+            base = _base_reason(candidate.reason)
+            core = assessment.reason.strip()
+            while core.startswith(_WEB_EVIDENCE_MARKER):
+                core = core[len(_WEB_EVIDENCE_MARKER):].strip()
+            if core:
+                fragment = f"{_WEB_EVIDENCE_MARKER}{core}"
+                reason = f"{base} {fragment}".strip() if base else fragment
+            else:
+                reason = base
 
         skip = (candidate.title, candidate.search_query)
         merged_aliases = merge_string_list(
@@ -2111,7 +2129,7 @@ def _build_opportunity_web_assessment_prompt(
         f"Candidate existing aliases: {list(candidate.aliases) if candidate.aliases else '[]'}",
         f"Candidate existing related: {list(candidate.related_keywords) if candidate.related_keywords else '[]'}",
         f"SNS heat score: {candidate.heat_score:.0f}/100",
-        f"SNS reason: {candidate.reason}",
+        f"SNS reason: {_base_reason(candidate.reason)}",
         f"Web query: {query}",
         "",
         "Search results:",
