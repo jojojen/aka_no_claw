@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -535,21 +534,32 @@ def _decode_json_list(value: object) -> tuple[str, ...]:
     return tuple(str(item) for item in parsed if isinstance(item, str) and item.strip())
 
 
-# Pre-fix DB rows can contain the same "網路佐證：…" sentence appended N
-# times because WebOpportunityResearcher.enrich() previously concatenated
-# the assessment reason on every cycle without dedup. Heal those rows on
-# read so the next upsert writes a clean version. The forward fix in
-# opportunity_agent.py (dedup-on-append) prevents new duplicates from
-# accumulating, but legacy rows need this regex to recover.
-_LEGACY_NETWORK_PROOF_RE = re.compile(
-    r"(網路佐證：[^網]+?)(?:\s*\1)+",
-)
+_WEB_EVIDENCE_MARKER = "網路佐證："
 
 
 def _normalize_legacy_reason(reason: str | None) -> str:
+    """Heal reason rows polluted by the old append-without-dedup web-research
+    behaviour. Splitting on the 網路佐證 marker unwinds BOTH plain repeats
+    ("網路佐證：X 網路佐證：X …") and nested prefixes ("網路佐證：網路佐證：X", which
+    the LLM produced by echoing the stored reason back into its own assessment);
+    we then keep the base text plus each DISTINCT evidence sentence once. A plain
+    regex cannot do this because the nested marker contains 網, so the old
+    "[^網]+?" capture could never span it."""
     if not reason:
         return reason or ""
-    return _LEGACY_NETWORK_PROOF_RE.sub(r"\1", reason)
+    if _WEB_EVIDENCE_MARKER not in reason:
+        return reason
+    base, _, rest = reason.partition(_WEB_EVIDENCE_MARKER)
+    base = base.strip()
+    fragments: list[str] = []
+    for piece in (_WEB_EVIDENCE_MARKER + rest).split(_WEB_EVIDENCE_MARKER):
+        piece = piece.strip()
+        if piece and piece not in fragments:
+            fragments.append(piece)
+    evidence = " ".join(f"{_WEB_EVIDENCE_MARKER}{piece}" for piece in fragments)
+    if base and evidence:
+        return f"{base} {evidence}"
+    return base or evidence
 
 
 def _candidate_from_row(row: sqlite3.Row) -> OpportunityCandidate:
