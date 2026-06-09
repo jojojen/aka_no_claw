@@ -45,6 +45,9 @@ These run in `quiz_db.py` before any LLM grader. Author so they pass:
 - The correct option must NOT appear verbatim in the stem (`answer_leaks_into_stem`).
 - `source_excerpt` must be real grounding text; for vocab cards `example_ja` must be
   a verbatim substring of `source_excerpt`.
+- The vocab seed's `zh_gloss_short` (the **中文** field) must be **Han-only Chinese** —
+  `upsert_vocab_seed` raises `ValueError` on any kana (`_contains_kana`). A Japanese
+  言い換え is NOT a Chinese gloss; write a real zh-TW meaning.
 
 ## Vocab-card example QUALITY (beyond the verbatim gate)
 
@@ -77,6 +80,10 @@ bootstrap), so you control it entirely through the excerpt you author:
 - ONE CARD PER NORMALIZED LINE — don't set an excerpt whose headword-line another
   headword already cards (e.g. 恥じらい and 素足 share 「恥じらいの素足をからめる」), or
   the dedup silently drops one card. Give each headword a distinct line/sentence.
+- CONJUGATED-FORM TRAP — the headword must appear **verbatim** in the excerpt. If the
+  lyric only has a conjugated form (装った, not 装う / 佇んで, not 佇む), the dict-form
+  headword is not a substring → no card. Author a **dict-form memorable sentence** as
+  the excerpt instead (it still teaches real usage; `source_name` still cites the song).
 
 ## Per-type rules
 
@@ -93,6 +100,12 @@ bootstrap), so you control it entirely through the excerpt you author:
   filter. A non-empty result means a distractor shares no sound with the answer or
   is phrase-length; fix it. An empty result does NOT certify quality — it only means
   no obvious garbage.
+- AVOID DUAL-READING HEADWORDS — a word with two legitimate readings is unfair as a
+  漢字読み item (both readings are "correct"). Drop it. Examples: 艶やか (つややか／あでやか),
+  卒塔婆 (そとば／そとうば).
+- WATCH づ/ず・ぢ/じ HOMOPHONE DISTRACTORS — a distractor that is the old-kana spelling
+  of the answer is pronounced identically, i.e. a second correct answer. BAD:
+  【躓く】つまずく with distractor つまづく. Use genuinely different readings instead.
 
 ### 言い換え類義
 - The answer must not be the same word in kana/kanji as the stem target. This means
@@ -115,10 +128,31 @@ bootstrap), so you control it entirely through the excerpt you author:
 - Answerable by language context, not by remembering the lyric.
 - Needs wider context? Read the cached full lyrics / commentary first (see pack note).
 
-### Reading types (内容理解・主張理解・統合・情報検索・読解)
-- The correct option must NOT be a verbatim 本文 line (`correct_option_is_verbatim_copy`).
-- The leak probe: stem+options without 本文 must be unanswerable. If solvable
-  without the passage, reject.
+### 用法
+- Present the target word used in 4 different sentences; exactly ONE uses it correctly.
+- DON'T let only the correct option contain the target word while every distractor swaps
+  it for a near-synonym — that tests visual presence, not usage. `youhou_target_word_presence_leaks`
+  rejects this; all four options should contain the word, only one used correctly.
+- The correct option is the grounding anchor (it carries the real line for 用法).
+
+### Reading types (内容理解・主張理解・統合理解・情報検索・読解・文章の文法)
+- **Passage must be ADAPTED FROM A REAL, EXISTING ARTICLE — never fully original prose.**
+  Summarize / restructure / simplify a real source (utaten 考察・特集, ニコニコ大百科,
+  Wikipedia, VocaDB, lyrical-nonsense 解説, etc.) into an N1-level 本文. Set
+  `source_text_url` to the actual article adapted from. Don't copy long spans verbatim
+  (copyright) — paraphrase and condense.
+- **No leading hint/giveaway sentence.** The 本文 is the article BODY only — never prepend
+  a sentence that states the conclusion/主張. (The renderer shows `source_excerpt` as 【本文】
+  before the stem, so a giveaway snippet hands the answer away.)
+- **Correct option must be a PARAPHRASE, not a verbatim lift** of a 本文 sentence
+  (`correct_option_is_verbatim_copy` rejects ≥90%-coverage copies). Rewrite the meaning with
+  different vocabulary/structure so the item forces a 同義轉換, not 字面 string-matching. If
+  needed, also rewrite the 本文 so it doesn't state the answer in the option's words.
+- **Distractors are near-synonyms / plausible misreadings of the passage**, not far-from-text
+  fillers — a strong "close but wrong" distractor discriminates; weak off-topic ones don't.
+- **Leak probe (strict):** stem+options WITHOUT the 本文 must be unanswerable. If the blind
+  solver still lands on the answer, the answer leaked into the stem — reject
+  (`_passes_reading_discrimination`).
 
 ## Difficulty calibration
 
@@ -157,3 +191,28 @@ stem: 〈とりとめのない〉に最も近い意味はどれか。
 options: ["まとまりや結論のない", "心から誠実に込めた", "互いに深く通じ合う", "丁寧に吟味した"]
 answer_index: 0
 ```
+
+## Code-gate reference (source of truth)
+
+These rules are MACHINE-ENFORCED. The code is authoritative; this spec only points to
+it. Don't re-derive or fight a gate — author so it passes.
+
+| Rule | Function | Location |
+| --- | --- | --- |
+| Source grounding (3-tier A/B/C) | `is_grounded` | `quiz_db.py:277` |
+| Excerpt-type vs exam-point conflict | `source_excerpt_type_conflicts_with_exam_point` | `quiz_db.py` |
+| No duplicate options | `options_have_duplicates` | `quiz_db.py:401` |
+| Answer leaks into stem | `answer_leaks_into_stem` | `quiz_db.py:416` |
+| 言い換え restates headword | `synonym_answer_restates_headword` | `quiz_db.py:430` |
+| 用法 presence-only leak | `youhou_target_word_presence_leaks` | `quiz_db.py:458` |
+| Chinese gloss must be Han-only | `_contains_kana` (in `upsert_vocab_seed`) | `quiz_db.py:491` / `:921` |
+| 漢字読み distractor audit | `audit_kanji_reading_distractors` | `quiz_db.py:515` |
+| Reading: correct option verbatim copy | `correct_option_is_verbatim_copy` | `quiz_db.py:365` |
+| Reading: 2-tier discrimination/leak probe | `_passes_reading_discrimination` | `quiz_generator.py:384` |
+| Dual-LLM author+blind-grader verify | `_validate_and_verify` | `quiz_generator.py:305` |
+| Vocab example length cap (70 chars) | `source_excerpt_vocab_example` (`_MAX_VOCAB_EXAMPLE_CHARS`) | `quiz_db.py:211` |
+| Vocab example low-value filter | `vocab_example_is_low_value` | `quiz_db.py:182` |
+| Card bootstrap + primary/example pick | `_backfill_vocab_cards`, `_VOCAB_PRIMARY_PRIORITY` | `quiz_db.py` |
+
+Card primary-question priority: **用法 > 文脈規定 > 言い換え類義 > 漢字読み** (`_VOCAB_PRIMARY_PRIORITY`).
+Line numbers drift — `grep` the function name if an anchor is stale.
