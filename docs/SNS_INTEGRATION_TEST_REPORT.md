@@ -21,7 +21,7 @@
 - 驗證規則正確保存至數據庫
 
 ```bash
-$ python -m openclaw_adapter sns.add-account aka_claw --chat-id -5245983980 --label "aka_claw" --interval 15
+$ python -m openclaw_adapter sns.add-account aka_claw --chat-id <YOUR_CHAT_ID> --label "aka_claw" --interval 15
 ✓ Added X account @aka_claw (id=account_...)
 ```
 
@@ -30,7 +30,7 @@ $ python -m openclaw_adapter sns.add-account aka_claw --chat-id -5245983980 --la
 - 驗證關鍵字規則保存
 
 ```bash
-$ python -m openclaw_adapter sns.add-keyword "機動戰士" --label "Gundam" --chat-id -5245983980 --interval 30
+$ python -m openclaw_adapter sns.add-keyword "機動戰士" --label "Gundam" --chat-id <YOUR_CHAT_ID> --interval 30
 ✓ Added keyword watch: 機動戰士 (id=keyword_...)
 ```
 
@@ -39,7 +39,7 @@ $ python -m openclaw_adapter sns.add-keyword "機動戰士" --label "Gundam" --c
 - 驗證趨勢規則保存
 
 ```bash
-$ python -m openclaw_adapter sns.add-trend trending --label "Trending Topics" --chat-id -5245983980 --interval 60
+$ python -m openclaw_adapter sns.add-trend trending --label "Trending Topics" --chat-id <YOUR_CHAT_ID> --interval 60
 ✓ Added trend watch: trending (id=trend_44...)
 ```
 
@@ -51,17 +51,17 @@ SNS Watch Rules (3 total):
 
   ✓ ENABLED | @aka_claw | aka_claw
          ID: account_1252b478581c
-         Interval: 15 min | Chat: -5245983980
+         Interval: 15 min | Chat: <YOUR_CHAT_ID>
          Last checked: Never
 
   ✓ ENABLED | @elonmusk | Elon Musk
          ID: account_d0e3942ba427
-         Interval: 15 min | Chat: -5245983980
+         Interval: 15 min | Chat: <YOUR_CHAT_ID>
          Last checked: Never
 
   ✓ ENABLED | Keyword: "機動戰士" | Gundam
          ID: keyword_1ef668326c55
-         Interval: 30 min | Chat: -5245983980
+         Interval: 30 min | Chat: <YOUR_CHAT_ID>
          Last checked: Never
 ```
 
@@ -173,7 +173,7 @@ tests/test_settings.py::test_get_settings_reads_local_text_router_environment_ke
 - ✅ X_USER_PASSWORD: (已配置)
 - ✅ SNS_DB_PATH: data/sns.sqlite3
 - ✅ X_COOKIES_FILE: data/x_cookies.json
-- ✅ OPENCLAW_TELEGRAM_CHAT_ID: -5245983980,5631877240
+- ✅ OPENCLAW_TELEGRAM_CHAT_ID: <YOUR_CHAT_ID>,<YOUR_USER_ID>
 - ✅ OPENCLAW_TELEGRAM_BOT_TOKEN: (已配置)
 
 ## 人類瀏覽模式驗證

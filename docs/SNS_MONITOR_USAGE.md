@@ -86,14 +86,14 @@ SNS 監控規則 (3 個):
 ```bash
 python -m openclaw_adapter sns.add-account elonmusk \
   --label "Elon Musk" \
-  --chat-id -5245983980 \
+  --chat-id <YOUR_CHAT_ID> \
   --interval 15
 ```
 
 只通知包含任一指定詞的帳號推文：
 ```bash
 python -m openclaw_adapter sns.add-account elonmusk \
-  --chat-id -5245983980 \
+  --chat-id <YOUR_CHAT_ID> \
   --keywords buy sell
 ```
 
@@ -101,7 +101,7 @@ python -m openclaw_adapter sns.add-account elonmusk \
 ```bash
 python -m openclaw_adapter sns.add-keyword "機動戰士" \
   --label "Gundam" \
-  --chat-id -5245983980 \
+  --chat-id <YOUR_CHAT_ID> \
   --interval 30
 ```
 
@@ -109,7 +109,7 @@ python -m openclaw_adapter sns.add-keyword "機動戰士" \
 ```bash
 python -m openclaw_adapter sns.add-trend trending \
   --label "Trending Topics" \
-  --chat-id -5245983980 \
+  --chat-id <YOUR_CHAT_ID> \
   --interval 60
 ```
 
@@ -240,7 +240,7 @@ grep "XClient" logs/openclaw.log
 /snsadd @AnthropicAI
 
 # 或通過 CLI
-python -m openclaw_adapter sns.add-account OpenAI --chat-id -5245983980
+python -m openclaw_adapter sns.add-account OpenAI --chat-id <YOUR_CHAT_ID>
 ```
 
 ### 場景 2: 監控產品發布公告
@@ -251,7 +251,7 @@ python -m openclaw_adapter sns.add-account OpenAI --chat-id -5245983980
 /snsadd keyword:beta版本
 
 # 或通過 CLI
-python -m openclaw_adapter sns.add-keyword "新產品發布" --chat-id -5245983980
+python -m openclaw_adapter sns.add-keyword "新產品發布" --chat-id <YOUR_CHAT_ID>
 ```
 
 ### 場景 3: 追蹤行業趨勢
@@ -262,7 +262,7 @@ python -m openclaw_adapter sns.add-keyword "新產品發布" --chat-id -52459839
 /snsadd trend:news
 
 # 或通過 CLI
-python -m openclaw_adapter sns.add-trend trending --chat-id -5245983980
+python -m openclaw_adapter sns.add-trend trending --chat-id <YOUR_CHAT_ID>
 ```
 
 ## 支援
