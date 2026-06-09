@@ -738,6 +738,16 @@ CREATE TABLE IF NOT EXISTS vocab_seed (
     reading_hiragana TEXT NOT NULL,
     zh_gloss_short   TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS voice_settings (
+    chat_id    TEXT PRIMARY KEY,
+    speed      REAL NOT NULL DEFAULT 1.0,
+    pitch      REAL NOT NULL DEFAULT 0.0,
+    intonation REAL NOT NULL DEFAULT 1.0,
+    tempo      REAL NOT NULL DEFAULT 1.0,
+    volume     REAL NOT NULL DEFAULT 1.0,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -936,6 +946,49 @@ class QuizDatabase:
                 (headword, reading_hiragana, zh_gloss_short),
             )
             self._backfill_vocab_cards(conn)
+
+    def get_voice_params(self, chat_id: str) -> "VoiceParams":
+        from .quiz_vocab_audio import VoiceParams
+
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT speed, pitch, intonation, tempo, volume "
+                "FROM voice_settings WHERE chat_id = ?",
+                (str(chat_id),),
+            ).fetchone()
+        if row is None:
+            return VoiceParams()
+        return VoiceParams(
+            speed=row["speed"],
+            pitch=row["pitch"],
+            intonation=row["intonation"],
+            tempo=row["tempo"],
+            volume=row["volume"],
+        )
+
+    def set_voice_params(self, chat_id: str, params: "VoiceParams") -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO voice_settings
+                       (chat_id, speed, pitch, intonation, tempo, volume, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(chat_id) DO UPDATE SET
+                       speed = excluded.speed,
+                       pitch = excluded.pitch,
+                       intonation = excluded.intonation,
+                       tempo = excluded.tempo,
+                       volume = excluded.volume,
+                       updated_at = excluded.updated_at""",
+                (
+                    str(chat_id),
+                    params.speed,
+                    params.pitch,
+                    params.intonation,
+                    params.tempo,
+                    params.volume,
+                    _utc_now_iso(),
+                ),
+            )
 
     def _backfill_source_excerpt_types(
         self, conn: sqlite3.Connection, *, overwrite_other: bool

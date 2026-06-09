@@ -482,7 +482,7 @@ def test_vocab_audio_callback_sends_document_for_vocab_card(tmp_path, monkeypatc
             sent["document_path"] = str(document_path)
             sent["caption"] = caption
 
-    monkeypatch.setattr("openclaw_adapter.quiz_command.build_vocab_synthesizer", lambda settings: _FakeSynth())
+    monkeypatch.setattr("openclaw_adapter.quiz_command.build_vocab_synthesizer", lambda settings, params=None: _FakeSynth())
     monkeypatch.setattr("openclaw_adapter.quiz_command.TelegramBotClient", _FakeClient)
 
     dbp = tmp_path / "quiz.sqlite3"
