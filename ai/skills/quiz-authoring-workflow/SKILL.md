@@ -1,6 +1,6 @@
 ---
 name: quiz-authoring-workflow
-description: Use when working on aka_no_claw /quiz JLPT question authoring, review, deletion, authoring-knowledge feedback, or handoff tracking. Enforces the user's workflow: confirm before starting, Codex authors questions directly, local model acts only as independent solver/checker, follow the current source scope (temporarily Project Sekai songs), keep at most 3 retained questions per song, write lessons into quiz_authoring_knowledge, and avoid locking DB/resources so other agents can work.
+description: Use when working on aka_no_claw /quiz JLPT question authoring, review, deletion, authoring-knowledge feedback, or handoff tracking. Enforces the user's workflow: confirm before starting; Claude and Codex author in parallel (Claude owns 文法形式 + reading types, Codex owns the 単語 types); the local qwen3:14b model is only a blind solver/grader, never an author; follow the current source scope (temporarily Project Sekai songs); keep at most 3 retained 単語 questions per song; write lessons into quiz_authoring_knowledge; and avoid locking DB/resources so other agents can work.
 ---
 
 # Quiz Authoring Workflow
@@ -16,16 +16,16 @@ If the user asks only for analysis, explain findings without changing code or DB
 ## Hard Constraints
 
 - Do not modify code unless the user explicitly asks for code changes.
-- Do not use `QuizGenerator.generate_one_question()` or `/quiz gen20` for this workflow. Codex authors the question directly.
-- The local model is an independent solver/checker, not the author.
+- Do not use `QuizGenerator.generate_one_question()` or `/quiz gen20` for this workflow. The questions are authored directly by a strong model.
+- **Two authors run in parallel, by question type:** Claude owns **文法形式の判断 + 文の組み立て + the reading types** (内容理解・主張理解・統合理解・情報検索・読解・文章の文法); Codex owns the **単語 types** (漢字読み・言い換え類義・文脈規定・用法). Before a big push, re-check the per-author / per-type breakdown via SQL since coverage shifts.
+- The local qwen3:14b model is a **blind solver/grader only — never an author.** It re-solves a finished candidate to check correctness; it does not write or rewrite questions.
 - When the DB has `favorite_songs.status='ready'` material, prefer those cached songs before pulling from the general song pool.
 - Source priority is song-list-first, not token-first: favorite songs should be covered first, and only after the ready favorite-song list has already produced questions may the workflow fall back to non-favorite songs.
 - Do not refetch the full lyric page or rerun morphology for a song that already has favorite-song cache rows unless the cache is missing/broken and the user approved repair work.
 - Cache-first does **not** mean token-only. When better question quality needs wider context, read the cached full lyrics first; when interpretation/background matters, read cached commentary/appreciation material first if available.
 - Prefer songs listed in `data/proseka_songs.json` (Project Sekai) as the current primary source pool, but Project Sekai is not the only allowed scope. The user clarified that non-Project-Sekai songs, such as `心拍数 #0822`, may also be used when source grounding is reliable and the item is good.
-- Retain at most 3 Codex-authored questions per song. Existing qwen/Claude questions do not count against this quota.
-- Prefer current scope `JLPT N1` and `question_type="単語"` unless the user explicitly changes scope.
-- Current `単語` subtypes are `漢字読み`, `言い換え類義`, and `文脈規定`.
+- Retain at most 3 単語 questions per song (the song-as-vocabulary-source quota). Reading/grammar types are passage/article-based, not song-vocabulary-based, so this per-song cap does not apply to them.
+- **Active scope is all three type families** at `JLPT N1` (N2-fallback per below): the **単語** types (`漢字読み`, `言い換え類義`, `文脈規定`, `用法`), the **reading** types (`内容理解`, `主張理解`, `統合理解`, `情報検索`, `読解`, `文章の文法`), and the **grammar** types (`文法形式の判断`, `文の組み立て`). Author by the division of labour above (Claude: grammar + reading; Codex: 単語).
 - **N1-preferred, N2 fallback (2026-06-07).** Genuine N1 vocabulary is the first
   choice. But N1 words are scarce per song, so requiring N1-only is too strict: when
   a song has no further suitable genuine-N1 word, you MAY author from a genuine **N2**
@@ -121,6 +121,8 @@ db.upsert_vocab_seed(
 )
 ```
 
+`zh_gloss_short` is the **中文** field rendered on the card — it MUST be Chinese (Han-only). `upsert_vocab_seed` raises `ValueError` if the gloss contains any kana, so a Japanese paraphrase can never leak into the 中文 field (`_contains_kana` gate, `quiz_db.py:491` / `:921`). Write a real short zh-TW gloss, not a Japanese 言い換え.
+
 `quiz_vocab_seed.py` no longer exists. The `vocab_seed` table in `data/quiz.sqlite3` is the sole source. Do not attempt to import or edit a Python seed file.
 
 **Step 1 — Insert.** Use `db.insert_question(...)` with the fields from the
@@ -140,9 +142,10 @@ Do not let the local model rewrite or author the question.
 
 Important calibration:
 
-- The local model is an advisory solver/checker, not the final judge.
+- **qwen3:14b is BELOW N1.** Its blind answer disagreeing with the authored answer is **weak evidence** the item is wrong, NOT a veto — qwen may simply have failed a legitimately hard N1 item. Never silently drop on disagreement.
+- The hard gate is **grounding** (`is_grounded`), never the grader's vote. Grounding is enforced in code and must always pass.
+- On grader **agreement** → retain (high confidence). On grader **disagreement** → capture `{stem, options, my answer, qwen's answer_index, qwen's reason}` and have the **strong model (Claude) adjudicate**: if grounded and unambiguously correct, force-retain; if a distractor is genuinely also-valid, fix or drop.
 - For objectively checkable `漢字読み` and grammar items, local-model disagreement is a false-negative signal to investigate, not automatic rejection.
-- If Codex can verify the reading/grammar fact independently and the item is genuinely N1-level, the question may be retained despite local-model disagreement.
 - For reading items, the leak probe remains strict: if the model can answer correctly without the passage, reject the question.
 
 ## Review Checklist
@@ -229,8 +232,6 @@ Do not create or update a handoff file until the user confirms where to keep it.
 - Do not hold an interactive Python session open while waiting for user input.
 - If Ollama or VocaDB is slow/unavailable, report it; do not silently fake a pass.
 
-## Current DB Caveat
+## Scope Note
 
-The DB may contain historical `exam_point` values outside the current authoring scope, including `内容理解`, `主張理解`, `文法形式の判断`, `用法`, `文章の文法`, `文の組み立て`, `情報検索`, and `統合理解`.
-
-Those existing rows are historical data, not permission to generate those types. Follow the user's current scope unless explicitly changed.
+All three type families are current authoring targets (see Hard Constraints): 単語, reading (`内容理解`, `主張理解`, `統合理解`, `情報検索`, `読解`, `文章の文法`), and grammar (`文法形式の判断`, `文の組み立て`). Author by the division of labour — Claude owns grammar + reading, Codex owns 単語. If the user narrows scope for a given batch, follow that for the batch.
