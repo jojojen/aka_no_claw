@@ -104,14 +104,14 @@ def _vocab_audio_enabled(card) -> bool:
     return bool((card.example_ja or "").strip())
 
 
-def _send_vocab_audio(settings: AssistantSettings, *, card, chat_id: str | None) -> None:
+def _send_vocab_audio(settings: AssistantSettings, *, card, chat_id: str | None, params=None) -> None:
     token = getattr(settings, "openclaw_telegram_bot_token", None)
     if not token:
         raise QuizVocabAudioError("telegram bot token missing")
     if not (chat_id or "").strip():
         raise QuizVocabAudioError("chat_id missing")
     cache_dir = build_vocab_audio_cache_dir(settings=settings)
-    synth = build_vocab_synthesizer(settings)
+    synth = build_vocab_synthesizer(settings, params)
     audio = synth.synthesize_to_cache(
         text=card.example_ja,
         cache_dir=cache_dir,
@@ -935,7 +935,8 @@ def build_quiz_callback_handler(
                 if not _vocab_audio_enabled(card):
                     return "這張單字卡目前沒有開放例句音檔", None, None
                 try:
-                    _send_vocab_audio(settings, card=card, chat_id=chat_id)
+                    voice_params = db.get_voice_params(str(chat_id or ""))
+                    _send_vocab_audio(settings, card=card, chat_id=chat_id, params=voice_params)
                 except QuizVocabAudioError as exc:
                     logger.warning("quiz vocab audio failed vocab_id=%s: %s", rest, exc)
                     return "音檔生成失敗", None, None

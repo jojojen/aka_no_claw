@@ -58,6 +58,11 @@ from .quiz_command import (
     build_quiz_handler,
     start_quiz_daily_scheduler,
 )
+from .voice_command import (
+    build_say_handler,
+    build_voice_callback_handler,
+    build_voice_handler,
+)
 from .natural_language import build_telegram_natural_language_router_from_settings
 from .quiz_favorite_songs import extract_first_youtube_url
 from .opportunity_agent import (
@@ -518,6 +523,9 @@ def run_telegram_polling(
         rag_callback_handler=_build_rag_callback_handler(settings),
         quiz_handler=build_quiz_handler(settings),
         quiz_callback_handler=build_quiz_callback_handler(settings),
+        voice_handler=build_voice_handler(settings),
+        say_handler=build_say_handler(settings),
+        voice_callback_handler=build_voice_callback_handler(settings),
         knowledge_db_path=str(settings.knowledge_db_path),
         watch_db=watch_db,
         sns_db=sns_db,
