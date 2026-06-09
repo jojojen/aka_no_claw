@@ -30,6 +30,7 @@ from price_monitor_bot.bot import (  # noqa: F401
     TelegramReputationDelivery,
     TelegramReputationQuery,
     TelegramTextReplyPlan,
+    RegisteredCommand,
     build_processing_ack,
     default_photo_intent_analyzer as _base_default_photo_intent_analyzer,
     default_board_loader as _base_default_board_loader,
@@ -463,6 +464,87 @@ def format_reputation_snapshot_delivery_text(
     return "\n".join(lines)
 
 
+def _build_registries(
+    settings: AssistantSettings,
+    dynamic_tool_runner,
+) -> "tuple[dict[str, RegisteredCommand], dict[str, Callable[[str, str, str], tuple[object, str, object]]]]":
+    """Build the command/callback registries that aka_no_claw injects into the
+    base dispatcher. Registering commands as data here means adding a new one
+    never requires editing price_monitor_bot/bot.py."""
+    quiz_handler = build_quiz_handler(settings)
+    backup_handler = build_backup_handler(settings)
+    recover_handler = build_recover_handler(settings)
+    scorecard_handler = build_scorecard_handler(settings)
+
+    def _quizlikesong_handler(remainder: str, chat_id: str):
+        return quiz_handler("like song " + (remainder or "").strip(), chat_id)
+
+    def _new_handler(remainder: str, chat_id: str) -> str:
+        if dynamic_tool_runner is None:
+            return "/new 尚未啟用（需有本地 text model）。"
+        return dynamic_tool_runner.run(remainder)
+
+    command_handlers: dict[str, RegisteredCommand] = {
+        "/quiz": RegisteredCommand(
+            quiz_handler,
+            ack="收到，正在出題（地端模型，可能要一點時間）…",
+            background=True,
+        ),
+        "/quizlikesong": RegisteredCommand(
+            _quizlikesong_handler, ack="收到，正在收藏歌曲…", background=True
+        ),
+        "/voice": RegisteredCommand(build_voice_handler(settings)),
+        "/say": RegisteredCommand(
+            build_say_handler(settings), ack="收到，正在合成語音…", background=True
+        ),
+        "/new": RegisteredCommand(
+            _new_handler,
+            ack="收到，正在找/生成工具並執行（地端模型，可能要 1-2 分鐘）…",
+            background=True,
+        ),
+        "/backupclaw": RegisteredCommand(
+            lambda r, c: backup_handler(r),
+            ack="收到，正在備份龍蝦的資料庫與自學工具規格…",
+            background=True,
+        ),
+        "/backup": RegisteredCommand(
+            lambda r, c: backup_handler(r),
+            ack="收到，正在備份龍蝦的資料庫與自學工具規格…",
+            background=True,
+        ),
+        "/clawrecover": RegisteredCommand(
+            lambda r, c: recover_handler(r),
+            ack="收到，正在從備份還原龍蝦的資料庫…",
+            background=True,
+        ),
+        "/recoverclaw": RegisteredCommand(
+            lambda r, c: recover_handler(r),
+            ack="收到，正在從備份還原龍蝦的資料庫…",
+            background=True,
+        ),
+        "/stats": RegisteredCommand(lambda r, c: scorecard_handler(r)),
+        "/scorecard": RegisteredCommand(lambda r, c: scorecard_handler(r)),
+    }
+
+    _rag_cb = _build_rag_callback_handler(settings)
+
+    def _rag_keep_adapter(payload: str, original_text: str, chat_id: str):
+        new_text, markup = _rag_cb("ragkeep", payload, original_text)
+        return "✅ 已保留", new_text, markup
+
+    def _rag_del_adapter(payload: str, original_text: str, chat_id: str):
+        new_text, markup = _rag_cb("ragdel", payload, original_text)
+        return "🗑️ 已刪除", new_text, markup
+
+    callback_handlers: dict[str, Callable[[str, str, str], tuple[object, str, object]]] = {
+        "quiz": build_quiz_callback_handler(settings),
+        "voice": build_voice_callback_handler(settings),
+        "ragkeep": _rag_keep_adapter,
+        "ragdel": _rag_del_adapter,
+    }
+    return command_handlers, callback_handlers
+
+
 def run_telegram_polling(
     *,
     settings: AssistantSettings,
@@ -487,9 +569,8 @@ def run_telegram_polling(
     rag_digest_scheduler = _start_rag_daily_digest(settings)
     quiz_daily_scheduler = start_quiz_daily_scheduler(settings)
     dynamic_tool_runner = build_dynamic_tool_runner_from_settings(settings)
-    dynamic_tool_handler = (
-        (lambda req: dynamic_tool_runner.run(req)) if dynamic_tool_runner is not None else None
-    )
+    command_handlers, callback_handlers = _build_registries(settings, dynamic_tool_runner)
+
     _price_bot_module.TelegramCommandProcessor = (
         lambda **kwargs: TelegramCommandProcessor(settings=settings, **kwargs)
     )
@@ -516,17 +597,9 @@ def run_telegram_polling(
         opportunity_target_pinner=lambda name: pin_opportunity_target(settings, name),
         opportunity_target_unpinner=lambda selector: unpin_opportunity_target(settings, selector),
         knowledge_handler=build_knowledge_handler(settings),
-        dynamic_tool_handler=dynamic_tool_handler,
-        backup_handler=build_backup_handler(settings),
-        recover_handler=build_recover_handler(settings),
-        scorecard_handler=build_scorecard_handler(settings),
-        rag_callback_handler=_build_rag_callback_handler(settings),
-        quiz_handler=build_quiz_handler(settings),
-        quiz_callback_handler=build_quiz_callback_handler(settings),
-        voice_handler=build_voice_handler(settings),
-        say_handler=build_say_handler(settings),
-        voice_callback_handler=build_voice_callback_handler(settings),
         knowledge_db_path=str(settings.knowledge_db_path),
+        command_handlers=command_handlers,
+        callback_handlers=callback_handlers,
         watch_db=watch_db,
         sns_db=sns_db,
         sns_buzz_fn=sns_buzz_fn,
