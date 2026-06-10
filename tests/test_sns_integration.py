@@ -416,6 +416,41 @@ class TestSnsMonitor:
 class TestTelegramSnsCommands:
     """Test SNS command handlers in TelegramCommandProcessor."""
 
+    @staticmethod
+    def _make_processor(db, **kwargs):
+        """Build a TelegramCommandProcessor wired with SNS registry handlers."""
+        from openclaw_adapter.sns_commands import (
+            build_sns_add_handler,
+            build_sns_buzz_handler,
+            build_sns_delete_handler,
+            build_snslist_handler,
+            build_snslist_view_fn,
+            build_sns_rule_deleter,
+        )
+        from price_monitor_bot.bot import RegisteredCommand, TelegramCommandProcessor
+
+        command_handlers = {
+            "/snsadd": RegisteredCommand(build_sns_add_handler(db)),
+            "/sns_add": RegisteredCommand(build_sns_add_handler(db)),
+            "/snslist": RegisteredCommand(build_snslist_handler(db)),
+            "/sns_list": RegisteredCommand(build_snslist_handler(db)),
+            "/snsdelete": RegisteredCommand(build_sns_delete_handler(db)),
+            "/sns_delete": RegisteredCommand(build_sns_delete_handler(db)),
+            "/snsbuzz": RegisteredCommand(build_sns_buzz_handler(None)),
+        }
+        view_handlers = {"sl": build_snslist_view_fn(db)}
+        item_deleter_handlers = {"sl": build_sns_rule_deleter(db)}
+        return TelegramCommandProcessor(
+            lookup_renderer=lambda q: "test",
+            board_loader=lambda: (),
+            catalog_renderer=lambda: "test",
+            sns_db=db,
+            command_handlers=command_handlers,
+            view_handlers=view_handlers,
+            item_deleter_handlers=item_deleter_handlers,
+            **kwargs,
+        )
+
     def test_telegram_processor_accepts_sns_db(self):
         """Test that TelegramCommandProcessor accepts sns_db parameter."""
         from price_monitor_bot.bot import TelegramCommandProcessor
@@ -458,7 +493,6 @@ class TestTelegramSnsCommands:
 
     def test_telegram_sns_add_command_with_account_filters(self):
         """Test Telegram /snsadd command stores account keyword filters."""
-        from price_monitor_bot.bot import TelegramCommandProcessor
         from sns_monitor.storage import SnsDatabase
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -466,12 +500,7 @@ class TestTelegramSnsCommands:
             db = SnsDatabase(db_path)
             db.bootstrap()
 
-            processor = TelegramCommandProcessor(
-                lookup_renderer=lambda q: "test",
-                board_loader=lambda: (),
-                catalog_renderer=lambda: "test",
-                sns_db=db,
-            )
+            processor = self._make_processor(db)
 
             plan = processor.build_reply_plan(chat_id="123", text='/snsadd @realDonaldTrump ["buy", "sell"]')
             assert plan is not None
@@ -485,7 +514,6 @@ class TestTelegramSnsCommands:
 
     def test_telegram_natural_language_sns_filter_update_falls_back_when_router_returns_unknown(self):
         """Natural-language SNS filter updates should still work when the LLM router returns unknown."""
-        from price_monitor_bot.bot import TelegramCommandProcessor
         from price_monitor_bot.natural_language import TelegramNaturalLanguageIntent
         from sns_monitor.models import AccountWatch
         from sns_monitor.storage import SnsDatabase
@@ -512,13 +540,7 @@ class TestTelegramSnsCommands:
                 )
             )
 
-            processor = TelegramCommandProcessor(
-                lookup_renderer=lambda q: "test",
-                board_loader=lambda: (),
-                catalog_renderer=lambda: "test",
-                sns_db=db,
-                natural_language_router=UnknownRouter(),
-            )
+            processor = self._make_processor(db, natural_language_router=UnknownRouter())
 
             reply = processor.build_reply(
                 chat_id="123",
@@ -536,7 +558,6 @@ class TestTelegramSnsCommands:
 
     def test_telegram_sns_list_command(self):
         """Test Telegram /snslist command handler."""
-        from price_monitor_bot.bot import TelegramCommandProcessor
         from sns_monitor.storage import SnsDatabase
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -544,12 +565,7 @@ class TestTelegramSnsCommands:
             db = SnsDatabase(db_path)
             db.bootstrap()
 
-            processor = TelegramCommandProcessor(
-                lookup_renderer=lambda q: "test",
-                board_loader=lambda: (),
-                catalog_renderer=lambda: "test",
-                sns_db=db,
-            )
+            processor = self._make_processor(db)
 
             plan = processor.build_reply_plan(chat_id="123", text="/snslist")
             assert plan is not None

@@ -52,7 +52,24 @@ from .backup_command import BackupScheduler, build_backup_handler, build_recover
 from .opportunity_scorecard import build_scorecard_handler
 from .rag_daily_digest import RagDailyDigestScheduler, handle_ragdel_callback, handle_ragkeep_callback
 from .dynamic_tools import build_dynamic_tool_runner_from_settings
-from .knowledge_command import build_knowledge_handler
+from .knowledge_command import (
+    build_knowledge_handler,
+    build_knowledge_market_view_fn,
+    build_knowledge_coding_view_fn,
+    build_knowledge_item_deleters,
+)
+from .sns_commands import (
+    build_sns_add_handler,
+    build_snslist_handler,
+    build_snslist_view_fn,
+    build_sns_rule_deleter,
+    build_sns_delete_handler,
+    build_sns_buzz_handler,
+    build_sns_clear_filter_handler,
+    build_snsdel_callback_handler,
+    build_snsaddok_callback_handler,
+    build_snsfb_callback_handler,
+)
 from .quiz_command import (
     build_like_song_confirmation,
     build_quiz_callback_handler,
@@ -467,10 +484,14 @@ def format_reputation_snapshot_delivery_text(
 def _build_registries(
     settings: AssistantSettings,
     dynamic_tool_runner,
-) -> "tuple[dict[str, RegisteredCommand], dict[str, Callable[[str, str, str], tuple[object, str, object]]]]":
-    """Build the command/callback registries that aka_no_claw injects into the
-    base dispatcher. Registering commands as data here means adding a new one
-    never requires editing price_monitor_bot/bot.py."""
+    sns_db=None,
+    buzz_fn=None,
+) -> "tuple[dict, dict, dict, dict]":
+    """Build registries injected into the base dispatcher.
+
+    Returns (command_handlers, callback_handlers, view_handlers, item_deleter_handlers).
+    Registering as data means adding a new command never requires editing bot.py.
+    """
     quiz_handler = build_quiz_handler(settings)
     backup_handler = build_backup_handler(settings)
     recover_handler = build_recover_handler(settings)
@@ -524,6 +545,29 @@ def _build_registries(
         ),
         "/stats": RegisteredCommand(lambda r, c: scorecard_handler(r)),
         "/scorecard": RegisteredCommand(lambda r, c: scorecard_handler(r)),
+        "/knowledge": RegisteredCommand(build_knowledge_handler(settings)),
+        "/kb": RegisteredCommand(build_knowledge_handler(settings)),
+        "/snsadd": RegisteredCommand(
+            build_sns_add_handler(sns_db), ack="收到 X 追蹤指令，正在設定…", background=True,
+        ),
+        "/sns_add": RegisteredCommand(
+            build_sns_add_handler(sns_db), ack="收到 X 追蹤指令，正在設定…", background=True,
+        ),
+        "/snslist": RegisteredCommand(build_snslist_handler(sns_db)),
+        "/sns_list": RegisteredCommand(build_snslist_handler(sns_db)),
+        "/snsdelete": RegisteredCommand(build_sns_delete_handler(sns_db)),
+        "/sns_delete": RegisteredCommand(build_sns_delete_handler(sns_db)),
+        "/snsbuzz": RegisteredCommand(
+            build_sns_buzz_handler(buzz_fn),
+            ack="收到，正在抓取 X 熱門討論並交給 LLM 整理…",
+            background=True,
+        ),
+        "/sns_buzz": RegisteredCommand(
+            build_sns_buzz_handler(buzz_fn),
+            ack="收到，正在抓取 X 熱門討論並交給 LLM 整理…",
+            background=True,
+        ),
+        "/snsclearfilter": RegisteredCommand(build_sns_clear_filter_handler(sns_db)),
     }
 
     _rag_cb = _build_rag_callback_handler(settings)
@@ -541,8 +585,22 @@ def _build_registries(
         "voice": build_voice_callback_handler(settings),
         "ragkeep": _rag_keep_adapter,
         "ragdel": _rag_del_adapter,
+        "snsdel": build_snsdel_callback_handler(sns_db),
+        "snsaddok": build_snsaddok_callback_handler(sns_db),
+        "snsfb": build_snsfb_callback_handler(sns_db),
     }
-    return command_handlers, callback_handlers
+
+    view_handlers = {
+        "km": build_knowledge_market_view_fn(settings),
+        "kc": build_knowledge_coding_view_fn(settings),
+        "sl": build_snslist_view_fn(sns_db),
+    }
+    item_deleter_handlers = {
+        **build_knowledge_item_deleters(settings),
+        "sl": build_sns_rule_deleter(sns_db),
+    }
+
+    return command_handlers, callback_handlers, view_handlers, item_deleter_handlers
 
 
 def run_telegram_polling(
@@ -569,7 +627,9 @@ def run_telegram_polling(
     rag_digest_scheduler = _start_rag_daily_digest(settings)
     quiz_daily_scheduler = start_quiz_daily_scheduler(settings)
     dynamic_tool_runner = build_dynamic_tool_runner_from_settings(settings)
-    command_handlers, callback_handlers = _build_registries(settings, dynamic_tool_runner)
+    command_handlers, callback_handlers, view_handlers, item_deleter_handlers = (
+        _build_registries(settings, dynamic_tool_runner, sns_db=sns_db, buzz_fn=sns_buzz_fn)
+    )
 
     _price_bot_module.TelegramCommandProcessor = (
         lambda **kwargs: TelegramCommandProcessor(settings=settings, **kwargs)
@@ -596,10 +656,10 @@ def run_telegram_polling(
         ),
         opportunity_target_pinner=lambda name: pin_opportunity_target(settings, name),
         opportunity_target_unpinner=lambda selector: unpin_opportunity_target(settings, selector),
-        knowledge_handler=build_knowledge_handler(settings),
-        knowledge_db_path=str(settings.knowledge_db_path),
         command_handlers=command_handlers,
         callback_handlers=callback_handlers,
+        view_handlers=view_handlers,
+        item_deleter_handlers=item_deleter_handlers,
         watch_db=watch_db,
         sns_db=sns_db,
         sns_buzz_fn=sns_buzz_fn,

@@ -1,9 +1,11 @@
 """Telegram-side dispatcher for the ``/knowledge`` (alias ``/kb``) command.
 
 Subcommands:
+  /knowledge market               — paginated RAG market knowledge view
+  /knowledge coding               — paginated coding knowledge view
   /knowledge add <entity> | <summary>
   /knowledge add <entity> [as <type>] | <summary>
-  /knowledge list                 — recent entries
+  /knowledge list                 — recent entries (text)
   /knowledge get <entity>         — show one entry
   /knowledge alias <entity> = <alias1>, <alias2>
   /knowledge remove <entity>      — delete an entry
@@ -26,17 +28,21 @@ _VALID_TYPES = ("ip", "product", "set", "creator", "event", "store", "other")
 
 def build_knowledge_handler(
     settings: AssistantSettings,
-) -> Callable[[str, str], str]:
-    """Return a handler that price_monitor_bot's ``/knowledge`` dispatcher
-    calls. Late-imports KnowledgeDatabase so this module stays cheap to load
-    even when the knowledge feature isn't being used in a given session."""
+) -> Callable[[str, str], "str | tuple[str, dict | None]"]:
+    """Return the /knowledge command handler for the registry.
+
+    Returns a string for most sub-commands, or a ``(text, markup)`` tuple
+    for the ``market`` and ``coding`` paginated views.
+    """
 
     from .knowledge_db import KnowledgeDatabase
 
     db_path = settings.knowledge_db_path
-    db = KnowledgeDatabase(db_path)  # bootstraps schema on first call
+    db = KnowledgeDatabase(db_path)
+    market_view = build_knowledge_market_view_fn(settings)
+    coding_view = build_knowledge_coding_view_fn(settings)
 
-    def handler(raw: str, chat_id: str) -> str:
+    def handler(raw: str, chat_id: str) -> "str | tuple[str, dict | None]":
         text = (raw or "").strip()
         if not text:
             return _usage_text()
@@ -44,6 +50,12 @@ def build_knowledge_handler(
         action = head.lower().strip()
         rest = rest.strip()
         try:
+            if action == "market":
+                body, markup, _ = market_view(page=0)
+                return body, markup
+            if action == "coding":
+                body, markup, _ = coding_view(page=0)
+                return body, markup
             if action == "add":
                 return _do_add(db, rest)
             if action == "list":
@@ -52,7 +64,7 @@ def build_knowledge_handler(
                 return _do_get(db, rest)
             if action == "alias":
                 return _do_alias(db, rest)
-            if action == "remove" or action == "delete":
+            if action in ("remove", "delete"):
                 return _do_remove(db, rest)
         except Exception as exc:
             logger.exception("knowledge_command: action=%s failed", action)
@@ -60,6 +72,103 @@ def build_knowledge_handler(
         return _usage_text()
 
     return handler
+
+
+def build_knowledge_market_view_fn(
+    settings: AssistantSettings,
+) -> Callable[..., "tuple[str, dict | None, int]"]:
+    """Return a callable ``(*, page=0, mode='r') -> (text, markup, clamped_page)``
+    for the market knowledge paginated list view (list_kind ``km``)."""
+
+    from .knowledge_db import KnowledgeDatabase
+    from price_monitor_bot.list_view import LIST_VIEW_MODE_READ, ListRow, build_list_view
+
+    db_path = settings.knowledge_db_path
+
+    def view_fn(*, page: int = 0, mode: str = LIST_VIEW_MODE_READ):
+        db = KnowledgeDatabase(db_path)
+        entries = db.recent_entries(limit=200)
+        items = []
+        for e in entries:
+            preview = (e.summary or "").strip().replace("\n", " ")[:80]
+            items.append(ListRow(
+                id=e.entry_id,
+                text=f"• {e.entity_canonical} ({e.entity_type}, {e.confidence:.0%})\n  {preview}",
+                short_label=e.entity_canonical,
+            ))
+        return build_list_view(
+            list_kind="km",
+            items=items,
+            page=page,
+            mode=mode,
+            list_title="📚 RAG 市場知識",
+            empty_message="知識庫尚無市場條目。",
+        )
+
+    return view_fn
+
+
+def build_knowledge_coding_view_fn(
+    settings: AssistantSettings,
+) -> Callable[..., "tuple[str, dict | None, int]"]:
+    """Return a callable ``(*, page=0, mode='r') -> (text, markup, clamped_page)``
+    for the coding knowledge paginated list view (list_kind ``kc``)."""
+
+    from .knowledge_db import KnowledgeDatabase
+    from price_monitor_bot.list_view import LIST_VIEW_MODE_READ, ListRow, build_list_view
+
+    db_path = settings.knowledge_db_path
+
+    def view_fn(*, page: int = 0, mode: str = LIST_VIEW_MODE_READ):
+        db = KnowledgeDatabase(db_path)
+        rows = db.all_codegen_knowledge()
+        items = []
+        for r in rows:
+            preview = (r.technique or "").strip().replace("\n", " ")[:80]
+            items.append(ListRow(
+                id=r.knowledge_id,
+                text=f"• [{r.category}] {r.title} ({r.confidence:.0%})\n  {preview}",
+                short_label=r.title,
+            ))
+        return build_list_view(
+            list_kind="kc",
+            items=items,
+            page=page,
+            mode=mode,
+            list_title="🧠 龍蝦 Coding 知識",
+            empty_message="尚無 coding 知識條目。",
+        )
+
+    return view_fn
+
+
+def build_knowledge_item_deleters(
+    settings: AssistantSettings,
+) -> "dict[str, tuple[Callable[[str], bool], str]]":
+    """Return deleter registry entries for ``km`` and ``kc`` list kinds."""
+
+    from .knowledge_db import KnowledgeDatabase
+
+    db_path = settings.knowledge_db_path
+
+    def delete_market_entry(entry_id: str) -> bool:
+        try:
+            return KnowledgeDatabase(db_path).delete_entry(entry_id)
+        except Exception:
+            logger.exception("knowledge market delete failed entry_id=%s", entry_id)
+            return False
+
+    def delete_coding_entry(knowledge_id: str) -> bool:
+        try:
+            return KnowledgeDatabase(db_path).delete_codegen(knowledge_id)
+        except Exception:
+            logger.exception("knowledge coding delete failed knowledge_id=%s", knowledge_id)
+            return False
+
+    return {
+        "km": (delete_market_entry, "市場知識條目"),
+        "kc": (delete_coding_entry, "Coding 知識條目"),
+    }
 
 
 def _usage_text() -> str:
