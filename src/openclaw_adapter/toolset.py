@@ -150,6 +150,15 @@ def build_tool_registry(settings: AssistantSettings | None = None) -> ToolRegist
     )
     registry.register(
         AssistantTool(
+            name="assistant.price-monitor-service",
+            description="Run the price monitor background service (watch_monitor, card image crawler, watch_inbox processing). Intended for local.openclaw.price_monitor launchd.",
+            configure_parser=lambda parser: None,
+            handler=lambda args: _handle_price_monitor_service(args, settings),
+            aliases=("price-monitor-service",),
+        )
+    )
+    registry.register(
+        AssistantTool(
             name="assistant.opportunity-status",
             description="Show recent opportunity candidates and recommendation decisions.",
             configure_parser=_configure_opportunity_status_parser,
@@ -604,3 +613,12 @@ def _handle_sns_monitor_service(
     logger.info("CLI sns-monitor-service started")
     from .sns_monitor_service import run_sns_monitor_service
     return run_sns_monitor_service(settings)
+
+
+def _handle_price_monitor_service(
+    args: argparse.Namespace,
+    settings: AssistantSettings,
+) -> int:
+    logger.info("CLI price-monitor-service started")
+    from .price_monitor_service import run_price_monitor_service
+    return run_price_monitor_service(settings)
