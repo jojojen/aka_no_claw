@@ -635,7 +635,16 @@ class DynamicToolRunner:
         return python
 
     def _pip_install(self, packages: tuple[str, ...]) -> None:
-        pkgs = tuple(p for p in packages if p and _is_safe_pkg(p))
+        safe = tuple(p for p in packages if p and _is_safe_pkg(p))
+        blocked = [p for p in safe if not _is_approved_pkg(p)]
+        if blocked:
+            msg = (
+                f"⛔ /new: 以下套件不在核准清單，已拒絕安裝：{', '.join(blocked)}\n"
+                "如需使用，請請求管理員將套件加入 _APPROVED_PACKAGES。"
+            )
+            logger.warning("dynamic_tools: blocked unapproved packages: %s", blocked)
+            raise RuntimeError(msg)
+        pkgs = tuple(p for p in safe if _is_approved_pkg(p))
         if not pkgs:
             return
         python = self._ensure_venv()
@@ -1049,8 +1058,26 @@ _STDLIB_MODULES = frozenset({
 })
 
 
+_APPROVED_PACKAGES: frozenset[str] = frozenset({
+    # data / HTTP / HTML
+    "yfinance", "requests", "httpx", "beautifulsoup4", "bs4", "lxml", "html5lib",
+    # numerical / display
+    "pandas", "numpy", "tabulate", "tqdm", "pillow",
+    # time / util
+    "python-dateutil", "pytz", "tzdata",
+})
+
+
 def _is_safe_pkg(name: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._\-\[\]=<>]*", name))
+
+
+def _is_approved_pkg(name: str) -> bool:
+    base = re.split(r"[><=!\[]", name)[0].lower().strip().replace("-", "_").replace(".", "_")
+    canon = re.split(r"[><=!\[]", name)[0].lower().strip()
+    return canon in _APPROVED_PACKAGES or base in {
+        p.lower().replace("-", "_").replace(".", "_") for p in _APPROVED_PACKAGES
+    }
 
 
 def _normalize_request(s: str) -> str:

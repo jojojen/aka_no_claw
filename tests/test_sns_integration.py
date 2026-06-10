@@ -445,6 +445,7 @@ class TestTelegramSnsCommands:
             board_loader=lambda: (),
             catalog_renderer=lambda: "test",
             sns_db=db,
+            allowed_chat_ids=frozenset({"123"}),
             command_handlers=command_handlers,
             view_handlers=view_handlers,
             item_deleter_handlers=item_deleter_handlers,

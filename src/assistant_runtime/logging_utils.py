@@ -2,12 +2,28 @@ from __future__ import annotations
 
 import logging
 import logging.handlers
+import re
 from pathlib import Path
 
 from .settings import AssistantSettings
 
 _CONFIGURED_LOG_PATH: str | None = None
 _MASK_IDENTIFIERS_IN_LOGS = True
+
+
+class _TokenRedactFilter(logging.Filter):
+    """Strip Telegram bot tokens from log records (token leaks via HTTP error tracebacks)."""
+    _PAT = re.compile(r"bot[0-9]{8,12}:[A-Za-z0-9_-]{30,}")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = self._PAT.sub("bot<REDACTED>", record.msg)
+        if record.args:
+            record.args = tuple(
+                self._PAT.sub("bot<REDACTED>", a) if isinstance(a, str) else a
+                for a in (record.args if isinstance(record.args, tuple) else (record.args,))
+            )
+        return True
 
 
 def configure_logging(settings: AssistantSettings) -> None:
@@ -28,6 +44,7 @@ def configure_logging(settings: AssistantSettings) -> None:
     root_logger = logging.getLogger()
     root_logger.handlers.clear()
     root_logger.setLevel(logging.DEBUG)
+    root_logger.addFilter(_TokenRedactFilter())
 
     console_handler = logging.StreamHandler()
     console_handler.setLevel(_level_from_name(settings.log_level))
