@@ -486,11 +486,16 @@ def _build_registries(
     dynamic_tool_runner,
     sns_db=None,
     buzz_fn=None,
+    sns_inbox=None,
+    knowledge_inbox=None,
 ) -> "tuple[dict, dict, dict, dict]":
     """Build registries injected into the base dispatcher.
 
     Returns (command_handlers, callback_handlers, view_handlers, item_deleter_handlers).
     Registering as data means adding a new command never requires editing bot.py.
+
+    When sns_inbox / knowledge_inbox are provided, write operations go through
+    the respective inbox (single-writer-per-file pattern for Task 3+).
     """
     quiz_handler = build_quiz_handler(settings)
     backup_handler = build_backup_handler(settings)
@@ -545,18 +550,24 @@ def _build_registries(
         ),
         "/stats": RegisteredCommand(lambda r, c: scorecard_handler(r)),
         "/scorecard": RegisteredCommand(lambda r, c: scorecard_handler(r)),
-        "/knowledge": RegisteredCommand(build_knowledge_handler(settings)),
-        "/kb": RegisteredCommand(build_knowledge_handler(settings)),
+        "/knowledge": RegisteredCommand(
+            build_knowledge_handler(settings, knowledge_inbox=knowledge_inbox)
+        ),
+        "/kb": RegisteredCommand(
+            build_knowledge_handler(settings, knowledge_inbox=knowledge_inbox)
+        ),
         "/snsadd": RegisteredCommand(
-            build_sns_add_handler(sns_db), ack="收到 X 追蹤指令，正在設定…", background=True,
+            build_sns_add_handler(sns_db, sns_inbox=sns_inbox),
+            ack="收到 X 追蹤指令，正在設定…", background=True,
         ),
         "/sns_add": RegisteredCommand(
-            build_sns_add_handler(sns_db), ack="收到 X 追蹤指令，正在設定…", background=True,
+            build_sns_add_handler(sns_db, sns_inbox=sns_inbox),
+            ack="收到 X 追蹤指令，正在設定…", background=True,
         ),
         "/snslist": RegisteredCommand(build_snslist_handler(sns_db)),
         "/sns_list": RegisteredCommand(build_snslist_handler(sns_db)),
-        "/snsdelete": RegisteredCommand(build_sns_delete_handler(sns_db)),
-        "/sns_delete": RegisteredCommand(build_sns_delete_handler(sns_db)),
+        "/snsdelete": RegisteredCommand(build_sns_delete_handler(sns_db, sns_inbox=sns_inbox)),
+        "/sns_delete": RegisteredCommand(build_sns_delete_handler(sns_db, sns_inbox=sns_inbox)),
         "/snsbuzz": RegisteredCommand(
             build_sns_buzz_handler(buzz_fn),
             ack="收到，正在抓取 X 熱門討論並交給 LLM 整理…",
@@ -567,10 +578,12 @@ def _build_registries(
             ack="收到，正在抓取 X 熱門討論並交給 LLM 整理…",
             background=True,
         ),
-        "/snsclearfilter": RegisteredCommand(build_sns_clear_filter_handler(sns_db)),
+        "/snsclearfilter": RegisteredCommand(
+            build_sns_clear_filter_handler(sns_db, sns_inbox=sns_inbox)
+        ),
     }
 
-    _rag_cb = _build_rag_callback_handler(settings)
+    _rag_cb = _build_rag_callback_handler(settings, knowledge_inbox=knowledge_inbox)
 
     def _rag_keep_adapter(payload: str, original_text: str, chat_id: str):
         new_text, markup = _rag_cb("ragkeep", payload, original_text)
@@ -585,9 +598,9 @@ def _build_registries(
         "voice": build_voice_callback_handler(settings),
         "ragkeep": _rag_keep_adapter,
         "ragdel": _rag_del_adapter,
-        "snsdel": build_snsdel_callback_handler(sns_db),
-        "snsaddok": build_snsaddok_callback_handler(sns_db),
-        "snsfb": build_snsfb_callback_handler(sns_db),
+        "snsdel": build_snsdel_callback_handler(sns_db, sns_inbox=sns_inbox),
+        "snsaddok": build_snsaddok_callback_handler(sns_db, sns_inbox=sns_inbox),
+        "snsfb": build_snsfb_callback_handler(sns_db, sns_inbox=sns_inbox),
     }
 
     view_handlers = {
@@ -597,7 +610,7 @@ def _build_registries(
     }
     item_deleter_handlers = {
         **build_knowledge_item_deleters(settings),
-        "sl": build_sns_rule_deleter(sns_db),
+        "sl": build_sns_rule_deleter(sns_db, sns_inbox=sns_inbox),
     }
 
     return command_handlers, callback_handlers, view_handlers, item_deleter_handlers
@@ -614,12 +627,15 @@ def run_telegram_polling(
     notify_startup: bool = False,
     drop_pending_updates: bool = True,
 ) -> int:
-    from .sns_tools import _start_sns_monitor
-
     token = require_telegram_token(settings)
     watch_db = _bootstrap_watch_db(settings)
     _start_watch_monitor(settings=settings, watch_db=watch_db, token=token)
-    sns_db, sns_buzz_fn = _start_sns_monitor(settings=settings, token=token, ssl_context=build_ssl_context(settings))
+    # SNS background monitor now runs in local.openclaw.sns_monitor (separate process).
+    # Telegram opens sns.sqlite3 read-only for /snslist queries; writes go through inbox.
+    sns_db = _open_sns_db_readonly(settings)
+    sns_buzz_fn = _build_buzz_fn_standalone(settings, ssl_context=build_ssl_context(settings))
+    # Bootstrap inboxes — telegram is the producer; sns_monitor service is the consumer.
+    sns_inbox, knowledge_inbox = _bootstrap_inboxes(settings)
     research_renderer = default_web_research_renderer(settings)
     feedback_service = _build_feedback_service(watch_db)
     _start_card_image_crawler(watch_db)
@@ -628,7 +644,8 @@ def run_telegram_polling(
     quiz_daily_scheduler = start_quiz_daily_scheduler(settings)
     dynamic_tool_runner = build_dynamic_tool_runner_from_settings(settings)
     command_handlers, callback_handlers, view_handlers, item_deleter_handlers = (
-        _build_registries(settings, dynamic_tool_runner, sns_db=sns_db, buzz_fn=sns_buzz_fn)
+        _build_registries(settings, dynamic_tool_runner, sns_db=sns_db, buzz_fn=sns_buzz_fn,
+                          sns_inbox=sns_inbox, knowledge_inbox=knowledge_inbox)
     )
 
     _price_bot_module.TelegramCommandProcessor = (
@@ -708,12 +725,8 @@ def _start_rag_daily_digest(settings) -> RagDailyDigestScheduler | None:
         return None
 
 
-def _build_rag_callback_handler(settings) -> "Callable[[str, str, str], tuple[str, object]]":
-    """Return a handler for ragkeep/ragdel callbacks.
-
-    Called by bot.py with (prefix, entry_id, original_text).
-    Returns (new_text, new_reply_markup).
-    """
+def _build_rag_callback_handler(settings, knowledge_inbox=None) -> "Callable[[str, str, str], tuple[str, object]]":
+    """Return a handler for ragkeep/ragdel callbacks."""
     from pathlib import Path as _Path
     db_path = _Path(settings.knowledge_db_path)
 
@@ -721,10 +734,72 @@ def _build_rag_callback_handler(settings) -> "Callable[[str, str, str], tuple[st
         if prefix == "ragkeep":
             return handle_ragkeep_callback(entry_id=entry_id, original_text=original_text)
         if prefix == "ragdel":
-            return handle_ragdel_callback(entry_id=entry_id, original_text=original_text, db_path=db_path)
+            return handle_ragdel_callback(
+                entry_id=entry_id, original_text=original_text,
+                db_path=db_path, knowledge_inbox=knowledge_inbox,
+            )
         return original_text, None
 
     return handler
+
+
+def _open_sns_db_readonly(settings):
+    """Open sns.sqlite3 read-only for telegram list queries.
+
+    Returns None and logs a warning if the file doesn't exist yet (sns_monitor
+    service not started). Telegram never writes sns.sqlite3 directly — writes
+    go through sns_inbox.
+    """
+    from pathlib import Path as _Path
+    from sns_monitor.storage import SnsDatabase
+    path = _Path(settings.sns_db_path)
+    if not path.exists():
+        logger.warning(
+            "_open_sns_db_readonly: %s not found — start local.openclaw.sns_monitor first",
+            path,
+        )
+        return None
+    try:
+        return SnsDatabase(path)
+    except Exception:
+        logger.exception("_open_sns_db_readonly: failed to open %s", path)
+        return None
+
+
+def _build_buzz_fn_standalone(settings, ssl_context=None):
+    """Build /snsbuzz using only the Reddit client — no full SNS monitor needed."""
+    try:
+        from sns_monitor.reddit_buzz import RedditBuzzClient
+        from sns_monitor.x_client_web import XClientWeb as _XClient
+        from .sns_tools import _build_sns_buzz_fn
+        reddit_client = RedditBuzzClient()
+        x_client = _XClient(buzz_search_backend=reddit_client)
+        buzz_fn = _build_sns_buzz_fn(settings, x_client, ssl_context=ssl_context)
+        if buzz_fn is not None:
+            logger.info("telegram: /snsbuzz enabled (Reddit + LLM)")
+        return buzz_fn
+    except Exception:
+        logger.exception("telegram: failed to build buzz_fn standalone")
+        return None
+
+
+def _bootstrap_inboxes(settings):
+    """Create and bootstrap the sns_inbox and knowledge_inbox for the telegram process.
+
+    Telegram is the *producer*; sns_monitor service is the consumer.
+    Returns (SnsInbox, KnowledgeInbox).
+    """
+    from sns_monitor.inbox import SnsInbox
+    from .knowledge_inbox import KnowledgeInbox
+    sns_inbox = SnsInbox(settings.sns_inbox_db_path)
+    sns_inbox.bootstrap()
+    knowledge_inbox = KnowledgeInbox(settings.knowledge_inbox_db_path)
+    knowledge_inbox.bootstrap()
+    logger.info(
+        "telegram: inboxes bootstrapped sns=%s knowledge=%s",
+        settings.sns_inbox_db_path, settings.knowledge_inbox_db_path,
+    )
+    return sns_inbox, knowledge_inbox
 
 
 def _start_backup_scheduler(settings) -> None:

@@ -147,8 +147,12 @@ def handle_ragdel_callback(
     entry_id: str,
     original_text: str,
     db_path: str | Path,
+    knowledge_inbox=None,
 ) -> tuple[str, None]:
     """Deletes the entry and returns updated text with buttons cleared."""
+    if knowledge_inbox is not None:
+        knowledge_inbox.push("delete_entry", {"entry_id": entry_id})
+        return f"{original_text}\n\n🗑️ 已排入刪除佇列", None
     db = KnowledgeDB(db_path)
     deleted = db.delete_entry(entry_id)
     suffix = "🗑️ 已從知識庫刪除" if deleted else "⚠️ 找不到條目（可能已刪除）"
