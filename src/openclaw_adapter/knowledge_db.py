@@ -493,27 +493,35 @@ class KnowledgeDatabase:
         return [_row_to_codegen(r) for r in rows]
 
     def retrieve_codegen_knowledge(self, request_text: str, k: int = 6) -> list[CodegenKnowledge]:
-        """Return up to ``k`` rules most relevant to ``request_text``. Relevance
-        = keyword/category/title token overlap with the request (case-folded);
-        ties and shortfall are filled by highest confidence. Always returns the
-        seed rules even on an empty request so the model gets baseline guidance."""
+        """Return up to ``k`` rules most relevant to ``request_text``.
+
+        Two classes of rules:
+        - Always-on (keywords contain "*"): generic best practices, eligible on
+          every request, ranked by confidence.
+        - Topical (no "*"): API recipes / domain methods. Eligible ONLY when the
+          request actually matches a keyword/category/title token — otherwise
+          excluded entirely. Injecting an unrelated recipe (e.g. weather into a
+          stock request) makes small models copy it verbatim, contaminating the
+          generated tool with data nobody asked for."""
         rows = self.all_codegen_knowledge()
         if not rows:
             return []
         request_lc = (request_text or "").lower()
         scored: list[tuple[float, CodegenKnowledge]] = []
         for row in rows:
-            score = 0.0
+            always_on = "*" in row.keywords
+            match = 0.0
             for kw in row.keywords:
-                if kw and kw.lower() in request_lc:
-                    score += 2.0
+                if kw and kw != "*" and kw.lower() in request_lc:
+                    match += 2.0
             if row.category and row.category.lower() in request_lc:
-                score += 1.0
+                match += 1.0
             for token in row.title.lower().split():
                 if len(token) >= 3 and token in request_lc:
-                    score += 0.5
-            score += row.confidence  # tiebreak toward trusted rules
-            scored.append((score, row))
+                    match += 0.5
+            if not always_on and match <= 0.0:
+                continue
+            scored.append((match + row.confidence, row))
         scored.sort(key=lambda pair: pair[0], reverse=True)
         return [row for _, row in scored[: max(1, k)]]
 
@@ -576,7 +584,7 @@ def _row_to_codegen(row: sqlite3.Row) -> CodegenKnowledge:
     )
 
 
-def format_codegen_knowledge_block(rows: list[CodegenKnowledge], *, max_chars: int = 2200) -> str:
+def format_codegen_knowledge_block(rows: list[CodegenKnowledge], *, max_chars: int = 4800) -> str:
     """Render retrieved rules into the codegen prompt's ``<代碼開發方法論>`` block."""
     if not rows:
         return "(無)"
@@ -604,13 +612,12 @@ CODEGEN_SEED: tuple[dict, ...] = (
         "category": "numeric_method",
         "title": "年化報酬要分簡單與複利",
         "technique": (
-            "年化有兩種算法：簡單年化 = 期間報酬 × (365/天數)；複利年化 = "
-            "(1+期間報酬)^(365/天數) − 1。指數是 365/天數（未滿一年時 >1，會把報酬放大），"
-            "千萬不要寫成 (天數/365)（那會縮小、是常見錯誤）。例：期間報酬 +20%、90 天 → "
-            "複利年化 = 1.20^(365/90) − 1 = 1.20^4.06 − 1 ≈ +108%（注意年化遠大於期間原始報酬）。"
-            "partial-year（未滿一年）絕不可直接當成全年報酬。"
-            "輸出時務必『同時』給出兩個數字：期間原始報酬（如今年以來/YTD 報酬）與年化報酬，"
-            "並明講用的是哪一種公式與天數。"
+            "年化報酬有「簡單年化」與「複利年化」兩種，結果差異大；"
+            "未滿一年（partial-year）的期間報酬絕不可直接當成全年報酬，"
+            "且年化的指數/倍率方向弄反是常見錯誤（未滿一年時年化會放大期間報酬，不是縮小）。"
+            "輸出時明講用哪一種算法與期間天數，並同時給出期間原始報酬。"
+            "公式不寫死於此，實作前以參考頁 Annualisation 一節的定義為準：\n"
+            "參考: https://en.wikipedia.org/wiki/Rate_of_return"
         ),
         "keywords": ["年化", "annualized", "報酬", "return", "cagr", "複利", "ytd", "今年以來"],
         "confidence": 0.9,
@@ -629,15 +636,59 @@ CODEGEN_SEED: tuple[dict, ...] = (
         "category": "data_fetch",
         "title": "天氣資料用免費免 API key 的端點",
         "technique": (
-            "查詢即時天氣不需 API key，兩個可靠端點：wttr.in 和 open-meteo.com。\n"
-            "wttr.in：url = https://wttr.in/<城市名>?format=j1，JSON 結構：current_condition[0]。\n"
-            "open-meteo：url = https://api.open-meteo.com/v1/forecast?"
-            "latitude=<緯度>&longitude=<經度>&current=<欄位>&daily=<欄位>&timezone=<時區>。\n"
-            "城市座標可用 nominatim.openstreetmap.org 或 geocode.maps.co 查詢，不要硬編碼。\n"
+            "天氣查詢 → 使用 wttr.in（直接接受城市名，無需座標，免 API key）：\n"
+            "  import urllib.parse\n"
+            "  city_enc = urllib.parse.quote(city_name, safe='')\n"
+            "  url = f'https://wttr.in/{city_enc}?format=j1'\n"
+            "  # 帶 User-Agent header 避免 403\n"
+            "  req = urllib.request.Request(url, headers={'User-Agent': 'WeatherBot/1.0'})\n"
+            "  回傳結構：current_condition[0].temp_C（現在氣溫），\n"
+            "    weather[0].maxtempC / weather[0].mintempC（今日最高/最低），\n"
+            "    weather[0].hourly 各時段 chanceofrain → max() 取最高降雨機率，\n"
+            "    current_condition[0].weatherDesc[0].value（天氣描述文字），\n"
+            "    current_condition[0].humidity（濕度%）。\n"
+            "  ⚠️ 勿使用 Nominatim（403 Forbidden）＋open-meteo 的二段式流程。\n"
             "絕對不要用假 placeholder token 呼叫需要授權的 API——生成工具沒有合法 API key。"
         ),
         "keywords": ["天氣", "氣溫", "濕度", "weather", "temperature", "humidity",
-                     "wttr", "open-meteo", "氣象", "即時", "降雨", "forecast"],
+                     "wttr", "open-meteo", "氣象", "降雨", "forecast", "下雨", "晴", "預報"],
+        "confidence": 0.95,
+    },
+    {
+        "category": "finance",
+        "title": "Yahoo Finance chart API 查股價與報酬",
+        "technique": (
+            "Yahoo Finance chart API（台股/美股日線都可用，務必帶 User-Agent header）：\n"
+            "  GET https://query1.finance.yahoo.com/v8/finance/chart/<symbol>"
+            "?period1=<unix_ts>&period2=<unix_ts>&interval=1d&events=div\n"
+            "  台股代號加 .TW（如 0050.TW），美股直接用代號（如 TSLA）。\n"
+            "  回傳 JSON 結構（請用這些確切路徑取值，不要自創 key 如 'data'）：\n"
+            "    r = json['chart']['result'][0]\n"
+            "    時間戳: r['timestamp']  # list[int]，秒\n"
+            "    收盤價(價格報酬用): r['indicators']['quote'][0]['close']  # list，可能含 None\n"
+            "    還原收盤價(含息總報酬用): r['indicators']['adjclose'][0]['adjclose']  # list\n"
+            "    配息: r['events']['dividends']  # dict，值為 {amount, date}\n"
+            "  close/adjclose 陣列**一定含 None**（停牌日），取起點/終點前必須過濾：\n"
+            "    prices = [p for p in raw_prices if p is not None]\n"
+            "    start_price, end_price = prices[0], prices[-1]\n"
+            "  千萬不要直接用 raw_prices[0] 或 raw_prices[-1]，那可能是 None。\n"
+            "  抓取寫法（照抄；務必帶 User-Agent，裸 urlopen 會被擋 HTTP 429/401）：\n"
+            "    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})\n"
+            "    data = json.load(urllib.request.urlopen(req, timeout=20))\n"
+            "  常見致命錯誤：\n"
+            "    - datetime.date 物件沒有 .timestamp()——要用 datetime(..., tzinfo=timezone.utc).timestamp()。\n"
+            "    - r['timestamp'] 是整數秒清單，不是資料列，絕不可對它的元素再取欄位。\n"
+            "    - period1/period2 是 unix 秒；period1 不可設 0（會抓到上市以來全部）。\n"
+            "    - 『某時點的值』當天若無交易資料，取該時點『之前』最近一筆收盤（carry-forward），"
+            "不可拿之後的資料代替；因此查詢範圍要比所需期間起點再多抓前幾個交易日。\n"
+            "    - 不要用 yfinance/pandas 套件，直接 urllib 打上面端點，簡單又不需安裝。\n"
+            "  報酬率/YTD/年化等金融公式與期間慣例不寫死於此，實作前以參考頁的定義為準：\n"
+            "  參考: https://en.wikipedia.org/wiki/Rate_of_return\n"
+            "  參考: https://en.wikipedia.org/wiki/Year-to-date"
+        ),
+        "keywords": ["股", "股票", "股價", "報酬", "etf", "0050", "ticker", "stock",
+                     "price", "yahoo", "台股", "美股", "收盤", "漲", "跌", "return",
+                     "ytd", "今年以來", "匯率", "指數"],
         "confidence": 0.95,
     },
     {
@@ -654,7 +705,7 @@ CODEGEN_SEED: tuple[dict, ...] = (
             "不確定時先把頂層 key 印出來探索結構。\n"
             "此原則適用於所有資料來源：天氣 API、金融 API、監控系統、資料庫查詢。"
         ),
-        "keywords": ["current", "daily", "snapshot", "aggregate", "max", "min",
+        "keywords": ["*", "current", "daily", "snapshot", "aggregate", "max", "min",
                      "即時", "聚合", "粒度", "最高", "最低", "high", "low", "range"],
         "confidence": 0.92,
     },
@@ -669,7 +720,7 @@ CODEGEN_SEED: tuple[dict, ...] = (
             "找不到欄位時試加這些後綴。\n"
             "4. 在正式查詢前加 assert 或 if key not in data: raise 提前捕捉欄位錯誤。"
         ),
-        "keywords": ["api", "field", "key", "欄位", "json", "explore", "探索", "suffix",
+        "keywords": ["*", "api", "field", "key", "欄位", "json", "explore", "探索", "suffix",
                      "_max", "_min", "error", "invalid"],
         "confidence": 0.9,
     },
@@ -680,7 +731,7 @@ CODEGEN_SEED: tuple[dict, ...] = (
             "呼叫外部 API 後，先檢查 HTTP 狀態、payload 是否為預期型別、list 是否非空、"
             "first/last 元素是否為 None，全部通過才索引取值。不要假設欄位一定存在。"
         ),
-        "keywords": ["api", "http", "json", "request", "fetch", "yahoo", "endpoint"],
+        "keywords": ["*", "api", "http", "json", "request", "fetch", "endpoint"],
         "confidence": 0.85,
     },
     {
@@ -688,9 +739,11 @@ CODEGEN_SEED: tuple[dict, ...] = (
         "title": "解析 JSON 用 get 加預設值",
         "technique": (
             "解析巢狀 JSON 一律用 dict.get(key, default) 與防呆，逐層確認不是 None 再往下取；"
-            "陣列取值前先確認長度。缺欄位時回報明確錯誤，不要讓 KeyError/IndexError 直接炸掉。"
+            "陣列取值前先確認長度。缺欄位時 raise 帶上實際 payload 片段的明確錯誤"
+            "（如 raise KeyError(f'missing close in {list(d)}')），"
+            "比裸 KeyError 更好定位，但仍要讓例外拋出，不可吞掉。"
         ),
-        "keywords": ["json", "parse", "dict", "解析", "欄位"],
+        "keywords": ["*", "json", "parse", "dict", "解析", "欄位"],
         "confidence": 0.8,
     },
     {
@@ -707,8 +760,25 @@ CODEGEN_SEED: tuple[dict, ...] = (
             "執行環境已刻意清除這些變數。\n"
             "核心原則：寧願回答「無法取得此資料（需要授權）」也不要用假 token 假裝嘗試。"
         ),
-        "keywords": ["token", "api key", "placeholder", "credential", "secret",
+        "keywords": ["*", "token", "api key", "placeholder", "credential", "secret",
                      "憑證", "假", "mock", "authorization", "授權"],
+        "confidence": 0.95,
+    },
+    {
+        "category": "data_fetch",
+        "title": "時間範圍必須動態計算，不可寫死常數",
+        "technique": (
+            "查詢用的時間範圍（unix timestamp、日期字串）必須用 datetime 依『今天日期』"
+            "動態算出，絕不可寫死數字常數（如 period1=1672531200）——"
+            "寫死的常數是訓練資料裡的過期範例值，會抓到完全錯誤期間的資料。"
+            "期間語意（今年以來、最近一週、本月）要先用今天日期換算成正確的起訖時點再查。"
+            "為了取基準值而多抓緩衝資料時，絕不可直接拿陣列第一筆當期初——"
+            "要用回傳的 timestamp 對齊：期初取『期間起點前最近一個資料點』"
+            "（掃 timestamp 找最後一個 < 期間起點的索引）。"
+            "結束時間要含到今天：period2 取現在時刻（int(time.time())）而非今日零點，"
+            "否則會切掉當天資料。"
+        ),
+        "keywords": ["*", "timestamp", "日期", "期間", "period", "range", "動態", "unix"],
         "confidence": 0.95,
     },
     {
@@ -716,10 +786,57 @@ CODEGEN_SEED: tuple[dict, ...] = (
         "title": "算完做合理性檢查",
         "technique": (
             "輸出數值前做 sanity check：量級是否合理、正負號是否符合預期、有沒有極端離群值。"
-            "異常時在輸出標註可疑，不要靜默回傳一個看似正常其實錯誤的數字。"
+            "異常時在輸出標註可疑，不要靜默回傳一個看似正常其實錯誤的數字。\n"
+            "退化值自檢（這些幾乎一定代表抓錯資料，直接 raise 而不是輸出）：\n"
+            "  - 變化率/報酬率恰好為 0；\n"
+            "  - 最高值 == 最低值（high=low 的範圍）；\n"
+            "  - 時間序列只有 1 筆資料、或全部值完全相同。\n"
+            "raise 時附上實際取得的原始值，讓修復機制有線索。"
         ),
-        "keywords": ["sanity", "檢查", "validate", "合理"],
-        "confidence": 0.8,
+        "keywords": ["*", "sanity", "檢查", "validate", "合理"],
+        "confidence": 0.85,
+    },
+    {
+        "category": "validation",
+        "title": "資料源紀律：只取需求要的資料，不替代、不自行拒答、不加料",
+        "technique": (
+            "(1) 只抓取並輸出需求明確要求的資料；找不到指定資料源時不可用『相近但不同』"
+            "的資料替代（例如要 A 股票卻回 B 指數、要今晚航班卻回歷史均價）。\n"
+            "(2) 需求可行性已由上游確認過——不要在腳本裡自行放棄，"
+            "印出『此功能需要 API key』『請自行查詢』之類的佔位文字當答案；"
+            "真的取不到資料就讓例外拋出，交給修復機制。\n"
+            "(3) 不要加料：需求沒要求的衍生計算（年化、含息、與其他標的比較、預測）一律不算不印，"
+            "只回答被問到的值。算得多不是加分，是答非所問。"
+        ),
+        "keywords": ["*", "資料源", "替代", "拒答", "加料", "scope", "需求"],
+        "confidence": 0.9,
+    },
+    {
+        "category": "error_handling",
+        "title": "禁止 try/except 吞錯誤——讓例外直接拋出",
+        "technique": (
+            "不要用 try/except 包住主流程把例外轉成模糊訊息或自訂錯誤輸出——"
+            "外層修復機制依賴 stderr 的完整 traceback 定位問題，吞掉就修不了。\n"
+            "防呆檢查失敗時直接 raise，並把實際收到的內容帶進訊息，例如：\n"
+            "  raise ValueError(f'unexpected payload: {str(data)[:200]}')\n"
+            "絕不要 raise ValueError('Invalid response from API') 這種沒有上下文的空泛訊息，"
+            "也不要把錯誤印進 ===ANSWER=== 區塊。"
+        ),
+        "keywords": ["*", "try", "except", "traceback", "錯誤", "exception"],
+        "confidence": 0.9,
+    },
+    {
+        "category": "output_contract",
+        "title": "輸出乾淨的資料值，不傾倒原始結構",
+        "technique": (
+            "答案區塊只放人類可讀的最終值：\n"
+            "  - 從巢狀 dict/list 取出純量再輸出，不要把整個 dict、list 或 JSON 原樣 print；\n"
+            "  - 不要把 URL 當成答案描述印出來；\n"
+            "  - API 回的數字常是字串，比較或計算前先轉 int/float；\n"
+            "  - 不要在腳本裡寫死表情符號/排版模板，排版由外層統一處理。"
+        ),
+        "keywords": ["*", "輸出", "dict", "list", "url", "字串", "排版"],
+        "confidence": 0.85,
     },
     {
         "category": "output_contract",
@@ -740,7 +857,7 @@ CODEGEN_SEED: tuple[dict, ...] = (
             "注意字面陷阱：DEFAULTS 存的英文 'Paris' 與輸出寫死的中文『巴黎』不會被字串比對抓到，"
             "唯一可靠做法就是輸出一律 echo params[...]，不要自己另寫標的字面值。"
         ),
-        "keywords": ["參數", "常數", "城市", "city", "ticker", "頂端", "constant", "硬編碼",
+        "keywords": ["*", "參數", "常數", "城市", "city", "ticker", "頂端", "constant", "硬編碼",
                      "重用", "reuse", "標的", "params", "答非所問", "輸出"],
         "confidence": 0.92,
     },
@@ -749,9 +866,11 @@ CODEGEN_SEED: tuple[dict, ...] = (
         "title": "答案夾在 ANSWER 標記並附計算依據",
         "technique": (
             "最終答案必須 print 在 ===ANSWER=== 與 ===END=== 之間，方便程式擷取；"
-            "數值結果要附一句『怎麼算的』（資料源、期間、公式），讓人能驗證。"
+            "數值結果要附一句『怎麼算的』（資料源、期間、公式），用 f-string 帶入實際值。\n"
+            "計算類答案同時印出關鍵原始值（如期初/期末收盤價與日期），讓人能對帳驗證；"
+            "百分比要 ×100 再印（印 52.82% 而不是 0.5282）。"
         ),
-        "keywords": ["output", "answer", "stdout", "輸出", "格式"],
+        "keywords": ["*", "output", "answer", "stdout", "輸出", "格式"],
         "confidence": 0.85,
     },
     {
@@ -763,8 +882,8 @@ CODEGEN_SEED: tuple[dict, ...] = (
             "income_stmt 是 DataFrame，columns 是財年結束日期（如 2025-12-31），"
             "index 是科目名（Total Revenue, Net Income, Diluted EPS, Gross Profit, Operating Income）。\n"
             "取最新年度：col = ticker.income_stmt.columns[0]，然後 df[col] 取各科目值。\n"
-            "毛利率 = Gross Profit / Total Revenue；營益率 = Operating Income / Total Revenue；"
-            "淨利率 = Net Income / Total Revenue。\n"
+            "毛利率/營益率/淨利率等比率的定義不寫死於此，實作前以參考頁為準：\n"
+            "參考: https://en.wikipedia.org/wiki/Profit_margin\n"
             "YoY 比較：cols = ticker.income_stmt.columns[:2]，分別取 col[0]（最新）與 col[1]（前一年）。\n"
             "金額單位是美元（不是十億），輸出時要除以 1e9 並標明 B。\n"
             "常見錯誤：(1)把 history() 的收盤價當作財報數字；(2)忘記除以 1e9；"
@@ -796,24 +915,19 @@ CODEGEN_SEED: tuple[dict, ...] = (
             "正確做法：把需要的外層變數作為函數參數傳入，或在函數內部最頂端明確賦值。"
             "常見錯誤：在函數外定義 start_date，在函數內生成器裡用到它，但呼叫函數時 start_date 尚未賦值。"
         ),
-        "keywords": ["nameerror", "scope", "generator", "lambda", "作用域", "undefined", "closure"],
+        "keywords": ["*", "nameerror", "scope", "generator", "lambda", "作用域", "undefined", "closure"],
         "confidence": 0.9,
     },
     {
         "category": "numeric_method",
         "title": "Black-Scholes 選擇權定價與標準常態 CDF 實作",
         "technique": (
-            "Black-Scholes 歐式選擇權公式（無息/含息通用）：\n"
-            "  d1 = (ln(S/K) + (r - q + σ²/2) × T) / (σ × √T)\n"
-            "  d2 = d1 − σ × √T\n"
-            "  call = S × e^(−qT) × N(d1) − K × e^(−rT) × N(d2)\n"
-            "  put  = K × e^(−rT) × N(−d2) − S × e^(−qT) × N(−d1)\n"
-            "N(x) = 標準常態累積分佈，用 Python stdlib 精確實作："
+            "Black-Scholes 歐式選擇權定價：公式不寫死於此，實作前以參考頁的定義為準；"
+            "call 與 put 公式不可混用，參數單位要一致（T 用『年』、r/σ/q 用年化值，"
+            "天數要先除以 365）。\n"
+            "標準常態累積分佈 N(x) 不需 scipy，用 Python stdlib 精確實作：\n"
             "  N = lambda x: 0.5 * (1 + math.erf(x / math.sqrt(2)))\n"
-            "（不需 scipy；math.erf 是最簡潔精確的做法。）\n"
-            "常見錯誤：(1) 把 d1 分子 σ² 少除以 2；(2) d2 寫成 d1 + σ√T（正負號反）；"
-            "(3) T 傳入天數而未除以 365；(4) r/σ/q 忘記年化；(5) 用 N(d1)/N(d2) 替代"
-            " N(d2)/N(d1) 算 put（call/put 公式不可混用）。"
+            "參考: https://en.wikipedia.org/wiki/Black%E2%80%93Scholes_model"
         ),
         "keywords": [
             "black-scholes", "option", "選擇權", "bs", "call", "put",

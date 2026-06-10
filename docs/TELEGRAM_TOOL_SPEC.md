@@ -40,7 +40,7 @@ The Telegram assistant can reach these tools:
 
 - `/search <question>`
 - `/research <question>`
-  - Search the web with DuckDuckGo, then summarize the result with the configured local LLM.
+  - Search the web with Yahoo Japan (persistent Playwright Chromium session, `search_yahoo_japan_playwright`), then summarize the result with the configured local LLM. Keep automated daily search volume in the single digits to avoid IP blocks.
   - Include source URLs / references in the final reply.
   - Use for price-direction / market-sentiment / recent-news / why-how questions, e.g. "寶可夢卡是不是在跌", "why are pokemon cards popular", "pokemon 市場最近怎麼了", "遊戲王最近暴跌".
 

@@ -1,7 +1,10 @@
-# /search DuckDuckGo Failure — Investigation Notes (parked)
+# /search DuckDuckGo Failure — Investigation Notes (historical)
 
-Status: **diagnosed, fix deferred.** Goal is to restore the 龍蝦's automated
-web-collection ability, not to fix DuckDuckGo specifically. Date: 2026-06-03.
+Status: **RESOLVED 2026-06-07.** `/search` now uses Yahoo Japan via a persistent
+Playwright Chromium session (`web_search.py::search_yahoo_japan_playwright`);
+DuckDuckGo is abandoned. Operating constraint: automated daily search volume
+must stay in the single digits to avoid IP blocks. The notes below are kept as
+the historical diagnosis (2026-06-03) only.
 
 ## TL;DR
 

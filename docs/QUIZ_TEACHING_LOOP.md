@@ -96,9 +96,10 @@
 6. **連結齊全**：作答後會顯示 📖 歌詞原文連結與 🎵 YouTube 連結（來自 VocaDB，
    見下）。若 media_url 為 None 表示該歌在 VocaDB 沒有 YouTube PV，可換一首。
 
-## 取材來源現況（重要：DuckDuckGo 已失效）
+## 取材來源現況（重要：web 搜尋已改 Playwright + Yahoo Japan）
 
-- 本機連 DuckDuckGo 會 `SSL: UNEXPECTED_EOF`（全面失效，勿再依賴 web 搜尋抓歌詞/YT）。
+- DuckDuckGo 已淘汰；`/search` 現走 `search_yahoo_japan_playwright`（Playwright + Yahoo Japan）。
+  但每日自動查詢量須壓在個位數（避免 IP 被封），故取材仍勿依賴 web 搜尋抓歌詞/YT。
 - 改用 **VocaDB API** 一次取齊（`miku_ranking.py` `fetch_miku_song_sources`）：
   - `media_url` ← `pvs[].service == 'Youtube'` 的網址
   - `excerpt`（接地用的真實日文歌詞）← `lyrics[].translationType == 'Original'` 且
