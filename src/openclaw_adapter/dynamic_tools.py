@@ -580,13 +580,28 @@ class DynamicToolRunner:
         # exhausted auto-install retry
         return DynamicToolResult(ok=False, slug=slug, error="缺少套件且自動安裝後仍失敗。")
 
+    # macOS sandbox-exec profile: deny writes to /Users except tool dir,
+    # allow everything else (network access needed for tools that fetch data).
+    _SANDBOX_PROFILE_TEMPLATE = """\
+(version 1)
+(allow default)
+(deny file-write* (subpath "/Users"))
+(allow file-write* (subpath "{tool_dir}"))
+"""
+
     def _execute(self, tool_path: Path) -> subprocess.CompletedProcess:
         venv_python = self._ensure_venv()
         tool_dir = tool_path.parent
         env = self._clean_env(tool_dir)
+        cmd: list[str] = [str(venv_python), str(tool_path)]
+        # Wrap with sandbox-exec on macOS if available (SEC-4).
+        import shutil
+        if shutil.which("sandbox-exec"):
+            profile = self._SANDBOX_PROFILE_TEMPLATE.format(tool_dir=str(tool_dir))
+            cmd = ["sandbox-exec", "-p", profile, *cmd]
         try:
             return subprocess.run(
-                [str(venv_python), str(tool_path)],
+                cmd,
                 shell=False,
                 cwd=str(tool_dir),
                 timeout=self.exec_timeout_seconds,
