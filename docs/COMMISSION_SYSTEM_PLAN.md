@@ -220,7 +220,7 @@ normalize_want(raw_want, target_price, *, knowledge_db, llm_fn, web_research_fn)
    ```
    **關鍵價值＝中文模糊詞 → 日文精準搜尋詞（含同義/變體）**，這是 Buyee 不會幫你做的。
 3. **網路研究消歧（選用）**：遇到「最新彈/latest」這種相對詞，或 LLM 標
-   `needs_clarification`，呼叫 `/search` 的 `build_web_research_answer`（DuckDuckGo +
+   `needs_clarification`，呼叫 `/search` 的 `build_web_research_answer`（Yahoo Japan Playwright 搜尋 +
    Ollama）查「目前最新一彈是哪個 set code」，再回填步驟2。
 4. **操作員確認（人在迴圈）**：正規化結果（建議搜尋詞＋品項＋set code）推到 Telegram，
    操作員可**編輯/確認**後才開始搜尋（沿用既有 pending-state + inline 按鈕）。

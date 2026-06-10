@@ -55,6 +55,10 @@ _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 _FENCE_RE = re.compile(r"```(?:python)?\s*(.*?)```", re.DOTALL)
 _REQUIRES_RE = re.compile(r"^#\s*requires:\s*(.+)$", re.MULTILINE)
 _MODULE_NOT_FOUND_RE = re.compile(r"ModuleNotFoundError: No module named ['\"]([\w\.]+)['\"]")
+# Knowledge rules cite formula/definition pages as `參考: <url>` instead of
+# hardcoding domain formulas in the DB; the pages are fetched and distilled
+# per-request (_ground_references).
+_REF_URL_RE = re.compile(r"參考:\s*(https?://[^\s）)」』]+)")
 # Safe environment variables passed through to generated scripts. Everything
 # else (notably all OPENCLAW_* secrets and tokens) is stripped.
 _SAFE_ENV_KEYS = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR")
@@ -74,6 +78,9 @@ _TRUNCATION_MARKERS = (
     "was never closed",
     "expected an indented block",
     "eof in multi-line",
+    # Output cut between a try block and its handler — the classic shape of a
+    # num_predict-capped script (models put try/except near the end).
+    "expected 'except'",
 )
 
 
@@ -139,7 +146,10 @@ def _ensure_stdlib_imports(code: str) -> str:
     if not missing:
         return code
     logger.info("dynamic_tools: auto-adding missing stdlib imports=%s", missing)
-    header = "".join(f"import {m}\n" for m in missing)
+    # Bare `import urllib` does NOT expose urllib.request/parse — the usual way
+    # generated code uses it — so import the submodules explicitly.
+    submodule_imports = {"urllib": "import urllib.request, urllib.parse, urllib.error"}
+    header = "".join(submodule_imports.get(m, f"import {m}") + "\n" for m in missing)
     return header + code
 
 
@@ -280,6 +290,8 @@ class DynamicToolRunner:
         self.distill_enabled = distill_enabled
         # Last codegen META block (tool_type + param_schema), parsed per generation.
         self._last_meta: dict | None = None
+        # Raw text of fetched `參考:` pages, keyed by URL (per-process politeness cache).
+        self._reference_cache: dict[str, str] = {}
         self.tools_dir.mkdir(parents=True, exist_ok=True)
 
     # ── public ──────────────────────────────────────────────────────────────
@@ -297,6 +309,8 @@ class DynamicToolRunner:
         if result.ok:
             prefix = "♻️ 重用既有工具\n" if result.reused else "🛠 新生成工具\n"
             return prefix + result.answer
+        if result.generations == 0:
+            return f"⚠️ 無法完成\n{result.error}"
         return f"⚠️ 無法完成（生成 {result.generations} 次仍失敗）\n{result.error}"
 
     def run_detailed(self, request: str) -> DynamicToolResult:
@@ -379,6 +393,13 @@ class DynamicToolRunner:
         code = tool_path.read_text(encoding="utf-8")
         result = self._install_and_execute(slug, tool_path, code)
         if result.ok:
+            valid, reason = self._validate_answer(request, result.answer)
+            if not valid:
+                logger.info(
+                    "dynamic_tools: reused answer failed validation (%s) slug=%s",
+                    reason, slug,
+                )
+                return None
             result.reused = True
             return result
         return None
@@ -433,11 +454,34 @@ class DynamicToolRunner:
     # ── generation + self-repair ────────────────────────────────────────────
 
     def _generate_with_repair(self, request: str) -> DynamicToolResult:
-        knowledge_rows = self._retrieve_knowledge(request)
+        always_on, topical = self._load_rules_split()
+        feasible, why, selected = self._preflight(request, topical)
+        if not feasible:
+            logger.info("dynamic_tools: infeasible request, refusing honestly: %s", why)
+            return DynamicToolResult(
+                ok=False, generations=0,
+                error=f"此需求需要的資料沒有免金鑰的公開資料源，無法以生成工具取得：{why}",
+            )
+        if selected is None:
+            knowledge_rows = (
+                self._keyword_fallback_rules(request, always_on)
+                if self.knowledge_db is not None else []
+            )
+            has_recipe = any("*" not in r.keywords for r in knowledge_rows)
+        else:
+            # Topical recipes lead the methodology block — burying them after a
+            # dozen always-on disciplines made small models miss the recipe.
+            knowledge_rows = selected + always_on
+            has_recipe = bool(selected)
+            if selected:
+                logger.info("dynamic_tools: preflight selected rules=%s",
+                            [r.title for r in selected])
 
-        # Phase 0: API exploration — run a tiny discovery script to capture actual
-        # field names from the real API response before writing the real tool.
-        api_structure = self._explore_api(request, knowledge_rows)
+        # Phase 0: live API exploration only for domains without a stored recipe —
+        # a selected recipe already carries a verified endpoint + field structure,
+        # so the discovery round-trip (one more LLM call + one HTTP run) is waste.
+        api_structure = None if has_recipe else self._explore_api(request, knowledge_rows)
+        references = self._ground_references(request, knowledge_rows)
 
         slug = self._make_slug(request)
         tool_dir = self.tools_dir / slug
@@ -476,9 +520,11 @@ class DynamicToolRunner:
                     self.client.num_predict = None
                     self.client.timeout_seconds = max(self.client.timeout_seconds, 1200)
                 code = self._generate_code(request, knowledge_rows, think=think,
-                                           api_structure=api_structure)
+                                           api_structure=api_structure,
+                                           references=references)
                 code = self._pass_syntax_gate(request, code, knowledge_rows,
-                                              think=think, api_structure=api_structure, phase=phase)
+                                              think=think, api_structure=api_structure,
+                                              references=references)
                 phase_gen = 1
                 while True:
                     generations += 1
@@ -486,26 +532,47 @@ class DynamicToolRunner:
                     exec_result = self._install_and_execute(slug, tool_path, code)
                     last_stdout = exec_result.raw_stdout
                     if exec_result.ok:
-                        exec_result.slug = slug
-                        exec_result.generations = generations
-                        meta = self._last_meta or {}
-                        self._register_manifest(
-                            slug, request, code, self._parse_requires(code),
-                            tool_type=meta.get("tool_type"),
-                            param_schema=meta.get("param_schema"),
+                        valid, reason = self._validate_answer(request, exec_result.answer)
+                        if valid:
+                            exec_result.slug = slug
+                            exec_result.generations = generations
+                            meta = self._last_meta or {}
+                            self._register_manifest(
+                                slug, request, code, self._parse_requires(code),
+                                tool_type=meta.get("tool_type"),
+                                param_schema=meta.get("param_schema"),
+                            )
+                            if generations >= 2 and self.distill_enabled:
+                                self._distill_failure(request, code, last_error)
+                            self._mark_knowledge_applied(knowledge_rows)
+                            return exec_result
+                        last_error = (
+                            "答案驗證未通過（程式執行成功但輸出內容不符需求）：" + reason
                         )
-                        if generations >= 2 and self.distill_enabled:
-                            self._distill_failure(request, code, last_error)
-                        self._mark_knowledge_applied(knowledge_rows)
-                        return exec_result
-                    last_error = exec_result.error
+                        logger.info(
+                            "dynamic_tools: answer validation FAIL slug=%s reason=%s",
+                            slug, reason,
+                        )
+                    else:
+                        last_error = exec_result.error
+                        logger.info("dynamic_tools: exec failed slug=%s err=%s",
+                                    slug, _tail(last_error, 200))
                     if phase_gen >= phase_max:
                         break
                     phase_gen += 1
+                    prev_code = code
                     code = self._repair_code(request, code, last_error, knowledge_rows,
-                                             think=think, api_structure=api_structure)
+                                             think=think, api_structure=api_structure,
+                                             references=references)
+                    if code.strip() == prev_code.strip():
+                        # The model returned the same code — re-executing it will
+                        # fail identically; skip straight to the next tier.
+                        logger.info("dynamic_tools: repair produced identical code, "
+                                    "escalating early (phase=%s)", phase)
+                        break
                     code = self._pass_syntax_gate(request, code, knowledge_rows,
-                                                  think=think, api_structure=api_structure, phase=phase)
+                                                  think=think, api_structure=api_structure,
+                                                  references=references)
 
             return DynamicToolResult(
                 ok=False, slug=slug, generations=generations,
@@ -518,14 +585,15 @@ class DynamicToolRunner:
 
     def _pass_syntax_gate(
         self, request: str, code: str, knowledge_rows, *,
-        think: bool, api_structure: str | None, phase: int,
+        think: bool, api_structure: str | None, references: str | None = None,
     ) -> str:
         """Lever 2: ast.parse the code before paying for a subprocess run.
 
         Syntax-only repairs don't count as a generation. Lever 1: if the failure
-        looks like truncation (output cut mid-statement) and we're in the capped
-        Phase 1, bump num_predict and regenerate from scratch instead of trying
-        to "repair" half-written code.
+        looks like truncation (output cut mid-statement) and num_predict is
+        still capped, bump it and regenerate from scratch instead of trying to
+        "repair" half-written code — repairing a truncated script regenerates
+        at the same cap and truncates again, burning the whole tier's budget.
         """
         for _ in range(_MAX_SYNTAX_FIXES):
             err = _syntax_error(code)
@@ -534,7 +602,7 @@ class DynamicToolRunner:
                 # (a runtime NameError ast.parse can't see) before execution.
                 return _ensure_stdlib_imports(code)
             logger.info("dynamic_tools: syntax gate caught: %s", err)
-            if (phase == 1 and _is_truncation_error(err)
+            if (_is_truncation_error(err)
                     and self.client.num_predict is not None
                     and self.client.num_predict < _NUM_PREDICT_BUMP):
                 logger.info(
@@ -543,10 +611,12 @@ class DynamicToolRunner:
                 )
                 self.client.num_predict = _NUM_PREDICT_BUMP
                 code = self._generate_code(request, knowledge_rows, think=think,
-                                           api_structure=api_structure)
+                                           api_structure=api_structure,
+                                           references=references)
                 continue
             code = self._repair_code(request, code, f"SyntaxError: {err}", knowledge_rows,
-                                     think=think, api_structure=api_structure)
+                                     think=think, api_structure=api_structure,
+                                     references=references)
         return code
 
     def _install_and_execute(self, slug: str, tool_path: Path, code: str) -> DynamicToolResult:
@@ -688,6 +758,65 @@ class DynamicToolRunner:
 
     # ── model prompts ───────────────────────────────────────────────────────
 
+    def _fetch_url_text(self, url: str) -> str:
+        """Reference-page fetch via the same readable-text extractor /fetch uses."""
+        cached = self._reference_cache.get(url)
+        if cached is not None:
+            return cached
+        from .web_search import fetch_page_text
+        text = fetch_page_text(url, timeout_seconds=15, max_chars=8000,
+                               user_agent="Mozilla/5.0")
+        if text:  # don't cache failures — they may be transient
+            self._reference_cache[url] = text
+        return text
+
+    def _ground_references(self, request: str, knowledge_rows: list) -> str | None:
+        """Domain formulas/conventions are NOT hardcoded in the knowledge DB —
+        rules cite `參考: <url>` pages instead. Fetch them and have the fast
+        model distill the request-relevant definitions; fail open to None."""
+        urls: list[str] = []
+        for row in knowledge_rows:
+            for url in _REF_URL_RE.findall(getattr(row, "technique", "")):
+                if url not in urls:
+                    urls.append(url)
+        if not urls:
+            return None
+        texts: list[str] = []
+        for url in urls[:2]:
+            try:
+                text = self._fetch_url_text(url)
+            except Exception as exc:
+                logger.info("dynamic_tools: reference fetch failed url=%s err=%s", url, exc)
+                continue
+            if text:
+                texts.append(text)
+            else:
+                logger.info("dynamic_tools: reference fetch empty url=%s", url)
+        if not texts:
+            return None
+        saved_model = self.client.model
+        try:
+            self.client.model = self.fast_model
+            prompt = (
+                "從下面參考資料中，抽取與需求直接相關的公式、名詞定義與慣例"
+                "（例如期間如何界定、期初值取哪個時點的值、百分比如何呈現）。\n"
+                f"需求：{request}\n\n"
+                "參考資料：\n" + "\n---\n".join(texts) + "\n\n"
+                "只輸出條列要點（公式用一行文字描述），200 字內；"
+                "參考資料與需求無關就只輸出 NONE。"
+            )
+            extract = self.client.generate(prompt, temperature=0.0, think=False).strip()
+        except Exception as exc:
+            logger.info("dynamic_tools: reference grounding failed: %s", exc)
+            return None
+        finally:
+            self.client.model = saved_model
+        if not extract or extract.upper().startswith("NONE"):
+            return None
+        logger.info("dynamic_tools: grounded %d reference page(s) -> %d chars: %s",
+                    len(texts), len(extract), _tail(extract, 200))
+        return extract
+
     def _explore_api(self, request: str, knowledge_rows: list) -> str | None:
         """Phase 0: generate + run a tiny discovery script to capture actual API
         field names. Returns the captured structure text, or None if exploration
@@ -756,15 +885,29 @@ class DynamicToolRunner:
                 return struct
         return None
 
+    @staticmethod
+    def _references_block(references: str | None) -> str:
+        if not references:
+            return ""
+        return (
+            "\n<參考資料（公式、名詞定義與慣例以此為準）>\n"
+            + references
+            + "\n</參考資料>\n"
+        )
+
     def _generate_code(self, request: str, knowledge_rows: list, *, think: bool = False,
-                       api_structure: str | None = None) -> str:
-        prompt = self._build_codegen_prompt(request, knowledge_rows, api_structure=api_structure)
+                       api_structure: str | None = None,
+                       references: str | None = None) -> str:
+        prompt = self._build_codegen_prompt(request, knowledge_rows,
+                                            api_structure=api_structure,
+                                            references=references)
         response = self.client.generate(prompt, temperature=0.0, think=think)
         self._last_meta = _extract_meta(response)
         return _extract_code(response)
 
     def _repair_code(self, request: str, code: str, error: str, knowledge_rows: list, *,
-                     think: bool = False, api_structure: str | None = None) -> str:
+                     think: bool = False, api_structure: str | None = None,
+                     references: str | None = None) -> str:
         today = date.today().isoformat()
         api_block = ""
         if api_structure:
@@ -778,6 +921,7 @@ class DynamicToolRunner:
             f"今天日期：{today}\n"
             f"原始需求：{request}\n"
             + api_block
+            + self._references_block(references)
             + f"\n前一版原始碼：\n{code}\n\n"
             f"執行錯誤/stderr：\n{_tail(error, 800)}\n\n"
             + self._rules_block(knowledge_rows)
@@ -791,7 +935,8 @@ class DynamicToolRunner:
         return _extract_code(response)
 
     def _build_codegen_prompt(self, request: str, knowledge_rows: list,
-                              api_structure: str | None = None) -> str:
+                              api_structure: str | None = None,
+                              references: str | None = None) -> str:
         today = date.today().isoformat()
         api_block = ""
         if api_structure:
@@ -805,6 +950,7 @@ class DynamicToolRunner:
             f"今天日期：{today}\n"
             f"需求：{request}\n"
             + api_block
+            + self._references_block(references)
             + "\n" + self._rules_block(knowledge_rows)
             + "\n請依序輸出三段，格式嚴格如下：\n"
             + _PLAN_MARK + "\n<簡短計畫：資料源、edge case、輸出格式、有哪些可被替換的輸入參數>\n"
@@ -817,80 +963,35 @@ class DynamicToolRunner:
         )
 
     def _rules_block(self, knowledge_rows: list) -> str:
+        """Only the STRUCTURAL CONTRACT lives here — things the surrounding code
+        parses or enforces (markers, # requires, params.json, sandbox limits).
+        All coding techniques/disciplines are RAG rules (knowledge_db CODEGEN_SEED
+        always-on entries + distilled rules) injected via the methodology block,
+        so they evolve through distillation instead of being hardcoded."""
         from .knowledge_db import format_codegen_knowledge_block
 
         methodology = format_codegen_knowledge_block(knowledge_rows) if knowledge_rows else "(無)"
         return (
             "可用環境：Python 3 標準函式庫；需要第三方套件時，在檔案最上方用註解列出，"
-            "例如：# requires: yfinance（會自動 pip install 到專屬 venv）。\n"
-            "優先使用標準函式庫 urllib + 公開 JSON API 以減少相依與加快執行。\n\n"
-            "天氣查詢 → 使用 wttr.in（直接接受城市名，無需座標，免 API key）：\n"
-            "  import urllib.parse\n"
-            "  city_enc = urllib.parse.quote(city_name, safe='')\n"
-            "  url = f'https://wttr.in/{city_enc}?format=j1'\n"
-            "  # 帶 User-Agent header 避免 403\n"
-            "  req = urllib.request.Request(url, headers={'User-Agent': 'WeatherBot/1.0'})\n"
-            "  回傳結構：current_condition[0].temp_C（現在氣溫），\n"
-            "    weather[0].maxtempC / weather[0].mintempC（今日最高/最低），\n"
-            "    weather[0].hourly 各時段 chanceofrain → max() 取最高降雨機率，\n"
-            "    current_condition[0].weatherDesc[0].value（天氣描述文字）\n"
-            "  ⚠️ 勿使用 Nominatim（403 Forbidden）＋open-meteo 的二段式流程。\n\n"
-            "Yahoo Finance chart API（台股/美股日線都可用，務必帶 User-Agent header）：\n"
-            "  GET https://query1.finance.yahoo.com/v8/finance/chart/<symbol>"
-            "?period1=<unix_ts>&period2=<unix_ts>&interval=1d&events=div\n"
-            "  台股代號加 .TW（如 0050.TW），美股直接用代號（如 TSLA）。\n"
-            "  回傳 JSON 結構（請用這些確切路徑取值，不要自創 key 如 'data'）：\n"
-            "    r = json['chart']['result'][0]\n"
-            "    時間戳: r['timestamp']  # list[int]，秒\n"
-            "    收盤價(價格報酬用): r['indicators']['quote'][0]['close']  # list，可能含 None\n"
-            "    還原收盤價(含息總報酬用): r['indicators']['adjclose'][0]['adjclose']  # list\n"
-            "    配息: r['events']['dividends']  # dict，值為 {amount, date}\n"
-            "  close/adjclose 陣列**一定含 None**（停牌日），取起點/終點前必須過濾：\n"
-            "    prices = [p for p in raw_prices if p is not None]\n"
-            "    start_price, end_price = prices[0], prices[-1]\n"
-            "  千萬不要直接用 raw_prices[0] 或 raw_prices[-1]，那可能是 None。\n\n"
-            "<代碼開發方法論>\n" + methodology + "\n</代碼開發方法論>\n\n"
-            "參數化（重要——讓工具能被重用）：\n"
-            "  把需求中『可替換的輸入值』（金額、利率、年期、城市、股票代碼、日期、清單資料等）"
-            "做成參數，不要散落寫死在計算式裡。在程式開頭這樣寫：\n"
-            "    import json, os\n"
-            "    DEFAULTS = {  # 本次需求的實際值\n"
-            "        # 例：'total_price': 10000000, 'down_payment': 4000000, 'annual_rate': 0.03, 'years': 20\n"
-            "    }\n"
-            "    params = dict(DEFAULTS)\n"
-            "    if os.path.exists('params.json'):\n"
-            "        params.update(json.load(open('params.json', encoding='utf-8')))\n"
-            "  之後所有計算都用 params[...]；不要再用字面值。\n"
-            "  META 的 param_schema 每個 name 必須與 DEFAULTS 的 key 完全一致。\n"
-            "  連『計算依據／計算方式』那句說明也必須用 f-string 帶入 params[...] 的實際值，"
-            "嚴禁把數字寫死在說明字串裡（例如不可寫『年利率3.5%、25年期』這種字面字串——"
-            "工具被重用換參數後那句會變成謊話；要寫成 "
-            "f\"年利率{params['annual_rate']*100}%、{params['years']}年期\"）。\n"
-            "  ⚠️ 最容易犯的錯：把『標的名稱』寫死在輸出文字裡。答案句子裡提到的『查的是什麼』"
-            "（城市名、股票名/代碼、公司名、日期）也是參數，必須用 params[...] 帶入，"
-            "絕不可寫死字面值——否則工具換參數重用後，數據對了但標的講錯，變成答非所問。\n"
-            "    ❌ 反例：DEFAULTS={'city':'Paris'}，卻 print(f\"巴黎現在氣溫{temp}°C\")"
-            "（換成倫敦重用時會抓倫敦的溫度、卻還是印『巴黎』）。\n"
-            "    ✅ 正解：print(f\"{params['city']}現在氣溫{temp}°C\")——標的跟著參數走。\n\n"
-            "  ⚠️ 輸出乾淨的『資料值』，不要輸出原始結構或連結：\n"
-            "    - API 欄位常是巢狀物件或清單（例如 {'value':'晴天'} 或 [{'value':'Aichi'}]），"
-            "要取出裡面的純量值再輸出（data[...][0]['value']），絕不可直接 print 出 dict/list。\n"
-            "    - 要『天氣描述/狀態』就取描述文字欄位，不要輸出圖片連結或 URL 當描述"
-            "（weatherIconUrl 之類是圖檔網址，不是給人看的描述）。\n"
-            "    - 數字做比較或運算前先轉型：很多 API 把數字當字串回傳（\"0\"），"
-            "直接 \"0\"==0 會是 False，要先 int()/float() 再比較，否則判斷會相反。\n"
-            "  ⚠️ 不要把使用者的『輸出版型/emoji 範例』寫死進工具：工具只負責輸出乾淨的資料"
-            "（標的、數值、描述文字），排版由外層格式層處理；把一次性版型寫死會讓工具僵化又易錯。\n\n"
-            "硬性規則：\n"
-            "1. 不可讀取任何祕密環境變數（OPENCLAW_*、API token 等）；"
-            "讀取同目錄的 params.json 是允許且必要的（那不是祕密）。\n"
-            "2. 不可刪除檔案、不可開 shell/subprocess。\n"
-            f"3. 成功時最終答案必須印在標記之間：先 print(\"{ANSWER_START}\")，"
-            f"接著 print 人類可讀答案（含數值與一句『怎麼算的』），最後 print(\"{ANSWER_END}\")。\n"
-            "4. 數值任務務必明講資料源、期間、用的公式（年化分簡單/複利、報酬分價格/含息）；"
-            "報酬與年化請以百分比輸出（記得乘以 100，例如 0.6 要寫成 60%）。\n"
-            f"5. 失敗時（抓不到資料、結構不符、計算不出來）**不要**把錯誤訊息印進 {ANSWER_START} 區塊，"
-            "而是要 raise 例外或 sys.exit(1) 讓程式以非零碼結束 —— 這樣外層才能觸發自動修復重寫。\n"
+            "例如：# requires: beautifulsoup4（會自動 pip install 到專屬 venv）。"
+            "優先使用標準函式庫 urllib + 公開 JSON API 以減少相依與加快執行；"
+            "方法論已給出可照抄端點/範本時，必須照抄範本，不可自行換用其他套件或端點。\n\n"
+            "<代碼開發方法論>\n" + methodology + "\n</代碼開發方法論>\n"
+            "（方法論是依本需求挑選的既驗證經驗，務必優先遵循；與需求無關的條目忽略。）\n\n"
+            "結構契約（外層程式會解析這些輸出，必須完全遵守）：\n"
+            "1. 可替換的輸入值（金額、城市、股票代碼、日期等）收進腳本頂端的 DEFAULTS dict，"
+            "並讀同目錄 params.json 覆寫：params = dict(DEFAULTS)，"
+            "若 os.path.exists('params.json') 則 params.update(json.load(open(...)))；"
+            "之後一律用 params[...]。META 的 param_schema 每個 name 必須與 DEFAULTS 的 key 完全一致。\n"
+            f"2. 成功時最終答案印在標記之間：先 print(\"{ANSWER_START}\")，"
+            f"接著 print 人類可讀答案，最後 print(\"{ANSWER_END}\")。"
+            "數值計算類答案必須同時印出計算依據（資料源、期間起迄日期、期初/期末原始值），"
+            "且依據的日期與數值必須取自 API 實際回傳的資料點（例如把所用資料點的 timestamp 轉成日期印出），"
+            "不可印程式自行假設的期間——驗證層會檢查依據與需求是否一致，缺依據或依據造假視為失敗。\n"
+            "3. 失敗時讓例外直接拋出、以非零碼結束——stderr 的 traceback 會觸發外層自動修復；"
+            f"絕不要把錯誤訊息印進 {ANSWER_START} 區塊。\n"
+            "4. 沙箱限制：不可讀取任何祕密環境變數（OPENCLAW_*、API token 等）；"
+            "不可刪除檔案、不可開 shell/subprocess。讀 params.json 是允許且必要的。\n"
         )
 
     # ── reuse / manifest ────────────────────────────────────────────────────
@@ -1002,16 +1103,131 @@ class DynamicToolRunner:
                 return t
         return None
 
+    def _validate_answer(self, request: str, answer: str) -> tuple[bool, str]:
+        """LLM gate on a successful run's output: does it plausibly answer the
+        request? Lenient by design — only clear mismatches FAIL. Any validator
+        error fails open (True) so a sick validator can never brick /new."""
+        prompt = (
+            "判斷下面的『答案』是否合理回應了『需求』。寬鬆判定：主題正確、有實質內容就算 PASS；"
+            "答案簡短但正確也算 PASS。只有以下情況才 FAIL：\n"
+            "- 答非所問：回答的『事情』不是需求問的那件事。即使提到相同的城市/股票/日期也一樣"
+            "（例如問機票價格卻回天氣、問報酬率卻回氣溫）。\n"
+            "- 夾帶需求沒問的多餘資料（例如問股票報酬卻多印一行天氣）。\n"
+            "- 內容空洞、只有佔位文字、或自述『無法取得資料』而沒有給出實際答案。\n"
+            "- 夾帶錯誤訊息/traceback、或明顯編造的假值。\n"
+            "- 數值是可疑的退化值：報酬率/變化率恰為 0.00%、最高=最低、"
+            "所有數值完全相同——真實資料幾乎不會這樣，多半是程式取值錯誤。\n"
+            "- 數值計算類答案沒有附計算依據（期間起迄日期、所用的期初/期末原始值）"
+            "——沒有依據就無法驗證，視為不合格。\n"
+            "- 計算依據與需求不一致：用今天日期換算需求的期間語意（如『今年以來』『最近一週』），"
+            "若依據顯示的期間起迄落在需求期間之外、或標的不符，FAIL。"
+            "例外：期初日期是期間起點前最近一個資料點（差距幾天內，常見基期慣例）算一致；"
+            "偏離期間起點數週以上就是取錯基準，FAIL。\n"
+            f"今天日期：{date.today().isoformat()}\n"
+            f"需求：{request}\n"
+            f"答案：\n{_tail(answer, 800)}\n"
+            "只輸出一行：PASS 或 FAIL: <一句原因>。不要任何解說。"
+        )
+        saved_model = self.client.model
+        try:
+            # The gate is the last line of defense for answer quality; the fast
+            # model rubber-stamped period/scope mismatches the strong one catches.
+            self.client.model = self.strong_model
+            raw = self.client.generate(prompt, temperature=0.0, think=False).strip()
+        except Exception:
+            logger.exception("dynamic_tools: answer validation call failed; failing open")
+            return True, ""
+        finally:
+            self.client.model = saved_model
+        first = raw.splitlines()[0].strip() if raw else ""
+        if first.upper().startswith("FAIL"):
+            normalized = first.replace("：", ":", 1)
+            reason = normalized.split(":", 1)[1].strip() if ":" in normalized else ""
+            return False, reason
+        return True, ""
+
+    def _preflight(self, request: str, topical: list) -> tuple[bool, str, list | None]:
+        """One strong-model call doing both pre-codegen judgments (they used to
+        be two serial calls — minutes of extra latency on a local model):
+
+        1. Feasibility gate: can the needed data come from a key-free,
+           programmatically accessible public source (or pure computation)?
+           INFEASIBLE → honest refusal upstream, zero generations burned, and
+           the cascade never gets coaxed into substituting unrelated data.
+        2. Topical rule selection (open-world, no keyword lists): which stored
+           recipes/methods apply to this request.
+
+        Returns (feasible, why, selected_topical). selected_topical None means
+        the selection part is unusable → caller falls back to keyword scoring.
+        Any call error fails open: (True, "", None)."""
+        listing = "\n".join(
+            f"{i}. [{row.category}] {row.title}" for i, row in enumerate(topical, start=1)
+        ) or "(無)"
+        prompt = (
+            "對下面的需求做兩個判斷，各輸出一行：\n"
+            "第1行（可行性判斷）：要用一支 Python 腳本自動完成需求，判斷『需求所需的資料』"
+            "能否從免金鑰、可程式化存取的公開來源取得（或純計算、不需外部資料）。"
+            "寬鬆判定：純數學計算、天氣、股價/匯率/指數、維基百科等公開資訊都算 FEASIBLE；"
+            "只有資料明確需要付費/授權 API、需要登入帳號、或根本沒有公開程式化來源時"
+            "才是 INFEASIBLE（例如：即時機票票價、演唱會剩餘票數、私人帳戶資料）。"
+            "輸出 FEASIBLE 或 INFEASIBLE: <一句原因>。\n"
+            "第2行（挑出與需求相關的規則）：從規則清單挑出『這個需求真的會用到』的，"
+            "例如股價需求挑金融資料源規則、天氣需求挑天氣資料源規則；"
+            "不相關的絕對不要挑（注入無關範例會汙染生成的程式）。"
+            "輸出相關規則的編號（逗號分隔），沒有相關的就輸出 NONE。\n"
+            f"需求：{request}\n"
+            f"規則清單：\n{listing}\n"
+            "只輸出兩行，不要任何解說。"
+        )
+        saved_model = self.client.model
+        try:
+            self.client.model = self.strong_model
+            raw = self.client.generate(prompt, temperature=0.0, think=False).strip()
+        except Exception:
+            logger.exception("dynamic_tools: preflight failed; failing open")
+            return True, "", None
+        finally:
+            self.client.model = saved_model
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        first = lines[0] if lines else ""
+        if first.upper().startswith("INFEASIBLE"):
+            normalized = first.replace("：", ":", 1)
+            reason = normalized.split(":", 1)[1].strip() if ":" in normalized else ""
+            return False, reason, None
+        if not topical:
+            return True, "", []
+        rest = " ".join(lines[1:])
+        if "NONE" in rest.upper():
+            return True, "", []
+        indices = [int(m) for m in re.findall(r"\d+", rest)]
+        picked = [topical[i - 1] for i in indices if 1 <= i <= len(topical)]
+        if not picked:
+            return True, "", None
+        return True, "", picked[:4]
+
     # ── distillation ────────────────────────────────────────────────────────
 
-    def _retrieve_knowledge(self, request: str) -> list:
+    def _load_rules_split(self) -> tuple[list, list]:
+        """(always_on, topical) rules from the knowledge DB. Always-on rules
+        ("*" keyword) are injected into every codegen prompt; topical rules are
+        picked per-request by the LLM in _preflight."""
         if self.knowledge_db is None:
-            return []
+            return [], []
+        try:
+            rows = self.knowledge_db.all_codegen_knowledge()
+        except Exception:
+            logger.exception("dynamic_tools: all_codegen_knowledge failed")
+            return [], []
+        always_on = [r for r in rows if "*" in r.keywords]
+        topical = [r for r in rows if "*" not in r.keywords]
+        return always_on, topical
+
+    def _keyword_fallback_rules(self, request: str, always_on: list) -> list:
         try:
             return self.knowledge_db.retrieve_codegen_knowledge(request, k=6)
         except Exception:
             logger.exception("dynamic_tools: retrieve_codegen_knowledge failed")
-            return []
+            return always_on
 
     def _mark_knowledge_applied(self, rows: list) -> None:
         if self.knowledge_db is None or not rows:
@@ -1033,7 +1249,12 @@ class DynamicToolRunner:
             "\"title\": \"短標題\", \"technique\": \"一兩句通則\", \"keywords\": [\"關鍵字\"]}。\n\n"
             f"需求：{request}\n曾遇到的錯誤：\n{_tail(last_error, 500)}\n"
         )
+        # Distillation runs synchronously in the answer path (only after a run
+        # that needed ≥2 generations); use the fast model so it adds seconds,
+        # not minutes — abstraction quality matters less than latency here.
+        saved_model = self.client.model
         try:
+            self.client.model = self.fast_model
             raw = self.client.generate(prompt, temperature=0.0)
             data = _load_json_object(raw)
             if not data:
@@ -1049,6 +1270,8 @@ class DynamicToolRunner:
             logger.info("dynamic_tools: distilled rule '%s'", data.get("title"))
         except Exception:
             logger.exception("dynamic_tools: distill_failure failed")
+        finally:
+            self.client.model = saved_model
 
     # ── misc ────────────────────────────────────────────────────────────────
 
@@ -1220,8 +1443,9 @@ def build_dynamic_tool_runner_from_settings(settings) -> DynamicToolRunner | Non
 
     # Codegen needs more time + context than the NL router.
     # num_ctx=8192: prevents 4096-default from leaving too few tokens for response.
-    # num_predict=1000: caps Phase-1 at ~4KB (~667s at 1.5 tok/s) safely under timeout.
-    #   1000 tokens is enough for any single-purpose script (Black-Scholes ~300 tok).
+    # num_predict=2000: generation time scales with tokens actually produced, so a
+    #   generous cap costs nothing on normal scripts (~600-800 tok) and avoids the
+    #   truncate→regenerate cycle that a 1000 cap kept triggering on verbose tiers.
     endpoint = settings.openclaw_local_text_endpoint
     if not probe_ollama(endpoint):
         logger.warning(
@@ -1235,7 +1459,7 @@ def build_dynamic_tool_runner_from_settings(settings) -> DynamicToolRunner | Non
         model=fast_model,
         timeout_seconds=codegen_timeout,
         num_ctx=8192,
-        num_predict=1000,
+        num_predict=2000,
     )
 
     knowledge_db = None
@@ -1251,6 +1475,9 @@ def build_dynamic_tool_runner_from_settings(settings) -> DynamicToolRunner | Non
     return DynamicToolRunner(
         client=client, tools_dir=tools_dir, knowledge_db=knowledge_db,
         fast_model=fast_model, strong_model=strong_model,
+        # Self-learning: abstract hard-won repairs into transferable RAG rules so
+        # novel question types get easier over time instead of relying on seeds.
+        distill_enabled=True,
     )
 
 

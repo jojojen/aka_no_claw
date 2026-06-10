@@ -70,7 +70,7 @@ Completed on 2026-05-13:
 Completed on 2026-05-14:
 
 - The opportunity agent now wraps SNS candidate discovery with web research when the local Ollama text model is configured.
-- For each SNS candidate, it searches DuckDuckGo using the shared web search helper and asks the text model for a JSON relevance/demand assessment.
+- For each SNS candidate, it searches Yahoo Japan via the shared Playwright web search helper (`search_yahoo_japan_playwright`) and asks the text model for a JSON relevance/demand assessment.
 - Web research can boost candidate heat when outside sources support demand, or lower heat when sources look unrelated.
 - Candidate metadata now stores the research query, assessment, and source URLs.
 - Telegram opportunity recommendations include a `市場佐證` section with web reference URLs when available.
@@ -140,7 +140,7 @@ Completed on 2026-05-16:
 
 - Goal: stop relying solely on whatever the user happens to follow on X. Add structured sources, and let the bot self-onboard TCG accounts.
 - **`HotCardBoardCandidateProvider`** — reuses `TcgHotCardService.load_boards()` (the data behind `/trend`) to emit `single_card` candidates per game with real card_number / rarity / set_code / hot_score. `source_kind="hot_card_board"`. Zero new external APIs.
-- **`ScheduledWebSearchCandidateProvider`** — runs a small batch of TCG-trend queries via DuckDuckGo (`search_duckduckgo`), feeds snippets to the same LLM extraction path via a new snippet-flavoured prompt (`_build_web_trend_candidate_prompt`), and emits sealed_box / starter_deck / booster_pack signals the hot-card board doesn't expose. `source_kind="web_trend_search"`. Default queries cover pokemon / yugioh / ws / union_arena and are env-overridable via `OPENCLAW_OPPORTUNITY_WEB_TREND_QUERIES`.
+- **`ScheduledWebSearchCandidateProvider`** — runs a small batch of TCG-trend queries via Yahoo Japan Playwright search (`search_yahoo_japan_playwright`), feeds snippets to the same LLM extraction path via a new snippet-flavoured prompt (`_build_web_trend_candidate_prompt`), and emits sealed_box / starter_deck / booster_pack signals the hot-card board doesn't expose. `source_kind="web_trend_search"`. Default queries cover pokemon / yugioh / ws / union_arena and are env-overridable via `OPENCLAW_OPPORTUNITY_WEB_TREND_QUERIES`.
 - **`ChainedCandidateProvider`** composes the providers, dedupes by `candidate_id` (higher heat wins on collision), ranks by `heat_score`, then truncates to `limit`.
 - **SNS rule `domains` field** — replaces the deny-list design. `AccountWatch / KeywordWatch / TrendWatch` in `sns_monitor_bot` now carry `domains: tuple[str, ...]`, persisted into `watch_rules.query_json`. The TCG opportunity agent's `SnsLlmCandidateProvider._read_recent_posts` JOINs `watch_rules` and filters to rows where `domains ∩ TCG_DOMAINS` ({pokemon, yugioh, ws, union_arena, tcg}) is non-empty. User can keep following `@realDonaldTrump` for `[politic, stock]` without polluting TCG candidates.
 - **`/snsadd` accepts labelled brackets** — `filter[抽選] domain[pokemon, ws]` for account, keyword, and trend rules. Re-running `/snsadd @existing_handle domain[…]` becomes an upsert (preserves filter when not re-specified, replaces domain). Legacy `["buy","sell"]` JSON-array filter form still works. `/snslist` now shows each rule's `filter[…]` and `domain[…]` tags; rules still awaiting backfill display `domain[?]`.
@@ -157,7 +157,7 @@ Completed on 2026-05-16:
 - Candidates come from three providers chained behind a `ChainedCandidateProvider`:
   1. `SnsLlmCandidateProvider` — domain-filtered SNS tweets → LLM extraction.
   2. `HotCardBoardCandidateProvider` — `/trend` hot-card boards → single_card candidates.
-  3. `ScheduledWebSearchCandidateProvider` — periodic TCG-trend DuckDuckGo queries → LLM extraction for sealed_box / starter_deck / booster_pack.
+  3. `ScheduledWebSearchCandidateProvider` — periodic TCG-trend Yahoo Japan (Playwright) queries → LLM extraction for sealed_box / starter_deck / booster_pack.
 - A preflight step runs before every tick: one-rule-per-tick domain backfill, plus a 6-hour-interval auto-discovery that may add new TCG accounts (max 2 / run, confidence ≥ 0.7, domains must intersect TCG_DOMAINS). Both flows notify the user via Telegram on each change.
 - `reputation_snapshot` is still required for seller checks. Snapshot timeouts (240 s) per listing are the slowest part of a tick.
 - `/hunt status` rows are formatted as `[{game} / {product_type}] {title}{identifier}`; `/snslist` rows include `filter[…] domain[…]`.

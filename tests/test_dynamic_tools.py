@@ -50,7 +50,11 @@ class FakeClient:
 
     def __init__(self, *, code_responses, pick_response="NONE", distill_response="{}",
                  explorer_response: str | None = None, meta_response="", params_response="{}",
-                 presentation_response: str | None = None, split_response: str = "{}"):
+                 presentation_response: str | None = None, split_response: str = "{}",
+                 validate_responses: list | None = None,
+                 feasibility_response: str | Exception = "FEASIBLE",
+                 rule_select_response: str | Exception = "NONE",
+                 ground_response: str | Exception = "NONE"):
         self._code = list(code_responses)
         self._pick = pick_response
         self._distill = distill_response
@@ -58,10 +62,18 @@ class FakeClient:
         self._params = params_response       # returned for param-extraction calls
         self._presentation = presentation_response  # returned for reformat calls
         self._split = split_response         # returned for intent-split calls
+        # Answer-validation gate responses; None/exhausted → "PASS" (keeps old tests green).
+        self._validate = list(validate_responses) if validate_responses else []
+        self._feasibility = feasibility_response
+        self._rule_select = rule_select_response
+        self._ground = ground_response
         # Default: declare no external API needed so exploration is a no-op in tests.
         self._explorer = explorer_response if explorer_response is not None else 'print("NO_EXTERNAL_API")'
         self.calls = {"pick": 0, "code": 0, "repair": 0, "distill": 0, "explore": 0,
-                      "params": 0, "present": 0, "split": 0}
+                      "params": 0, "present": 0, "split": 0, "validate": 0, "feasibility": 0,
+                      "select": 0, "ground": 0}
+        self.repair_prompts: list[str] = []
+        self.code_prompts: list[str] = []
         self.timeout_seconds = 420
         self.num_predict = 1000  # mirrors OllamaTextClient attribute
         self.num_ctx = 8192      # mirrors OllamaTextClient attribute
@@ -71,6 +83,30 @@ class FakeClient:
         self.num_ctx_seen: list[int | None] = []
 
     def generate(self, prompt: str, *, temperature: float = 0.0, think: bool = False) -> str:
+        if "可行性判斷" in prompt:
+            # Combined preflight: feasibility line + rule-selection line.
+            self.calls["feasibility"] += 1
+            if isinstance(self._feasibility, Exception):
+                raise self._feasibility
+            self.calls["select"] += 1
+            if isinstance(self._rule_select, Exception):
+                raise self._rule_select
+            return self._feasibility + "\n" + self._rule_select
+        if "直接相關的公式" in prompt:
+            # Reference-page grounding extraction (only fires when a selected
+            # rule cites a 參考: URL and the fetch succeeded).
+            self.calls["ground"] += 1
+            if isinstance(self._ground, Exception):
+                raise self._ground
+            return self._ground
+        if "是否合理回應" in prompt:
+            self.calls["validate"] += 1
+            if not self._validate:
+                return "PASS"
+            entry = self._validate.pop(0)
+            if isinstance(entry, Exception):
+                raise entry
+            return entry
         if "拆成兩部分" in prompt:
             self.calls["split"] += 1
             return self._split  # default "{}" → runner falls back to (request, "")
@@ -94,8 +130,10 @@ class FakeClient:
             return self._explorer
         if "執行失敗" in prompt:
             self.calls["repair"] += 1
+            self.repair_prompts.append(prompt)
         else:
             self.calls["code"] += 1
+            self.code_prompts.append(prompt)
         # Record which model/think/ctx the cascade used for this codegen call.
         self.codegen_models.append((self.model, think))
         self.num_ctx_seen.append(self.num_ctx)
@@ -145,7 +183,8 @@ def test_self_repair_succeeds_on_second(tmp_path):
 
 def test_repair_exhausts_and_fails(tmp_path):
     # Cascade tiers: A fast (3) + B strong-fast (3) + C strong-think (1) = 7 total.
-    client = FakeClient(code_responses=[BAD_SCRIPT] * 7)
+    # Scripts must differ — identical repair output short-circuits the tier.
+    client = FakeClient(code_responses=[BAD_SCRIPT + f"\n# v{i}" for i in range(7)])
     runner = _make_runner(tmp_path, client)
     res = runner.run_detailed("總是失敗")
     assert not res.ok
@@ -162,7 +201,10 @@ def test_cascade_escalates_fast_model_to_strong(tmp_path):
     # Tier A (fast model) fails 3x, then Tier B (strong model) succeeds on its
     # first attempt. Verifies the model name climbs fast -> strong on failure and
     # that the common case would never have touched the strong model.
-    client = FakeClient(code_responses=[BAD_SCRIPT, BAD_SCRIPT, BAD_SCRIPT, GOOD_SCRIPT])
+    client = FakeClient(
+        code_responses=[BAD_SCRIPT + "\n# v1", BAD_SCRIPT + "\n# v2",
+                        BAD_SCRIPT + "\n# v3", GOOD_SCRIPT],
+    )
     runner = DynamicToolRunner(
         client=client,
         tools_dir=tmp_path / "generated_tools",
@@ -235,6 +277,25 @@ def test_truncation_bumps_and_regenerates(tmp_path):
     assert client.num_predict == 1000  # bumped during run, restored afterwards
 
 
+def test_identical_repair_escalates_tier_early(tmp_path):
+    # When repair returns byte-identical code, re-executing it would fail the
+    # same way — the runner skips the wasted cycles and climbs a tier directly.
+    client = FakeClient(code_responses=[BAD_SCRIPT, BAD_SCRIPT, GOOD_SCRIPT])
+    runner = _make_runner(tmp_path, client)
+    res = runner.run_detailed("修復卡死的任務")
+    assert res.ok
+    assert res.generations == 2  # tier-1 attempt + tier-2 success; no replay of dupes
+    assert client.calls["repair"] == 1
+
+
+def test_truncation_marker_covers_cut_try_block():
+    # A num_predict-capped script typically dies between `try:` and its handler;
+    # that must count as truncation (bump & regenerate), not a plain syntax error
+    # (repair at the same cap → truncates again → burns the tier's budget).
+    from openclaw_adapter.dynamic_tools import _is_truncation_error
+    assert _is_truncation_error("expected 'except' or 'finally' block (line 22)")
+
+
 def test_clean_env_strips_secrets(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENCLAW_TELEGRAM_BOT_TOKEN", "super-secret-123")
     client = FakeClient(code_responses=[SECRET_PROBE])
@@ -285,6 +346,223 @@ def test_parameterized_tool_reuse_matches_by_type(tmp_path):
     assert client2.calls["pick"] == 1    # classification ran
     assert client2.calls["params"] == 1  # params extracted
     assert "77" in second.answer
+
+
+def test_validator_pass_unchanged(tmp_path):
+    # Default validator (PASS) → behavior identical to pre-gate pipeline,
+    # but the validation call itself must have happened.
+    client = FakeClient(code_responses=[GOOD_SCRIPT])
+    runner = _make_runner(tmp_path, client)
+    res = runner.run_detailed("計算常數")
+    assert res.ok
+    assert res.generations == 1
+    assert client.calls["validate"] == 1
+    assert len(runner._load_manifest()) == 1
+
+
+def test_validator_fail_triggers_repair(tmp_path):
+    # Execution succeeds but the answer flunks validation → counts as a failed
+    # generation, validator reason is fed into the repair prompt, retry passes.
+    client = FakeClient(
+        code_responses=[GOOD_SCRIPT, GOOD_SCRIPT + "\n# retry"],
+        validate_responses=["FAIL: 主題不符", "PASS"],
+    )
+    runner = _make_runner(tmp_path, client)
+    res = runner.run_detailed("查天氣")
+    assert res.ok
+    assert res.generations == 2
+    assert client.calls["repair"] == 1
+    assert "主題不符" in client.repair_prompts[0]
+
+
+def test_reuse_validation_fail_regenerates(tmp_path):
+    # First run registers a legacy tool (validator passes by default).
+    client1 = FakeClient(code_responses=[GOOD_SCRIPT])
+    runner = _make_runner(tmp_path, client1)
+    runner.run_detailed("查某個東西")
+
+    # Same request → exact-match reuse executes, but its answer FAILs validation
+    # → falls through to fresh generation, whose answer PASSes.
+    client2 = FakeClient(
+        code_responses=[GOOD_SCRIPT],
+        validate_responses=["FAIL: 答非所問", "PASS"],
+    )
+    runner.client = client2
+    second = runner.run_detailed("查某個東西")
+    assert second.ok
+    assert second.reused is False
+    assert client2.calls["code"] == 1
+    assert client2.calls["validate"] == 2
+
+
+def test_validator_exception_fails_open(tmp_path):
+    # A sick validator (call raises) must never block a good answer.
+    client = FakeClient(
+        code_responses=[GOOD_SCRIPT],
+        validate_responses=[RuntimeError("ollama down")],
+    )
+    runner = _make_runner(tmp_path, client)
+    res = runner.run_detailed("計算常數")
+    assert res.ok
+    assert res.generations == 1
+    assert client.calls["validate"] == 1
+
+
+def test_validator_always_fail_respects_cap(tmp_path):
+    # Validation failures consume the same 3+3+1 budget as exec failures.
+    client = FakeClient(
+        code_responses=[GOOD_SCRIPT + f"\n# v{i}" for i in range(7)],
+        validate_responses=["FAIL: 答非所問"] * 7,
+    )
+    runner = _make_runner(tmp_path, client)
+    res = runner.run_detailed("永遠答非所問")
+    assert not res.ok
+    assert res.generations == 7
+    assert "答案驗證未通過" in res.error
+    # A tool that never passed validation must not enter the reuse pool.
+    assert runner._load_manifest() == []
+
+
+def test_feasibility_infeasible_fails_fast(tmp_path):
+    # No key-free public source → honest failure BEFORE any codegen is burned.
+    client = FakeClient(
+        code_responses=[],
+        feasibility_response="INFEASIBLE: 即時機票票價需要授權 API",
+    )
+    runner = _make_runner(tmp_path, client)
+    res = runner.run_detailed("查今晚從東京飛台北最便宜的飛機")
+    assert not res.ok
+    assert res.generations == 0
+    assert client.calls["code"] == 0
+    assert "機票" in res.error
+    assert runner._load_manifest() == []
+
+
+def test_feasibility_error_fails_open(tmp_path):
+    # A sick feasibility checker must never block generation.
+    client = FakeClient(
+        code_responses=[GOOD_SCRIPT],
+        feasibility_response=RuntimeError("ollama down"),
+    )
+    runner = _make_runner(tmp_path, client)
+    res = runner.run_detailed("計算常數")
+    assert res.ok
+    assert res.generations == 1
+
+
+def _make_rule_db(tmp_path):
+    db = KnowledgeDatabase(tmp_path / "k.sqlite3")
+    db.upsert_codegen_knowledge(
+        category="output_contract", title="通用守則",
+        technique="答案夾在標記之間輸出",
+        keywords=("*",), origin="seed", confidence=0.9,
+    )
+    db.upsert_codegen_knowledge(
+        category="finance", title="股價資料源",
+        technique="股價用 Yahoo chart API 取收盤序列",
+        keywords=("股票", "報酬"), origin="seed", confidence=0.95,
+    )
+    return db
+
+
+def test_llm_rule_selector_injects_picked_rule(tmp_path):
+    # LLM picks topical rule #1 → its technique reaches the codegen prompt,
+    # alongside the always-on rule. No keyword match required ("ETF績效" hits
+    # none of the stored keywords).
+    client = FakeClient(code_responses=[GOOD_SCRIPT], rule_select_response="1")
+    runner = _make_runner(tmp_path, client, db=_make_rule_db(tmp_path))
+    res = runner.run_detailed("ETF績效如何")
+    assert res.ok
+    assert client.calls["select"] == 1
+    assert "Yahoo chart API" in client.code_prompts[0]
+    assert "答案夾在標記之間" in client.code_prompts[0]
+    # Topical recipe must PRECEDE always-on rules: the methodology block is
+    # char-budgeted, so a recipe placed after a dozen disciplines gets cut.
+    prompt = client.code_prompts[0]
+    assert prompt.index("Yahoo chart API") < prompt.index("答案夾在標記之間")
+    # A selected recipe already documents the API structure → no live explorer.
+    assert client.calls["explore"] == 0
+
+
+def test_llm_rule_selector_none_excludes_topical(tmp_path):
+    # LLM says NONE → topical recipe stays OUT of the prompt even though the
+    # request contains a matching keyword; always-on rules still injected.
+    client = FakeClient(code_responses=[GOOD_SCRIPT], rule_select_response="NONE")
+    runner = _make_runner(tmp_path, client, db=_make_rule_db(tmp_path))
+    res = runner.run_detailed("算股票報酬")
+    assert res.ok
+    assert "Yahoo chart API" not in client.code_prompts[0]
+    assert "答案夾在標記之間" in client.code_prompts[0]
+    # No recipe selected → unknown domain → live exploration still runs.
+    assert client.calls["explore"] == 1
+
+
+def test_llm_rule_selector_error_falls_back_to_keyword(tmp_path):
+    # Selector LLM call dies → keyword-scored retrieval takes over, so a
+    # keyword-matching request still gets the topical recipe.
+    client = FakeClient(
+        code_responses=[GOOD_SCRIPT],
+        rule_select_response=RuntimeError("ollama down"),
+    )
+    runner = _make_runner(tmp_path, client, db=_make_rule_db(tmp_path))
+    res = runner.run_detailed("算股票報酬")
+    assert res.ok
+    assert "Yahoo chart API" in client.code_prompts[0]
+
+
+def _make_ref_rule_db(tmp_path):
+    db = KnowledgeDatabase(tmp_path / "k.sqlite3")
+    db.upsert_codegen_knowledge(
+        category="finance", title="股價資料源",
+        technique="股價用 Yahoo chart API。公式以參考頁為準：\n參考: https://example.org/rate",
+        keywords=("股票", "報酬"), origin="seed", confidence=0.95,
+    )
+    return db
+
+
+def test_reference_grounding_injects_block(tmp_path):
+    # A selected rule cites a 參考: URL → page fetched (stubbed) → fast model
+    # distills the request-relevant definitions → extract lands in the codegen
+    # prompt. Formulas live on the reference page, never hardcoded in the DB.
+    client = FakeClient(code_responses=[GOOD_SCRIPT], rule_select_response="1",
+                        ground_response="- YTD 基期為去年最後交易日收盤")
+    runner = _make_runner(tmp_path, client, db=_make_ref_rule_db(tmp_path))
+    fetched: list[str] = []
+    runner._fetch_url_text = (  # type: ignore[assignment]
+        lambda url: fetched.append(url) or "rate of return page text")
+    res = runner.run_detailed("0050 今年以來報酬率")
+    assert res.ok
+    assert fetched == ["https://example.org/rate"]
+    assert client.calls["ground"] == 1
+    assert "參考資料" in client.code_prompts[0]
+    assert "YTD 基期為去年最後交易日收盤" in client.code_prompts[0]
+
+
+def test_reference_grounding_fetch_failure_fails_open(tmp_path):
+    # Reference page unreachable → grounding silently skipped, codegen proceeds.
+    client = FakeClient(code_responses=[GOOD_SCRIPT], rule_select_response="1")
+    runner = _make_runner(tmp_path, client, db=_make_ref_rule_db(tmp_path))
+
+    def boom(url):
+        raise OSError("offline")
+
+    runner._fetch_url_text = boom  # type: ignore[assignment]
+    res = runner.run_detailed("0050 今年以來報酬率")
+    assert res.ok
+    assert client.calls["ground"] == 0
+    assert "參考資料" not in client.code_prompts[0]
+
+
+def test_reference_grounding_irrelevant_extract_omits_block(tmp_path):
+    # Extractor judges the page irrelevant (NONE) → no 參考資料 block.
+    client = FakeClient(code_responses=[GOOD_SCRIPT], rule_select_response="1",
+                        ground_response="NONE")
+    runner = _make_runner(tmp_path, client, db=_make_ref_rule_db(tmp_path))
+    runner._fetch_url_text = lambda url: "unrelated page"  # type: ignore[assignment]
+    res = runner.run_detailed("0050 今年以來報酬率")
+    assert res.ok
+    assert client.calls["ground"] == 1
+    assert "參考資料" not in client.code_prompts[0]
 
 
 def test_presentation_applies_when_intent_split_yields_format(tmp_path):

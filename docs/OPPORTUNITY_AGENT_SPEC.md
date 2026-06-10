@@ -14,7 +14,7 @@ Continuously find buying opportunities by combining several signals:
 1. **Three candidate providers** (chained, deduped by candidate_id):
    - `SnsLlmCandidateProvider` — domain-filtered SNS tweets (only rules whose `domains` intersect `{pokemon, yugioh, ws, union_arena, tcg}`).
    - `HotCardBoardCandidateProvider` — reuses the `/trend` hot-card boards.
-   - `ScheduledWebSearchCandidateProvider` — periodic DuckDuckGo TCG-trend queries.
+   - `ScheduledWebSearchCandidateProvider` — periodic Yahoo Japan (Playwright) TCG-trend queries.
 2. `price_monitor_bot` estimates fair value and searches Mercari listings at or below the target price.
 3. `reputation_snapshot` verifies seller reputation for each listing.
 4. OpenClaw Telegram sends only qualified recommendations to the user.
@@ -159,7 +159,7 @@ Dismissed targets are marked inactive in SQLite and are not reactivated by later
 
 ## Current Limitations
 
-- Candidate sources are SNS (domain-filtered), hot-card board, and DuckDuckGo. Per-vendor restock-page scrapers (Yuyutei / Cardrush / Magi) are not yet wired.
+- Candidate sources are SNS (domain-filtered), hot-card board, and Yahoo Japan web search (Playwright). Per-vendor restock-page scrapers (Yuyutei / Cardrush / Magi) are not yet wired.
 - Supported IPs: `pokemon`, `ws`, `yugioh`, `union_arena` (matches the current TCG price modules and the `RECOMMENDED_DOMAINS` enum).
 - It only recommends Mercari listings.
 - Reputation verification waits for `reputation_snapshot` job completion, so a first-time seller check can take several minutes (default 240 s timeout).

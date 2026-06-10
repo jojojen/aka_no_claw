@@ -87,7 +87,7 @@ def discover_tcg_sns_accounts(
     sns_db : SnsDatabase
         Used to skip handles that are already followed and to save new rules.
     search_fn : callable(query, limit=N) -> Sequence[WebSearchResult]
-        e.g. `search_duckduckgo`.
+        e.g. `search_yahoo_japan_playwright`.
     llm_fn : callable(prompt) -> str
         Returns the LLM's JSON response for a single relevance probe.
     telegram_notify_fn : callable(text) | None
