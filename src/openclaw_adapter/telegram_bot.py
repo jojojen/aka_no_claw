@@ -83,13 +83,11 @@ from .voice_command import (
 )
 from .natural_language import build_telegram_natural_language_router_from_settings
 from .quiz_favorite_songs import extract_first_youtube_url
-from .opportunity_agent import (
-    dismiss_opportunity_target,
-    format_opportunity_status,
-    list_opportunity_targets,
-    pin_opportunity_target,
-    unpin_opportunity_target,
-    update_opportunity_string_list,
+from .opportunity_command import (
+    build_hunt_callback_handler,
+    build_hunt_handler,
+    build_huntlist_item_deleter,
+    build_huntlist_view_fn,
 )
 from .reputation_agent import ensure_agent_thread
 from .reputation_snapshot import (
@@ -488,6 +486,7 @@ def _build_registries(
     buzz_fn=None,
     sns_inbox=None,
     knowledge_inbox=None,
+    opportunity_inbox=None,
 ) -> "tuple[dict, dict, dict, dict]":
     """Build registries injected into the base dispatcher.
 
@@ -581,6 +580,12 @@ def _build_registries(
         "/snsclearfilter": RegisteredCommand(
             build_sns_clear_filter_handler(sns_db, sns_inbox=sns_inbox)
         ),
+        "/hunt": RegisteredCommand(
+            build_hunt_handler(settings, opportunity_inbox=opportunity_inbox)
+        ),
+        "/opportunity": RegisteredCommand(
+            build_hunt_handler(settings, opportunity_inbox=opportunity_inbox)
+        ),
     }
 
     _rag_cb = _build_rag_callback_handler(settings, knowledge_inbox=knowledge_inbox)
@@ -601,16 +606,19 @@ def _build_registries(
         "snsdel": build_snsdel_callback_handler(sns_db, sns_inbox=sns_inbox),
         "snsaddok": build_snsaddok_callback_handler(sns_db, sns_inbox=sns_inbox),
         "snsfb": build_snsfb_callback_handler(sns_db, sns_inbox=sns_inbox),
+        "oppfb": build_hunt_callback_handler(settings, opportunity_inbox=opportunity_inbox),
     }
 
     view_handlers = {
         "km": build_knowledge_market_view_fn(settings),
         "kc": build_knowledge_coding_view_fn(settings),
         "sl": build_snslist_view_fn(sns_db),
+        "hl": build_huntlist_view_fn(settings),
     }
     item_deleter_handlers = {
         **build_knowledge_item_deleters(settings),
         "sl": build_sns_rule_deleter(sns_db, sns_inbox=sns_inbox),
+        "hl": build_huntlist_item_deleter(settings, opportunity_inbox=opportunity_inbox),
     }
 
     return command_handlers, callback_handlers, view_handlers, item_deleter_handlers
@@ -634,8 +642,9 @@ def run_telegram_polling(
     # Telegram opens sns.sqlite3 read-only for /snslist queries; writes go through inbox.
     sns_db = _open_sns_db_readonly(settings)
     sns_buzz_fn = _build_buzz_fn_standalone(settings, ssl_context=build_ssl_context(settings))
-    # Bootstrap inboxes — telegram is the producer; sns_monitor service is the consumer.
+    # Bootstrap inboxes — telegram is the producer; owner services are the consumers.
     sns_inbox, knowledge_inbox = _bootstrap_inboxes(settings)
+    opportunity_inbox = _bootstrap_opportunity_inbox(settings)
     research_renderer = default_web_research_renderer(settings)
     feedback_service = _build_feedback_service(watch_db)
     _start_card_image_crawler(watch_db)
@@ -645,7 +654,8 @@ def run_telegram_polling(
     dynamic_tool_runner = build_dynamic_tool_runner_from_settings(settings)
     command_handlers, callback_handlers, view_handlers, item_deleter_handlers = (
         _build_registries(settings, dynamic_tool_runner, sns_db=sns_db, buzz_fn=sns_buzz_fn,
-                          sns_inbox=sns_inbox, knowledge_inbox=knowledge_inbox)
+                          sns_inbox=sns_inbox, knowledge_inbox=knowledge_inbox,
+                          opportunity_inbox=opportunity_inbox)
     )
 
     _price_bot_module.TelegramCommandProcessor = (
@@ -665,14 +675,6 @@ def run_telegram_polling(
         ssl_context=build_ssl_context(settings),
         allowed_chat_ids=frozenset(settings.openclaw_telegram_chat_ids),
         status_renderer=lambda: _build_status_text(settings),
-        opportunity_status_renderer=lambda: format_opportunity_status(settings),
-        opportunity_target_remover=lambda target: dismiss_opportunity_target(settings, target),
-        opportunity_list_provider=lambda: list_opportunity_targets(settings),
-        opportunity_alias_updater=lambda selector, kind, action, names: update_opportunity_string_list(
-            settings, selector, kind=kind, action=action, names=names,
-        ),
-        opportunity_target_pinner=lambda name: pin_opportunity_target(settings, name),
-        opportunity_target_unpinner=lambda selector: unpin_opportunity_target(settings, selector),
         command_handlers=command_handlers,
         callback_handlers=callback_handlers,
         view_handlers=view_handlers,
@@ -800,6 +802,19 @@ def _bootstrap_inboxes(settings):
         settings.sns_inbox_db_path, settings.knowledge_inbox_db_path,
     )
     return sns_inbox, knowledge_inbox
+
+
+def _bootstrap_opportunity_inbox(settings):
+    """Create and bootstrap the opportunity_inbox for the telegram process.
+
+    Telegram is the *producer*; opportunity_agent service is the consumer.
+    Returns OpportunityInbox.
+    """
+    from .opportunity_inbox import OpportunityInbox
+    inbox = OpportunityInbox(settings.opportunity_inbox_db_path)
+    inbox.bootstrap()
+    logger.info("telegram: opportunity inbox bootstrapped path=%s", settings.opportunity_inbox_db_path)
+    return inbox
 
 
 def _start_backup_scheduler(settings) -> None:

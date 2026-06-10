@@ -43,6 +43,7 @@ class AssistantSettings:
     sns_inbox_db_path: str = "data/sns_inbox.sqlite3"
     knowledge_db_path: str = "data/knowledge.sqlite3"
     knowledge_inbox_db_path: str = "data/knowledge_inbox.sqlite3"
+    opportunity_inbox_db_path: str = "data/opportunity_inbox.sqlite3"
     quiz_db_path: str = "data/quiz.sqlite3"
     openclaw_backup_dir: str = "/Volumes/JEN_SSD/claw_data"
     openclaw_backup_interval_hours: int = 24
@@ -161,6 +162,7 @@ def get_settings() -> AssistantSettings:
         sns_inbox_db_path=os.getenv("SNS_INBOX_DB_PATH", "data/sns_inbox.sqlite3"),
         knowledge_db_path=os.getenv("KNOWLEDGE_DB_PATH", "data/knowledge.sqlite3"),
         knowledge_inbox_db_path=os.getenv("KNOWLEDGE_INBOX_DB_PATH", "data/knowledge_inbox.sqlite3"),
+        opportunity_inbox_db_path=os.getenv("OPPORTUNITY_INBOX_DB_PATH", "data/opportunity_inbox.sqlite3"),
         quiz_db_path=os.getenv("OPENCLAW_QUIZ_DB_PATH", "data/quiz.sqlite3"),
         openclaw_backup_dir=os.getenv("OPENCLAW_BACKUP_DIR", "/Volumes/JEN_SSD/claw_data"),
         openclaw_backup_interval_hours=_as_int(

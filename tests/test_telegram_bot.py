@@ -12,6 +12,7 @@ from tcg_tracker.service import TcgLookupResult
 from tests.image_lookup_case_fixtures import get_image_lookup_live_case
 from price_monitor_bot.bot import (
     PendingTelegramTextClarification,
+    RegisteredCommand,
     TelegramPhotoIntentAnalysis,
     TelegramPhotoIntentOption,
 )
@@ -336,27 +337,43 @@ def test_command_processor_help_lists_trend_and_scan_commands() -> None:
 
 def test_command_processor_handles_hunt_status() -> None:
     settings = AssistantSettings(openclaw_telegram_chat_id="123")
+
+    def _stub_hunt(remainder: str, chat_id: str) -> str:
+        if remainder.strip() in {"status", ""}:
+            return "targets: Umbreon"
+        return "unknown"
+
     processor = TelegramCommandProcessor(
         settings=settings,
         lookup_renderer=lambda query: query.name,
         board_loader=lambda: (_stub_board(),),
         catalog_renderer=lambda: "catalog",
-        opportunity_status_renderer=lambda: "targets: Umbreon",
+        command_handlers={"/hunt": RegisteredCommand(_stub_hunt)},
     )
 
     assert processor.build_reply(chat_id="123", text="/hunt status") == "targets: Umbreon"
 
 
 def test_command_processor_handles_hunt_remove() -> None:
+    import re as _re
+
     settings = AssistantSettings(openclaw_telegram_chat_id="123")
     seen: list[str] = []
+
+    def _stub_hunt(remainder: str, chat_id: str) -> str:
+        m = _re.match(r"^(?:remove|delete|dismiss)\s+(.+)$", remainder.strip(), _re.IGNORECASE)
+        if m:
+            target = m.group(1).strip()
+            seen.append(target)
+            return f"removed:{target}"
+        return "unknown"
+
     processor = TelegramCommandProcessor(
         settings=settings,
         lookup_renderer=lambda query: query.name,
         board_loader=lambda: (_stub_board(),),
         catalog_renderer=lambda: "catalog",
-        opportunity_status_renderer=lambda: "targets: Umbreon",
-        opportunity_target_remover=lambda target: seen.append(target) or f"removed:{target}",
+        command_handlers={"/hunt": RegisteredCommand(_stub_hunt)},
     )
 
     assert processor.build_reply(chat_id="123", text="/hunt remove 2") == "removed:2"
@@ -691,6 +708,8 @@ def test_command_processor_handles_natural_language_web_research_via_router() ->
 
 
 def test_command_processor_handles_natural_language_opportunity_remove_via_router() -> None:
+    import re as _re
+
     settings = AssistantSettings(openclaw_telegram_chat_id="123")
     router = StubNaturalLanguageRouter(
         TelegramNaturalLanguageIntent(
@@ -700,13 +719,20 @@ def test_command_processor_handles_natural_language_opportunity_remove_via_route
         )
     )
     seen: list[str] = []
+
+    def _stub_hunt(remainder: str, chat_id: str) -> str:
+        m = _re.match(r"^(?:remove|dismiss)\s+(.+)$", remainder.strip(), _re.IGNORECASE)
+        target = m.group(1).strip() if m else remainder.strip()
+        seen.append(target)
+        return f"removed:{target}"
+
     processor = TelegramCommandProcessor(
         settings=settings,
         lookup_renderer=lambda query: query.name,
         board_loader=lambda: (_stub_board(),),
         catalog_renderer=lambda: "catalog",
         natural_language_router=router,
-        opportunity_target_remover=lambda target: seen.append(target) or f"removed:{target}",
+        command_handlers={"/hunt": RegisteredCommand(_stub_hunt)},
     )
 
     plan = processor.build_reply_plan(chat_id="123", text="remove target 2 from the opportunity list")

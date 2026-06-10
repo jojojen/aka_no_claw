@@ -2507,9 +2507,95 @@ def _web_research_sources_from_metadata(metadata: object) -> list[dict[str, str]
     return normalized
 
 
+_INBOX_POLL_INTERVAL = 3  # seconds
+
+
+def _apply_opportunity_inbox_request(store: "OpportunityStore", settings: AssistantSettings, req: dict) -> None:
+    action = req.get("action", "")
+    payload = req.get("payload", {})
+
+    if action == "dismiss_candidate":
+        candidate_id = str(payload.get("candidate_id", ""))
+        if candidate_id:
+            store.dismiss_candidate(candidate_id)
+
+    elif action == "set_is_target":
+        candidate_id = str(payload.get("candidate_id", ""))
+        is_target = bool(payload.get("is_target", False))
+        if candidate_id:
+            store.set_is_target(candidate_id, is_target)
+
+    elif action == "update_string_list":
+        candidate_id = str(payload.get("candidate_id", ""))
+        kind = payload.get("kind", "")
+        action_word = payload.get("action", "")
+        names = tuple(payload.get("names") or [])
+        if candidate_id and kind in {"aliases", "related"} and action_word in {"add", "remove"}:
+            fn = (
+                store.update_candidate_aliases
+                if kind == "aliases"
+                else store.update_candidate_related_keywords
+            )
+            if action_word == "add":
+                fn(candidate_id, add=names)
+            else:
+                fn(candidate_id, remove=names)
+
+    elif action == "pin_by_name":
+        name = str(payload.get("name", "")).strip()
+        if name:
+            pin_opportunity_target(settings, name)
+
+    elif action == "record_feedback":
+        rec_id = str(payload.get("recommendation_id", ""))
+        kind = str(payload.get("kind", ""))
+        if rec_id and kind:
+            from .opportunity_feedback import record_opportunity_feedback
+            record_opportunity_feedback(
+                recommendation_id=rec_id, kind=kind, settings=settings
+            )
+
+    else:
+        logger.warning("opportunity_inbox: unknown action=%s", action)
+
+
+def _run_opportunity_inbox_poller(settings: AssistantSettings, stop_event: threading.Event) -> None:
+    from .opportunity_inbox import OpportunityInbox
+    inbox = OpportunityInbox(settings.opportunity_inbox_db_path)
+    inbox.bootstrap()
+    store = OpportunityStore(settings.opportunity_db_path)
+    store.bootstrap()
+    logger.info("opportunity inbox poller started path=%s", settings.opportunity_inbox_db_path)
+    while not stop_event.is_set():
+        try:
+            pending = inbox.pop_pending(limit=20)
+            for req in pending:
+                try:
+                    _apply_opportunity_inbox_request(store, settings, req)
+                    inbox.mark_done(req["id"])
+                except Exception:
+                    logger.exception("opportunity inbox apply failed req=%s", req)
+                    inbox.mark_error(req["id"], "apply error")
+        except Exception:
+            logger.exception("opportunity inbox poll cycle failed")
+        stop_event.wait(timeout=_INBOX_POLL_INTERVAL)
+
+
 def run_opportunity_agent(*, settings: AssistantSettings | None = None, once: bool = False) -> OpportunityPipelineStats | None:
+    settings = settings or get_settings()
     agent = build_opportunity_agent(settings)
     if once:
         return agent.run_once()
+
+    stop_event = threading.Event()
+    inbox_thread = threading.Thread(
+        target=_run_opportunity_inbox_poller,
+        args=(settings, stop_event),
+        daemon=True,
+        name="opportunity-inbox-poller",
+    )
+    inbox_thread.start()
+
     agent.run_forever()
+    stop_event.set()
     return None
