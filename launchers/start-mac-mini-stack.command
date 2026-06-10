@@ -31,6 +31,7 @@ LAUNCHCTL_OLLAMA_LABEL="local.openclaw.ollama"
 LAUNCHCTL_REPUTATION_LABEL="local.openclaw.reputation"
 LAUNCHCTL_TELEGRAM_LABEL="local.openclaw.telegram"
 LAUNCHCTL_OPPORTUNITY_LABEL="local.openclaw.opportunity"
+LAUNCHCTL_SNS_MONITOR_LABEL="local.openclaw.sns_monitor"
 LAUNCHCTL_AIVIS_LABEL="local.openclaw.aivis"
 
 AIVIS_HOST="${AIVIS_HOST:-127.0.0.1}"
@@ -982,7 +983,7 @@ stop_launchctl_jobs() {
     return
   fi
   local label
-  for label in "${LAUNCHCTL_OLLAMA_LABEL}" "${LAUNCHCTL_AIVIS_LABEL}" "${LAUNCHCTL_REPUTATION_LABEL}" "${LAUNCHCTL_TELEGRAM_LABEL}" "${LAUNCHCTL_OPPORTUNITY_LABEL}"; do
+  for label in "${LAUNCHCTL_OLLAMA_LABEL}" "${LAUNCHCTL_AIVIS_LABEL}" "${LAUNCHCTL_REPUTATION_LABEL}" "${LAUNCHCTL_TELEGRAM_LABEL}" "${LAUNCHCTL_SNS_MONITOR_LABEL}" "${LAUNCHCTL_OPPORTUNITY_LABEL}"; do
     if launchctl_job_exists "${label}"; then
       log "Stopping launchctl job ${label}."
       launchctl remove "${label}" >/dev/null 2>&1 || true
@@ -1173,6 +1174,26 @@ opportunity_agent_enabled() {
   [[ "${enabled}" != "0" && "${enabled}" != "false" && "${enabled}" != "no" && "${enabled}" != "off" ]]
 }
 
+start_sns_monitor_service() {
+  log "Starting OpenClaw SNS monitor service..."
+  if use_launchctl_services; then
+    launchctl submit -l "${LAUNCHCTL_SNS_MONITOR_LABEL}" \
+      -o "${LOG_DIR}/openclaw_sns_monitor.log" \
+      -e "${LOG_DIR}/openclaw_sns_monitor.log" \
+      -- /bin/bash -lc "source '${RUNTIME_ENV_FILE}'; cd '${AKA_DIR}'; export PYTHONPATH='.:src'; exec '${AKA_VENV}/bin/python' -m openclaw_adapter sns-monitor-service"
+    local pid
+    pid="$(launchctl_job_pid "${LAUNCHCTL_SNS_MONITOR_LABEL}")"
+    [[ -n "${pid}" ]] && echo "${pid}" >> "${PID_FILE}"
+    return
+  fi
+
+  (
+    cd "${AKA_DIR}"
+    nohup "${AKA_VENV}/bin/python" -m openclaw_adapter sns-monitor-service >> "${LOG_DIR}/openclaw_sns_monitor.log" 2>&1 &
+    echo $! >> "${PID_FILE}"
+  )
+}
+
 start_opportunity_agent() {
   if ! opportunity_agent_enabled; then
     log "Skipping opportunity agent because OPENCLAW_OPPORTUNITY_AGENT_ENABLED=0."
@@ -1217,6 +1238,7 @@ main() {
   start_reputation_server
   wait_for_reputation_server
   start_openclaw_telegram
+  start_sns_monitor_service
   start_opportunity_agent
 
   log "Started."
@@ -1224,6 +1246,7 @@ main() {
   log "Logs:"
   log "  ${LOG_DIR}/reputation_snapshot.log"
   log "  ${LOG_DIR}/openclaw_telegram.log"
+  log "  ${LOG_DIR}/openclaw_sns_monitor.log"
   log "  ${LOG_DIR}/opportunity_agent.log"
   log "  ${LOG_DIR}/aivis_speech.log"
   if use_launchctl_services; then

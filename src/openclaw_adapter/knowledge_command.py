@@ -28,11 +28,16 @@ _VALID_TYPES = ("ip", "product", "set", "creator", "event", "store", "other")
 
 def build_knowledge_handler(
     settings: AssistantSettings,
+    knowledge_inbox=None,
 ) -> Callable[[str, str], "str | tuple[str, dict | None]"]:
     """Return the /knowledge command handler for the registry.
 
     Returns a string for most sub-commands, or a ``(text, markup)`` tuple
     for the ``market`` and ``coding`` paginated views.
+
+    When ``knowledge_inbox`` is provided, write operations (add/alias/remove) go
+    through the inbox (sns_monitor service is the sole writer to knowledge.sqlite3).
+    Read operations (list/get/market/coding) always use the DB directly.
     """
 
     from .knowledge_db import KnowledgeDatabase
@@ -57,15 +62,15 @@ def build_knowledge_handler(
                 body, markup, _ = coding_view(page=0)
                 return body, markup
             if action == "add":
-                return _do_add(db, rest)
+                return _do_add(db, rest, knowledge_inbox=knowledge_inbox)
             if action == "list":
                 return _do_list(db, rest)
             if action == "get":
                 return _do_get(db, rest)
             if action == "alias":
-                return _do_alias(db, rest)
+                return _do_alias(db, rest, knowledge_inbox=knowledge_inbox)
             if action in ("remove", "delete"):
-                return _do_remove(db, rest)
+                return _do_remove(db, rest, knowledge_inbox=knowledge_inbox)
         except Exception as exc:
             logger.exception("knowledge_command: action=%s failed", action)
             return f"知識庫指令失敗：{exc}"
@@ -183,7 +188,7 @@ def _usage_text() -> str:
     )
 
 
-def _do_add(db, rest: str) -> str:
+def _do_add(db, rest: str, knowledge_inbox=None) -> str:
     if "|" not in rest:
         return "請用 `|` 分隔 entity 與 summary。例如：/knowledge add pjsk | プロセカ 是 SEGA 的節奏音遊…"
     head, summary = rest.split("|", 1)
@@ -205,15 +210,24 @@ def _do_add(db, rest: str) -> str:
     if not head:
         return "請提供 entity 名稱。"
     try:
-        db.upsert_entry(
-            entity_canonical=head,
-            entity_type=entity_type,
-            summary=summary,
-            source_urls=(),
-            confidence=1.0,
-            origin="manual",
-            aliases=(),
-        )
+        if knowledge_inbox is not None:
+            knowledge_inbox.push("save_entry", {
+                "entity_canonical": head,
+                "entity_type": entity_type,
+                "summary": summary,
+                "confidence": 1.0,
+                "origin": "manual",
+            })
+        else:
+            db.upsert_entry(
+                entity_canonical=head,
+                entity_type=entity_type,
+                summary=summary,
+                source_urls=(),
+                confidence=1.0,
+                origin="manual",
+                aliases=(),
+            )
     except Exception as exc:
         return f"寫入失敗：{exc}"
     return f"✅ 已記入知識庫：{head} (type={entity_type}, {len(summary)} 字)"
@@ -265,7 +279,7 @@ def _do_get(db, rest: str) -> str:
     )
 
 
-def _do_alias(db, rest: str) -> str:
+def _do_alias(db, rest: str, knowledge_inbox=None) -> str:
     if "=" not in rest:
         return "用法：/knowledge alias <entity> = <alias1>, <alias2>"
     entity, _, alias_str = rest.partition("=")
@@ -275,20 +289,28 @@ def _do_alias(db, rest: str) -> str:
         return "請提供 entity 與至少一個 alias。"
     if db.get_entry(entity) is None:
         return f"entity「{entity}」尚未在知識庫中，請先 /knowledge add 建立。"
-    added = 0
-    for alias in aliases:
-        if db.add_alias(alias, entity):
-            added += 1
-    return f"✅ 已為 {entity} 加入 {added} 個 alias。"
+    try:
+        if knowledge_inbox is not None:
+            for alias in aliases:
+                knowledge_inbox.push("alias_entry", {"canonical": entity, "alias": alias})
+            return f"✅ 已為 {entity} 排入 {len(aliases)} 個 alias。"
+        added = 0
+        for alias in aliases:
+            if db.add_alias(alias, entity):
+                added += 1
+        return f"✅ 已為 {entity} 加入 {added} 個 alias。"
+    except Exception as exc:
+        return f"alias 寫入失敗：{exc}"
 
 
-def _do_remove(db, rest: str) -> str:
+def _do_remove(db, rest: str, knowledge_inbox=None) -> str:
     entity = rest.strip()
     if not entity:
         return "請提供 entity 名稱。"
-    # KnowledgeDatabase.delete_entry isn't a hard requirement of the plan; fall
-    # back to a direct DELETE so the command still works without API changes.
     try:
+        if knowledge_inbox is not None:
+            knowledge_inbox.push("delete_entry", {"entity_canonical": entity.strip().lower()})
+            return "✅ 已排入刪除佇列。"
         with db.connect() as conn:
             cur = conn.execute(
                 "DELETE FROM knowledge_entries WHERE entity_canonical = ?",

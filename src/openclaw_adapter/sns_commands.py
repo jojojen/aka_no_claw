@@ -1,8 +1,15 @@
 """Telegram-side SNS command handlers.
 
 Extracted from price_monitor_bot.bot so that the base dispatcher contains no
-SNS domain logic. All builders accept a SnsDatabase instance (or None for
-graceful degradation) and return callables matching the registry signatures.
+SNS domain logic.
+
+All builders accept:
+- ``sns_db``    — SnsDatabase (or None) opened read-only for list/resolve lookups.
+- ``sns_inbox`` — SnsInbox (or None) for write operations.
+
+When ``sns_inbox`` is provided, writes go through the inbox (single-writer-per-file
+pattern: sns_monitor service is the sole writer to sns.sqlite3). When None, writes
+fall back to direct ``sns_db`` access (used in tests / standalone mode).
 """
 from __future__ import annotations
 
@@ -97,7 +104,7 @@ def _describe_sns_rule(sns_db, rule_id: str) -> str:
     return rule_id[:8]
 
 
-def _do_sns_delete(sns_db, raw: str) -> str:
+def _do_sns_delete(sns_db, raw: str, sns_inbox=None) -> str:
     if sns_db is None:
         return "SNS 監控尚未啟用（sns_db 未設定）。"
     try:
@@ -108,11 +115,15 @@ def _do_sns_delete(sns_db, raw: str) -> str:
         if rule_id is None:
             return f"找不到對應的 SNS 規則：{target}"
         label = _describe_sns_rule(sns_db, rule_id)
-        found = sns_db.delete_watch_rule(rule_id)
-        if found:
+        if sns_inbox is not None:
+            sns_inbox.push("delete_rule", {"rule_id": rule_id})
+            logger.info("SNS rule delete queued rule_id=%s target=%s", rule_id, target)
+        else:
+            found = sns_db.delete_watch_rule(rule_id)
+            if not found:
+                return f"找不到規則 {target}"
             logger.info("SNS rule deleted rule_id=%s target=%s", rule_id, target)
-            return f"✓ 已刪除 SNS 監控：{label}"
-        return f"找不到規則 {target}"
+        return f"✓ 已刪除 SNS 監控：{label}"
     except Exception as exc:
         logger.exception("SNS delete failed raw=%s", raw)
         return f"刪除失敗：{exc}"
@@ -122,11 +133,11 @@ def _do_sns_delete(sns_db, raw: str) -> str:
 # Command handler builders
 # ---------------------------------------------------------------------------
 
-def build_sns_add_handler(sns_db) -> Callable[[str, str], str]:
+def build_sns_add_handler(sns_db, sns_inbox=None) -> Callable[[str, str], str]:
     """Build handler for /snsadd (and /sns_add). ``(remainder, chat_id) -> str``."""
 
     def handler(raw: str, chat_id: str) -> str:
-        if sns_db is None:
+        if sns_db is None and sns_inbox is None:
             return "SNS 監控尚未啟用（sns_db 未設定）。"
         from sns_monitor.filters import (
             extract_labeled_brackets,
@@ -189,9 +200,12 @@ def build_sns_add_handler(sns_db) -> Callable[[str, str], str]:
                     last_checked_at=getattr(existing_rule, "last_checked_at", None),
                     source=source,
                 )
-                sns_db.save_watch_rule(rule)
+                if sns_inbox is not None:
+                    sns_inbox.push_rule(rule, chat_id=chat_id)
+                elif sns_db is not None:
+                    sns_db.save_watch_rule(rule)
                 logger.info(
-                    "SNS account watch added source=%s target=%s chat_id=%s "
+                    "SNS account watch queued/added source=%s target=%s chat_id=%s "
                     "include_keywords=%s domains=%s schedule=%dm",
                     source, screen_name, chat_id, include_keywords,
                     resolved_domains, schedule_minutes,
@@ -232,9 +246,12 @@ def build_sns_add_handler(sns_db) -> Callable[[str, str], str]:
                     last_checked_at=None,
                     source=source,
                 )
-                sns_db.save_watch_rule(rule)
+                if sns_inbox is not None:
+                    sns_inbox.push_rule(rule, chat_id=chat_id)
+                elif sns_db is not None:
+                    sns_db.save_watch_rule(rule)
                 logger.info(
-                    "SNS keyword watch added source=%s query=%s chat_id=%s domains=%s schedule=%dm",
+                    "SNS keyword watch queued/added source=%s query=%s chat_id=%s domains=%s schedule=%dm",
                     source, query, chat_id, resolved_domains, schedule_minutes,
                 )
                 domain_line = f"\n領域：{', '.join(resolved_domains)}" if resolved_domains else ""
@@ -271,9 +288,12 @@ def build_sns_add_handler(sns_db) -> Callable[[str, str], str]:
                     last_checked_at=None,
                     source=source,
                 )
-                sns_db.save_watch_rule(rule)
+                if sns_inbox is not None:
+                    sns_inbox.push_rule(rule, chat_id=chat_id)
+                elif sns_db is not None:
+                    sns_db.save_watch_rule(rule)
                 logger.info(
-                    "SNS trend watch added source=%s category=%s chat_id=%s schedule=%dm",
+                    "SNS trend watch queued/added source=%s category=%s chat_id=%s schedule=%dm",
                     source, category, chat_id, schedule_minutes,
                 )
                 return (
@@ -365,10 +385,17 @@ def build_snslist_handler(sns_db) -> Callable[[str, str], tuple]:
     return handler
 
 
-def build_sns_rule_deleter(sns_db) -> tuple[Callable[[str], bool], str]:
+def build_sns_rule_deleter(sns_db, sns_inbox=None) -> tuple[Callable[[str], bool], str]:
     """Return ``(deleter_fn, human_label)`` for list kind ``sl``."""
 
     def delete_fn(rule_id: str) -> bool:
+        if sns_inbox is not None:
+            try:
+                sns_inbox.push("delete_rule", {"rule_id": rule_id})
+                return True
+            except Exception:
+                logger.exception("SNS delete inbox push failed rule_id=%s", rule_id)
+                return False
         if sns_db is None:
             return False
         try:
@@ -380,11 +407,11 @@ def build_sns_rule_deleter(sns_db) -> tuple[Callable[[str], bool], str]:
     return delete_fn, "SNS 規則"
 
 
-def build_sns_delete_handler(sns_db) -> Callable[[str, str], str]:
+def build_sns_delete_handler(sns_db, sns_inbox=None) -> Callable[[str, str], str]:
     """Build handler for /snsdelete. ``(remainder, chat_id) -> str``."""
 
     def handler(raw: str, chat_id: str) -> str:
-        return _do_sns_delete(sns_db, raw)
+        return _do_sns_delete(sns_db, raw, sns_inbox=sns_inbox)
 
     return handler
 
@@ -407,7 +434,7 @@ def build_sns_buzz_handler(buzz_fn) -> Callable[[str, str], str]:
     return handler
 
 
-def build_sns_clear_filter_handler(sns_db) -> Callable[[str, str], str]:
+def build_sns_clear_filter_handler(sns_db, sns_inbox=None) -> Callable[[str, str], str]:
     """Build handler for NL ``sns_clear_filter`` intent. ``(handle, chat_id) -> str``."""
 
     def handler(handle: str, chat_id: str) -> str:
@@ -429,8 +456,11 @@ def build_sns_clear_filter_handler(sns_db) -> Callable[[str, str], str]:
                 return f"✓ @{screen_name} 目前沒有 filter，無需清空。"
             previous = existing_rule.include_keywords
             cleared = replace(existing_rule, include_keywords=())
-            sns_db.save_watch_rule(cleared)
-            logger.info("SNS filter cleared screen_name=%s previous=%s", screen_name, previous)
+            if sns_inbox is not None:
+                sns_inbox.push_rule(cleared, chat_id=chat_id)
+            else:
+                sns_db.save_watch_rule(cleared)
+            logger.info("SNS filter cleared/queued screen_name=%s previous=%s", screen_name, previous)
             return f"✓ 已清空 @{screen_name} 的 filter（追蹤仍啟用，原本：{', '.join(previous)}）。"
         except Exception as exc:
             logger.exception("SNS clear filter failed handle=%s", handle)
@@ -443,12 +473,12 @@ def build_sns_clear_filter_handler(sns_db) -> Callable[[str, str], str]:
 # Callback handler builders
 # ---------------------------------------------------------------------------
 
-def build_snsdel_callback_handler(sns_db) -> Callable[[str, str, str], tuple]:
+def build_snsdel_callback_handler(sns_db, sns_inbox=None) -> Callable[[str, str, str], tuple]:
     """Build callback for ``snsdel:<handle>`` — notification one-tap delete."""
 
     def handler(payload: str, original_text: str, chat_id: str) -> tuple:
         handle = payload.lstrip("@")
-        reply = _do_sns_delete(sns_db, f"@{handle}")
+        reply = _do_sns_delete(sns_db, f"@{handle}", sns_inbox=sns_inbox)
         if reply.startswith("✓"):
             return f"已刪除 @{handle}", f"{original_text}\n\n✓ 已刪除 @{handle}", None
         if reply.startswith("找不到"):
@@ -462,32 +492,37 @@ def build_snsdel_callback_handler(sns_db) -> Callable[[str, str, str], tuple]:
     return handler
 
 
-def build_snsaddok_callback_handler(sns_db) -> Callable[[str, str, str], tuple]:
+def build_snsaddok_callback_handler(sns_db, sns_inbox=None) -> Callable[[str, str, str], tuple]:
     """Build callback for ``snsaddok:<handle>`` — notification one-tap positive feedback."""
 
     def handler(payload: str, original_text: str, chat_id: str) -> tuple:
         handle = payload.lstrip("@")
-        if sns_db is None:
+        if sns_db is None and sns_inbox is None:
             return "SNS monitor 未啟用，無法寫入回饋", None, None
         try:
-            from sns_monitor.models import AccountWatch as _AccountWatch
+            domains: tuple = ()
+            if sns_db is not None:
+                from sns_monitor.models import AccountWatch as _AccountWatch
+                rule = next(
+                    (r for r in sns_db.list_watch_rules()
+                     if isinstance(r, _AccountWatch)
+                     and (r.screen_name or "").lower() == handle.lower()),
+                    None,
+                )
+                domains = tuple(getattr(rule, "domains", ()) or ()) if rule else ()
 
-            rule = next(
-                (
-                    r
-                    for r in sns_db.list_watch_rules()
-                    if isinstance(r, _AccountWatch)
-                    and (r.screen_name or "").lower() == handle.lower()
-                ),
-                None,
-            )
-            domains = tuple(getattr(rule, "domains", ()) or ()) if rule else ()
-            sns_db.record_auto_discovery_feedback(
-                screen_name=handle,
-                polarity="positive",
-                domains=domains,
-                chat_id=str(chat_id),
-            )
+            if sns_inbox is not None:
+                sns_inbox.push("auto_discovery_feedback", {
+                    "screen_name": handle,
+                    "polarity": "positive",
+                    "domains": list(domains),
+                    "chat_id": str(chat_id),
+                }, chat_id=str(chat_id))
+            elif sns_db is not None:
+                sns_db.record_auto_discovery_feedback(
+                    screen_name=handle, polarity="positive",
+                    domains=domains, chat_id=str(chat_id),
+                )
             toast = f"👍 已記錄 @{handle}"
             new_text = f"{original_text}\n\n👍 已記錄為投資訊號帳號"
             return toast, new_text, None
@@ -498,7 +533,7 @@ def build_snsaddok_callback_handler(sns_db) -> Callable[[str, str, str], tuple]:
     return handler
 
 
-def build_snsfb_callback_handler(sns_db) -> Callable[[str, str, str], tuple]:
+def build_snsfb_callback_handler(sns_db, sns_inbox=None) -> Callable[[str, str, str], tuple]:
     """Build callback for ``snsfb:<kind>:<tweet_id>:<rule_id>`` — per-post feedback."""
 
     def handler(payload: str, original_text: str, chat_id: str) -> tuple:
@@ -506,6 +541,23 @@ def build_snsfb_callback_handler(sns_db) -> Callable[[str, str, str], tuple]:
         if len(parts) != 3 or parts[0] not in {"up", "down", "bought"}:
             return "未知回饋", None, None
         kind, tweet_id, rule_id = parts
+
+        if sns_inbox is not None:
+            sns_inbox.push("feedback", {
+                "tweet_id": tweet_id,
+                "rule_id": rule_id,
+                "kind": kind,
+                "chat_id": str(chat_id),
+            }, chat_id=str(chat_id))
+            # Optimistic toast — service will apply and can push a Telegram notification
+            if kind == "up":
+                toast = "✓ 已記錄 👍（已提高同類推文推播機率）"
+            elif kind == "bought":
+                toast = "✓ 已記錄 💰（已提高同類推文推播機率）"
+            else:
+                toast = "✓ 已標記不感興趣（24h cooldown）"
+            return toast, f"{original_text}\n\n{toast}", None
+
         sns_db_path = getattr(sns_db, "path", None) if sns_db is not None else None
         if sns_db_path is None:
             return "SNS monitor 未啟用，無法寫入回饋", None, None

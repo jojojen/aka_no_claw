@@ -141,6 +141,15 @@ def build_tool_registry(settings: AssistantSettings | None = None) -> ToolRegist
     )
     registry.register(
         AssistantTool(
+            name="assistant.sns-monitor-service",
+            description="Run the SNS background monitor service (RSS polling, classifier, push notifications, inbox processing). Intended for local.openclaw.sns_monitor launchd.",
+            configure_parser=lambda parser: None,
+            handler=lambda args: _handle_sns_monitor_service(args, settings),
+            aliases=("sns-monitor-service",),
+        )
+    )
+    registry.register(
+        AssistantTool(
             name="assistant.opportunity-status",
             description="Show recent opportunity candidates and recommendation decisions.",
             configure_parser=_configure_opportunity_status_parser,
@@ -586,3 +595,12 @@ def _handle_opportunity_status(
 ) -> int:
     print(format_opportunity_status(settings, limit=max(1, min(30, args.limit))))
     return 0
+
+
+def _handle_sns_monitor_service(
+    args: argparse.Namespace,
+    settings: AssistantSettings,
+) -> int:
+    logger.info("CLI sns-monitor-service started")
+    from .sns_monitor_service import run_sns_monitor_service
+    return run_sns_monitor_service(settings)
