@@ -637,7 +637,9 @@ def run_telegram_polling(
 ) -> int:
     token = require_telegram_token(settings)
     watch_db = _bootstrap_watch_db(settings)
-    _start_watch_monitor(settings=settings, watch_db=watch_db, token=token)
+    # Price monitor now runs in local.openclaw.price_monitor (separate process).
+    # Telegram reads monitor.sqlite3 for watchlist queries; writes go through watch_inbox.
+    watch_inbox = _bootstrap_watch_inbox(settings)
     # SNS background monitor now runs in local.openclaw.sns_monitor (separate process).
     # Telegram opens sns.sqlite3 read-only for /snslist queries; writes go through inbox.
     sns_db = _open_sns_db_readonly(settings)
@@ -647,7 +649,6 @@ def run_telegram_polling(
     opportunity_inbox = _bootstrap_opportunity_inbox(settings)
     research_renderer = default_web_research_renderer(settings)
     feedback_service = _build_feedback_service(watch_db)
-    _start_card_image_crawler(watch_db)
     _start_backup_scheduler(settings)
     rag_digest_scheduler = _start_rag_daily_digest(settings)
     quiz_daily_scheduler = start_quiz_daily_scheduler(settings)
@@ -680,6 +681,7 @@ def run_telegram_polling(
         view_handlers=view_handlers,
         item_deleter_handlers=item_deleter_handlers,
         watch_db=watch_db,
+        watch_inbox=watch_inbox,
         sns_db=sns_db,
         sns_buzz_fn=sns_buzz_fn,
         feedback_service=feedback_service,
@@ -802,6 +804,19 @@ def _bootstrap_inboxes(settings):
         settings.sns_inbox_db_path, settings.knowledge_inbox_db_path,
     )
     return sns_inbox, knowledge_inbox
+
+
+def _bootstrap_watch_inbox(settings):
+    """Create and bootstrap the watch_inbox for the telegram process.
+
+    Telegram is the *producer*; price_monitor service is the consumer.
+    Returns WatchInbox.
+    """
+    from .watch_inbox import WatchInbox
+    inbox = WatchInbox(settings.watch_inbox_db_path)
+    inbox.bootstrap()
+    logger.info("telegram: watch inbox bootstrapped path=%s", settings.watch_inbox_db_path)
+    return inbox
 
 
 def _bootstrap_opportunity_inbox(settings):
