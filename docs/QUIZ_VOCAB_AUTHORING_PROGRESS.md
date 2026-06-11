@@ -12,6 +12,25 @@ Last updated: 2026-06-07 JST
   - `文脈規定`
   - `用法`
 
+## Development Priority Order
+
+The user has fixed the development priority order below. These are **not**
+parallel goals; lower items must not override higher ones:
+
+1. `正確性/品質`
+2. `不被封鎖 IP`
+3. `節省 token 消耗`
+4. `速度`
+
+Operational meaning:
+
+- Do not take a faster path if it lowers question quality, grounding quality,
+  or vocab-card example quality.
+- Do not re-fetch or hit external lyric/commentary sources more than necessary
+  just to save tokens or move faster.
+- Use token-saving tactics only after quality and IP-safety are preserved.
+- Treat speed as the final optimization, never the driver.
+
 ## Current Status
 
 - Current clean `quiz_vocab_cards` count after source-excerpt example enforcement: 300.

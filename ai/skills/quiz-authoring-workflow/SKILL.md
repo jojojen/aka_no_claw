@@ -13,6 +13,36 @@ Before generating questions, deleting questions, writing `quiz_authoring_knowled
 
 If the user asks only for analysis, explain findings without changing code or DB.
 
+## Priority Order
+
+The user's authoring principles are **strictly ordered**. Treat this as a
+priority ladder, not four equally important goals:
+
+1. **Correctness / quality comes first.**
+   If a faster / cheaper / lower-request method lowers question quality,
+   grounding quality, distractor quality, vocab-card example quality, or review
+   confidence, do **not** use it.
+2. **Avoid getting the source sites / IP blocked.**
+   If a method would hit external sites more aggressively, refetch pages that are
+   already cached, or create avoidable scraper-like traffic, do **not** use it,
+   even if it is faster or cheaper in tokens.
+3. **Save token usage.**
+   After quality and IP-safety are preserved, prefer cache-first, deterministic
+   checks, and compact context to reduce model spend.
+4. **Speed comes last.**
+   Faster is good only after 1, 2, and 3 are already satisfied. Never sacrifice
+   correctness, source safety, or token discipline merely to go faster.
+
+If two tactics conflict, resolve them by this order. Examples:
+
+- Prefer a slower manual/source-grounded fix over a quick weak paraphrase.
+- Prefer cached lyrics/commentary over re-fetching a site, even if re-fetching is
+  more convenient in the moment.
+- Prefer a one-question-at-a-time solver check over a flaky batch if the batch
+  risks wrong retention.
+- Prefer a token-heavier strong-model judgment over a cheap shortcut when that
+  shortcut weakens N1 calibration or example quality.
+
 ## Hard Constraints
 
 - Do not modify code unless the user explicitly asks for code changes.
