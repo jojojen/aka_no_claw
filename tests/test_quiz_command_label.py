@@ -324,6 +324,37 @@ def test_callback_wrong_marker_routes_to_wrong_only(tmp_path):
     assert new_text is not None and "沒有錯題" in new_text
 
 
+def test_answer_callback_shows_random_and_same_type_buttons(tmp_path):
+    from openclaw_adapter.quiz_command import build_quiz_callback_handler
+    from openclaw_adapter.quiz_db import QuizDatabase
+
+    dbp = tmp_path / "quiz.sqlite3"
+    db = QuizDatabase(dbp)
+    q = db.insert_question(
+        level="JLPT N1",
+        exam_point="文法形式の判断",
+        stem="彼は約束を守る（　　）人だ。",
+        options=("べき", "まま", "のみ", "ほど"),
+        answer_index=0,
+        explanation="文脈上は当然・義務の意味。",
+        source_type="vocaloid_song",
+        source_name="炉心融解",
+        source_excerpt="x" * 12,
+        author="Claude",
+        verified=True,
+        allow_ungrounded=True,
+    )
+    handler = build_quiz_callback_handler(SimpleNamespace(quiz_db_path=dbp))
+    toast, new_text, markup = handler(f"a:{q.question_id}:0", "orig", "u1")
+    assert toast == "✅ 答對了！"
+    assert new_text is not None and "✅ 正解！" in new_text
+    flat = [b for row in markup["inline_keyboard"] for b in row]
+    cbs = [b["callback_data"] for b in flat]
+    assert f"quiz:t:{q.level}:*" in cbs
+    assert f"quiz:t:{q.level}:{q.exam_point}" in cbs
+    assert any(b["text"] == "🧩 同類型下一題" for b in flat)
+
+
 def test_render_vocab_lookup_multiple_hits_lists_suggestions():
     class _LookupDB:
         def get_vocab_card(self, **kwargs):
