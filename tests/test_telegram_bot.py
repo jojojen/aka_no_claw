@@ -36,6 +36,7 @@ from openclaw_adapter.telegram_bot import (
     parse_lookup_command,
     parse_reputation_snapshot_command,
     _build_status_text,
+    _build_registries,
     _chromium_launch_options,
 )
 
@@ -333,6 +334,52 @@ def test_command_processor_help_lists_trend_and_scan_commands() -> None:
     assert "/search" in help_reply
     assert "/scan pokemon" in help_reply
     assert "/hunt status" in help_reply
+    assert "/translateja 你好，今天辛苦了" in help_reply
+    assert "/translatezh お疲れさま、今日は大変だったね" in help_reply
+
+
+def test_openclaw_registries_include_translate_commands() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    command_handlers, _, _, _ = _build_registries(settings, dynamic_tool_runner=None)
+    for command in ("/translateja", "/ja", "/jp", "/translatezh", "/zh"):
+        assert command in command_handlers
+
+
+def test_command_processor_handles_translate_aliases(monkeypatch) -> None:
+    settings = AssistantSettings(
+        openclaw_telegram_chat_id="123",
+        openclaw_local_text_backend="ollama",
+        openclaw_local_text_endpoint="http://127.0.0.1:11434",
+        openclaw_local_text_model="qwen3:14b",
+    )
+
+    def _fake_call_local_text_model(*, endpoint, model, prompt, timeout_seconds, ssl_context):
+        if "日文" in prompt:
+            return "こんにちは、今日はお疲れさまでした。"
+        return "你好，今天辛苦了。"
+
+    monkeypatch.setattr(
+        "openclaw_adapter.telegram_bot._call_local_text_model",
+        _fake_call_local_text_model,
+    )
+
+    command_handlers, _, _, _ = _build_registries(settings, dynamic_tool_runner=None)
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        command_handlers=command_handlers,
+    )
+
+    assert processor.build_reply(chat_id="123", text="/translateja 你好，今天辛苦了") == (
+        "こんにちは、今日はお疲れさまでした。"
+    )
+    assert processor.build_reply(chat_id="123", text="/ja 你好，今天辛苦了") == (
+        "こんにちは、今日はお疲れさまでした。"
+    )
+    assert processor.build_reply(chat_id="123", text="/translatezh お疲れさま") == "你好，今天辛苦了。"
+    assert processor.build_reply(chat_id="123", text="/zh お疲れさま") == "你好，今天辛苦了。"
 
 
 def test_command_processor_handles_hunt_status() -> None:
