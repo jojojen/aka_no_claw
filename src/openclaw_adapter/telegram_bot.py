@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import logging
 import os
+import json
 import shutil
 import threading
 import uuid
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 from pathlib import Path
 from typing import Callable
 
@@ -130,6 +133,9 @@ class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
         if allowed_chat_ids is None and settings is not None and settings.openclaw_telegram_chat_id:
             allowed_chat_ids = frozenset({settings.openclaw_telegram_chat_id})
         super().__init__(allowed_chat_ids=allowed_chat_ids, **kwargs)
+
+    def _help_text(self) -> str:
+        return _build_openclaw_help_text()
 
     def _build_youtube_like_song_plan(
         self,
@@ -263,6 +269,11 @@ _LLM_NOT_CONFIGURED_MESSAGE = (
     "請設定 OPENCLAW_LOCAL_TEXT_BACKEND=ollama 與 OPENCLAW_LOCAL_TEXT_MODEL。"
 )
 
+_TRANSLATE_NOT_CONFIGURED_MESSAGE = (
+    "翻譯功能尚未啟用。請設定 OPENCLAW_LOCAL_TEXT_BACKEND=ollama 與 "
+    "OPENCLAW_LOCAL_TEXT_MODEL。"
+)
+
 
 def default_web_research_renderer(settings: AssistantSettings) -> ResearchRenderer:
     backend = (settings.openclaw_local_text_backend or "").strip().lower()
@@ -343,6 +354,175 @@ def _select_text_generation_model(settings: AssistantSettings) -> str | None:
     if not settings.openclaw_local_text_model:
         return None
     return next((part.strip() for part in settings.openclaw_local_text_model.split(",") if part.strip()), None)
+
+
+def _build_openclaw_help_text() -> str:
+    return "\n".join(
+        [
+            "OpenClaw — 指令一覧",
+            "",
+            "--- 系統 ---",
+            "/ping  /status  /tools",
+            "",
+            "--- 價格查詢 ---",
+            "/price pokemon Pikachu ex",
+            "/price pokemon | Pikachu ex | 132/106 | SAR | sv08",
+            "/price ws | Hatsune Miku | PJS/S91-T51 | TD | pjs",
+            "/price ygo | 青眼の白龍 | QCCP-JP001 | UR",
+            "/price ua | 綾波レイ | UAPR/EVA-1-71",
+            "",
+            "--- 市場熱度 ---",
+            "/trend pokemon          # 熱銷榜（預設 10）",
+            "/trend ws 5             # 指定數量",
+            "/hot pokemon            # 同 /trend",
+            "/liquidity ws 5         # 流動性排名",
+            "",
+            "--- 商品快照／信譽查詢 ---",
+            "/snapshot https://jp.mercari.com/item/m123456789",
+            "",
+            "--- 網路搜尋 ---",
+            "/search 初音未來哪年發明的？",
+            "/fetch https://example.com 這篇文章的重點是什麼",
+            "",
+            "--- 圖片辨識 ---",
+            "傳圖片 + caption: /scan pokemon",
+            "",
+            "--- Mercari / Rakuma / 遊々亭 追蹤 ---",
+            "/watch 想いが重なる場所で 初音ミク SSP on 300000",
+            "/watch アビスアイ box on 8000 markets:rakuma",
+            "/watchlist",
+            "/unwatch <ID>",
+            "/setprice <ID> <新價格>",
+            "",
+            "--- SNS (X/Twitter) 監控 ---",
+            "/snsadd @username",
+            '/snsadd @username ["buy", "sell"]   # 加關鍵字過濾',
+            "/snsadd keyword:搜詞",
+            "/snsadd trend:trending",
+            "/snslist",
+            "/snsdelete <rule_id>",
+            "/snsbuzz amd            # Reddit 即時討論熱度",
+            "",
+            "--- JLPT 日文測驗 (Miku 歌詞) ---",
+            "/quiz                   # 出題選單",
+            "/quiz random            # 隨機出一題",
+            "/quiz wrong             # 錯題本",
+            "/quiz stats             # 各考點正確率分析",
+            "/quiz vocab             # 單字卡",
+            "/quiz review            # 查看近期作答",
+            "/quizlikesong <youtube_url>   # 收藏新歌並建立題庫",
+            "",
+            "--- 翻譯 ---",
+            "/translateja 你好，今天辛苦了",
+            "/ja 你好，今天辛苦了      # /translateja 短別名",
+            "/translatezh お疲れさま、今日は大変だったね",
+            "/zh お疲れさま、今日は大変だったね  # /translatezh 短別名",
+            "",
+            "--- 語音 ---",
+            "/voice <日文>            # 語音合成（AivisSpeech），預覽參數",
+            "/say <日文>              # 直接合成並傳送 WAV",
+            "",
+            "--- 知識庫 ---",
+            "/knowledge market       # 查詢市場知識（集換式卡牌）",
+            "/knowledge coding       # 查詢程式技術知識",
+            "",
+            "--- Opportunity Agent ---",
+            "/hunt                   # 目標清單",
+            "/hunt status            # 狀態 + 推薦紀錄",
+            "/hunt remove 2          # 移除目標 #2",
+            "/stats                  # 作答統計",
+            "",
+            "--- 動態自寫工具 ---",
+            "/new 幫我查0050今年以來到5月的年化報酬",
+            "",
+            "--- 資料備份／還原 ---",
+            "/backupclaw             # 備份到預設外接碟",
+            "/backupclaw /path/to/dir",
+            "/clawrecover            # 從預設外接碟還原",
+            "/clawrecover force      # 覆蓋現有資料庫",
+            "",
+            "--- 自然語言也可以 ---",
+            "pokemon 熱門前 5",
+            "幫我查 pokemon Pikachu ex 132/106",
+            "why are Pikachu Pokemon cards so popular?",
+        ]
+    )
+
+
+def _call_local_text_model(
+    *,
+    endpoint: str,
+    model: str,
+    prompt: str,
+    timeout_seconds: int,
+    ssl_context,
+) -> str:
+    request_payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "think": False,
+        "options": {"temperature": 0.2},
+    }
+    request = Request(
+        f"{endpoint.rstrip('/')}/api/generate",
+        data=json.dumps(request_payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=timeout_seconds, context=ssl_context) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+    except HTTPError as exc:
+        raise RuntimeError(f"翻譯 LLM HTTP {exc.code}.") from exc
+    except URLError as exc:
+        raise RuntimeError(f"翻譯 LLM request failed: {exc.reason}") from exc
+    payload = json.loads(raw)
+    result = payload.get("response", "")
+    if not isinstance(result, str):
+        raise RuntimeError(f"翻譯 LLM response type was {type(result).__name__}.")
+    return result.strip()
+
+
+def build_translate_handler(settings: AssistantSettings, *, target: str) -> Callable[[str, str], str]:
+    backend = (settings.openclaw_local_text_backend or "").strip().lower()
+    endpoint = settings.openclaw_local_text_endpoint
+    model = _select_text_generation_model(settings)
+    timeout = max(1, settings.openclaw_local_text_timeout_seconds)
+    ssl_ctx = build_ssl_context(settings) if endpoint.startswith("https://") else None
+    target = target.strip().lower()
+    if target == "ja":
+        usage = "用法：/translateja <要翻成日文的文字>"
+        instruction = (
+            "將下列文字翻譯成自然、通順的日文。"
+            "只輸出譯文，不要解說，不要加引號，不要加前綴。"
+            "保留 URL、專有名詞、產品名；必要時只做最自然的日文化。"
+        )
+    else:
+        usage = "用法：/translatezh <要翻成繁體中文的文字>"
+        instruction = (
+            "將下列文字翻譯成自然、通順的繁體中文（台灣用語）。"
+            "只輸出譯文，不要解說，不要加引號，不要加前綴。"
+            "保留 URL、專有名詞、產品名。"
+        )
+
+    def handler(remainder: str, chat_id: str) -> str:
+        text = (remainder or "").strip()
+        if not text:
+            return usage
+        if backend != "ollama" or not endpoint or not model:
+            return _TRANSLATE_NOT_CONFIGURED_MESSAGE
+        prompt = f"{instruction}\n\n原文：\n{text}\n\n譯文："
+        translated = _call_local_text_model(
+            endpoint=endpoint,
+            model=model,
+            prompt=prompt,
+            timeout_seconds=timeout,
+            ssl_context=ssl_ctx,
+        ).strip()
+        return translated or "本地模型沒有回傳可用譯文。"
+
+    return handler
 
 
 def render_reputation_snapshot_artifacts(
@@ -521,6 +701,31 @@ def _build_registries(
         "/voice": RegisteredCommand(build_voice_handler(settings)),
         "/say": RegisteredCommand(
             build_say_handler(settings), ack="收到，正在合成語音…", background=True
+        ),
+        "/translateja": RegisteredCommand(
+            build_translate_handler(settings, target="ja"),
+            ack="收到，正在翻譯成日文…",
+            background=True,
+        ),
+        "/ja": RegisteredCommand(
+            build_translate_handler(settings, target="ja"),
+            ack="收到，正在翻譯成日文…",
+            background=True,
+        ),
+        "/jp": RegisteredCommand(
+            build_translate_handler(settings, target="ja"),
+            ack="收到，正在翻譯成日文…",
+            background=True,
+        ),
+        "/translatezh": RegisteredCommand(
+            build_translate_handler(settings, target="zh"),
+            ack="收到，正在翻譯成繁體中文…",
+            background=True,
+        ),
+        "/zh": RegisteredCommand(
+            build_translate_handler(settings, target="zh"),
+            ack="收到，正在翻譯成繁體中文…",
+            background=True,
         ),
         "/new": RegisteredCommand(
             _new_handler,
