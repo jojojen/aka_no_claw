@@ -5,9 +5,12 @@ The Ollama client and the venv python are faked so these run fast and offline.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
+from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -54,7 +57,9 @@ class FakeClient:
                  validate_responses: list | None = None,
                  feasibility_response: str | Exception = "FEASIBLE",
                  rule_select_response: str | Exception = "NONE",
-                 ground_response: str | Exception = "NONE"):
+                 ground_response: str | Exception = "NONE",
+                 searchq_response: str | Exception = "stub-query",
+                 needs_search_response: str | Exception = "NO"):
         self._code = list(code_responses)
         self._pick = pick_response
         self._distill = distill_response
@@ -67,11 +72,13 @@ class FakeClient:
         self._feasibility = feasibility_response
         self._rule_select = rule_select_response
         self._ground = ground_response
+        self._searchq = searchq_response
+        self._needs_search = needs_search_response
         # Default: declare no external API needed so exploration is a no-op in tests.
         self._explorer = explorer_response if explorer_response is not None else 'print("NO_EXTERNAL_API")'
         self.calls = {"pick": 0, "code": 0, "repair": 0, "distill": 0, "explore": 0,
                       "params": 0, "present": 0, "split": 0, "validate": 0, "feasibility": 0,
-                      "select": 0, "ground": 0}
+                      "select": 0, "ground": 0, "searchq": 0, "needs_search": 0}
         self.repair_prompts: list[str] = []
         self.code_prompts: list[str] = []
         self.timeout_seconds = 420
@@ -94,11 +101,27 @@ class FakeClient:
             return self._feasibility + "\n" + self._rule_select
         if "直接相關的公式" in prompt:
             # Reference-page grounding extraction (only fires when a selected
-            # rule cites a 參考: URL and the fetch succeeded).
+            # rule cites a 參考: URL and the fetch succeeded). Distillation is
+            # one call per page; a list response is consumed in order.
             self.calls["ground"] += 1
             if isinstance(self._ground, Exception):
                 raise self._ground
+            if isinstance(self._ground, list):
+                return self._ground.pop(0)
             return self._ground
+        if "機構公告型事實數值" in prompt:
+            # Gate: do successful rule references still lack a current
+            # institution-announced value? Default NO keeps old tests offline.
+            self.calls["needs_search"] += 1
+            if isinstance(self._needs_search, Exception):
+                raise self._needs_search
+            return self._needs_search
+        if "網頁搜尋查詢" in prompt:
+            # Search-grounding query reformulation (fallback when no rule URL).
+            self.calls["searchq"] += 1
+            if isinstance(self._searchq, Exception):
+                raise self._searchq
+            return self._searchq
         if "是否合理回應" in prompt:
             self.calls["validate"] += 1
             if not self._validate:
@@ -195,6 +218,27 @@ def test_repair_exhausts_and_fails(tmp_path):
     assert client.timeout_seconds == 420
     # num_ctx must stay constant across every tier (changing it forces a reload).
     assert set(client.num_ctx_seen) == {8192}
+
+
+def test_blocked_package_feeds_repair_instead_of_crashing(tmp_path):
+    # A script declaring an unapproved package must NOT crash /new — the pip
+    # refusal becomes an exec failure that the repair loop fixes (rewrite with
+    # stdlib), so the run still succeeds.
+    blocked_script = "# requires: scipy\n" + GOOD_SCRIPT
+    client = FakeClient(code_responses=[blocked_script, GOOD_SCRIPT])
+    runner = _make_runner(tmp_path, client)
+
+    def strict_pip(packages):
+        if "scipy" in packages:
+            raise RuntimeError("⛔ /new: 以下套件不在核准清單，已拒絕安裝：scipy")
+
+    runner._pip_install = strict_pip  # type: ignore[assignment]
+    res = runner.run_detailed("需要被擋下的套件")
+    assert res.ok
+    assert res.generations == 2
+    assert client.calls["repair"] == 1
+    assert "核准清單" in client.repair_prompts[0]
+    assert "標準函式庫" in client.repair_prompts[0]
 
 
 def test_cascade_escalates_fast_model_to_strong(tmp_path):
@@ -497,6 +541,63 @@ def test_llm_rule_selector_none_excludes_topical(tmp_path):
     assert client.calls["explore"] == 1
 
 
+def test_requires_maps_import_name_to_pip_name(tmp_path):
+    # `# requires: dateutil` names the import, but the pip distribution is
+    # python-dateutil (approved); installing the raw module name got an
+    # approved package blocked in live runs.
+    client = FakeClient(code_responses=[])
+    runner = _make_runner(tmp_path, client)
+    assert runner._parse_requires("# requires: dateutil, bs4\nx=1") == (
+        "python-dateutil", "beautifulsoup4")
+
+
+def test_distill_per_text_drops_irrelevant_page(tmp_path):
+    # Pages are distilled one call each (a joined prompt can overflow num_ctx,
+    # Ollama head-truncates it and the instructions silently vanish → NONE).
+    # A wrong-metric page answering NONE is dropped; the relevant one stays.
+    client = FakeClient(
+        code_responses=[],
+        ground_response=["NONE\n（不同指標，不相關）", "現行值 0.75%（自2026-06）"],
+    )
+    runner = _make_runner(tmp_path, client)
+    out = runner._distill_reference_texts(
+        "日銀政策金利", ["prime-rate junk page", "boj policy rate page"])
+    assert out == "現行值 0.75%（自2026-06）"
+    assert client.calls["ground"] == 2
+    # The per-call num_ctx bump must not leak past the distiller.
+    assert client.num_ctx == 8192
+
+
+def test_keyword_floor_merges_unpicked_topical(tmp_path):
+    # The preflight listing re-orders between runs, so the LLM's pick is
+    # unstable. A topical rule whose declared keyword appears verbatim in the
+    # request must reach the prompt even when the LLM didn't pick it.
+    db = _make_rule_db(tmp_path)
+    db.upsert_codegen_knowledge(
+        category="numeric_method", title="極值掃描守則",
+        technique="極值掃描要在更新當下記錄構成點",
+        keywords=("回撤", "極值"), origin="seed", confidence=0.9,
+    )
+    client = FakeClient(code_responses=[GOOD_SCRIPT], rule_select_response="1")
+    runner = _make_runner(tmp_path, client, db=db)
+    res = runner.run_detailed("算股票今年的最大回撤")
+    assert res.ok
+    prompt = client.code_prompts[0]
+    assert "Yahoo chart API" in prompt          # LLM-picked rule (#1)
+    assert "極值掃描要在更新當下記錄構成點" in prompt  # keyword floor
+
+
+def test_keyword_floor_respects_llm_none(tmp_path):
+    # Floor only augments a non-empty LLM pick; an explicit NONE verdict
+    # stays authoritative even when keywords match.
+    db = _make_rule_db(tmp_path)
+    client = FakeClient(code_responses=[GOOD_SCRIPT], rule_select_response="NONE")
+    runner = _make_runner(tmp_path, client, db=db)
+    res = runner.run_detailed("算股票報酬")
+    assert res.ok
+    assert "Yahoo chart API" not in client.code_prompts[0]
+
+
 def test_llm_rule_selector_error_falls_back_to_keyword(tmp_path):
     # Selector LLM call dies → keyword-scored retrieval takes over, so a
     # keyword-matching request still gets the topical recipe.
@@ -563,6 +664,174 @@ def test_reference_grounding_irrelevant_extract_omits_block(tmp_path):
     assert res.ok
     assert client.calls["ground"] == 1
     assert "參考資料" not in client.code_prompts[0]
+
+
+def test_search_grounding_injects_block_and_burns_budget(tmp_path):
+    # No rule cites a 參考 URL → fallback: ONE web search (stubbed) → page
+    # fetch → distillation → 參考資料 block with source URLs; budget counted.
+    client = FakeClient(code_responses=[GOOD_SCRIPT],
+                        ground_response="- 政策金利 0.75%（2026-01 起）",
+                        searchq_response="日銀 政策金利 現在")
+    runner = _make_runner(tmp_path, client)
+    searched: list[tuple[str, int]] = []
+    runner.search_fn = lambda q, n: searched.append((q, n)) or [
+        SimpleNamespace(url="https://example.jp/boj")]
+    runner._fetch_url_text = lambda url: "boj rate page"  # type: ignore[assignment]
+    res = runner.run_detailed("以日銀現行政策金利算100萬日圓10年複利")
+    assert res.ok
+    assert searched == [("日銀 政策金利 現在", 4)]
+    assert client.calls["searchq"] == 1
+    assert client.calls["ground"] == 1
+    assert "參考資料" in client.code_prompts[0]
+    assert "政策金利 0.75%" in client.code_prompts[0]
+    assert "https://example.jp/boj" in client.code_prompts[0]
+    state = json.loads((tmp_path / "generated_tools" / "search_state.json").read_text(encoding="utf-8"))
+    assert state["count"] == 1
+    assert "以日銀現行政策金利算100萬日圓10年複利" in state["cache"]
+
+
+def test_search_grounding_cache_hit_skips_search(tmp_path):
+    # Same request later the same day → cached block reused, zero new queries.
+    request = "以日銀現行政策金利算100萬日圓10年複利"
+    state_path = tmp_path / "generated_tools" / "search_state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps({
+        "date": date.today().isoformat(), "count": 3,
+        "cache": {request: "- 政策金利 0.75%\n來源:\nhttps://example.jp/boj"},
+    }), encoding="utf-8")
+    client = FakeClient(code_responses=[GOOD_SCRIPT])
+    runner = _make_runner(tmp_path, client)
+
+    def no_search(q, n):
+        raise AssertionError("search must not fire on cache hit")
+
+    runner.search_fn = no_search
+    res = runner.run_detailed(request)
+    assert res.ok
+    assert client.calls["searchq"] == 0
+    assert "政策金利 0.75%" in client.code_prompts[0]
+    assert json.loads(state_path.read_text(encoding="utf-8"))["count"] == 3
+
+
+def test_search_grounding_skips_engine_internal_and_pdf_urls(tmp_path):
+    # Engine-internal links and PDFs (HTML-only extractor) must not consume the
+    # 2-page fetch budget; the real article behind them gets fetched instead.
+    client = FakeClient(code_responses=[GOOD_SCRIPT],
+                        ground_response="- 現行 0.75%（自2026-01）")
+    runner = _make_runner(tmp_path, client)
+    runner.search_fn = lambda q, n: [
+        SimpleNamespace(url="https://www.boj.or.jp/press/speech.pdf"),
+        SimpleNamespace(url="https://search.yahoo.co.jp/image/search?p=rate"),
+        SimpleNamespace(url="https://news.example.jp/boj-rate"),
+    ]
+    fetched: list[str] = []
+    runner._fetch_url_text = (  # type: ignore[assignment]
+        lambda url: fetched.append(url) or "article text")
+    res = runner.run_detailed("以日銀現行政策金利算複利")
+    assert res.ok
+    assert fetched == ["https://news.example.jp/boj-rate"]
+    assert "https://news.example.jp/boj-rate" in client.code_prompts[0]
+
+
+def test_search_grounding_cache_stores_raw_texts_and_redistills(tmp_path):
+    # New-format cache keeps the raw page texts; a later run re-distills them
+    # (so distill prompt fixes apply) without touching the search backend.
+    request = "以日銀現行政策金利算100萬日圓10年複利"
+    state_path = tmp_path / "generated_tools" / "search_state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps({
+        "date": date.today().isoformat(), "count": 2,
+        "cache": {request: {"texts": ["boj rate page"],
+                            "sources": ["https://example.jp/boj"]}},
+    }), encoding="utf-8")
+    client = FakeClient(code_responses=[GOOD_SCRIPT],
+                        ground_response="- 現行 0.75%（自2026-01）；另有檢討中的 1%，尚未生效")
+    runner = _make_runner(tmp_path, client)
+
+    def no_search(q, n):
+        raise AssertionError("search must not fire on cache hit")
+
+    runner.search_fn = no_search
+    res = runner.run_detailed(request)
+    assert res.ok
+    assert client.calls["searchq"] == 0
+    assert client.calls["ground"] == 1  # re-distilled from cached raw text
+    assert "現行 0.75%" in client.code_prompts[0]
+    assert "https://example.jp/boj" in client.code_prompts[0]
+    assert json.loads(state_path.read_text(encoding="utf-8"))["count"] == 2
+
+
+def test_search_grounding_budget_exhausted_skips(tmp_path):
+    # Daily cap reached → no reformulation, no search, codegen proceeds bare.
+    state_path = tmp_path / "generated_tools" / "search_state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps({
+        "date": date.today().isoformat(), "count": 4, "cache": {}}), encoding="utf-8")
+    client = FakeClient(code_responses=[GOOD_SCRIPT])
+    runner = _make_runner(tmp_path, client)
+    searched: list[str] = []
+    runner.search_fn = lambda q, n: searched.append(q) or []
+    res = runner.run_detailed("需要新知識的需求")
+    assert res.ok
+    assert searched == []
+    assert client.calls["searchq"] == 0
+    assert "參考資料" not in client.code_prompts[0]
+    assert json.loads(state_path.read_text(encoding="utf-8"))["count"] == 4
+
+
+def test_search_grounding_failure_fails_open_but_burns_budget(tmp_path):
+    # Backend blows up mid-search → /new continues without grounding, and the
+    # query still counts against the budget (it may have reached Yahoo).
+    client = FakeClient(code_responses=[GOOD_SCRIPT])
+    runner = _make_runner(tmp_path, client)
+
+    def boom(q, n):
+        raise RuntimeError("yahoo down")
+
+    runner.search_fn = boom
+    res = runner.run_detailed("需要新知識的需求")
+    assert res.ok
+    assert "參考資料" not in client.code_prompts[0]
+    state = json.loads((tmp_path / "generated_tools" / "search_state.json").read_text(encoding="utf-8"))
+    assert state["count"] == 1
+
+
+def test_rule_grounding_plus_search_when_current_fact_missing(tmp_path):
+    # Rule grounding succeeded with a generic formula page, but the request
+    # hinges on a current announced value (policy rate) the page doesn't have
+    # → the gate says YES → search grounding APPENDS to the rule references.
+    client = FakeClient(code_responses=[GOOD_SCRIPT], rule_select_response="1",
+                        ground_response="- 複利公式 FV=PV*(1+r)^n",
+                        needs_search_response="YES（缺現行政策金利）",
+                        searchq_response="日銀 政策金利 現在")
+    runner = _make_runner(tmp_path, client, db=_make_ref_rule_db(tmp_path))
+    runner.search_fn = lambda q, n: [SimpleNamespace(url="https://example.jp/boj")]
+    runner._fetch_url_text = lambda url: "page text"  # type: ignore[assignment]
+    res = runner.run_detailed("以日銀現行政策金利算100萬日圓10年複利的股票替代報酬")
+    assert res.ok
+    assert client.calls["needs_search"] == 1
+    assert client.calls["searchq"] == 1
+    assert client.calls["ground"] == 2  # rule distill + search distill
+    assert "複利公式 FV=PV*(1+r)^n" in client.code_prompts[0]
+    assert "https://example.jp/boj" in client.code_prompts[0]
+
+
+def test_rule_grounding_gate_no_skips_search(tmp_path):
+    # Gate says NO (references suffice) → search backend never touched.
+    client = FakeClient(code_responses=[GOOD_SCRIPT], rule_select_response="1",
+                        ground_response="- YTD 基期為去年最後交易日收盤")
+    runner = _make_runner(tmp_path, client, db=_make_ref_rule_db(tmp_path))
+
+    def no_search(q, n):
+        raise AssertionError("search must not fire when gate says NO")
+
+    runner.search_fn = no_search
+    runner._fetch_url_text = lambda url: "rate page"  # type: ignore[assignment]
+    res = runner.run_detailed("0050 今年以來報酬率")
+    assert res.ok
+    assert client.calls["needs_search"] == 1
+    assert client.calls["searchq"] == 0
+    assert "YTD 基期為去年最後交易日收盤" in client.code_prompts[0]
 
 
 def test_presentation_applies_when_intent_split_yields_format(tmp_path):
