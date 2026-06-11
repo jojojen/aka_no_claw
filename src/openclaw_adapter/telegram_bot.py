@@ -684,7 +684,10 @@ def _build_registries(
     backup_handler = build_backup_handler(settings)
     recover_handler = build_recover_handler(settings)
     scorecard_handler = build_scorecard_handler(settings)
-    research_handler = build_research_handler(notifier_factory=research_notifier_factory)
+    research_handler = build_research_handler(
+        notifier_factory=research_notifier_factory,
+        knowledge_db_path=settings.knowledge_db_path,
+    )
 
     def _quizlikesong_handler(remainder: str, chat_id: str):
         return quiz_handler("like song " + (remainder or "").strip(), chat_id)
