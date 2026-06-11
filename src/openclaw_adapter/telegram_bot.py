@@ -833,19 +833,41 @@ def _bootstrap_opportunity_inbox(settings):
 
 
 def _start_backup_scheduler(settings) -> None:
-    """Start the periodic auto-backup daemon (every 6 h, 5 min initial delay)."""
+    """Start the daily auto-backup daemon (fires at 23:00 local time)."""
     data_dir = Path(settings.monitor_db_path).resolve().parent
     project_root = data_dir.parent
     generated_tools_dir = project_root / "generated_tools"
     dest = Path(settings.openclaw_backup_dir)
-    interval_hours = getattr(settings, "openclaw_backup_interval_hours", 24)
+    hour = getattr(settings, "openclaw_backup_hour", 23)
     scheduler = BackupScheduler(
         data_dir=data_dir,
         generated_tools_dir=generated_tools_dir if generated_tools_dir.is_dir() else None,
         dest=dest,
-        interval_seconds=interval_hours * 3600.0,
+        hour=hour,
+        notify=_build_backup_notify(settings),
     )
     scheduler.start()
+
+
+def _build_backup_notify(settings):
+    """Telegram send callback for scheduled-backup reports; None → log-only."""
+    chat_ids = tuple(cid for cid in settings.openclaw_telegram_chat_ids if cid)
+    if not chat_ids:
+        logger.warning("_build_backup_notify: no chat_ids configured — backup runs silent")
+        return None
+    try:
+        from price_monitor_bot.bot import TelegramBotClient
+        token = require_telegram_token(settings)
+        client = TelegramBotClient(token, ssl_context=build_ssl_context(settings))
+    except Exception:
+        logger.exception("_build_backup_notify: notify client unavailable — backup runs silent")
+        return None
+
+    def _notify(text: str) -> None:
+        for chat_id in chat_ids:
+            client.send_message(chat_id=chat_id, text=text)
+
+    return _notify
 
 
 def _start_card_image_crawler(watch_db: MonitorDatabase):

@@ -9,6 +9,8 @@ the code; this backup carries the *state* that lives outside it:
   - SNS tracked accounts + tweet/discovery preferences (sns.sqlite3)
   - opportunity targets + product preferences (opportunities.sqlite3)
   - collaboration outcomes / backfill + any other data/*.sqlite3
+  - non-DB data assets in data/ (curated JSON lists like proseka_songs.json,
+    quiz_song_packs/, ...) — anything that isn't a DB sidecar or .bak snapshot
   - a SPEC of the tools learned via /new — the original natural-language
     requests, NOT the generated code (the code + per-tool venvs are pure
     regenerable bloat; re-feeding each request to /new rebuilds the tool).
@@ -33,7 +35,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -42,6 +44,26 @@ DEFAULT_BACKUP_DIR = "/Volumes/JEN_SSD/claw_data"
 
 # SQLite sidecar / snapshot files we never copy verbatim.
 _DB_SUFFIXES = (".sqlite3", ".db")
+_SIDECAR_ENDINGS = ("-wal", "-shm", "-journal")
+# Subdirectory names whose contents are soft caches regenerable from a DB.
+_CACHE_DIRS: frozenset[str] = frozenset({"quiz_song_packs"})
+
+# Human-readable Chinese labels for each known DB file.
+_DB_LABELS: dict[str, str] = {
+    "knowledge.sqlite3":        "/new 代碼技巧 RAG",
+    "knowledge_inbox.sqlite3":  "/new 知識待入庫佇列",
+    "monitor.sqlite3":          "商品監控 + 自選清單",
+    "watch_inbox.sqlite3":      "自選清單寫入佇列",
+    "sns.sqlite3":              "SNS 追蹤帳號 + 推文",
+    "sns_inbox.sqlite3":        "SNS 寫入佇列",
+    "opportunities.sqlite3":    "機會追蹤清單",
+    "opportunity_inbox.sqlite3": "機會寫入佇列",
+    "quiz.sqlite3":             "日文測驗題庫 + 出題技巧 RAG",
+    "quiz.db":                  "日文測驗（舊格式，空）",
+    "collab_backfill.sqlite3":  "協作 backfill 紀錄",
+    "collab_outcomes.sqlite3":  "協作成果紀錄",
+    "test-image-lookup.sqlite3": "商品圖感知雜湊快取",
+}
 
 
 @dataclass(slots=True)
@@ -56,6 +78,7 @@ class BackupReport:
     dest: str
     started_at: str
     databases: list[BackupItem] = field(default_factory=list)
+    assets: list[BackupItem] = field(default_factory=list)
     tools_spec_count: int = 0
     tools_spec_path: str | None = None
     errors: list[str] = field(default_factory=list)
@@ -63,6 +86,10 @@ class BackupReport:
     @property
     def total_db_bytes(self) -> int:
         return sum(item.bytes for item in self.databases if item.bytes > 0)
+
+    @property
+    def total_asset_bytes(self) -> int:
+        return sum(item.bytes for item in self.assets if item.bytes > 0)
 
 
 def _is_live_db(path: Path) -> bool:
@@ -76,6 +103,28 @@ def _is_live_db(path: Path) -> bool:
     # data/monitor.sqlite3.bak_... has suffix ".bak_..." -> suffix not in set,
     # but be defensive about any ".bak" anywhere in the name.
     return ".bak" not in path.name
+
+
+def _is_data_asset(path: Path, data_dir: Path) -> bool:
+    """True for a non-DB data file worth backing up (curated JSON lists, ...).
+
+    Excludes soft caches whose contents are regenerable from a live DB
+    (e.g. quiz_song_packs — rebuilt by build_song_candidate_pack()).
+    """
+    if path.name.startswith("."):
+        return False
+    if ".bak" in path.name:
+        return False
+    if path.suffix in _DB_SUFFIXES:
+        return False
+    if path.name.endswith(_SIDECAR_ENDINGS):
+        return False
+    # Exclude any file that lives inside a known cache subdirectory.
+    try:
+        parts = path.relative_to(data_dir).parts
+    except ValueError:
+        parts = ()
+    return not any(p in _CACHE_DIRS for p in parts)
 
 
 def _backup_sqlite(src: Path, dst: Path) -> int:
@@ -190,6 +239,23 @@ def run_backup(
     else:
         report.errors.append(f"data dir not found: {data_dir}")
 
+    # 1b) Non-DB data assets (curated JSON lists, ...; regenerable caches excluded).
+    if data_dir.is_dir():
+        for asset in sorted(p for p in data_dir.rglob("*") if p.is_file()):
+            if not _is_data_asset(asset, data_dir):
+                continue
+            rel = asset.relative_to(data_dir)
+            target = dest_data / rel
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(asset, target)
+                report.assets.append(
+                    BackupItem(str(rel), target.stat().st_size, "copied")
+                )
+            except OSError as exc:
+                report.assets.append(BackupItem(str(rel), -1, f"error: {exc}"))
+                report.errors.append(f"{rel}: {exc}")
+
     # 2) SPEC of /new-learned tools (request only, no code — code is regenerable).
     if generated_tools_dir is not None and generated_tools_dir.is_dir():
         spec_path = dest / "generated_tools_spec.md"
@@ -207,6 +273,10 @@ def run_backup(
         "databases": [
             {"name": i.name, "bytes": i.bytes, "status": i.status}
             for i in report.databases
+        ],
+        "assets": [
+            {"name": i.name, "bytes": i.bytes, "status": i.status}
+            for i in report.assets
         ],
         "tools_spec_count": report.tools_spec_count,
         "tools_spec_path": report.tools_spec_path,
@@ -244,7 +314,18 @@ def _format_report(report: BackupReport) -> str:
     for item in report.databases:
         mark = "•" if not item.status.startswith("error") else "⚠️"
         size = _human_bytes(item.bytes) if item.bytes >= 0 else "失敗"
-        lines.append(f"  {mark} {item.name} ({size})")
+        label = _DB_LABELS.get(item.name, "")
+        hint = f" — {label}" if label else ""
+        lines.append(f"  {mark} {item.name}{hint} ({size})")
+    if report.assets:
+        ok_assets = [i for i in report.assets if not i.status.startswith("error")]
+        lines.append(
+            f"資料檔 {len(ok_assets)} 個（{_human_bytes(report.total_asset_bytes)}）："
+        )
+        for item in report.assets:
+            mark = "•" if not item.status.startswith("error") else "⚠️"
+            size = _human_bytes(item.bytes) if item.bytes >= 0 else "失敗"
+            lines.append(f"  {mark} {item.name} ({size})")
     if report.tools_spec_count:
         lines.append(
             f"自學工具規格：{report.tools_spec_count} 個工具的需求已寫入 "
@@ -260,12 +341,22 @@ def _format_report(report: BackupReport) -> str:
     return "\n".join(lines)
 
 
+def _seconds_until_next(hour: int) -> float:
+    """Seconds from now until the next occurrence of *hour*:00 local time."""
+    now = datetime.now()
+    target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return (target - now).total_seconds()
+
+
 class BackupScheduler:
-    """Daemon thread that runs :func:`run_backup` at a fixed interval.
+    """Daemon thread that runs :func:`run_backup` daily at *hour*:00 local time.
 
     Checks whether the backup destination's parent directory is mounted before
     each run. If it's absent (e.g. the SSD is unplugged), logs a warning and
-    skips — no silent failure.
+    skips — no silent failure. When a ``notify`` callback is provided, each run
+    reports its outcome (success summary / skip / failure) through it.
     """
 
     def __init__(
@@ -274,14 +365,14 @@ class BackupScheduler:
         data_dir: Path,
         generated_tools_dir: Path | None,
         dest: Path,
-        interval_seconds: float = 24.0 * 3600,
-        initial_delay_seconds: float = 300.0,
+        hour: int = 23,
+        notify: Callable[[str], None] | None = None,
     ) -> None:
         self._data_dir = data_dir
         self._generated_tools_dir = generated_tools_dir
         self._dest = dest
-        self._interval = interval_seconds
-        self._initial_delay = initial_delay_seconds
+        self._hour = hour
+        self._notify = notify
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
@@ -292,15 +383,25 @@ class BackupScheduler:
         )
         self._thread.start()
         logger.info(
-            "BackupScheduler started dest=%s interval=%.0fh initial_delay=%.0fs",
-            self._dest, self._interval / 3600, self._initial_delay,
+            "BackupScheduler started dest=%s — fires daily at %02d:00 "
+            "(first in %.0f min)",
+            self._dest, self._hour, _seconds_until_next(self._hour) / 60,
         )
 
     def _loop(self) -> None:
-        time.sleep(self._initial_delay)
         while True:
+            time.sleep(_seconds_until_next(self._hour))
             self._run_once()
-            time.sleep(self._interval)
+            # Guard against double-firing within the same minute.
+            time.sleep(23 * 3600)
+
+    def _send_notify(self, text: str) -> None:
+        if self._notify is None:
+            return
+        try:
+            self._notify(text)
+        except Exception:
+            logger.exception("BackupScheduler: notify failed")
 
     def _run_once(self) -> None:
         if not self._dest.parent.exists():
@@ -308,6 +409,10 @@ class BackupScheduler:
                 "BackupScheduler: backup destination parent not mounted — skipping "
                 "(dest=%s). Plug in the SSD or set OPENCLAW_BACKUP_DIR.",
                 self._dest,
+            )
+            self._send_notify(
+                f"⚠️ 龍蝦排程備份略過：外接 SSD 未掛載（{self._dest}）。"
+                "插回 SSD 後明天 23:00 會自動補跑。"
             )
             return
         try:
@@ -327,8 +432,11 @@ class BackupScheduler:
                     self._dest, len(report.databases),
                     _human_bytes(report.total_db_bytes),
                 )
-        except Exception:
+            if self._notify is not None:
+                self._send_notify(_format_report(report))
+        except Exception as exc:
             logger.exception("BackupScheduler: backup failed dest=%s", self._dest)
+            self._send_notify(f"❌ 龍蝦排程備份失敗：{exc}")
 
 
 def build_backup_handler(settings) -> Callable[[str], str]:
@@ -373,6 +481,7 @@ class RecoverReport:
     source: str
     started_at: str
     databases: list[BackupItem] = field(default_factory=list)
+    assets: list[BackupItem] = field(default_factory=list)
     spec_restored: bool = False
     skipped_existing: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
@@ -418,6 +527,24 @@ def run_recover(
             report.databases.append(BackupItem(db_path.name, -1, f"error: {exc}"))
             report.errors.append(f"{db_path.name}: {exc}")
 
+    for asset in sorted(p for p in src_data.rglob("*") if p.is_file()):
+        if not _is_data_asset(asset, src_data):
+            continue
+        rel = asset.relative_to(src_data)
+        target = data_dir / rel
+        if target.exists() and target.stat().st_size > 0 and not force:
+            report.skipped_existing.append(str(rel))
+            continue
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(asset, target)
+            report.assets.append(
+                BackupItem(str(rel), target.stat().st_size, "restored")
+            )
+        except OSError as exc:
+            report.assets.append(BackupItem(str(rel), -1, f"error: {exc}"))
+            report.errors.append(f"{rel}: {exc}")
+
     spec_src = source / "generated_tools_spec.md"
     if spec_src.is_file():
         try:
@@ -441,6 +568,16 @@ def _format_recover_report(report: RecoverReport, *, default_source: str) -> str
     if restored:
         lines.append(f"已還原資料庫 {len(restored)} 個（{_human_bytes(sum(i.bytes for i in restored))}）：")
         for item in report.databases:
+            mark = "•" if item.status == "restored" else "⚠️"
+            size = _human_bytes(item.bytes) if item.bytes >= 0 else "失敗"
+            lines.append(f"  {mark} {item.name} ({size})")
+    restored_assets = [i for i in report.assets if i.status == "restored"]
+    if restored_assets:
+        lines.append(
+            f"已還原資料檔 {len(restored_assets)} 個"
+            f"（{_human_bytes(sum(i.bytes for i in restored_assets))}）："
+        )
+        for item in report.assets:
             mark = "•" if item.status == "restored" else "⚠️"
             size = _human_bytes(item.bytes) if item.bytes >= 0 else "失敗"
             lines.append(f"  {mark} {item.name} ({size})")
