@@ -446,6 +446,41 @@ class TestVocabCards:
             source_excerpt_type="lyric",
         ) == "矛盾を抱えて生きてくなんて怒られてしまう。"
 
+    def test_source_excerpt_example_splits_japanese_sentences_without_spaces(self):
+        excerpt = (
+            "何度も辞めたい、逃げたいと思うけれど、心のどこかでは明日と自分に期待している。"
+            "今は葛藤ばかりの主人公ですが、昔は大きな夢があった様子。"
+            "その時の思いや夢を大切にしまっているからこそ、人生を簡単に諦めることはできない。"
+        )
+        assert source_excerpt_vocab_example(
+            headword="葛藤",
+            source_excerpt=excerpt,
+            source_excerpt_type="article",
+        ) == "今は葛藤ばかりの主人公ですが、昔は大きな夢があった様子。"
+
+    def test_source_excerpt_example_extracts_short_window_from_lyric_blob(self):
+        excerpt = (
+            "【文章A】きっかけは自分だったのです 傷を付けてしまったのです 放っておけば自然消滅 "
+            "でも 痛みがいちいち主張してくるよ 【文章B】別の歌詞が続く"
+        )
+        got = source_excerpt_vocab_example(
+            headword="自然消滅",
+            source_excerpt=excerpt,
+            source_excerpt_type="lyric",
+        )
+        assert got is not None
+        assert "自然消滅" in got
+        assert len(got) <= 70
+
+    def test_source_excerpt_example_caps_selected_example_to_three_sentences(self):
+        excerpt = "葛藤だ。葛藤だよ。葛藤なんだ。葛藤かもしれない。"
+        got = source_excerpt_vocab_example(
+            headword="葛藤",
+            source_excerpt=excerpt,
+            source_excerpt_type="article",
+        )
+        assert got in {"葛藤だ。", "葛藤だよ。", "葛藤なんだ。", "葛藤かもしれない。"}
+
     def test_backfill_skips_no_example_question_and_keeps_example_author(self, tmp_path):
         # An article question (yields no card example) must not sink the card
         # when a lyric question for the same headword yields a real example.
