@@ -37,6 +37,7 @@ from datetime import date, datetime, timezone
 from hashlib import sha1
 from pathlib import Path
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 logger = logging.getLogger(__name__)
@@ -292,6 +293,13 @@ class DynamicToolRunner:
         self._last_meta: dict | None = None
         # Raw text of fetched `參考:` pages, keyed by URL (per-process politeness cache).
         self._reference_cache: dict[str, str] = {}
+        # Search-grounding fallback reuses /search's Yahoo backend; injectable for
+        # tests. Hard budget: the user's IP must never get banned, so at most
+        # search_daily_cap queries/day, persisted in search_state_path (which
+        # also caches distilled results so re-runs cost zero queries).
+        self.search_fn = None  # (query, max_results) -> Sequence[WebSearchResult]
+        self.search_daily_cap = 4
+        self.search_state_path = Path(tools_dir) / "search_state.json"
         self.tools_dir.mkdir(parents=True, exist_ok=True)
 
     # ── public ──────────────────────────────────────────────────────────────
@@ -343,10 +351,12 @@ class DynamicToolRunner:
         the core lets reuse-matching, slug, and codegen see only the data need."""
         prompt = (
             "把下面的需求拆成兩部分，只輸出一個 JSON 物件：\n"
-            '{"core": "<要查什麼資料的精簡描述，去掉任何排版/格式/範例指示>", '
+            '{"core": "<要查什麼資料、要做什麼計算的精簡描述，去掉任何排版/格式/範例指示>", '
             '"format": "<使用者指定的輸出格式或範例原文；沒有就空字串>"}\n'
-            "規則：core 只保留『要查的資料種類與標的』（例如城市、股票、日期），"
-            "不可包含任何『格式如下』『版型』『emoji 範例』等排版指示；"
+            "規則：core 必須完整保留『要查的資料種類與標的』（例如城市、股票、日期）"
+            "以及『要做的計算與其全部條件』（例如複利、本金、年數、百分比口徑）——"
+            "計算需求屬於 core，絕不可被刪掉或移進 format；"
+            "core 不可包含任何『格式如下』『版型』『emoji 範例』等排版指示；"
             "format 原樣保留使用者貼的版型/範例文字（含 emoji 與欄位），沒有就給空字串。\n"
             "⚠️ 最重要：『格式範例』裡出現的地名／數字／日期只是版型示意，"
             "不是使用者真正要查的標的；core 必須完整保留使用者真正要查的標的"
@@ -469,6 +479,8 @@ class DynamicToolRunner:
             )
             has_recipe = any("*" not in r.keywords for r in knowledge_rows)
         else:
+            if selected:
+                selected = self._merge_keyword_topicals(request, selected)
             # Topical recipes lead the methodology block — burying them after a
             # dozen always-on disciplines made small models miss the recipe.
             knowledge_rows = selected + always_on
@@ -477,11 +489,22 @@ class DynamicToolRunner:
                 logger.info("dynamic_tools: preflight selected rules=%s",
                             [r.title for r in selected])
 
+        # Grounding first: if a reference page (rule URL or search fallback)
+        # already supplies the needed fact, the explorer must see it — otherwise
+        # it hallucinates endpoints for data we already hold.
+        references = self._ground_references(request, knowledge_rows)
+        if references is None:
+            references = self._search_ground(request)
+        elif self._needs_search_grounding(request, references):
+            extra = self._search_ground(request)
+            if extra:
+                references = references + "\n" + extra
+
         # Phase 0: live API exploration only for domains without a stored recipe —
         # a selected recipe already carries a verified endpoint + field structure,
         # so the discovery round-trip (one more LLM call + one HTTP run) is waste.
-        api_structure = None if has_recipe else self._explore_api(request, knowledge_rows)
-        references = self._ground_references(request, knowledge_rows)
+        api_structure = None if has_recipe else self._explore_api(
+            request, knowledge_rows, references=references)
 
         slug = self._make_slug(request)
         tool_dir = self.tools_dir / slug
@@ -532,7 +555,8 @@ class DynamicToolRunner:
                     exec_result = self._install_and_execute(slug, tool_path, code)
                     last_stdout = exec_result.raw_stdout
                     if exec_result.ok:
-                        valid, reason = self._validate_answer(request, exec_result.answer)
+                        valid, reason = self._validate_answer(
+                            request, exec_result.answer, references=references)
                         if valid:
                             exec_result.slug = slug
                             exec_result.generations = generations
@@ -548,6 +572,9 @@ class DynamicToolRunner:
                             return exec_result
                         last_error = (
                             "答案驗證未通過（程式執行成功但輸出內容不符需求）：" + reason
+                            + "\n（修正方向：改程式邏輯，讓輸出的依據取自真實資料點、"
+                            "且用依據能重算出答案。驗證訊息裡出現的數字只是檢查線索，"
+                            "絕不可把它寫死進程式或拿來 assert 對照。）"
                         )
                         logger.info(
                             "dynamic_tools: answer validation FAIL slug=%s reason=%s",
@@ -624,7 +651,16 @@ class DynamicToolRunner:
         auto-installable ModuleNotFoundError (doesn't count as a generation)."""
         requires = self._parse_requires(code)
         if requires:
-            self._pip_install(requires)
+            try:
+                self._pip_install(requires)
+            except RuntimeError as exc:
+                # Unapproved package is a *code* problem (the script chose the
+                # wrong dependency), so it must feed the repair loop instead of
+                # crashing /new.
+                return DynamicToolResult(
+                    ok=False, slug=slug,
+                    error=f"{exc}\n請改用標準函式庫（或核准清單內的套件）重寫，不要依賴該套件。",
+                )
         for _ in range(2):  # initial + one auto-install retry
             proc = self._execute(tool_path)
             stdout = proc.stdout or ""
@@ -640,8 +676,17 @@ class DynamicToolRunner:
             missing = _MODULE_NOT_FOUND_RE.search(stderr)
             if missing:
                 pkg = missing.group(1).split(".")[0]
+                # Import name ≠ pip distribution name (dateutil→python-dateutil):
+                # installing the raw module name gets an approved package blocked.
+                pkg = _MODULE_TO_PIP.get(pkg, pkg)
                 logger.info("dynamic_tools: auto-installing missing module=%s", pkg)
-                self._pip_install((pkg,))
+                try:
+                    self._pip_install((pkg,))
+                except RuntimeError as exc:
+                    return DynamicToolResult(
+                        ok=False, slug=slug, raw_stdout=stdout,
+                        error=f"{exc}\n請改用標準函式庫（或核准清單內的套件）重寫，不要依賴該套件。",
+                    )
                 continue
             return DynamicToolResult(
                 ok=False, slug=slug, raw_stdout=stdout,
@@ -751,7 +796,7 @@ class DynamicToolRunner:
                     continue
                 if low in _REQUIRES_STOPWORDS or low in _STDLIB_MODULES:
                     continue  # "none"/"無"/stdlib mentions aren't pip packages
-                out.append(token)
+                out.append(_MODULE_TO_PIP.get(token, token))
         # de-dup, preserve order
         seen: set[str] = set()
         return tuple(p for p in out if not (p in seen or seen.add(p)))
@@ -794,43 +839,244 @@ class DynamicToolRunner:
                 logger.info("dynamic_tools: reference fetch empty url=%s", url)
         if not texts:
             return None
-        saved_model = self.client.model
-        try:
-            self.client.model = self.fast_model
-            prompt = (
-                "從下面參考資料中，抽取與需求直接相關的公式、名詞定義與慣例"
-                "（例如期間如何界定、期初值取哪個時點的值、百分比如何呈現）。\n"
-                f"需求：{request}\n\n"
-                "參考資料：\n" + "\n---\n".join(texts) + "\n\n"
-                "只輸出條列要點（公式用一行文字描述），200 字內；"
-                "參考資料與需求無關就只輸出 NONE。"
-            )
-            extract = self.client.generate(prompt, temperature=0.0, think=False).strip()
-        except Exception as exc:
-            logger.info("dynamic_tools: reference grounding failed: %s", exc)
-            return None
-        finally:
-            self.client.model = saved_model
-        if not extract or extract.upper().startswith("NONE"):
+        extract = self._distill_reference_texts(request, texts)
+        if extract is None:
             return None
         logger.info("dynamic_tools: grounded %d reference page(s) -> %d chars: %s",
                     len(texts), len(extract), _tail(extract, 200))
         return extract
 
-    def _explore_api(self, request: str, knowledge_rows: list) -> str | None:
+    def _distill_reference_texts(self, request: str, texts: list[str]) -> str | None:
+        saved_model = self.client.model
+        saved_ctx = self.client.num_ctx
+        extracts: list[str] = []
+        try:
+            # Needle-in-noise extraction (one key sentence inside pages of table
+            # junk) is where the fast model drops the value; use the strong one.
+            self.client.model = self.strong_model
+            # One page per call, with a window that actually fits: a fetched
+            # page can be ~8000 CJK chars ≈ more tokens than the default 8192
+            # num_ctx. An overflowing prompt gets head-truncated by Ollama —
+            # the instructions silently vanish and the model answers NONE.
+            if saved_ctx is not None:
+                self.client.num_ctx = max(saved_ctx, 16384)
+            for text in texts:
+                prompt = (
+                    "從下面參考資料中，抽取與需求直接相關的公式、名詞定義與慣例"
+                    "（例如期間如何界定、期初值取哪個時點的值、百分比如何呈現；"
+                    "事實查詢就抽取現值、生效/發布日期與出處）。\n"
+                    "⚠️ 若資料同時提到『現行值』與『檢討中/提案中/預期中的未來值』，"
+                    "兩者必須分開標明（格式：現行值 X（自某時點）；另有檢討中的 Y，尚未生效），"
+                    "絕不可把尚未生效的值當成現值；資料裡『現在、目前』後面接的數字才是現值。\n"
+                    "⚠️ 名詞必須嚴格一致：需求點名的指標/名詞，與資料實際描述的指標必須是同一個；"
+                    "同領域但不同名詞的指標（別的利率、別的費率、別的統計）不算相關，"
+                    "這種資料就輸出 NONE，絕不可拿相近指標的數值充當。\n"
+                    f"需求：{request}\n\n"
+                    "參考資料：\n" + text + "\n\n"
+                    "只輸出條列要點（公式用一行文字描述），200 字內；"
+                    "參考資料與需求無關就只輸出 NONE。"
+                )
+                try:
+                    extract = self.client.generate(
+                        prompt, temperature=0.0, think=False).strip()
+                except Exception as exc:
+                    logger.info("dynamic_tools: reference distillation failed: %s", exc)
+                    continue
+                if not extract or extract.upper().startswith("NONE"):
+                    continue
+                # Models sometimes wrap the NONE verdict in a bullet
+                # ("- **X**：NONE") instead of answering bare NONE; lines
+                # carrying it are junk, and an extract that is ONLY such lines
+                # grounded nothing.
+                lines = [l for l in extract.splitlines()
+                         if l.strip() and "NONE" not in l.upper()]
+                if lines:
+                    extracts.append("\n".join(lines))
+        finally:
+            self.client.model = saved_model
+            self.client.num_ctx = saved_ctx
+        if not extracts:
+            return None
+        return "\n".join(extracts)
+
+    # ── search-grounding fallback (/search + /fetch reuse) ──────────────────
+
+    def _load_search_state(self) -> dict:
+        try:
+            state = json.loads(self.search_state_path.read_text(encoding="utf-8"))
+            if not isinstance(state, dict):
+                raise ValueError("not a dict")
+        except Exception:
+            state = {}
+        today = date.today().isoformat()
+        if state.get("date") != today:
+            state = {"date": today, "count": 0, "cache": {}}
+        state.setdefault("count", 0)
+        state.setdefault("cache", {})
+        return state
+
+    def _save_search_state(self, state: dict) -> None:
+        try:
+            self.search_state_path.write_text(
+                json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            logger.exception("dynamic_tools: search state save failed")
+
+    def _needs_search_grounding(self, request: str, references: str) -> bool:
+        """Rule grounding can 'succeed' with a generic formula page while the
+        request still hinges on a CURRENT institution-announced value (policy
+        rate, official fee, latest decision) that has no key-free API and may be
+        stale in training data. One cheap judgment decides whether to spend a
+        search query on it. Fail-closed: errors return False (never burn budget
+        on a sick gate)."""
+        prompt = (
+            "判斷要完成下面的需求，是否還缺少『當下時點的機構公告型事實數值』"
+            "（例如現行政策利率、官方費率、最新會議決議值——這類值沒有免金鑰公開 API 可查，"
+            "且模型訓練資料裡的舊值可能已過期），而且下面的參考資料也沒有給出該數值。\n"
+            "股價、匯率、天氣等有免金鑰公開 API 可即時查到的資料不算缺。\n"
+            "判斷要點：需求文字若點名了某機構的『現在/目前/最新』數值"
+            "（如『現在的政策金利』『目前的基準費率』），而參考資料只有公式/定義、"
+            "沒有給出該數值的具體現值與時點，就是 YES。\n"
+            f"需求：{request}\n"
+            f"參考資料：\n{_tail(references, 600)}\n"
+            "只輸出一行：YES（缺，需要補搜尋）或 NO。"
+        )
+        saved_model = self.client.model
+        try:
+            # Judgment call, not codegen: the fast model rubber-stamps NO even
+            # when the request literally names an announced value, so this gate
+            # runs on the strong model (one short call, only after rule
+            # grounding succeeded).
+            self.client.model = self.strong_model
+            ans = self.client.generate(prompt, temperature=0.0, think=False).strip()
+        except Exception:
+            logger.exception("dynamic_tools: search-grounding gate failed; assuming NO")
+            return False
+        finally:
+            self.client.model = saved_model
+        need = ans.upper().startswith("YES")
+        logger.info("dynamic_tools: search-grounding gate verdict=%s (%s)",
+                    "YES" if need else "NO", _tail(ans, 120))
+        return need
+
+    def _search_ground(self, request: str) -> str | None:
+        """When no rule reference page covers the request, fall back to ONE web
+        search (same Yahoo backend as /search) + page fetches (same extractor
+        as /fetch), distilled like rule grounding. Hard daily budget + per-day
+        result cache keep query volume near zero; everything fails open."""
+        if self.search_fn is None:
+            # Not wired (unit tests / minimal configs): never reach the network.
+            return None
+        try:
+            state = self._load_search_state()
+            cached = state["cache"].get(request)
+            if cached is not None:
+                logger.info("dynamic_tools: search grounding cache hit for request")
+                if isinstance(cached, str):  # legacy entries cached the distilled block
+                    return cached or None
+                texts = list(cached.get("texts") or [])
+                sources = list(cached.get("sources") or [])
+                if not texts:
+                    return None
+                # Raw page texts are cached (not the distillate) so distillation
+                # improvements take effect on re-runs without a new query.
+                extract = self._distill_reference_texts(request, texts)
+                if not extract:
+                    return None
+                return extract + "\n來源:\n" + "\n".join(sources)
+            if state["count"] >= self.search_daily_cap:
+                logger.info("dynamic_tools: search grounding budget exhausted (%d/%d) — skipping",
+                            state["count"], self.search_daily_cap)
+                return None
+            saved_model = self.client.model
+            try:
+                self.client.model = self.fast_model
+                query = self.client.generate(
+                    "把下面的需求轉成一條適合網頁搜尋引擎的網頁搜尋查詢"
+                    "（保留關鍵專有名詞，可用中文或日文）。\n"
+                    f"需求：{request}\n"
+                    "只輸出查詢字串一行，不要引號、不要解說。",
+                    temperature=0.0, think=False,
+                ).strip().splitlines()[0].strip()
+            finally:
+                self.client.model = saved_model
+            if not query:
+                return None
+            search = self.search_fn
+            # Count the query BEFORE issuing it: a crash after the request has
+            # hit Yahoo must still burn budget.
+            state["count"] += 1
+            self._save_search_state(state)
+            logger.info("dynamic_tools: search grounding query=%r (budget %d/%d)",
+                        query, state["count"], self.search_daily_cap)
+            results = list(search(query, 4) or [])
+            logger.info("dynamic_tools: search grounding got %d result(s): %s",
+                        len(results), [getattr(r, "url", "") for r in results])
+            texts: list[str] = []
+            sources: list[str] = []
+            for res in results:
+                if len(texts) >= 2:
+                    break
+                url = getattr(res, "url", "")
+                if not url:
+                    continue
+                parsed = urlparse(url)
+                # The extractor is HTML-only and engine-internal links (e.g.
+                # search.<engine>/image/...) carry no content — fetching them
+                # wastes the 2-page budget on garbage the distiller rejects.
+                if parsed.netloc.lower().startswith("search.") or \
+                        parsed.path.lower().endswith(".pdf"):
+                    logger.info("dynamic_tools: search grounding skipping "
+                                "non-content url=%s", url)
+                    continue
+                try:
+                    text = self._fetch_url_text(url)
+                except Exception as exc:
+                    logger.info("dynamic_tools: search grounding fetch failed url=%s err=%s", url, exc)
+                    continue
+                if text:
+                    texts.append(text)
+                    sources.append(url)
+                else:
+                    logger.info("dynamic_tools: search grounding fetch empty url=%s", url)
+            block = ""
+            if texts:
+                extract = self._distill_reference_texts(request, texts)
+                if extract:
+                    block = extract + "\n來源:\n" + "\n".join(sources)
+                    logger.info("dynamic_tools: search grounding hit %d page(s) -> %d chars: %s",
+                                len(texts), len(extract), _tail(extract, 200))
+                else:
+                    logger.info("dynamic_tools: search grounding distill returned NONE "
+                                "for %d fetched page(s) %s", len(texts), sources)
+            if not block:
+                logger.info("dynamic_tools: search grounding found nothing usable")
+            # Cache the raw texts (misses too — no re-query today); distillation
+            # reruns on each hit so prompt fixes don't need a fresh search.
+            state["cache"][request] = {"texts": texts, "sources": sources}
+            self._save_search_state(state)
+            return block or None
+        except Exception:
+            logger.exception("dynamic_tools: search grounding failed; continuing without it")
+            return None
+
+    def _explore_api(self, request: str, knowledge_rows: list,
+                     references: str | None = None) -> str | None:
         """Phase 0: generate + run a tiny discovery script to capture actual API
         field names. Returns the captured structure text, or None if exploration
         fails / is not needed (pure-computation requests)."""
         explorer_prompt = (
             "你是 Python 工程師。請為以下需求寫一個「API 探索腳本」（不是最終工具）。\n"
             "目的：呼叫相關 API 一次，把回傳的 JSON 欄位結構印出，供後續正式腳本使用正確欄位名。\n\n"
-            f"需求：{request}\n\n"
-            "規則：\n"
+            f"需求：{request}\n"
+            + self._references_block(references)
+            + "\n規則：\n"
             f'1. 若需求需要外部 API（天氣、股票、匯率等）：呼叫 API，然後：\n'
             f'   print("{_API_STRUCT_START}")\n'
             '   print(json.dumps(response, indent=2, ensure_ascii=False)[:1200])\n'
             f'   print("{_API_STRUCT_END}")\n'
-            '2. 若需求是純計算（不需外部 API，資料已在 request 中）：只 print("NO_EXTERNAL_API")\n'
+            '2. 若需求是純計算（不需外部 API，資料已在 request 中或參考資料已給出所需數值）：'
+            '只 print("NO_EXTERNAL_API")，絕不可為了重新取得參考資料已有的數值而猜測 API 端點\n'
             "3. 失敗時 sys.exit(1)；不要 ===ANSWER=== 標記；只用 stdlib+urllib（不要 # requires）。\n"
             "推薦端點（依需求選擇）：\n"
             "  天氣：wttr.in/{city}?format=j1 —— 直接接受城市名（city 須 urllib.parse.quote 編碼）\n"
@@ -893,6 +1139,9 @@ class DynamicToolRunner:
             "\n<參考資料（公式、名詞定義與慣例以此為準）>\n"
             + references
             + "\n</參考資料>\n"
+            "（參考資料若已給出需求所需的數值（利率、匯率、現值等），"
+            "就把該數值放進 DEFAULTS 直接使用，並在計算依據印出其來源與資訊時點；"
+            "絕不可為了重新取得這個值而呼叫或猜測任何 API 端點。）\n"
         )
 
     def _generate_code(self, request: str, knowledge_rows: list, *, think: bool = False,
@@ -971,9 +1220,13 @@ class DynamicToolRunner:
         from .knowledge_db import format_codegen_knowledge_block
 
         methodology = format_codegen_knowledge_block(knowledge_rows) if knowledge_rows else "(無)"
+        approved = ", ".join(sorted(_APPROVED_PACKAGES))
         return (
             "可用環境：Python 3 標準函式庫；需要第三方套件時，在檔案最上方用註解列出，"
             "例如：# requires: beautifulsoup4（會自動 pip install 到專屬 venv）。"
+            f"第三方套件僅限核准清單：{approved}——清單外的（如 scipy）一律禁止，"
+            "需要清單外才有的演算法（統計、線性代數等）就用 numpy 或自己用基本運算實作。"
+            "絕不可臆造標準函式庫不存在的函式（不確定某函式是否存在，就自己實作該計算）。"
             "優先使用標準函式庫 urllib + 公開 JSON API 以減少相依與加快執行；"
             "方法論已給出可照抄端點/範本時，必須照抄範本，不可自行換用其他套件或端點。\n\n"
             "<代碼開發方法論>\n" + methodology + "\n</代碼開發方法論>\n"
@@ -985,9 +1238,16 @@ class DynamicToolRunner:
             "之後一律用 params[...]。META 的 param_schema 每個 name 必須與 DEFAULTS 的 key 完全一致。\n"
             f"2. 成功時最終答案印在標記之間：先 print(\"{ANSWER_START}\")，"
             f"接著 print 人類可讀答案，最後 print(\"{ANSWER_END}\")。"
-            "數值計算類答案必須同時印出計算依據（資料源、期間起迄日期、期初/期末原始值），"
-            "且依據的日期與數值必須取自 API 實際回傳的資料點（例如把所用資料點的 timestamp 轉成日期印出），"
-            "不可印程式自行假設的期間——驗證層會檢查依據與需求是否一致，缺依據或依據造假視為失敗。\n"
+            "數值計算類答案必須同時印出計算依據，形式依題型："
+            "時間序列計算印資料源、期間起迄日期、期初/期末原始值，"
+            "若答案取決於序列中的關鍵資料點（如極值），也要印出該關鍵點的日期與數值，"
+            "且必須是『真正決定答案的那組』資料點，與答案數值自洽"
+            "（例如最大回撤要在掃描時記下達成最大跌幅當下的峰值與谷值日期/價格一起印出，"
+            "印出的峰→谷跌幅必須等於答案的回撤率；不可印掃描結束時的最後峰值），"
+            "且日期與數值必須取自 API 實際回傳的資料點（例如把所用資料點的 timestamp 轉成日期印出），"
+            "不可印程式自行假設的期間；"
+            "以單一外部參數計算（利率、匯率等）則印參數值、參數來源（URL/機構）與資訊時點"
+            "——驗證層會檢查依據與需求是否一致，缺依據或依據造假視為失敗。\n"
             "3. 失敗時讓例外直接拋出、以非零碼結束——stderr 的 traceback 會觸發外層自動修復；"
             f"絕不要把錯誤訊息印進 {ANSWER_START} 區塊。\n"
             "4. 沙箱限制：不可讀取任何祕密環境變數（OPENCLAW_*、API token 等）；"
@@ -1103,10 +1363,22 @@ class DynamicToolRunner:
                 return t
         return None
 
-    def _validate_answer(self, request: str, answer: str) -> tuple[bool, str]:
+    def _validate_answer(self, request: str, answer: str,
+                         references: str | None = None) -> tuple[bool, str]:
         """LLM gate on a successful run's output: does it plausibly answer the
         request? Lenient by design — only clear mismatches FAIL. Any validator
         error fails open (True) so a sick validator can never brick /new."""
+        refs_block = ""
+        if references:
+            refs_block = (
+                "已查證的參考資料（答案使用的外部參數值——利率、費率、現值等——"
+                "必須與此一致；參考資料給了值而答案用了別的值就 FAIL；"
+                "參考資料標明某值僅是『檢討中/提案中/尚未生效』，"
+                "答案卻把它當成現行值使用，也是 FAIL。"
+                "判定外部參數值時一律以這份參考資料為準——"
+                "你記憶中的舊值可能已過期，不可拿來推翻參考資料）：\n"
+                + _tail(references, 600) + "\n"
+            )
         prompt = (
             "判斷下面的『答案』是否合理回應了『需求』。寬鬆判定：主題正確、有實質內容就算 PASS；"
             "答案簡短但正確也算 PASS。只有以下情況才 FAIL：\n"
@@ -1115,15 +1387,24 @@ class DynamicToolRunner:
             "- 夾帶需求沒問的多餘資料（例如問股票報酬卻多印一行天氣）。\n"
             "- 內容空洞、只有佔位文字、或自述『無法取得資料』而沒有給出實際答案。\n"
             "- 夾帶錯誤訊息/traceback、或明顯編造的假值。\n"
+            "- 答案文字夾帶未替換的程式佔位符（如 {params['x']}、{變數} 之類的樣板殘骸"
+            "出現在人類可讀文字裡）。\n"
             "- 數值是可疑的退化值：報酬率/變化率恰為 0.00%、最高=最低、"
             "所有數值完全相同——真實資料幾乎不會這樣，多半是程式取值錯誤。\n"
-            "- 數值計算類答案沒有附計算依據（期間起迄日期、所用的期初/期末原始值）"
-            "——沒有依據就無法驗證，視為不合格。\n"
+            "- 數值計算類答案沒有附計算依據——沒有依據就無法驗證，視為不合格。"
+            "依據形式依題型：時間序列計算要有期間起迄日期與期初/期末原始值，"
+            "且若答案取決於序列中的關鍵資料點（如最大回撤的峰值/谷值），"
+            "必須印出該關鍵點的日期與數值，缺了就 FAIL；"
+            "以單一外部參數計算（利率、匯率等）要有參數值、參數來源與資訊時點。\n"
             "- 計算依據與需求不一致：用今天日期換算需求的期間語意（如『今年以來』『最近一週』），"
             "若依據顯示的期間起迄落在需求期間之外、或標的不符，FAIL。"
             "例外：期初日期是期間起點前最近一個資料點（差距幾天內，常見基期慣例）算一致；"
             "偏離期間起點數週以上就是取錯基準，FAIL。\n"
-            f"今天日期：{date.today().isoformat()}\n"
+            "- 依據與答案數值不自洽：用依據裡的關鍵資料點驗算答案"
+            "（例如最大回撤＝(峰值−谷值)/峰值，所述峰/谷算出的跌幅必須等於答案的回撤率），"
+            "明顯對不上就是依據造假或程式取錯資料點，FAIL。\n"
+            + refs_block
+            + f"今天日期：{date.today().isoformat()}\n"
             f"需求：{request}\n"
             f"答案：\n{_tail(answer, 800)}\n"
             "只輸出一行：PASS 或 FAIL: <一句原因>。不要任何解說。"
@@ -1229,6 +1510,30 @@ class DynamicToolRunner:
             logger.exception("dynamic_tools: retrieve_codegen_knowledge failed")
             return always_on
 
+    def _merge_keyword_topicals(self, request: str, selected: list) -> list:
+        """Deterministic floor under the LLM rule selector. The preflight
+        listing is re-ordered every run (confidence/updated_at churn from
+        distillation), so which rules the LLM picks is unstable — a critical
+        recipe it picked last run can silently drop out the next. A topical
+        rule whose author-declared keywords literally appear in the request is
+        related by definition, so merge those in regardless of the LLM's pick.
+        Only runs when the LLM picked a non-empty set: an explicit NONE verdict
+        stays authoritative."""
+        if self.knowledge_db is None:
+            return selected
+        try:
+            ranked = self.knowledge_db.retrieve_codegen_knowledge(request, k=6)
+        except Exception:
+            logger.exception("dynamic_tools: keyword-floor retrieval failed")
+            return selected
+        have = {r.knowledge_id for r in selected}
+        extras = [r for r in ranked
+                  if "*" not in r.keywords and r.knowledge_id not in have]
+        if extras:
+            logger.info("dynamic_tools: keyword floor added rules=%s",
+                        [r.title for r in extras])
+        return (selected + extras)[:6]
+
     def _mark_knowledge_applied(self, rows: list) -> None:
         if self.knowledge_db is None or not rows:
             return
@@ -1304,6 +1609,17 @@ _APPROVED_PACKAGES: frozenset[str] = frozenset({
     # time / util
     "python-dateutil", "pytz", "tzdata",
 })
+
+# Import name → pip distribution name for the well-known mismatches; installing
+# the raw module name makes an *approved* package look unapproved.
+_MODULE_TO_PIP: dict[str, str] = {
+    "dateutil": "python-dateutil",
+    "bs4": "beautifulsoup4",
+    "PIL": "pillow",
+    "yaml": "pyyaml",
+    "sklearn": "scikit-learn",
+    "cv2": "opencv-python",
+}
 
 
 def _is_safe_pkg(name: str) -> bool:
@@ -1472,13 +1788,21 @@ def build_dynamic_tool_runner_from_settings(settings) -> DynamicToolRunner | Non
         logger.exception("dynamic_tools: knowledge DB init failed; continuing without RAG")
 
     tools_dir = _resolve_tools_dir()
-    return DynamicToolRunner(
+    runner = DynamicToolRunner(
         client=client, tools_dir=tools_dir, knowledge_db=knowledge_db,
         fast_model=fast_model, strong_model=strong_model,
         # Self-learning: abstract hard-won repairs into transferable RAG rules so
         # novel question types get easier over time instead of relying on seeds.
         distill_enabled=True,
     )
+    try:
+        from .web_search import search_yahoo_japan_playwright
+
+        runner.search_fn = lambda q, max_results: search_yahoo_japan_playwright(
+            q, max_results=max_results)
+    except Exception:
+        logger.exception("dynamic_tools: search grounding backend unavailable")
+    return runner
 
 
 def _select_model(raw_models: str | None) -> str | None:
