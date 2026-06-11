@@ -174,7 +174,7 @@ Common reject examples:
 
 - `漢字読み` tests a basic word such as `最高` or `味方`.
 - `漢字読み` treats a pure song title or full title phrase as a vocabulary item, such as `25時の情熱`.
-- Vocabulary-card examples are not traceable to real lyric/article/commentary source text, reuse the same sentence across multiple cards, or use the same template for similar words with only the target word swapped. Template examples such as `「X」という言葉が心に残った。`, `Xという言葉を覚えた。`, `Xの意味を調べた。`, or `Xについて考えた。` are rejected; the card's `example_ja` must be a verbatim substring of `source_excerpt`.
+- Vocabulary-card examples are not traceable to real lyric/article/commentary source text, reuse the same sentence across multiple cards, use the same template for similar words with only the target word swapped, or spill into a long paragraph / more than 3 sentences. Template examples such as `「X」という言葉が心に残った。`, `Xという言葉を覚えた。`, `Xの意味を調べた。`, or `Xについて考えた。` are rejected; the card's `example_ja` must be a short verbatim substring of `source_excerpt`.
 - The correct reading is wrong or a real alternative reading appears as a distractor.
 - `言い換え類義` uses the same word in kana/kanji as the answer.
 - `文脈規定` is only answerable by remembering the lyric, not by language context.

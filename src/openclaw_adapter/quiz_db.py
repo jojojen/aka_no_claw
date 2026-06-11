@@ -206,6 +206,42 @@ def vocab_example_is_low_value(headword: str, example_ja: str | None) -> bool:
 # no sentence delimiters to split on collapse into one giant blob; anything past
 # this length is a blob, not an example, and is rejected.
 _MAX_VOCAB_EXAMPLE_CHARS = 70
+_MAX_VOCAB_EXAMPLE_SENTENCES = 3
+
+
+def _clean_vocab_source_excerpt(excerpt: str) -> str:
+    text = re.sub(r"\s+", " ", (excerpt or "").strip())
+    text = re.sub(r"【文章[^\]]*?】", " ", text)
+    text = re.sub(r"【[^】]*】", " ", text)
+    text = re.sub(r"≪[^≫]*≫", " ", text)
+    text = re.sub(r"-{3,}", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _count_vocab_example_sentences(text: str) -> int:
+    return len([p for p in re.split(r"[。！？!?]+", text) if p.strip()])
+
+
+def _extract_token_window_candidate(text: str, headword: str) -> str | None:
+    if " " not in text:
+        return None
+    tokens = [t for t in text.split(" ") if t]
+    hit_indexes = [i for i, token in enumerate(tokens) if headword in token]
+    best = None
+    for hit in hit_indexes:
+        for left in range(hit, -1, -1):
+            for right in range(hit, len(tokens)):
+                cand = " ".join(tokens[left : right + 1]).strip()
+                if headword not in cand:
+                    continue
+                if len(cand) > _MAX_VOCAB_EXAMPLE_CHARS:
+                    break
+                if len(_normalize_grounding(cand)) <= len(_normalize_grounding(headword)) + 2:
+                    continue
+                if best is None or len(cand) < len(best):
+                    best = cand
+    return best
 
 
 def source_excerpt_vocab_example(
@@ -213,32 +249,57 @@ def source_excerpt_vocab_example(
 ) -> str | None:
     """Pick a real source sentence containing the headword for a vocab card."""
     headword = (headword or "").strip()
-    excerpt = re.sub(r"\s+", " ", (source_excerpt or "").strip())
+    excerpt = _clean_vocab_source_excerpt(source_excerpt or "")
     if not headword or not excerpt or headword not in excerpt:
         return None
     if _normalize_source_excerpt_type(source_excerpt_type) == "title":
         # A title can ground a reading question, but it is not a memory-helpful
         # example sentence by itself.
         return None
+    quoted_candidates = []
+    for pat in (
+        rf"「[^」]*{re.escape(headword)}[^」]*」",
+        rf"『[^』]*{re.escape(headword)}[^』]*』",
+        rf'"[^"]*{re.escape(headword)}[^"]*"',
+    ):
+        quoted_candidates.extend(m.group(0).strip() for m in re.finditer(pat, excerpt))
     pieces = [
         p.strip()
-        for p in re.split(r"(?<=[。！？!?])\s+|[\r\n]+", excerpt)
+        for p in re.split(r"(?<=[。！？!?])|[\r\n]+", excerpt)
         if p.strip()
     ]
-    candidates = [p for p in pieces if headword in p]
+    candidates = quoted_candidates + [p for p in pieces if headword in p]
     if not candidates:
         candidates = [excerpt]
+    window_candidates = []
+    for cand in list(candidates):
+        if len(cand) <= _MAX_VOCAB_EXAMPLE_CHARS:
+            continue
+        token_window = _extract_token_window_candidate(cand, headword)
+        if token_window:
+            window_candidates.append(token_window)
+    candidates.extend(window_candidates)
     candidates = [
         p for p in candidates
         if not p.endswith(("「", "『", "（", "(", "、", ","))
     ]
     usable = [
         p for p in candidates
-        if headword in p and len(_normalize_grounding(p)) > len(_normalize_grounding(headword)) + 2
+        if (
+            headword in p
+            and len(_normalize_grounding(p)) > len(_normalize_grounding(headword)) + 2
+            and _count_vocab_example_sentences(p) <= _MAX_VOCAB_EXAMPLE_SENTENCES
+        )
     ]
     if not usable:
         return None
     best = min(usable, key=len)
+    if (
+        " " not in best
+        and not re.search(r"[、。！？!?「」『』（）()…]", best)
+        and len(best) > len(headword) + 8
+    ):
+        return None
     if len(best) > _MAX_VOCAB_EXAMPLE_CHARS:
         return None
     return best

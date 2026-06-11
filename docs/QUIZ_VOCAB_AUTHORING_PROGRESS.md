@@ -53,6 +53,7 @@ Last updated: 2026-06-07 JST
   - one memory-helpful Japanese example sentence
   - related song/source URL
 - Card examples must come from a real, traceable lyric/article/commentary `source_excerpt`. Do not count a card if the example sentence cannot be tied back to actual source text.
+- Card examples must stay short: at most 3 sentences, and in practice usually a single short line/clause that helps memorization. Do not dump an entire commentary paragraph or multi-line passage into one card.
 - Do not reuse the same example sentence across multiple cards. Even for similar words, do not use the same sentence template with only the target word swapped. Choose real source excerpts that distinguish each word's actual usage, nuance, or context.
 - Do not accept low-value examples that merely say the learner remembered, heard, searched, studied, or thought about the word, such as `「X」という言葉が心に残った。`, `Xという言葉を覚えた。`, `Xの意味を調べた。`, or `Xについて考えた。`. That blocked list is the FLOOR, not the bar — judge memorability yourself.
 - **The example must teach REAL USAGE — no fragmentary, context-broken (文意破碎), memory-worthless sentences (user directive 2026-06-08).** Quality/correctness is NOT only the question being right — the example itself is part of the bar: it must actively AID MEMORY, and ideally pin down the word's 語感 so the learner can distinguish it from its 類義語 (e.g. 妥協 vs 譲歩, 凶暴 vs 乱暴, 偽装 vs 偽造). A bland "X happened" sentence is a MISS even when grounded and grammatical. Concretely:
