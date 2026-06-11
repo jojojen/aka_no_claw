@@ -47,7 +47,7 @@ class AssistantSettings:
     watch_inbox_db_path: str = "data/watch_inbox.sqlite3"
     quiz_db_path: str = "data/quiz.sqlite3"
     openclaw_backup_dir: str = "/Volumes/JEN_SSD/claw_data"
-    openclaw_backup_interval_hours: int = 24
+    openclaw_backup_hour: int = 23  # daily auto-backup fire time (local)
     sns_classifier_enabled: bool = True
     sns_classifier_min_score: int = 60
     opportunity_agent_enabled: bool = False
@@ -167,8 +167,8 @@ def get_settings() -> AssistantSettings:
         watch_inbox_db_path=os.getenv("WATCH_INBOX_DB_PATH", "data/watch_inbox.sqlite3"),
         quiz_db_path=os.getenv("OPENCLAW_QUIZ_DB_PATH", "data/quiz.sqlite3"),
         openclaw_backup_dir=os.getenv("OPENCLAW_BACKUP_DIR", "/Volumes/JEN_SSD/claw_data"),
-        openclaw_backup_interval_hours=_as_int(
-            os.getenv("OPENCLAW_BACKUP_INTERVAL_HOURS"), default=24
+        openclaw_backup_hour=_as_int(
+            os.getenv("OPENCLAW_BACKUP_HOUR"), default=23
         ),
         sns_classifier_enabled=_as_bool(
             os.getenv("OPENCLAW_SNS_CLASSIFIER_ENABLED", "true")

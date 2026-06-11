@@ -34,6 +34,13 @@ def _project(tmp_path: Path) -> tuple[Path, Path]:
     _make_db(data_dir / "sns.sqlite3", 2)
     # A redundant manual snapshot that must be skipped.
     _make_db(data_dir / "monitor.sqlite3.bak_20260101", 5)
+    # Non-DB data assets that MUST be backed up (curated lists, song packs).
+    (data_dir / "proseka_songs.json").write_text('{"songs": []}', encoding="utf-8")
+    (data_dir / "quiz_song_packs").mkdir()
+    (data_dir / "quiz_song_packs" / "44.json").write_text("{}", encoding="utf-8")
+    # Sidecar / junk that must be skipped.
+    (data_dir / "orphan.sqlite3-journal").write_text("junk", encoding="utf-8")
+    (data_dir / ".DS_Store").write_text("junk", encoding="utf-8")
     # A learned tool: only its request spec matters; code/venv must NOT be copied.
     (tools_dir / "tool_a").mkdir(parents=True)
     (tools_dir / "tool_a" / "tool.py").write_text("print('hi')")
@@ -87,6 +94,25 @@ def test_run_backup_copies_live_dbs_and_specs_tools(tmp_path: Path) -> None:
     assert "/new 找出50以內的質數印出來" in spec
     assert "yfinance" in spec
     assert "print('hi')" not in spec  # no code leaked
+
+
+def test_run_backup_copies_data_assets(tmp_path: Path) -> None:
+    data_dir, tools_dir = _project(tmp_path)
+    dest = tmp_path / "backup"
+
+    report = run_backup(data_dir=data_dir, generated_tools_dir=tools_dir, dest=dest)
+
+    asset_names = {item.name for item in report.assets}
+    # Only curated assets; quiz_song_packs is a regenerable cache — excluded.
+    assert asset_names == {"proseka_songs.json"}
+    assert (dest / "data" / "proseka_songs.json").is_file()
+    assert not (dest / "data" / "quiz_song_packs").exists()
+    # Sidecars / dotfiles never copied.
+    assert not (dest / "data" / "orphan.sqlite3-journal").exists()
+    assert not (dest / "data" / ".DS_Store").exists()
+    # Manifest records the assets.
+    manifest = json.loads((dest / "backup_manifest.json").read_text())
+    assert {a["name"] for a in manifest["assets"]} == asset_names
 
 
 def test_run_backup_is_idempotent(tmp_path: Path) -> None:
@@ -253,3 +279,74 @@ def test_backup_scheduler_logs_warning_on_errors(tmp_path: Path) -> None:
         with patch("openclaw_adapter.backup_command.logger") as mock_logger:
             scheduler._run_once()
     mock_logger.warning.assert_called()
+
+
+def test_run_recover_restores_data_assets(tmp_path: Path) -> None:
+    data_dir, tools_dir = _project(tmp_path)
+    backup_dir = tmp_path / "backup"
+    run_backup(data_dir=data_dir, generated_tools_dir=tools_dir, dest=backup_dir)
+
+    fresh_root = tmp_path / "fresh_project"
+    fresh_data = fresh_root / "data"
+    report = run_recover(data_dir=fresh_data, project_root=fresh_root, source=backup_dir)
+
+    assert {i.name for i in report.assets} == {"proseka_songs.json"}
+    assert (fresh_data / "proseka_songs.json").is_file()
+    assert not (fresh_data / "quiz_song_packs").exists()
+
+
+def test_backup_scheduler_notifies_on_success(tmp_path: Path) -> None:
+    """A scheduled run sends the formatted backup report through notify."""
+    data_dir, tools_dir = _project(tmp_path)
+    dest = tmp_path / "claw_data"
+    notify = MagicMock()
+    scheduler = BackupScheduler(
+        data_dir=data_dir,
+        generated_tools_dir=tools_dir,
+        dest=dest,
+        notify=notify,
+    )
+    scheduler._run_once()
+    notify.assert_called_once()
+    text = notify.call_args[0][0]
+    assert "龍蝦資料備份完成" in text
+    assert "knowledge.sqlite3" in text
+    assert "proseka_songs.json" in text
+    assert "quiz_song_packs" not in text
+
+
+def test_backup_scheduler_notifies_on_skip_when_unmounted(tmp_path: Path) -> None:
+    """SSD unplugged → notify carries the skip warning, run_backup not called."""
+    dest = tmp_path / "no_such_volume" / "claw_data"
+    notify = MagicMock()
+    scheduler = BackupScheduler(
+        data_dir=tmp_path / "data",
+        generated_tools_dir=None,
+        dest=dest,
+        notify=notify,
+    )
+    with patch("openclaw_adapter.backup_command.run_backup") as mock_backup:
+        scheduler._run_once()
+    mock_backup.assert_not_called()
+    notify.assert_called_once()
+    assert "未掛載" in notify.call_args[0][0]
+
+
+def test_backup_scheduler_notify_failure_does_not_raise(tmp_path: Path) -> None:
+    """A broken Telegram send must never kill the backup loop."""
+    data_dir, tools_dir = _project(tmp_path)
+    scheduler = BackupScheduler(
+        data_dir=data_dir,
+        generated_tools_dir=tools_dir,
+        dest=tmp_path / "claw_data",
+        notify=MagicMock(side_effect=RuntimeError("telegram down")),
+    )
+    scheduler._run_once()  # must not raise
+
+
+def test_seconds_until_next_hour_in_range() -> None:
+    from openclaw_adapter.backup_command import _seconds_until_next
+
+    for hour in range(24):
+        delay = _seconds_until_next(hour)
+        assert 0 < delay <= 24 * 3600
