@@ -83,7 +83,7 @@ CREATE INDEX IF NOT EXISTS idx_codegen_category ON codegen_knowledge(category);
 ENTITY_TYPES: tuple[str, ...] = ("ip", "tcg", "product", "set", "creator", "event", "store", "other")
 # "tcg" — TCG game system itself (e.g. UNION ARENA, Weiss Schwarz, Pokemon TCG)
 #         distinct from "ip" (a content brand) and "product" (a SKU).
-ORIGINS: tuple[str, ...] = ("web_research", "manual", "tweet_aggregation")
+ORIGINS: tuple[str, ...] = ("web_research", "manual", "tweet_aggregation", "research_command")
 
 
 def _utc_now_iso() -> str:

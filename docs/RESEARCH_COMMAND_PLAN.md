@@ -1,6 +1,6 @@
 # /research 深度商品研究功能規劃（草案，尚未實作）
 
-> 狀態：M1 開發中。2026-06-12 起草；同日已落地 `/research` registry 覆蓋、`/resaerch` alias、progress notifier／budget／單 chat 鎖骨架，M2 資料層尚未接上。
+> 狀態：M2 開發中。2026-06-12 起草；同日已落地 `/research` registry 覆蓋、`/resaerch` alias、progress notifier／budget／單 chat 鎖骨架；目前已接上 Mercari item adapter、`ItemData`/`ResearchSectionResult` contract、knowledge DB `research_command` origin 與 M2 測試，四大分析中的 seller snapshot / 比價 / 熱度證據仍待接。
 > 注意：使用者輸入打成 `/resaerch` 也應容錯（dispatcher 加 alias）。
 
 ## 目標

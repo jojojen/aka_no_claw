@@ -353,6 +353,24 @@ def test_openclaw_registries_include_research_commands() -> None:
         assert command in command_handlers
 
 
+def test_build_registries_passes_knowledge_db_path_to_research_handler(monkeypatch, tmp_path: Path) -> None:
+    settings = AssistantSettings(
+        openclaw_telegram_chat_id="123",
+        knowledge_db_path=str(tmp_path / "knowledge.sqlite3"),
+    )
+    seen: dict[str, object] = {}
+
+    def _fake_build_research_handler(**kwargs):
+        seen.update(kwargs)
+        return lambda remainder, chat_id: "ok"
+
+    monkeypatch.setattr("openclaw_adapter.telegram_bot.build_research_handler", _fake_build_research_handler)
+
+    _build_registries(settings, dynamic_tool_runner=None)
+
+    assert seen["knowledge_db_path"] == str(tmp_path / "knowledge.sqlite3")
+
+
 def test_command_processor_routes_research_to_registered_handler_before_web_search() -> None:
     settings = AssistantSettings(openclaw_telegram_chat_id="123")
     command_handlers, _, _, _ = _build_registries(settings, dynamic_tool_runner=None)

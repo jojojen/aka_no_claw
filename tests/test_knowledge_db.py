@@ -8,6 +8,7 @@ from openclaw_adapter.knowledge_db import (
     ENTITY_TYPES,
     KnowledgeDatabase,
     KnowledgeEntry,
+    ORIGINS,
     format_knowledge_block,
 )
 
@@ -125,6 +126,10 @@ def test_recent_entries_respects_limit_and_returns_entries(db):
 def test_entity_types_constant_matches_schema_intent():
     """If anyone adds a new entity_type they must update the constant too."""
     assert set(ENTITY_TYPES) >= {"ip", "product", "set", "creator", "event", "store", "other"}
+
+
+def test_research_command_origin_is_whitelisted():
+    assert "research_command" in ORIGINS
 
 
 # ── format_knowledge_block helper ──────────────────────────────────────────
