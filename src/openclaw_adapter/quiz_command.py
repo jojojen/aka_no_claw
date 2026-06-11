@@ -326,6 +326,26 @@ def _grade_view(q, original_text: str, chosen: int) -> tuple[str, str]:
     return toast, "\n".join(parts)
 
 
+def _grade_actions_markup(db, q) -> dict:
+    buttons: list[list[dict]] = [[
+        {"text": "🎲 下一題（隨機）", "callback_data": f"quiz:t:{q.level}:*"},
+        {"text": "🧩 同類型下一題", "callback_data": f"quiz:t:{q.level}:{q.exam_point}"},
+    ]]
+    if q.tested_point:
+        try:
+            vcard = db.get_vocab_card(
+                headword=q.tested_point, level=q.level
+            )
+        except Exception:
+            vcard = None
+        if vcard is not None:
+            buttons.append([{
+                "text": f"📚 查「{q.tested_point}」單字卡",
+                "callback_data": f"quiz:vc:{vcard.vocab_id}",
+            }])
+    return {"inline_keyboard": buttons}
+
+
 def _render_stats(db, chat_id: str | None) -> str:
     """Show the learner's per-題型 accuracy and weakest specific 考点 so they can
     see what the adaptive selector is now biasing toward."""
@@ -823,22 +843,7 @@ def build_quiz_callback_handler(
                 except Exception:
                     logger.exception("quiz: record_attempt failed qid=%s", qid)
                 db.mark_served(qid)
-                buttons: list[list[dict]] = [
-                    [{"text": "🎲 下一題（隨機）", "callback_data": f"quiz:t:{question.level}:*"}]
-                ]
-                if question.tested_point:
-                    try:
-                        vcard = db.get_vocab_card(
-                            headword=question.tested_point, level=question.level
-                        )
-                    except Exception:
-                        vcard = None
-                    if vcard is not None:
-                        buttons.append([{
-                            "text": f"📚 查「{question.tested_point}」單字卡",
-                            "callback_data": f"quiz:vc:{vcard.vocab_id}",
-                        }])
-                return toast, new_text, {"inline_keyboard": buttons}
+                return toast, new_text, _grade_actions_markup(db, question)
             if action == "t":
                 # type-menu selection: rest = "<level>:<exam_point>"
                 # ('*' = random/all, '!' = 錯題本/wrong-only, else a specific 題型).
