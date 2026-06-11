@@ -332,6 +332,7 @@ def test_command_processor_help_lists_trend_and_scan_commands() -> None:
     assert "/price pokemon | Pikachu ex | 132/106 | SAR | sv08" in help_reply
     assert "/snapshot https://jp.mercari.com/item/m123456789" in help_reply
     assert "/search" in help_reply
+    assert "/research https://jp.mercari.com/item/m123456789" in help_reply
     assert "/scan pokemon" in help_reply
     assert "/hunt status" in help_reply
     assert "/translateja 你好，今天辛苦了" in help_reply
@@ -343,6 +344,35 @@ def test_openclaw_registries_include_translate_commands() -> None:
     command_handlers, _, _, _ = _build_registries(settings, dynamic_tool_runner=None)
     for command in ("/translateja", "/ja", "/jp", "/translatezh", "/zh"):
         assert command in command_handlers
+
+
+def test_openclaw_registries_include_research_commands() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    command_handlers, _, _, _ = _build_registries(settings, dynamic_tool_runner=None)
+    for command in ("/research", "/resaerch"):
+        assert command in command_handlers
+
+
+def test_command_processor_routes_research_to_registered_handler_before_web_search() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    command_handlers, _, _, _ = _build_registries(settings, dynamic_tool_runner=None)
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        research_renderer=lambda query: "不應走到這裡",
+        command_handlers=command_handlers,
+    )
+
+    plan = processor.build_reply_plan(
+        chat_id="123",
+        text="/research https://jp.mercari.com/item/m65806654179?afid=foo",
+    )
+
+    assert plan.ack == "收到，正在進行深度商品研究（會分階段回報進度）…"
+    assert plan.run_in_background is True
+    assert plan.reply_factory is not None
 
 
 def test_command_processor_handles_translate_aliases(monkeypatch) -> None:

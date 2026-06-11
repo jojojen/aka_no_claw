@@ -39,6 +39,8 @@ def test_command_registry_has_expected_keys(tmp_path):
         "/scorecard",
         "/knowledge",
         "/kb",
+        "/research",
+        "/resaerch",
         "/snsadd",
         "/sns_add",
         "/snslist",

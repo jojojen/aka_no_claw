@@ -1,6 +1,6 @@
 # /research 深度商品研究功能規劃（草案，尚未實作）
 
-> 狀態：規劃中，先放著等批准。2026-06-12 起草。
+> 狀態：M1 開發中。2026-06-12 起草；同日已落地 `/research` registry 覆蓋、`/resaerch` alias、progress notifier／budget／單 chat 鎖骨架，M2 資料層尚未接上。
 > 注意：使用者輸入打成 `/resaerch` 也應容錯（dispatcher 加 alias）。
 
 ## 目標
