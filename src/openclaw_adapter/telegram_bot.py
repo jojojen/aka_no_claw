@@ -84,6 +84,7 @@ from .voice_command import (
     build_voice_callback_handler,
     build_voice_handler,
 )
+from .research_command import ResearchNotifier, build_research_handler
 from .natural_language import build_telegram_natural_language_router_from_settings
 from .quiz_favorite_songs import extract_first_youtube_url
 from .opportunity_command import (
@@ -380,8 +381,10 @@ def _build_openclaw_help_text() -> str:
             "--- 商品快照／信譽查詢 ---",
             "/snapshot https://jp.mercari.com/item/m123456789",
             "",
-            "--- 網路搜尋 ---",
+            "--- 網路搜尋 / 深度研究 ---",
             "/search 初音未來哪年發明的？",
+            "/research https://jp.mercari.com/item/m123456789",
+            "/research 初音ミク 15th フィギュア",
             "/fetch https://example.com 這篇文章的重點是什麼",
             "",
             "--- 圖片辨識 ---",
@@ -667,6 +670,7 @@ def _build_registries(
     sns_inbox=None,
     knowledge_inbox=None,
     opportunity_inbox=None,
+    research_notifier_factory: "Callable[[str], ResearchNotifier] | None" = None,
 ) -> "tuple[dict, dict, dict, dict]":
     """Build registries injected into the base dispatcher.
 
@@ -680,6 +684,7 @@ def _build_registries(
     backup_handler = build_backup_handler(settings)
     recover_handler = build_recover_handler(settings)
     scorecard_handler = build_scorecard_handler(settings)
+    research_handler = build_research_handler(notifier_factory=research_notifier_factory)
 
     def _quizlikesong_handler(remainder: str, chat_id: str):
         return quiz_handler("like song " + (remainder or "").strip(), chat_id)
@@ -760,6 +765,16 @@ def _build_registries(
         "/kb": RegisteredCommand(
             build_knowledge_handler(settings, knowledge_inbox=knowledge_inbox)
         ),
+        "/research": RegisteredCommand(
+            research_handler,
+            ack="收到，正在進行深度商品研究（會分階段回報進度）…",
+            background=True,
+        ),
+        "/resaerch": RegisteredCommand(
+            research_handler,
+            ack="收到，正在進行深度商品研究（會分階段回報進度）…",
+            background=True,
+        ),
         "/snsadd": RegisteredCommand(
             build_sns_add_handler(sns_db, sns_inbox=sns_inbox),
             ack="收到 X 追蹤指令，正在設定…", background=True,
@@ -829,6 +844,20 @@ def _build_registries(
     return command_handlers, callback_handlers, view_handlers, item_deleter_handlers
 
 
+def _build_research_notifier_factory(settings: AssistantSettings) -> "Callable[[str], ResearchNotifier]":
+    token = require_telegram_token(settings)
+    client = TelegramBotClient(token, ssl_context=build_ssl_context(settings))
+
+    class _TelegramResearchNotifier:
+        def __init__(self, chat_id: str) -> None:
+            self._chat_id = chat_id
+
+        def send(self, text: str) -> None:
+            client.send_message(chat_id=self._chat_id, text=text)
+
+    return lambda chat_id: _TelegramResearchNotifier(str(chat_id))
+
+
 def run_telegram_polling(
     *,
     settings: AssistantSettings,
@@ -861,7 +890,8 @@ def run_telegram_polling(
     command_handlers, callback_handlers, view_handlers, item_deleter_handlers = (
         _build_registries(settings, dynamic_tool_runner, sns_db=sns_db, buzz_fn=sns_buzz_fn,
                           sns_inbox=sns_inbox, knowledge_inbox=knowledge_inbox,
-                          opportunity_inbox=opportunity_inbox)
+                          opportunity_inbox=opportunity_inbox,
+                          research_notifier_factory=_build_research_notifier_factory(settings))
     )
 
     _price_bot_module.TelegramCommandProcessor = (
