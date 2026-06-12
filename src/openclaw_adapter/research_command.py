@@ -5,6 +5,7 @@ import logging
 import re
 import statistics
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Protocol, Sequence
@@ -178,8 +179,18 @@ class ResearchJobContext:
     seller_snapshot: SellerReputationSnapshot | None = None
     current_stage: int = 0
     current_label: str = ""
+    heartbeat_interval_seconds: float = 15.0
+    stage_started_monotonic: float = 0.0
+    last_heartbeat_monotonic: float = 0.0
 
     def heartbeat(self, note: str = "仍在處理…") -> None:
+        now = time.monotonic()
+        if self.heartbeat_interval_seconds > 0:
+            if self.stage_started_monotonic and now - self.stage_started_monotonic < self.heartbeat_interval_seconds:
+                return
+            if self.last_heartbeat_monotonic and now - self.last_heartbeat_monotonic < self.heartbeat_interval_seconds:
+                return
+        self.last_heartbeat_monotonic = now
         self.notifier.send(f"⏳ [{self.current_stage}/6] {self.current_label}：{note}")
 
     def add_section_result(self, result: ResearchSectionResult) -> None:
@@ -667,6 +678,10 @@ class ResearchCommandService:
         (5, "流動性分析"),
         (6, "賣家風險分析"),
     )
+    _MILESTONE_STAGES: dict[int, str] = {
+        1: "已抓到商品頁",
+        4: "已完成市場比價",
+    }
 
     def __init__(
         self,
@@ -683,6 +698,7 @@ class ResearchCommandService:
         sold_average_lookup_fn: SoldAverageLookupFn | None = None,
         ip_heat_lookup_fn: IpHeatLookupFn | None = None,
         final_formatter: Callable[[ResearchReport], object] | None = None,
+        heartbeat_interval_seconds: float = 15.0,
     ) -> None:
         self._notifier_factory = notifier_factory or (lambda chat_id: _NullResearchNotifier())
         self._search_fn = search_fn or _NOOP_SEARCH_FN
@@ -695,6 +711,7 @@ class ResearchCommandService:
         self._sold_average_lookup_fn = sold_average_lookup_fn or _default_sold_average_lookup
         self._ip_heat_lookup_fn = ip_heat_lookup_fn or (lambda canonicals: {})
         self._final_formatter = final_formatter or format_research_full_report
+        self._heartbeat_interval_seconds = max(0.0, heartbeat_interval_seconds)
         self._lock = threading.Lock()
         self._active_chat_ids: set[str] = set()
         self._stage_runners = tuple(stage_runners or self._build_default_stage_runners())
@@ -719,14 +736,19 @@ class ResearchCommandService:
             notifier=notifier,
             budget=budget,
             search_fn=budgeted_search_fn,
+            heartbeat_interval_seconds=self._heartbeat_interval_seconds,
         )
         try:
+            notifier.send("⏳ /research 已開始，先抓商品頁與市場資料…")
             for (stage_no, label), runner in zip(self._STAGES, self._stage_runners, strict=True):
                 ctx.current_stage = stage_no
                 ctx.current_label = label
-                notifier.send(f"⏳ [{stage_no}/6] {label}中…")
+                ctx.stage_started_monotonic = time.monotonic()
+                ctx.last_heartbeat_monotonic = 0.0
                 note = runner(ctx)
-                notifier.send(f"✅ [{stage_no}/6] 完成（{note}）")
+                milestone = self._MILESTONE_STAGES.get(stage_no)
+                if milestone:
+                    notifier.send(f"✅ {milestone}：{note}")
             report = build_research_report(ctx)
             return self._final_formatter(report)
         finally:
@@ -1083,6 +1105,7 @@ def build_research_handler(
     sold_average_lookup_fn: SoldAverageLookupFn | None = None,
     ip_heat_lookup_fn: IpHeatLookupFn | None = None,
     final_formatter: Callable[[ResearchReport], object] | None = None,
+    heartbeat_interval_seconds: float = 15.0,
 ) -> Callable[[str, str], object]:
     service = ResearchCommandService(
         notifier_factory=notifier_factory,
@@ -1097,6 +1120,7 @@ def build_research_handler(
         sold_average_lookup_fn=sold_average_lookup_fn,
         ip_heat_lookup_fn=ip_heat_lookup_fn,
         final_formatter=final_formatter,
+        heartbeat_interval_seconds=heartbeat_interval_seconds,
     )
     return service.run
 
