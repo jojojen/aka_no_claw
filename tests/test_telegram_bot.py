@@ -19,6 +19,7 @@ from price_monitor_bot.bot import (
 
 from openclaw_adapter.formatters import format_lookup_result_telegram
 from openclaw_adapter.natural_language import TelegramNaturalLanguageIntent
+from openclaw_adapter.reputation_snapshot import ReputationSnapshotResult
 from openclaw_adapter.telegram_bot import (
     TelegramCommandProcessor,
     TelegramFileAttachment,
@@ -35,6 +36,7 @@ from openclaw_adapter.telegram_bot import (
     handle_telegram_message,
     parse_lookup_command,
     parse_reputation_snapshot_command,
+    _build_research_seller_snapshot_lookup,
     _build_status_text,
     _build_registries,
     _chromium_launch_options,
@@ -1362,3 +1364,37 @@ def test_format_liquidity_board_includes_reference_url() -> None:
     assert "support 90.08" in text
     assert "buy-up" in text
     assert "stub methodology" not in text
+
+
+def test_research_seller_snapshot_lookup_extracts_negative_review_excerpts(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "openclaw_adapter.telegram_bot.request_reputation_snapshot",
+        lambda *, settings, query_url: ReputationSnapshotResult(
+            proof_url="http://127.0.0.1:5000/p/proof_123",
+            proof_id="proof_123",
+            reused=False,
+        ),
+    )
+    monkeypatch.setattr(
+        "openclaw_adapter.telegram_bot.fetch_reputation_proof_document",
+        lambda *, settings, proof_id: {
+            "subject": {"display_name": "risk seller"},
+            "metrics": {"total_reviews": 55, "listing_count": 8},
+            "quality": {"as_seller": {"positive": 20, "negative": 2, "rate": 90.9}},
+            "review_entries": [
+                {"role": "seller", "rating": "negative", "body_excerpt": "発送が遅かったです。"},
+                {"role": "buyer", "rating": "negative", "body_excerpt": "buyer side"},
+                {"role": "seller", "rating": "positive", "body_excerpt": "positive"},
+                {"role": "seller", "rating": "negative", "body_excerpt": "梱包が雑でした。"},
+                {"role": "seller", "rating": "negative", "body_excerpt": "発送が遅かったです。"},
+            ],
+        },
+    )
+    settings = AssistantSettings(reputation_agent_server_url="http://127.0.0.1:5000")
+
+    lookup = _build_research_seller_snapshot_lookup(settings)
+    snapshot = lookup("https://jp.mercari.com/user/profile/123")
+
+    assert snapshot.display_name == "risk seller"
+    assert snapshot.seller_negative == 2
+    assert snapshot.seller_negative_excerpts == ("発送が遅かったです。", "梱包が雑でした。")

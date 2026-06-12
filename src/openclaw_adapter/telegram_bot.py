@@ -875,6 +875,7 @@ def _build_research_seller_snapshot_lookup(
         subject = proof_document.get("subject", {}) if isinstance(proof_document, dict) else {}
         metrics = proof_document.get("metrics", {}) if isinstance(proof_document, dict) else {}
         quality = proof_document.get("quality", {}) if isinstance(proof_document, dict) else {}
+        review_entries = proof_document.get("review_entries", ()) if isinstance(proof_document, dict) else ()
         as_seller = quality.get("as_seller") if isinstance(quality, dict) else None
         as_buyer = quality.get("as_buyer") if isinstance(quality, dict) else None
         overall = quality.get("overall") if isinstance(quality, dict) else None
@@ -896,9 +897,30 @@ def _build_research_seller_snapshot_lookup(
             buyer_negative=as_buyer.get("negative") if isinstance(as_buyer, dict) else None,
             buyer_rate=as_buyer.get("rate") if isinstance(as_buyer, dict) else None,
             overall_rate=overall.get("rate") if isinstance(overall, dict) else None,
+            seller_negative_excerpts=_extract_negative_seller_review_excerpts(review_entries),
         )
 
     return lookup
+
+
+def _extract_negative_seller_review_excerpts(review_entries: object) -> tuple[str, ...]:
+    if not isinstance(review_entries, list):
+        return ()
+    excerpts: list[str] = []
+    seen: set[str] = set()
+    for entry in review_entries:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("role") != "seller" or entry.get("rating") != "negative":
+            continue
+        text = " ".join(str(entry.get("body_excerpt") or "").split()).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        excerpts.append(text)
+        if len(excerpts) >= 3:
+            break
+    return tuple(excerpts)
 
 
 def run_telegram_polling(

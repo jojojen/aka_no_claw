@@ -38,6 +38,9 @@ _META_PRICE_RE = re.compile(
     r'<meta[^>]+name=["\']product:price:amount["\'][^>]+content=["\'](\d+)["\']',
     re.IGNORECASE,
 )
+_GRADED_TITLE_RE = re.compile(r"\b(?:psa|bgs|ars)(?:\s*\d{1,2})?\b|鑑定", re.IGNORECASE)
+_GENERIC_PROMO_TOKEN_RE = re.compile(r"\d+|周年|限定|フェス|記念|特典|入場者", re.IGNORECASE)
+_REVIEW_WHITESPACE_RE = re.compile(r"\s+")
 
 
 class ResearchNotifier(Protocol):
@@ -130,6 +133,7 @@ class SellerReputationSnapshot:
     buyer_negative: int | None = None
     buyer_rate: float | None = None
     overall_rate: float | None = None
+    seller_negative_excerpts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +159,9 @@ class ResearchJobContext:
     item_data: ItemData | None = None
     section_results: list[ResearchSectionResult] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    active_price_evidence: tuple[PriceEvidence, ...] = ()
+    sold_price_evidence: tuple[PriceEvidence, ...] = ()
+    sold_average_jpy: float | None = None
     current_stage: int = 0
     current_label: str = ""
 
@@ -673,14 +680,18 @@ class ResearchCommandService:
             summary_parts.append(f"賣家 ID：{item.seller_id}。")
         summary_parts.append(f"參考：{item.item_url}")
         db = KnowledgeDatabase(self._knowledge_db_path)
+        entity_canonical = f"{item.source_site}:{item.item_id}"
+        aliases = tuple(
+            alias for alias in (item.title, item.item_id, item.item_url) if alias
+        )
         db.upsert_entry(
-            entity_canonical=item.title,
+            entity_canonical=entity_canonical,
             entity_type="product",
             summary=" ".join(summary_parts),
             source_urls=(item.item_url, *item.image_urls[:2]),
             confidence=min(0.85, item.source_confidence),
             origin="research_command",
-            aliases=(),
+            aliases=aliases,
         )
 
     def _stage_appreciation_placeholder(self, ctx: ResearchJobContext) -> str:
@@ -714,37 +725,49 @@ class ResearchCommandService:
             return summary
 
         listed_price = ctx.item_data.listed_price_jpy if ctx.item_data is not None else None
+        reference_title = ctx.item_data.title if ctx.item_data is not None and ctx.item_data.title else query
         price_cap = _derive_active_price_cap(listed_price)
-        active_raw = self._active_market_search_fn(query, price_cap, 8)
+        active_raw_all = self._active_market_search_fn(query, price_cap, 8)
+        active_raw, active_dropped = _filter_market_items_for_price(
+            reference_title=reference_title,
+            items=active_raw_all,
+            min_similarity=0.32,
+        )
         active_evidence = tuple(_price_evidence_from_market_item(item, sold_status="active") for item in active_raw)
-        sold_raw = self._sold_market_search_fn(query, 8)
+        sold_raw_all = self._sold_market_search_fn(query, 8)
+        sold_raw, sold_dropped = _filter_market_items_for_price(
+            reference_title=reference_title,
+            items=sold_raw_all,
+            min_similarity=0.32,
+        )
         sold_evidence = tuple(_price_evidence_from_market_item(item, sold_status="sold") for item in sold_raw)
         sold_avg = _average_price_from_evidence(sold_evidence)
         if sold_avg is None:
             sold_avg = self._sold_average_lookup_fn(query)
+        ctx.active_price_evidence = active_evidence
+        ctx.sold_price_evidence = sold_evidence
+        ctx.sold_average_jpy = sold_avg
         result = _build_price_section_result(
             query=query,
             listed_price_jpy=listed_price,
             active_evidence=active_evidence,
             sold_evidence=sold_evidence,
             sold_average_jpy=sold_avg,
+            active_dropped=active_dropped,
+            sold_dropped=sold_dropped,
         )
         ctx.add_section_result(result)
         return result.summary
 
     def _stage_liquidity_placeholder(self, ctx: ResearchJobContext) -> str:
-        summary = "流動性分析仍待接 LIQUIDITY_METHODOLOGY 所需資料。"
-        result = ResearchSectionResult(
-            section_name="流動性分析",
-            status="unavailable",
-            confidence=0.0,
-            sample_count=0,
-            evidence_count=0,
-            summary=summary,
-            warnings=(summary,),
+        result = _build_liquidity_section_result(
+            query=_build_price_query(ctx),
+            active_evidence=ctx.active_price_evidence,
+            sold_evidence=ctx.sold_price_evidence,
+            sold_average_jpy=ctx.sold_average_jpy,
         )
         ctx.add_section_result(result)
-        return summary
+        return result.summary
 
     def _stage_seller_placeholder(self, ctx: ResearchJobContext) -> str:
         if ctx.target and ctx.target.mode != "mercari_url":
@@ -918,6 +941,12 @@ def _build_seller_snapshot_section_result(snapshot: SellerReputationSnapshot) ->
             status = "partial"
         warnings.append("賣家評價樣本偏少，風險判讀可信度有限。")
 
+    negative_review_summary, negative_review_warning = _summarize_negative_reviews(
+        snapshot.seller_negative_excerpts
+    )
+    if negative_review_warning:
+        warnings.append(negative_review_warning)
+
     confidence = 0.35
     if snapshot.proof_url:
         confidence += 0.15
@@ -941,6 +970,8 @@ def _build_seller_snapshot_section_result(snapshot: SellerReputationSnapshot) ->
     if snapshot.captured_at:
         summary_parts.append(f"快照時間 {snapshot.captured_at}")
     summary_parts.append(risk_text)
+    if negative_review_summary:
+        summary_parts.append(negative_review_summary)
 
     return ResearchSectionResult(
         section_name="賣家風險分析",
@@ -952,6 +983,64 @@ def _build_seller_snapshot_section_result(snapshot: SellerReputationSnapshot) ->
         evidence_urls=evidence_urls,
         warnings=tuple(warnings),
     )
+
+
+def _summarize_negative_reviews(excerpts: Sequence[str]) -> tuple[str | None, str | None]:
+    cleaned = _normalize_negative_review_excerpts(excerpts)
+    if not cleaned:
+        return None, None
+
+    theme_order = (
+        "発送遲延",
+        "商品狀態落差",
+        "梱包問題",
+        "溝通回覆問題",
+        "售後爭議",
+    )
+    theme_counts = {name: 0 for name in theme_order}
+    for excerpt in cleaned:
+        lower = excerpt.lower()
+        if any(token in lower for token in ("発送", "到着", "届", "遅")):
+            theme_counts["発送遲延"] += 1
+        if any(token in lower for token in ("状態", "説明", "写真", "傷", "汚れ", "破損", "欠品")):
+            theme_counts["商品狀態落差"] += 1
+        if any(token in lower for token in ("梱包", "箱", "封筒", "折れ", "凹", "潰", "濡")):
+            theme_counts["梱包問題"] += 1
+        if any(token in lower for token in ("連絡", "返信", "対応", "メッセージ")):
+            theme_counts["溝通回覆問題"] += 1
+        if any(token in lower for token in ("キャンセル", "返金", "受取", "評価")):
+            theme_counts["售後爭議"] += 1
+
+    ranked_themes = sorted(
+        (name for name, count in theme_counts.items() if count > 0),
+        key=lambda name: (-theme_counts[name], theme_order.index(name)),
+    )
+    if ranked_themes:
+        summary = f"差評重點：{' / '.join(ranked_themes[:3])}。"
+    else:
+        summary = "已有具體差評內容，建議人工查看 proof 原文。"
+
+    quoted = " / ".join(f"「{_shorten_review_excerpt(excerpt)}」" for excerpt in cleaned[:2])
+    warning = f"最近差評例：{quoted}"
+    return summary, warning
+
+
+def _normalize_negative_review_excerpts(excerpts: Sequence[str]) -> tuple[str, ...]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for excerpt in excerpts:
+        text = _REVIEW_WHITESPACE_RE.sub(" ", str(excerpt or "")).strip(" \n\t;；")
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        normalized.append(text)
+    return tuple(normalized)
+
+
+def _shorten_review_excerpt(text: str, limit: int = 34) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
 
 
 def _build_price_query(ctx: ResearchJobContext) -> str:
@@ -993,6 +1082,8 @@ def _build_price_section_result(
     active_evidence: tuple[PriceEvidence, ...],
     sold_evidence: tuple[PriceEvidence, ...],
     sold_average_jpy: float | None,
+    active_dropped: int = 0,
+    sold_dropped: int = 0,
 ) -> ResearchSectionResult:
     active_prices = [e.price_jpy for e in active_evidence if e.price_jpy is not None]
     sold_prices = [e.price_jpy for e in sold_evidence if e.price_jpy is not None]
@@ -1038,6 +1129,10 @@ def _build_price_section_result(
         status = "unavailable"
         summary_parts = [f"查詢「{query}」未取得可用的 sold 或 active 樣本。"]
 
+    if sold_dropped:
+        warnings.append(f"sold 候選排除了 {sold_dropped} 筆低相關樣本。")
+    if active_dropped:
+        warnings.append(f"active 候選排除了 {active_dropped} 筆低相關樣本。")
     if sold_prices and len(sold_prices) < 3:
         if status == "ok":
             status = "partial"
@@ -1070,6 +1165,89 @@ def _build_price_section_result(
     )
 
 
+def _build_liquidity_section_result(
+    *,
+    query: str,
+    active_evidence: tuple[PriceEvidence, ...],
+    sold_evidence: tuple[PriceEvidence, ...],
+    sold_average_jpy: float | None,
+) -> ResearchSectionResult:
+    active_count = len([e for e in active_evidence if e.price_jpy is not None])
+    sold_count = len([e for e in sold_evidence if e.price_jpy is not None])
+    sample_count = active_count + sold_count
+    evidence_urls = tuple(
+        e.source_url
+        for e in (*sold_evidence[:3], *active_evidence[:3])
+        if e.source_url
+    )
+
+    if sample_count == 0:
+        summary = f"查詢「{query}」尚未取得可用的 active / sold 樣本，無法判讀流動性。"
+        return ResearchSectionResult(
+            section_name="流動性分析",
+            status="unavailable",
+            confidence=0.0,
+            sample_count=0,
+            evidence_count=0,
+            summary=summary,
+            warnings=("流動性分析缺少 active / sold 樣本。",),
+        )
+
+    ratio = float(sold_count) if active_count == 0 else sold_count / active_count
+    warnings: list[str] = []
+    status = "ok"
+    summary_parts = [
+        f"Mercari active {active_count} 筆 / sold {sold_count} 筆",
+        f"sold/active 比 {ratio:.2f}",
+    ]
+
+    if sold_count >= 5 and ratio >= 1.0:
+        liquidity_text = "樣本顯示流動性偏高，近期換手速度看起來不慢。"
+    elif sold_count >= 2 and ratio >= 0.5:
+        liquidity_text = "樣本顯示流動性中等，仍有一定成交速度。"
+    elif sold_count == 0 and active_count >= 3:
+        liquidity_text = "只看到在售、沒看到同款成交，流動性偏弱。"
+    elif active_count == 0 and sold_count >= 2:
+        liquidity_text = "成交樣本存在但當前在售很少，可能是換手快，也可能是供給薄。"
+        status = "partial"
+    else:
+        liquidity_text = "樣本偏少，流動性暫時只能做弱判讀。"
+        status = "partial"
+
+    summary_parts.append(liquidity_text)
+    if sold_average_jpy is not None and sold_average_jpy > 0:
+        summary_parts.append(f"參考 sold 均價約 ¥{sold_average_jpy:,.0f}")
+
+    if sold_count < 2:
+        warnings.append("sold 樣本少於 2 筆，流動性判讀可信度有限。")
+    if active_count < 2:
+        warnings.append("active 樣本少於 2 筆，供給側觀察有限。")
+    if sample_count < 4 and status == "ok":
+        status = "partial"
+
+    confidence = 0.2
+    if sold_count >= 2:
+        confidence += 0.2
+    if active_count >= 2:
+        confidence += 0.2
+    if ratio >= 0.5 and sold_count >= 2:
+        confidence += 0.1
+    if sold_count >= 5:
+        confidence += 0.1
+    confidence = round(min(0.8, confidence), 2)
+
+    return ResearchSectionResult(
+        section_name="流動性分析",
+        status=status,
+        confidence=confidence,
+        sample_count=sample_count,
+        evidence_count=len(evidence_urls),
+        summary="；".join(summary_parts),
+        evidence_urls=evidence_urls,
+        warnings=tuple(warnings),
+    )
+
+
 def _default_active_market_search(query: str, price_cap: int, max_results: int) -> list[dict[str, object]]:
     from market_monitor.mercari_search import search_mercari
 
@@ -1093,3 +1271,121 @@ def _average_price_from_evidence(evidence: tuple[PriceEvidence, ...]) -> float |
     if not prices:
         return None
     return sum(prices) / len(prices)
+
+
+def _filter_market_items_for_price(
+    *,
+    reference_title: str,
+    items: list[dict[str, object]],
+    min_similarity: float,
+) -> tuple[list[dict[str, object]], int]:
+    kept: list[dict[str, object]] = []
+    dropped = 0
+    specific_tokens = _specific_reference_tokens(reference_title)
+    anchor_tokens = set(specific_tokens[1:] if len(specific_tokens) >= 2 else specific_tokens)
+    for item in items:
+        title = str(item.get("title") or "").strip()
+        if not title:
+            dropped += 1
+            continue
+        if _looks_graded_title(title) and not _looks_graded_title(reference_title):
+            dropped += 1
+            continue
+        candidate_tokens = set(_market_title_tokens(_normalize_market_title(title)))
+        if anchor_tokens and not (anchor_tokens & candidate_tokens):
+            dropped += 1
+            continue
+        similarity = _title_similarity_score(reference_title, title)
+        if similarity < min_similarity:
+            dropped += 1
+            continue
+        kept.append(item)
+    return kept, dropped
+
+
+def _title_similarity_score(reference: str, candidate: str) -> float:
+    ref = _normalize_market_title(reference)
+    cand = _normalize_market_title(candidate)
+    if not ref or not cand:
+        return 0.0
+    if ref == cand:
+        return 1.0
+
+    ref_tokens = set(_market_title_tokens(ref))
+    cand_tokens = set(_market_title_tokens(cand))
+    token_score = 0.0
+    token_coverage = 0.0
+    if ref_tokens and cand_tokens:
+        overlap = ref_tokens & cand_tokens
+        token_score = len(overlap) / len(ref_tokens | cand_tokens)
+        token_coverage = len(overlap) / len(cand_tokens)
+
+    ref_bigrams = _char_ngrams(ref, 2)
+    cand_bigrams = _char_ngrams(cand, 2)
+    bigram_score = 0.0
+    bigram_coverage = 0.0
+    if ref_bigrams and cand_bigrams:
+        overlap = ref_bigrams & cand_bigrams
+        bigram_score = len(overlap) / len(ref_bigrams | cand_bigrams)
+        bigram_coverage = len(overlap) / len(cand_bigrams)
+
+    containment_bonus = 0.0
+    if ref in cand or cand in ref:
+        containment_bonus = 0.15
+
+    score = max(
+        token_score * 0.55 + bigram_score * 0.45,
+        token_coverage * 0.55 + bigram_coverage * 0.45,
+    )
+    return min(1.0, round(score + containment_bonus, 4))
+
+
+def _normalize_market_title(text: str) -> str:
+    normalized = (text or "").lower()
+    for src, dst in (
+        ("　", " "),
+        ("・", " "),
+        ("【", " "),
+        ("】", " "),
+        ("（", " "),
+        ("）", " "),
+        ("(", " "),
+        (")", " "),
+        ("「", " "),
+        ("」", " "),
+        ("[", " "),
+        ("]", " "),
+        ("-", " "),
+        ("_", " "),
+        ("/", " "),
+    ):
+        normalized = normalized.replace(src, dst)
+    return " ".join(normalized.split()).strip()
+
+
+def _market_title_tokens(text: str) -> tuple[str, ...]:
+    tokens = tuple(token for token in re.split(r"\s+", text) if len(token) >= 2)
+    return tokens
+
+
+def _char_ngrams(text: str, size: int) -> set[str]:
+    compact = text.replace(" ", "")
+    if len(compact) < size:
+        return {compact} if compact else set()
+    return {compact[index : index + size] for index in range(len(compact) - size + 1)}
+
+
+def _looks_graded_title(text: str) -> bool:
+    return bool(_GRADED_TITLE_RE.search(text or ""))
+
+
+def _specific_reference_tokens(text: str) -> tuple[str, ...]:
+    specific: list[str] = []
+    for token in _market_title_tokens(_normalize_market_title(text)):
+        if len(token) < 4:
+            continue
+        if _GENERIC_PROMO_TOKEN_RE.search(token):
+            continue
+        if token not in specific:
+            specific.append(token)
+    return tuple(specific)
