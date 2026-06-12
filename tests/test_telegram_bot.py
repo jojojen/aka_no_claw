@@ -37,10 +37,14 @@ from openclaw_adapter.telegram_bot import (
     parse_lookup_command,
     parse_reputation_snapshot_command,
     _build_research_seller_snapshot_lookup,
+    _build_research_callback_handler,
+    _build_research_reply_formatter,
+    _ResearchReplyCache,
     _build_status_text,
     _build_registries,
     _chromium_launch_options,
 )
+from openclaw_adapter.research_command import ResearchReport, ResearchSectionResult
 
 # Every call to handle_telegram_message now sends an immediate intake ack
 # before kicking off the real processing pipeline.
@@ -350,9 +354,10 @@ def test_openclaw_registries_include_translate_commands() -> None:
 
 def test_openclaw_registries_include_research_commands() -> None:
     settings = AssistantSettings(openclaw_telegram_chat_id="123")
-    command_handlers, _, _, _ = _build_registries(settings, dynamic_tool_runner=None)
+    command_handlers, callback_handlers, _, _ = _build_registries(settings, dynamic_tool_runner=None)
     for command in ("/research", "/resaerch"):
         assert command in command_handlers
+    assert "rs" in callback_handlers
 
 
 def test_build_registries_passes_knowledge_db_path_to_research_handler(monkeypatch, tmp_path: Path) -> None:
@@ -396,6 +401,80 @@ def test_command_processor_routes_research_to_registered_handler_before_web_sear
     assert plan.ack == "收到，正在進行深度商品研究（會分階段回報進度）…"
     assert plan.run_in_background is True
     assert plan.reply_factory is not None
+
+
+def test_research_reply_formatter_returns_compact_text_with_buttons() -> None:
+    cache = _ResearchReplyCache()
+    formatter = _build_research_reply_formatter(cache)
+    report = ResearchReport(
+        chat_id="123",
+        mode_label="Mercari 商品網址",
+        target_display_text="https://jp.mercari.com/item/m1",
+        budget_used=1,
+        budget_max=5,
+        item_data=None,
+        section_results=(
+            ResearchSectionResult(
+                section_name="合理市價分析",
+                status="partial",
+                confidence=0.6,
+                sample_count=2,
+                evidence_count=2,
+                summary="賣家開價 ¥1,800；Mercari sold 樣本 1 筆，均價約 ¥1,500。",
+            ),
+        ),
+        warnings=("sold 樣本少於 3 筆，成交均價可信度有限。",),
+    )
+
+    text, markup = formatter(report)
+
+    assert text.startswith("/research 摘要")
+    flat = [button for row in markup["inline_keyboard"] for button in row]
+    assert any(button["text"] == "看市價" for button in flat)
+    assert all(str(button["callback_data"]).startswith("rs:") for button in flat)
+
+
+def test_research_callback_handler_renders_cached_detail_view() -> None:
+    cache = _ResearchReplyCache()
+    report = ResearchReport(
+        chat_id="123",
+        mode_label="Mercari 商品網址",
+        target_display_text="https://jp.mercari.com/item/m1",
+        budget_used=1,
+        budget_max=5,
+        item_data=None,
+        section_results=(
+            ResearchSectionResult(
+                section_name="合理市價分析",
+                status="partial",
+                confidence=0.6,
+                sample_count=2,
+                evidence_count=2,
+                summary="賣家開價 ¥1,800；Mercari sold 樣本 1 筆，均價約 ¥1,500。",
+                evidence_urls=("https://jp.mercari.com/item/a",),
+                warnings=("sold 樣本少於 3 筆，成交均價可信度有限。",),
+            ),
+            ResearchSectionResult(
+                section_name="流動性分析",
+                status="partial",
+                confidence=0.2,
+                sample_count=2,
+                evidence_count=2,
+                summary="Mercari active 1 筆 / sold 1 筆；樣本偏少。",
+            ),
+        ),
+        warnings=("sold 樣本少於 3 筆，成交均價可信度有限。",),
+    )
+    token = cache.put(report)
+    handler = _build_research_callback_handler(cache)
+
+    toast, text, markup = handler(f"{token}:price", "orig", "123")
+
+    assert toast == "已切換研究視圖"
+    assert text is not None
+    assert "/research 市價細節" in text
+    assert "合理市價分析 [partial]" in text
+    assert markup is not None
 
 
 def test_command_processor_handles_translate_aliases(monkeypatch) -> None:

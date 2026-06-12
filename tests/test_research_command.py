@@ -10,9 +10,11 @@ from openclaw_adapter.research_command import (
     ItemData,
     MercariItemAdapter,
     ResearchBudget,
+    ResearchReport,
     SellerReputationSnapshot,
     build_budgeted_search_fn,
     build_research_handler,
+    format_research_compact_report,
     normalize_mercari_item_url,
     parse_research_target,
 )
@@ -128,6 +130,37 @@ def test_research_handler_reports_progress_heartbeat_and_final_reply() -> None:
     assert notifier.messages[-1] == "✅ [6/6] 完成（M1 骨架：已保留賣家風險分析階段）"
     assert "龍蝦 /research 已完成目前可用流程。" in reply
     assert "https://jp.mercari.com/item/m65806654179" in reply
+
+
+def test_research_handler_supports_custom_final_formatter() -> None:
+    notifier = FakeNotifier()
+    seen: list[ResearchReport] = []
+
+    def final_formatter(report: ResearchReport) -> str:
+        seen.append(report)
+        return format_research_compact_report(report)
+
+    handler = build_research_handler(
+        notifier_factory=lambda chat_id: notifier,
+        stage_runners=(
+            _parse_stage,
+            _placeholder("M1 骨架：已保留商品抓取接點"),
+            _placeholder("M1 骨架：已保留實體辨識與知識庫接點"),
+            _placeholder("M1 骨架：已保留增值潛力分析階段"),
+            _placeholder("M1 骨架：已保留合理市價分析階段"),
+            _placeholder("M1 骨架：已保留流動性分析階段"),
+            _placeholder("M1 骨架：已保留賣家風險分析階段"),
+        ),
+        active_market_search_fn=_fake_active_search,
+        sold_market_search_fn=_fake_sold_search,
+        sold_average_lookup_fn=_fake_sold_average,
+        final_formatter=final_formatter,
+    )
+
+    reply = handler("https://jp.mercari.com/item/m65806654179", "chat-1")
+
+    assert seen
+    assert reply.startswith("/research 摘要")
 
 
 def test_research_handler_rejects_overlapping_jobs_in_same_chat() -> None:

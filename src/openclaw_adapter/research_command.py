@@ -186,6 +186,18 @@ class ResearchJobContext:
         self.warnings.extend(result.warnings)
 
 
+@dataclass(frozen=True, slots=True)
+class ResearchReport:
+    chat_id: str
+    mode_label: str
+    target_display_text: str
+    budget_used: int
+    budget_max: int
+    item_data: ItemData | None
+    section_results: tuple[ResearchSectionResult, ...]
+    warnings: tuple[str, ...]
+
+
 class _NullResearchNotifier:
     def send(self, text: str) -> None:
         return None
@@ -668,6 +680,7 @@ class ResearchCommandService:
         sold_market_search_fn: SoldMarketSearchFn | None = None,
         sold_average_lookup_fn: SoldAverageLookupFn | None = None,
         ip_heat_lookup_fn: IpHeatLookupFn | None = None,
+        final_formatter: Callable[[ResearchReport], object] | None = None,
     ) -> None:
         self._notifier_factory = notifier_factory or (lambda chat_id: _NullResearchNotifier())
         self._search_fn = search_fn or _NOOP_SEARCH_FN
@@ -679,6 +692,7 @@ class ResearchCommandService:
         self._sold_market_search_fn = sold_market_search_fn or _default_sold_market_search
         self._sold_average_lookup_fn = sold_average_lookup_fn or _default_sold_average_lookup
         self._ip_heat_lookup_fn = ip_heat_lookup_fn or (lambda canonicals: {})
+        self._final_formatter = final_formatter or format_research_full_report
         self._lock = threading.Lock()
         self._active_chat_ids: set[str] = set()
         self._stage_runners = tuple(stage_runners or self._build_default_stage_runners())
@@ -711,7 +725,8 @@ class ResearchCommandService:
                 notifier.send(f"⏳ [{stage_no}/6] {label}中…")
                 note = runner(ctx)
                 notifier.send(f"✅ [{stage_no}/6] 完成（{note}）")
-            return self._format_final_report(ctx)
+            report = build_research_report(ctx)
+            return self._final_formatter(report)
         finally:
             self._release_chat(chat_key)
 
@@ -1051,39 +1066,6 @@ class ResearchCommandService:
         ctx.add_section_result(result)
         return result.summary
 
-    def _format_final_report(self, ctx: ResearchJobContext) -> str:
-        assert ctx.target is not None
-        mode_label = "Mercari 商品網址" if ctx.target.mode == "mercari_url" else "商品名稱"
-        lines = [
-            "龍蝦 /research 已完成目前可用流程。",
-            f"研究模式：{mode_label}",
-            f"研究目標：{ctx.target.display_text}",
-            f"搜尋預算：{ctx.budget.searches_used}/{ctx.budget.max_searches}",
-        ]
-        if ctx.item_data is not None:
-            item = ctx.item_data
-            price_text = f"¥{item.listed_price_jpy:,}" if item.listed_price_jpy is not None else "未知"
-            lines.append(
-                f"商品頁資料：{item.title} / {price_text} / 狀態 {item.condition_label or '未知'} / "
-                f"賣家 {item.seller_id or '未知'} / 圖片 {len(item.image_urls)} 張"
-            )
-        lines.append("")
-        lines.append("各節結果：")
-        for result in ctx.section_results:
-            lines.append(
-                f"- {result.section_name} [{result.status}] "
-                f"confidence={result.confidence:.2f} sample={result.sample_count}: {result.summary}"
-            )
-            if result.evidence_urls:
-                lines.extend(f"  source: {url}" for url in result.evidence_urls[:4])
-        if ctx.warnings:
-            deduped = list(dict.fromkeys(ctx.warnings))
-            lines.append("")
-            lines.append("Warnings：")
-            lines.extend(f"- {warning}" for warning in deduped)
-        return "\n".join(lines)
-
-
 def build_research_handler(
     *,
     notifier_factory: Callable[[str], ResearchNotifier] | None = None,
@@ -1097,7 +1079,8 @@ def build_research_handler(
     sold_market_search_fn: SoldMarketSearchFn | None = None,
     sold_average_lookup_fn: SoldAverageLookupFn | None = None,
     ip_heat_lookup_fn: IpHeatLookupFn | None = None,
-) -> Callable[[str, str], str]:
+    final_formatter: Callable[[ResearchReport], object] | None = None,
+) -> Callable[[str, str], object]:
     service = ResearchCommandService(
         notifier_factory=notifier_factory,
         search_fn=search_fn,
@@ -1110,8 +1093,286 @@ def build_research_handler(
         sold_market_search_fn=sold_market_search_fn,
         sold_average_lookup_fn=sold_average_lookup_fn,
         ip_heat_lookup_fn=ip_heat_lookup_fn,
+        final_formatter=final_formatter,
     )
     return service.run
+
+
+def build_research_report(ctx: ResearchJobContext) -> ResearchReport:
+    assert ctx.target is not None
+    mode_label = "Mercari 商品網址" if ctx.target.mode == "mercari_url" else "商品名稱"
+    return ResearchReport(
+        chat_id=ctx.chat_id,
+        mode_label=mode_label,
+        target_display_text=ctx.target.display_text,
+        budget_used=ctx.budget.searches_used,
+        budget_max=ctx.budget.max_searches,
+        item_data=ctx.item_data,
+        section_results=tuple(ctx.section_results),
+        warnings=tuple(dict.fromkeys(ctx.warnings)),
+    )
+
+
+def format_research_full_report(report: ResearchReport) -> str:
+    lines = [
+        "龍蝦 /research 已完成目前可用流程。",
+        f"研究模式：{report.mode_label}",
+        f"研究目標：{report.target_display_text}",
+        f"搜尋預算：{report.budget_used}/{report.budget_max}",
+    ]
+    if report.item_data is not None:
+        item = report.item_data
+        price_text = f"¥{item.listed_price_jpy:,}" if item.listed_price_jpy is not None else "未知"
+        lines.append(
+            f"商品頁資料：{item.title} / {price_text} / 狀態 {item.condition_label or '未知'} / "
+            f"賣家 {item.seller_id or '未知'} / 圖片 {len(item.image_urls)} 張"
+        )
+    lines.append("")
+    lines.append("各節結果：")
+    for result in report.section_results:
+        lines.append(
+            f"- {result.section_name} [{result.status}] "
+            f"confidence={result.confidence:.2f} sample={result.sample_count}: {result.summary}"
+        )
+        if result.evidence_urls:
+            lines.extend(f"  source: {url}" for url in result.evidence_urls[:4])
+    if report.warnings:
+        lines.append("")
+        lines.append("Warnings：")
+        lines.extend(f"- {warning}" for warning in report.warnings)
+    return "\n".join(lines)
+
+
+def format_research_compact_report(report: ResearchReport) -> str:
+    item = report.item_data
+    price_text = "未知"
+    title_text = report.target_display_text
+    condition_text = "未知"
+    seller_text = "未知"
+    if item is not None:
+        title_text = item.title or title_text
+        if item.listed_price_jpy is not None:
+            price_text = f"¥{item.listed_price_jpy:,}"
+        condition_text = item.condition_label or "未知"
+        seller_text = item.seller_id or "未知"
+    lines = [
+        "/research 摘要",
+        f"商品：{title_text}",
+        f"開價：{price_text}",
+        f"狀態：{condition_text}",
+        f"賣家：{seller_text}",
+        "",
+        "重點：",
+    ]
+    for bullet in _build_compact_report_bullets(report):
+        lines.append(f"- {bullet}")
+    return "\n".join(lines)
+
+
+def format_research_detail_report(report: ResearchReport, *, view: str) -> str:
+    normalized = (view or "summary").strip().lower()
+    if normalized == "price":
+        return _format_research_price_detail(report)
+    if normalized == "seller":
+        return _format_research_seller_detail(report)
+    if normalized == "sources":
+        return _format_research_sources_detail(report)
+    if normalized == "warnings":
+        return _format_research_warnings_detail(report)
+    return format_research_compact_report(report)
+
+
+def _build_compact_report_bullets(report: ResearchReport) -> tuple[str, ...]:
+    bullets: list[str] = []
+    price = _find_section_result(report, "合理市價分析")
+    liquidity = _find_section_result(report, "流動性分析")
+    seller = _find_section_result(report, "賣家風險分析")
+    appreciation = _find_section_result(report, "增值潛力分析")
+    if price is not None:
+        bullets.append("市價：" + _compact_price_summary(price))
+    if liquidity is not None:
+        bullets.append("流動性：" + _compact_liquidity_summary(liquidity))
+    if seller is not None:
+        bullets.append("賣家：" + _compact_seller_summary(seller))
+    if appreciation is not None and appreciation.status != "unavailable":
+        bullets.append("增值：" + _compact_appreciation_summary(appreciation))
+    focus_warnings = _select_compact_warnings(report.warnings)
+    if focus_warnings:
+        bullets.append("注意：" + " / ".join(focus_warnings))
+    if not bullets:
+        bullets.append("目前只取得基礎商品資料，尚無更多研究結論。")
+    return tuple(bullets[:5])
+
+
+def _select_compact_warnings(warnings: Sequence[str]) -> tuple[str, ...]:
+    picked: list[str] = []
+    for warning in warnings:
+        normalized = _compact_warning_label(warning)
+        if normalized:
+            picked.append(normalized)
+        if len(picked) >= 2:
+            break
+    return tuple(picked)
+
+
+def _compact_warning_label(warning: str) -> str | None:
+    normalized = _compact_whitespace(warning)
+    if "商品資料只有部分可信" in normalized or "欄位缺漏" in normalized:
+        return "商品頁欄位仍有缺漏"
+    if "sold 樣本少於" in normalized or "active 樣本少於" in normalized:
+        return "市價樣本偏少"
+    if "snapshot 失敗" in normalized:
+        return "賣家快照暫時失敗"
+    if "賣家評價樣本偏少" in normalized:
+        return "賣家評價樣本偏少"
+    return None
+
+
+def _compact_price_summary(result: ResearchSectionResult) -> str:
+    parts = [part for part in result.summary.split("；") if part]
+    selected: list[str] = []
+    for part in parts:
+        text = _compact_whitespace(part)
+        if text.startswith("目前開價"):
+            selected.append(text)
+        elif "均價約" in text and "sold" in text:
+            selected.append(text)
+        elif text.startswith("active 樣本") and len(selected) < 2:
+            selected.append(text)
+    if not selected:
+        selected = [_truncate_research_text(result.summary, 68)]
+    return _truncate_research_text("；".join(selected), 76)
+
+
+def _compact_liquidity_summary(result: ResearchSectionResult) -> str:
+    parts = [_compact_whitespace(part) for part in result.summary.split("；") if part]
+    if not parts:
+        return _truncate_research_text(result.summary, 68)
+    selected = parts[:2]
+    return _truncate_research_text("；".join(selected), 76)
+
+
+def _compact_seller_summary(result: ResearchSectionResult) -> str:
+    parts = [_compact_whitespace(part) for part in result.summary.split("；") if part]
+    for part in parts:
+        if "快照顯示" in part or "snapshot 失敗" in part:
+            return _truncate_research_text(part, 76)
+    if parts:
+        return _truncate_research_text(parts[-1], 76)
+    return _truncate_research_text(result.summary, 68)
+
+
+def _compact_appreciation_summary(result: ResearchSectionResult) -> str:
+    parts = [_compact_whitespace(part) for part in result.summary.split("。") if part]
+    selected: list[str] = []
+    for part in parts:
+        if part.startswith("命中知識庫") or part.startswith("外部補證"):
+            selected.append(part)
+    if not selected:
+        selected = [_truncate_research_text(result.summary, 68)]
+    return _truncate_research_text("。".join(selected), 76)
+
+
+def _format_research_price_detail(report: ResearchReport) -> str:
+    lines = _detail_header(report, "市價細節")
+    price = _find_section_result(report, "合理市價分析")
+    liquidity = _find_section_result(report, "流動性分析")
+    if price is not None:
+        lines.extend(_render_detail_section(price))
+    if liquidity is not None:
+        lines.extend(_render_detail_section(liquidity))
+    warnings = _collect_section_warnings((price, liquidity))
+    if warnings:
+        lines.append("")
+        lines.append("提醒：")
+        lines.extend(f"- {warning}" for warning in warnings)
+    return "\n".join(lines)
+
+
+def _format_research_seller_detail(report: ResearchReport) -> str:
+    lines = _detail_header(report, "賣家細節")
+    seller = _find_section_result(report, "賣家風險分析")
+    if seller is not None:
+        lines.extend(_render_detail_section(seller))
+    else:
+        lines.append("目前沒有賣家風險資料。")
+    warnings = _collect_section_warnings((seller,))
+    if warnings:
+        lines.append("")
+        lines.append("提醒：")
+        lines.extend(f"- {warning}" for warning in warnings)
+    return "\n".join(lines)
+
+
+def _format_research_sources_detail(report: ResearchReport) -> str:
+    lines = _detail_header(report, "來源")
+    any_source = False
+    for result in report.section_results:
+        urls = tuple(dict.fromkeys(url for url in result.evidence_urls if url))
+        if not urls:
+            continue
+        any_source = True
+        lines.append(f"{result.section_name}：")
+        lines.extend(f"- {url}" for url in urls[:6])
+    if not any_source:
+        lines.append("目前沒有額外來源可顯示。")
+    return "\n".join(lines)
+
+
+def _format_research_warnings_detail(report: ResearchReport) -> str:
+    lines = _detail_header(report, "警告")
+    if not report.warnings:
+        lines.append("目前沒有額外警告。")
+        return "\n".join(lines)
+    lines.extend(f"- {warning}" for warning in report.warnings)
+    return "\n".join(lines)
+
+
+def _detail_header(report: ResearchReport, title: str) -> list[str]:
+    lines = [f"/research {title}"]
+    if report.item_data is not None:
+        item = report.item_data
+        price_text = f"¥{item.listed_price_jpy:,}" if item.listed_price_jpy is not None else "未知"
+        lines.append(f"商品：{item.title}")
+        lines.append(f"開價：{price_text} / 狀態：{item.condition_label or '未知'} / 賣家：{item.seller_id or '未知'}")
+    else:
+        lines.append(f"研究目標：{report.target_display_text}")
+    lines.append("")
+    return lines
+
+
+def _render_detail_section(result: ResearchSectionResult) -> list[str]:
+    lines = [f"{result.section_name} [{result.status}]"]
+    lines.append(result.summary)
+    if result.evidence_urls:
+        lines.append("來源：")
+        lines.extend(f"- {url}" for url in tuple(dict.fromkeys(result.evidence_urls))[:6])
+    return lines
+
+
+def _collect_section_warnings(results: Sequence[ResearchSectionResult | None]) -> tuple[str, ...]:
+    warnings: list[str] = []
+    for result in results:
+        if result is None:
+            continue
+        for warning in result.warnings:
+            if warning not in warnings:
+                warnings.append(warning)
+    return tuple(warnings)
+
+
+def _find_section_result(report: ResearchReport, section_name: str) -> ResearchSectionResult | None:
+    for result in report.section_results:
+        if result.section_name == section_name:
+            return result
+    return None
+
+
+def _truncate_research_text(text: str, limit: int) -> str:
+    normalized = _compact_whitespace(text)
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 1].rstrip() + "…"
 
 
 def _build_seller_snapshot_section_result(snapshot: SellerReputationSnapshot) -> ResearchSectionResult:
