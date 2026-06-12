@@ -4,6 +4,11 @@
 
 開始任何 substantial work 前，先讀 [Constitution.md](Constitution.md)。
 
+另外，協作規則以外部 skill 為準：先讀
+`https://raw.githubusercontent.com/jojojen/claude-collab-rules/main/SKILL.md`。
+這條不是可選建議；它是 session-start 規則。尤其在任何 `git push` 前，必須先依
+該 `SKILL.md` 的 push protocol 做 summary，並等使用者明確確認。
+
 目前我們先把底層拆成三層：
 
 - `assistant_runtime`
