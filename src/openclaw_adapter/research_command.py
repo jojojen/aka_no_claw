@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 SearchFn = Callable[[str, int], tuple[object, ...]]
 FetchHtmlFn = Callable[[str], str]
+SellerSnapshotLookupFn = Callable[[str], "SellerReputationSnapshot"]
 ResearchStageRunner = Callable[["ResearchJobContext"], str]
 
 _MERCARI_ITEM_PATH_RE = re.compile(r"^/item/(m\d+)/?$", re.IGNORECASE)
@@ -104,6 +105,27 @@ class PriceEvidence:
     shipping_note: str | None
     excluded_reason: str | None
     observed_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class SellerReputationSnapshot:
+    seller_url: str
+    proof_url: str
+    proof_id: str | None
+    reused: bool
+    display_name: str | None
+    captured_at: str | None
+    total_reviews: int | None
+    listing_count: int | None
+    followers_count: int | None
+    following_count: int | None
+    seller_positive: int | None
+    seller_negative: int | None
+    seller_rate: float | None
+    buyer_positive: int | None = None
+    buyer_negative: int | None = None
+    buyer_rate: float | None = None
+    overall_rate: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -469,12 +491,14 @@ class ResearchCommandService:
         max_searches: int = 5,
         item_fetcher: MercariItemAdapter | None = None,
         knowledge_db_path: str | None = None,
+        seller_snapshot_lookup_fn: SellerSnapshotLookupFn | None = None,
     ) -> None:
         self._notifier_factory = notifier_factory or (lambda chat_id: _NullResearchNotifier())
         self._search_fn = search_fn or _NOOP_SEARCH_FN
         self._max_searches = max_searches
         self._item_fetcher = item_fetcher or MercariItemAdapter()
         self._knowledge_db_path = knowledge_db_path
+        self._seller_snapshot_lookup_fn = seller_snapshot_lookup_fn
         self._lock = threading.Lock()
         self._active_chat_ids: set[str] = set()
         self._stage_runners = tuple(stage_runners or self._build_default_stage_runners())
@@ -708,22 +732,58 @@ class ResearchCommandService:
             )
             ctx.add_section_result(result)
             return summary
-        if ctx.item_data is not None and ctx.item_data.seller_id is not None:
-            summary = f"已抓到賣家 ID {ctx.item_data.seller_id}，但 reputation snapshot 尚未串接。"
-        else:
-            summary = "賣家風險分析仍待接 reputation snapshot 服務。"
-        result = ResearchSectionResult(
-            section_name="賣家風險分析",
-            status="partial" if ctx.item_data is not None else "unavailable",
-            confidence=0.2 if ctx.item_data and ctx.item_data.seller_id else 0.0,
-            sample_count=1 if ctx.item_data and ctx.item_data.seller_id else 0,
-            evidence_count=1 if ctx.item_data and ctx.item_data.seller_url else 0,
-            summary=summary,
-            evidence_urls=(ctx.item_data.seller_url,) if ctx.item_data and ctx.item_data.seller_url else (),
-            warnings=("M2 只抓到賣家識別資訊，尚未建立評價快照。",),
-        )
+        if ctx.item_data is None:
+            summary = "尚未取得商品頁資料，無法建立 reputation snapshot。"
+            result = ResearchSectionResult(
+                section_name="賣家風險分析",
+                status="unavailable",
+                confidence=0.0,
+                sample_count=0,
+                evidence_count=0,
+                summary=summary,
+                warnings=(summary,),
+            )
+            ctx.add_section_result(result)
+            return summary
+        snapshot_query_url = ctx.item_data.seller_url or ctx.item_data.item_url
+        if self._seller_snapshot_lookup_fn is None:
+            summary = f"已抓到賣家 ID {ctx.item_data.seller_id or '未知'}，但 reputation snapshot 未啟用。"
+            result = ResearchSectionResult(
+                section_name="賣家風險分析",
+                status="partial",
+                confidence=0.2,
+                sample_count=1 if ctx.item_data.seller_id else 0,
+                evidence_count=1,
+                summary=summary,
+                evidence_urls=(snapshot_query_url,),
+                warnings=("賣家 snapshot adapter 尚未注入；可單獨執行 /snapshot 驗證。",),
+            )
+            ctx.add_section_result(result)
+            return summary
+
+        try:
+            snapshot = self._seller_snapshot_lookup_fn(snapshot_query_url)
+        except Exception as exc:
+            summary = f"賣家 reputation snapshot 失敗：{exc}"
+            result = ResearchSectionResult(
+                section_name="賣家風險分析",
+                status="partial",
+                confidence=0.2,
+                sample_count=1 if ctx.item_data.seller_id else 0,
+                evidence_count=1,
+                summary=summary,
+                evidence_urls=(snapshot_query_url,),
+                warnings=(
+                    summary,
+                    f"建議跟進：/snapshot {snapshot_query_url}",
+                ),
+            )
+            ctx.add_section_result(result)
+            return summary
+
+        result = _build_seller_snapshot_section_result(snapshot)
         ctx.add_section_result(result)
-        return summary
+        return result.summary
 
     def _format_final_report(self, ctx: ResearchJobContext) -> str:
         assert ctx.target is not None
@@ -764,6 +824,7 @@ def build_research_handler(
     max_searches: int = 5,
     item_fetcher: MercariItemAdapter | None = None,
     knowledge_db_path: str | None = None,
+    seller_snapshot_lookup_fn: SellerSnapshotLookupFn | None = None,
 ) -> Callable[[str, str], str]:
     service = ResearchCommandService(
         notifier_factory=notifier_factory,
@@ -772,5 +833,87 @@ def build_research_handler(
         max_searches=max_searches,
         item_fetcher=item_fetcher,
         knowledge_db_path=knowledge_db_path,
+        seller_snapshot_lookup_fn=seller_snapshot_lookup_fn,
     )
     return service.run
+
+
+def _build_seller_snapshot_section_result(snapshot: SellerReputationSnapshot) -> ResearchSectionResult:
+    sample_count = 0
+    if snapshot.seller_positive is not None or snapshot.seller_negative is not None:
+        sample_count = int(snapshot.seller_positive or 0) + int(snapshot.seller_negative or 0)
+    elif snapshot.total_reviews is not None:
+        sample_count = snapshot.total_reviews
+
+    evidence_urls = tuple(url for url in (snapshot.seller_url, snapshot.proof_url) if url)
+    warnings: list[str] = []
+    status = "ok"
+
+    meta_bits: list[str] = []
+    if snapshot.display_name:
+        meta_bits.append(f"賣家 {snapshot.display_name}")
+    if snapshot.total_reviews is not None:
+        meta_bits.append(f"總評價 {snapshot.total_reviews}")
+    if snapshot.listing_count is not None:
+        meta_bits.append(f"刊登 {snapshot.listing_count}")
+
+    seller_bits: list[str] = []
+    if snapshot.seller_positive is not None:
+        seller_bits.append(f"好評 {snapshot.seller_positive}")
+    if snapshot.seller_negative is not None:
+        seller_bits.append(f"差評 {snapshot.seller_negative}")
+    if snapshot.seller_rate is not None:
+        seller_bits.append(f"好評率 {snapshot.seller_rate:.1f}%")
+
+    risk_text = "快照資料不足，需人工檢查 proof。"
+    if snapshot.seller_rate is None:
+        status = "partial"
+        warnings.append("reputation snapshot 缺少賣家面向好評率，只能提供部分統計。")
+    else:
+        negative = int(snapshot.seller_negative or 0)
+        if snapshot.seller_rate < 90 or negative >= 5:
+            risk_text = "快照顯示賣家風險偏高。"
+        elif snapshot.seller_rate < 98 or negative >= 1:
+            risk_text = "快照顯示賣家風險中等，建議人工查看差評內容。"
+        else:
+            risk_text = "快照顯示賣家風險偏低。"
+
+    if sample_count and sample_count < 10:
+        if status == "ok":
+            status = "partial"
+        warnings.append("賣家評價樣本偏少，風險判讀可信度有限。")
+
+    confidence = 0.35
+    if snapshot.proof_url:
+        confidence += 0.15
+    if snapshot.total_reviews is not None:
+        confidence += 0.1
+    if snapshot.seller_rate is not None:
+        confidence += 0.2
+    if sample_count >= 20:
+        confidence += 0.1
+    elif sample_count >= 5:
+        confidence += 0.05
+    if snapshot.display_name:
+        confidence += 0.05
+    confidence = round(min(0.9, confidence), 2)
+
+    summary_parts: list[str] = []
+    if meta_bits:
+        summary_parts.append(" / ".join(meta_bits))
+    if seller_bits:
+        summary_parts.append("身為賣家：" + " / ".join(seller_bits))
+    if snapshot.captured_at:
+        summary_parts.append(f"快照時間 {snapshot.captured_at}")
+    summary_parts.append(risk_text)
+
+    return ResearchSectionResult(
+        section_name="賣家風險分析",
+        status=status,
+        confidence=confidence,
+        sample_count=sample_count,
+        evidence_count=len(evidence_urls),
+        summary="；".join(summary_parts),
+        evidence_urls=evidence_urls,
+        warnings=tuple(warnings),
+    )
