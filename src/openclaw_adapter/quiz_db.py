@@ -89,6 +89,17 @@ _TITLE_READING_MARKERS = re.compile(r"曲名|歌名|タイトル")
 _GENERIC_YOUHOU_STEM_RE = re.compile(
     r"^(?:次のうち、)?(?:語句)?[「〈][^」〉]+[」〉]の使い方として最も適切な(?:文|もの)はどれか。?$"
 )
+_LEXICAL_COMMENTARY_MARKERS: tuple[str, ...] = (
+    "解説によれば",
+    "と解説されている",
+    "と解説される",
+    "筆者は読み解いている",
+    "筆者",
+    "読み解いている",
+    "語り手",
+    "徹底解説",
+    "という部分は、",
+)
 
 
 def _token_before(stem: str, keyword: str) -> str | None:
@@ -153,6 +164,16 @@ def youhou_uses_generic_template_stem(*, exam_point: str | None, stem: str) -> b
     if "用法" not in ep:
         return False
     return bool(_GENERIC_YOUHOU_STEM_RE.match((stem or "").strip()))
+
+
+def lexical_stem_uses_commentary_wrapper(*, exam_point: str | None, stem: str) -> bool:
+    """Reject lexical stems that quote commentary/about-text prose instead of a
+    memory-helpful usage sentence."""
+    ep = (exam_point or "").strip()
+    if ep not in {"漢字読み", "言い換え類義", "文脈規定", "用法"}:
+        return False
+    text = (stem or "").strip()
+    return any(marker in text for marker in _LEXICAL_COMMENTARY_MARKERS)
 
 
 def _normalize_grounding(text: str | None) -> str:
@@ -1765,6 +1786,11 @@ class QuizDatabase:
             raise ValueError(
                 "youhou item uses generic template stem: every question must carry "
                 "its own memory value, not just wrap options in a stock prompt"
+            )
+        if lexical_stem_uses_commentary_wrapper(exam_point=exam_point, stem=stem):
+            raise ValueError(
+                "lexical stem uses commentary wrapper: lexical items must be taught "
+                "through a meaningful sentence, not commentary/about-text prose"
             )
         if youhou_target_word_presence_leaks(
             exam_point=exam_point, stem=stem, options=opts, answer_index=int(answer_index)

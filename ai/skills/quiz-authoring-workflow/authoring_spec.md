@@ -96,6 +96,9 @@ bootstrap), so you control it entirely through the excerpt you author:
   real lyric/article sentence, that sentence may ground a valid lexical item. The ban
   is on treating the title string itself as the question, not on reusing a real
   sentence that happens to contain title vocabulary.
+- DO NOT wrap a lexical item in commentary/about-text prose such as `解説によれば`,
+  `筆者は読み解いている`, `語り手`, `徹底解説`, or `という部分は...`. A lexical item
+  must be taught through a meaningful sentence, not a meta description of the song.
 - **Distractors must be plausible WRONG READINGS OF THE TARGET WORD** — alternative
   on/kun readings, similar-character confusion, connected-sound (連濁) variants.
   NEVER readings of unrelated words.
