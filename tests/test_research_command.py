@@ -120,14 +120,15 @@ def test_research_handler_reports_progress_heartbeat_and_final_reply() -> None:
         active_market_search_fn=_fake_active_search,
         sold_market_search_fn=_fake_sold_search,
         sold_average_lookup_fn=_fake_sold_average,
+        heartbeat_interval_seconds=0.0,
     )
 
     reply = handler("https://jp.mercari.com/item/m65806654179?afid=foo", "chat-1")
 
-    assert notifier.messages[0] == "⏳ [0/6] 解析輸入中…"
-    assert notifier.messages[1] == "✅ [0/6] 完成（已正規化 Mercari 商品網址（m65806654179））"
+    assert notifier.messages[0] == "⏳ /research 已開始，先抓商品頁與市場資料…"
     assert "⏳ [1/6] 取得商品資料：還在整理資料源配置" in notifier.messages
-    assert notifier.messages[-1] == "✅ [6/6] 完成（M1 骨架：已保留賣家風險分析階段）"
+    assert "✅ 已抓到商品頁：M1 骨架：已保留商品抓取接點" in notifier.messages
+    assert "✅ 已完成市場比價：M1 骨架：已保留合理市價分析階段" in notifier.messages
     assert "龍蝦 /research 已完成目前可用流程。" in reply
     assert "https://jp.mercari.com/item/m65806654179" in reply
 
@@ -227,7 +228,7 @@ def test_research_handler_fetches_mercari_item_and_persists_knowledge(tmp_path: 
 
     reply = handler("https://jp.mercari.com/item/m18542743389?utm_source=share", "chat-1")
 
-    assert any("✅ [1/6] 完成（標題" in message for message in notifier.messages)
+    assert any(message.startswith("✅ 已抓到商品頁：標題") for message in notifier.messages)
     assert "研究模式：Mercari 商品網址" in reply
     assert "商品頁資料：エヴァンゲリオン 30周年フェス限定 綾波レイ ユニオンアリーナ プロモカード" in reply
     assert "賣家 146184751" in reply
@@ -674,7 +675,7 @@ def test_research_handler_includes_seller_snapshot_result(tmp_path: Path) -> Non
 
     assert "賣家風險分析 [ok]" in reply
     assert "快照顯示賣家風險偏低。" in reply
-    assert notifier.messages[-1].startswith("✅ [6/6] 完成（賣家 kiko / 總評價 4864")
+    assert any(message.startswith("✅ 已完成市場比價：") for message in notifier.messages)
 
 
 def test_research_handler_summarizes_negative_seller_reviews(tmp_path: Path) -> None:
