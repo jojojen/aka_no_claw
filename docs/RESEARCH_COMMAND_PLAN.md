@@ -1,6 +1,6 @@
 # /research 深度商品研究功能規劃（草案，尚未實作）
 
-> 狀態：M3 開發中。2026-06-12 起草；同日已落地 `/research` registry 覆蓋、`/resaerch` alias、progress notifier／budget／單 chat 鎖骨架；目前已接上 Mercari item adapter、`ItemData`/`ResearchSectionResult` contract、knowledge DB `research_command` origin、seller reputation snapshot、以及第一版合理市價分析（Mercari active 樣本 + sold evidence URL / sold avg）。仍待接的是 sold 樣本品質過濾、IP/作者熱度證據、流動性 methodology 與 seller 差評內容摘要。
+> 狀態：M3 開發中。2026-06-12 起草；同日已落地 `/research` registry 覆蓋、`/resaerch` alias、progress notifier／budget／單 chat 鎖骨架；目前已接上 Mercari item adapter、`ItemData`/`ResearchSectionResult` contract、knowledge DB `research_command` origin、seller reputation snapshot、seller 差評內容摘要、第一版合理市價分析（Mercari active 樣本 + sold evidence URL / sold avg）、以及基於 sold/active 樣本的第一版流動性判讀。仍待接的是 IP/作者熱度證據與更完整的流動性 methodology。
 > 注意：使用者輸入打成 `/resaerch` 也應容錯（dispatcher 加 alias）。
 
 ## 目標

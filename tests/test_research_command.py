@@ -200,7 +200,7 @@ def test_research_handler_fetches_mercari_item_and_persists_knowledge(tmp_path: 
     assert "狀態 新品、未使用" in reply
     assert "各節結果：" in reply
     db = KnowledgeDatabase(knowledge_db_path)
-    entry = db.get_entry("エヴァンゲリオン 30周年フェス限定 綾波レイ ユニオンアリーナ プロモカード")
+    entry = db.get_entry("mercari:m18542743389")
     assert entry is not None
     assert entry.origin == "research_command"
     assert entry.entity_type == "product"
@@ -208,6 +208,7 @@ def test_research_handler_fetches_mercari_item_and_persists_knowledge(tmp_path: 
     assert "賣家 ID：146184751。" in entry.summary
     assert "商品狀態：新品、未使用。" in entry.summary
     assert "https://jp.mercari.com/item/m18542743389" in entry.source_urls
+    assert db.lookup_canonical("エヴァンゲリオン 30周年フェス限定 綾波レイ ユニオンアリーナ プロモカード") == "mercari:m18542743389"
 
 
 def test_mercari_item_adapter_extracts_expected_fields_from_fixture() -> None:
@@ -224,6 +225,51 @@ def test_mercari_item_adapter_extracts_expected_fields_from_fixture() -> None:
     assert item.seller_url == "https://jp.mercari.com/user/profile/433414807"
     assert item.image_urls == ("https://static.mercdn.net/item/detail/orig/photos/m85537287496_1.jpg?1776239339",)
     assert item.source_confidence >= 0.8
+
+
+def test_research_item_knowledge_uses_item_id_key_and_updates_same_row(tmp_path: Path) -> None:
+    class SwappingItemFetcher:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def fetch(self, _target):
+            self.calls += 1
+            title = "初版標題" if self.calls == 1 else "更新後標題"
+            return ItemData(
+                source_site="mercari",
+                item_url="https://jp.mercari.com/item/m99911122233",
+                item_id="m99911122233",
+                title=title,
+                listed_price_jpy=4800,
+                description="desc",
+                condition_label="目立った傷や汚れなし",
+                seller_id="12345",
+                seller_url="https://jp.mercari.com/user/profile/12345",
+                image_urls=(),
+                fetched_at="2026-06-12T00:00:00+00:00",
+                source_confidence=0.8,
+            )
+
+    knowledge_db_path = tmp_path / "knowledge.sqlite3"
+    handler = build_research_handler(
+        notifier_factory=lambda chat_id: FakeNotifier(),
+        item_fetcher=SwappingItemFetcher(),
+        knowledge_db_path=str(knowledge_db_path),
+        active_market_search_fn=_fake_active_search,
+        sold_market_search_fn=_fake_sold_search,
+        sold_average_lookup_fn=_fake_sold_average,
+    )
+
+    handler("https://jp.mercari.com/item/m99911122233", "chat-1")
+    handler("https://jp.mercari.com/item/m99911122233", "chat-1")
+
+    db = KnowledgeDatabase(knowledge_db_path)
+    entry = db.get_entry("mercari:m99911122233")
+    assert entry is not None
+    assert "更新後標題" in entry.summary
+    assert db.lookup_canonical("初版標題") == "mercari:m99911122233"
+    assert db.lookup_canonical("更新後標題") == "mercari:m99911122233"
+    assert len(db.recent_entries(10)) == 1
 
 
 def test_research_handler_builds_price_section_from_active_and_sold_samples(tmp_path: Path) -> None:
@@ -301,6 +347,8 @@ def test_research_handler_builds_price_section_from_active_and_sold_samples(tmp_
     assert "Mercari sold 樣本 3 筆，均價約 ¥7,000" in reply
     assert "active 樣本 3 筆，中位數 ¥6,800，區間 ¥6,100–¥7,200" in reply
     assert "目前開價接近 sold 均價" in reply
+    assert "流動性分析 [ok]" in reply
+    assert "Mercari active 3 筆 / sold 3 筆；sold/active 比 1.00；樣本顯示流動性中等，仍有一定成交速度。" in reply
     assert "https://jp.mercari.com/item/s1" in reply
 
 
@@ -338,7 +386,69 @@ def test_research_handler_price_stage_works_for_text_query_without_item_page() -
     assert "研究模式：商品名稱" in reply
     assert "合理市價分析 [partial]" in reply
     assert "active 樣本 2 筆，中位數 ¥9,400，區間 ¥9,000–¥9,800" in reply
+    assert "流動性分析 [partial]" in reply
+    assert "Mercari active 2 筆 / sold 0 筆；sold/active 比 0.00；樣本偏少，流動性暫時只能做弱判讀。" in reply
     assert "Mercari sold 價目前只拿到平均值接口；此查詢未回傳可用 sold avg。" in reply
+
+
+def test_research_handler_filters_low_relevance_and_graded_price_samples(tmp_path: Path) -> None:
+    item_fetcher = MercariItemAdapter(
+        fetch_html_fn=lambda _url: _load_fixture("mercari_item_m18542743389.html")
+    )
+
+    def active_search(query: str, price_cap: int, max_results: int) -> list[dict[str, object]]:
+        return [
+            {
+                "item_id": "a1",
+                "title": "エヴァンゲリオン 30周年フェス限定 綾波レイ ユニオンアリーナ プロモカード",
+                "price_jpy": 6400,
+                "url": "https://jp.mercari.com/item/a1",
+                "thumbnail_url": "",
+            },
+            {
+                "item_id": "a2",
+                "title": "エヴァンゲリオン ポスター 30周年",
+                "price_jpy": 1200,
+                "url": "https://jp.mercari.com/item/a2",
+                "thumbnail_url": "",
+            },
+        ]
+
+    def sold_search(query: str, max_results: int) -> list[dict[str, object]]:
+        return [
+            {
+                "item_id": "s1",
+                "title": "PSA10 エヴァンゲリオン 30周年フェス限定 綾波レイ ユニオンアリーナ プロモカード",
+                "price_jpy": 18000,
+                "url": "https://jp.mercari.com/item/s1",
+                "thumbnail_url": "",
+            },
+            {
+                "item_id": "s2",
+                "title": "エヴァンゲリオン 30周年フェス限定 綾波レイ ユニオンアリーナ プロモカード",
+                "price_jpy": 7000,
+                "url": "https://jp.mercari.com/item/s2",
+                "thumbnail_url": "",
+            },
+        ]
+
+    handler = build_research_handler(
+        notifier_factory=lambda chat_id: FakeNotifier(),
+        item_fetcher=item_fetcher,
+        knowledge_db_path=str(tmp_path / "knowledge.sqlite3"),
+        active_market_search_fn=active_search,
+        sold_market_search_fn=sold_search,
+        sold_average_lookup_fn=lambda query: None,
+    )
+
+    reply = handler("https://jp.mercari.com/item/m18542743389", "chat-1")
+
+    assert "Mercari sold 樣本 1 筆，均價約 ¥7,000" in reply
+    assert "Warnings：" in reply
+    assert "sold 候選排除了 1 筆低相關樣本。" in reply
+    assert "active 候選排除了 1 筆低相關樣本。" in reply
+    assert "https://jp.mercari.com/item/s2" in reply
+    assert "https://jp.mercari.com/item/s1" not in reply
 
 
 def test_research_handler_includes_seller_snapshot_result(tmp_path: Path) -> None:
@@ -381,6 +491,54 @@ def test_research_handler_includes_seller_snapshot_result(tmp_path: Path) -> Non
     assert "賣家風險分析 [ok]" in reply
     assert "快照顯示賣家風險偏低。" in reply
     assert notifier.messages[-1].startswith("✅ [6/6] 完成（賣家 kiko / 總評價 4864")
+
+
+def test_research_handler_summarizes_negative_seller_reviews(tmp_path: Path) -> None:
+    item_fetcher = MercariItemAdapter(
+        fetch_html_fn=lambda _url: _load_fixture("mercari_item_m18542743389.html")
+    )
+
+    def seller_lookup(seller_url: str) -> SellerReputationSnapshot:
+        assert seller_url == "https://jp.mercari.com/user/profile/146184751"
+        return SellerReputationSnapshot(
+            seller_url=seller_url,
+            proof_url="http://127.0.0.1:5000/p/proof_456",
+            proof_id="proof_456",
+            reused=False,
+            display_name="risk seller",
+            captured_at="2026-06-12T02:34:56+09:00",
+            total_reviews=220,
+            listing_count=21,
+            followers_count=88,
+            following_count=5,
+            seller_positive=47,
+            seller_negative=3,
+            seller_rate=94.0,
+            overall_rate=97.8,
+            seller_negative_excerpts=(
+                "発送が予定より遅かった。連絡も少なかったです。",
+                "商品の状態が説明より悪かったです。少し残念でした。",
+                "発送が予定より遅かった。連絡も少なかったです。",
+            ),
+        )
+
+    handler = build_research_handler(
+        notifier_factory=lambda chat_id: FakeNotifier(),
+        item_fetcher=item_fetcher,
+        knowledge_db_path=str(tmp_path / "knowledge.sqlite3"),
+        seller_snapshot_lookup_fn=seller_lookup,
+        active_market_search_fn=_fake_active_search,
+        sold_market_search_fn=_fake_sold_search,
+        sold_average_lookup_fn=_fake_sold_average,
+    )
+
+    reply = handler("https://jp.mercari.com/item/m18542743389", "chat-1")
+
+    assert "快照顯示賣家風險中等，建議人工查看差評內容。" in reply
+    assert "差評重點：発送遲延 / 商品狀態落差 / 溝通回覆問題。" in reply
+    assert "最近差評例：" in reply
+    assert "発送が予定より遅かった。連絡も少なかったです。" in reply
+    assert "商品の状態が説明より悪かったです。少し残念でした。" in reply
 
 
 def test_research_handler_degrades_when_seller_snapshot_fails(tmp_path: Path) -> None:
