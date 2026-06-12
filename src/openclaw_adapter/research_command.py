@@ -22,6 +22,7 @@ SearchFn = Callable[[str, int], tuple[object, ...]]
 FetchHtmlFn = Callable[[str], str]
 SellerSnapshotLookupFn = Callable[[str], "SellerReputationSnapshot"]
 ActiveMarketSearchFn = Callable[[str, int, int], list[dict[str, object]]]
+SoldMarketSearchFn = Callable[[str, int], list[dict[str, object]]]
 SoldAverageLookupFn = Callable[[str], float | None]
 ResearchStageRunner = Callable[["ResearchJobContext"], str]
 
@@ -496,6 +497,7 @@ class ResearchCommandService:
         knowledge_db_path: str | None = None,
         seller_snapshot_lookup_fn: SellerSnapshotLookupFn | None = None,
         active_market_search_fn: ActiveMarketSearchFn | None = None,
+        sold_market_search_fn: SoldMarketSearchFn | None = None,
         sold_average_lookup_fn: SoldAverageLookupFn | None = None,
     ) -> None:
         self._notifier_factory = notifier_factory or (lambda chat_id: _NullResearchNotifier())
@@ -505,6 +507,7 @@ class ResearchCommandService:
         self._knowledge_db_path = knowledge_db_path
         self._seller_snapshot_lookup_fn = seller_snapshot_lookup_fn
         self._active_market_search_fn = active_market_search_fn or _default_active_market_search
+        self._sold_market_search_fn = sold_market_search_fn or _default_sold_market_search
         self._sold_average_lookup_fn = sold_average_lookup_fn or _default_sold_average_lookup
         self._lock = threading.Lock()
         self._active_chat_ids: set[str] = set()
@@ -714,11 +717,16 @@ class ResearchCommandService:
         price_cap = _derive_active_price_cap(listed_price)
         active_raw = self._active_market_search_fn(query, price_cap, 8)
         active_evidence = tuple(_price_evidence_from_market_item(item, sold_status="active") for item in active_raw)
-        sold_avg = self._sold_average_lookup_fn(query)
+        sold_raw = self._sold_market_search_fn(query, 8)
+        sold_evidence = tuple(_price_evidence_from_market_item(item, sold_status="sold") for item in sold_raw)
+        sold_avg = _average_price_from_evidence(sold_evidence)
+        if sold_avg is None:
+            sold_avg = self._sold_average_lookup_fn(query)
         result = _build_price_section_result(
             query=query,
             listed_price_jpy=listed_price,
             active_evidence=active_evidence,
+            sold_evidence=sold_evidence,
             sold_average_jpy=sold_avg,
         )
         ctx.add_section_result(result)
@@ -827,6 +835,8 @@ class ResearchCommandService:
                 f"- {result.section_name} [{result.status}] "
                 f"confidence={result.confidence:.2f} sample={result.sample_count}: {result.summary}"
             )
+            if result.evidence_urls:
+                lines.extend(f"  source: {url}" for url in result.evidence_urls[:4])
         if ctx.warnings:
             deduped = list(dict.fromkeys(ctx.warnings))
             lines.append("")
@@ -845,6 +855,7 @@ def build_research_handler(
     knowledge_db_path: str | None = None,
     seller_snapshot_lookup_fn: SellerSnapshotLookupFn | None = None,
     active_market_search_fn: ActiveMarketSearchFn | None = None,
+    sold_market_search_fn: SoldMarketSearchFn | None = None,
     sold_average_lookup_fn: SoldAverageLookupFn | None = None,
 ) -> Callable[[str, str], str]:
     service = ResearchCommandService(
@@ -856,6 +867,7 @@ def build_research_handler(
         knowledge_db_path=knowledge_db_path,
         seller_snapshot_lookup_fn=seller_snapshot_lookup_fn,
         active_market_search_fn=active_market_search_fn,
+        sold_market_search_fn=sold_market_search_fn,
         sold_average_lookup_fn=sold_average_lookup_fn,
     )
     return service.run
@@ -979,10 +991,16 @@ def _build_price_section_result(
     query: str,
     listed_price_jpy: int | None,
     active_evidence: tuple[PriceEvidence, ...],
+    sold_evidence: tuple[PriceEvidence, ...],
     sold_average_jpy: float | None,
 ) -> ResearchSectionResult:
     active_prices = [e.price_jpy for e in active_evidence if e.price_jpy is not None]
-    evidence_urls = tuple(e.source_url for e in active_evidence[:4] if e.source_url)
+    sold_prices = [e.price_jpy for e in sold_evidence if e.price_jpy is not None]
+    evidence_urls = tuple(
+        e.source_url
+        for e in (*sold_evidence[:3], *active_evidence[:3])
+        if e.source_url
+    )
     warnings: list[str] = []
     status = "ok"
     summary_parts: list[str] = []
@@ -991,7 +1009,8 @@ def _build_price_section_result(
         summary_parts.append(f"賣家開價 ¥{listed_price_jpy:,}")
 
     if sold_average_jpy is not None and sold_average_jpy > 0:
-        summary_parts.append(f"Mercari sold 均價約 ¥{sold_average_jpy:,.0f}")
+        sold_label = f"Mercari sold 樣本 {len(sold_prices)} 筆" if sold_prices else "Mercari sold 均價"
+        summary_parts.append(f"{sold_label}，均價約 ¥{sold_average_jpy:,.0f}")
     else:
         status = "partial"
         warnings.append("Mercari sold 價目前只拿到平均值接口；此查詢未回傳可用 sold avg。")
@@ -1019,6 +1038,10 @@ def _build_price_section_result(
         status = "unavailable"
         summary_parts = [f"查詢「{query}」未取得可用的 sold 或 active 樣本。"]
 
+    if sold_prices and len(sold_prices) < 3:
+        if status == "ok":
+            status = "partial"
+        warnings.append("sold 樣本少於 3 筆，成交均價可信度有限。")
     if active_prices and len(active_prices) < 3:
         if status == "ok":
             status = "partial"
@@ -1039,8 +1062,8 @@ def _build_price_section_result(
         section_name="合理市價分析",
         status=status,
         confidence=confidence,
-        sample_count=len(active_prices),
-        evidence_count=len(active_evidence) + (1 if sold_average_jpy is not None and sold_average_jpy > 0 else 0),
+        sample_count=len(active_prices) + len(sold_prices),
+        evidence_count=len(active_evidence) + len(sold_evidence) + (1 if sold_average_jpy is not None and sold_average_jpy > 0 else 0),
         summary="；".join(summary_parts),
         evidence_urls=evidence_urls,
         warnings=tuple(warnings),
@@ -1053,7 +1076,20 @@ def _default_active_market_search(query: str, price_cap: int, max_results: int) 
     return search_mercari(query, price_max=price_cap, max_results=max_results)
 
 
+def _default_sold_market_search(query: str, max_results: int) -> list[dict[str, object]]:
+    from market_monitor.mercari_search import search_mercari_sold
+
+    return search_mercari_sold(query, max_results=max_results)
+
+
 def _default_sold_average_lookup(query: str) -> float | None:
     from market_monitor.mercari_search import fetch_avg_sold_price
 
     return fetch_avg_sold_price(query)
+
+
+def _average_price_from_evidence(evidence: tuple[PriceEvidence, ...]) -> float | None:
+    prices = [price for price in (item.price_jpy for item in evidence) if price is not None]
+    if not prices:
+        return None
+    return sum(prices) / len(prices)

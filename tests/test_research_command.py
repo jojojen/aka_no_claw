@@ -56,6 +56,10 @@ def _fake_active_search(query: str, price_cap: int, max_results: int) -> list[di
     return []
 
 
+def _fake_sold_search(query: str, max_results: int) -> list[dict[str, object]]:
+    return []
+
+
 def _fake_sold_average(query: str) -> float | None:
     return None
 
@@ -111,6 +115,7 @@ def test_research_handler_reports_progress_heartbeat_and_final_reply() -> None:
             _placeholder("M1 骨架：已保留賣家風險分析階段"),
         ),
         active_market_search_fn=_fake_active_search,
+        sold_market_search_fn=_fake_sold_search,
         sold_average_lookup_fn=_fake_sold_average,
     )
 
@@ -149,6 +154,7 @@ def test_research_handler_rejects_overlapping_jobs_in_same_chat() -> None:
             _placeholder("名稱模式首版不做賣家風險"),
         ),
         active_market_search_fn=_fake_active_search,
+        sold_market_search_fn=_fake_sold_search,
         sold_average_lookup_fn=_fake_sold_average,
     )
 
@@ -181,6 +187,7 @@ def test_research_handler_fetches_mercari_item_and_persists_knowledge(tmp_path: 
         item_fetcher=item_fetcher,
         knowledge_db_path=str(knowledge_db_path),
         active_market_search_fn=_fake_active_search,
+        sold_market_search_fn=_fake_sold_search,
         sold_average_lookup_fn=_fake_sold_average,
     )
 
@@ -252,20 +259,49 @@ def test_research_handler_builds_price_section_from_active_and_sold_samples(tmp_
             },
         ]
 
+    def sold_search(query: str, max_results: int) -> list[dict[str, object]]:
+        assert "エヴァンゲリオン" in query
+        assert max_results == 8
+        return [
+            {
+                "item_id": "s1",
+                "title": "エヴァンゲリオン 綾波レイ 成交 1",
+                "price_jpy": 7000,
+                "url": "https://jp.mercari.com/item/s1",
+                "thumbnail_url": "",
+            },
+            {
+                "item_id": "s2",
+                "title": "エヴァンゲリオン 綾波レイ 成交 2",
+                "price_jpy": 7200,
+                "url": "https://jp.mercari.com/item/s2",
+                "thumbnail_url": "",
+            },
+            {
+                "item_id": "s3",
+                "title": "エヴァンゲリオン 綾波レイ 成交 3",
+                "price_jpy": 6800,
+                "url": "https://jp.mercari.com/item/s3",
+                "thumbnail_url": "",
+            },
+        ]
+
     handler = build_research_handler(
         notifier_factory=lambda chat_id: FakeNotifier(),
         item_fetcher=item_fetcher,
         knowledge_db_path=str(tmp_path / "knowledge.sqlite3"),
         active_market_search_fn=active_search,
-        sold_average_lookup_fn=lambda query: 7000.0,
+        sold_market_search_fn=sold_search,
+        sold_average_lookup_fn=lambda query: 9999.0,
     )
 
     reply = handler("https://jp.mercari.com/item/m18542743389", "chat-1")
 
     assert "合理市價分析 [ok]" in reply
-    assert "Mercari sold 均價約 ¥7,000" in reply
+    assert "Mercari sold 樣本 3 筆，均價約 ¥7,000" in reply
     assert "active 樣本 3 筆，中位數 ¥6,800，區間 ¥6,100–¥7,200" in reply
     assert "目前開價接近 sold 均價" in reply
+    assert "https://jp.mercari.com/item/s1" in reply
 
 
 def test_research_handler_price_stage_works_for_text_query_without_item_page() -> None:
@@ -293,6 +329,7 @@ def test_research_handler_price_stage_works_for_text_query_without_item_page() -
     handler = build_research_handler(
         notifier_factory=lambda chat_id: FakeNotifier(),
         active_market_search_fn=active_search,
+        sold_market_search_fn=_fake_sold_search,
         sold_average_lookup_fn=lambda query: None,
     )
 
@@ -335,6 +372,7 @@ def test_research_handler_includes_seller_snapshot_result(tmp_path: Path) -> Non
         knowledge_db_path=str(tmp_path / "knowledge.sqlite3"),
         seller_snapshot_lookup_fn=seller_lookup,
         active_market_search_fn=_fake_active_search,
+        sold_market_search_fn=_fake_sold_search,
         sold_average_lookup_fn=_fake_sold_average,
     )
 
@@ -359,6 +397,7 @@ def test_research_handler_degrades_when_seller_snapshot_fails(tmp_path: Path) ->
         knowledge_db_path=str(tmp_path / "knowledge.sqlite3"),
         seller_snapshot_lookup_fn=failing_lookup,
         active_market_search_fn=_fake_active_search,
+        sold_market_search_fn=_fake_sold_search,
         sold_average_lookup_fn=_fake_sold_average,
     )
 
@@ -413,6 +452,7 @@ def test_research_handler_falls_back_to_item_url_for_snapshot_when_seller_url_mi
         knowledge_db_path=str(tmp_path / "knowledge.sqlite3"),
         seller_snapshot_lookup_fn=seller_lookup,
         active_market_search_fn=_fake_active_search,
+        sold_market_search_fn=_fake_sold_search,
         sold_average_lookup_fn=_fake_sold_average,
     )
 
