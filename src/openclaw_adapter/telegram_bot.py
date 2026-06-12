@@ -120,6 +120,27 @@ REPUTATION_SNAPSHOT_COMMANDS = {"/snapshot", "/proof", "/repcheck", "/reputation
 HEAVY_COMMANDS = PRICE_LOOKUP_COMMANDS | TREND_BOARD_COMMANDS | REPUTATION_SNAPSHOT_COMMANDS
 
 
+def _run_research_worker_call(func: Callable[[], object]) -> object:
+    result_box: dict[str, object] = {}
+    error_box: dict[str, BaseException] = {}
+    done = threading.Event()
+
+    def runner() -> None:
+        try:
+            result_box["value"] = func()
+        except BaseException as exc:  # pragma: no cover - re-raised to caller
+            error_box["error"] = exc
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=runner, daemon=True)
+    thread.start()
+    done.wait()
+    if "error" in error_box:
+        raise error_box["error"]
+    return result_box.get("value")
+
+
 class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
     """OpenClaw compatibility wrapper around the reusable Telegram processor."""
 
@@ -686,8 +707,16 @@ def _build_registries(
     scorecard_handler = build_scorecard_handler(settings)
     research_handler = build_research_handler(
         notifier_factory=research_notifier_factory,
+        search_fn=lambda q, limit: _run_research_worker_call(
+            lambda: search_yahoo_japan_playwright(
+                q,
+                max_results=limit,
+                reuse_context=False,
+            )
+        ),
         knowledge_db_path=settings.knowledge_db_path,
         seller_snapshot_lookup_fn=_build_research_seller_snapshot_lookup(settings),
+        ip_heat_lookup_fn=_build_research_ip_heat_lookup(settings),
     )
 
     def _quizlikesong_handler(remainder: str, chat_id: str):
@@ -921,6 +950,26 @@ def _extract_negative_seller_review_excerpts(review_entries: object) -> tuple[st
         if len(excerpts) >= 3:
             break
     return tuple(excerpts)
+
+
+def _build_research_ip_heat_lookup(
+    settings: AssistantSettings,
+) -> "Callable[[tuple[str, ...]], dict[str, tuple[object, ...]]]":
+    from pathlib import Path as _Path
+
+    from .ip_heat_store import IpHeatStore
+
+    store = IpHeatStore(_Path(settings.knowledge_db_path).with_name("ip_heat.sqlite3"))
+
+    def lookup(canonicals: tuple[str, ...]) -> dict[str, tuple[object, ...]]:
+        result: dict[str, tuple[object, ...]] = {}
+        for canonical in canonicals:
+            signals = tuple(store.latest_for_ip(canonical))
+            if signals:
+                result[canonical] = signals
+        return result
+
+    return lookup
 
 
 def run_telegram_polling(

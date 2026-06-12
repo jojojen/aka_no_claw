@@ -371,7 +371,9 @@ def test_build_registries_passes_knowledge_db_path_to_research_handler(monkeypat
     _build_registries(settings, dynamic_tool_runner=None)
 
     assert seen["knowledge_db_path"] == str(tmp_path / "knowledge.sqlite3")
+    assert callable(seen["search_fn"])
     assert callable(seen["seller_snapshot_lookup_fn"])
+    assert callable(seen["ip_heat_lookup_fn"])
 
 
 def test_command_processor_routes_research_to_registered_handler_before_web_search() -> None:
