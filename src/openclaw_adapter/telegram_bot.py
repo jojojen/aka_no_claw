@@ -8,6 +8,7 @@ import json
 import shutil
 import threading
 import uuid
+import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from pathlib import Path
@@ -84,7 +85,14 @@ from .voice_command import (
     build_voice_callback_handler,
     build_voice_handler,
 )
-from .research_command import ResearchNotifier, SellerReputationSnapshot, build_research_handler
+from .research_command import (
+    ResearchNotifier,
+    ResearchReport,
+    SellerReputationSnapshot,
+    build_research_handler,
+    format_research_compact_report,
+    format_research_detail_report,
+)
 from .natural_language import build_telegram_natural_language_router_from_settings
 from .quiz_favorite_songs import extract_first_youtube_url
 from .opportunity_command import (
@@ -139,6 +147,88 @@ def _run_research_worker_call(func: Callable[[], object]) -> object:
     if "error" in error_box:
         raise error_box["error"]
     return result_box.get("value")
+
+
+class _ResearchReplyCache:
+    def __init__(self, *, max_entries: int = 128, ttl_seconds: int = 3600) -> None:
+        self._max_entries = max(8, max_entries)
+        self._ttl_seconds = max(60, ttl_seconds)
+        self._lock = threading.Lock()
+        self._entries: dict[str, tuple[str, float, ResearchReport]] = {}
+
+    def put(self, report: ResearchReport) -> str:
+        token = uuid.uuid4().hex[:8]
+        now = time.time()
+        with self._lock:
+            self._prune_locked(now)
+            self._entries[token] = (report.chat_id, now, report)
+            while len(self._entries) > self._max_entries:
+                oldest_token = next(iter(self._entries))
+                self._entries.pop(oldest_token, None)
+        return token
+
+    def get(self, *, token: str, chat_id: str) -> ResearchReport | None:
+        now = time.time()
+        with self._lock:
+            self._prune_locked(now)
+            entry = self._entries.get(token)
+            if entry is None:
+                return None
+            stored_chat_id, _created_at, report = entry
+            if stored_chat_id != chat_id:
+                return None
+            return report
+
+    def _prune_locked(self, now: float) -> None:
+        expired = [
+            token
+            for token, (_chat_id, created_at, _report) in self._entries.items()
+            if now - created_at > self._ttl_seconds
+        ]
+        for token in expired:
+            self._entries.pop(token, None)
+
+
+def _build_research_reply_markup(token: str) -> dict[str, object]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "摘要", "callback_data": f"rs:{token}:summary"},
+                {"text": "看市價", "callback_data": f"rs:{token}:price"},
+            ],
+            [
+                {"text": "看賣家", "callback_data": f"rs:{token}:seller"},
+                {"text": "看來源", "callback_data": f"rs:{token}:sources"},
+            ],
+            [
+                {"text": "看警告", "callback_data": f"rs:{token}:warnings"},
+            ],
+        ]
+    }
+
+
+def _build_research_reply_formatter(
+    cache: _ResearchReplyCache,
+) -> "Callable[[ResearchReport], tuple[str, dict[str, object]]]":
+    def render(report: ResearchReport) -> tuple[str, dict[str, object]]:
+        token = cache.put(report)
+        return format_research_compact_report(report), _build_research_reply_markup(token)
+
+    return render
+
+
+def _build_research_callback_handler(
+    cache: _ResearchReplyCache,
+) -> "Callable[[str, str, str], tuple[object, str | None, object]]":
+    def handler(payload: str, original_text: str, chat_id: str) -> tuple[object, str | None, object]:
+        token, _, view = (payload or "").partition(":")
+        report = cache.get(token=token, chat_id=str(chat_id))
+        if report is None:
+            return "研究結果已過期，請重新執行 /research。", None, None
+        detail_text = format_research_detail_report(report, view=view or "summary")
+        return "已切換研究視圖", detail_text, _build_research_reply_markup(token)
+
+    return handler
 
 
 class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
@@ -705,6 +795,7 @@ def _build_registries(
     backup_handler = build_backup_handler(settings)
     recover_handler = build_recover_handler(settings)
     scorecard_handler = build_scorecard_handler(settings)
+    research_cache = _ResearchReplyCache()
     research_handler = build_research_handler(
         notifier_factory=research_notifier_factory,
         search_fn=lambda q, limit: _run_research_worker_call(
@@ -717,6 +808,7 @@ def _build_registries(
         knowledge_db_path=settings.knowledge_db_path,
         seller_snapshot_lookup_fn=_build_research_seller_snapshot_lookup(settings),
         ip_heat_lookup_fn=_build_research_ip_heat_lookup(settings),
+        final_formatter=_build_research_reply_formatter(research_cache),
     )
 
     def _quizlikesong_handler(remainder: str, chat_id: str):
@@ -860,6 +952,7 @@ def _build_registries(
         "snsaddok": build_snsaddok_callback_handler(sns_db, sns_inbox=sns_inbox),
         "snsfb": build_snsfb_callback_handler(sns_db, sns_inbox=sns_inbox),
         "oppfb": build_hunt_callback_handler(settings, opportunity_inbox=opportunity_inbox),
+        "rs": _build_research_callback_handler(research_cache),
     }
 
     view_handlers = {
