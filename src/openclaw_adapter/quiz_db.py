@@ -30,6 +30,10 @@ from hashlib import sha1
 from pathlib import Path
 from typing import Iterator
 
+from .grammar_card_manual_overrides import (
+    get_grammar_card_manual_override,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -81,6 +85,10 @@ def is_reading_exam_point(exam_point: str | None) -> bool:
 _BRACKET_TOKEN = re.compile(r"[〈「『]([^〈「『〉」』]+)[〉」』]")
 # Cloze / grammar-form / passage-grammar: the blank's correct option IS the 考点.
 _ANSWER_IS_POINT = ("文脈規定", "文法形式の判断", "文章の文法")
+_TITLE_READING_MARKERS = re.compile(r"曲名|歌名|タイトル")
+_GENERIC_YOUHOU_STEM_RE = re.compile(
+    r"^(?:次のうち、)?(?:語句)?[「〈][^」〉]+[」〉]の使い方として最も適切な(?:文|もの)はどれか。?$"
+)
 
 
 def _token_before(stem: str, keyword: str) -> str | None:
@@ -114,6 +122,37 @@ def derive_tested_point(
         if 0 <= answer_index < len(opts):
             return str(opts[answer_index]).strip() or None
     return None
+
+
+def reading_question_targets_source_title(
+    *, exam_point: str | None, stem: str, source_excerpt_type: str | None
+) -> bool:
+    """Reject reading items that test a song/article title rather than a vocab word.
+
+    These usually appear as prompts like 「次の曲名『X』の読み方…」 or are grounded
+    only by a title excerpt. They are formally answerable but pedagogically weak:
+    they test memorized title strings, not lexical reading ability.
+    """
+    ep = (exam_point or "").strip()
+    if "漢字読み" not in ep:
+        return False
+    if _normalize_source_excerpt_type(source_excerpt_type) == "title":
+        return True
+    return bool(_TITLE_READING_MARKERS.search(stem or ""))
+
+
+def youhou_uses_generic_template_stem(*, exam_point: str | None, stem: str) -> bool:
+    """Reject generic 用法 stems that add no memory value.
+
+    A bare prompt like 「次のうち、語句『X』の使い方として最も適切な文はどれか」 only
+    wraps four options in a quiz shell; it does not itself teach the word or help
+    retention. The user requested fail-closed behavior here: if we cannot author a
+    meaningful contextual prompt, we should not keep the item.
+    """
+    ep = (exam_point or "").strip()
+    if "用法" not in ep:
+        return False
+    return bool(_GENERIC_YOUHOU_STEM_RE.match((stem or "").strip()))
 
 
 def _normalize_grounding(text: str | None) -> str:
@@ -309,12 +348,220 @@ def _normalize_vocab_example_identity(example: str | None) -> str:
     return _normalize_grounding(example or "")
 
 
+_MAX_GRAMMAR_EXAMPLE_CHARS = 110
+_GRAMMAR_BLANK_RE = re.compile(r"[（(][\s　]*[）)]|[（(][\s　]+")
+
+
+def _strip_commentary_frame(text: str) -> str:
+    text = (text or "").strip()
+    text = re.sub(r"^[「『][^」』]+[」』]の解説(?:では|によれば)、?", "", text).strip()
+    text = re.sub(r"^解説では、?", "", text).strip()
+    text = re.sub(r"^解説によれば、?", "", text).strip()
+    text = re.sub(r"、?と筆者は読み解いている。?$", "。", text).strip()
+    text = re.sub(r"、?と述べられている。?$", "。", text).strip()
+    return text
+
+
+def _question_answer_option(row: sqlite3.Row) -> str:
+    try:
+        options = json.loads(row["options_json"] or "[]")
+        answer_index = int(row["answer_index"])
+    except Exception:
+        return ""
+    if (
+        isinstance(options, list)
+        and 0 <= answer_index < len(options)
+        and isinstance(options[answer_index], str)
+    ):
+        return options[answer_index].strip()
+    return ""
+
+
+def _short_grammar_excerpt_candidate(excerpt: str, answer: str) -> str:
+    excerpt = _clean_vocab_source_excerpt(excerpt or "")
+    if not excerpt:
+        return ""
+    stripped_excerpt = _strip_commentary_frame(excerpt)
+    if (
+        len(stripped_excerpt) <= _MAX_GRAMMAR_EXAMPLE_CHARS
+        and not any(marker in stripped_excerpt for marker in ("解説", "筆者", "読み解"))
+    ):
+        return stripped_excerpt
+    pieces = [
+        _strip_commentary_frame(p.strip())
+        for p in re.split(r"(?<=[。！？!?])|[\r\n]+", excerpt)
+        if _strip_commentary_frame(p.strip())
+    ]
+    if answer:
+        answer_pieces = [p for p in pieces if answer in p]
+        if answer_pieces:
+            short = [p for p in answer_pieces if len(p) <= _MAX_GRAMMAR_EXAMPLE_CHARS]
+            if short:
+                return min(short, key=len)
+            return min(answer_pieces, key=len)[:_MAX_GRAMMAR_EXAMPLE_CHARS].rstrip("、，, ") + "…"
+        index = excerpt.find(answer)
+        if index >= 0:
+            start = max(0, index - 30)
+            end = min(len(excerpt), index + len(answer) + 45)
+            return excerpt[start:end].strip(" 、，,\n\r\t") + "…"
+    short_pieces = [
+        p for p in pieces
+        if 8 <= len(p) <= _MAX_GRAMMAR_EXAMPLE_CHARS
+        and not any(marker in p for marker in ("解説", "筆者", "読み解", "とされる"))
+    ]
+    if short_pieces:
+        return min(short_pieces, key=len)
+    return excerpt[:_MAX_GRAMMAR_EXAMPLE_CHARS].rstrip("、，, ") + "…"
+
+
 def _grammar_card_example(row: sqlite3.Row) -> str:
-    excerpt = _clean_vocab_source_excerpt(row["source_excerpt"] or "")
+    stem = re.sub(r"\s+", " ", (row["stem"] or "").strip())
+    answer = _question_answer_option(row)
+    if stem and answer and _GRAMMAR_BLANK_RE.search(stem):
+        filled = _GRAMMAR_BLANK_RE.sub(answer, stem)
+        if filled != stem:
+            return filled
+    excerpt = _short_grammar_excerpt_candidate(row["source_excerpt"] or "", answer)
     if excerpt:
         return excerpt
-    stem = re.sub(r"\s+", " ", (row["stem"] or "").strip())
     return stem
+
+
+def _grammar_card_example_source_kind(row: sqlite3.Row, example_ja: str) -> str:
+    stem = re.sub(r"\s+", " ", (row["stem"] or "").strip())
+    answer = _question_answer_option(row)
+    if stem and answer and _GRAMMAR_BLANK_RE.search(stem):
+        filled = _GRAMMAR_BLANK_RE.sub(answer, stem)
+        if filled == example_ja:
+            return "adapted"
+    return "source_excerpt" if (row["source_excerpt"] or "").strip() else "stem"
+
+
+def _grammar_card_has_safe_source(
+    row: sqlite3.Row,
+    example_ja: str,
+    example_source_kind: str,
+    manual_override: object | None = None,
+) -> bool:
+    """Fail closed for learner-facing grammar cards.
+
+    Grammar questions can remain in the quiz pool, but a study card should only
+    be shown when its example is clearly usable as a learning example and not a
+    loose source-themed rewrite.
+    """
+    exam_point = (row["exam_point"] or "").strip()
+    explanation = row["explanation"] or ""
+    source_excerpt = _clean_vocab_source_excerpt(row["source_excerpt"] or "")
+    example = (example_ja or "").strip()
+
+    if not example:
+        return False
+    if len(example) > _MAX_GRAMMAR_EXAMPLE_CHARS:
+        return False
+    if any(marker in example for marker in ("解説", "筆者", "読み解いて")):
+        return False
+    if manual_override is not None and getattr(manual_override, "example_ja", None):
+        return example_source_kind == "adapted"
+
+    if exam_point in {"文法形式の判断", "文章の文法"}:
+        if example_source_kind != "adapted":
+            return False
+        if "原歌詞" in explanation and source_excerpt and source_excerpt not in example:
+            # A source-inspired rewrite is not enough for a correctness-first
+            # grammar card; it can imply the lyric itself is the grammar example.
+            return False
+        return True
+
+    if exam_point == "文の組み立て":
+        return False
+
+    return False
+
+
+_GRAMMAR_SUMMARY_DROP_MARKERS: tuple[str, ...] = (
+    "正しい並びは",
+    "★印",
+    "空欄",
+    "正解",
+    "選択肢",
+    "出典の対応箇所",
+    "【読み】",
+    "に入るのは",
+)
+_GRAMMAR_SUMMARY_KEEP_MARKERS: tuple[str, ...] = (
+    "表す",
+    "意味",
+    "含み",
+    "接続",
+    "付いて",
+    "直後",
+    "直前",
+    "文末",
+    "連体修飾",
+    "呼応",
+    "固定",
+    "構造",
+    "中止形",
+    "逆接",
+    "引用",
+    "条件",
+    "補語",
+    "述語",
+    "主語",
+    "受身",
+    "意向形",
+    "縮約形",
+    "文語",
+    "慣用句",
+)
+_GRAMMAR_SUMMARY_MAX_CHARS = 120
+
+
+def _split_japanese_sentences(text: str) -> list[str]:
+    parts = re.split(r"(?<=。)", text or "")
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _normalize_grammar_summary_text(text: str) -> str:
+    text = re.sub(r"【読み】.*$", "", text).strip()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def build_grammar_card_summary(*, headword: str, exam_point: str, explanation: str) -> str:
+    """Build a prelearning summary from a question explanation without repeating
+    answer-specific detail. This is deterministic on purpose: zero extra tokens,
+    and the output stays grounded in the reviewed explanation text."""
+    cleaned = _normalize_grammar_summary_text(explanation)
+    if not cleaned:
+        return (headword or exam_point or "").strip()
+
+    candidates: list[str] = []
+    for sentence in _split_japanese_sentences(cleaned):
+        if any(marker in sentence for marker in _GRAMMAR_SUMMARY_DROP_MARKERS):
+            continue
+        if any(marker in sentence for marker in _GRAMMAR_SUMMARY_KEEP_MARKERS):
+            candidates.append(sentence)
+    if not candidates:
+        for sentence in _split_japanese_sentences(cleaned):
+            if any(marker in sentence for marker in _GRAMMAR_SUMMARY_DROP_MARKERS):
+                continue
+            candidates.append(sentence)
+            if len(candidates) >= 2:
+                break
+    if not candidates:
+        base = (headword or exam_point or "").strip()
+        return base[:_GRAMMAR_SUMMARY_MAX_CHARS]
+
+    summary = "".join(candidates[:2]).strip()
+    if exam_point == "文の組み立て" and headword and headword not in summary:
+        summary = f"{headword}。{summary}".strip()
+    if len(summary) > _GRAMMAR_SUMMARY_MAX_CHARS:
+        cut = summary[:_GRAMMAR_SUMMARY_MAX_CHARS].rstrip("、，・ ")
+        if "。" in cut:
+            cut = cut[: cut.rfind("。") + 1]
+        summary = cut or summary[:_GRAMMAR_SUMMARY_MAX_CHARS]
+    return summary.strip()
 
 
 def _stem_segments(stem: str) -> list[str]:
@@ -1332,11 +1579,51 @@ class QuizDatabase:
                 ),
                 group[0],
             )
-            example_ja = _grammar_card_example(primary)
-            explanation_zh = (primary["explanation"] or "").strip()
+            manual_override = get_grammar_card_manual_override(headword)
+            manual_explanation = manual_override.explanation_zh if manual_override else None
+            example_ja = (
+                manual_override.example_ja
+                if manual_override and manual_override.example_ja is not None
+                else _grammar_card_example(primary)
+            )
+            explanation_zh = manual_explanation or build_grammar_card_summary(
+                headword=headword,
+                exam_point=(primary["exam_point"] or "").strip(),
+                explanation=(primary["explanation"] or "").strip(),
+            )
             if not example_ja or not explanation_zh:
                 if existing is not None:
                     seen_ids.add(card_id)
+                continue
+            example_source_kind = (
+                manual_override.example_source_kind
+                if manual_override and manual_override.example_source_kind is not None
+                else _grammar_card_example_source_kind(primary, example_ja)
+            )
+            source_name = (
+                manual_override.source_name
+                if manual_override and manual_override.source_name is not None
+                else (primary["source_name"] or "").strip()
+            )
+            source_text_url = (
+                manual_override.source_text_url
+                if manual_override and manual_override.example_ja is not None
+                else primary["source_text_url"]
+            )
+            source_media_url = (
+                manual_override.source_media_url
+                if manual_override and manual_override.example_ja is not None
+                else primary["source_media_url"]
+            )
+            if example_source_kind == "adapted" and not (
+                manual_override and manual_override.example_ja is not None
+            ):
+                source_name = "改寫例句"
+                source_text_url = None
+                source_media_url = None
+            if not _grammar_card_has_safe_source(
+                primary, example_ja, example_source_kind, manual_override
+            ):
                 continue
             support_ids = tuple(
                 dict.fromkeys(
@@ -1389,10 +1676,10 @@ class QuizDatabase:
                     headword,
                     explanation_zh,
                     example_ja,
-                    "source_excerpt" if (primary["source_excerpt"] or "").strip() else "stem",
-                    (primary["source_name"] or "").strip(),
-                    primary["source_text_url"],
-                    primary["source_media_url"],
+                    example_source_kind,
+                    source_name,
+                    source_text_url,
+                    source_media_url,
                     (primary["question_id"] or "").strip(),
                     json.dumps(list(support_ids), ensure_ascii=False),
                     json.dumps(list(exam_points), ensure_ascii=False),
@@ -1467,12 +1754,33 @@ class QuizDatabase:
                 "may use article/commentary text only when the quoted source text is "
                 "verbatim grounded, and title-only grounding is limited to 漢字読み"
             )
+        if reading_question_targets_source_title(
+            exam_point=exam_point, stem=stem, source_excerpt_type=excerpt_kind
+        ):
+            raise ValueError(
+                "reading item targets source title: 漢字読み must test a lexical item, "
+                "not ask how a song/article title is read"
+            )
+        if youhou_uses_generic_template_stem(exam_point=exam_point, stem=stem):
+            raise ValueError(
+                "youhou item uses generic template stem: every question must carry "
+                "its own memory value, not just wrap options in a stock prompt"
+            )
         if youhou_target_word_presence_leaks(
             exam_point=exam_point, stem=stem, options=opts, answer_index=int(answer_index)
         ):
             raise ValueError(
                 "youhou item leaks by target-word presence: at least one distractor "
                 "must also use the target word form"
+            )
+        reading_distractor_issues = audit_kanji_reading_distractors(
+            options=opts, answer_index=int(answer_index)
+        )
+        if exam_point == "漢字読み" and reading_distractor_issues:
+            raise ValueError(
+                "kanji reading distractors are implausible: distractors must be "
+                "plausible wrong readings of the same target word, not unrelated "
+                "readings or phrase-length garbage"
             )
         if not allow_ungrounded and not is_grounded(
             exam_point=exam_point or "",
@@ -2081,6 +2389,14 @@ class QuizDatabase:
                 tuple(params),
             ).fetchall()
         return [_row_to_grammar_card(r) for r in rows]
+
+    def set_grammar_card_explanation(self, *, card_id: str, explanation_zh: str) -> bool:
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "UPDATE quiz_grammar_cards SET explanation_zh = ?, updated_at = ? WHERE card_id = ?",
+                ((explanation_zh or "").strip(), _utc_now_iso(), (card_id or "").strip()),
+            )
+        return cursor.rowcount > 0
 
     def _vocab_progress_maps(self, conn, chat_id: str | None):
         attempts: dict[str, list[int]] = {}

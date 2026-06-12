@@ -7,10 +7,13 @@ import pytest
 
 from openclaw_adapter.quiz_db import (
     QuizDatabase,
+    build_grammar_card_summary,
     build_question_id,
+    reading_question_targets_source_title,
     format_authoring_knowledge_block,
     infer_source_excerpt_type,
     is_grounded,
+    youhou_uses_generic_template_stem,
     source_excerpt_vocab_example,
     source_excerpt_type_conflicts_with_exam_point,
     synonym_answer_restates_headword,
@@ -391,24 +394,25 @@ class TestVocabCards:
     def test_title_source_excerpt_does_not_backfill_vocab_card(self, tmp_path):
         db = _db(tmp_path)
         db.upsert_vocab_seed("25時の情熱", "にごじのじょうねつ", "歌曲名稱")
-        db.insert_question(
-            level="JLPT N1",
-            exam_point="漢字読み",
-            stem="次の一節「25時の情熱」にある〈25時の情熱〉の読み方として最も適切なものはどれか。",
-            options=("にごじのじょうねつ", "にじゅうごじのじょうねつ", "にごときのねつ", "ごじのじょうねつ"),
-            answer_index=0,
-            explanation="〈25時の情熱〉は「にごじのじょうねつ」と読む。",
-            source_type="vocaloid_song",
-            source_name="25時の情熱",
-            source_text_url="https://vocadb.net/Search?searchType=Song&filter=Songs&query=25%E6%99%82%E3%81%AE%E6%83%85%E7%86%B1",
-            source_media_url="https://youtu.be/RifILHUOV_w",
-            source_excerpt="25時の情熱",
-            source_excerpt_type="title",
-            tested_point="25時の情熱",
-            author="codex",
-            verified=True,
-            allow_ungrounded=True,
-        )
+        with pytest.raises(ValueError, match="reading item targets source title"):
+            db.insert_question(
+                level="JLPT N1",
+                exam_point="漢字読み",
+                stem="次の一節「25時の情熱」にある〈25時の情熱〉の読み方として最も適切なものはどれか。",
+                options=("にごじのじょうねつ", "にじゅうごじのじょうねつ", "にごときのねつ", "ごじのじょうねつ"),
+                answer_index=0,
+                explanation="〈25時の情熱〉は「にごじのじょうねつ」と読む。",
+                source_type="vocaloid_song",
+                source_name="25時の情熱",
+                source_text_url="https://vocadb.net/Search?searchType=Song&filter=Songs&query=25%E6%99%82%E3%81%AE%E6%83%85%E7%86%B1",
+                source_media_url="https://youtu.be/RifILHUOV_w",
+                source_excerpt="25時の情熱",
+                source_excerpt_type="title",
+                tested_point="25時の情熱",
+                author="codex",
+                verified=True,
+                allow_ungrounded=True,
+            )
         assert db.get_vocab_card(headword="25時の情熱", level="JLPT N1") is None
 
     def test_vocab_example_low_value_detection(self):
@@ -609,7 +613,7 @@ class TestVocabCards:
         youhou_q = db.insert_question(
             level="JLPT N1",
             exam_point="用法",
-            stem="〈範疇〉の使い方として最も適切なものはどれか。",
+            stem="業務の範囲を説明する文脈で、〈範疇〉の使い方として最も適切なものはどれか。",
             options=("彼の態度は範疇だ。", "これは業務の範疇だ。", "範疇が速く走る。", "範疇を飲んだ。"),
             answer_index=1,
             explanation="「範疇」は物事の範囲・カテゴリーを表す。",
@@ -845,6 +849,20 @@ class TestSourceExcerptType:
 
 
 class TestYouhouLeakGuard:
+    def test_detects_generic_youhou_template_stem(self):
+        assert youhou_uses_generic_template_stem(
+            exam_point="用法",
+            stem="次のうち、語句「魅了する」の使い方として最も適切な文はどれか。",
+        )
+        assert youhou_uses_generic_template_stem(
+            exam_point="用法",
+            stem="「浪費」の使い方として最も適切なものはどれか。",
+        )
+        assert not youhou_uses_generic_template_stem(
+            exam_point="用法",
+            stem="困難な課題に直面する意の「壁にぶち当たる」の使い方として最も適切なものはどれか。",
+        )
+
     def test_detects_target_word_presence_leak(self):
         assert youhou_target_word_presence_leaks(
             exam_point="用法",
@@ -877,12 +895,31 @@ class TestYouhouLeakGuard:
             db.insert_question(
                 level="JLPT N1",
                 exam_point="用法",
-                stem="次のうち、語句「魅了する」の使い方として最も適切な文はどれか。",
+                stem="観客が強く引きつけられる場面で、語句「魅了する」の使い方として最も適切な文はどれか。",
                 options=(
                     "重なる波形に魅了されていく",
                     "甘い香りに魅惑されて、しばらくその場を離れられなかった",
                     "観客は演奏に陶酔して、終演後もしばらく席を立てなかった",
                     "不思議な光に惹きつけられて、彼は思わず足を止めた",
+                ),
+                answer_index=0,
+                source_name="ヒビカセ",
+                source_text_url="http://vgperson.com/lyrics.php?song=hibikase",
+                source_excerpt="重なる波形に魅了されていく",
+            )
+
+    def test_insert_rejects_generic_youhou_template_stem(self, tmp_path):
+        db = _db(tmp_path)
+        with pytest.raises(ValueError, match="generic template stem"):
+            db.insert_question(
+                level="JLPT N1",
+                exam_point="用法",
+                stem="次のうち、語句「魅了する」の使い方として最も適切な文はどれか。",
+                options=(
+                    "重なる波形に魅了されていく",
+                    "観客は演奏を魅了されて、終演後もしばらく席を立てなかった",
+                    "甘い香りが彼に魅了して、店先で足を止めさせた",
+                    "その演説は聴衆に魅了され、多くの支持を集めた",
                 ),
                 answer_index=0,
                 source_name="ヒビカセ",
@@ -1210,6 +1247,45 @@ class TestDeriveTestedPoint:
                                    options=["a", "b"], answer_index=0) is None
 
 
+class TestReadingTitleGuard:
+    def test_detects_explicit_song_title_reading_prompt(self):
+        assert reading_question_targets_source_title(
+            exam_point="漢字読み",
+            stem="次の曲名「ロストワンの号哭」にある〈号哭〉の読み方として最も適切なものはどれか。",
+            source_excerpt_type="lyric",
+        )
+
+    def test_detects_title_only_grounding_even_without_marker(self):
+        assert reading_question_targets_source_title(
+            exam_point="漢字読み",
+            stem="「〈号哭〉」の読み方として正しいものはどれか。",
+            source_excerpt_type="title",
+        )
+
+    def test_allows_lexical_reading_grounded_by_real_lyric(self):
+        assert not reading_question_targets_source_title(
+            exam_point="漢字読み",
+            stem="次の歌詞の「号哭」の読み方として正しいものはどれか。",
+            source_excerpt_type="lyric",
+        )
+
+    def test_insert_rejects_song_title_reading_prompt(self, tmp_path):
+        db = _db(tmp_path)
+        with pytest.raises(ValueError, match="reading item targets source title"):
+            db.insert_question(
+                level="JLPT N1",
+                exam_point="漢字読み",
+                stem="次の曲名「ロストワンの号哭」にある〈号哭〉の読み方として最も適切なものはどれか。",
+                options=("ごうこく", "ごうきゅう", "こうこく", "ごうなき"),
+                answer_index=0,
+                source_name="ロストワンの号哭",
+                source_excerpt="ロストワンの号哭",
+                source_excerpt_type="title",
+                tested_point="号哭",
+                author="codex",
+            )
+
+
 class TestKanjiReadingDistractorAudit:
     def test_flags_zero_overlap_distractors(self):
         from openclaw_adapter.quiz_db import audit_kanji_reading_distractors
@@ -1239,6 +1315,23 @@ class TestKanjiReadingDistractorAudit:
     def test_out_of_range_answer_index_is_safe(self):
         from openclaw_adapter.quiz_db import audit_kanji_reading_distractors
         assert audit_kanji_reading_distractors(options=("a", "b"), answer_index=9) == []
+
+    def test_insert_rejects_implausible_reading_distractors(self, tmp_path):
+        db = _db(tmp_path)
+        with pytest.raises(ValueError, match="kanji reading distractors are implausible"):
+            db.insert_question(
+                level="JLPT N1",
+                exam_point="漢字読み",
+                stem="「創造」の読み方として正しいものはどれか。",
+                options=("そうぞう", "けいばつ", "やきめ", "そうさく"),
+                answer_index=0,
+                source_name="sample",
+                source_excerpt="創造",
+                source_excerpt_type="lyric",
+                tested_point="創造",
+                author="codex",
+                allow_ungrounded=True,
+            )
 
 
 class TestQuestionDedup:
@@ -1563,7 +1656,8 @@ class TestGrammarCards:
         card = db.get_grammar_card(headword="〜まい", level="JLPT N1")
         assert card is not None
         assert card.primary_question_id == q.question_id
-        assert card.example_ja == "逃げるまいと心に決めた。"
+        assert card.example_ja == "彼は最後まで逃げるまいと踏みとどまった。"
+        assert card.example_source_kind == "adapted"
         assert "否定意志" in card.explanation_zh
         assert card.exam_points == ("文章の文法",)
 
@@ -1598,6 +1692,226 @@ class TestGrammarCards:
         )
         wrong_cards = db.list_grammar_cards(level="JLPT N1", chat_id="u1", mode="wrong")
         assert [c.headword for c in wrong_cards] == ["〜以上"]
+
+    def test_grammar_card_summary_strips_answer_specific_noise(self, tmp_path):
+        db = _db(tmp_path)
+        db.insert_question(
+            level="JLPT N1",
+            exam_point="文の組み立て",
+            stem="＿＿　＿＿　★＿＿　＿＿",
+            options=("身動きも", "取れず", "眺めてる", "世界は不自由だなって"),
+            answer_index=1,
+            explanation=(
+                "正しい並びは『身動きも→取れず→眺めてる→世界は不自由だなって』で、"
+                "『身動きも取れず眺めてる世界は不自由だなって、ため息をつく。』となる。"
+                "慣用句「身動きも取れない」の文語的な中止形「取れず」は「身動きも」の直後に来て"
+                "『〜できないまま』を表す。"
+                "「眺めてる」は連体修飾として名詞「世界」に掛かり、"
+                "「世界は不自由だなって」が感想の引用として「ため息をつく」につながる。"
+                "★印の空欄（＿＿②）に入るのは「取れず」。"
+                "出典の対応箇所は「身動きも取れず眺めてる世界は不自由だなって」。"
+                "【読み】身動（みうご）き・取（と）れず"
+            ),
+            source_type="vocaloid_song",
+            source_name="反逆者の僕ら",
+            source_text_url="https://example.com/text",
+            source_excerpt="身動きも取れず眺めてる世界は不自由だなって",
+            tested_point="文語否定「ず」の中止法",
+            author="Claude",
+            verified=True,
+            allow_ungrounded=True,
+        )
+        card = db.get_grammar_card(headword="文語否定「ず」の中止法", level="JLPT N1")
+        assert card is not None
+        assert "正しい並び" not in card.explanation_zh
+        assert "★印" not in card.explanation_zh
+        assert "【読み】" not in card.explanation_zh
+        assert "動詞連用形後" in card.explanation_zh
+        assert len(card.explanation_zh) <= 120
+
+
+def test_build_grammar_card_summary_prefers_prelearning_sentences():
+    summary = build_grammar_card_summary(
+        headword="文語否定「ず」の中止法",
+        exam_point="文の組み立て",
+        explanation=(
+            "正しい並びは『身動きも→取れず→眺めてる→世界は不自由だなって』で、"
+            "『身動きも取れず眺めてる世界は不自由だなって、ため息をつく。』となる。"
+            "慣用句「身動きも取れない」の文語的な中止形「取れず」は「身動きも」の直後に来て"
+            "『〜できないまま』を表す。"
+            "★印の空欄（＿＿②）に入るのは「取れず」。"
+            "【読み】身動（みうご）き・取（と）れず"
+        ),
+    )
+    assert "正しい並び" not in summary
+    assert "★印" not in summary
+    assert "【読み】" not in summary
+    assert "〜できないまま" in summary
+
+
+def test_grammar_card_manual_override_wins_over_generated_summary(tmp_path):
+    db = QuizDatabase(tmp_path / "quiz.sqlite3")
+    db.insert_question(
+        level="JLPT N1",
+        exam_point="文法形式の判断",
+        stem="その全てを肯定し（　　）前に進めないかい。",
+        options=("ないと", "まいと", "がてら", "かたがた"),
+        answer_index=0,
+        explanation=(
+            "動詞ます形語幹『受け入れ』に接続し、かつ"
+            "『受け入れなければ踏み出せない』という必要条件を表すのは「ないと」のみ。"
+        ),
+        source_type="vocaloid_song",
+        source_name="ドラマツルギー",
+        source_text_url="https://example.com/text",
+        source_excerpt="その全てを肯定しないと前に進めないかい",
+        tested_point="〜ないと（必要条件）",
+        author="Claude",
+        verified=True,
+        allow_ungrounded=True,
+    )
+    card = db.get_grammar_card(headword="〜ないと（必要条件）", level="JLPT N1")
+    assert card is not None
+    assert card.explanation_zh.startswith("表示「不……就不行」")
+    assert "受け入れ" not in card.explanation_zh
+
+
+def test_grammar_card_manual_override_for_bungo_zu_is_chinese(tmp_path):
+    db = QuizDatabase(tmp_path / "quiz.sqlite3")
+    db.insert_question(
+        level="JLPT N1",
+        exam_point="文の組み立て",
+        stem="身動きも（　　）眺めてる世界は不自由だなって。",
+        options=("取れず", "取れて", "取ると", "取れば"),
+        answer_index=0,
+        explanation=(
+            "正しい並びは『身動きも→取れず→眺めてる→世界は不自由だなって』で、"
+            "慣用句「身動きも取れない」の文語的な中止形「取れず」は"
+            "「身動きも」の直後に来て『〜できないまま』を表す。"
+        ),
+        source_type="vocaloid_song",
+        source_name="反逆者の僕ら",
+        source_text_url="https://example.com/text",
+        source_excerpt="身動きも取れず眺めてる世界は不自由だなって",
+        tested_point="文語否定「ず」の中止法",
+        author="Claude",
+        verified=True,
+        allow_ungrounded=True,
+    )
+    card = db.get_grammar_card(headword="文語否定「ず」の中止法", level="JLPT N1")
+    assert card is not None
+    assert "動詞連用形後" in card.explanation_zh
+    assert "文語的な中止形" not in card.explanation_zh
+
+
+def test_grammar_card_manual_override_can_replace_bad_source_example(tmp_path):
+    db = QuizDatabase(tmp_path / "quiz.sqlite3")
+    db.insert_question(
+        level="JLPT N1",
+        exam_point="文法形式の判断",
+        stem="重大な決断を前に、彼は誰に相談（　　）、たった一人で全てを決めてしまった。",
+        options=("せずに", "するなり", "するそばから", "しようものなら"),
+        answer_index=0,
+        explanation=(
+            "「〜ずに」は『〜しないで（次の動作をする）』の意で、"
+            "『する』は不規則に『せずに』となる。"
+        ),
+        source_type="vocaloid_song",
+        source_name="花を唄う",
+        source_text_url="https://example.com/text",
+        source_excerpt="どうしても 大人に成れずに",
+        tested_point="〜ずに（〜しないで）",
+        author="Claude",
+        verified=True,
+        allow_ungrounded=True,
+    )
+    card = db.get_grammar_card(headword="〜ずに（〜しないで）", level="JLPT N1")
+    assert card is not None
+    assert card.example_ja == "彼は誰にも相談せずに、たった一人で全てを決めてしまった。"
+    assert card.source_name == "改寫例句"
+    assert card.source_text_url is None
+    assert "ない形去掉「ない」" in card.explanation_zh
+    assert "大人に成れずに" not in card.example_ja
+
+
+def test_grammar_card_uses_filled_stem_as_adapted_example(tmp_path):
+    db = QuizDatabase(tmp_path / "quiz.sqlite3")
+    db.insert_question(
+        level="JLPT N1",
+        exam_point="文法形式の判断",
+        stem="明日の試合の結果（　　）、方針が変わるだろう。",
+        options=("いかんで", "ながらに", "をよそに", "だに"),
+        answer_index=0,
+        explanation="「〜いかんで」は結果次第で後件が決まることを表す。",
+        source_type="vocaloid_song",
+        source_name="テスト曲",
+        source_text_url="https://example.com/text",
+        source_excerpt="どこを行けばどこに着くか？",
+        tested_point="〜いかんで（〜がどうであるかによって）",
+        author="Claude",
+        verified=True,
+        allow_ungrounded=True,
+    )
+    card = db.get_grammar_card(
+        headword="〜いかんで（〜がどうであるかによって）", level="JLPT N1"
+    )
+    assert card is not None
+    assert card.example_ja == "明日の試合の結果いかんで、方針が変わるだろう。"
+    assert card.example_source_kind == "adapted"
+    assert card.source_name == "改寫例句"
+    assert card.source_text_url is None
+    assert card.explanation_zh.startswith("表示後項取決於前項")
+
+
+def test_grammar_card_fills_all_blanks_in_adapted_example(tmp_path):
+    db = QuizDatabase(tmp_path / "quiz.sqlite3")
+    db.insert_question(
+        level="JLPT N1",
+        exam_point="文法形式の判断",
+        stem="幸福（　　）不幸（　　）、朝は誰にでもやって来る。",
+        options=("であろうと", "につれて", "をおいて", "がてら"),
+        answer_index=0,
+        explanation="「〜であろうと」は条件に左右されない譲歩を表す。",
+        source_type="vocaloid_song",
+        source_name="ハロ／ハワユ",
+        source_text_url="https://example.com/text",
+        source_excerpt="幸せだろうと 不幸せだろうと 平等に残酷に 朝日は昇る",
+        tested_point="〜であろうと",
+        author="Claude",
+        verified=True,
+        allow_ungrounded=True,
+    )
+    card = db.get_grammar_card(headword="〜であろうと", level="JLPT N1")
+    assert card is not None
+    assert card.example_ja == "幸福であろうと不幸であろうと、朝は誰にでもやって来る。"
+    assert "（" not in card.example_ja
+    assert card.source_name == "改寫例句"
+
+
+def test_grammar_card_rejects_commentary_source_excerpt(tmp_path):
+    db = QuizDatabase(tmp_path / "quiz.sqlite3")
+    db.insert_question(
+        level="JLPT N1",
+        exam_point="文の組み立て",
+        stem="次の語句を並べ替えて、『＿＿①　＿＿②★　＿＿③　＿＿④』という文を完成させる。",
+        options=("敵と見なしていることが", "主人公は", "読み取れる", "自分自身を恐れ、"),
+        answer_index=3,
+        explanation="目的語を含む並列述語の語順を問う。",
+        source_type="vocaloid_song",
+        source_name="ECHO",
+        source_text_url="https://example.com/text",
+        source_excerpt=(
+            "「ECHO」の解説によれば、前半部分の矛盾や「見えない敵」の存在を合わせて考えると、"
+            "主人公は自分自身を恐れ、敵と見なしていることが読み取れるという。"
+            "二面性のある心がせめぎ合って主人公を苦しめているのである。"
+        ),
+        tested_point="目的語を含む並列述語の語順",
+        author="codex",
+        verified=True,
+        allow_ungrounded=True,
+    )
+    card = db.get_grammar_card(headword="目的語を含む並列述語の語順", level="JLPT N1")
+    assert card is None
 
 
 def test_synonym_answer_restates_headword_flags_kana_restatement():

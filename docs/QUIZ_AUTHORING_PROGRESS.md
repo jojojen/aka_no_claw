@@ -1,6 +1,6 @@
 # /quiz 出題進度與交接紀錄
 
-Last updated: 2026-06-12 JST
+Last updated: 2026-06-13 JST
 
 ## Runtime Notes
 
@@ -12,6 +12,18 @@ Last updated: 2026-06-12 JST
   - `文章の文法`
   - `文の組み立て`
 - The grouping key is still `quiz_questions.tested_point`. If Claude inserts a new verified grammar row with a stable `tested_point`, the corresponding `/quiz grammar` card will refresh automatically.
+- Grammar-card `explanation_zh` is now intentionally a short prelearning summary. It must not mirror answer-reveal explanations or include ordering answers, blank positions, or `【読み】` dumps.
+- As of 2026-06-12 JST, grammar-card summaries are deterministic/manual, not local-model generated. Source of truth is `src/openclaw_adapter/grammar_card_manual_overrides.py`, including explicit overrides plus reviewed headword templates and conservative structure templates.
+- As of 2026-06-13 JST, live quiz DB path should be read from `settings.quiz_db_path`
+  (`src/assistant_runtime/settings.py`, env `OPENCLAW_QUIZ_DB_PATH`, default
+  `data/quiz.sqlite3`). The sibling file `data/quiz.sqlite` is a stale empty artifact
+  and not the learner-facing question DB.
+- Grammar-card examples are fail-closed for correctness. Cards are emitted only when the example is an `adapted` complete sentence from a fill-in stem plus correct answer, or an explicitly reviewed manual adapted example. Adapted examples are labeled `改寫例句` and do not inherit song/source URLs.
+- `文の組み立て` rows are not promoted to learner-facing grammar cards unless they have an explicit manual adapted example. Commentary/source excerpts are too easy to misrepresent as grammar examples, so they remain quiz rows only.
+- Vocabulary/reading authoring is also correctness-first now:
+  - `漢字読み` must test a lexical item in real text, not ask how a song/article title is read.
+  - `用法` must not use a generic stock stem like `次のうち、語句「X」の使い方...`; the prompt itself must carry memory value.
+  - All learner-facing question text and card examples must help the learner remember the target word/grammar point. If a sentence is only answerable but not memorable, fail closed and delete/reject it.
 - Vocabulary-card counts in this file do not include grammar cards. Do not mix the two inventories when tracking coverage.
 
 ## Scope
@@ -68,6 +80,71 @@ Last updated: 2026-06-12 JST
 
 ## Log
 
+- 2026-06-13 JST — Deleted low-value vocabulary templates and banned them at insert time:
+  - User reported that some vocab questions were meaningless templates, especially:
+    - `漢字読み` items that directly asked how a song title is read.
+    - `用法` items wrapped in generic stock prompts with low-memory or absurd options.
+  - Code changes:
+    - `src/openclaw_adapter/quiz_db.py`
+      - Added `reading_question_targets_source_title(...)` guard to reject `漢字読み` items that test source titles rather than lexical readings.
+      - Added `youhou_uses_generic_template_stem(...)` guard to reject generic `用法` stems like `次のうち、語句「X」の使い方として最も適切な文はどれか。`
+    - `tests/test_quiz_db.py` / `tests/test_quiz_command_label.py`
+      - Updated tests so surviving `用法` fixtures use contextual, memory-bearing prompts instead of generic wrappers.
+      - Added rejection tests for title-reading items and generic `用法` template stems.
+  - DB cleanup:
+    - Deleted 396 verified `漢字読み` questions that were song/article-title reading prompts.
+    - Deleted 41 verified `用法` questions that used the generic stock stem template.
+  - Post-cleanup audit:
+    - `漢字読み`: 809 verified rows remain.
+    - `用法`: 1 verified row remains.
+    - Remaining title-reading items in verified `漢字読み`: 0.
+    - Remaining generic-template items in verified `用法`: 0.
+  - Verification:
+    - `PYTHONPATH=src uv run --no-project --with pytest --with truststore python -m pytest tests/test_quiz_db.py tests/test_quiz_command_label.py` — 158 passed.
+- 2026-06-13 JST — Runtime-path doc alignment + `漢字読み` distractor purge:
+  - Confirmed that the live quiz DB path is `settings.quiz_db_path` from
+    `src/assistant_runtime/settings.py` (env `OPENCLAW_QUIZ_DB_PATH`, default
+    `data/quiz.sqlite3`).
+  - Documented that `data/quiz.sqlite` is a stale empty artifact left beside the live
+    DB and should not be used for audits or QA.
+  - Tightened `src/openclaw_adapter/quiz_db.py` so `漢字読み` rows are rejected when
+    `audit_kanji_reading_distractors(...)` finds unrelated readings or phrase-length
+    distractors.
+  - Deleted 269 existing verified `漢字読み` rows that violated that rule.
+  - Post-cleanup audit:
+    - `漢字読み`: 540 verified rows remain.
+    - Remaining rows flagged by the same `漢字読み` audit: 0.
+  - Verification:
+    - `PYTHONPATH=src uv run --no-project --with pytest --with truststore python -m pytest tests/test_quiz_db.py tests/test_quiz_command_label.py` — 159 passed.
+- 2026-06-12 JST — Repaired `/quiz grammar` learner-facing cards without local-model rewriting:
+  - User reported `〜ずに（〜しないで）` had a bad example: `どうしても 大人に成れずに` was an incomplete lyric fragment and not a good card example for `〜ずに`.
+  - Read project principles before broad repair: `AGENTS.md`, `Constitution.md`, `CLAUDE.md`, `README.md`, `docs/QUIZ_TEACHING_LOOP.md`, and `ai/skills/aka-no-claw-workflow/SKILL.md`.
+  - Decision: do not use qwen/local model for grammar-card rewrite quality. Repaired through deterministic code paths and reviewable static templates.
+  - Code changes:
+    - `src/openclaw_adapter/grammar_card_manual_overrides.py`
+      - Added `GrammarCardManualOverride`.
+      - Added explicit `〜ずに（〜しないで）` and `文語否定「ず」の中止法` replacements with adapted complete examples.
+      - Added deterministic headword/structure templates for the remaining grammar cards.
+    - `src/openclaw_adapter/quiz_db.py`
+      - Grammar examples now prefer filled stems for fill-in grammar questions.
+      - Grammar card backfill now fails closed: weak source excerpts, commentary-derived examples, and unreviewed `文の組み立て` snippets are not promoted to learner-facing cards.
+      - Adapted examples are labeled `改寫例句`; source URLs are cleared so the card does not imply the sentence is original lyrics.
+      - Backfill now applies deterministic/manual overrides during card regeneration.
+    - `src/openclaw_adapter/quiz_command.py`
+      - Grammar-card rendering no longer calls the local model for summary rewriting.
+      - Grammar cards with unknown `tested_jlpt_level` display `難度 未標定` instead of defaulting to `N1`.
+  - DB refresh: bootstrapped `data/quiz.sqlite3` after code change so `quiz_grammar_cards` reflects the repaired summaries/examples.
+  - Final fail-closed audit:
+    - `quiz_grammar_cards`: 47 learner-facing cards.
+    - `example_source_kind`: 47 `adapted`, 0 `source_excerpt`.
+    - `source_name`: 47 `改寫例句`.
+    - Bad/Japanese-heavy explanations: 0.
+    - Long examples over 110 chars: 0.
+    - Examples containing blank brackets or commentary markers (`解説` / `筆者` / `読み解`): 0.
+    - Weak/source-grounding grammar questions remain in `quiz_questions`; they are not shown as `/quiz grammar` cards until manually repaired.
+  - Verification:
+    - `PYTHONPATH=src uv run --no-project python -m py_compile src/openclaw_adapter/grammar_card_manual_overrides.py src/openclaw_adapter/quiz_db.py src/openclaw_adapter/quiz_command.py`
+    - `PYTHONPATH=src uv run --no-project --with pytest --with truststore python -m pytest tests/test_quiz_db.py tests/test_quiz_command_label.py` — 152 passed.
 - 2026-06-04 JST — Inventory only, no DB writes:
   - `data/proseka_songs.json` contains 653 source-scope songs.
   - Current DB had 262 verified `JLPT N1` rows.

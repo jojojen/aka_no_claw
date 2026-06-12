@@ -464,7 +464,8 @@ def test_quiz_grammar_handler_exact_lookup(tmp_path):
     text, markup = handler("grammar 〜まい", "u1")
     assert "句型：〜まい" in text
     assert "說明：" in text
-    assert "例句：逃げるまいと心に決めた。" in text
+    assert "例句：彼は最後まで逃げるまいと踏みとどまった。" in text
+    assert "否定意志" in text
     assert any(
         b["callback_data"].startswith("quiz:gr:")
         for row in markup["inline_keyboard"]
@@ -534,6 +535,27 @@ def test_render_grammar_card_shows_audio_button_for_example():
     _, markup = _render_grammar_card(card, mode="all", index=0, total=1)
     flat = [b for row in markup["inline_keyboard"] for b in row]
     assert any(b["callback_data"] == "quiz:ga:gid1" for b in flat)
+
+
+def test_render_grammar_card_does_not_default_unknown_difficulty_to_n1():
+    from openclaw_adapter.quiz_command import _render_grammar_card
+
+    card = SimpleNamespace(
+        card_id="gid1",
+        level="JLPT N1",
+        headword="〜ずに",
+        explanation_zh="不做前項就做後項。",
+        example_ja="彼は誰にも相談せずに決めた。",
+        exam_points=("文法形式の判断",),
+        source_name="改寫例句",
+        source_media_url=None,
+        source_text_url=None,
+        tested_jlpt_level=None,
+        author="codex",
+    )
+    text, _ = _render_grammar_card(card, mode="all", index=0, total=1)
+    assert "難度 未標定" in text.splitlines()[0]
+    assert "難度 N1" not in text.splitlines()[0]
 
 
 def test_vocab_related_question_callback_serves_matching_question(tmp_path):
@@ -616,7 +638,59 @@ def test_grammar_card_end_to_end_flow(tmp_path):
     toast, card_again_text, card_again_markup = callback_handler(review_payload, graded_text, "u1")
     assert toast is None
     assert "句型：〜まい" in card_again_text
+    assert "正解：A. まい" not in card_again_text
     assert card_again_markup is not None
+
+
+def test_grammar_card_lookup_does_not_use_local_model(tmp_path, monkeypatch):
+    from openclaw_adapter.quiz_command import build_quiz_handler
+    from openclaw_adapter.quiz_db import QuizDatabase
+
+    dbp = tmp_path / "quiz.sqlite3"
+    db = QuizDatabase(dbp)
+    db.insert_question(
+        level="JLPT N1",
+        exam_point="文章の文法",
+        stem="彼は最後まで逃げる（　　）と踏みとどまった。",
+        options=("まい", "べく", "ものを", "ながら"),
+        answer_index=0,
+        explanation=(
+            "「〜まい」は強い否定意志を表し、この文では"
+            "『逃げるつもりはない』という意味になる。"
+        ),
+        source_type="vocaloid_song",
+        source_name="ロキ",
+        source_text_url="https://example.com/text",
+        source_excerpt="逃げるまいと心に決めた。",
+        tested_point="〜まい",
+        author="Claude",
+        verified=True,
+        allow_ungrounded=True,
+    )
+    called = False
+
+    def _fail_if_called(**kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("grammar cards must not use the local model")
+
+    monkeypatch.setattr("openclaw_adapter.opportunity_agent._call_ollama_json", _fail_if_called)
+    settings = SimpleNamespace(
+        quiz_db_path=dbp,
+        openclaw_local_text_endpoint="http://127.0.0.1:11434",
+        openclaw_local_text_model="qwen3:14b",
+        openclaw_local_text_timeout_seconds=45,
+        openclaw_tls_insecure_skip_verify=False,
+        openclaw_ca_bundle_path=None,
+    )
+    handler = build_quiz_handler(settings)
+    text, markup = handler("grammar 〜まい", "u1")
+    assert called is False
+    assert "否定意志" in text
+    assert markup is not None
+    card = db.get_grammar_card(headword="〜まい", level="JLPT N1")
+    assert card is not None
+    assert "否定意志" in card.explanation_zh
 
 
 def test_grammar_audio_callback_sends_document_for_grammar_card(tmp_path, monkeypatch):
@@ -732,7 +806,7 @@ def test_vocab_audio_callback_sends_document_for_vocab_card(tmp_path, monkeypatc
     db.insert_question(
         level="JLPT N1",
         exam_point="用法",
-        stem="「いがみ合って」の使い方として最も適切なものはどれか。",
+        stem="対立して言い争う場面で、「いがみ合って」の使い方として最も適切なものはどれか。",
         options=("二人はいがみ合っていた。", "春はいがみ合って咲く。"),
         answer_index=0,
         explanation="人どうしが反目して争う文脈で使う。",

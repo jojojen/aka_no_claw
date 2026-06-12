@@ -99,12 +99,13 @@ re-reading are removed.
    after marking tokens used.
 
 3. **Mechanical checks are pure Python — never spend an LLM on them.** Use the
-   `quiz_db.py` helpers: `options_have_duplicates`, `answer_leaks_into_stem`,
-   `audit_kanji_reading_distractors` (additive advisory filter for 漢字読み distractors),
-   and `questions_are_near_duplicate` / `db.find_duplicate_questions` for dedup. Run
-   **dedup once at the final-output stage**, not on every step. `audit_…` flags obvious
-   garbage cheaply but is NOT an oracle — an empty result does not certify distractor
-   quality; that judgment stays with the strong model.
+   helpers in `src/openclaw_adapter/quiz_db.py`: `options_have_duplicates`,
+   `answer_leaks_into_stem`, `audit_kanji_reading_distractors`, and
+   `questions_are_near_duplicate` / `db.find_duplicate_questions` for dedup. Run
+   **dedup once at the final-output stage**, not on every step. For `漢字読み`,
+   `audit_…` is now a hard gate for obvious garbage: a non-empty result means reject
+   and rewrite. An empty result still does NOT certify distractor quality; subtle
+   plausibility remains the strong model's job.
 
 What stays on the strong model (do NOT offload to the local solver to save tokens):
 difficulty / N1-level judgment, and distractor plausibility in the subtle band. The
@@ -116,7 +117,9 @@ Before accepting a generated question:
 
 1. Confirm the current user-approved source priority. If a suitable favorite-song cache entry exists, use favorite songs first at the song-source level. Only after the ready favorite-song list has already been covered may non-favorite songs be considered. Otherwise, Project Sekai songs in `data/proseka_songs.json` are preferred first, but non-list songs may be used after the user's 2026-06-04 clarification.
 2. Normalize obvious title punctuation when checking membership, such as terminal `。`, HTML entities, spacing, `＃/♯/#`, and common Project Sekai title variants.
-3. Count retained Codex-authored questions for that song in `data/quiz.sqlite3`.
+3. Count retained Codex-authored questions for that song in the DB at
+   `settings.quiz_db_path` (default `data/quiz.sqlite3`, configured in
+   `src/assistant_runtime/settings.py`).
 4. Reject/delete if the source cannot be grounded to a reliable text/media source.
 5. Reject/delete if retaining it would exceed 3 Codex-authored questions for that song.
 
@@ -151,9 +154,15 @@ db.upsert_vocab_seed(
 )
 ```
 
-`zh_gloss_short` is the **中文** field rendered on the card — it MUST be Chinese (Han-only). `upsert_vocab_seed` raises `ValueError` if the gloss contains any kana, so a Japanese paraphrase can never leak into the 中文 field (`_contains_kana` gate, `quiz_db.py:491` / `:921`). Write a real short zh-TW gloss, not a Japanese 言い換え.
+`zh_gloss_short` is the **中文** field rendered on the card — it MUST be Chinese
+(Han-only). `upsert_vocab_seed` raises `ValueError` if the gloss contains any kana,
+so a Japanese paraphrase can never leak into the 中文 field (`_contains_kana` gate in
+`src/openclaw_adapter/quiz_db.py`). Write a real short zh-TW gloss, not a Japanese
+言い換え.
 
-`quiz_vocab_seed.py` no longer exists. The `vocab_seed` table in `data/quiz.sqlite3` is the sole source. Do not attempt to import or edit a Python seed file.
+`quiz_vocab_seed.py` no longer exists. The `vocab_seed` table in the live quiz DB
+(`settings.quiz_db_path`, default `data/quiz.sqlite3`) is the sole source. Do not
+attempt to import or edit a Python seed file.
 
 **Step 1 — Insert.** Use `db.insert_question(...)` with the fields from the
 `authoring_spec.md` schema, plus the workflow constants: `level="JLPT N1"`,
