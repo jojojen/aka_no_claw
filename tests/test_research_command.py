@@ -7,8 +7,10 @@ import pytest
 
 from openclaw_adapter.research_command import (
     BudgetExhaustedError,
+    ItemData,
     MercariItemAdapter,
     ResearchBudget,
+    SellerReputationSnapshot,
     build_budgeted_search_fn,
     build_research_handler,
     normalize_mercari_item_url,
@@ -201,3 +203,115 @@ def test_mercari_item_adapter_extracts_expected_fields_from_fixture() -> None:
     assert item.seller_url == "https://jp.mercari.com/user/profile/433414807"
     assert item.image_urls == ("https://static.mercdn.net/item/detail/orig/photos/m85537287496_1.jpg?1776239339",)
     assert item.source_confidence >= 0.8
+
+
+def test_research_handler_includes_seller_snapshot_result(tmp_path: Path) -> None:
+    notifier = FakeNotifier()
+    item_fetcher = MercariItemAdapter(
+        fetch_html_fn=lambda _url: _load_fixture("mercari_item_m85537287496.html")
+    )
+
+    def seller_lookup(seller_url: str) -> SellerReputationSnapshot:
+        assert seller_url == "https://jp.mercari.com/user/profile/433414807"
+        return SellerReputationSnapshot(
+            seller_url=seller_url,
+            proof_url="http://127.0.0.1:5000/p/proof_123",
+            proof_id="proof_123",
+            reused=True,
+            display_name="kiko",
+            captured_at="2026-06-12T01:23:45+09:00",
+            total_reviews=4864,
+            listing_count=12,
+            followers_count=345,
+            following_count=22,
+            seller_positive=120,
+            seller_negative=0,
+            seller_rate=100.0,
+            overall_rate=100.0,
+        )
+
+    handler = build_research_handler(
+        notifier_factory=lambda chat_id: notifier,
+        item_fetcher=item_fetcher,
+        knowledge_db_path=str(tmp_path / "knowledge.sqlite3"),
+        seller_snapshot_lookup_fn=seller_lookup,
+    )
+
+    reply = handler("https://jp.mercari.com/item/m85537287496", "chat-1")
+
+    assert "賣家風險分析 [ok]" in reply
+    assert "快照顯示賣家風險偏低。" in reply
+    assert notifier.messages[-1].startswith("✅ [6/6] 完成（賣家 kiko / 總評價 4864")
+
+
+def test_research_handler_degrades_when_seller_snapshot_fails(tmp_path: Path) -> None:
+    item_fetcher = MercariItemAdapter(
+        fetch_html_fn=lambda _url: _load_fixture("mercari_item_m18542743389.html")
+    )
+
+    def failing_lookup(_seller_url: str) -> SellerReputationSnapshot:
+        raise RuntimeError("snapshot server unavailable")
+
+    handler = build_research_handler(
+        notifier_factory=lambda chat_id: FakeNotifier(),
+        item_fetcher=item_fetcher,
+        knowledge_db_path=str(tmp_path / "knowledge.sqlite3"),
+        seller_snapshot_lookup_fn=failing_lookup,
+    )
+
+    reply = handler("https://jp.mercari.com/item/m18542743389", "chat-1")
+
+    assert "賣家風險分析 [partial]" in reply
+    assert "賣家 reputation snapshot 失敗：snapshot server unavailable" in reply
+    assert "/snapshot https://jp.mercari.com/user/profile/146184751" in reply
+
+
+def test_research_handler_falls_back_to_item_url_for_snapshot_when_seller_url_missing(tmp_path: Path) -> None:
+    class MissingSellerUrlFetcher:
+        def fetch(self, _target):
+            return ItemData(
+                source_site="mercari",
+                item_url="https://jp.mercari.com/item/m99999999999",
+                item_id="m99999999999",
+                title="測試商品",
+                listed_price_jpy=4200,
+                description="desc",
+                condition_label="新品、未使用",
+                seller_id=None,
+                seller_url=None,
+                image_urls=(),
+                fetched_at="2026-06-12T00:00:00+00:00",
+                source_confidence=0.7,
+            )
+
+    seen: list[str] = []
+
+    def seller_lookup(query_url: str) -> SellerReputationSnapshot:
+        seen.append(query_url)
+        return SellerReputationSnapshot(
+            seller_url="https://jp.mercari.com/user/profile/fallback",
+            proof_url="http://127.0.0.1:5000/p/proof_fallback",
+            proof_id="proof_fallback",
+            reused=False,
+            display_name="fallback seller",
+            captured_at="2026-06-12T01:23:45+09:00",
+            total_reviews=12,
+            listing_count=3,
+            followers_count=None,
+            following_count=None,
+            seller_positive=12,
+            seller_negative=0,
+            seller_rate=100.0,
+        )
+
+    handler = build_research_handler(
+        notifier_factory=lambda chat_id: FakeNotifier(),
+        item_fetcher=MissingSellerUrlFetcher(),
+        knowledge_db_path=str(tmp_path / "knowledge.sqlite3"),
+        seller_snapshot_lookup_fn=seller_lookup,
+    )
+
+    reply = handler("https://jp.mercari.com/item/m99999999999", "chat-1")
+
+    assert seen == ["https://jp.mercari.com/item/m99999999999"]
+    assert "賣家風險分析 [ok]" in reply

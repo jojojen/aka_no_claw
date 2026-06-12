@@ -84,7 +84,7 @@ from .voice_command import (
     build_voice_callback_handler,
     build_voice_handler,
 )
-from .research_command import ResearchNotifier, build_research_handler
+from .research_command import ResearchNotifier, SellerReputationSnapshot, build_research_handler
 from .natural_language import build_telegram_natural_language_router_from_settings
 from .quiz_favorite_songs import extract_first_youtube_url
 from .opportunity_command import (
@@ -687,6 +687,7 @@ def _build_registries(
     research_handler = build_research_handler(
         notifier_factory=research_notifier_factory,
         knowledge_db_path=settings.knowledge_db_path,
+        seller_snapshot_lookup_fn=_build_research_seller_snapshot_lookup(settings),
     )
 
     def _quizlikesong_handler(remainder: str, chat_id: str):
@@ -859,6 +860,45 @@ def _build_research_notifier_factory(settings: AssistantSettings) -> "Callable[[
             client.send_message(chat_id=self._chat_id, text=text)
 
     return lambda chat_id: _TelegramResearchNotifier(str(chat_id))
+
+
+def _build_research_seller_snapshot_lookup(
+    settings: AssistantSettings,
+) -> "Callable[[str], SellerReputationSnapshot]":
+    def lookup(seller_url: str) -> SellerReputationSnapshot:
+        result = request_reputation_snapshot(settings=settings, query_url=seller_url)
+        proof_document = (
+            fetch_reputation_proof_document(settings=settings, proof_id=result.proof_id)
+            if result.proof_id
+            else {}
+        )
+        subject = proof_document.get("subject", {}) if isinstance(proof_document, dict) else {}
+        metrics = proof_document.get("metrics", {}) if isinstance(proof_document, dict) else {}
+        quality = proof_document.get("quality", {}) if isinstance(proof_document, dict) else {}
+        as_seller = quality.get("as_seller") if isinstance(quality, dict) else None
+        as_buyer = quality.get("as_buyer") if isinstance(quality, dict) else None
+        overall = quality.get("overall") if isinstance(quality, dict) else None
+        return SellerReputationSnapshot(
+            seller_url=seller_url,
+            proof_url=result.proof_url,
+            proof_id=result.proof_id,
+            reused=result.reused,
+            display_name=subject.get("display_name") if isinstance(subject, dict) else None,
+            captured_at=proof_document.get("captured_at") if isinstance(proof_document, dict) else None,
+            total_reviews=metrics.get("total_reviews") if isinstance(metrics, dict) else None,
+            listing_count=metrics.get("listing_count") if isinstance(metrics, dict) else None,
+            followers_count=metrics.get("followers_count") if isinstance(metrics, dict) else None,
+            following_count=metrics.get("following_count") if isinstance(metrics, dict) else None,
+            seller_positive=as_seller.get("positive") if isinstance(as_seller, dict) else None,
+            seller_negative=as_seller.get("negative") if isinstance(as_seller, dict) else None,
+            seller_rate=as_seller.get("rate") if isinstance(as_seller, dict) else None,
+            buyer_positive=as_buyer.get("positive") if isinstance(as_buyer, dict) else None,
+            buyer_negative=as_buyer.get("negative") if isinstance(as_buyer, dict) else None,
+            buyer_rate=as_buyer.get("rate") if isinstance(as_buyer, dict) else None,
+            overall_rate=overall.get("rate") if isinstance(overall, dict) else None,
+        )
+
+    return lookup
 
 
 def run_telegram_polling(
