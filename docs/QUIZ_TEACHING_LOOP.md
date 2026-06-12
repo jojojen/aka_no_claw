@@ -83,6 +83,13 @@
 - `used_quiz_count` / `used_flashcard_count` 是後續重複利用節流的基礎；新流程應先消耗未用過的詞。
 - Favorite Songs 是**來源優先權**，不是正確性豁免。所有題目仍要滿足本文件前述的「自足、唯一解、N1 難度、grounded」要求。
 
+## 目前 learner-facing 卡片面
+
+- `/quiz vocab`：詞彙預習卡。資料來自 `quiz_vocab_cards`，只吃詞彙題型（`漢字読み` / `言い換え類義` / `文脈規定` / `用法`）。
+- `/quiz grammar`：文法預習卡。資料來自 `quiz_grammar_cards`，只吃文法題型（`文法形式の判断` / `文章の文法` / `文の組み立て`）。
+- 兩者都以 `quiz_questions.tested_point` 為卡片聚合鍵，按卡後會用同一 `tested_point` 回到對應題目做測驗。
+- 插入新的 verified 題目時，card backfill 會自動刷新；不要手動直接改 card table 當成主要資料來源。
+
 ## 合格標準（審題檢查清單）
 
 一題**單語題**要全部通過才算合格：

@@ -309,6 +309,14 @@ def _normalize_vocab_example_identity(example: str | None) -> str:
     return _normalize_grounding(example or "")
 
 
+def _grammar_card_example(row: sqlite3.Row) -> str:
+    excerpt = _clean_vocab_source_excerpt(row["source_excerpt"] or "")
+    if excerpt:
+        return excerpt
+    stem = re.sub(r"\s+", " ", (row["stem"] or "").strip())
+    return stem
+
+
 def _stem_segments(stem: str) -> list[str]:
     """Split a stem on blank/reorder slots, keeping bracketed real words (the 〈〉
     of a 言い換え target is part of the real line), then normalize each piece."""
@@ -716,6 +724,29 @@ CREATE INDEX IF NOT EXISTS idx_vocab_level_author ON quiz_vocab_cards(level, aut
 CREATE INDEX IF NOT EXISTS idx_vocab_headword ON quiz_vocab_cards(headword);
 CREATE INDEX IF NOT EXISTS idx_vocab_source_name ON quiz_vocab_cards(source_name);
 
+CREATE TABLE IF NOT EXISTS quiz_grammar_cards (
+    card_id                   TEXT PRIMARY KEY,
+    level                     TEXT NOT NULL,
+    headword                  TEXT NOT NULL,
+    explanation_zh            TEXT NOT NULL,
+    example_ja                TEXT NOT NULL,
+    example_source_kind       TEXT NOT NULL DEFAULT 'source_excerpt',
+    source_name               TEXT NOT NULL DEFAULT '',
+    source_text_url           TEXT,
+    source_media_url          TEXT,
+    primary_question_id       TEXT NOT NULL,
+    support_question_ids_json TEXT NOT NULL DEFAULT '[]',
+    exam_points_json          TEXT NOT NULL DEFAULT '[]',
+    tested_jlpt_level         TEXT,
+    author                    TEXT NOT NULL DEFAULT 'codex',
+    created_at                TEXT NOT NULL,
+    updated_at                TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_grammar_level_author ON quiz_grammar_cards(level, author);
+CREATE INDEX IF NOT EXISTS idx_grammar_headword ON quiz_grammar_cards(headword);
+CREATE INDEX IF NOT EXISTS idx_grammar_source_name ON quiz_grammar_cards(source_name);
+
 -- Song corpus the quiz system pulls lyrics/vocab from. `favorite` (1/0) separates
 -- songs the user explicitly hearted (1) from songs ingested purely as quiz
 -- material (0). The user-facing 最愛 views must filter favorite = 1.
@@ -826,6 +857,12 @@ _VOCAB_PRIMARY_PRIORITY: dict[str, int] = {
     "言い換え類義": 2,
     "漢字読み": 3,
 }
+GRAMMAR_CARD_EXAM_POINTS: tuple[str, ...] = ("文法形式の判断", "文章の文法", "文の組み立て")
+_GRAMMAR_PRIMARY_PRIORITY: dict[str, int] = {
+    "文章の文法": 0,
+    "文法形式の判断": 1,
+    "文の組み立て": 2,
+}
 
 
 def _utc_now_iso() -> str:
@@ -843,6 +880,10 @@ def build_authoring_knowledge_id(*, category: str, title: str) -> str:
 
 def build_vocab_card_id(*, level: str, headword: str) -> str:
     return sha1(f"{level}|{headword}".encode("utf-8")).hexdigest()
+
+
+def build_grammar_card_id(*, level: str, headword: str) -> str:
+    return sha1(f"grammar|{level}|{headword}".encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -892,6 +933,26 @@ class QuizVocabCard:
     zh_gloss_short: str
     example_ja: str
     example_source_kind: str = "adapted"
+    source_name: str = ""
+    source_text_url: str | None = None
+    source_media_url: str | None = None
+    primary_question_id: str = ""
+    support_question_ids: tuple[str, ...] = ()
+    exam_points: tuple[str, ...] = ()
+    tested_jlpt_level: str | None = None
+    author: str = "codex"
+    created_at: str = ""
+    updated_at: str = ""
+
+
+@dataclass(frozen=True)
+class QuizGrammarCard:
+    card_id: str
+    level: str
+    headword: str
+    explanation_zh: str
+    example_ja: str
+    example_source_kind: str = "source_excerpt"
     source_name: str = ""
     source_text_url: str | None = None
     source_media_url: str | None = None
@@ -988,6 +1049,7 @@ class QuizDatabase:
             # Re-infer it on every startup so previously migrated rows converge.
             self._backfill_source_excerpt_types(conn, overwrite_other=True)
             self._backfill_vocab_cards(conn)
+            self._backfill_grammar_cards(conn)
 
     def upsert_vocab_seed(
         self, headword: str, reading_hiragana: str, zh_gloss_short: str
@@ -1007,6 +1069,7 @@ class QuizDatabase:
                 (headword, reading_hiragana, zh_gloss_short),
             )
             self._backfill_vocab_cards(conn)
+            self._backfill_grammar_cards(conn)
 
     def get_voice_params(self, chat_id: str) -> "VoiceParams":
         from .quiz_vocab_audio import VoiceParams
@@ -1228,6 +1291,132 @@ class QuizDatabase:
                 "DELETE FROM quiz_vocab_cards WHERE author IN ('codex', 'Claude') AND level = 'JLPT N1'"
             )
 
+    def _backfill_grammar_cards(self, conn: sqlite3.Connection) -> None:
+        rows = conn.execute(
+            """
+            SELECT * FROM quiz_questions
+            WHERE verified = 1
+              AND author IN ('codex', 'Claude')
+              AND level = 'JLPT N1'
+              AND tested_point IS NOT NULL
+              AND TRIM(tested_point) <> ''
+              AND exam_point IN (?, ?, ?)
+            ORDER BY created_at ASC, question_id ASC
+            """,
+            GRAMMAR_CARD_EXAM_POINTS,
+        ).fetchall()
+        groups: dict[str, list[sqlite3.Row]] = {}
+        for row in rows:
+            groups.setdefault((row["tested_point"] or "").strip(), []).append(row)
+
+        seen_ids: set[str] = set()
+        now = _utc_now_iso()
+        for headword, group in groups.items():
+            card_id = build_grammar_card_id(level="JLPT N1", headword=headword)
+            existing = conn.execute(
+                "SELECT * FROM quiz_grammar_cards WHERE card_id = ?",
+                (card_id,),
+            ).fetchone()
+            group.sort(
+                key=lambda r: (
+                    _GRAMMAR_PRIMARY_PRIORITY.get((r["exam_point"] or "").strip(), 99),
+                    r["created_at"] or "",
+                    r["question_id"] or "",
+                )
+            )
+            primary = next(
+                (
+                    cand for cand in group
+                    if ((cand["source_excerpt"] or "").strip() or (cand["stem"] or "").strip())
+                    and (cand["explanation"] or "").strip()
+                ),
+                group[0],
+            )
+            example_ja = _grammar_card_example(primary)
+            explanation_zh = (primary["explanation"] or "").strip()
+            if not example_ja or not explanation_zh:
+                if existing is not None:
+                    seen_ids.add(card_id)
+                continue
+            support_ids = tuple(
+                dict.fromkeys(
+                    (r["question_id"] or "").strip()
+                    for r in group
+                    if (r["question_id"] or "").strip()
+                )
+            )
+            exam_points = tuple(
+                ep for ep, _ in sorted(
+                    {
+                        (
+                            (r["exam_point"] or "").strip(),
+                            _GRAMMAR_PRIMARY_PRIORITY.get((r["exam_point"] or "").strip(), 99),
+                        )
+                        for r in group
+                        if (r["exam_point"] or "").strip()
+                    },
+                    key=lambda pair: (pair[1], pair[0]),
+                )
+            )
+            seen_ids.add(card_id)
+            created_at = existing["created_at"] if existing else now
+            conn.execute(
+                """
+                INSERT INTO quiz_grammar_cards (
+                    card_id, level, headword, explanation_zh, example_ja,
+                    example_source_kind, source_name, source_text_url, source_media_url,
+                    primary_question_id, support_question_ids_json, exam_points_json,
+                    tested_jlpt_level, author, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(card_id) DO UPDATE SET
+                    explanation_zh = excluded.explanation_zh,
+                    example_ja = excluded.example_ja,
+                    example_source_kind = excluded.example_source_kind,
+                    source_name = excluded.source_name,
+                    source_text_url = excluded.source_text_url,
+                    source_media_url = excluded.source_media_url,
+                    primary_question_id = excluded.primary_question_id,
+                    support_question_ids_json = excluded.support_question_ids_json,
+                    exam_points_json = excluded.exam_points_json,
+                    tested_jlpt_level = excluded.tested_jlpt_level,
+                    author = excluded.author,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    card_id,
+                    "JLPT N1",
+                    headword,
+                    explanation_zh,
+                    example_ja,
+                    "source_excerpt" if (primary["source_excerpt"] or "").strip() else "stem",
+                    (primary["source_name"] or "").strip(),
+                    primary["source_text_url"],
+                    primary["source_media_url"],
+                    (primary["question_id"] or "").strip(),
+                    json.dumps(list(support_ids), ensure_ascii=False),
+                    json.dumps(list(exam_points), ensure_ascii=False),
+                    (
+                        primary["tested_jlpt_level"]
+                        if "tested_jlpt_level" in primary.keys()
+                        else None
+                    ),
+                    (primary["author"] or "codex").strip(),
+                    created_at,
+                    now,
+                ),
+            )
+        if seen_ids:
+            placeholders = ", ".join("?" for _ in seen_ids)
+            conn.execute(
+                f"DELETE FROM quiz_grammar_cards WHERE author IN ('codex', 'Claude') AND level = 'JLPT N1' AND card_id NOT IN ({placeholders})",
+                tuple(seen_ids),
+            )
+        else:
+            conn.execute(
+                "DELETE FROM quiz_grammar_cards WHERE author IN ('codex', 'Claude') AND level = 'JLPT N1'"
+            )
+
     # ── Questions ─────────────────────────────────────────────────────────────
 
     def insert_question(
@@ -1344,6 +1533,7 @@ class QuizDatabase:
                 ),
             )
             self._backfill_vocab_cards(conn)
+            self._backfill_grammar_cards(conn)
         loaded = self.get_question(question_id)
         assert loaded is not None
         return loaded
@@ -1763,6 +1953,135 @@ class QuizDatabase:
             ).fetchall()
         return [_row_to_vocab_card(r) for r in rows]
 
+    def get_grammar_card(
+        self,
+        *,
+        card_id: str | None = None,
+        headword: str | None = None,
+        level: str | None = None,
+        author: str | None = None,
+    ) -> QuizGrammarCard | None:
+        if not card_id and not headword:
+            raise ValueError("get_grammar_card requires card_id or headword")
+        clauses: list[str] = []
+        params: list[object] = []
+        if author:
+            clauses.append("author = ?")
+            params.append(author.strip())
+        if level:
+            clauses.append("level = ?")
+            params.append(level.strip())
+        if card_id:
+            clauses.append("card_id = ?")
+            params.append(card_id.strip())
+        else:
+            clauses.append("headword = ?")
+            params.append((headword or "").strip())
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM quiz_grammar_cards WHERE " + " AND ".join(clauses) + " LIMIT 1",
+                tuple(params),
+            ).fetchone()
+        return _row_to_grammar_card(row) if row else None
+
+    def list_grammar_cards(
+        self,
+        *,
+        level: str,
+        chat_id: str | None = None,
+        author: str | None = None,
+        mode: str = "weak",
+    ) -> list[QuizGrammarCard]:
+        clauses = ["level = ?"]
+        params: list[object] = [(level or "").strip()]
+        if author:
+            clauses.append("author = ?")
+            params.append(author.strip())
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM quiz_grammar_cards WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY headword ASC",
+                tuple(params),
+            ).fetchall()
+            tp_stats, tp_last = self._vocab_progress_maps(conn, chat_id)
+        cards = [_row_to_grammar_card(r) for r in rows]
+        mode = (mode or "weak").strip().lower()
+        if mode == "wrong":
+            cards = [c for c in cards if tp_last.get(c.headword) is False]
+            cards.sort(
+                key=lambda c: (
+                    tp_stats.get(c.headword, (0, 0))[1] / max(tp_stats.get(c.headword, (0, 0))[0], 1),
+                    -tp_stats.get(c.headword, (0, 0))[0],
+                    c.headword,
+                )
+            )
+            return cards
+        if mode == "all":
+            return cards
+        if mode == "recent":
+            cards.sort(key=lambda c: (c.created_at or "", c.card_id), reverse=True)
+            return cards
+        if mode == "random":
+            if not cards:
+                return []
+            return [random.choice(cards)]
+        cards.sort(
+            key=lambda c: (
+                _vocab_mastery_sort_key(c.headword, tp_stats, tp_last),
+                c.headword,
+            )
+        )
+        return cards
+
+    def find_grammar_cards(
+        self,
+        *,
+        level: str,
+        query: str,
+        author: str | None = None,
+    ) -> list[QuizGrammarCard]:
+        q = f"%{(query or '').strip()}%"
+        clauses = ["level = ?"]
+        params: list[object] = [(level or "").strip()]
+        if author:
+            clauses.append("author = ?")
+            params.append(author.strip())
+        clauses.append("(headword LIKE ? OR explanation_zh LIKE ?)")
+        params.extend([q, q])
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM quiz_grammar_cards WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY headword ASC",
+                tuple(params),
+            ).fetchall()
+        return [_row_to_grammar_card(r) for r in rows]
+
+    def grammar_cards_for_source(
+        self,
+        *,
+        level: str,
+        source_name: str,
+        author: str | None = None,
+    ) -> list[QuizGrammarCard]:
+        q = f"%{(source_name or '').strip()}%"
+        clauses = ["level = ?"]
+        params: list[object] = [(level or "").strip()]
+        if author:
+            clauses.append("author = ?")
+            params.append(author.strip())
+        clauses.append("source_name LIKE ?")
+        params.append(q)
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM quiz_grammar_cards WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY headword ASC",
+                tuple(params),
+            ).fetchall()
+        return [_row_to_grammar_card(r) for r in rows]
+
     def _vocab_progress_maps(self, conn, chat_id: str | None):
         attempts: dict[str, list[int]] = {}
         last: dict[str, bool] = {}
@@ -1836,6 +2155,7 @@ class QuizDatabase:
                 "DELETE FROM quiz_questions WHERE question_id = ?", (question_id,)
             )
             self._backfill_vocab_cards(conn)
+            self._backfill_grammar_cards(conn)
         return cursor.rowcount > 0
 
     def missing_media_song_questions(self) -> list[tuple[str, str]]:
@@ -2469,6 +2789,41 @@ def _row_to_vocab_card(row: sqlite3.Row) -> QuizVocabCard:
         zh_gloss_short=row["zh_gloss_short"],
         example_ja=row["example_ja"],
         example_source_kind=row["example_source_kind"] or "adapted",
+        source_name=row["source_name"] or "",
+        source_text_url=row["source_text_url"],
+        source_media_url=row["source_media_url"],
+        primary_question_id=row["primary_question_id"] or "",
+        support_question_ids=tuple(str(x).strip() for x in support_ids if str(x).strip()),
+        exam_points=tuple(str(x).strip() for x in exam_points if str(x).strip()),
+        tested_jlpt_level=(
+            row["tested_jlpt_level"] if "tested_jlpt_level" in row.keys() else None
+        ),
+        author=row["author"] or "codex",
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _row_to_grammar_card(row: sqlite3.Row) -> QuizGrammarCard:
+    try:
+        support_ids = json.loads(row["support_question_ids_json"] or "[]")
+        if not isinstance(support_ids, list):
+            support_ids = []
+    except (TypeError, ValueError, json.JSONDecodeError):
+        support_ids = []
+    try:
+        exam_points = json.loads(row["exam_points_json"] or "[]")
+        if not isinstance(exam_points, list):
+            exam_points = []
+    except (TypeError, ValueError, json.JSONDecodeError):
+        exam_points = []
+    return QuizGrammarCard(
+        card_id=row["card_id"],
+        level=row["level"],
+        headword=row["headword"],
+        explanation_zh=row["explanation_zh"],
+        example_ja=row["example_ja"],
+        example_source_kind=row["example_source_kind"] or "source_excerpt",
         source_name=row["source_name"] or "",
         source_text_url=row["source_text_url"],
         source_media_url=row["source_media_url"],

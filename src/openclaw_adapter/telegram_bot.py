@@ -523,6 +523,7 @@ def _build_openclaw_help_text() -> str:
             "/quiz wrong             # 錯題本",
             "/quiz stats             # 各考點正確率分析",
             "/quiz vocab             # 單字卡",
+            "/quiz grammar           # 文法卡",
             "/quiz review            # 查看近期作答",
             "/quizlikesong <youtube_url>   # 收藏新歌並建立題庫",
             "",
