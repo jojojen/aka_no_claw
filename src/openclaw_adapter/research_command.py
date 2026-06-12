@@ -175,6 +175,7 @@ class ResearchJobContext:
     sold_price_evidence: tuple[PriceEvidence, ...] = ()
     sold_average_jpy: float | None = None
     appreciation_search_results: tuple[WebSearchResult, ...] = ()
+    seller_snapshot: SellerReputationSnapshot | None = None
     current_stage: int = 0
     current_label: str = ""
 
@@ -194,6 +195,7 @@ class ResearchReport:
     budget_used: int
     budget_max: int
     item_data: ItemData | None
+    seller_snapshot: SellerReputationSnapshot | None
     section_results: tuple[ResearchSectionResult, ...]
     warnings: tuple[str, ...]
 
@@ -1062,6 +1064,7 @@ class ResearchCommandService:
             ctx.add_section_result(result)
             return summary
 
+        ctx.seller_snapshot = snapshot
         result = _build_seller_snapshot_section_result(snapshot)
         ctx.add_section_result(result)
         return result.summary
@@ -1108,6 +1111,7 @@ def build_research_report(ctx: ResearchJobContext) -> ResearchReport:
         budget_used=ctx.budget.searches_used,
         budget_max=ctx.budget.max_searches,
         item_data=ctx.item_data,
+        seller_snapshot=ctx.seller_snapshot,
         section_results=tuple(ctx.section_results),
         warnings=tuple(dict.fromkeys(ctx.warnings)),
     )
@@ -1123,9 +1127,10 @@ def format_research_full_report(report: ResearchReport) -> str:
     if report.item_data is not None:
         item = report.item_data
         price_text = f"¥{item.listed_price_jpy:,}" if item.listed_price_jpy is not None else "未知"
+        seller_text = _resolve_report_seller_label(report)
         lines.append(
             f"商品頁資料：{item.title} / {price_text} / 狀態 {item.condition_label or '未知'} / "
-            f"賣家 {item.seller_id or '未知'} / 圖片 {len(item.image_urls)} 張"
+            f"賣家 {seller_text} / 圖片 {len(item.image_urls)} 張"
         )
     lines.append("")
     lines.append("各節結果：")
@@ -1148,13 +1153,12 @@ def format_research_compact_report(report: ResearchReport) -> str:
     price_text = "未知"
     title_text = report.target_display_text
     condition_text = "未知"
-    seller_text = "未知"
+    seller_text = _resolve_report_seller_label(report)
     if item is not None:
         title_text = item.title or title_text
         if item.listed_price_jpy is not None:
             price_text = f"¥{item.listed_price_jpy:,}"
         condition_text = item.condition_label or "未知"
-        seller_text = item.seller_id or "未知"
     lines = [
         "/research 摘要",
         f"商品：{title_text}",
@@ -1334,7 +1338,9 @@ def _detail_header(report: ResearchReport, title: str) -> list[str]:
         item = report.item_data
         price_text = f"¥{item.listed_price_jpy:,}" if item.listed_price_jpy is not None else "未知"
         lines.append(f"商品：{item.title}")
-        lines.append(f"開價：{price_text} / 狀態：{item.condition_label or '未知'} / 賣家：{item.seller_id or '未知'}")
+        lines.append(
+            f"開價：{price_text} / 狀態：{item.condition_label or '未知'} / 賣家：{_resolve_report_seller_label(report)}"
+        )
     else:
         lines.append(f"研究目標：{report.target_display_text}")
     lines.append("")
@@ -1373,6 +1379,27 @@ def _truncate_research_text(text: str, limit: int) -> str:
     if len(normalized) <= limit:
         return normalized
     return normalized[: limit - 1].rstrip() + "…"
+
+
+def _resolve_report_seller_label(report: ResearchReport) -> str:
+    item = report.item_data
+    if item is not None:
+        if item.seller_id:
+            return item.seller_id
+        if item.seller_url:
+            extracted = _extract_seller_id(item.seller_url)
+            if extracted:
+                return extracted
+    snapshot = report.seller_snapshot
+    if snapshot is not None:
+        if snapshot.display_name:
+            return snapshot.display_name
+        extracted = _extract_seller_id(snapshot.seller_url)
+        if extracted:
+            return extracted
+        if snapshot.seller_url:
+            return snapshot.seller_url
+    return "未知"
 
 
 def _build_seller_snapshot_section_result(snapshot: SellerReputationSnapshot) -> ResearchSectionResult:

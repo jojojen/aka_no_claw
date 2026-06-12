@@ -804,6 +804,57 @@ def test_research_handler_falls_back_to_item_url_for_snapshot_when_seller_url_mi
     assert "賣家風險分析 [ok]" in reply
 
 
+def test_research_compact_report_backfills_seller_from_snapshot_when_item_seller_missing(tmp_path: Path) -> None:
+    class MissingSellerUrlFetcher:
+        def fetch(self, _target):
+            return ItemData(
+                source_site="mercari",
+                item_url="https://jp.mercari.com/item/m99999999999",
+                item_id="m99999999999",
+                title="測試商品",
+                listed_price_jpy=4200,
+                description="desc",
+                condition_label="新品、未使用",
+                seller_id=None,
+                seller_url=None,
+                image_urls=(),
+                fetched_at="2026-06-12T00:00:00+00:00",
+                source_confidence=0.7,
+            )
+
+    def seller_lookup(_query_url: str) -> SellerReputationSnapshot:
+        return SellerReputationSnapshot(
+            seller_url="https://jp.mercari.com/user/profile/fallback",
+            proof_url="http://127.0.0.1:5000/p/proof_fallback",
+            proof_id="proof_fallback",
+            reused=False,
+            display_name="fallback seller",
+            captured_at="2026-06-12T01:23:45+09:00",
+            total_reviews=12,
+            listing_count=3,
+            followers_count=None,
+            following_count=None,
+            seller_positive=12,
+            seller_negative=0,
+            seller_rate=100.0,
+        )
+
+    handler = build_research_handler(
+        notifier_factory=lambda chat_id: FakeNotifier(),
+        item_fetcher=MissingSellerUrlFetcher(),
+        knowledge_db_path=str(tmp_path / "knowledge.sqlite3"),
+        seller_snapshot_lookup_fn=seller_lookup,
+        active_market_search_fn=_fake_active_search,
+        sold_market_search_fn=_fake_sold_search,
+        sold_average_lookup_fn=_fake_sold_average,
+        final_formatter=format_research_compact_report,
+    )
+
+    reply = handler("https://jp.mercari.com/item/m99999999999", "chat-1")
+
+    assert "賣家：fallback seller" in reply
+
+
 def test_research_handler_degrades_when_market_search_backends_fail(tmp_path: Path) -> None:
     item_fetcher = MercariItemAdapter(
         fetch_html_fn=lambda _url: _load_fixture("mercari_item_m18542743389.html")
