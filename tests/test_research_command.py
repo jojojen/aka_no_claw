@@ -52,6 +52,14 @@ def _load_fixture(name: str) -> str:
     return fixture_path.read_text(encoding="utf-8")
 
 
+def _fake_active_search(query: str, price_cap: int, max_results: int) -> list[dict[str, object]]:
+    return []
+
+
+def _fake_sold_average(query: str) -> float | None:
+    return None
+
+
 def test_normalize_mercari_item_url_strips_tracking_query() -> None:
     assert normalize_mercari_item_url(
         "https://jp.mercari.com/item/m65806654179?afid=123&utm_source=x&source_location=share"
@@ -102,6 +110,8 @@ def test_research_handler_reports_progress_heartbeat_and_final_reply() -> None:
             _placeholder("M1 骨架：已保留流動性分析階段"),
             _placeholder("M1 骨架：已保留賣家風險分析階段"),
         ),
+        active_market_search_fn=_fake_active_search,
+        sold_average_lookup_fn=_fake_sold_average,
     )
 
     reply = handler("https://jp.mercari.com/item/m65806654179?afid=foo", "chat-1")
@@ -138,6 +148,8 @@ def test_research_handler_rejects_overlapping_jobs_in_same_chat() -> None:
             _placeholder("M1 骨架：已保留流動性分析階段"),
             _placeholder("名稱模式首版不做賣家風險"),
         ),
+        active_market_search_fn=_fake_active_search,
+        sold_average_lookup_fn=_fake_sold_average,
     )
 
     result_box: dict[str, str] = {}
@@ -168,6 +180,8 @@ def test_research_handler_fetches_mercari_item_and_persists_knowledge(tmp_path: 
         notifier_factory=lambda chat_id: notifier,
         item_fetcher=item_fetcher,
         knowledge_db_path=str(knowledge_db_path),
+        active_market_search_fn=_fake_active_search,
+        sold_average_lookup_fn=_fake_sold_average,
     )
 
     reply = handler("https://jp.mercari.com/item/m18542743389?utm_source=share", "chat-1")
@@ -205,6 +219,91 @@ def test_mercari_item_adapter_extracts_expected_fields_from_fixture() -> None:
     assert item.source_confidence >= 0.8
 
 
+def test_research_handler_builds_price_section_from_active_and_sold_samples(tmp_path: Path) -> None:
+    item_fetcher = MercariItemAdapter(
+        fetch_html_fn=lambda _url: _load_fixture("mercari_item_m18542743389.html")
+    )
+
+    def active_search(query: str, price_cap: int, max_results: int) -> list[dict[str, object]]:
+        assert "エヴァンゲリオン" in query
+        assert price_cap == 13110
+        assert max_results == 8
+        return [
+            {
+                "item_id": "m1",
+                "title": "エヴァンゲリオン 綾波レイ プロモ 1",
+                "price_jpy": 6100,
+                "url": "https://jp.mercari.com/item/m1",
+                "thumbnail_url": "",
+            },
+            {
+                "item_id": "m2",
+                "title": "エヴァンゲリオン 綾波レイ プロモ 2",
+                "price_jpy": 6800,
+                "url": "https://jp.mercari.com/item/m2",
+                "thumbnail_url": "",
+            },
+            {
+                "item_id": "m3",
+                "title": "エヴァンゲリオン 綾波レイ プロモ 3",
+                "price_jpy": 7200,
+                "url": "https://jp.mercari.com/item/m3",
+                "thumbnail_url": "",
+            },
+        ]
+
+    handler = build_research_handler(
+        notifier_factory=lambda chat_id: FakeNotifier(),
+        item_fetcher=item_fetcher,
+        knowledge_db_path=str(tmp_path / "knowledge.sqlite3"),
+        active_market_search_fn=active_search,
+        sold_average_lookup_fn=lambda query: 7000.0,
+    )
+
+    reply = handler("https://jp.mercari.com/item/m18542743389", "chat-1")
+
+    assert "合理市價分析 [ok]" in reply
+    assert "Mercari sold 均價約 ¥7,000" in reply
+    assert "active 樣本 3 筆，中位數 ¥6,800，區間 ¥6,100–¥7,200" in reply
+    assert "目前開價接近 sold 均價" in reply
+
+
+def test_research_handler_price_stage_works_for_text_query_without_item_page() -> None:
+    def active_search(query: str, price_cap: int, max_results: int) -> list[dict[str, object]]:
+        assert query == "初音ミク 15th フィギュア"
+        assert price_cap == 50000
+        assert max_results == 8
+        return [
+            {
+                "item_id": "mx1",
+                "title": "初音ミク 15th フィギュア A",
+                "price_jpy": 9000,
+                "url": "https://jp.mercari.com/item/mx1",
+                "thumbnail_url": "",
+            },
+            {
+                "item_id": "mx2",
+                "title": "初音ミク 15th フィギュア B",
+                "price_jpy": 9800,
+                "url": "https://jp.mercari.com/item/mx2",
+                "thumbnail_url": "",
+            },
+        ]
+
+    handler = build_research_handler(
+        notifier_factory=lambda chat_id: FakeNotifier(),
+        active_market_search_fn=active_search,
+        sold_average_lookup_fn=lambda query: None,
+    )
+
+    reply = handler("初音ミク 15th フィギュア", "chat-1")
+
+    assert "研究模式：商品名稱" in reply
+    assert "合理市價分析 [partial]" in reply
+    assert "active 樣本 2 筆，中位數 ¥9,400，區間 ¥9,000–¥9,800" in reply
+    assert "Mercari sold 價目前只拿到平均值接口；此查詢未回傳可用 sold avg。" in reply
+
+
 def test_research_handler_includes_seller_snapshot_result(tmp_path: Path) -> None:
     notifier = FakeNotifier()
     item_fetcher = MercariItemAdapter(
@@ -235,6 +334,8 @@ def test_research_handler_includes_seller_snapshot_result(tmp_path: Path) -> Non
         item_fetcher=item_fetcher,
         knowledge_db_path=str(tmp_path / "knowledge.sqlite3"),
         seller_snapshot_lookup_fn=seller_lookup,
+        active_market_search_fn=_fake_active_search,
+        sold_average_lookup_fn=_fake_sold_average,
     )
 
     reply = handler("https://jp.mercari.com/item/m85537287496", "chat-1")
@@ -257,6 +358,8 @@ def test_research_handler_degrades_when_seller_snapshot_fails(tmp_path: Path) ->
         item_fetcher=item_fetcher,
         knowledge_db_path=str(tmp_path / "knowledge.sqlite3"),
         seller_snapshot_lookup_fn=failing_lookup,
+        active_market_search_fn=_fake_active_search,
+        sold_average_lookup_fn=_fake_sold_average,
     )
 
     reply = handler("https://jp.mercari.com/item/m18542743389", "chat-1")
@@ -309,6 +412,8 @@ def test_research_handler_falls_back_to_item_url_for_snapshot_when_seller_url_mi
         item_fetcher=MissingSellerUrlFetcher(),
         knowledge_db_path=str(tmp_path / "knowledge.sqlite3"),
         seller_snapshot_lookup_fn=seller_lookup,
+        active_market_search_fn=_fake_active_search,
+        sold_average_lookup_fn=_fake_sold_average,
     )
 
     reply = handler("https://jp.mercari.com/item/m99999999999", "chat-1")

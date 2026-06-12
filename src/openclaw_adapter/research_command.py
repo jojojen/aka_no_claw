@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import statistics
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -20,6 +21,8 @@ logger = logging.getLogger(__name__)
 SearchFn = Callable[[str, int], tuple[object, ...]]
 FetchHtmlFn = Callable[[str], str]
 SellerSnapshotLookupFn = Callable[[str], "SellerReputationSnapshot"]
+ActiveMarketSearchFn = Callable[[str, int, int], list[dict[str, object]]]
+SoldAverageLookupFn = Callable[[str], float | None]
 ResearchStageRunner = Callable[["ResearchJobContext"], str]
 
 _MERCARI_ITEM_PATH_RE = re.compile(r"^/item/(m\d+)/?$", re.IGNORECASE)
@@ -492,6 +495,8 @@ class ResearchCommandService:
         item_fetcher: MercariItemAdapter | None = None,
         knowledge_db_path: str | None = None,
         seller_snapshot_lookup_fn: SellerSnapshotLookupFn | None = None,
+        active_market_search_fn: ActiveMarketSearchFn | None = None,
+        sold_average_lookup_fn: SoldAverageLookupFn | None = None,
     ) -> None:
         self._notifier_factory = notifier_factory or (lambda chat_id: _NullResearchNotifier())
         self._search_fn = search_fn or _NOOP_SEARCH_FN
@@ -499,6 +504,8 @@ class ResearchCommandService:
         self._item_fetcher = item_fetcher or MercariItemAdapter()
         self._knowledge_db_path = knowledge_db_path
         self._seller_snapshot_lookup_fn = seller_snapshot_lookup_fn
+        self._active_market_search_fn = active_market_search_fn or _default_active_market_search
+        self._sold_average_lookup_fn = sold_average_lookup_fn or _default_sold_average_lookup
         self._lock = threading.Lock()
         self._active_chat_ids: set[str] = set()
         self._stage_runners = tuple(stage_runners or self._build_default_stage_runners())
@@ -688,22 +695,34 @@ class ResearchCommandService:
         return result.summary
 
     def _stage_price_placeholder(self, ctx: ResearchJobContext) -> str:
-        if ctx.item_data is not None and ctx.item_data.listed_price_jpy is not None:
-            summary = f"已拿到賣家開價 ¥{ctx.item_data.listed_price_jpy:,}，但 sold/active 比價樣本尚未接入。"
-        else:
-            summary = "合理市價分析仍待接 sold/active 比價資料。"
-        result = ResearchSectionResult(
-            section_name="合理市價分析",
-            status="partial" if ctx.item_data is not None else "unavailable",
-            confidence=0.2 if ctx.item_data is not None else 0.0,
-            sample_count=1 if ctx.item_data is not None else 0,
-            evidence_count=1 if ctx.item_data is not None else 0,
-            summary=summary,
-            evidence_urls=(ctx.item_data.item_url,) if ctx.item_data is not None else (),
-            warnings=("M2 只保留開價，市場比價 evidence 還沒接上。",),
+        query = _build_price_query(ctx)
+        if not query:
+            summary = "缺少可用的商品名稱，無法進行市價分析。"
+            result = ResearchSectionResult(
+                section_name="合理市價分析",
+                status="unavailable",
+                confidence=0.0,
+                sample_count=0,
+                evidence_count=0,
+                summary=summary,
+                warnings=(summary,),
+            )
+            ctx.add_section_result(result)
+            return summary
+
+        listed_price = ctx.item_data.listed_price_jpy if ctx.item_data is not None else None
+        price_cap = _derive_active_price_cap(listed_price)
+        active_raw = self._active_market_search_fn(query, price_cap, 8)
+        active_evidence = tuple(_price_evidence_from_market_item(item, sold_status="active") for item in active_raw)
+        sold_avg = self._sold_average_lookup_fn(query)
+        result = _build_price_section_result(
+            query=query,
+            listed_price_jpy=listed_price,
+            active_evidence=active_evidence,
+            sold_average_jpy=sold_avg,
         )
         ctx.add_section_result(result)
-        return summary
+        return result.summary
 
     def _stage_liquidity_placeholder(self, ctx: ResearchJobContext) -> str:
         summary = "流動性分析仍待接 LIQUIDITY_METHODOLOGY 所需資料。"
@@ -825,6 +844,8 @@ def build_research_handler(
     item_fetcher: MercariItemAdapter | None = None,
     knowledge_db_path: str | None = None,
     seller_snapshot_lookup_fn: SellerSnapshotLookupFn | None = None,
+    active_market_search_fn: ActiveMarketSearchFn | None = None,
+    sold_average_lookup_fn: SoldAverageLookupFn | None = None,
 ) -> Callable[[str, str], str]:
     service = ResearchCommandService(
         notifier_factory=notifier_factory,
@@ -834,6 +855,8 @@ def build_research_handler(
         item_fetcher=item_fetcher,
         knowledge_db_path=knowledge_db_path,
         seller_snapshot_lookup_fn=seller_snapshot_lookup_fn,
+        active_market_search_fn=active_market_search_fn,
+        sold_average_lookup_fn=sold_average_lookup_fn,
     )
     return service.run
 
@@ -917,3 +940,120 @@ def _build_seller_snapshot_section_result(snapshot: SellerReputationSnapshot) ->
         evidence_urls=evidence_urls,
         warnings=tuple(warnings),
     )
+
+
+def _build_price_query(ctx: ResearchJobContext) -> str:
+    if ctx.item_data is not None and ctx.item_data.title:
+        return ctx.item_data.title
+    if ctx.target is not None:
+        return ctx.target.display_text
+    return ""
+
+
+def _derive_active_price_cap(listed_price_jpy: int | None) -> int:
+    if listed_price_jpy is None or listed_price_jpy <= 0:
+        return 50_000
+    return max(5_000, int(listed_price_jpy * 2.0))
+
+
+def _price_evidence_from_market_item(item: dict[str, object], *, sold_status: str) -> PriceEvidence:
+    source_url = str(item.get("url") or "").strip()
+    title = str(item.get("title") or "").strip()
+    raw_price = item.get("price_jpy")
+    price_jpy = int(raw_price) if isinstance(raw_price, (int, float)) or str(raw_price).isdigit() else None
+    return PriceEvidence(
+        source_site="mercari",
+        source_url=source_url,
+        title=title,
+        price_jpy=price_jpy,
+        sold_status=sold_status,
+        condition_label=None,
+        shipping_note=None,
+        excluded_reason=None,
+        observed_at=_utc_now_iso(),
+    )
+
+
+def _build_price_section_result(
+    *,
+    query: str,
+    listed_price_jpy: int | None,
+    active_evidence: tuple[PriceEvidence, ...],
+    sold_average_jpy: float | None,
+) -> ResearchSectionResult:
+    active_prices = [e.price_jpy for e in active_evidence if e.price_jpy is not None]
+    evidence_urls = tuple(e.source_url for e in active_evidence[:4] if e.source_url)
+    warnings: list[str] = []
+    status = "ok"
+    summary_parts: list[str] = []
+
+    if listed_price_jpy is not None:
+        summary_parts.append(f"賣家開價 ¥{listed_price_jpy:,}")
+
+    if sold_average_jpy is not None and sold_average_jpy > 0:
+        summary_parts.append(f"Mercari sold 均價約 ¥{sold_average_jpy:,.0f}")
+    else:
+        status = "partial"
+        warnings.append("Mercari sold 價目前只拿到平均值接口；此查詢未回傳可用 sold avg。")
+
+    if active_prices:
+        active_median = statistics.median(active_prices)
+        summary_parts.append(
+            f"active 樣本 {len(active_prices)} 筆，中位數 ¥{active_median:,.0f}，區間 ¥{min(active_prices):,}–¥{max(active_prices):,}"
+        )
+    else:
+        status = "partial" if summary_parts else "unavailable"
+        warnings.append("Mercari active 比價樣本不足。")
+
+    if listed_price_jpy is not None and sold_average_jpy is not None and sold_average_jpy > 0:
+        ratio = listed_price_jpy / sold_average_jpy
+        diff_pct = abs(ratio - 1.0) * 100
+        if ratio <= 0.85:
+            summary_parts.append(f"目前開價低於 sold 均價約 {diff_pct:.0f}%")
+        elif ratio >= 1.10:
+            summary_parts.append(f"目前開價高於 sold 均價約 {diff_pct:.0f}%")
+        else:
+            summary_parts.append("目前開價接近 sold 均價")
+
+    if sold_average_jpy is None and not active_prices:
+        status = "unavailable"
+        summary_parts = [f"查詢「{query}」未取得可用的 sold 或 active 樣本。"]
+
+    if active_prices and len(active_prices) < 3:
+        if status == "ok":
+            status = "partial"
+        warnings.append("active 樣本少於 3 筆，市價判讀可信度有限。")
+
+    confidence = 0.0
+    if active_prices:
+        confidence += 0.25
+        if len(active_prices) >= 3:
+            confidence += 0.15
+    if sold_average_jpy is not None and sold_average_jpy > 0:
+        confidence += 0.25
+    if listed_price_jpy is not None:
+        confidence += 0.1
+    confidence = round(min(0.75, confidence), 2)
+
+    return ResearchSectionResult(
+        section_name="合理市價分析",
+        status=status,
+        confidence=confidence,
+        sample_count=len(active_prices),
+        evidence_count=len(active_evidence) + (1 if sold_average_jpy is not None and sold_average_jpy > 0 else 0),
+        summary="；".join(summary_parts),
+        evidence_urls=evidence_urls,
+        warnings=tuple(warnings),
+    )
+
+
+def _default_active_market_search(query: str, price_cap: int, max_results: int) -> list[dict[str, object]]:
+    from market_monitor.mercari_search import search_mercari
+
+    return search_mercari(query, price_max=price_cap, max_results=max_results)
+
+
+def _default_sold_average_lookup(query: str) -> float | None:
+    from market_monitor.mercari_search import fetch_avg_sold_price
+
+    return fetch_avg_sold_price(query)
