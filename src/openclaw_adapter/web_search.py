@@ -129,6 +129,7 @@ def search_yahoo_japan_playwright(
     *,
     max_results: int = DEFAULT_WEB_SEARCH_LIMIT,
     profile_dir: str | None = None,
+    reuse_context: bool = True,
 ) -> tuple[WebSearchResult, ...]:
     """Yahoo Japan web search via a persistent Playwright Chromium session.
 
@@ -144,17 +145,42 @@ def search_yahoo_japan_playwright(
     url = f"{YAHOO_JAPAN_SEARCH_URL}?{urlencode({'p': cleaned_query})}"
     logger.info("Yahoo Japan search query=%s", cleaned_query)
 
-    ctx = _get_yahoo_context(profile_dir)
-    page = ctx.new_page()
-    try:
+    if reuse_context:
+        ctx = _get_yahoo_context(profile_dir)
+        page = ctx.new_page()
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-        except PlaywrightTimeout:
-            logger.warning("Yahoo Japan goto timeout; reading current DOM")
-        page.wait_for_timeout(_YAHOO_WAIT_MS)
-        results = _extract_yahoo_japan_results(page, max_results)
-    finally:
-        page.close()
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            except PlaywrightTimeout:
+                logger.warning("Yahoo Japan goto timeout; reading current DOM")
+            page.wait_for_timeout(_YAHOO_WAIT_MS)
+            results = _extract_yahoo_japan_results(page, max_results)
+        finally:
+            page.close()
+    else:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+            )
+            context = browser.new_context(
+                locale="ja-JP",
+                user_agent=_PLAYWRIGHT_UA,
+                viewport={"width": 1280, "height": 900},
+            )
+            page = context.new_page()
+            try:
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                except PlaywrightTimeout:
+                    logger.warning("Yahoo Japan goto timeout; reading current DOM")
+                page.wait_for_timeout(_YAHOO_WAIT_MS)
+                results = _extract_yahoo_japan_results(page, max_results)
+            finally:
+                context.close()
+                browser.close()
 
     if not results:
         logger.warning("Yahoo Japan returned 0 results query=%s", cleaned_query)

@@ -17,6 +17,7 @@ from openclaw_adapter.research_command import (
     parse_research_target,
 )
 from openclaw_adapter.knowledge_db import KnowledgeDatabase
+from openclaw_adapter.web_search import WebSearchResult
 
 
 class FakeNotifier:
@@ -227,6 +228,63 @@ def test_mercari_item_adapter_extracts_expected_fields_from_fixture() -> None:
     assert item.source_confidence >= 0.8
 
 
+def test_mercari_item_adapter_falls_back_to_adjacent_condition_and_generic_profile_link() -> None:
+    html = """
+    <html>
+      <head>
+        <title>通常盤 形藻土 初回プレス限定仕様 未開封 by メルカリ</title>
+        <meta name="description" content="新品で保管しています。">
+        <meta name="product:price:amount" content="1800">
+        <meta property="og:image" content="https://static.mercdn.net/item/detail/orig/photos/m12345678901_1.jpg?123">
+      </head>
+      <body>
+        <main>
+          <section>
+            <div class="itemInfo">
+              <div class="label">商品の状態</div>
+              <div class="valueWrap"><span>新品、未使用</span></div>
+            </div>
+            <div class="sellerBlock">
+              <span>出品者</span>
+              <a href="/user/profile/99887766">some seller</a>
+            </div>
+          </section>
+        </main>
+      </body>
+    </html>
+    """
+    adapter = MercariItemAdapter(fetch_html_fn=lambda _url: html)
+    target = parse_research_target("https://jp.mercari.com/item/m12345678901")
+
+    item = adapter.fetch(target)
+
+    assert item.item_id == "m12345678901"
+    assert item.title == "通常盤 形藻土 初回プレス限定仕様 未開封"
+    assert item.listed_price_jpy == 1800
+    assert item.condition_label == "新品、未使用"
+    assert item.seller_id == "99887766"
+    assert item.seller_url == "https://jp.mercari.com/user/profile/99887766"
+    assert item.image_urls == ("https://static.mercdn.net/item/detail/orig/photos/m12345678901_1.jpg?123",)
+
+
+def test_mercari_item_adapter_infers_new_condition_from_title_when_page_omits_field() -> None:
+    html = """
+    <html>
+      <head>
+        <title>通常盤 形藻土 初回プレス限定仕様 未開封 by メルカリ</title>
+        <meta name="description" content="generic mercari description">
+        <meta name="product:price:amount" content="1800">
+      </head>
+      <body><main><p>detail omitted</p></main></body>
+    </html>
+    """
+    adapter = MercariItemAdapter(fetch_html_fn=lambda _url: html)
+
+    item = adapter.fetch(parse_research_target("https://jp.mercari.com/item/m12345000000"))
+
+    assert item.condition_label == "新品、未使用"
+
+
 def test_research_item_knowledge_uses_item_id_key_and_updates_same_row(tmp_path: Path) -> None:
     class SwappingItemFetcher:
         def __init__(self) -> None:
@@ -270,6 +328,99 @@ def test_research_item_knowledge_uses_item_id_key_and_updates_same_row(tmp_path:
     assert db.lookup_canonical("初版標題") == "mercari:m99911122233"
     assert db.lookup_canonical("更新後標題") == "mercari:m99911122233"
     assert len(db.recent_entries(10)) == 1
+
+
+def test_research_handler_builds_appreciation_section_from_knowledge_and_heat(tmp_path: Path) -> None:
+    class FakeHeatSignal:
+        def __init__(self, source: str, percentile: float) -> None:
+            self.source = source
+            self.percentile = percentile
+
+    knowledge_db_path = tmp_path / "knowledge.sqlite3"
+    db = KnowledgeDatabase(knowledge_db_path)
+    db.upsert_entry(
+        entity_canonical="evangelion",
+        entity_type="ip",
+        summary="EVA 是長期有收藏需求的動畫 IP，週年與限定活動通常會帶動周邊成交熱度。",
+        source_urls=("https://example.com/eva",),
+        confidence=0.7,
+        origin="manual",
+        aliases=("エヴァンゲリオン",),
+    )
+    db.upsert_entry(
+        entity_canonical="rei ayanami",
+        entity_type="creator",
+        summary="綾波レイ是 EVA 核心角色，角色人氣通常能支撐單角週邊需求。",
+        source_urls=("https://example.com/rei",),
+        confidence=0.7,
+        origin="manual",
+        aliases=("綾波レイ",),
+    )
+    item_fetcher = MercariItemAdapter(
+        fetch_html_fn=lambda _url: _load_fixture("mercari_item_m18542743389.html")
+    )
+
+    def heat_lookup(canonicals: tuple[str, ...]) -> dict[str, tuple[object, ...]]:
+        assert "evangelion" in canonicals
+        return {
+            "evangelion": (
+                FakeHeatSignal("google_trends", 88.0),
+                FakeHeatSignal("reddit", 71.0),
+            ),
+        }
+
+    handler = build_research_handler(
+        notifier_factory=lambda chat_id: FakeNotifier(),
+        item_fetcher=item_fetcher,
+        knowledge_db_path=str(knowledge_db_path),
+        ip_heat_lookup_fn=heat_lookup,
+        active_market_search_fn=_fake_active_search,
+        sold_market_search_fn=_fake_sold_search,
+        sold_average_lookup_fn=_fake_sold_average,
+    )
+
+    reply = handler("https://jp.mercari.com/item/m18542743389", "chat-1")
+
+    assert "增值潛力分析 [ok]" in reply
+    assert "命中知識庫 2 筆：evangelion(ip)、rei ayanami(creator)。" in reply
+    assert "evangelion 近期 熱度高（google_trends 88pct / reddit 71pct）。" in reply
+    assert "rei ayanami：綾波レイ是 EVA 核心角色" in reply
+
+
+def test_research_handler_uses_budgeted_web_search_for_appreciation_gap() -> None:
+    seen_queries: list[tuple[str, int]] = []
+
+    def search_backend(query: str, limit: int) -> tuple[WebSearchResult, ...]:
+        seen_queries.append((query, limit))
+        return (
+            WebSearchResult(
+                title="エヴァンゲリオン30周年 公式イベント",
+                url="https://example.com/eva-event",
+                snippet="30周年施策と限定商品を告知。",
+            ),
+            WebSearchResult(
+                title="Mercari listing should be filtered",
+                url="https://jp.mercari.com/item/m123456789",
+                snippet="ignored",
+            ),
+        )
+
+    handler = build_research_handler(
+        notifier_factory=lambda chat_id: FakeNotifier(),
+        search_fn=search_backend,
+        active_market_search_fn=_fake_active_search,
+        sold_market_search_fn=_fake_sold_search,
+        sold_average_lookup_fn=_fake_sold_average,
+    )
+
+    reply = handler("エヴァンゲリオン 30周年 限定", "chat-1")
+
+    assert seen_queries == [("エヴァンゲリオン 30周年 限定", 3)]
+    assert "搜尋預算：1/5" in reply
+    assert "增值潛力分析 [partial]" in reply
+    assert "外部補證 1 筆：エヴァンゲリオン30周年 公式イベント。" in reply
+    assert "https://example.com/eva-event" in reply
+    assert "https://jp.mercari.com/item/m123456789" not in reply
 
 
 def test_research_handler_builds_price_section_from_active_and_sold_samples(tmp_path: Path) -> None:
@@ -618,3 +769,58 @@ def test_research_handler_falls_back_to_item_url_for_snapshot_when_seller_url_mi
 
     assert seen == ["https://jp.mercari.com/item/m99999999999"]
     assert "賣家風險分析 [ok]" in reply
+
+
+def test_research_handler_degrades_when_market_search_backends_fail(tmp_path: Path) -> None:
+    item_fetcher = MercariItemAdapter(
+        fetch_html_fn=lambda _url: _load_fixture("mercari_item_m18542743389.html")
+    )
+
+    def fail_active(_query: str, _price_cap: int, _max_results: int) -> list[dict[str, object]]:
+        raise RuntimeError("active backend boom")
+
+    def fail_sold(_query: str, _max_results: int) -> list[dict[str, object]]:
+        raise RuntimeError("sold backend boom")
+
+    def fail_avg(_query: str) -> float | None:
+        raise RuntimeError("avg backend boom")
+
+    handler = build_research_handler(
+        notifier_factory=lambda chat_id: FakeNotifier(),
+        item_fetcher=item_fetcher,
+        knowledge_db_path=str(tmp_path / "knowledge.sqlite3"),
+        active_market_search_fn=fail_active,
+        sold_market_search_fn=fail_sold,
+        sold_average_lookup_fn=fail_avg,
+    )
+
+    reply = handler("https://jp.mercari.com/item/m18542743389", "chat-1")
+
+    assert "合理市價分析 [unavailable]" in reply
+    assert "Mercari active 比價抓取失敗：active backend boom" in reply
+    assert "Mercari sold 比價抓取失敗：sold backend boom" in reply
+    assert "Mercari sold 均價查詢失敗：avg backend boom" in reply
+
+
+def test_research_handler_degrades_when_appreciation_search_backend_fails(tmp_path: Path) -> None:
+    item_fetcher = MercariItemAdapter(
+        fetch_html_fn=lambda _url: _load_fixture("mercari_item_m18542743389.html")
+    )
+
+    def fail_search(_query: str, _limit: int) -> tuple[object, ...]:
+        raise RuntimeError("search backend boom")
+
+    handler = build_research_handler(
+        notifier_factory=lambda chat_id: FakeNotifier(),
+        search_fn=fail_search,
+        item_fetcher=item_fetcher,
+        knowledge_db_path=str(tmp_path / "knowledge.sqlite3"),
+        active_market_search_fn=_fake_active_search,
+        sold_market_search_fn=_fake_sold_search,
+        sold_average_lookup_fn=_fake_sold_average,
+    )
+
+    reply = handler("https://jp.mercari.com/item/m18542743389", "chat-1")
+
+    assert "增值潛力分析" in reply
+    assert "search backend boom" not in reply

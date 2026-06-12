@@ -14,7 +14,8 @@ from urllib.request import Request, urlopen
 
 from bs4 import BeautifulSoup, NavigableString, Tag
 
-from .knowledge_db import KnowledgeDatabase
+from .knowledge_db import KnowledgeDatabase, KnowledgeEntry
+from .web_search import WebSearchResult
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,7 @@ SellerSnapshotLookupFn = Callable[[str], "SellerReputationSnapshot"]
 ActiveMarketSearchFn = Callable[[str, int, int], list[dict[str, object]]]
 SoldMarketSearchFn = Callable[[str, int], list[dict[str, object]]]
 SoldAverageLookupFn = Callable[[str], float | None]
+IpHeatLookupFn = Callable[[tuple[str, ...]], dict[str, tuple[object, ...]]]
 ResearchStageRunner = Callable[["ResearchJobContext"], str]
 
 _MERCARI_ITEM_PATH_RE = re.compile(r"^/item/(m\d+)/?$", re.IGNORECASE)
@@ -41,6 +43,16 @@ _META_PRICE_RE = re.compile(
 _GRADED_TITLE_RE = re.compile(r"\b(?:psa|bgs|ars)(?:\s*\d{1,2})?\b|鑑定", re.IGNORECASE)
 _GENERIC_PROMO_TOKEN_RE = re.compile(r"\d+|周年|限定|フェス|記念|特典|入場者", re.IGNORECASE)
 _REVIEW_WHITESPACE_RE = re.compile(r"\s+")
+_MERCARI_ITEM_CONDITIONS = frozenset(
+    {
+        "新品、未使用",
+        "未使用に近い",
+        "目立った傷や汚れなし",
+        "やや傷や汚れあり",
+        "傷や汚れあり",
+        "全体的に状態が悪い",
+    }
+)
 
 
 class ResearchNotifier(Protocol):
@@ -162,6 +174,7 @@ class ResearchJobContext:
     active_price_evidence: tuple[PriceEvidence, ...] = ()
     sold_price_evidence: tuple[PriceEvidence, ...] = ()
     sold_average_jpy: float | None = None
+    appreciation_search_results: tuple[WebSearchResult, ...] = ()
     current_stage: int = 0
     current_label: str = ""
 
@@ -262,6 +275,8 @@ class MercariItemAdapter:
             listed_price = _extract_meta_price(html)
 
         condition_label = _extract_detail_value_text(soup, "商品の状態")
+        if not condition_label:
+            condition_label = _infer_condition_from_title(title)
         seller_url = _extract_seller_url(soup, base_url=item_url)
         seller_id = _extract_seller_id(seller_url)
         image_urls = _extract_image_urls(soup, product, item_id)
@@ -371,13 +386,13 @@ def _extract_detail_value_text(soup: BeautifulSoup, label: str) -> str | None:
             return direct_text
     header = soup.find("h3", string=lambda text: isinstance(text, str) and text.strip() == label)
     if not isinstance(header, Tag):
-        return None
+        return _extract_adjacent_label_value(soup, label)
     row = header.find_parent("div", class_=lambda classes: classes and "merDisplayRow" in classes)
     if not isinstance(row, Tag):
-        return None
+        return _extract_adjacent_label_value(soup, label)
     body = row.find("div", class_=lambda classes: classes and any("body__" in cls for cls in classes))
     if not isinstance(body, Tag):
-        return None
+        return _extract_adjacent_label_value(soup, label)
     direct_parts: list[str] = []
     for child in body.children:
         if isinstance(child, NavigableString):
@@ -399,17 +414,37 @@ def _extract_detail_value_text(soup: BeautifulSoup, label: str) -> str | None:
     if direct_parts:
         return direct_parts[0]
     text = _compact_whitespace(body.get_text(" ", strip=True))
-    return text or None
+    if text:
+        return text
+    return _extract_adjacent_label_value(soup, label)
 
 
 def _extract_seller_url(soup: BeautifulSoup, *, base_url: str) -> str | None:
     link = soup.select_one('a[data-location="item_details:seller_info"]')
-    if not isinstance(link, Tag):
-        return None
-    href = str(link.get("href") or "").strip()
-    if not href:
-        return None
-    return urljoin(base_url, href)
+    if isinstance(link, Tag):
+        href = str(link.get("href") or "").strip()
+        if href:
+            return urljoin(base_url, href)
+
+    prioritized: list[str] = []
+    fallback: list[str] = []
+    for anchor in soup.find_all("a", href=True):
+        href = str(anchor.get("href") or "").strip()
+        if not href:
+            continue
+        absolute = urljoin(base_url, href)
+        path = urlsplit(absolute).path or ""
+        if not _MERCARI_PROFILE_PATH_RE.match(path):
+            continue
+        bucket = prioritized if _anchor_looks_like_seller_link(anchor) else fallback
+        if absolute not in bucket:
+            bucket.append(absolute)
+
+    if prioritized:
+        return prioritized[0]
+    if fallback:
+        return fallback[0]
+    return None
 
 
 def _extract_seller_id(seller_url: str | None) -> str | None:
@@ -417,6 +452,111 @@ def _extract_seller_id(seller_url: str | None) -> str | None:
         return None
     match = _MERCARI_PROFILE_PATH_RE.match(urlsplit(seller_url).path or "")
     return match.group(1) if match else None
+
+
+def _infer_condition_from_title(title: str) -> str | None:
+    normalized = _compact_whitespace(title)
+    if not normalized:
+        return None
+    if "新品、未使用" in normalized:
+        return "新品、未使用"
+    if "未使用に近い" in normalized:
+        return "未使用に近い"
+    if "目立った傷や汚れなし" in normalized:
+        return "目立った傷や汚れなし"
+    if "やや傷や汚れあり" in normalized:
+        return "やや傷や汚れあり"
+    if "傷や汚れあり" in normalized:
+        return "傷や汚れあり"
+    if "全体的に状態が悪い" in normalized:
+        return "全体的に状態が悪い"
+    if any(token in normalized for token in ("未開封", "新品", "未使用")):
+        return "新品、未使用"
+    return None
+
+
+def _extract_adjacent_label_value(soup: BeautifulSoup, label: str) -> str | None:
+    for label_tag in soup.find_all(
+        lambda tag: isinstance(tag, Tag) and _compact_whitespace(tag.get_text(" ", strip=True)) == label
+    ):
+        candidate = _extract_value_near_label_tag(label_tag, label)
+        if candidate:
+            return candidate
+    return None
+
+
+def _extract_value_near_label_tag(label_tag: Tag, label: str) -> str | None:
+    condition_hits: list[str] = []
+    generic_hits: list[str] = []
+    for candidate in _iter_label_neighbor_texts(label_tag):
+        if candidate == label:
+            continue
+        if candidate in _MERCARI_ITEM_CONDITIONS:
+            condition_hits.append(candidate)
+            continue
+        generic_hits.append(candidate)
+    if condition_hits:
+        return condition_hits[0]
+    if generic_hits:
+        return generic_hits[0]
+    return None
+
+
+def _iter_label_neighbor_texts(label_tag: Tag):
+    seen: set[str] = set()
+
+    def remember(value: str) -> str | None:
+        normalized = _compact_whitespace(value)
+        if not normalized or normalized in seen:
+            return None
+        seen.add(normalized)
+        return normalized
+
+    current = label_tag
+    while isinstance(current, Tag):
+        for sibling in current.next_siblings:
+            text = _extract_first_meaningful_text(sibling)
+            if text:
+                remembered = remember(text)
+                if remembered:
+                    yield remembered
+        parent = current.parent
+        if not isinstance(parent, Tag):
+            break
+        for sibling in parent.children:
+            if sibling is current:
+                continue
+            text = _extract_first_meaningful_text(sibling)
+            if text:
+                remembered = remember(text)
+                if remembered:
+                    yield remembered
+        current = parent
+
+
+def _extract_first_meaningful_text(node: object) -> str | None:
+    if isinstance(node, NavigableString):
+        text = _compact_whitespace(str(node))
+        return text or None
+    if not isinstance(node, Tag):
+        return None
+    if node.name in {"script", "style"}:
+        return None
+    text = _compact_whitespace(node.get_text(" ", strip=True))
+    return text or None
+
+
+def _anchor_looks_like_seller_link(anchor: Tag) -> bool:
+    anchor_text = _compact_whitespace(anchor.get_text(" ", strip=True))
+    if anchor_text in {"出品者", "판매자", "seller"}:
+        return True
+    for candidate in (anchor, anchor.parent, anchor.find_parent()):
+        if not isinstance(candidate, Tag):
+            continue
+        nearby_text = _compact_whitespace(candidate.get_text(" ", strip=True))
+        if "出品者" in nearby_text:
+            return True
+    return False
 
 
 def _extract_image_urls(
@@ -482,6 +622,27 @@ def _compact_whitespace(text: str) -> str:
     return " ".join((text or "").split()).strip()
 
 
+def _run_in_isolated_thread(func: Callable[[], object]) -> object:
+    result_box: dict[str, object] = {}
+    error_box: dict[str, BaseException] = {}
+    done = threading.Event()
+
+    def runner() -> None:
+        try:
+            result_box["value"] = func()
+        except BaseException as exc:  # pragma: no cover - re-raised to caller
+            error_box["error"] = exc
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=runner, daemon=True)
+    thread.start()
+    done.wait()
+    if "error" in error_box:
+        raise error_box["error"]
+    return result_box.get("value")
+
+
 class ResearchCommandService:
     _STAGES: tuple[tuple[int, str], ...] = (
         (0, "解析輸入"),
@@ -506,6 +667,7 @@ class ResearchCommandService:
         active_market_search_fn: ActiveMarketSearchFn | None = None,
         sold_market_search_fn: SoldMarketSearchFn | None = None,
         sold_average_lookup_fn: SoldAverageLookupFn | None = None,
+        ip_heat_lookup_fn: IpHeatLookupFn | None = None,
     ) -> None:
         self._notifier_factory = notifier_factory or (lambda chat_id: _NullResearchNotifier())
         self._search_fn = search_fn or _NOOP_SEARCH_FN
@@ -516,6 +678,7 @@ class ResearchCommandService:
         self._active_market_search_fn = active_market_search_fn or _default_active_market_search
         self._sold_market_search_fn = sold_market_search_fn or _default_sold_market_search
         self._sold_average_lookup_fn = sold_average_lookup_fn or _default_sold_average_lookup
+        self._ip_heat_lookup_fn = ip_heat_lookup_fn or (lambda canonicals: {})
         self._lock = threading.Lock()
         self._active_chat_ids: set[str] = set()
         self._stage_runners = tuple(stage_runners or self._build_default_stage_runners())
@@ -695,18 +858,54 @@ class ResearchCommandService:
         )
 
     def _stage_appreciation_placeholder(self, ctx: ResearchJobContext) -> str:
-        warning = "增值潛力分析仍待接 IP 熱度、作者背景與來源證據。"
-        result = ResearchSectionResult(
-            section_name="增值潛力分析",
-            status="unavailable",
-            confidence=0.0,
-            sample_count=0,
-            evidence_count=0,
-            summary="M2 尚未接入增值潛力分析。",
-            warnings=(warning,),
+        entries = self._lookup_appreciation_entries(ctx)
+        heat_by_canonical = self._ip_heat_lookup_fn(tuple(entry.entity_canonical for entry in entries))
+        search_results = ()
+        if _should_enrich_appreciation(entries, heat_by_canonical):
+            search_results = _collect_appreciation_search_results(ctx)
+            ctx.appreciation_search_results = search_results
+        result = _build_appreciation_section_result(
+            query=_build_price_query(ctx),
+            entries=entries,
+            heat_by_canonical=heat_by_canonical,
+            search_results=search_results,
         )
         ctx.add_section_result(result)
         return result.summary
+
+    def _lookup_appreciation_entries(self, ctx: ResearchJobContext) -> tuple[KnowledgeEntry, ...]:
+        if not self._knowledge_db_path:
+            return ()
+        db = KnowledgeDatabase(self._knowledge_db_path)
+        haystacks = (
+            _normalize_alias_text(ctx.target.display_text) if ctx.target is not None else "",
+            _normalize_alias_text(ctx.item_data.title) if ctx.item_data is not None else "",
+            _normalize_alias_text(ctx.item_data.description) if ctx.item_data is not None else "",
+        )
+        current_product_key = (
+            f"{ctx.item_data.source_site}:{ctx.item_data.item_id}" if ctx.item_data is not None else None
+        )
+        matches: dict[str, int] = {}
+        for alias, canonical in db.all_aliases():
+            alias_text = _normalize_alias_text(alias)
+            if len(alias_text) < 3:
+                continue
+            if current_product_key and canonical == current_product_key:
+                continue
+            if any(alias_text in haystack for haystack in haystacks if haystack):
+                matches[canonical] = max(matches.get(canonical, 0), len(alias_text))
+
+        ranked = sorted(matches.items(), key=lambda item: (-item[1], item[0]))
+        entries: list[KnowledgeEntry] = []
+        for canonical, _score in ranked:
+            entry = db.get_entry(canonical)
+            if entry is None:
+                continue
+            entries.append(entry)
+            db.mark_referenced(canonical)
+            if len(entries) >= 3:
+                break
+        return tuple(entries)
 
     def _stage_price_placeholder(self, ctx: ResearchJobContext) -> str:
         query = _build_price_query(ctx)
@@ -727,14 +926,25 @@ class ResearchCommandService:
         listed_price = ctx.item_data.listed_price_jpy if ctx.item_data is not None else None
         reference_title = ctx.item_data.title if ctx.item_data is not None and ctx.item_data.title else query
         price_cap = _derive_active_price_cap(listed_price)
-        active_raw_all = self._active_market_search_fn(query, price_cap, 8)
+        backend_warnings: list[str] = []
+        try:
+            active_raw_all = self._active_market_search_fn(query, price_cap, 8)
+        except Exception as exc:
+            logger.exception("Research active market search failed query=%s", query)
+            active_raw_all = []
+            backend_warnings.append(f"Mercari active 比價抓取失敗：{exc}")
         active_raw, active_dropped = _filter_market_items_for_price(
             reference_title=reference_title,
             items=active_raw_all,
             min_similarity=0.32,
         )
         active_evidence = tuple(_price_evidence_from_market_item(item, sold_status="active") for item in active_raw)
-        sold_raw_all = self._sold_market_search_fn(query, 8)
+        try:
+            sold_raw_all = self._sold_market_search_fn(query, 8)
+        except Exception as exc:
+            logger.exception("Research sold market search failed query=%s", query)
+            sold_raw_all = []
+            backend_warnings.append(f"Mercari sold 比價抓取失敗：{exc}")
         sold_raw, sold_dropped = _filter_market_items_for_price(
             reference_title=reference_title,
             items=sold_raw_all,
@@ -743,7 +953,12 @@ class ResearchCommandService:
         sold_evidence = tuple(_price_evidence_from_market_item(item, sold_status="sold") for item in sold_raw)
         sold_avg = _average_price_from_evidence(sold_evidence)
         if sold_avg is None:
-            sold_avg = self._sold_average_lookup_fn(query)
+            try:
+                sold_avg = self._sold_average_lookup_fn(query)
+            except Exception as exc:
+                logger.exception("Research sold average lookup failed query=%s", query)
+                sold_avg = None
+                backend_warnings.append(f"Mercari sold 均價查詢失敗：{exc}")
         ctx.active_price_evidence = active_evidence
         ctx.sold_price_evidence = sold_evidence
         ctx.sold_average_jpy = sold_avg
@@ -755,6 +970,7 @@ class ResearchCommandService:
             sold_average_jpy=sold_avg,
             active_dropped=active_dropped,
             sold_dropped=sold_dropped,
+            backend_warnings=tuple(backend_warnings),
         )
         ctx.add_section_result(result)
         return result.summary
@@ -880,6 +1096,7 @@ def build_research_handler(
     active_market_search_fn: ActiveMarketSearchFn | None = None,
     sold_market_search_fn: SoldMarketSearchFn | None = None,
     sold_average_lookup_fn: SoldAverageLookupFn | None = None,
+    ip_heat_lookup_fn: IpHeatLookupFn | None = None,
 ) -> Callable[[str, str], str]:
     service = ResearchCommandService(
         notifier_factory=notifier_factory,
@@ -892,6 +1109,7 @@ def build_research_handler(
         active_market_search_fn=active_market_search_fn,
         sold_market_search_fn=sold_market_search_fn,
         sold_average_lookup_fn=sold_average_lookup_fn,
+        ip_heat_lookup_fn=ip_heat_lookup_fn,
     )
     return service.run
 
@@ -1043,6 +1261,154 @@ def _shorten_review_excerpt(text: str, limit: int = 34) -> str:
     return text[: limit - 1].rstrip() + "…"
 
 
+def _build_appreciation_section_result(
+    *,
+    query: str,
+    entries: Sequence[KnowledgeEntry],
+    heat_by_canonical: dict[str, tuple[object, ...]],
+    search_results: Sequence[WebSearchResult],
+) -> ResearchSectionResult:
+    if not entries:
+        summary = f"查詢「{query}」目前只拿到商品頁事實，尚未命中可用的 IP / 作者知識。"
+        if search_results:
+            rendered = _render_appreciation_search_results(search_results)
+            summary += " " + rendered
+        return ResearchSectionResult(
+            section_name="增值潛力分析",
+            status="partial" if search_results else "unavailable",
+            confidence=0.2 if search_results else 0.1,
+            sample_count=0,
+            evidence_count=len(search_results),
+            summary=summary,
+            evidence_urls=tuple(result.url for result in search_results[:4]),
+            warnings=(
+                "增值潛力尚未命中 knowledge DB 既有 entity；目前只提供 search snippet 級 evidence。",
+            ),
+        )
+
+    evidence_urls: list[str] = []
+    matched_labels: list[str] = []
+    summary_parts: list[str] = []
+    warnings: list[str] = []
+    heat_lines: list[str] = []
+    heat_hit = False
+
+    for entry in entries:
+        matched_labels.append(f"{entry.entity_canonical}({entry.entity_type})")
+        evidence_urls.extend(url for url in entry.source_urls[:2] if url)
+        summary_parts.append(_summarize_knowledge_entry(entry))
+        signals = tuple(heat_by_canonical.get(entry.entity_canonical) or ())
+        if signals:
+            rendered = _render_heat_summary(entry.entity_canonical, signals)
+            if rendered:
+                heat_lines.append(rendered)
+                heat_hit = True
+
+    summary = f"命中知識庫 {len(entries)} 筆：{'、'.join(matched_labels)}。"
+    if heat_lines:
+        summary += " " + " ".join(heat_lines)
+    summary += " " + " ".join(summary_parts)
+    if search_results:
+        summary += " " + _render_appreciation_search_results(search_results)
+
+    status = "ok" if heat_hit else "partial"
+    if not heat_hit:
+        warnings.append("尚未命中 IP heat 訊號；目前僅能根據既有知識摘要做弱判讀。")
+    if search_results:
+        warnings.append("外部搜尋結果目前只使用 snippet，尚未做頁面抓取與 LLM 催化劑摘要。")
+    else:
+        warnings.append("作者軌跡 / 再販 / 官方催化劑的 web enrichment 尚未接入。")
+    confidence = 0.35 + min(0.25, 0.1 * len(entries)) + (0.15 if heat_hit else 0.0) + (0.05 if search_results else 0.0)
+    return ResearchSectionResult(
+        section_name="增值潛力分析",
+        status=status,
+        confidence=round(min(0.85, confidence), 2),
+        sample_count=len(entries),
+        evidence_count=len(tuple(dict.fromkeys([*evidence_urls, *(result.url for result in search_results)]))),
+        summary=summary.strip(),
+        evidence_urls=tuple(dict.fromkeys([*evidence_urls, *(result.url for result in search_results)]))[:4],
+        warnings=tuple(warnings),
+    )
+
+
+def _summarize_knowledge_entry(entry: KnowledgeEntry) -> str:
+    compact = _compact_whitespace(entry.summary)
+    if len(compact) > 90:
+        compact = compact[:89].rstrip() + "…"
+    return f"{entry.entity_canonical}：{compact}"
+
+
+def _render_heat_summary(canonical: str, signals: Sequence[object]) -> str | None:
+    rendered_bits: list[str] = []
+    peak_percentile: float | None = None
+    for signal in signals:
+        source = getattr(signal, "source", None)
+        percentile = getattr(signal, "percentile", None)
+        if source is None or percentile is None:
+            continue
+        percentile_value = float(percentile)
+        rendered_bits.append(f"{source} {percentile_value:.0f}pct")
+        peak_percentile = percentile_value if peak_percentile is None else max(peak_percentile, percentile_value)
+    if not rendered_bits:
+        return None
+    heat_label = "熱度高" if (peak_percentile or 0.0) >= 80 else "熱度中等" if (peak_percentile or 0.0) >= 60 else "熱度普通"
+    return f"{canonical} 近期 {heat_label}（{' / '.join(rendered_bits)}）。"
+
+
+def _normalize_alias_text(text: str) -> str:
+    return _compact_whitespace(text).lower()
+
+
+def _should_enrich_appreciation(
+    entries: Sequence[KnowledgeEntry],
+    heat_by_canonical: dict[str, tuple[object, ...]],
+) -> bool:
+    return not entries or not heat_by_canonical
+
+
+def _collect_appreciation_search_results(ctx: ResearchJobContext) -> tuple[WebSearchResult, ...]:
+    query = _build_price_query(ctx)
+    if not query:
+        return ()
+    try:
+        raw_results = tuple(ctx.search_fn(query, 3))
+    except BudgetExhaustedError:
+        return ()
+    except Exception:
+        logger.exception("Research appreciation web search failed query=%s", query)
+        return ()
+    return _filter_appreciation_search_results(raw_results)
+
+
+def _filter_appreciation_search_results(results: Sequence[WebSearchResult]) -> tuple[WebSearchResult, ...]:
+    filtered: list[WebSearchResult] = []
+    seen_urls: set[str] = set()
+    for result in results:
+        url = str(result.url or "").strip()
+        if not url or url in seen_urls:
+            continue
+        host = (urlsplit(url).netloc or "").lower()
+        if host in _MERCARI_HOSTS:
+            continue
+        seen_urls.add(url)
+        filtered.append(result)
+        if len(filtered) >= 3:
+            break
+    return tuple(filtered)
+
+
+def _render_appreciation_search_results(results: Sequence[WebSearchResult]) -> str:
+    if not results:
+        return ""
+    labels = []
+    for result in results[:2]:
+        title = _compact_whitespace(result.title)
+        if len(title) > 42:
+            title = title[:41].rstrip() + "…"
+        labels.append(title)
+    return f"外部補證 {len(results)} 筆：{' / '.join(labels)}。"
+
+
 def _build_price_query(ctx: ResearchJobContext) -> str:
     if ctx.item_data is not None and ctx.item_data.title:
         return ctx.item_data.title
@@ -1084,6 +1450,7 @@ def _build_price_section_result(
     sold_average_jpy: float | None,
     active_dropped: int = 0,
     sold_dropped: int = 0,
+    backend_warnings: tuple[str, ...] = (),
 ) -> ResearchSectionResult:
     active_prices = [e.price_jpy for e in active_evidence if e.price_jpy is not None]
     sold_prices = [e.price_jpy for e in sold_evidence if e.price_jpy is not None]
@@ -1129,6 +1496,7 @@ def _build_price_section_result(
         status = "unavailable"
         summary_parts = [f"查詢「{query}」未取得可用的 sold 或 active 樣本。"]
 
+    warnings.extend(backend_warnings)
     if sold_dropped:
         warnings.append(f"sold 候選排除了 {sold_dropped} 筆低相關樣本。")
     if active_dropped:
@@ -1251,19 +1619,23 @@ def _build_liquidity_section_result(
 def _default_active_market_search(query: str, price_cap: int, max_results: int) -> list[dict[str, object]]:
     from market_monitor.mercari_search import search_mercari
 
-    return search_mercari(query, price_max=price_cap, max_results=max_results)
+    return _run_in_isolated_thread(
+        lambda: search_mercari(query, price_max=price_cap, max_results=max_results)
+    )
 
 
 def _default_sold_market_search(query: str, max_results: int) -> list[dict[str, object]]:
     from market_monitor.mercari_search import search_mercari_sold
 
-    return search_mercari_sold(query, max_results=max_results)
+    return _run_in_isolated_thread(
+        lambda: search_mercari_sold(query, max_results=max_results)
+    )
 
 
 def _default_sold_average_lookup(query: str) -> float | None:
     from market_monitor.mercari_search import fetch_avg_sold_price
 
-    return fetch_avg_sold_price(query)
+    return _run_in_isolated_thread(lambda: fetch_avg_sold_price(query))
 
 
 def _average_price_from_evidence(evidence: tuple[PriceEvidence, ...]) -> float | None:
