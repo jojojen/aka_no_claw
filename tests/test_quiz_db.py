@@ -1286,6 +1286,39 @@ class TestReadingTitleGuard:
             )
 
 
+class TestLexicalCommentaryWrapperGuard:
+    def test_detects_commentary_wrapped_lexical_stem(self):
+        from openclaw_adapter.quiz_db import lexical_stem_uses_commentary_wrapper
+        assert lexical_stem_uses_commentary_wrapper(
+            exam_point="漢字読み",
+            stem="次の一節『「ブリキノダンス」の解説によれば、...と筆者は読み解いている。』にある〈壮大〉の読み方として最も適切なものはどれか。",
+        )
+
+    def test_allows_real_lyric_sentence(self):
+        from openclaw_adapter.quiz_db import lexical_stem_uses_commentary_wrapper
+        assert not lexical_stem_uses_commentary_wrapper(
+            exam_point="言い換え類義",
+            stem="次の一節「理想で作った道を現実が塗り替えていくよ」にある〈塗り替える〉に最も近い意味はどれか。",
+        )
+
+    def test_insert_rejects_commentary_wrapped_lexical_stem(self, tmp_path):
+        db = _db(tmp_path)
+        with pytest.raises(ValueError, match="lexical stem uses commentary wrapper"):
+            db.insert_question(
+                level="JLPT N1",
+                exam_point="漢字読み",
+                stem="次の一節『「ブリキノダンス」の解説によれば、...と筆者は読み解いている。』にある〈壮大〉の読み方として最も適切なものはどれか。",
+                options=("そうだい", "そうたい", "そだい", "そうてい"),
+                answer_index=0,
+                source_name="ブリキノダンス",
+                source_excerpt="「ブリキノダンス」の解説によれば、...と筆者は読み解いている。",
+                source_excerpt_type="commentary",
+                tested_point="壮大",
+                author="codex",
+                allow_ungrounded=True,
+            )
+
+
 class TestKanjiReadingDistractorAudit:
     def test_flags_zero_overlap_distractors(self):
         from openclaw_adapter.quiz_db import audit_kanji_reading_distractors

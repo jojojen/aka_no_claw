@@ -100,6 +100,9 @@ reached.
   the stale empty file `data/quiz.sqlite`.
 - Do not use title-only grounding for `漢字読み`. A prompt that asks how a song/article title is read is now rejected.
 - If a word that also appears in the title shows up naturally inside a real lyric/article sentence, that sentence may still ground a good lexical item. The distinction is: **real sentence with memory value is allowed; title-only prompt is not**.
+- Do not keep lexical stems that quote commentary/about-text prose such as
+  `解説によれば`, `筆者は読み解いている`, `語り手`, or `徹底解説`. Those are
+  commentary wrappers, not memory-helpful usage sentences.
 - Do not use mechanical title slices merely to increase the count. Reject pure song titles, full title phrases, kana-particle fragments, connective fragments, basic words, and title chunks that are not natural standalone vocabulary items. If the song title or lyric line does not provide enough good vocabulary, switch to cached or reliable background/commentary/appreciation material and use a question type that can be legally grounded by that source.
 - Before inserting a question for a new headword, register it in the `vocab_seed` table:
   ```python
@@ -130,6 +133,16 @@ reached.
     - `文脈規定 = 39`
     - `用法 = 1`
     - remaining rows flagged by the same `漢字読み` audit: `0`
+
+- 2026-06-13 JST — Commentary-wrapper lexical cleanup:
+  - Added a hard reject for lexical stems that teach a word through commentary/about-text
+    prose instead of a real sentence with memory value.
+  - Deleted 7 existing verified `漢字読み` rows that used this wrapper family.
+  - Updated live lexical counts after both cleanup passes:
+    - `漢字読み = 533`
+    - `言い換え類義 = 651`
+    - `文脈規定 = 39`
+    - `用法 = 1`
 
 - 2026-06-04 JST — Planning pass:
   - Baseline confirmed: 97 cards.

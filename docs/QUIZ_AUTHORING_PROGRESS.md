@@ -116,6 +116,18 @@ Last updated: 2026-06-13 JST
     - Remaining rows flagged by the same `漢字読み` audit: 0.
   - Verification:
     - `PYTHONPATH=src uv run --no-project --with pytest --with truststore python -m pytest tests/test_quiz_db.py tests/test_quiz_command_label.py` — 159 passed.
+- 2026-06-13 JST — Deleted commentary-wrapped lexical template items:
+  - Added a new hard reject in `src/openclaw_adapter/quiz_db.py` for lexical stems that
+    package a target word inside commentary/about-text prose such as `解説によれば`,
+    `筆者は読み解いている`, `語り手`, `徹底解説`, or `という部分は...`.
+  - Deleted 7 existing verified `漢字読み` rows that used this commentary wrapper.
+  - Post-cleanup lexical counts:
+    - `漢字読み = 533`
+    - `言い換え類義 = 651`
+    - `文脈規定 = 39`
+    - `用法 = 1`
+  - Verification:
+    - `PYTHONPATH=src uv run --no-project --with pytest --with truststore python -m pytest tests/test_quiz_db.py tests/test_quiz_command_label.py` — 162 passed.
 - 2026-06-12 JST — Repaired `/quiz grammar` learner-facing cards without local-model rewriting:
   - User reported `〜ずに（〜しないで）` had a bad example: `どうしても 大人に成れずに` was an incomplete lyric fragment and not a good card example for `〜ずに`.
   - Read project principles before broad repair: `AGENTS.md`, `Constitution.md`, `CLAUDE.md`, `README.md`, `docs/QUIZ_TEACHING_LOOP.md`, and `ai/skills/aka-no-claw-workflow/SKILL.md`.
