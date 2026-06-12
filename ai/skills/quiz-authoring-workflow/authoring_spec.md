@@ -91,15 +91,21 @@ bootstrap), so you control it entirely through the excerpt you author:
 - `tested_point` must be genuine **N1** vocabulary: 難読語・複合語・文語語彙
   (老舗・矜持・逡巡・蹉跌・執拗・脆弱・凋落). NOT N3/N4 basics
   (視聴者・創造・形成・予測・脱出・裏切る・批判).
+- DO NOT test how a song/article title is read. Reject prompts like `次の曲名「X」の読み方...`
+  and reject title-only grounding. However, if the same word appears naturally in a
+  real lyric/article sentence, that sentence may ground a valid lexical item. The ban
+  is on treating the title string itself as the question, not on reusing a real
+  sentence that happens to contain title vocabulary.
 - **Distractors must be plausible WRONG READINGS OF THE TARGET WORD** — alternative
   on/kun readings, similar-character confusion, connected-sound (連濁) variants.
   NEVER readings of unrelated words.
   - Good: 【創造】そうぞう → そうさく / さくぞう / そうきょう
   - Bad:  【創造】そうぞう → けいばつ / やきめ (zero relation to the answer)
-- Run `audit_kanji_reading_distractors(options, answer_index)` — a cheap additive
-  filter. A non-empty result means a distractor shares no sound with the answer or
-  is phrase-length; fix it. An empty result does NOT certify quality — it only means
-  no obvious garbage.
+- Run `audit_kanji_reading_distractors(options, answer_index)` before insertion.
+  A non-empty result is now a HARD REJECT, not just advice: if a distractor shares
+  no sound with the answer or is phrase-length, the item is garbage and must be
+  rewritten. An empty result does NOT certify quality — it only means no obvious
+  garbage.
 - AVOID DUAL-READING HEADWORDS — a word with two legitimate readings is unfair as a
   漢字読み item (both readings are "correct"). Drop it. Examples: 艶やか (つややか／あでやか),
   卒塔婆 (そとば／そとうば).
@@ -130,10 +136,17 @@ bootstrap), so you control it entirely through the excerpt you author:
 
 ### 用法
 - Present the target word used in 4 different sentences; exactly ONE uses it correctly.
+- DO NOT use a stock wrapper stem like `次のうち、語句「X」の使い方として最も適切な文はどれか。`
+  The prompt itself must carry context and memory value. A learner should remember
+  the target word better after reading the item, not just see four mechanically
+  swapped sentences under a generic shell.
 - DON'T let only the correct option contain the target word while every distractor swaps
   it for a near-synonym — that tests visual presence, not usage. `youhou_target_word_presence_leaks`
   rejects this; all four options should contain the word, only one used correctly.
 - The correct option is the grounding anchor (it carries the real line for 用法).
+- Reject absurd filler options whose only role is to pad to four choices. If a
+  distractor is obviously nonsense rather than a close usage error, the item has no
+  memory value and should be dropped.
 
 ### Reading types (内容理解・主張理解・統合理解・情報検索・読解・文章の文法)
 - **Passage must be ADAPTED FROM A REAL, EXISTING ARTICLE — never fully original prose.**
@@ -199,20 +212,21 @@ it. Don't re-derive or fight a gate — author so it passes.
 
 | Rule | Function | Location |
 | --- | --- | --- |
-| Source grounding (3-tier A/B/C) | `is_grounded` | `quiz_db.py:277` |
-| Excerpt-type vs exam-point conflict | `source_excerpt_type_conflicts_with_exam_point` | `quiz_db.py` |
-| No duplicate options | `options_have_duplicates` | `quiz_db.py:401` |
-| Answer leaks into stem | `answer_leaks_into_stem` | `quiz_db.py:416` |
-| 言い換え restates headword | `synonym_answer_restates_headword` | `quiz_db.py:430` |
-| 用法 presence-only leak | `youhou_target_word_presence_leaks` | `quiz_db.py:458` |
-| Chinese gloss must be Han-only | `_contains_kana` (in `upsert_vocab_seed`) | `quiz_db.py:491` / `:921` |
-| 漢字読み distractor audit | `audit_kanji_reading_distractors` | `quiz_db.py:515` |
-| Reading: correct option verbatim copy | `correct_option_is_verbatim_copy` | `quiz_db.py:365` |
-| Reading: 2-tier discrimination/leak probe | `_passes_reading_discrimination` | `quiz_generator.py:384` |
-| Dual-LLM author+blind-grader verify | `_validate_and_verify` | `quiz_generator.py:305` |
-| Vocab example length cap (70 chars) | `source_excerpt_vocab_example` (`_MAX_VOCAB_EXAMPLE_CHARS`) | `quiz_db.py:211` |
-| Vocab example low-value filter | `vocab_example_is_low_value` | `quiz_db.py:182` |
-| Card bootstrap + primary/example pick | `_backfill_vocab_cards`, `_VOCAB_PRIMARY_PRIORITY` | `quiz_db.py` |
+| Source grounding (3-tier A/B/C) | `is_grounded` | `src/openclaw_adapter/quiz_db.py` |
+| Excerpt-type vs exam-point conflict | `source_excerpt_type_conflicts_with_exam_point` | `src/openclaw_adapter/quiz_db.py` |
+| No duplicate options | `options_have_duplicates` | `src/openclaw_adapter/quiz_db.py` |
+| Answer leaks into stem | `answer_leaks_into_stem` | `src/openclaw_adapter/quiz_db.py` |
+| 言い換え restates headword | `synonym_answer_restates_headword` | `src/openclaw_adapter/quiz_db.py` |
+| 用法 presence-only leak | `youhou_target_word_presence_leaks` | `src/openclaw_adapter/quiz_db.py` |
+| Chinese gloss must be Han-only | `_contains_kana` (in `upsert_vocab_seed`) | `src/openclaw_adapter/quiz_db.py` |
+| 漢字読み distractor audit / hard reject | `audit_kanji_reading_distractors` | `src/openclaw_adapter/quiz_db.py` |
+| Reading: correct option verbatim copy | `correct_option_is_verbatim_copy` | `src/openclaw_adapter/quiz_db.py` |
+| Reading: 2-tier discrimination/leak probe | `_passes_reading_discrimination` | `src/openclaw_adapter/quiz_generator.py` |
+| Dual-LLM author+blind-grader verify | `_validate_and_verify` | `src/openclaw_adapter/quiz_generator.py` |
+| Vocab example length cap (70 chars) | `source_excerpt_vocab_example` (`_MAX_VOCAB_EXAMPLE_CHARS`) | `src/openclaw_adapter/quiz_db.py` |
+| Vocab example low-value filter | `vocab_example_is_low_value` | `src/openclaw_adapter/quiz_db.py` |
+| Card bootstrap + primary/example pick | `_backfill_vocab_cards`, `_VOCAB_PRIMARY_PRIORITY` | `src/openclaw_adapter/quiz_db.py` |
 
 Card primary-question priority: **用法 > 文脈規定 > 言い換え類義 > 漢字読み** (`_VOCAB_PRIMARY_PRIORITY`).
-Line numbers drift — `grep` the function name if an anchor is stale.
+After refactors, treat function name + file path as the stable anchor; do not rely on
+line numbers in docs.

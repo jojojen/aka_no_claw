@@ -1,11 +1,13 @@
 # /quiz vocabulary-card expansion progress
 
-Last updated: 2026-06-12 JST
+Last updated: 2026-06-13 JST
 
 ## Goal
 
 - User target: continue authoring quiz-backed vocabulary until `/quiz vocab` reaches at least 800 `JLPT N1` Codex vocabulary cards.
-- Current card source model: vocabulary cards are derived from `quiz_questions.tested_point` for Codex-authored lexical quiz rows.
+- Current card source model: vocabulary cards are backfilled from verified lexical
+  quiz rows keyed by `quiz_questions.tested_point`, using the current primary-question
+  priority in `src/openclaw_adapter/quiz_db.py`.
 - Runtime note: `/quiz grammar` now exists as a separate study surface backed by `quiz_grammar_cards`. Grammar-card counts and backfill rules are separate; do not count grammar cards toward the `/quiz vocab` 800-card target.
 - Lexical quiz types counted for vocab cards:
   - `漢字読み`
@@ -34,16 +36,19 @@ Operational meaning:
 
 ## Current Status
 
-- Current clean `quiz_vocab_cards` count after source-excerpt example enforcement: 300.
-- Current Codex lexical question-row count: 853.
-- Current distinct `tested_point` count: 827.
-- Current `vocab_seed` table count: 666 (DB-backed, `quiz_vocab_seed.py` has been deleted).
-- Current ready `favorite_songs` count: 28.
+- Current clean `quiz_vocab_cards` count: 886.
+- Current verified lexical question-row count (`漢字読み` / `言い換え類義` / `文脈規定` / `用法`): 1231.
+- Current distinct lexical `tested_point` count: 817.
+- Current `vocab_seed` table count: 1273 (DB-backed, `quiz_vocab_seed.py` has been deleted).
 - Current target floor: 800 cards.
-- Remaining clean vocabulary cards needed from the current baseline: 500.
-- Status: in progress.
+- Remaining clean vocabulary cards needed from the current baseline: 0.
+- Status: target reached; cleanup / QA hardening in progress.
 
 ## Reverse Plan
+
+Historical planning snapshot from the expansion phase. Keep for provenance; do not use
+these numbers as the current live baseline now that the 800-card target has been
+reached.
 
 - One new unique lexical `tested_point` produces one vocabulary card.
 - Therefore, from the current clean baseline, minimum new unique lexical quiz rows required: 546.
@@ -90,7 +95,11 @@ Operational meaning:
 
 ## Implementation Notes
 
-- Use `漢字読み` title-grounded rows only when the song title contains a natural standalone vocabulary item that a learner could use outside the song title.
+- Live DB path is `settings.quiz_db_path` from `src/assistant_runtime/settings.py`
+  (env `OPENCLAW_QUIZ_DB_PATH`, default `data/quiz.sqlite3`). Do not point tooling at
+  the stale empty file `data/quiz.sqlite`.
+- Do not use title-only grounding for `漢字読み`. A prompt that asks how a song/article title is read is now rejected.
+- If a word that also appears in the title shows up naturally inside a real lyric/article sentence, that sentence may still ground a good lexical item. The distinction is: **real sentence with memory value is allowed; title-only prompt is not**.
 - Do not use mechanical title slices merely to increase the count. Reject pure song titles, full title phrases, kana-particle fragments, connective fragments, basic words, and title chunks that are not natural standalone vocabulary items. If the song title or lyric line does not provide enough good vocabulary, switch to cached or reliable background/commentary/appreciation material and use a question type that can be legally grounded by that source.
 - Before inserting a question for a new headword, register it in the `vocab_seed` table:
   ```python
@@ -106,13 +115,29 @@ Operational meaning:
 
 ## Progress Log
 
+- 2026-06-13 JST — Runtime-path alignment + `漢字読み` distractor cleanup:
+  - Updated docs to follow the refactored runtime DB path:
+    - live path is `settings.quiz_db_path` from `src/assistant_runtime/settings.py`
+    - default remains `data/quiz.sqlite3`
+    - `data/quiz.sqlite` is only a stale empty artifact and must not be used for audits
+  - Promoted `audit_kanji_reading_distractors(...)` from advisory guidance to an
+    insert-time hard reject for `漢字読み`.
+  - Deleted 269 existing verified `漢字読み` rows whose distractors were unrelated
+    readings or phrase-length garbage.
+  - Post-cleanup lexical pool snapshot:
+    - `漢字読み = 540`
+    - `言い換え類義 = 651`
+    - `文脈規定 = 39`
+    - `用法 = 1`
+    - remaining rows flagged by the same `漢字読み` audit: `0`
+
 - 2026-06-04 JST — Planning pass:
   - Baseline confirmed: 97 cards.
   - Need at least 203 new unique lexical quiz points.
   - Minimum source requirement: 68 fresh song sources at 3 questions each.
   - Working batch target set to 70 sources / 210 quiz rows / final 307 cards.
 - 2026-06-04 JST — Title-grounded expansion batch:
-  - Inserted a large Codex `漢字読み` batch using song-title grounding.
+  - Historical note only. This batch was later superseded by stricter rules; title-only `漢字読み` prompts were removed from the live verified pool on 2026-06-13 JST.
   - Source pool used two layers:
     - under-quota songs already present in `data/proseka_songs.json`
     - additional reliable Vocaloid song sources from VocaDB ranking pages when the Proseka-only pool was insufficient

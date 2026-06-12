@@ -80,8 +80,6 @@ _COMMENTARY_URL_MARKERS = (
     "specialarticle", "dic.nicovideo", "hatenablog", "ameblo",
     "note.com", "/blog", "blog.", "/v/", "考察", "解説",
 )
-
-
 def _is_commentary_url(url: str | None) -> bool:
     u = (url or "").lower()
     return any(m in u for m in _COMMENTARY_URL_MARKERS)
@@ -497,7 +495,7 @@ def _render_grammar_card(card, *, mode: str, index: int, total: int) -> tuple[st
         "recent": "最新加入文法卡",
         "lookup": "文法查詢",
     }.get(mode, "文法卡")
-    difficulty = (getattr(card, "tested_jlpt_level", None) or "").strip().upper() or "N1"
+    difficulty = (getattr(card, "tested_jlpt_level", None) or "").strip().upper() or "未標定"
     author_label = (getattr(card, "author", None) or "codex").strip() or "codex"
     head = f"📗 {card.level} {mode_label}　{index + 1}/{total}　〔難度 {difficulty}〕〔作者 {author_label}〕"
     lines = [
