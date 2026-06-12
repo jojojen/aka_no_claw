@@ -1,6 +1,18 @@
 # /quiz 出題進度與交接紀錄
 
-Last updated: 2026-06-04 JST
+Last updated: 2026-06-12 JST
+
+## Runtime Notes
+
+- Learner-facing study surfaces now split into:
+  - `/quiz vocab` for lexical cards backed by `quiz_vocab_cards`
+  - `/quiz grammar` for grammar cards backed by `quiz_grammar_cards`
+- Grammar cards are backfilled automatically from verified `JLPT N1` quiz rows whose `exam_point` is one of:
+  - `文法形式の判断`
+  - `文章の文法`
+  - `文の組み立て`
+- The grouping key is still `quiz_questions.tested_point`. If Claude inserts a new verified grammar row with a stable `tested_point`, the corresponding `/quiz grammar` card will refresh automatically.
+- Vocabulary-card counts in this file do not include grammar cards. Do not mix the two inventories when tracking coverage.
 
 ## Scope
 

@@ -5,9 +5,11 @@ from openclaw_adapter.quiz_command import (
     _author_from_code,
     _grade_view,
     _is_commentary_url,
+    _parse_grammar_args,
     _parse_vocab_args,
     _parse_serve_args,
     _render_author_menu,
+    _render_grammar_lookup,
     _render_stats,
     _render_type_menu,
     _render_vocab_lookup,
@@ -98,6 +100,15 @@ def test_parse_vocab_args_modes_and_query():
     assert _parse_vocab_args("random") == ("JLPT N1", "random", "")
     assert _parse_vocab_args("source 夜もすがら君想ふ") == ("JLPT N1", "source", "夜もすがら君想ふ")
     assert _parse_vocab_args("範疇") == ("JLPT N1", "lookup", "範疇")
+
+
+def test_parse_grammar_args_modes_and_query():
+    assert _parse_grammar_args("") == ("JLPT N1", "weak", "")
+    assert _parse_grammar_args("all") == ("JLPT N1", "all", "")
+    assert _parse_grammar_args("wrong") == ("JLPT N1", "wrong", "")
+    assert _parse_grammar_args("random") == ("JLPT N1", "random", "")
+    assert _parse_grammar_args("source ロキ") == ("JLPT N1", "source", "ロキ")
+    assert _parse_grammar_args("〜まい") == ("JLPT N1", "lookup", "〜まい")
 
 
 class _FakeDB:
@@ -372,6 +383,23 @@ def test_render_vocab_lookup_multiple_hits_lists_suggestions():
     assert "魅了する（みりょうする）" in text
 
 
+def test_render_grammar_lookup_multiple_hits_lists_suggestions():
+    class _LookupDB:
+        def get_grammar_card(self, **kwargs):
+            return None
+
+        def find_grammar_cards(self, **kwargs):
+            return [
+                SimpleNamespace(headword="〜まい", source_name="ロキ"),
+                SimpleNamespace(headword="〜以上", source_name="テスト曲"),
+            ]
+
+    text = _render_grammar_lookup(_LookupDB(), level="JLPT N1", query="〜")
+    assert "找到 2 張相關文法卡" in text
+    assert "〜まい" in text
+    assert "〜以上" in text
+
+
 def test_quiz_vocab_handler_exact_lookup(tmp_path):
     from openclaw_adapter.quiz_command import build_quiz_handler
     from openclaw_adapter.quiz_db import QuizDatabase
@@ -404,6 +432,41 @@ def test_quiz_vocab_handler_exact_lookup(tmp_path):
     assert "原文：http://www5.atwiki.jp/hmiku/pages/35673.html" in text
     assert any(
         b["callback_data"].startswith("quiz:vr:")
+        for row in markup["inline_keyboard"]
+        for b in row
+    )
+
+
+def test_quiz_grammar_handler_exact_lookup(tmp_path):
+    from openclaw_adapter.quiz_command import build_quiz_handler
+    from openclaw_adapter.quiz_db import QuizDatabase
+
+    dbp = tmp_path / "quiz.sqlite3"
+    db = QuizDatabase(dbp)
+    db.insert_question(
+        level="JLPT N1",
+        exam_point="文章の文法",
+        stem="彼は最後まで逃げる（　　）と踏みとどまった。",
+        options=("まい", "べく", "ものを", "ながら"),
+        answer_index=0,
+        explanation="「〜まい」は強い否定意志を表し、この文では『逃げるつもりはない』という意味になる。",
+        source_type="vocaloid_song",
+        source_name="ロキ",
+        source_text_url="https://example.com/text",
+        source_media_url="https://example.com/song",
+        source_excerpt="逃げるまいと心に決めた。",
+        tested_point="〜まい",
+        author="codex",
+        verified=True,
+        allow_ungrounded=True,
+    )
+    handler = build_quiz_handler(SimpleNamespace(quiz_db_path=dbp))
+    text, markup = handler("grammar 〜まい", "u1")
+    assert "句型：〜まい" in text
+    assert "說明：" in text
+    assert "例句：逃げるまいと心に決めた。" in text
+    assert any(
+        b["callback_data"].startswith("quiz:gr:")
         for row in markup["inline_keyboard"]
         for b in row
     )
@@ -451,6 +514,28 @@ def test_render_vocab_card_shows_audio_button_for_any_headword_with_example():
     assert any(b["callback_data"] == "quiz:va:vid2" for b in flat)
 
 
+def test_render_grammar_card_shows_audio_button_for_example():
+    from openclaw_adapter.quiz_command import _render_grammar_card
+
+    card = SimpleNamespace(
+        card_id="gid1",
+        level="JLPT N1",
+        headword="〜まい",
+        explanation_zh="強い否定意志。",
+        example_ja="逃げるまいと心に決めた。",
+        exam_points=("文章の文法",),
+        source_name="ロキ",
+        source_media_url=None,
+        source_text_url=None,
+        tested_jlpt_level="N1",
+        author="codex",
+    )
+    assert _vocab_audio_enabled(card) is True
+    _, markup = _render_grammar_card(card, mode="all", index=0, total=1)
+    flat = [b for row in markup["inline_keyboard"] for b in row]
+    assert any(b["callback_data"] == "quiz:ga:gid1" for b in flat)
+
+
 def test_vocab_related_question_callback_serves_matching_question(tmp_path):
     from openclaw_adapter.quiz_command import build_quiz_callback_handler
     from openclaw_adapter.quiz_db import QuizDatabase
@@ -481,6 +566,131 @@ def test_vocab_related_question_callback_serves_matching_question(tmp_path):
     assert toast is None
     assert q.stem in new_text
     assert markup is not None
+
+
+def test_grammar_card_end_to_end_flow(tmp_path):
+    from openclaw_adapter.quiz_command import build_quiz_callback_handler
+    from openclaw_adapter.quiz_command import build_quiz_handler
+    from openclaw_adapter.quiz_db import QuizDatabase
+
+    dbp = tmp_path / "quiz.sqlite3"
+    db = QuizDatabase(dbp)
+    q = db.insert_question(
+        level="JLPT N1",
+        exam_point="文章の文法",
+        stem="彼は最後まで逃げる（　　）と踏みとどまった。",
+        options=("まい", "べく", "ものを", "ながら"),
+        answer_index=0,
+        explanation="「〜まい」は強い否定意志を表し、この文では『逃げるつもりはない』という意味になる。",
+        source_type="vocaloid_song",
+        source_name="ロキ",
+        source_text_url="https://example.com/text",
+        source_excerpt="逃げるまいと心に決めた。",
+        tested_point="〜まい",
+        author="codex",
+        verified=True,
+        allow_ungrounded=True,
+    )
+    command_handler = build_quiz_handler(SimpleNamespace(quiz_db_path=dbp))
+    card_text, card_markup = command_handler("grammar 〜まい", "u1")
+    serve_payload = next(
+        b["callback_data"].removeprefix("quiz:")
+        for row in card_markup["inline_keyboard"]
+        for b in row
+        if b["callback_data"].startswith("quiz:gr:")
+    )
+    callback_handler = build_quiz_callback_handler(SimpleNamespace(quiz_db_path=dbp))
+    toast, question_text, question_markup = callback_handler(serve_payload, card_text, "u1")
+    assert toast is None
+    assert q.stem in question_text
+    assert question_markup is not None
+    toast, graded_text, graded_markup = callback_handler(f"a:{q.question_id}:0", question_text, "u1")
+    assert toast == "✅ 答對了！"
+    assert "正解：A. まい" in graded_text
+    review_payload = next(
+        b["callback_data"].removeprefix("quiz:")
+        for row in graded_markup["inline_keyboard"]
+        for b in row
+        if b["callback_data"].startswith("quiz:gc:")
+    )
+    toast, card_again_text, card_again_markup = callback_handler(review_payload, graded_text, "u1")
+    assert toast is None
+    assert "句型：〜まい" in card_again_text
+    assert card_again_markup is not None
+
+
+def test_grammar_audio_callback_sends_document_for_grammar_card(tmp_path, monkeypatch):
+    from openclaw_adapter.quiz_command import build_quiz_callback_handler
+    from openclaw_adapter.quiz_db import QuizDatabase
+
+    class _FakeSynth:
+        def synthesize_to_path(self, *, text, output_path):
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(f"audio:{text}".encode("utf-8"))
+            return output_path
+
+        def synthesize_to_cache(self, *, text, cache_dir, vocab_id):
+            out = cache_dir / f"{vocab_id}--fake.wav"
+            self.synthesize_to_path(text=text, output_path=out)
+            return SimpleNamespace(
+                output_path=out,
+                engine_tag="fake",
+                engine_label="Fake Engine",
+            )
+
+    sent = {}
+
+    class _FakeClient:
+        def __init__(self, token, *, ssl_context=None):
+            sent["token"] = token
+
+        def send_document(self, *, chat_id, document_path, caption=None):
+            sent["chat_id"] = chat_id
+            sent["document_path"] = str(document_path)
+            sent["caption"] = caption
+
+    monkeypatch.setattr("openclaw_adapter.quiz_command.build_vocab_synthesizer", lambda settings, params=None: _FakeSynth())
+    monkeypatch.setattr("openclaw_adapter.quiz_command.TelegramBotClient", _FakeClient)
+
+    dbp = tmp_path / "quiz.sqlite3"
+    db = QuizDatabase(dbp)
+    db.insert_question(
+        level="JLPT N1",
+        exam_point="文章の文法",
+        stem="彼は最後まで逃げる（　　）と踏みとどまった。",
+        options=("まい", "べく", "ものを", "ながら"),
+        answer_index=0,
+        explanation="「〜まい」は強い否定意志を表し、この文では『逃げるつもりはない』という意味になる。",
+        source_type="vocaloid_song",
+        source_name="ロキ",
+        source_text_url="https://example.com/text",
+        source_media_url="https://example.com/song",
+        source_excerpt="逃げるまいと心に決めた。",
+        tested_point="〜まい",
+        author="codex",
+        verified=True,
+        allow_ungrounded=True,
+    )
+    card = db.get_grammar_card(headword="〜まい", level="JLPT N1")
+    assert card is not None
+    settings = SimpleNamespace(
+        quiz_db_path=dbp,
+        openclaw_telegram_bot_token="token123",
+        openclaw_local_tts_endpoint="http://127.0.0.1:10101",
+        openclaw_local_tts_timeout_seconds=20,
+        openclaw_local_tts_speaker_id=None,
+        openclaw_tls_insecure_skip_verify=False,
+        openclaw_ca_bundle_path=None,
+    )
+    handler = build_quiz_callback_handler(settings)
+    toast, new_text, markup = handler(f"ga:{card.card_id}", "card text", "u1")
+    assert toast == "已送出例句音檔"
+    assert new_text is None
+    assert markup is None
+    assert sent["chat_id"] == "u1"
+    assert "Fake Engine" in sent["caption"]
+    assert "〜まい" in sent["caption"]
+    assert sent["document_path"].endswith(f"{card.card_id}--fake.wav")
 
 
 def test_vocab_audio_callback_sends_document_for_vocab_card(tmp_path, monkeypatch):

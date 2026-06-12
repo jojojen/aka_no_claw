@@ -179,6 +179,7 @@ launchers\start-telegram-bot.bat --notify-startup
 /liquidity ws 5
 /snapshot https://jp.mercari.com/item/m123456789
 /scan pokemon
+/quiz grammar
 傳卡圖並加上 caption: /scan pokemon
 ```
 

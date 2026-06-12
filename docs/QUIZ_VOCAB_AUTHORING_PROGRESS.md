@@ -1,11 +1,12 @@
 # /quiz vocabulary-card expansion progress
 
-Last updated: 2026-06-07 JST
+Last updated: 2026-06-12 JST
 
 ## Goal
 
 - User target: continue authoring quiz-backed vocabulary until `/quiz vocab` reaches at least 800 `JLPT N1` Codex vocabulary cards.
 - Current card source model: vocabulary cards are derived from `quiz_questions.tested_point` for Codex-authored lexical quiz rows.
+- Runtime note: `/quiz grammar` now exists as a separate study surface backed by `quiz_grammar_cards`. Grammar-card counts and backfill rules are separate; do not count grammar cards toward the `/quiz vocab` 800-card target.
 - Lexical quiz types counted for vocab cards:
   - `漢字読み`
   - `言い換え類義`

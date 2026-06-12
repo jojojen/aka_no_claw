@@ -341,6 +341,7 @@ def test_command_processor_help_lists_trend_and_scan_commands() -> None:
     assert "/research https://jp.mercari.com/item/m123456789" in help_reply
     assert "/scan pokemon" in help_reply
     assert "/hunt status" in help_reply
+    assert "/quiz grammar" in help_reply
     assert "/translateja 你好，今天辛苦了" in help_reply
     assert "/translatezh お疲れさま、今日は大変だったね" in help_reply
 

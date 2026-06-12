@@ -19,6 +19,7 @@ Subcommands:
                                        (weighted); drops out once you re-answer right.
   /quiz stats                        — per-題型 accuracy, weakest 考点, 混淆選項分析.
   /quiz vocab [mode|word]            — 單字卡：弱點/全部/錯題/隨機/查詞.
+  /quiz grammar [mode|pattern]       — 文法卡：弱點/全部/錯題/隨機/查句型.
   /quizlikesong <youtube_url>         — 收藏歌曲並預先抓歌詞/NLP.
   /quiz review [page]                — answer-revealed paginated list (QA review).
   /quiz gen20 [n]                    — bootstrap: generate N (default 20) questions.
@@ -33,6 +34,10 @@ Callback payloads (prefix ``quiz`` is stripped by bot.py, so we see the rest):
   vb:<level>:<mode>:<index>   — vocabulary-card browsing
   vr:<vocab_id>               — serve one question related to the vocabulary card
   vc:<vocab_id>               — show a specific vocab card directly (from grade result)
+  gb:<level>:<mode>:<index>   — grammar-card browsing
+  gr:<card_id>                — serve one question related to the grammar card
+  gc:<card_id>                — show a specific grammar card directly
+  ga:<card_id>                — play the grammar-card example audio
   p:<page>                    — re-render review page
   d:<question_id>             — delete a question, re-render current page
 
@@ -64,6 +69,7 @@ _DEFAULT_LEVEL = "JLPT N1"
 _DEFAULT_THEME = "miku"
 _LETTERS = "ABCDEFGHIJ"
 _REVIEW_PAGE_SIZE = 3
+_GRAMMAR_CARD_EXAM_POINTS = {"文法形式の判断", "文章の文法", "文の組み立て"}
 # source_text_url usually points to lyrics for these source types — but a song item
 # can instead be grounded on a 賞析/解説 article (e.g. reading-comprehension items),
 # in which case the URL, not source_type, is the truthful signal. See _is_commentary_url.
@@ -112,17 +118,20 @@ def _send_vocab_audio(settings: AssistantSettings, *, card, chat_id: str | None,
         raise QuizVocabAudioError("chat_id missing")
     cache_dir = build_vocab_audio_cache_dir(settings=settings)
     synth = build_vocab_synthesizer(settings, params)
+    cache_id = (
+        getattr(card, "vocab_id", None)
+        or getattr(card, "card_id", None)
+        or getattr(card, "headword", "")
+    )
     audio = synth.synthesize_to_cache(
         text=card.example_ja,
         cache_dir=cache_dir,
-        vocab_id=card.vocab_id,
+        vocab_id=str(cache_id),
     )
     client = TelegramBotClient(token, ssl_context=build_ssl_context(settings))
-    caption = (
-        f"{card.headword}（{card.reading_hiragana}）\n"
-        f"音源：{audio.engine_label}\n"
-        f"例句：{card.example_ja}"
-    )
+    reading = (getattr(card, "reading_hiragana", None) or "").strip()
+    heading = f"{card.headword}（{reading}）" if reading else str(card.headword)
+    caption = f"{heading}\n音源：{audio.engine_label}\n例句：{card.example_ja}"
     client.send_document(
         chat_id=str(chat_id),
         document_path=audio.output_path,
@@ -332,17 +341,28 @@ def _grade_actions_markup(db, q) -> dict:
         {"text": "🧩 同類型下一題", "callback_data": f"quiz:t:{q.level}:{q.exam_point}"},
     ]]
     if q.tested_point:
-        try:
-            vcard = db.get_vocab_card(
-                headword=q.tested_point, level=q.level
-            )
-        except Exception:
-            vcard = None
-        if vcard is not None:
-            buttons.append([{
-                "text": f"📚 查「{q.tested_point}」單字卡",
-                "callback_data": f"quiz:vc:{vcard.vocab_id}",
-            }])
+        if q.exam_point in _GRAMMAR_CARD_EXAM_POINTS:
+            try:
+                gcard = db.get_grammar_card(headword=q.tested_point, level=q.level)
+            except Exception:
+                gcard = None
+            if gcard is not None:
+                buttons.append([{
+                    "text": f"📗 查「{q.tested_point}」文法卡",
+                    "callback_data": f"quiz:gc:{gcard.card_id}",
+                }])
+        else:
+            try:
+                vcard = db.get_vocab_card(
+                    headword=q.tested_point, level=q.level
+                )
+            except Exception:
+                vcard = None
+            if vcard is not None:
+                buttons.append([{
+                    "text": f"📚 查「{q.tested_point}」單字卡",
+                    "callback_data": f"quiz:vc:{vcard.vocab_id}",
+                }])
     return {"inline_keyboard": buttons}
 
 
@@ -384,6 +404,25 @@ def _parse_vocab_args(text: str) -> tuple[str, str, str]:
       lookup - exact/substring word lookup
       source - filter by source name
     """
+    level = _DEFAULT_LEVEL
+    tokens: list[str] = []
+    for part in (text or "").split():
+        if part.lower().startswith("jlpt") or re.search(r"[nN][1-5]", part):
+            level = _normalize_level(part)
+        else:
+            tokens.append(part)
+    if not tokens:
+        return level, "weak", ""
+    head = tokens[0].lower()
+    if head in {"all", "wrong", "random"}:
+        return level, head, " ".join(tokens[1:]).strip()
+    if head == "source":
+        return level, "source", " ".join(tokens[1:]).strip()
+    return level, "lookup", " ".join(tokens).strip()
+
+
+def _parse_grammar_args(text: str) -> tuple[str, str, str]:
+    """Return (level, mode, query) for `/quiz grammar ...`."""
     level = _DEFAULT_LEVEL
     tokens: list[str] = []
     for part in (text or "").split():
@@ -449,6 +488,53 @@ def _render_vocab_card(card, *, mode: str, index: int, total: int) -> tuple[str,
     return "\n".join(lines), {"inline_keyboard": buttons}
 
 
+def _render_grammar_card(card, *, mode: str, index: int, total: int) -> tuple[str, dict]:
+    mode_label = {
+        "weak": "弱點文法卡",
+        "all": "全部文法卡",
+        "wrong": "錯題文法卡",
+        "random": "隨機文法卡",
+        "recent": "最新加入文法卡",
+        "lookup": "文法查詢",
+    }.get(mode, "文法卡")
+    difficulty = (getattr(card, "tested_jlpt_level", None) or "").strip().upper() or "N1"
+    author_label = (getattr(card, "author", None) or "codex").strip() or "codex"
+    head = f"📗 {card.level} {mode_label}　{index + 1}/{total}　〔難度 {difficulty}〕〔作者 {author_label}〕"
+    lines = [
+        head,
+        "",
+        f"句型：{card.headword}",
+        f"說明：{card.explanation_zh}",
+        f"例句：{card.example_ja}",
+    ]
+    if card.exam_points:
+        lines.append(f"題型：{' / '.join(card.exam_points)}")
+    lines.append(f"來源：{card.source_name or '—'}")
+    if card.source_media_url:
+        lines.append(f"歌曲：{card.source_media_url}")
+    if card.source_text_url:
+        lines.append(f"原文：{card.source_text_url}")
+    buttons: list[list[dict]] = []
+    if mode in {"weak", "all", "wrong", "recent"} and total > 1:
+        nav: list[dict] = []
+        if index > 0:
+            nav.append(
+                {"text": "⬅️ 上一張", "callback_data": f"quiz:gb:{card.level}:{mode}:{index - 1}"}
+            )
+        nav.append({"text": f"{index + 1}/{total}", "callback_data": "noop"})
+        if index < total - 1:
+            nav.append(
+                {"text": "下一張 ➡️", "callback_data": f"quiz:gb:{card.level}:{mode}:{index + 1}"}
+            )
+        buttons.append(nav)
+    if _vocab_audio_enabled(card):
+        buttons.append([{"text": "🔊 播放例句", "callback_data": f"quiz:ga:{card.card_id}"}])
+    buttons.append([{"text": "📝 出相關題", "callback_data": f"quiz:gr:{card.card_id}"}])
+    buttons.append([{"text": "🆕 最新加入", "callback_data": f"quiz:gb:{card.level}:recent:0"}])
+    buttons.append([{"text": "🎲 下一張隨機", "callback_data": f"quiz:grnd:{card.level}"}])
+    return "\n".join(lines), {"inline_keyboard": buttons}
+
+
 def _render_vocab_browser(db, *, level: str, mode: str, chat_id: str | None, index: int = 0):
     cards = db.list_vocab_cards(level=level, chat_id=str(chat_id or ""), mode=mode)
     if not cards:
@@ -457,6 +543,16 @@ def _render_vocab_browser(db, *, level: str, mode: str, chat_id: str | None, ind
         return "📘 目前沒有可用的單字卡。"
     index = max(0, min(index, len(cards) - 1))
     return _render_vocab_card(cards[index], mode=mode, index=index, total=len(cards))
+
+
+def _render_grammar_browser(db, *, level: str, mode: str, chat_id: str | None, index: int = 0):
+    cards = db.list_grammar_cards(level=level, chat_id=str(chat_id or ""), mode=mode)
+    if not cards:
+        if mode == "wrong":
+            return "📗 目前沒有可看的錯題文法卡。先去 /quiz 練文法題，答錯後這裡才會有內容。"
+        return "📗 目前沒有可用的文法卡。"
+    index = max(0, min(index, len(cards) - 1))
+    return _render_grammar_card(cards[index], mode=mode, index=index, total=len(cards))
 
 
 def _render_vocab_lookup(db, *, level: str, query: str):
@@ -479,6 +575,26 @@ def _render_vocab_lookup(db, *, level: str, query: str):
     return "\n".join(lines)
 
 
+def _render_grammar_lookup(db, *, level: str, query: str):
+    query = (query or "").strip()
+    if not query:
+        return "用法：/quiz grammar <句型>　或　/quiz grammar source <歌曲名>"
+    exact = db.get_grammar_card(headword=query, level=level)
+    if exact is not None:
+        return _render_grammar_card(exact, mode="lookup", index=0, total=1)
+    hits = db.find_grammar_cards(level=level, query=query)
+    if not hits:
+        return f"📗 找不到「{query}」的文法卡。"
+    if len(hits) == 1:
+        return _render_grammar_card(hits[0], mode="lookup", index=0, total=1)
+    lines = [f"📗 找到 {len(hits)} 張相關文法卡：", ""]
+    for card in hits[:12]:
+        lines.append(f"・{card.headword} — {card.source_name or '—'}")
+    lines.append("")
+    lines.append("可直接用 /quiz grammar <句型> 查看其中一張。")
+    return "\n".join(lines)
+
+
 def _render_vocab_source_list(db, *, level: str, source_name: str):
     source_name = (source_name or "").strip()
     if not source_name:
@@ -493,6 +609,23 @@ def _render_vocab_source_list(db, *, level: str, source_name: str):
         lines.append("…")
     lines.append("")
     lines.append("可直接用 /quiz vocab <單字> 查看某一張卡。")
+    return "\n".join(lines)
+
+
+def _render_grammar_source_list(db, *, level: str, source_name: str):
+    source_name = (source_name or "").strip()
+    if not source_name:
+        return "用法：/quiz grammar source <歌曲名>"
+    cards = db.grammar_cards_for_source(level=level, source_name=source_name)
+    if not cards:
+        return f"📗 找不到來源包含「{source_name}」的文法卡。"
+    lines = [f"📗 來源包含「{source_name}」的文法卡（{len(cards)}）", ""]
+    for card in cards[:20]:
+        lines.append(f"・{card.headword} — {card.source_name or '—'}")
+    if len(cards) > 20:
+        lines.append("…")
+    lines.append("")
+    lines.append("可直接用 /quiz grammar <句型> 查看某一張卡。")
     return "\n".join(lines)
 
 
@@ -727,6 +860,20 @@ def build_quiz_handler(
                 if mode == "source":
                     return _render_vocab_source_list(db, level=level, source_name=query)
                 return _render_vocab_lookup(db, level=level, query=query)
+            if action == "grammar":
+                level, mode, query = _parse_grammar_args(rest)
+                if mode in {"weak", "all", "wrong"}:
+                    return _render_grammar_browser(
+                        db, level=level, mode=mode, chat_id=chat_id, index=0
+                    )
+                if mode == "random":
+                    cards = db.list_grammar_cards(level=level, chat_id=str(chat_id or ""), mode="random")
+                    if not cards:
+                        return "📗 目前沒有可用的文法卡。"
+                    return _render_grammar_card(cards[0], mode="random", index=0, total=1)
+                if mode == "source":
+                    return _render_grammar_source_list(db, level=level, source_name=query)
+                return _render_grammar_lookup(db, level=level, query=query)
             if action == "like":
                 kind, _, target = rest.partition(" ")
                 if kind.lower().strip() != "song":
@@ -902,6 +1049,21 @@ def build_quiz_callback_handler(
                     text, markup = rendered
                     return None, text, markup
                 return None, rendered, None
+            if action == "gb":
+                lvl, _, tail = rest.partition(":")
+                mode, _, idx_str = tail.partition(":")
+                lvl = lvl or _DEFAULT_LEVEL
+                try:
+                    index = max(0, int(idx_str))
+                except ValueError:
+                    index = 0
+                rendered = _render_grammar_browser(
+                    db, level=lvl, mode=mode or "weak", chat_id=chat_id, index=index
+                )
+                if isinstance(rendered, tuple):
+                    text, markup = rendered
+                    return None, text, markup
+                return None, rendered, None
             if action == "vr":
                 card = db.get_vocab_card(vocab_id=rest, level=_DEFAULT_LEVEL)
                 if card is None:
@@ -917,12 +1079,33 @@ def build_quiz_callback_handler(
                 db.mark_served(question.question_id)
                 text, markup = _question_view(question)
                 return None, text, markup
+            if action == "gr":
+                card = db.get_grammar_card(card_id=rest, level=_DEFAULT_LEVEL)
+                if card is None:
+                    return "找不到這張文法卡", None, None
+                question = db.weighted_question(
+                    level=card.level,
+                    chat_id=str(chat_id or ""),
+                    tested_point=card.headword,
+                    author=card.author,
+                )
+                if question is None:
+                    return "這張文法卡目前沒有可出的相關題目", None, None
+                db.mark_served(question.question_id)
+                text, markup = _question_view(question)
+                return None, text, markup
             if action == "vc":
                 # Direct vocab-card view by vocab_id (jumped from grade result).
                 card = db.get_vocab_card(vocab_id=rest, level=_DEFAULT_LEVEL)
                 if card is None:
                     return "找不到這張單字卡", None, None
                 text, markup = _render_vocab_card(card, mode="lookup", index=0, total=1)
+                return None, text, markup
+            if action == "gc":
+                card = db.get_grammar_card(card_id=rest, level=_DEFAULT_LEVEL)
+                if card is None:
+                    return "找不到這張文法卡", None, None
+                text, markup = _render_grammar_card(card, mode="lookup", index=0, total=1)
                 return None, text, markup
             if action == "vrnd":
                 level = rest or _DEFAULT_LEVEL
@@ -933,6 +1116,31 @@ def build_quiz_callback_handler(
                     return "目前沒有可用的單字卡", None, None
                 text, markup = _render_vocab_card(cards[0], mode="random", index=0, total=1)
                 return None, text, markup
+            if action == "grnd":
+                level = rest or _DEFAULT_LEVEL
+                cards = db.list_grammar_cards(
+                    level=level, chat_id=str(chat_id or ""), mode="random"
+                )
+                if not cards:
+                    return "目前沒有可用的文法卡", None, None
+                text, markup = _render_grammar_card(cards[0], mode="random", index=0, total=1)
+                return None, text, markup
+            if action == "ga":
+                card = db.get_grammar_card(card_id=rest, level=_DEFAULT_LEVEL)
+                if card is None:
+                    return "找不到這張文法卡", None, None
+                if not _vocab_audio_enabled(card):
+                    return "這張文法卡目前沒有開放例句音檔", None, None
+                try:
+                    voice_params = db.get_voice_params(str(chat_id or ""))
+                    _send_vocab_audio(settings, card=card, chat_id=chat_id, params=voice_params)
+                except QuizVocabAudioError as exc:
+                    logger.warning("quiz grammar audio failed card_id=%s: %s", rest, exc)
+                    return "音檔生成失敗", None, None
+                except Exception:
+                    logger.exception("quiz grammar audio unexpected failure card_id=%s", rest)
+                    return "音檔生成失敗", None, None
+                return "已送出例句音檔", None, None
             if action == "va":
                 card = db.get_vocab_card(vocab_id=rest, level=_DEFAULT_LEVEL)
                 if card is None:

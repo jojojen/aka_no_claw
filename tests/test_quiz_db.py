@@ -61,6 +61,7 @@ class TestSchemaAndPragmas:
             "quiz_questions",
             "quiz_authoring_knowledge",
             "quiz_vocab_cards",
+            "quiz_grammar_cards",
             "quiz_songs",
             "lyrics",
             "sentences",
@@ -1536,6 +1537,67 @@ class TestVocabCardDifficultyBadge:
         # NULL/blank tag is treated as N1 and still shows a badge.
         text_n1, _ = _render_vocab_card(_card(None), mode="all", index=0, total=3)
         assert "難度 N1" in text_n1.splitlines()[0]
+
+
+class TestGrammarCards:
+    def test_insert_grammar_question_backfills_grammar_card(self, tmp_path):
+        db = _db(tmp_path)
+        q = db.insert_question(
+            level="JLPT N1",
+            exam_point="文章の文法",
+            stem="彼は最後まで逃げる（　　）と踏みとどまった。",
+            options=("まい", "べく", "ものを", "ながら"),
+            answer_index=0,
+            explanation="「〜まい」は強い否定意志を表し、この文では『逃げるつもりはない』という意味になる。",
+            source_type="vocaloid_song",
+            source_name="ロキ",
+            source_text_url="https://example.com/text",
+            source_media_url="https://example.com/song",
+            source_excerpt="逃げるまいと心に決めた。",
+            tested_point="〜まい",
+            tested_jlpt_level="N1",
+            author="codex",
+            verified=True,
+            allow_ungrounded=True,
+        )
+        card = db.get_grammar_card(headword="〜まい", level="JLPT N1")
+        assert card is not None
+        assert card.primary_question_id == q.question_id
+        assert card.example_ja == "逃げるまいと心に決めた。"
+        assert "否定意志" in card.explanation_zh
+        assert card.exam_points == ("文章の文法",)
+
+    def test_grammar_card_lookup_and_wrong_mode_use_tested_point_progress(self, tmp_path):
+        db = _db(tmp_path)
+        db.insert_question(
+            level="JLPT N1",
+            exam_point="文法形式の判断",
+            stem="事情を知っている（　　）、黙っているわけにはいかない。",
+            options=("以上", "ほど", "だけ", "まで"),
+            answer_index=0,
+            explanation="「〜以上」は前件を受けて当然そうなるという含みを持つ。",
+            source_type="vocaloid_song",
+            source_name="テスト曲",
+            source_text_url="https://example.com/text",
+            source_excerpt="事情を知っている以上、黙ってはいられない。",
+            tested_point="〜以上",
+            author="codex",
+            verified=True,
+            allow_ungrounded=True,
+        )
+        card = db.get_grammar_card(headword="〜以上", level="JLPT N1")
+        assert card is not None
+        db.record_attempt(
+            question_id=card.primary_question_id,
+            exam_point="文法形式の判断",
+            tested_point="〜以上",
+            level="JLPT N1",
+            chat_id="u1",
+            chosen_index=1,
+            correct=False,
+        )
+        wrong_cards = db.list_grammar_cards(level="JLPT N1", chat_id="u1", mode="wrong")
+        assert [c.headword for c in wrong_cards] == ["〜以上"]
 
 
 def test_synonym_answer_restates_headword_flags_kana_restatement():
