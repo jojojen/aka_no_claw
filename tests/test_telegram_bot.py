@@ -44,7 +44,7 @@ from openclaw_adapter.telegram_bot import (
     _build_registries,
     _chromium_launch_options,
 )
-from openclaw_adapter.research_command import ResearchReport, ResearchSectionResult
+from openclaw_adapter.research_command import ResearchReport, ResearchSectionResult, SellerReputationSnapshot
 
 # Every call to handle_telegram_message now sends an immediate intake ack
 # before kicking off the real processing pipeline.
@@ -413,6 +413,7 @@ def test_research_reply_formatter_returns_compact_text_with_buttons() -> None:
         budget_used=1,
         budget_max=5,
         item_data=None,
+        seller_snapshot=None,
         section_results=(
             ResearchSectionResult(
                 section_name="合理市價分析",
@@ -443,6 +444,7 @@ def test_research_callback_handler_renders_cached_detail_view() -> None:
         budget_used=1,
         budget_max=5,
         item_data=None,
+        seller_snapshot=None,
         section_results=(
             ResearchSectionResult(
                 section_name="合理市價分析",
@@ -475,6 +477,40 @@ def test_research_callback_handler_renders_cached_detail_view() -> None:
     assert "/research 市價細節" in text
     assert "合理市價分析 [partial]" in text
     assert markup is not None
+
+
+def test_research_reply_formatter_prefers_snapshot_seller_when_item_seller_missing() -> None:
+    cache = _ResearchReplyCache()
+    formatter = _build_research_reply_formatter(cache)
+    report = ResearchReport(
+        chat_id="123",
+        mode_label="Mercari 商品網址",
+        target_display_text="https://jp.mercari.com/item/m1",
+        budget_used=1,
+        budget_max=5,
+        item_data=None,
+        seller_snapshot=SellerReputationSnapshot(
+            seller_url="https://jp.mercari.com/user/profile/123",
+            proof_url="http://127.0.0.1:5055/p/proof_x",
+            proof_id="proof_x",
+            reused=True,
+            display_name="bassman",
+            captured_at=None,
+            total_reviews=9,
+            listing_count=13,
+            followers_count=None,
+            following_count=None,
+            seller_positive=6,
+            seller_negative=0,
+            seller_rate=100.0,
+        ),
+        section_results=(),
+        warnings=(),
+    )
+
+    text, _markup = formatter(report)
+
+    assert "賣家：bassman" in text
 
 
 def test_command_processor_handles_translate_aliases(monkeypatch) -> None:
