@@ -551,10 +551,22 @@ def _normalize_legacy_reason(reason: str | None) -> str:
         return reason
     base, _, rest = reason.partition(_WEB_EVIDENCE_MARKER)
     base = base.strip()
+    raw_pieces = [
+        piece.strip()
+        for piece in (_WEB_EVIDENCE_MARKER + rest).split(_WEB_EVIDENCE_MARKER)
+        if piece.strip()
+    ]
+    # Drop fragments wholly contained in a longer one. The LLM echoes the stored
+    # evidence back and tacks a few more words on each cycle, so the copies are
+    # GROWING supersets, not exact repeats — exact-match dedup let every stage
+    # through ("X", "X…Y", "X…Y…Z"), which is the 40×-repeat the user saw. Keeping
+    # only the maximal fragments collapses the growth chain while preserving two
+    # genuinely DISTINCT evidence sentences (neither contains the other).
     fragments: list[str] = []
-    for piece in (_WEB_EVIDENCE_MARKER + rest).split(_WEB_EVIDENCE_MARKER):
-        piece = piece.strip()
-        if piece and piece not in fragments:
+    for piece in raw_pieces:
+        if any(piece != other and piece in other for other in raw_pieces):
+            continue
+        if piece not in fragments:
             fragments.append(piece)
     evidence = " ".join(f"{_WEB_EVIDENCE_MARKER}{piece}" for piece in fragments)
     if base and evidence:
