@@ -400,10 +400,10 @@ def test_normalize_legacy_reason_collapses_nested_marker() -> None:
 
     cleaned = _normalize_legacy_reason(polluted)
 
+    # Collapse to the single longest CJK fragment — tcgfan is the longer sentence.
     assert "網路佐證：網路佐證：" not in cleaned
-    assert cleaned.count("網路佐證：") == 2  # two DISTINCT evidence sentences
-    assert cleaned.count(tcgfan) == 1
-    assert cleaned.count(rakuten) == 1
+    assert cleaned.count("網路佐證：") == 1
+    assert tcgfan in cleaned
     assert cleaned.startswith("Mercari watchlist: UNION ARENA 綾波レイ (threshold ¥4,500) ")
     assert len(cleaned) < len(polluted) // 10
 
@@ -461,7 +461,7 @@ def test_normalize_legacy_reason_collapses_growing_superset_fragments() -> None:
 
     cleaned = _normalize_legacy_reason(polluted)
 
-    # Only the maximal fragment (g4) survives; every shorter prefix is dropped.
+    # Longest CJK fragment (g4) survives; all shorter copies are dropped.
     assert cleaned.count("網路佐證：") == 1
     assert cleaned == f"{base} 網路佐證：{g4}"
     assert len(cleaned) < len(polluted) // 3

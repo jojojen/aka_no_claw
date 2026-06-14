@@ -537,41 +537,48 @@ def _decode_json_list(value: object) -> tuple[str, ...]:
 _WEB_EVIDENCE_MARKER = "網路佐證："
 
 
+def _cjk_ratio(text: str) -> float:
+    """Fraction of characters in *text* that are CJK / Japanese / full-width."""
+    if not text:
+        return 0.0
+    cjk = sum(
+        1 for c in text
+        if "　" <= c <= "鿿" or "豈" <= c <= "﫿"
+        or "゠" <= c <= "ヿ"   # katakana
+        or "぀" <= c <= "ゟ"   # hiragana
+    )
+    return cjk / len(text)
+
+
 def _normalize_legacy_reason(reason: str | None) -> str:
     """Heal reason rows polluted by the old append-without-dedup web-research
-    behaviour. Splitting on the 網路佐證 marker unwinds BOTH plain repeats
-    ("網路佐證：X 網路佐證：X …") and nested prefixes ("網路佐證：網路佐證：X", which
-    the LLM produced by echoing the stored reason back into its own assessment);
-    we then keep the base text plus each DISTINCT evidence sentence once. A plain
-    regex cannot do this because the nested marker contains 網, so the old
-    "[^網]+?" capture could never span it."""
+    behaviour.  Any time the stored reason contains multiple 網路佐證 fragments
+    (produced by cycles of echoing + appending), collapse them to the single
+    most-informative Chinese/Japanese fragment.
+
+    Strategy: pick the LONGEST fragment whose CJK ratio ≥ 20 % (the target
+    language).  This beats exact-match and substring checks — the LLM often
+    changes a 。 to a ，between copies, so "X。" is never a substring of "X，Y"
+    even though they are semantically identical.  If no CJK fragment exists,
+    fall back to the longest fragment of any language."""
     if not reason:
         return reason or ""
     if _WEB_EVIDENCE_MARKER not in reason:
         return reason
     base, _, rest = reason.partition(_WEB_EVIDENCE_MARKER)
     base = base.strip()
-    raw_pieces = [
+    pieces = [
         piece.strip()
         for piece in (_WEB_EVIDENCE_MARKER + rest).split(_WEB_EVIDENCE_MARKER)
         if piece.strip()
     ]
-    # Drop fragments wholly contained in a longer one. The LLM echoes the stored
-    # evidence back and tacks a few more words on each cycle, so the copies are
-    # GROWING supersets, not exact repeats — exact-match dedup let every stage
-    # through ("X", "X…Y", "X…Y…Z"), which is the 40×-repeat the user saw. Keeping
-    # only the maximal fragments collapses the growth chain while preserving two
-    # genuinely DISTINCT evidence sentences (neither contains the other).
-    fragments: list[str] = []
-    for piece in raw_pieces:
-        if any(piece != other and piece in other for other in raw_pieces):
-            continue
-        if piece not in fragments:
-            fragments.append(piece)
-    evidence = " ".join(f"{_WEB_EVIDENCE_MARKER}{piece}" for piece in fragments)
-    if base and evidence:
-        return f"{base} {evidence}"
-    return base or evidence
+    if not pieces:
+        return base
+    # Keep exactly ONE fragment — the longest CJK one (or globally longest as fallback).
+    cjk_pieces = [p for p in pieces if _cjk_ratio(p) >= 0.20]
+    best = max(cjk_pieces if cjk_pieces else pieces, key=len)
+    evidence = f"{_WEB_EVIDENCE_MARKER}{best}"
+    return f"{base} {evidence}" if base else evidence
 
 
 def _candidate_from_row(row: sqlite3.Row) -> OpportunityCandidate:
