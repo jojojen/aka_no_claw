@@ -964,20 +964,10 @@ class ResearchCommandService:
 
         listed_price = ctx.item_data.listed_price_jpy if ctx.item_data is not None else None
         reference_title = ctx.item_data.title if ctx.item_data is not None and ctx.item_data.title else query
-        price_cap = _derive_active_price_cap(listed_price)
         backend_warnings: list[str] = []
-        try:
-            active_raw_all = self._active_market_search_fn(query, price_cap, 8)
-        except Exception as exc:
-            logger.exception("Research active market search failed query=%s", query)
-            active_raw_all = []
-            backend_warnings.append(f"Mercari active 比價抓取失敗：{exc}")
-        active_raw, active_dropped = _filter_market_items_for_price(
-            reference_title=reference_title,
-            items=active_raw_all,
-            min_similarity=0.32,
-        )
-        active_evidence = tuple(_price_evidence_from_market_item(item, sold_status="active") for item in active_raw)
+        # Sold first: its average sets the active price cap so a high-value item
+        # (no listed price on a bare keyword query) doesn't get its active
+        # listings filtered out by the low default cap.
         try:
             sold_raw_all = self._sold_market_search_fn(query, 8)
         except Exception as exc:
@@ -998,6 +988,19 @@ class ResearchCommandService:
                 logger.exception("Research sold average lookup failed query=%s", query)
                 sold_avg = None
                 backend_warnings.append(f"Mercari sold 均價查詢失敗：{exc}")
+        price_cap = _derive_active_price_cap(listed_price, sold_avg)
+        try:
+            active_raw_all = self._active_market_search_fn(query, price_cap, 8)
+        except Exception as exc:
+            logger.exception("Research active market search failed query=%s", query)
+            active_raw_all = []
+            backend_warnings.append(f"Mercari active 比價抓取失敗：{exc}")
+        active_raw, active_dropped = _filter_market_items_for_price(
+            reference_title=reference_title,
+            items=active_raw_all,
+            min_similarity=0.32,
+        )
+        active_evidence = tuple(_price_evidence_from_market_item(item, sold_status="active") for item in active_raw)
         ctx.active_price_evidence = active_evidence
         ctx.sold_price_evidence = sold_evidence
         ctx.sold_average_jpy = sold_avg
@@ -1729,10 +1732,12 @@ def _build_price_query(ctx: ResearchJobContext) -> str:
     return ""
 
 
-def _derive_active_price_cap(listed_price_jpy: int | None) -> int:
-    if listed_price_jpy is None or listed_price_jpy <= 0:
-        return 50_000
-    return max(5_000, int(listed_price_jpy * 2.0))
+def _derive_active_price_cap(listed_price_jpy: int | None, sold_average_jpy: int | None = None) -> int:
+    if listed_price_jpy is not None and listed_price_jpy > 0:
+        return max(5_000, int(listed_price_jpy * 2.0))
+    if sold_average_jpy is not None and sold_average_jpy > 0:
+        return max(5_000, int(sold_average_jpy * 2.0))
+    return 50_000
 
 
 def _price_evidence_from_market_item(item: dict[str, object], *, sold_status: str) -> PriceEvidence:
@@ -1741,7 +1746,7 @@ def _price_evidence_from_market_item(item: dict[str, object], *, sold_status: st
     raw_price = item.get("price_jpy")
     price_jpy = int(raw_price) if isinstance(raw_price, (int, float)) or str(raw_price).isdigit() else None
     return PriceEvidence(
-        source_site="mercari",
+        source_site=str(item.get("source") or "mercari"),
         source_url=source_url,
         title=title,
         price_jpy=price_jpy,
@@ -1787,12 +1792,14 @@ def _build_price_section_result(
 
     if active_prices:
         active_median = statistics.median(active_prices)
+        source_breakdown = _active_source_breakdown(active_evidence)
+        breakdown_note = f"（{source_breakdown}）" if source_breakdown else ""
         summary_parts.append(
-            f"active 樣本 {len(active_prices)} 筆，中位數 ¥{active_median:,.0f}，區間 ¥{min(active_prices):,}–¥{max(active_prices):,}"
+            f"active 樣本 {len(active_prices)} 筆{breakdown_note}，中位數 ¥{active_median:,.0f}，區間 ¥{min(active_prices):,}–¥{max(active_prices):,}"
         )
     else:
         status = "partial" if summary_parts else "unavailable"
-        warnings.append("Mercari active 比價樣本不足。")
+        warnings.append("active 比價樣本不足（Mercari / Rakuma / Yuyutei 均未取得）。")
 
     if listed_price_jpy is not None and sold_average_jpy is not None and sold_average_jpy > 0:
         ratio = listed_price_jpy / sold_average_jpy
@@ -1929,11 +1936,42 @@ def _build_liquidity_section_result(
 
 
 def _default_active_market_search(query: str, price_cap: int, max_results: int) -> list[dict[str, object]]:
-    from market_monitor.mercari_search import search_mercari
+    """Cross-platform active listing search.
 
-    return _run_in_isolated_thread(
-        lambda: search_mercari(query, price_max=price_cap, max_results=max_results)
-    )
+    Reuses the marketplace registry that the watchlist monitor uses
+    (Mercari + Rakuma + Yuyutei, and any future source registered there) so
+    /research reference pricing reflects every platform the user already
+    monitors — not just Mercari. Each source's failure is isolated: a dead
+    scraper logs and is skipped, the others still contribute evidence."""
+    from price_monitor_bot.watch_monitor import default_marketplace_clients
+
+    clients = default_marketplace_clients()
+
+    def run() -> list[dict[str, object]]:
+        merged: list[dict[str, object]] = []
+        for source_name, client in clients.items():
+            try:
+                listings = client.search(query, price_max=price_cap, max_results=max_results)
+            except Exception:
+                logger.exception(
+                    "Research active market search failed source=%s query=%s",
+                    source_name, query,
+                )
+                continue
+            for listing in listings:
+                merged.append(
+                    {
+                        "source": getattr(listing, "source", source_name) or source_name,
+                        "item_id": getattr(listing, "item_id", ""),
+                        "title": getattr(listing, "title", ""),
+                        "price_jpy": getattr(listing, "price_jpy", None),
+                        "url": getattr(listing, "url", ""),
+                        "thumbnail_url": getattr(listing, "thumbnail_url", None),
+                    }
+                )
+        return merged
+
+    return _run_in_isolated_thread(run)
 
 
 def _default_sold_market_search(query: str, max_results: int) -> list[dict[str, object]]:
@@ -1948,6 +1986,19 @@ def _default_sold_average_lookup(query: str) -> float | None:
     from market_monitor.mercari_search import fetch_avg_sold_price
 
     return _run_in_isolated_thread(lambda: fetch_avg_sold_price(query))
+
+
+def _active_source_breakdown(evidence: tuple[PriceEvidence, ...]) -> str:
+    """Render a per-platform sample count, e.g. "mercari 4 / rakuma 2 / yuyutei 1",
+    so the user can see the cross-platform reference pricing at a glance."""
+    counts: dict[str, int] = {}
+    for item in evidence:
+        if item.price_jpy is None:
+            continue
+        counts[item.source_site] = counts.get(item.source_site, 0) + 1
+    if len(counts) <= 1:
+        return ""
+    return " / ".join(f"{source} {count}" for source, count in sorted(counts.items()))
 
 
 def _average_price_from_evidence(evidence: tuple[PriceEvidence, ...]) -> float | None:
