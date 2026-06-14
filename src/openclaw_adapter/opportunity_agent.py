@@ -569,6 +569,10 @@ class WebOpportunityResearcher:
                 reason = f"{base} {fragment}".strip() if base else fragment
             else:
                 reason = base
+            # Collapse any markers the model echoed INSIDE its own assessment.reason
+            # (stripping only leading markers above leaves internal repeats), so the
+            # stored reason is already deduped — not just healed on read.
+            reason = _normalize_legacy_reason(reason)
 
         skip = (candidate.title, candidate.search_query)
         merged_aliases = merge_string_list(

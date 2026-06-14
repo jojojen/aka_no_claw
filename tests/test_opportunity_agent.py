@@ -442,6 +442,31 @@ def test_web_opportunity_researcher_strips_echoed_marker() -> None:
     assert "網路佐證：網路佐證：" not in enriched.reason
 
 
+def test_normalize_legacy_reason_collapses_growing_superset_fragments() -> None:
+    """The 綾波レイ ユニオンアリーナ target-hit notification repeated 網路佐證 dozens of
+    times where each copy GREW (the LLM echoed the stored evidence and appended a few
+    more words: '…販售' → '…販售，且Yahoo!オークション…' → '…收藏價值，代表市場…').
+    Exact-match dedup missed these because no two copies were identical; the maximal-
+    fragment rule must keep only the single longest, most complete sentence."""
+    from openclaw_adapter.opportunity_store import _normalize_legacy_reason
+
+    base = "Mercari watchlist: 綾波レイ ユニオンアリーナ プロモカード (threshold ¥4,500)"
+    g1 = "搜尋結果顯示在Mercari上以高價販售"
+    g2 = g1 + "，且有「希少・非売品」的描述，佐證其具有高需求"
+    g3 = g2 + "，且Yahoo!オークション上描述為配布品，更顯示其稀有性與收藏價值"
+    g4 = g3 + "，代表市場對此卡牌有高度的收藏興趣"
+    polluted = base + " " + " ".join(
+        f"網路佐證：{g}" for g in (g1, g2, g3, g2, g4, g3, g1, g4)
+    )
+
+    cleaned = _normalize_legacy_reason(polluted)
+
+    # Only the maximal fragment (g4) survives; every shorter prefix is dropped.
+    assert cleaned.count("網路佐證：") == 1
+    assert cleaned == f"{base} 網路佐證：{g4}"
+    assert len(cleaned) < len(polluted) // 3
+
+
 def test_normalize_legacy_reason_handles_none_and_empty() -> None:
     """Helper must be safe on empty / None inputs (some DB rows may have
     NULL or empty reason)."""
