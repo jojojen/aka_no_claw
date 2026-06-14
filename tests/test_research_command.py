@@ -12,6 +12,7 @@ from openclaw_adapter.research_command import (
     ResearchBudget,
     ResearchReport,
     SellerReputationSnapshot,
+    ShopReference,
     build_budgeted_search_fn,
     build_research_handler,
     format_research_compact_report,
@@ -530,10 +531,10 @@ def test_research_handler_builds_price_section_from_active_and_sold_samples(tmp_
 
     assert "合理市價分析 [ok]" in reply
     assert "Mercari sold 樣本 3 筆，均價約 ¥7,000" in reply
-    assert "active 樣本 3 筆，中位數 ¥6,800，區間 ¥6,100–¥7,200" in reply
+    assert "active 樣本 3 筆（mercari 3筆 中位¥6,800），中位數 ¥6,800，區間 ¥6,100–¥7,200" in reply
     assert "目前開價接近 sold 均價" in reply
     assert "流動性分析 [ok]" in reply
-    assert "Mercari active 3 筆 / sold 3 筆；sold/active 比 1.00；樣本顯示流動性中等，仍有一定成交速度。" in reply
+    assert "active 3 筆（跨平台）/ Mercari sold 3 筆；sold/active 比 1.00；樣本顯示流動性中等，仍有一定成交速度。" in reply
     assert "https://jp.mercari.com/item/s1" in reply
 
 
@@ -581,9 +582,96 @@ def test_research_handler_active_price_includes_non_mercari_platforms(tmp_path: 
 
     reply = handler("https://jp.mercari.com/item/m18542743389", "chat-multi")
 
-    assert "active 樣本 3 筆（mercari 1 / rakuma 1 / yuyutei 1）" in reply
+    assert "active 樣本 3 筆（mercari 1筆 ¥6,100 / rakuma 1筆 ¥6,800 / yuyutei 1筆 ¥7,200）" in reply
     assert "https://fril.jp/item/r1" in reply
     assert "https://yuyu-tei.jp/sell/ua/card/y1" in reply
+
+
+def test_research_renders_yuyutei_shop_reference_band() -> None:
+    """A shop platform (Yuyu亭) must surface its 買取/販売 band in the market
+    detail text — upper bound stock-backed — not just leave a clickable link."""
+    def shop_reference(query: str, price_cap: int) -> ShopReference:
+        return ShopReference(
+            label="遊々亭",
+            buy_reference=57000,
+            sell_reference=79900,
+            stock_total=2,
+            buy_count=2,
+            sell_count=2,
+            sample_urls=("https://yuyu-tei.jp/buy/ua/card/b1", "https://yuyu-tei.jp/sell/ua/card/s1"),
+            buy_min=50000,
+            buy_max=64000,
+            sell_min=75000,
+            sell_max=85000,
+        )
+
+    handler = build_research_handler(
+        notifier_factory=lambda chat_id: FakeNotifier(),
+        active_market_search_fn=lambda q, cap, n: [],
+        sold_market_search_fn=lambda q, n: [],
+        sold_average_lookup_fn=lambda q: None,
+        shop_reference_fn=shop_reference,
+    )
+
+    reply = handler("大好きを前に 桐谷遥 SSP UA", "chat-shop")
+
+    assert "遊々亭参考帯 買取¥50,000〜¥64,000／販売¥75,000〜¥85,000（在庫2点）" in reply
+    assert "https://yuyu-tei.jp/sell/ua/card/s1" in reply
+
+
+def test_research_shop_reference_sell_only_when_out_of_stock_drops_upper() -> None:
+    """When 販売 has no stock, only 買取 (lower) is shown and flagged as a weak
+    upper reference — the user's 庫存0 concern."""
+    def shop_reference(query: str, price_cap: int) -> ShopReference:
+        return ShopReference(
+            label="遊々亭",
+            buy_reference=57000,
+            sell_reference=None,
+            stock_total=0,
+            buy_count=1,
+            sell_count=0,
+            sample_urls=("https://yuyu-tei.jp/buy/ua/card/b1",),
+        )
+
+    handler = build_research_handler(
+        notifier_factory=lambda chat_id: FakeNotifier(),
+        active_market_search_fn=lambda q, cap, n: [],
+        sold_market_search_fn=lambda q, n: [],
+        sold_average_lookup_fn=lambda q: None,
+        shop_reference_fn=shop_reference,
+    )
+
+    reply = handler("大好きを前に 桐谷遥 SSP UA", "chat-shop-oos")
+
+    assert "遊々亭参考 買取¥57,000（販売在庫なし、上限參考弱）" in reply
+
+
+def test_research_single_non_mercari_source_shows_platform_and_price_in_text() -> None:
+    """When active listings come from a single non-Mercari source (e.g. Yuyutei
+    alone), the summary text must name the platform and its price inline — not
+    just drop a bare link the user has to click."""
+    def active_search(query: str, price_cap: int, max_results: int) -> list[dict[str, object]]:
+        return [
+            {
+                "source": "yuyutei",
+                "item_id": "y1",
+                "title": "大好きを前に 桐谷遥 SSP",
+                "price_jpy": 79900,
+                "url": "https://yuyu-tei.jp/sell/ua/card/y1",
+                "thumbnail_url": "",
+            },
+        ]
+
+    handler = build_research_handler(
+        notifier_factory=lambda chat_id: FakeNotifier(),
+        active_market_search_fn=active_search,
+        sold_market_search_fn=lambda query, max_results: [],
+        sold_average_lookup_fn=lambda query: None,
+    )
+
+    reply = handler("大好きを前に 桐谷遥 SSP", "chat-yuyu")
+
+    assert "yuyutei 1筆 ¥79,900" in reply
 
 
 def test_research_active_price_cap_uses_sold_average_for_high_value_text_query() -> None:
@@ -671,9 +759,9 @@ def test_research_handler_price_stage_works_for_text_query_without_item_page() -
 
     assert "研究模式：商品名稱" in reply
     assert "合理市價分析 [partial]" in reply
-    assert "active 樣本 2 筆，中位數 ¥9,400，區間 ¥9,000–¥9,800" in reply
+    assert "active 樣本 2 筆（mercari 2筆 中位¥9,400），中位數 ¥9,400，區間 ¥9,000–¥9,800" in reply
     assert "流動性分析 [partial]" in reply
-    assert "Mercari active 2 筆 / sold 0 筆；sold/active 比 0.00；樣本偏少，流動性暫時只能做弱判讀。" in reply
+    assert "active 2 筆（跨平台）/ Mercari sold 0 筆；sold/active 比 0.00；樣本偏少，流動性暫時只能做弱判讀。" in reply
     assert "Mercari sold 價目前只拿到平均值接口；此查詢未回傳可用 sold avg。" in reply
 
 

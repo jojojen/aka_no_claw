@@ -797,17 +797,19 @@ def _build_registries(
     recover_handler = build_recover_handler(settings)
     scorecard_handler = build_scorecard_handler(settings)
     research_cache = _ResearchReplyCache()
+    research_search_fn = lambda q, limit: _run_research_worker_call(
+        lambda: search_yahoo_japan_playwright(
+            q,
+            max_results=limit,
+            reuse_context=False,
+        )
+    )
     research_handler = build_research_handler(
         notifier_factory=research_notifier_factory,
-        search_fn=lambda q, limit: _run_research_worker_call(
-            lambda: search_yahoo_japan_playwright(
-                q,
-                max_results=limit,
-                reuse_context=False,
-            )
-        ),
+        search_fn=research_search_fn,
         knowledge_db_path=settings.knowledge_db_path,
         seller_snapshot_lookup_fn=_build_research_seller_snapshot_lookup(settings),
+        game_code_resolver_fn=_build_yuyutei_code_resolver(settings, research_search_fn),
         ip_heat_lookup_fn=_build_research_ip_heat_lookup(settings),
         final_formatter=_build_research_reply_formatter(research_cache),
     )
@@ -1064,6 +1066,34 @@ def _build_research_ip_heat_lookup(
         return result
 
     return lookup
+
+
+def _build_yuyutei_code_resolver(
+    settings: AssistantSettings, search_fn: "Callable[[str, int], object]"
+) -> "Callable[[str], str | None] | None":
+    """Build the LLM/RAG resolver that maps a bare card name → yuyutei game code
+    so the 遊々亭 買取/販売 band can appear for queries with no game keyword.
+    Returns ``None`` (band falls back to keyword-only routing) when the local
+    text LLM isn't configured."""
+    backend = (settings.openclaw_local_text_backend or "").strip().lower()
+    endpoint = settings.openclaw_local_text_endpoint
+    model = _select_text_generation_model(settings)
+    if backend != "ollama" or not endpoint or not model:
+        return None
+
+    from .opportunity_agent import _call_ollama_json
+    from .yuyutei_code_resolver import YuyuteiGameCodeResolver
+
+    resolver = YuyuteiGameCodeResolver(
+        knowledge_db_path=settings.knowledge_db_path,
+        json_call_fn=_call_ollama_json,
+        endpoint=endpoint,
+        model=model,
+        timeout_seconds=max(1, settings.openclaw_local_text_timeout_seconds),
+        ssl_context=build_ssl_context(settings) if endpoint.startswith("https://") else None,
+        search_fn=search_fn,
+    )
+    return resolver.resolve
 
 
 def run_telegram_polling(

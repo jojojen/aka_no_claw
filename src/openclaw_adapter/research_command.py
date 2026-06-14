@@ -26,6 +26,8 @@ SellerSnapshotLookupFn = Callable[[str], "SellerReputationSnapshot"]
 ActiveMarketSearchFn = Callable[[str, int, int], list[dict[str, object]]]
 SoldMarketSearchFn = Callable[[str, int], list[dict[str, object]]]
 SoldAverageLookupFn = Callable[[str], float | None]
+ShopReferenceFn = Callable[[str, int], "ShopReference | None"]
+GameCodeResolverFn = Callable[[str], "str | None"]
 IpHeatLookupFn = Callable[[tuple[str, ...]], dict[str, tuple[object, ...]]]
 ResearchStageRunner = Callable[["ResearchJobContext"], str]
 
@@ -128,6 +130,25 @@ class PriceEvidence:
 
 
 @dataclass(frozen=True, slots=True)
+class ShopReference:
+    """Shop-price reference band (e.g. Yuyu亭): 買取 (what the shop pays — lower
+    side) and in-stock 販売 (what the shop charges — upper side). Surfaced as a
+    distinct band in the price section, NOT folded into the C2C active median."""
+
+    label: str
+    buy_reference: int | None
+    sell_reference: int | None
+    stock_total: int
+    buy_count: int
+    sell_count: int
+    sample_urls: tuple[str, ...]
+    buy_min: int | None = None
+    buy_max: int | None = None
+    sell_min: int | None = None
+    sell_max: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class SellerReputationSnapshot:
     seller_url: str
     proof_url: str
@@ -175,6 +196,7 @@ class ResearchJobContext:
     active_price_evidence: tuple[PriceEvidence, ...] = ()
     sold_price_evidence: tuple[PriceEvidence, ...] = ()
     sold_average_jpy: float | None = None
+    shop_reference: ShopReference | None = None
     appreciation_search_results: tuple[WebSearchResult, ...] = ()
     seller_snapshot: SellerReputationSnapshot | None = None
     current_stage: int = 0
@@ -696,6 +718,8 @@ class ResearchCommandService:
         active_market_search_fn: ActiveMarketSearchFn | None = None,
         sold_market_search_fn: SoldMarketSearchFn | None = None,
         sold_average_lookup_fn: SoldAverageLookupFn | None = None,
+        shop_reference_fn: ShopReferenceFn | None = None,
+        game_code_resolver_fn: GameCodeResolverFn | None = None,
         ip_heat_lookup_fn: IpHeatLookupFn | None = None,
         final_formatter: Callable[[ResearchReport], object] | None = None,
         heartbeat_interval_seconds: float = 15.0,
@@ -709,6 +733,7 @@ class ResearchCommandService:
         self._active_market_search_fn = active_market_search_fn or _default_active_market_search
         self._sold_market_search_fn = sold_market_search_fn or _default_sold_market_search
         self._sold_average_lookup_fn = sold_average_lookup_fn or _default_sold_average_lookup
+        self._shop_reference_fn = shop_reference_fn or build_shop_reference_fn(game_code_resolver_fn)
         self._ip_heat_lookup_fn = ip_heat_lookup_fn or (lambda canonicals: {})
         self._final_formatter = final_formatter or format_research_full_report
         self._heartbeat_interval_seconds = max(0.0, heartbeat_interval_seconds)
@@ -1001,15 +1026,23 @@ class ResearchCommandService:
             min_similarity=0.32,
         )
         active_evidence = tuple(_price_evidence_from_market_item(item, sold_status="active") for item in active_raw)
+        try:
+            shop_reference = self._shop_reference_fn(query, price_cap)
+        except Exception as exc:
+            logger.exception("Research shop reference lookup failed query=%s", query)
+            shop_reference = None
+            backend_warnings.append(f"店舗參考價抓取失敗：{exc}")
         ctx.active_price_evidence = active_evidence
         ctx.sold_price_evidence = sold_evidence
         ctx.sold_average_jpy = sold_avg
+        ctx.shop_reference = shop_reference
         result = _build_price_section_result(
             query=query,
             listed_price_jpy=listed_price,
             active_evidence=active_evidence,
             sold_evidence=sold_evidence,
             sold_average_jpy=sold_avg,
+            shop_reference=shop_reference,
             active_dropped=active_dropped,
             sold_dropped=sold_dropped,
             backend_warnings=tuple(backend_warnings),
@@ -1106,6 +1139,8 @@ def build_research_handler(
     active_market_search_fn: ActiveMarketSearchFn | None = None,
     sold_market_search_fn: SoldMarketSearchFn | None = None,
     sold_average_lookup_fn: SoldAverageLookupFn | None = None,
+    shop_reference_fn: ShopReferenceFn | None = None,
+    game_code_resolver_fn: GameCodeResolverFn | None = None,
     ip_heat_lookup_fn: IpHeatLookupFn | None = None,
     final_formatter: Callable[[ResearchReport], object] | None = None,
     heartbeat_interval_seconds: float = 15.0,
@@ -1121,6 +1156,8 @@ def build_research_handler(
         active_market_search_fn=active_market_search_fn,
         sold_market_search_fn=sold_market_search_fn,
         sold_average_lookup_fn=sold_average_lookup_fn,
+        shop_reference_fn=shop_reference_fn,
+        game_code_resolver_fn=game_code_resolver_fn,
         ip_heat_lookup_fn=ip_heat_lookup_fn,
         final_formatter=final_formatter,
         heartbeat_interval_seconds=heartbeat_interval_seconds,
@@ -1758,6 +1795,42 @@ def _price_evidence_from_market_item(item: dict[str, object], *, sold_status: st
     )
 
 
+def _format_price_band(low: int | None, high: int | None) -> str:
+    """Render a min–max range as ``¥low〜¥high``; collapse to a single ``¥x``
+    when the bounds coincide (or only one is known)."""
+    lo = low if low is not None else high
+    hi = high if high is not None else low
+    if lo is None:
+        return ""
+    if hi is None or hi == lo:
+        return f"¥{lo:,}"
+    return f"¥{lo:,}〜¥{hi:,}"
+
+
+def _format_shop_reference(ref: ShopReference) -> str:
+    """One-line shop band for the price summary. 買取 = lower (liquidation),
+    in-stock 販売 = upper (acquisition). Both sides are shown as a min–max
+    range so the band conveys an actual upper/lower spread, not a single point.
+    販売 only appears when stock-backed, so a 庫存0 card never poses as an upper
+    bound."""
+    has_buy = ref.buy_reference is not None
+    has_sell = ref.sell_reference is not None
+    buy_band = _format_price_band(ref.buy_min, ref.buy_max) or (
+        f"¥{ref.buy_reference:,}" if has_buy else ""
+    )
+    sell_band = _format_price_band(ref.sell_min, ref.sell_max) or (
+        f"¥{ref.sell_reference:,}" if has_sell else ""
+    )
+    stock_note = f"（在庫{ref.stock_total}点）" if ref.stock_total else ""
+    if has_buy and has_sell:
+        return f"{ref.label}参考帯 買取{buy_band}／販売{sell_band}{stock_note}"
+    if has_sell:
+        return f"{ref.label}参考 販売{sell_band}{stock_note}"
+    if has_buy:
+        return f"{ref.label}参考 買取{buy_band}（販売在庫なし、上限參考弱）"
+    return ""
+
+
 def _build_price_section_result(
     *,
     query: str,
@@ -1765,6 +1838,7 @@ def _build_price_section_result(
     active_evidence: tuple[PriceEvidence, ...],
     sold_evidence: tuple[PriceEvidence, ...],
     sold_average_jpy: float | None,
+    shop_reference: ShopReference | None = None,
     active_dropped: int = 0,
     sold_dropped: int = 0,
     backend_warnings: tuple[str, ...] = (),
@@ -1776,6 +1850,8 @@ def _build_price_section_result(
         for e in (*sold_evidence[:3], *active_evidence[:3])
         if e.source_url
     )
+    if shop_reference is not None and shop_reference.sample_urls:
+        evidence_urls = (*evidence_urls, *shop_reference.sample_urls)
     warnings: list[str] = []
     status = "ok"
     summary_parts: list[str] = []
@@ -1799,7 +1875,13 @@ def _build_price_section_result(
         )
     else:
         status = "partial" if summary_parts else "unavailable"
-        warnings.append("active 比價樣本不足（Mercari / Rakuma / Yuyutei 均未取得）。")
+        warnings.append("active 比價樣本不足（Mercari / Rakuma 均未取得）。")
+
+    shop_band_text = _format_shop_reference(shop_reference) if shop_reference is not None else ""
+    if shop_band_text:
+        summary_parts.append(shop_band_text)
+        if status == "unavailable":
+            status = "partial"
 
     if listed_price_jpy is not None and sold_average_jpy is not None and sold_average_jpy > 0:
         ratio = listed_price_jpy / sold_average_jpy
@@ -1812,8 +1894,13 @@ def _build_price_section_result(
             summary_parts.append("目前開價接近 sold 均價")
 
     if sold_average_jpy is None and not active_prices:
-        status = "unavailable"
-        summary_parts = [f"查詢「{query}」未取得可用的 sold 或 active 樣本。"]
+        if shop_band_text:
+            # No C2C data, but the shop band still gives a usable reference.
+            status = "partial"
+            summary_parts = [f"查詢「{query}」無 Mercari/Rakuma 樣本，僅店舗參考：", shop_band_text]
+        else:
+            status = "unavailable"
+            summary_parts = [f"查詢「{query}」未取得可用的 sold 或 active 樣本。"]
 
     warnings.extend(backend_warnings)
     if sold_dropped:
@@ -1884,7 +1971,7 @@ def _build_liquidity_section_result(
     warnings: list[str] = []
     status = "ok"
     summary_parts = [
-        f"Mercari active {active_count} 筆 / sold {sold_count} 筆",
+        f"active {active_count} 筆（跨平台）/ Mercari sold {sold_count} 筆",
         f"sold/active 比 {ratio:.2f}",
     ]
 
@@ -1950,6 +2037,11 @@ def _default_active_market_search(query: str, price_cap: int, max_results: int) 
     def run() -> list[dict[str, object]]:
         merged: list[dict[str, object]] = []
         for source_name, client in clients.items():
+            # Yuyutei is a shop, not C2C — its 買取/販売 prices are surfaced as a
+            # separate reference band (see _default_shop_reference_fn) so they
+            # don't get averaged into the Mercari/Rakuma C2C median.
+            if source_name == "yuyutei":
+                continue
             try:
                 listings = client.search(query, price_max=price_cap, max_results=max_results)
             except Exception:
@@ -1988,17 +2080,86 @@ def _default_sold_average_lookup(query: str) -> float | None:
     return _run_in_isolated_thread(lambda: fetch_avg_sold_price(query))
 
 
+def _shop_reference_from_band(
+    query: str, price_cap: int, source_options: dict[str, object] | None
+) -> ShopReference | None:
+    from market_monitor.yuyutei_search import YuyuteiMarketplaceSearchClient
+
+    def run() -> ShopReference | None:
+        band = YuyuteiMarketplaceSearchClient().reference_band(
+            query, price_max=price_cap, source_options=source_options
+        )
+        if band is None or not band.has_data:
+            return None
+        return ShopReference(
+            label="遊々亭",
+            buy_reference=band.buy_reference,
+            sell_reference=band.sell_reference,
+            stock_total=band.sell_stock_total,
+            buy_count=len(band.buy_prices),
+            sell_count=len(band.sell_prices),
+            sample_urls=band.sample_urls,
+            buy_min=band.buy_min,
+            buy_max=band.buy_max,
+            sell_min=band.sell_min,
+            sell_max=band.sell_max,
+        )
+
+    return _run_in_isolated_thread(run)
+
+
+def build_shop_reference_fn(
+    game_code_resolver_fn: GameCodeResolverFn | None = None,
+) -> ShopReferenceFn:
+    """Build the Yuyu亭 shop-band fetcher. When a ``game_code_resolver_fn`` is
+    supplied, it resolves a query's yuyutei game code (e.g. プロセカ card →
+    ``ws``) so the band appears even for bare card names with no game keyword.
+    The resolver returns ``None`` when it can't identify a TCG game, in which
+    case Yuyutei is skipped (no fan-out, no wasted request)."""
+
+    def fn(query: str, price_cap: int) -> ShopReference | None:
+        source_options: dict[str, object] | None = None
+        if game_code_resolver_fn is not None:
+            try:
+                code = game_code_resolver_fn(query)
+            except Exception:
+                logger.exception("Yuyutei game-code resolver failed query=%s", query)
+                code = None
+            if not code:
+                return None
+            source_options = {"game_code": code}
+        return _shop_reference_from_band(query, price_cap, source_options)
+
+    return fn
+
+
+# Default (no resolver): only resolves codes a query already spells out (game
+# word or explicit code). Real wiring injects an LLM/RAG resolver via
+# build_research_handler so bare card names route correctly.
+_default_shop_reference_fn: ShopReferenceFn = build_shop_reference_fn(None)
+
+
 def _active_source_breakdown(evidence: tuple[PriceEvidence, ...]) -> str:
-    """Render a per-platform sample count, e.g. "mercari 4 / rakuma 2 / yuyutei 1",
-    so the user can see the cross-platform reference pricing at a glance."""
-    counts: dict[str, int] = {}
+    """Render a per-platform count AND representative price, e.g.
+    "mercari 2筆 中位¥3,500 / rakuma 1筆 ¥79,900", so each source's reference
+    price shows up inline in the summary text — not only as a clickable link.
+    Rendered even for a single source: when active is e.g. Rakuma-only, the
+    user still needs to see which platform and at what price, instead of a
+    bare "active 樣本 1 筆" that forces them to open the link."""
+    prices_by_source: dict[str, list[int]] = {}
     for item in evidence:
         if item.price_jpy is None:
             continue
-        counts[item.source_site] = counts.get(item.source_site, 0) + 1
-    if len(counts) <= 1:
+        prices_by_source.setdefault(item.source_site, []).append(item.price_jpy)
+    if not prices_by_source:
         return ""
-    return " / ".join(f"{source} {count}" for source, count in sorted(counts.items()))
+    parts: list[str] = []
+    for source, prices in sorted(prices_by_source.items()):
+        if len(prices) == 1:
+            parts.append(f"{source} 1筆 ¥{prices[0]:,}")
+        else:
+            parts.append(f"{source} {len(prices)}筆 中位¥{statistics.median(prices):,.0f}")
+    return " / ".join(parts)
 
 
 def _average_price_from_evidence(evidence: tuple[PriceEvidence, ...]) -> float | None:
