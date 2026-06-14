@@ -491,6 +491,29 @@ class OpportunityStore:
             )
         return cursor.rowcount > 0
 
+    def prune_watchlist_orphans(self, valid_ids: set[str]) -> int:
+        """Delete opp_mw_* candidates (and their recommendations) whose watchlist
+        entry no longer exists.  Called by MarketplaceWatchlistCandidateProvider
+        after each discover() so deletions propagate on the next pipeline tick."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT candidate_id FROM opportunity_candidates WHERE candidate_id LIKE 'opp_mw_%'"
+            ).fetchall()
+            orphan_ids = [r[0] for r in rows if r[0] not in valid_ids]
+            if not orphan_ids:
+                return 0
+            placeholders = ",".join("?" * len(orphan_ids))
+            connection.execute(
+                f"DELETE FROM opportunity_recommendations WHERE candidate_id IN ({placeholders})",
+                orphan_ids,
+            )
+            connection.execute(
+                f"DELETE FROM opportunity_candidates WHERE candidate_id IN ({placeholders})",
+                orphan_ids,
+            )
+        logger.info("Opportunity store: pruned %d orphan watchlist candidates: %s", len(orphan_ids), orphan_ids)
+        return len(orphan_ids)
+
     def list_recent_recommendations(self, *, limit: int = 10) -> list[sqlite3.Row]:
         with self.connect() as connection:
             return list(

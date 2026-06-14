@@ -949,10 +949,12 @@ class MarketplaceWatchlistCandidateProvider:
         market_db: MonitorDatabase,
         llm_fn=None,
         normalize_fn=_normalize_target_query,
+        opportunity_store: "OpportunityStore | None" = None,
     ) -> None:
         self._market_db = market_db
         self._llm_fn = llm_fn
         self._normalize_fn = normalize_fn
+        self._opportunity_store = opportunity_store
         # Process-local cache: (source, query) → normalized dict.
         self._cache: dict[str, dict[str, str]] = {}
 
@@ -1011,6 +1013,9 @@ class MarketplaceWatchlistCandidateProvider:
                     is_target=True,
                 )
             )
+        if self._opportunity_store is not None:
+            valid_ids = {c.candidate_id for c in out}
+            self._opportunity_store.prune_watchlist_orphans(valid_ids)
         return tuple(out)
 
 
@@ -1282,6 +1287,7 @@ def build_opportunity_agent(settings: AssistantSettings | None = None) -> Opport
         MarketplaceWatchlistCandidateProvider(
             market_db=MonitorDatabase(settings.monitor_db_path),
             llm_fn=target_llm_fn,
+            opportunity_store=store,
         ),
         sns_provider,
     ]
