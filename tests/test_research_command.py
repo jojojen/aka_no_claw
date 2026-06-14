@@ -537,6 +537,107 @@ def test_research_handler_builds_price_section_from_active_and_sold_samples(tmp_
     assert "https://jp.mercari.com/item/s1" in reply
 
 
+def test_research_handler_active_price_includes_non_mercari_platforms(tmp_path: Path) -> None:
+    item_fetcher = MercariItemAdapter(
+        fetch_html_fn=lambda _url: _load_fixture("mercari_item_m18542743389.html")
+    )
+
+    def active_search(query: str, price_cap: int, max_results: int) -> list[dict[str, object]]:
+        return [
+            {
+                "source": "mercari",
+                "item_id": "m1",
+                "title": "エヴァンゲリオン 綾波レイ プロモ 1",
+                "price_jpy": 6100,
+                "url": "https://jp.mercari.com/item/m1",
+                "thumbnail_url": "",
+            },
+            {
+                "source": "rakuma",
+                "item_id": "r1",
+                "title": "エヴァンゲリオン 綾波レイ プロモ 2",
+                "price_jpy": 6800,
+                "url": "https://fril.jp/item/r1",
+                "thumbnail_url": "",
+            },
+            {
+                "source": "yuyutei",
+                "item_id": "y1",
+                "title": "エヴァンゲリオン 綾波レイ プロモ 3",
+                "price_jpy": 7200,
+                "url": "https://yuyu-tei.jp/sell/ua/card/y1",
+                "thumbnail_url": "",
+            },
+        ]
+
+    handler = build_research_handler(
+        notifier_factory=lambda chat_id: FakeNotifier(),
+        item_fetcher=item_fetcher,
+        knowledge_db_path=str(tmp_path / "knowledge.sqlite3"),
+        active_market_search_fn=active_search,
+        sold_market_search_fn=lambda query, max_results: [],
+        sold_average_lookup_fn=lambda query: None,
+    )
+
+    reply = handler("https://jp.mercari.com/item/m18542743389", "chat-multi")
+
+    assert "active 樣本 3 筆（mercari 1 / rakuma 1 / yuyutei 1）" in reply
+    assert "https://fril.jp/item/r1" in reply
+    assert "https://yuyu-tei.jp/sell/ua/card/y1" in reply
+
+
+def test_research_active_price_cap_uses_sold_average_for_high_value_text_query() -> None:
+    """Bare keyword (no listed price) for a high-value item: the active cap must
+    be derived from the sold average, not fall back to the low ¥50,000 default,
+    otherwise every active listing gets price-filtered out."""
+    seen_caps: list[int] = []
+
+    def active_search(query: str, price_cap: int, max_results: int) -> list[dict[str, object]]:
+        seen_caps.append(price_cap)
+        return [
+            {
+                "source": "mercari",
+                "item_id": "h1",
+                "title": "ピカチュウ SAR プロモ A",
+                "price_jpy": 110000,
+                "url": "https://jp.mercari.com/item/h1",
+                "thumbnail_url": "",
+            }
+        ]
+
+    def sold_search(query: str, max_results: int) -> list[dict[str, object]]:
+        return [
+            {
+                "source": "mercari",
+                "item_id": "hs1",
+                "title": "ピカチュウ SAR プロモ B",
+                "price_jpy": 120000,
+                "url": "https://jp.mercari.com/item/hs1",
+                "thumbnail_url": "",
+            },
+            {
+                "source": "mercari",
+                "item_id": "hs2",
+                "title": "ピカチュウ SAR プロモ C",
+                "price_jpy": 116000,
+                "url": "https://jp.mercari.com/item/hs2",
+                "thumbnail_url": "",
+            },
+        ]
+
+    handler = build_research_handler(
+        notifier_factory=lambda chat_id: FakeNotifier(),
+        active_market_search_fn=active_search,
+        sold_market_search_fn=sold_search,
+        sold_average_lookup_fn=lambda query: None,
+    )
+
+    reply = handler("ピカチュウ SAR プロモ", "chat-highval")
+
+    assert seen_caps == [236000]
+    assert "https://jp.mercari.com/item/h1" in reply
+
+
 def test_research_handler_price_stage_works_for_text_query_without_item_page() -> None:
     def active_search(query: str, price_cap: int, max_results: int) -> list[dict[str, object]]:
         assert query == "初音ミク 15th フィギュア"
