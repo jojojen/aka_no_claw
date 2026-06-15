@@ -1777,6 +1777,19 @@ def _derive_active_price_cap(listed_price_jpy: int | None, sold_average_jpy: int
     return 50_000
 
 
+def _classify_condition_class(title: str) -> str:
+    """Binary 新品/中古 class for a C2C search-result listing.
+
+    The marketplace search returns only title+price+url (Mercari's structured
+    商品の状態 is a *filter* input, not a result field), so we infer from the
+    title via the existing condition inferrer. Only an explicit 新品/未開封/
+    未使用 claim counts as 新品; 未使用に近い and every unlabeled resale fall to
+    中古 (C2C default). Heuristic — a mislabeled listing can land in the wrong
+    bucket, but it cleanly separates the bulk sealed-stock band from genuine
+    secondhand prices."""
+    return "新品" if _infer_condition_from_title(title) == "新品、未使用" else "中古"
+
+
 def _price_evidence_from_market_item(item: dict[str, object], *, sold_status: str) -> PriceEvidence:
     source_url = str(item.get("url") or "").strip()
     title = str(item.get("title") or "").strip()
@@ -1788,11 +1801,36 @@ def _price_evidence_from_market_item(item: dict[str, object], *, sold_status: st
         title=title,
         price_jpy=price_jpy,
         sold_status=sold_status,
-        condition_label=None,
+        condition_label=_classify_condition_class(title) if title else None,
         shipping_note=None,
         excluded_reason=None,
         observed_at=_utc_now_iso(),
     )
+
+
+def _condition_split_lines(evidence: tuple[PriceEvidence, ...], *, kind: str) -> list[str]:
+    """Per-condition (中古 / 新品) median+range lines for a price sample.
+
+    Returns lines only when BOTH classes are present — when the whole sample is
+    one condition, the headline line already conveys it, so we skip the noise.
+    ``kind`` is the band label (e.g. ``active``) shown in each line."""
+    buckets: dict[str, list[int]] = {"中古": [], "新品": []}
+    for e in evidence:
+        if e.price_jpy is None:
+            continue
+        buckets.setdefault(e.condition_label or "中古", []).append(e.price_jpy)
+    present = [(label, buckets[label]) for label in ("中古", "新品") if buckets[label]]
+    if len(present) < 2:
+        return []
+    lines: list[str] = []
+    for label, prices in present:
+        ordered = sorted(prices)
+        median = statistics.median(ordered)
+        lines.append(
+            f"・{label} {kind} {len(ordered)} 筆，中位數 ¥{median:,.0f}，"
+            f"區間 ¥{min(ordered):,}–¥{max(ordered):,}"
+        )
+    return lines
 
 
 def _format_price_band(low: int | None, high: int | None) -> str:
@@ -1862,6 +1900,7 @@ def _build_price_section_result(
     if sold_average_jpy is not None and sold_average_jpy > 0:
         sold_label = f"Mercari sold 樣本 {len(sold_prices)} 筆" if sold_prices else "Mercari sold 均價"
         summary_parts.append(f"{sold_label}，均價約 ¥{sold_average_jpy:,.0f}")
+        summary_parts.extend(_condition_split_lines(sold_evidence, kind="sold"))
     else:
         status = "partial"
         warnings.append("Mercari sold 價目前只拿到平均值接口；此查詢未回傳可用 sold avg。")
@@ -1873,6 +1912,7 @@ def _build_price_section_result(
         summary_parts.append(
             f"active 樣本 {len(active_prices)} 筆{breakdown_note}，中位數 ¥{active_median:,.0f}，區間 ¥{min(active_prices):,}–¥{max(active_prices):,}"
         )
+        summary_parts.extend(_condition_split_lines(active_evidence, kind="active"))
     else:
         status = "partial" if summary_parts else "unavailable"
         warnings.append("active 比價樣本不足（Mercari / Rakuma 均未取得）。")
