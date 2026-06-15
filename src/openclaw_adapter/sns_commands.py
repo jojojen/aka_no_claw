@@ -149,9 +149,16 @@ def build_sns_add_handler(sns_db, sns_inbox=None) -> Callable[[str, str], str]:
         from sns_monitor.models import AccountWatch, KeywordWatch, TrendWatch
         from sns_monitor.storage import SnsDatabase
 
+        # Default scan cadence for a new /snsadd rule when the user gives no
+        # explicit schedule:NN. 720m (12h) keeps polling gentle on each source
+        # (avoids rate-limit/ban) while still surfacing new posts twice a day.
+        _DEFAULT_SCHEDULE_MINUTES = 720
         default_schedules: dict[tuple[str, str], int] = {
-            ("x", "account"): 15, ("x", "keyword"): 30, ("x", "trend"): 60,
-            ("reddit", "account"): 30, ("reddit", "keyword"): 60,
+            ("x", "account"): _DEFAULT_SCHEDULE_MINUTES,
+            ("x", "keyword"): _DEFAULT_SCHEDULE_MINUTES,
+            ("x", "trend"): _DEFAULT_SCHEDULE_MINUTES,
+            ("reddit", "account"): _DEFAULT_SCHEDULE_MINUTES,
+            ("reddit", "keyword"): _DEFAULT_SCHEDULE_MINUTES,
         }
         source_label = {"x": "X", "reddit": "Reddit"}
 
@@ -186,7 +193,7 @@ def build_sns_add_handler(sns_db, sns_inbox=None) -> Callable[[str, str], str]:
                     schedule_override
                     if schedule_override is not None
                     else getattr(existing_rule, "schedule_minutes", None)
-                    or default_schedules.get((source, "account"), 30)
+                    or default_schedules.get((source, "account"), _DEFAULT_SCHEDULE_MINUTES)
                 )
                 display = f"r/{screen_name}" if source == "reddit" else f"@{screen_name}"
                 rule = AccountWatch(
@@ -235,7 +242,7 @@ def build_sns_add_handler(sns_db, sns_inbox=None) -> Callable[[str, str], str]:
                     schedule_override
                     if schedule_override is not None
                     else getattr(existing_rule, "schedule_minutes", None)
-                    or default_schedules.get((source, "keyword"), 60)
+                    or default_schedules.get((source, "keyword"), _DEFAULT_SCHEDULE_MINUTES)
                 )
                 rule = KeywordWatch(
                     rule_id=rule_id,
@@ -277,7 +284,7 @@ def build_sns_add_handler(sns_db, sns_inbox=None) -> Callable[[str, str], str]:
                     schedule_override
                     if schedule_override is not None
                     else getattr(existing_rule, "schedule_minutes", None)
-                    or default_schedules.get((source, "trend"), 60)
+                    or default_schedules.get((source, "trend"), _DEFAULT_SCHEDULE_MINUTES)
                 )
                 rule = TrendWatch(
                     rule_id=rule_id,
