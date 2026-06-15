@@ -765,6 +765,36 @@ def test_research_handler_price_stage_works_for_text_query_without_item_page() -
     assert "Mercari sold 價目前只拿到平均值接口；此查詢未回傳可用 sold avg。" in reply
 
 
+def test_research_handler_splits_active_band_by_new_vs_used_condition() -> None:
+    query = "ずっと真夜中でいいのに 形藻土 通常盤"
+
+    def active_search(q: str, price_cap: int, max_results: int) -> list[dict[str, object]]:
+        return [
+            # New: explicit 新品/未開封 claim in title → 新品 bucket.
+            {"item_id": "n1", "title": f"{query} 新品未開封 シュリンク付", "price_jpy": 4800,
+             "url": "https://jp.mercari.com/item/n1", "thumbnail_url": ""},
+            {"item_id": "n2", "title": f"{query} 新品", "price_jpy": 5200,
+             "url": "https://jp.mercari.com/item/n2", "thumbnail_url": ""},
+            # Used: no new-claim (incl. 未使用に近い, a Mercari *used* grade) → 中古.
+            {"item_id": "u1", "title": f"{query} 未使用に近い", "price_jpy": 3000,
+             "url": "https://jp.mercari.com/item/u1", "thumbnail_url": ""},
+            {"item_id": "u2", "title": f"{query} 開封済み", "price_jpy": 2600,
+             "url": "https://jp.mercari.com/item/u2", "thumbnail_url": ""},
+        ]
+
+    handler = build_research_handler(
+        notifier_factory=lambda chat_id: FakeNotifier(),
+        active_market_search_fn=active_search,
+        sold_market_search_fn=_fake_sold_search,
+        sold_average_lookup_fn=lambda q: None,
+    )
+
+    reply = handler(query, "chat-1")
+
+    assert "・中古 active 2 筆，中位數 ¥2,800，區間 ¥2,600–¥3,000" in reply
+    assert "・新品 active 2 筆，中位數 ¥5,000，區間 ¥4,800–¥5,200" in reply
+
+
 def test_research_handler_filters_low_relevance_and_graded_price_samples(tmp_path: Path) -> None:
     item_fetcher = MercariItemAdapter(
         fetch_html_fn=lambda _url: _load_fixture("mercari_item_m18542743389.html")
