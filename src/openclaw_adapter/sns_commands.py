@@ -143,6 +143,7 @@ def build_sns_add_handler(sns_db, sns_inbox=None) -> Callable[[str, str], str]:
             extract_labeled_brackets,
             extract_schedule_minutes,
             parse_account_watch_text,
+            rewrite_social_url,
             split_source_prefix,
         )
         from sns_monitor.models import AccountWatch, KeywordWatch, TrendWatch
@@ -166,6 +167,7 @@ def build_sns_add_handler(sns_db, sns_inbox=None) -> Callable[[str, str], str]:
                     '     /snsadd reddit:keyword:Umbreon ex domain[pokemon]'
                 )
 
+            raw = rewrite_social_url(raw)
             schedule_override, raw = extract_schedule_minutes(raw)
             source, body = split_source_prefix(raw)
 
