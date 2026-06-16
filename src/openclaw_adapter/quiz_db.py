@@ -99,7 +99,35 @@ _LEXICAL_COMMENTARY_MARKERS: tuple[str, ...] = (
     "語り手",
     "徹底解説",
     "という部分は、",
+    "という表現は",
+    "フレーズは",
+    "暗示",
+    "イベント",
+    "メインに、",
+    "表現された楽曲となっています",
+    "公開したMVには",
+    "プロセカにはいくつかのユニットがありますが",
+    "MVで使用されている",
+    "品質表示",
+    "【文章A】",
+    "聖書では",
+    "主題歌としての側面",
+    "相合傘",
+    "心の動きが表されています",
+    "一曲",
+    "ふりがな付",
+    "舞台は",
+    "象徴しているという",
+    "歌ってみたが魅力の",
+    "表現者としての才能はあっても",
+    "結果的に仲間を失ってしまい",
+    "想像できます",
+    "依存心と支配欲",
+    "実際に行動に移して",
+    "とされる。",
 )
+_LOW_VALUE_SYNONYM_POINT_RE = re.compile(r"^[^ 　。、，「」『』]+(?:って|て|で)$")
+_LOW_VALUE_READING_POINT_RE = re.compile(r"^[^ 　。、，「」『』]+(?:って|ちゃって|らない|いたって)$")
 
 
 def _token_before(stem: str, keyword: str) -> str | None:
@@ -174,6 +202,30 @@ def lexical_stem_uses_commentary_wrapper(*, exam_point: str | None, stem: str) -
         return False
     text = (stem or "").strip()
     return any(marker in text for marker in _LEXICAL_COMMENTARY_MARKERS)
+
+
+def synonym_target_is_low_value_fragment(*, exam_point: str | None, tested_point: str | None) -> bool:
+    """Reject 言い換え targets that are just colloquial whole-utterance fragments
+    or verb inflection fragments rather than clean lexical items."""
+    ep = (exam_point or "").strip()
+    point = (tested_point or "").strip()
+    if "言い換え" not in ep and "類義" not in ep:
+        return False
+    if point == "どうだっていいや":
+        return True
+    if "の" in point:
+        return False
+    return bool(_LOW_VALUE_SYNONYM_POINT_RE.match(point))
+
+
+def reading_target_is_low_value_fragment(*, exam_point: str | None, tested_point: str | None) -> bool:
+    """Reject 漢字読み targets that are just inflected fragments instead of a clean
+    lexical item."""
+    ep = (exam_point or "").strip()
+    point = (tested_point or "").strip()
+    if "漢字読み" not in ep:
+        return False
+    return bool(_LOW_VALUE_READING_POINT_RE.match(point))
 
 
 def _normalize_grounding(text: str | None) -> str:
@@ -1791,6 +1843,16 @@ class QuizDatabase:
             raise ValueError(
                 "lexical stem uses commentary wrapper: lexical items must be taught "
                 "through a meaningful sentence, not commentary/about-text prose"
+            )
+        if synonym_target_is_low_value_fragment(exam_point=exam_point, tested_point=tested_point):
+            raise ValueError(
+                "synonym target is a low-value fragment: 言い換え類義 must test a clean "
+                "lexical item, not a colloquial whole-utterance or inflection fragment"
+            )
+        if reading_target_is_low_value_fragment(exam_point=exam_point, tested_point=tested_point):
+            raise ValueError(
+                "reading target is a low-value fragment: 漢字読み must test a clean "
+                "lexical item, not an inflected fragment"
             )
         if youhou_target_word_presence_leaks(
             exam_point=exam_point, stem=stem, options=opts, answer_index=int(answer_index)
