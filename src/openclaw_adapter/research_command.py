@@ -32,9 +32,13 @@ IpHeatLookupFn = Callable[[tuple[str, ...]], dict[str, tuple[object, ...]]]
 ResearchStageRunner = Callable[["ResearchJobContext"], str]
 
 _MERCARI_ITEM_PATH_RE = re.compile(r"^/item/(m\d+)/?$", re.IGNORECASE)
+_MERCARI_SHOPS_PATH_RE = re.compile(r"^/shops/product/([A-Za-z0-9]+)/?$")
 _MERCARI_PROFILE_PATH_RE = re.compile(r"^/user/profile/(\d+)/?$", re.IGNORECASE)
 _MERCARI_HOSTS = frozenset({"jp.mercari.com", "www.mercari.com", "mercari.com"})
 _TITLE_SUFFIX_RE = re.compile(r"\s+by メルカリ$", re.IGNORECASE)
+# Mercari Shops og:title ends with " - <shop name> メルカリ店"; strip it.
+# The separator is a spaced hyphen, so internal hyphens (e.g. "K-ON!") are kept.
+_SHOPS_TITLE_SUFFIX_RE = re.compile(r"\s+-\s+\S.*?メルカリ店\s*$")
 _MERCARI_ORIG_IMAGE_RE = re.compile(
     r"https://static\.mercdn\.net/item/detail/orig/photos/(m\d+)_\d+\.(?:jpg|jpeg|png|webp)(?:\?[^\s\"'>]+)?",
     re.IGNORECASE,
@@ -259,6 +263,16 @@ def parse_research_target(raw_input: str) -> ResearchTarget:
             canonical_url=mercari,
             item_id=item_id,
         )
+    shops = normalize_mercari_shops_url(cleaned)
+    if shops is not None:
+        canonical_url, token = shops
+        return ResearchTarget(
+            mode="mercari_url",
+            raw_input=cleaned,
+            display_text=canonical_url,
+            canonical_url=canonical_url,
+            item_id=token,
+        )
     return ResearchTarget(mode="text_query", raw_input=cleaned, display_text=cleaned)
 
 
@@ -284,6 +298,31 @@ def _extract_mercari_item_id(url: str) -> str | None:
     return match.group(1).lower() if match else None
 
 
+def normalize_mercari_shops_url(url: str) -> tuple[str, str] | None:
+    """Return (canonical_url, token) for a Mercari Shops product URL, else None.
+
+    Shops pages render price client-side (absent from static HTML), but the
+    product name is in og:title — enough to drive entity recognition + market
+    search, so we route them through the same mercari_url fetch path.
+    """
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return None
+    if parsed.scheme not in {"http", "https"}:
+        return None
+    host = (parsed.netloc or "").lower()
+    if host not in _MERCARI_HOSTS:
+        return None
+    match = _MERCARI_SHOPS_PATH_RE.match(parsed.path or "")
+    if not match:
+        return None
+    token = match.group(1)
+    canonical_path = f"/shops/product/{token}"
+    canonical_url = urlunsplit(("https", "jp.mercari.com", canonical_path, "", ""))
+    return canonical_url, token
+
+
 class MercariItemAdapter:
     def __init__(self, *, fetch_html_fn: FetchHtmlFn | None = None) -> None:
         self._fetch_html_fn = fetch_html_fn or _fetch_html
@@ -304,14 +343,14 @@ class MercariItemAdapter:
         fallback_title = ""
         if soup.title:
             fallback_title = _compact_whitespace(
-                _TITLE_SUFFIX_RE.sub("", soup.title.get_text(" ", strip=True))
+                _clean_item_title(soup.title.get_text(" ", strip=True))
             )
         title = (
             _compact_whitespace(str(product.get("name") or ""))
             or _extract_meta_content(soup, "property", "og:title")
             or fallback_title
         )
-        title = _compact_whitespace(_TITLE_SUFFIX_RE.sub("", title))
+        title = _compact_whitespace(_clean_item_title(title))
 
         description = _compact_whitespace(str(product.get("description") or ""))
         if not description:
@@ -626,7 +665,10 @@ def _extract_image_urls(
     seen: set[str] = set()
     for url in urls:
         normalized = _normalize_image_url(url)
-        if item_id not in normalized:
+        # Shops product images live on a separate CDN with their own ids that
+        # don't echo the product token, so the item_id guard can't apply there.
+        is_shops_image = "mercari-shops-static.com" in normalized
+        if not is_shops_image and item_id not in normalized:
             continue
         if normalized in seen:
             continue
@@ -667,6 +709,12 @@ def _score_item_data_confidence(
 
 def _compact_whitespace(text: str) -> str:
     return " ".join((text or "").split()).strip()
+
+
+def _clean_item_title(text: str) -> str:
+    cleaned = _TITLE_SUFFIX_RE.sub("", text or "")
+    cleaned = _SHOPS_TITLE_SUFFIX_RE.sub("", cleaned)
+    return cleaned
 
 
 def _run_in_isolated_thread(func: Callable[[], object]) -> object:
@@ -1103,6 +1151,20 @@ class ResearchCommandService:
                 evidence_count=0,
                 summary=summary,
                 warnings=(summary,),
+            )
+            ctx.add_section_result(result)
+            return summary
+        if ctx.item_data.seller_url is None and _MERCARI_SHOPS_PATH_RE.match(
+            urlsplit(ctx.item_data.item_url).path or ""
+        ):
+            summary = "Mercari Shops 商品頁無個人賣家檔案，不適用賣家風險分析。"
+            result = ResearchSectionResult(
+                section_name="賣家風險分析",
+                status="unavailable",
+                confidence=1.0,
+                sample_count=0,
+                evidence_count=0,
+                summary=summary,
             )
             ctx.add_section_result(result)
             return summary

@@ -17,6 +17,7 @@ from openclaw_adapter.research_command import (
     build_research_handler,
     format_research_compact_report,
     normalize_mercari_item_url,
+    normalize_mercari_shops_url,
     parse_research_target,
 )
 from openclaw_adapter.knowledge_db import KnowledgeDatabase
@@ -80,6 +81,51 @@ def test_parse_research_target_treats_non_url_as_text_query() -> None:
     assert target.mode == "text_query"
     assert target.display_text == "初音ミク 15th フィギュア"
     assert target.canonical_url is None
+
+
+def test_normalize_mercari_shops_url_strips_query_and_returns_token() -> None:
+    result = normalize_mercari_shops_url(
+        "https://jp.mercari.com/shops/product/2JPEa5BQcDaCwxJamae4fp"
+        "?source_location=share&utm_medium=share&utm_source=ios"
+    )
+    assert result == (
+        "https://jp.mercari.com/shops/product/2JPEa5BQcDaCwxJamae4fp",
+        "2JPEa5BQcDaCwxJamae4fp",
+    )
+
+
+def test_normalize_mercari_shops_url_rejects_non_shops() -> None:
+    assert normalize_mercari_shops_url("https://jp.mercari.com/item/m65806654179") is None
+    assert normalize_mercari_shops_url("https://example.com/shops/product/abc") is None
+
+
+def test_parse_research_target_routes_shops_url_to_mercari_mode() -> None:
+    target = parse_research_target(
+        "https://jp.mercari.com/shops/product/2JPEa5BQcDaCwxJamae4fp?utm_source=ios"
+    )
+    assert target.mode == "mercari_url"
+    assert target.item_id == "2JPEa5BQcDaCwxJamae4fp"
+    assert target.canonical_url == (
+        "https://jp.mercari.com/shops/product/2JPEa5BQcDaCwxJamae4fp"
+    )
+
+
+def test_parse_html_strips_shops_title_suffix_and_keeps_internal_hyphen() -> None:
+    token = "2JPEa5BQcDaCwxJamae4fp"
+    item_url = f"https://jp.mercari.com/shops/product/{token}"
+    html = (
+        "<html><head>"
+        '<meta property="og:title" content="【中古】K-ON! MUSIC BOX 初回盤 - お宝創庫 メルカリ店">'
+        '<meta property="og:image" content="'
+        "https://assets.mercari-shops-static.com/-/large/plain/2JPEa59pmqLqDvMeerrUWM.jpg@jpg"
+        '">'
+        "</head><body></body></html>"
+    )
+    item = MercariItemAdapter().parse_html(html, item_url=item_url, item_id=token)
+    assert item.title == "【中古】K-ON! MUSIC BOX 初回盤"
+    assert item.image_urls == (
+        "https://assets.mercari-shops-static.com/-/large/plain/2JPEa59pmqLqDvMeerrUWM.jpg@jpg",
+    )
 
 
 def test_budgeted_search_fn_stops_after_budget_exhausted() -> None:

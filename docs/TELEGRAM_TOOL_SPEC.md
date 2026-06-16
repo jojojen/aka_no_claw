@@ -154,8 +154,40 @@ Routing rules:
 - Return `scan_help` when the user asks how to use image/photo scan or wants image lookup instructions before sending a photo.
 - Return `lookup_card` for one-card valuation requests.
 - Return `trend_board` ONLY for explicit leaderboard / top-N / ranking requests (e.g. "pokemon 熱門前 5", "遊戲王熱門排行"). Price-direction questions go to `web_research`, not `trend_board`.
-- Return `reputation_snapshot` when a Mercari URL is provided for seller/item trust checking.
+- Return `reputation_snapshot` when a Mercari URL is provided for seller/item trust checking (wording like 信譽/credit/賣家可靠嗎).
+- Return `product_research` when the user wants investment/market analysis of a listed product from its URL (wording like 增值/值不值得買/行情/這個能賺嗎).
+- A bare Mercari item/shops product URL with no reputation-or-research wording is ambiguous between `reputation_snapshot` and `product_research`: set `query_url` and return confidence below 0.5 so the caller asks the user which one.
 - Return `web_research` when the user asks about price direction, market sentiment, recent news, or any why/how/explanatory question that needs web sources and summarization.
 - Return `opportunity_remove` when the user wants to remove/dismiss a target from the opportunity/hunt list.
 - Return watch intents for tracking requests.
 - Return `unknown` when the request is unrelated or too ambiguous.
+
+## Natural-language routing pipeline
+
+A non-slash message is routed in two stages (`TelegramCommandProcessor._route_natural_language`):
+
+1. **Embedding fast-path** (`openclaw_adapter/intent_fast_path.py`). One bge-m3
+   embedding of the message is compared (cosine) against canonical phrasings in
+   `data/intent_routing_phrasings.json`. It short-circuits **only** when the top
+   intent is a zero-arg command — `help`, `status`, `tools`, `scan_help`,
+   `sns_list`, `list_watches` — AND the score clears `OPENCLAW_INTENT_FASTPATH_MIN_SCORE`
+   (default 0.65) AND beats the runner-up by a small margin. ~130 ms.
+   It returns the intent label only; it never extracts slots.
+2. **LLM router** (`qwen3:14b`, `price_monitor_bot.natural_language`). Everything
+   the fast-path declines — slot-bearing intents (`add_watch`, `lookup_card`,
+   `sns_add_account`, …) and any low-confidence / ambiguous message — falls
+   through here unchanged, so parameter extraction is exactly as before. ~50 s.
+3. A deterministic regex fallback still backstops the LLM for a few bulk-filter
+   sentences.
+
+Design notes:
+
+- This is a **fast-path, not a replacement**: the only thing it can decide is
+  "this is confidently a zero-arg list/info command". The blast radius of a
+  wrong short-circuit is bounded to those six harmless commands.
+- Fully reversible: an empty/blank embed model, a missing phrasings file, or any
+  embed failure disables the fast-path and every message routes through the LLM.
+- Tune the floor with `OPENCLAW_INTENT_FASTPATH_MIN_SCORE`. Lower = faster /
+  riskier; higher = more messages fall through to the slow LLM router.
+- Spike evidence (20 real utterances, both routers 20/20 on intent, embedding
+  ~412x faster): `spikes/intent_routing/RESULTS.md`.
