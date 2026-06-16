@@ -1,0 +1,72 @@
+[
+  {
+    "id": 1,
+    "kind": "exact",
+    "query": "ブルーロック",
+    "target": "blue_lock",
+    "note": "正式別名完全命中 → 回歸測試：embedding 不可比 lexical 差"
+  },
+  {
+    "id": 2,
+    "kind": "semantic",
+    "query": "彩虹社那位扮成年輕教授的VTuber是誰",
+    "target": "オリバー・エバンス",
+    "note": "別名只有片假名/Oliver Evans；查詢用『彩虹社』(=にじさんじ) 同義詞。lexical 應該找不到。"
+  },
+  {
+    "id": 3,
+    "kind": "semantic",
+    "query": "足球題材 名字叫藍色牢籠的那部漫畫",
+    "target": "blue_lock",
+    "note": "別名是『藍色監獄』，查詢用『藍色牢籠』近義替換。"
+  },
+  {
+    "id": 4,
+    "kind": "semantic",
+    "query": "獨自一人變強的那部韓國網漫",
+    "target": "sololeveling",
+    "note": "別名『我獨自升級』；查詢是情節描述而非標題。"
+  },
+  {
+    "id": 5,
+    "kind": "exact",
+    "query": "咒術迴戰",
+    "target": "jujutsu",
+    "note": "別名完全命中 → 回歸測試。"
+  },
+  {
+    "id": 6,
+    "kind": "semantic",
+    "query": "賣模型手辦的萬代官方限定通販網站",
+    "target": "プレミアムバンダイ",
+    "note": "canonical 是片假名、無中文別名；只能靠 summary 語意命中。"
+  },
+  {
+    "id": 7,
+    "kind": "variant",
+    "query": "怪獸八號 動畫第二季",
+    "target": "kaiju8",
+    "note": "別名是『怪獸 8 號』(阿拉伯數字+空格)，查詢用漢字『八』且無空格。"
+  },
+  {
+    "id": 8,
+    "kind": "semantic",
+    "query": "PSA評級拿到滿分的卡",
+    "target": "psa10",
+    "note": "別名『完美品相卡 / Gem Mint 10』；查詢用『滿分』語意替換。"
+  },
+  {
+    "id": 9,
+    "kind": "variant",
+    "query": "東北地區限定的皮卡丘卡盒",
+    "target": "トウホクのピカチュウ p [sv-p 260](スペシャルbox「ポケモンセンタートウホク」)",
+    "note": "別名『東北的皮卡丘 P [SV-P 260]』；查詢加了『地區限定』『卡盒』雜訊詞。"
+  },
+  {
+    "id": 10,
+    "kind": "exact",
+    "query": "ドラゴンスター",
+    "target": "ドラゴンスター",
+    "note": "店名 canonical 完全命中 → 回歸測試。"
+  }
+]

@@ -30,6 +30,9 @@ class AssistantSettings:
     # (larger) openclaw_local_text_model only when this tier exhausts repairs.
     openclaw_codegen_fast_model: str | None = "qwen2.5-coder:7b"
     openclaw_local_text_timeout_seconds: int = 45
+    # KB semantic retrieval. Multilingual embed model served by the local text
+    # endpoint (Ollama). Empty string disables KB embedding (pure-lexical).
+    openclaw_kb_embed_model: str = "bge-m3"
     openclaw_ca_bundle_path: str | None = None
     openclaw_tls_insecure_skip_verify: bool = False
     reputation_agent_server_url: str = "http://127.0.0.1:5000"
@@ -148,6 +151,7 @@ def get_settings() -> AssistantSettings:
             os.getenv("OPENCLAW_LOCAL_TEXT_TIMEOUT_SECONDS"),
             default=45,
         ),
+        openclaw_kb_embed_model=os.getenv("OPENCLAW_KB_EMBED_MODEL", "bge-m3"),
         openclaw_ca_bundle_path=_none_if_empty(os.getenv("OPENCLAW_CA_BUNDLE_PATH")),
         openclaw_tls_insecure_skip_verify=_as_bool(os.getenv("OPENCLAW_TLS_INSECURE_SKIP_VERIFY")),
         reputation_agent_server_url=os.getenv(

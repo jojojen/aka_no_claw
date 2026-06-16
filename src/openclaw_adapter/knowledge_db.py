@@ -21,17 +21,48 @@ The DB is shared by sns_monitor_bot's classifier (read) and aka_no_claw's
 
 from __future__ import annotations
 
+import array
 import json
 import logging
+import math
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from hashlib import sha1
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
+
+
+@runtime_checkable
+class Embedder(Protocol):
+    """A text→vector callable carrying its model identity. Production wraps an
+    Ollama multilingual model (bge-m3); tests inject a deterministic fake.
+
+    ``__call__`` MUST be best-effort: return ``None`` on any failure (network,
+    timeout, bad response) rather than raising — the KB write must never break
+    because embedding was unavailable."""
+
+    model: str
+    dim: int
+
+    def __call__(self, text: str) -> list[float] | None: ...
+
+
+# Process-wide default embedder. The bot wires this ONCE at startup via
+# ``set_default_embedder`` so every existing ``KnowledgeDatabase(path)`` call
+# site picks it up without threading the dependency through. Left unset →
+# embedding is fully disabled (pure-lexical behaviour, the pre-embedding state).
+_DEFAULT_EMBEDDER: Embedder | None = None
+
+
+def set_default_embedder(embedder: Embedder | None) -> None:
+    """Install (or clear) the process-wide default embedder. Pass ``None`` to
+    disable KB embedding everywhere — the kill switch for rollback."""
+    global _DEFAULT_EMBEDDER
+    _DEFAULT_EMBEDDER = embedder
 
 
 _SCHEMA = """
@@ -74,6 +105,20 @@ CREATE TABLE IF NOT EXISTS codegen_knowledge (
 );
 
 CREATE INDEX IF NOT EXISTS idx_codegen_category ON codegen_knowledge(category);
+
+-- Optional semantic index (additive; drop to fully remove). One row per
+-- (kind, ref_id): kind='entry' → ref_id is entity_canonical; kind='codegen' →
+-- ref_id is knowledge_id. ``vec`` is normalized float32 little-endian bytes.
+-- ``model``/``dim`` let a model swap invalidate stale rows without a migration.
+CREATE TABLE IF NOT EXISTS embeddings (
+    kind       TEXT NOT NULL,
+    ref_id     TEXT NOT NULL,
+    model      TEXT NOT NULL,
+    dim        INTEGER NOT NULL,
+    vec        BLOB NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (kind, ref_id)
+);
 """
 
 
@@ -85,9 +130,34 @@ ENTITY_TYPES: tuple[str, ...] = ("ip", "tcg", "product", "set", "creator", "even
 #         distinct from "ip" (a content brand) and "product" (a SKU).
 ORIGINS: tuple[str, ...] = ("web_research", "manual", "tweet_aggregation", "research_command")
 
+# Minimum cosine similarity for a codegen rule to be pulled in via the semantic
+# fallback. Tuned conservatively: the lexical gate deliberately excludes
+# unrelated recipes, so the fallback must stay relevant-only.
+_CODEGEN_SEMANTIC_MIN_SIM = 0.5
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _vec_to_array(vec: list[float] | None) -> array.array | None:
+    """Normalize to unit length and return a float32 array (cosine via dot).
+    Returns None for empty/zero/non-finite vectors."""
+    if not vec:
+        return None
+    norm = math.sqrt(sum(float(x) * float(x) for x in vec))
+    if not math.isfinite(norm) or norm == 0.0:
+        return None
+    return array.array("f", [float(x) / norm for x in vec])
+
+
+def _vec_to_blob(vec: list[float] | None) -> bytes | None:
+    arr = _vec_to_array(vec)
+    return arr.tobytes() if arr is not None else None
+
+
+def _dot(a: array.array, b: array.array) -> float:
+    return math.fsum(a[i] * b[i] for i in range(len(a)))
 
 
 def _normalize_canonical(name: str) -> str:
@@ -144,9 +214,12 @@ class KnowledgeEntry:
 
 
 class KnowledgeDatabase:
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, embedder: Embedder | None = None) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Explicit arg wins; otherwise fall back to the process-wide default
+        # (None → embedding disabled, identical to pre-embedding behaviour).
+        self._embedder: Embedder | None = embedder if embedder is not None else _DEFAULT_EMBEDDER
         # Auto-bootstrap so callers don't have to remember a separate step —
         # CREATE TABLE IF NOT EXISTS is idempotent and cheap to re-run.
         self.bootstrap()
@@ -246,6 +319,7 @@ class KnowledgeDatabase:
         # Reread for return.
         loaded = self.get_entry(canonical)
         assert loaded is not None, "upsert_entry expected to read back its write"
+        self._reindex_entry(canonical)  # best-effort; never raises
         return loaded
 
     def add_alias(self, alias: str, entity_canonical: str) -> bool:
@@ -260,6 +334,8 @@ class KnowledgeDatabase:
             if exists is None:
                 return False
             self._add_aliases_inside_conn(conn, canonical, (alias,))
+        # Index text includes aliases, so an alias change must re-embed.
+        self._reindex_entry(canonical)  # best-effort; never raises
         return True
 
     def _add_aliases_inside_conn(
@@ -339,10 +415,17 @@ class KnowledgeDatabase:
     def delete_entry(self, entry_id: str) -> bool:
         """Delete a knowledge entry by entry_id. Returns True if a row was deleted."""
         with self.connect() as conn:
+            row = conn.execute(
+                "SELECT entity_canonical FROM knowledge_entries WHERE entry_id = ?",
+                (entry_id,),
+            ).fetchone()
             cursor = conn.execute(
                 "DELETE FROM knowledge_entries WHERE entry_id = ?", (entry_id,)
             )
-        return cursor.rowcount > 0
+            deleted = cursor.rowcount > 0
+        if deleted and row is not None:
+            self._delete_embedding("entry", str(row["entity_canonical"]))
+        return deleted
 
     def delete_codegen(self, knowledge_id: str) -> bool:
         """Delete a codegen knowledge row by knowledge_id. Returns True if deleted."""
@@ -350,7 +433,102 @@ class KnowledgeDatabase:
             cursor = conn.execute(
                 "DELETE FROM codegen_knowledge WHERE knowledge_id = ?", (knowledge_id,)
             )
-        return cursor.rowcount > 0
+            deleted = cursor.rowcount > 0
+        if deleted:
+            self._delete_embedding("codegen", knowledge_id)
+        return deleted
+
+    # ── Embedding index (best-effort; all methods swallow failure) ──────────
+
+    def _reindex_entry(self, entity_canonical: str) -> None:
+        if self._embedder is None:
+            return
+        entry = self.get_entry(entity_canonical)
+        if entry is None:
+            return
+        aliases = [a for a, c in self.all_aliases() if c == entry.entity_canonical]
+        text = self._entry_index_text(entry, aliases)
+        self._store_embedding("entry", entry.entity_canonical, text)
+
+    def _reindex_codegen(self, knowledge_id: str) -> None:
+        if self._embedder is None:
+            return
+        row = self._get_codegen_knowledge(knowledge_id)
+        if row is None:
+            return
+        text = self._codegen_index_text(row)
+        self._store_embedding("codegen", knowledge_id, text)
+
+    @staticmethod
+    def _entry_index_text(entry: KnowledgeEntry, aliases: list[str]) -> str:
+        return f"{entry.entity_canonical} | {' ; '.join(aliases)} | {entry.summary}"
+
+    @staticmethod
+    def _codegen_index_text(row: CodegenKnowledge) -> str:
+        return f"{row.title} | {row.technique} | {' ; '.join(row.keywords)}"
+
+    def _store_embedding(self, kind: str, ref_id: str, text: str) -> None:
+        emb = self._embedder
+        if emb is None:
+            return
+        try:
+            vec = emb(text)
+        except Exception:  # embedder should return None, but double-guard.
+            logger.warning("embedding failed for %s/%s", kind, ref_id, exc_info=True)
+            return
+        blob = _vec_to_blob(vec)
+        if blob is None:
+            logger.warning("embedding skipped (empty/invalid) for %s/%s", kind, ref_id)
+            return
+        try:
+            with self.connect() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO embeddings "
+                    "(kind, ref_id, model, dim, vec, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (kind, ref_id, emb.model, emb.dim, blob, _utc_now_iso()),
+                )
+        except sqlite3.Error:
+            logger.warning("embedding store failed for %s/%s", kind, ref_id, exc_info=True)
+
+    def _delete_embedding(self, kind: str, ref_id: str) -> None:
+        try:
+            with self.connect() as conn:
+                conn.execute(
+                    "DELETE FROM embeddings WHERE kind = ? AND ref_id = ?", (kind, ref_id)
+                )
+        except sqlite3.Error:
+            logger.warning("embedding delete failed for %s/%s", kind, ref_id, exc_info=True)
+
+    def search_semantic(self, kind: str, query: str, k: int = 5) -> list[tuple[str, float]]:
+        """Cosine top-k over stored vectors for ``kind``. Returns
+        ``[(ref_id, score), ...]`` best-first. Empty when embedding is disabled,
+        the query can't be embedded, or no compatible vectors exist (e.g. after a
+        model swap, until backfill re-runs)."""
+        emb = self._embedder
+        if emb is None:
+            return []
+        try:
+            qvec = emb(query)
+        except Exception:
+            logger.warning("query embedding failed", exc_info=True)
+            return []
+        qarr = _vec_to_array(qvec)
+        if qarr is None:
+            return []
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT ref_id, vec FROM embeddings WHERE kind = ? AND model = ? AND dim = ?",
+                (kind, emb.model, emb.dim),
+            ).fetchall()
+        scored: list[tuple[str, float]] = []
+        for r in rows:
+            v = array.array("f")
+            v.frombytes(r["vec"])
+            if len(v) != len(qarr):
+                continue
+            scored.append((str(r["ref_id"]), _dot(qarr, v)))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored[: max(0, int(k))]
 
     def append_observation(
         self,
@@ -475,6 +653,7 @@ class KnowledgeDatabase:
                 )
         loaded = self._get_codegen_knowledge(knowledge_id)
         assert loaded is not None
+        self._reindex_codegen(knowledge_id)  # best-effort; never raises
         return loaded
 
     def _get_codegen_knowledge(self, knowledge_id: str) -> CodegenKnowledge | None:
@@ -523,7 +702,25 @@ class KnowledgeDatabase:
                 continue
             scored.append((match + row.confidence, row))
         scored.sort(key=lambda pair: pair[0], reverse=True)
-        return [row for _, row in scored[: max(1, k)]]
+        k = max(1, k)
+        selected = [row for _, row in scored[:k]]
+        if self._embedder is None or len(selected) >= k:
+            return selected
+        # Lexical under-filled → top up with semantic matches, but only ones
+        # genuinely related (cosine ≥ threshold) so we don't reintroduce the
+        # unrelated-recipe contamination the strict lexical gate guards against.
+        chosen = {r.knowledge_id for r in selected}
+        by_id = {r.knowledge_id: r for r in rows}
+        for ref_id, score in self.search_semantic("codegen", request_text, k):
+            if len(selected) >= k:
+                break
+            if score < _CODEGEN_SEMANTIC_MIN_SIM or ref_id in chosen:
+                continue
+            row = by_id.get(ref_id)
+            if row is not None:
+                selected.append(row)
+                chosen.add(ref_id)
+        return selected
 
     def mark_codegen_applied(self, knowledge_ids: tuple[str, ...]) -> None:
         if not knowledge_ids:
