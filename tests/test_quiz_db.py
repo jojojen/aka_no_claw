@@ -1293,6 +1293,26 @@ class TestLexicalCommentaryWrapperGuard:
             exam_point="漢字読み",
             stem="次の一節『「ブリキノダンス」の解説によれば、...と筆者は読み解いている。』にある〈壮大〉の読み方として最も適切なものはどれか。",
         )
+        assert lexical_stem_uses_commentary_wrapper(
+            exam_point="漢字読み",
+            stem="次の一節『「夜が明ける」というフレーズは、戦争が終盤を迎えていることや』にある〈終盤〉の読み方として最も適切なものはどれか。",
+        )
+        assert lexical_stem_uses_commentary_wrapper(
+            exam_point="漢字読み",
+            stem="次の一節『同日に公開したMVには、作詞作曲を担当したn-bunaが原案、監督、アニメーターとして初めて映像の制作に携わっています。』にある〈原案〉の読み方として最も適切なものはどれか。",
+        )
+        assert lexical_stem_uses_commentary_wrapper(
+            exam_point="漢字読み",
+            stem="歌詞『フロムトーキョー』では、MVで使用されているイラストが『シンデレラ』と近いテイストで描かれており、2つの歌詞の一人称が両方とも「あたし」であることから、にある〈一人称〉の読み方として最も適切なものはどれか。",
+        )
+        assert lexical_stem_uses_commentary_wrapper(
+            exam_point="漢字読み",
+            stem="歌詞「フロムトーキョー 歌詞 夏代孝明,渡辺拓也,cillia feat. 初音ミク ふりがな付。」にある〈渡辺拓也〉の読み方として最も適切なものはどれか。",
+        )
+        assert lexical_stem_uses_commentary_wrapper(
+            exam_point="漢字読み",
+            stem="次の一節『表現者としての才能はあっても『人を愛する才能』はありません。結果的に仲間を失ってしまい』にある〈表現者〉の読み方として最も適切なものはどれか。",
+        )
 
     def test_allows_real_lyric_sentence(self):
         from openclaw_adapter.quiz_db import lexical_stem_uses_commentary_wrapper
@@ -1314,6 +1334,95 @@ class TestLexicalCommentaryWrapperGuard:
                 source_excerpt="「ブリキノダンス」の解説によれば、...と筆者は読み解いている。",
                 source_excerpt_type="commentary",
                 tested_point="壮大",
+                author="codex",
+                allow_ungrounded=True,
+            )
+
+
+class TestLowValueSynonymTargetGuard:
+    def test_detects_colloquial_whole_utterance(self):
+        from openclaw_adapter.quiz_db import synonym_target_is_low_value_fragment
+        assert synonym_target_is_low_value_fragment(
+            exam_point="言い換え類義",
+            tested_point="どうだっていいや",
+        )
+
+    def test_detects_inflection_fragment(self):
+        from openclaw_adapter.quiz_db import synonym_target_is_low_value_fragment
+        assert synonym_target_is_low_value_fragment(
+            exam_point="言い換え類義",
+            tested_point="いがみ合って",
+        )
+        assert synonym_target_is_low_value_fragment(
+            exam_point="言い換え類義",
+            tested_point="占って",
+        )
+
+    def test_allows_fixed_nominal_phrase(self):
+        from openclaw_adapter.quiz_db import synonym_target_is_low_value_fragment
+        assert not synonym_target_is_low_value_fragment(
+            exam_point="言い換え類義",
+            tested_point="挙句の果て",
+        )
+
+    def test_insert_rejects_low_value_synonym_target(self, tmp_path):
+        db = _db(tmp_path)
+        with pytest.raises(ValueError, match="synonym target is a low-value fragment"):
+            db.insert_question(
+                level="JLPT N1",
+                exam_point="言い換え類義",
+                stem="次の一節「もうどうだっていいや」にある〈どうだっていいや〉の意味として最も近いものはどれか。",
+                options=("何よりも大切だ", "もう関心が持てない", "細かく調べたい", "正しく直したい"),
+                answer_index=1,
+                source_name="ロストワンの号哭",
+                source_excerpt="もうどうだっていいや",
+                source_excerpt_type="lyric",
+                tested_point="どうだっていいや",
+                author="codex",
+                allow_ungrounded=True,
+            )
+
+
+class TestLowValueReadingTargetGuard:
+    def test_detects_inflected_reading_fragment(self):
+        from openclaw_adapter.quiz_db import reading_target_is_low_value_fragment
+        assert reading_target_is_low_value_fragment(
+            exam_point="漢字読み",
+            tested_point="募って",
+        )
+        assert reading_target_is_low_value_fragment(
+            exam_point="漢字読み",
+            tested_point="推し量らない",
+        )
+        assert reading_target_is_low_value_fragment(
+            exam_point="漢字読み",
+            tested_point="踠いたって",
+        )
+
+    def test_allows_clean_nominal_lexeme(self):
+        from openclaw_adapter.quiz_db import reading_target_is_low_value_fragment
+        assert not reading_target_is_low_value_fragment(
+            exam_point="漢字読み",
+            tested_point="切り抜け",
+        )
+        assert not reading_target_is_low_value_fragment(
+            exam_point="漢字読み",
+            tested_point="腑抜け",
+        )
+
+    def test_insert_rejects_low_value_reading_target(self, tmp_path):
+        db = _db(tmp_path)
+        with pytest.raises(ValueError, match="reading target is a low-value fragment"):
+            db.insert_question(
+                level="JLPT N1",
+                exam_point="漢字読み",
+                stem="「脅迫的に〈縛っちゃって〉」の〈縛っちゃって〉の読み方は？",
+                options=("しばっちゃって", "しばちゃって", "ばくちゃって", "しばりちゃって"),
+                answer_index=0,
+                source_name="裏表ラバーズ",
+                source_excerpt="脅迫的に縛っちゃって",
+                source_excerpt_type="lyric",
+                tested_point="縛っちゃって",
                 author="codex",
                 allow_ungrounded=True,
             )

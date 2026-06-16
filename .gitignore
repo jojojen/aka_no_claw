@@ -20,6 +20,7 @@ build/
 dist/
 
 # Local databases and runtime data
+data/*.sqlite
 data/*.sqlite3
 data/*.sqlite3-shm
 data/*.sqlite3-wal
