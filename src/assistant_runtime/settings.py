@@ -42,7 +42,7 @@ class AssistantSettings:
     reputation_agent_server_url: str = "http://127.0.0.1:5000"
     reputation_agent_admin_token: str | None = None
     reputation_agent_poll_secs: int = 5
-    reputation_agent_job_timeout_secs: float = 240.0
+    reputation_agent_job_timeout_secs: float = 360.0
     monitor_env: str = "development"
     log_level: str = "INFO"
     log_file_path: str = "logs/openclaw.log"
