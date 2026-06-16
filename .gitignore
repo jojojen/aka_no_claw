@@ -41,6 +41,9 @@ generated_tools/
 .openclaw_ocr/
 reports/
 
+# Regenerable spike embedding caches (compare.py rebuilds on run)
+spikes/**/emb_*.npz
+
 # OS / editor noise
 .DS_Store
 Thumbs.db
