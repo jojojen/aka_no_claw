@@ -33,11 +33,16 @@ class AssistantSettings:
     # KB semantic retrieval. Multilingual embed model served by the local text
     # endpoint (Ollama). Empty string disables KB embedding (pure-lexical).
     openclaw_kb_embed_model: str = "bge-m3"
+    # Minimum cosine score for the embedding intent fast-path to short-circuit a
+    # zero-arg command (skipping the slow LLM router). Below this it falls
+    # through to the LLM router. Lower = faster but riskier mis-routes.
+    openclaw_intent_fastpath_min_score: float = 0.65
     openclaw_ca_bundle_path: str | None = None
     openclaw_tls_insecure_skip_verify: bool = False
     reputation_agent_server_url: str = "http://127.0.0.1:5000"
     reputation_agent_admin_token: str | None = None
     reputation_agent_poll_secs: int = 5
+    reputation_agent_job_timeout_secs: float = 240.0
     monitor_env: str = "development"
     log_level: str = "INFO"
     log_file_path: str = "logs/openclaw.log"
@@ -152,6 +157,10 @@ def get_settings() -> AssistantSettings:
             default=45,
         ),
         openclaw_kb_embed_model=os.getenv("OPENCLAW_KB_EMBED_MODEL", "bge-m3"),
+        openclaw_intent_fastpath_min_score=_as_float(
+            os.getenv("OPENCLAW_INTENT_FASTPATH_MIN_SCORE"),
+            default=0.65,
+        ),
         openclaw_ca_bundle_path=_none_if_empty(os.getenv("OPENCLAW_CA_BUNDLE_PATH")),
         openclaw_tls_insecure_skip_verify=_as_bool(os.getenv("OPENCLAW_TLS_INSECURE_SKIP_VERIFY")),
         reputation_agent_server_url=os.getenv(
@@ -159,6 +168,9 @@ def get_settings() -> AssistantSettings:
         ),
         reputation_agent_admin_token=_none_if_empty(os.getenv("REPUTATION_AGENT_ADMIN_TOKEN")),
         reputation_agent_poll_secs=_as_int(os.getenv("REPUTATION_AGENT_POLL_SECS"), default=5),
+        reputation_agent_job_timeout_secs=_as_float(
+            os.getenv("REPUTATION_AGENT_JOB_TIMEOUT_SECS"), default=240.0
+        ),
         monitor_env=os.getenv("MONITOR_ENV", "development"),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
         log_file_path=os.getenv("LOG_FILE_PATH", "logs/openclaw.log"),

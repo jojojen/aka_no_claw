@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from assistant_runtime import AssistantSettings
 
-from openclaw_adapter.reputation_snapshot import ReputationSnapshotClient
+from openclaw_adapter.reputation_snapshot import (
+    ReputationSnapshotClient,
+    request_reputation_snapshot,
+)
 
 
 def _settings() -> AssistantSettings:
@@ -79,3 +82,38 @@ def test_reputation_snapshot_client_times_out_with_agent_hint(monkeypatch) -> No
         assert "reputation agent" in str(exc)
     else:  # pragma: no cover - defensive.
         raise AssertionError("Expected a timeout error when no reputation agent is available.")
+
+
+def test_request_reputation_snapshot_uses_settings_job_timeout(monkeypatch) -> None:
+    # Regression: the hard-coded 90 s client default gave up before slow jobs
+    # (~133 s observed) finished. The poll budget must come from settings.
+    captured: dict[str, float] = {}
+
+    real_init = ReputationSnapshotClient.__init__
+
+    def spy_init(self, *, settings, timeout_seconds=30.0, poll_interval_seconds=2.0, job_timeout_seconds=90.0):
+        captured["job_timeout_seconds"] = job_timeout_seconds
+        real_init(
+            self,
+            settings=settings,
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+            job_timeout_seconds=job_timeout_seconds,
+        )
+
+    def fake_request_json(self, path: str, *, method: str, body: dict[str, object] | None = None) -> dict[str, object]:
+        return {"proof_id": "p1", "proof_url": "/p/p1", "reused": False}
+
+    monkeypatch.setattr(ReputationSnapshotClient, "__init__", spy_init)
+    monkeypatch.setattr(ReputationSnapshotClient, "_request_json", fake_request_json)
+
+    settings = AssistantSettings(
+        reputation_agent_server_url="http://127.0.0.1:5000",
+        reputation_agent_job_timeout_secs=300.0,
+    )
+    request_reputation_snapshot(
+        settings=settings,
+        query_url="https://jp.mercari.com/item/m123456789",
+    )
+
+    assert captured["job_timeout_seconds"] == 300.0
