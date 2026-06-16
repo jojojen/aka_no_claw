@@ -1096,6 +1096,22 @@ def _build_yuyutei_code_resolver(
     return resolver.resolve
 
 
+def _wire_kb_embedder(settings: AssistantSettings) -> None:
+    """Install the process-wide KB embedder once at boot so every
+    ``KnowledgeDatabase(...)`` in this process gets semantic write/retrieval.
+    Best-effort: any failure leaves the KB pure-lexical."""
+    try:
+        from .kb_embedder import build_kb_embedder
+        from .knowledge_db import set_default_embedder
+
+        embedder = build_kb_embedder(settings, ssl_context=build_ssl_context(settings))
+        set_default_embedder(embedder)
+        if embedder is not None:
+            logger.info("KB embedder wired: model=%s dim=%s", embedder.model, embedder.dim)
+    except Exception:
+        logger.warning("KB embedder wiring failed — KB stays lexical", exc_info=True)
+
+
 def run_telegram_polling(
     *,
     settings: AssistantSettings,
@@ -1108,6 +1124,7 @@ def run_telegram_polling(
     drop_pending_updates: bool = True,
 ) -> int:
     token = require_telegram_token(settings)
+    _wire_kb_embedder(settings)
     watch_db = _bootstrap_watch_db(settings)
     # Price monitor now runs in local.openclaw.price_monitor (separate process).
     # Telegram reads monitor.sqlite3 for watchlist queries; writes go through watch_inbox.

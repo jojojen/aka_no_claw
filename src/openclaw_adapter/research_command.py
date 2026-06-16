@@ -961,14 +961,34 @@ class ResearchCommandService:
 
         ranked = sorted(matches.items(), key=lambda item: (-item[1], item[0]))
         entries: list[KnowledgeEntry] = []
+        seen: set[str] = set()
         for canonical, _score in ranked:
             entry = db.get_entry(canonical)
             if entry is None:
                 continue
             entries.append(entry)
+            seen.add(canonical)
             db.mark_referenced(canonical)
             if len(entries) >= 3:
                 break
+
+        # Substring (lexical) under-filled → semantic fallback. Catches cross-
+        # language / paraphrase matches the alias scan misses (e.g. product text
+        # "藍色牢籠" → KB entry whose alias is "藍色監獄"). Exact matches above
+        # keep priority; this only tops up the remaining slots.
+        if len(entries) < 3:
+            query = " ".join(h for h in haystacks if h)
+            for canonical, _sim in db.search_semantic("entry", query, 3):
+                if len(entries) >= 3:
+                    break
+                if canonical in seen or canonical == current_product_key:
+                    continue
+                entry = db.get_entry(canonical)
+                if entry is None:
+                    continue
+                entries.append(entry)
+                seen.add(canonical)
+                db.mark_referenced(canonical)
         return tuple(entries)
 
     def _stage_price_placeholder(self, ctx: ResearchJobContext) -> str:
