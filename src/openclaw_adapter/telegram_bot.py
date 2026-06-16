@@ -1112,6 +1112,18 @@ def _wire_kb_embedder(settings: AssistantSettings) -> None:
         logger.warning("KB embedder wiring failed — KB stays lexical", exc_info=True)
 
 
+def _build_intent_fast_path(settings: AssistantSettings):
+    """Build the embedding intent fast-path (zero-arg command short-circuit).
+    Best-effort: any failure leaves routing to the LLM router alone."""
+    try:
+        from .intent_fast_path import build_intent_fast_path
+
+        return build_intent_fast_path(settings)
+    except Exception:
+        logger.warning("intent fast-path build failed — using LLM router only", exc_info=True)
+        return None
+
+
 def run_telegram_polling(
     *,
     settings: AssistantSettings,
@@ -1163,6 +1175,7 @@ def run_telegram_polling(
         research_renderer=research_renderer,
         fetch_renderer=default_web_fetch_renderer(settings),
         natural_language_router=build_telegram_natural_language_router_from_settings(settings),
+        intent_fast_path=_build_intent_fast_path(settings),
         ssl_context=build_ssl_context(settings),
         allowed_chat_ids=frozenset(settings.openclaw_telegram_chat_ids),
         status_renderer=lambda: _build_status_text(settings),

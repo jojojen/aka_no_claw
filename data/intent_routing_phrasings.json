@@ -1,0 +1,122 @@
+{
+  "lookup_card": [
+    "查一張卡的價格 リザードンex 201/165",
+    "幫我查這張卡多少錢 青眼の白龍 QCCP-JP001 UR",
+    "price of pikachu ex card",
+    "ユニオンアリーナ 綾波レイ 行情"
+  ],
+  "trend_board": [
+    "pokemon 熱門前 5",
+    "現在哪些卡最熱銷 給我排行榜",
+    "show me the top hot cards ranking",
+    "遊戲王 熱賣榜 前十"
+  ],
+  "add_watch": [
+    "追蹤 初音ミク SSP 五萬以下",
+    "在 rakuma 監控 アビスアイ box 8000 以下通知我",
+    "watch pikachu ex under 10000 yen on mercari",
+    "幫我盯著這個商品低於三萬就通知"
+  ],
+  "list_watches": [
+    "看我的 mercari 追蹤清單",
+    "列出我正在追蹤的商品",
+    "show my mercari watchlist",
+    "我的商品追蹤項目有哪些"
+  ],
+  "remove_watch": [
+    "取消追蹤 abc12345",
+    "停止追蹤這個 watch id def67890",
+    "remove watch abc12345",
+    "把這個追蹤刪掉 12ab34cd"
+  ],
+  "update_watch_price": [
+    "把 abc12345 改成四萬",
+    "更新這個追蹤的價格上限到 50000",
+    "change watch abc12345 threshold to 30000",
+    "調整 def67890 的價格門檻"
+  ],
+  "reputation_snapshot": [
+    "查這個賣家的信用 https://jp.mercari.com/item/m123",
+    "幫我看這個 mercari 賣家評價 https://jp.mercari.com/user/profile/123",
+    "check seller reputation for this url",
+    "這個連結的賣家可信嗎 截圖一下"
+  ],
+  "web_research": [
+    "為什麼寶可夢卡那麼有人氣",
+    "寶可夢卡最近是不是在跌",
+    "why are pokemon cards dropping recently",
+    "遊戲王市場最近怎麼了 幫我查一下新聞"
+  ],
+  "opportunity_remove": [
+    "機會清單把第 2 個拿掉",
+    "我對 Umbreon ex SAR 沒興趣了 從 hunt 移除",
+    "remove target 3 from hunt status",
+    "獵物清單不要 ホエルオーex 了"
+  ],
+  "sns_add_account": [
+    "追蹤 X 帳號 @elonmusk",
+    "新增推特監控 @aka_claw",
+    "把 @PokeGetInfoMain 的排程改成每 720 分鐘",
+    "track twitter account @pokeca_news"
+  ],
+  "sns_add_keyword": [
+    "新增關鍵字監控 葬送のフリーレン",
+    "幫我加一個 X 主題追蹤 ポケカ 抽選",
+    "add a keyword watch for one piece card",
+    "監控推特上有關 初音ミク 的話題"
+  ],
+  "sns_list": [
+    "看我的 SNS 監控清單",
+    "列出所有 X / Twitter 追蹤規則",
+    "show my sns twitter watch rules",
+    "我追蹤了哪些推特帳號"
+  ],
+  "sns_delete": [
+    "刪除追蹤 @elonmusk",
+    "取消追蹤這個推特帳號 @aka_claw",
+    "unfollow @pokeca_news",
+    "停止追蹤 @tenbai_hakase 整個規則"
+  ],
+  "sns_buzz": [
+    "reddit 上大家在討論什麼 寶可夢",
+    "幫我看 pokemon 最近的熱門討論摘要",
+    "what's buzzing about one piece on reddit",
+    "葬送のフリーレン 最近的話題整理"
+  ],
+  "sns_clear_filter": [
+    "把 @ARS_Arsales 的 filter 全部拿掉",
+    "清空 @elonmusk 的篩選關鍵字",
+    "clear filter on @aka_claw",
+    "@tenbai_hakase 的過濾條件清掉但保留追蹤"
+  ],
+  "sns_bulk_add_filter": [
+    "把每個 pokemon 相關的追蹤帳號 filter 都加上「抽選」",
+    "所有 tcg domain 的帳號篩選都加入 預約",
+    "add the keyword 抽選 to every yugioh account filter",
+    "全部 ws 帳號的 filter 改成包含 限定"
+  ],
+  "help": [
+    "這個機器人能做什麼",
+    "有哪些功能 怎麼用",
+    "what can you do",
+    "幫助 說明 指令一覽"
+  ],
+  "status": [
+    "現在系統狀態如何",
+    "服務還活著嗎 用哪個模型",
+    "what is the current runtime status",
+    "目前運行狀態 健康檢查"
+  ],
+  "tools": [
+    "列出所有可用工具",
+    "給我完整的工具清單",
+    "show me the full tool catalog",
+    "有哪些 tool 可以用"
+  ],
+  "scan_help": [
+    "我要怎麼用照片掃描一張卡",
+    "傳圖片辨識卡片怎麼操作",
+    "how do I scan a card from a photo",
+    "拍照查卡的指令是什麼"
+  ]
+}

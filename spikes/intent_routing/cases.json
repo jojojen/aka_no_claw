@@ -1,0 +1,22 @@
+[
+  {"utterance": "幫我看一下寶可夢 リザードンex 201/165 SAR 現在大概多少", "expected": "lookup_card", "note": "single-card price lookup, with card number + rarity"},
+  {"utterance": "遊戲王最近哪幾張卡最熱 給我前五名", "expected": "trend_board", "note": "explicit top-N ranking"},
+  {"utterance": "在 mercari 幫我盯 初音ミク SSP 低於五萬就通知", "expected": "add_watch", "note": "marketplace watch + price threshold + platform"},
+  {"utterance": "看一下我現在追蹤了哪些東西", "expected": "list_watches", "note": "mercari watchlist, no @handle"},
+  {"utterance": "不要再追蹤 a1b2c3d4 了", "expected": "remove_watch", "note": "remove mercari watch by hex id"},
+  {"utterance": "把 a1b2c3d4 的價格上限調成 4萬", "expected": "update_watch_price", "note": "change threshold of existing watch"},
+  {"utterance": "這個賣家評價如何 https://jp.mercari.com/item/m98765432", "expected": "reputation_snapshot", "note": "reputation + URL"},
+  {"utterance": "最近寶可夢卡是不是在跌啊", "expected": "web_research", "note": "price direction question, NOT a ranking"},
+  {"utterance": "hunt 清單第 2 個我沒興趣 拿掉", "expected": "opportunity_remove", "note": "remove from opportunity list by number"},
+  {"utterance": "幫我追蹤推特帳號 @pokeca_new_card", "expected": "sns_add_account", "note": "@handle present -> SNS add"},
+  {"utterance": "新增一個 X 關鍵字監控 葬送のフリーレン", "expected": "sns_add_keyword", "note": "keyword watch, no @handle"},
+  {"utterance": "給我Sns監控清單", "expected": "sns_list", "note": "user's own example utterance"},
+  {"utterance": "取消追蹤 @elonmusk", "expected": "sns_delete", "note": "unfollow whole rule on @handle"},
+  {"utterance": "reddit 上最近大家在聊什麼 one piece 卡", "expected": "sns_buzz", "note": "topic digest"},
+  {"utterance": "把 @ARS_Arsales 的篩選關鍵字全部清掉 但保留追蹤", "expected": "sns_clear_filter", "note": "clear filter, keep rule"},
+  {"utterance": "你這個機器人到底能幫我做什麼", "expected": "help", "note": "capabilities question"},
+  {"utterance": "現在跑得還正常嗎 用的是哪個模型", "expected": "status", "note": "runtime/model health"},
+  {"utterance": "把所有可以用的工具列出來給我", "expected": "tools", "note": "full tool catalog"},
+  {"utterance": "我想用拍照的方式查卡 要怎麼弄", "expected": "scan_help", "note": "photo-scan instructions"},
+  {"utterance": "每個跟 pokemon 有關的追蹤帳號 filter 都幫我加上「抽選」", "expected": "sns_bulk_add_filter", "note": "bulk domain filter add with plural quantifier"}
+]
