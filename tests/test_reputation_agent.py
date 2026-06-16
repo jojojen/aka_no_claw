@@ -311,6 +311,83 @@ def test_capture_review_tab_texts_keeps_seller_and_buyer_review_texts() -> None:
     assert "buyer review" in result["reviews_buyer_text"]
 
 
+class _NavigatingPage:
+    """Raises the Mercari SPA navigation error a few times, then settles."""
+
+    def __init__(self, fail_times: int) -> None:
+        self._fail_times = fail_times
+        self.content_calls = 0
+
+    def content(self) -> str:
+        self.content_calls += 1
+        if self.content_calls <= self._fail_times:
+            raise RuntimeError(
+                "Page.content: Unable to retrieve content because the page is "
+                "navigating and changing the content."
+            )
+        return "<html>settled</html>"
+
+    def wait_for_load_state(self, *args, **kwargs) -> None:
+        pass
+
+    def wait_for_timeout(self, *args, **kwargs) -> None:
+        pass
+
+
+def test_page_content_settled_retries_through_navigation_race() -> None:
+    page = _NavigatingPage(fail_times=2)
+    assert reputation_agent._page_content_settled(page) == "<html>settled</html>"
+    assert page.content_calls == 3
+
+
+def test_page_content_settled_reraises_when_never_settles() -> None:
+    page = _NavigatingPage(fail_times=99)
+    try:
+        reputation_agent._page_content_settled(page)
+    except RuntimeError as exc:
+        assert "navigating" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("Expected the navigation error to propagate after retries.")
+
+
+def test_item_page_blocked_flags_empty_spa_shell() -> None:
+    # Real capture of a rate-limited item page: ~674 chars of skeleton text,
+    # no 出品者 seller label (Mercari withheld the content behind bot protection).
+    shell_text = "コンテンツにスキップ\nメルカリ\n" + ("x" * 600)
+    assert reputation_agent._item_page_blocked(shell_text) is True
+    assert reputation_agent._item_page_blocked("") is True
+    assert reputation_agent._item_page_blocked(None) is True
+
+
+def test_item_page_blocked_accepts_real_item_page() -> None:
+    real_text = "商品名\n¥999\n出品者\n" + ("詳細 " * 400)
+    assert reputation_agent._item_page_blocked(real_text) is False
+    # Short text is fine as long as the seller label rendered.
+    assert reputation_agent._item_page_blocked("¥999 出品者 someone") is False
+
+
+def test_reviews_capture_degraded_flags_unsupported_browser_interstitial() -> None:
+    # Mercari sometimes serves a thin "unsupported browser" page to bots; that
+    # must be treated as degraded so the agent retries instead of letting the
+    # server fall back to its slow capture_lookup_page path.
+    assert reputation_agent._reviews_capture_degraded(
+        "お使いのブラウザがWebサイトに対応していない可能性があります。"
+    ) is True
+
+
+def test_reviews_capture_degraded_flags_empty_text() -> None:
+    assert reputation_agent._reviews_capture_degraded("") is True
+    assert reputation_agent._reviews_capture_degraded(None) is True
+    assert reputation_agent._reviews_capture_degraded("コンテンツにスキップ") is True
+
+
+def test_reviews_capture_degraded_accepts_real_review_text() -> None:
+    assert reputation_agent._reviews_capture_degraded(
+        "2026/06\naoi_ouma\n出品者\nこのたびはありがとうございました。"
+    ) is False
+    assert reputation_agent._reviews_capture_degraded("評価一覧\n良かった (3)") is False
+
+
 def test_profile_page_loaded_rejects_company_page_snapshot() -> None:
     assert reputation_agent._profile_page_loaded(
         {

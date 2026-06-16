@@ -43,6 +43,26 @@ def _get(server_url: str, api_key: str, path: str) -> dict:
 
 # ── Playwright helpers ────────────────────────────────────────────────────────
 
+def _page_content_settled(page) -> str:
+    """page.content() throws while Mercari's SPA is mid-navigation
+    ('Unable to retrieve content because the page is navigating'). Wait for the
+    navigation to settle and retry a few times instead of failing the job."""
+    last_exc: Exception | None = None
+    for _ in range(4):
+        try:
+            return page.content()
+        except Exception as exc:
+            last_exc = exc
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=8000)
+            except Exception:
+                pass
+            page.wait_for_timeout(1500)
+    if last_exc is not None:
+        raise last_exc
+    return page.content()
+
+
 def _capture_page(page, url: str) -> dict:
     page.goto(url, wait_until="domcontentloaded", timeout=60000)
     page.wait_for_selector("body", timeout=15000)
@@ -52,7 +72,7 @@ def _capture_page(page, url: str) -> dict:
     except Exception:
         pass
     return {
-        "raw_html":     page.content(),
+        "raw_html":     _page_content_settled(page),
         "visible_text": page.evaluate("() => document.body ? document.body.innerText : ''"),
     }
 
@@ -114,7 +134,7 @@ def _capture_review_tab_texts(page, initial_capture: dict) -> dict:
 
     if _click_review_tab(page, "seller"):
         _click_review_tab(page, "good")
-        tab_text["reviews_html"] = page.content()
+        tab_text["reviews_html"] = _page_content_settled(page)
         tab_text["reviews_text"] = _read_body_text(page)
 
     if _click_review_tab(page, "bad"):
@@ -127,6 +147,31 @@ def _capture_review_tab_texts(page, initial_capture: dict) -> dict:
             tab_text["reviews_buyer_bad_text"] = _read_body_text(page)
 
     return tab_text
+
+
+def _reviews_capture_degraded(text: str | None) -> bool:
+    """True when a reviews capture looks empty or is Mercari's degraded
+    'unsupported browser' interstitial — the case that otherwise forces the
+    server's slow, flaky capture_lookup_page fallback."""
+    t = text or ""
+    if "お使いのブラウザ" in t:  # unsupported-browser interstitial served to bots
+        return True
+    if "評価一覧" in t:
+        return False
+    if re.search(r"\d{4}/\d{2}", t):  # at least one dated review present
+        return False
+    return len(t.strip()) < 400
+
+
+def _item_page_blocked(item_text: str | None) -> bool:
+    """True when an item page rendered only its empty SPA shell — Mercari's bot
+    protection withholds the seller/price content (the page ships captcha /
+    rate-limit JS) and leaves the visible text near-empty. Distinct from a
+    genuine 'seller not found': here the seller label never even loaded."""
+    t = item_text or ""
+    if "出品者" in t:  # real item pages always render the seller label
+        return False
+    return len(t.strip()) < 1200
 
 
 def _profile_candidate_records(page) -> list[dict[str, str]]:
@@ -375,7 +420,7 @@ def _capture_profile_page(page, profile_url: str) -> tuple[str, str, bytes]:
             pass
         if _profile_page_loaded(_read_profile_page_state(page, profile_id)):
             return (
-                page.content(),
+                _page_content_settled(page),
                 page.evaluate("() => document.body ? document.body.innerText : ''"),
                 page.screenshot(full_page=True, type="png"),
             )
@@ -398,7 +443,7 @@ def _resolve_item_profile_url(page, item_html: str) -> str | None:
             continue
 
     page.wait_for_timeout(1500)
-    profile_url = _find_profile_url(page.content())
+    profile_url = _find_profile_url(_page_content_settled(page))
     if profile_url:
         return profile_url
     return _find_profile_url_in_page(page)
@@ -443,16 +488,45 @@ def _run_capture(query_url: str) -> dict:
         query_kind = "profile"
 
         if is_item:
-            pg = ctx.new_page()
-            d = _capture_page(pg, f"https://{_MERCARI_HOST}{path}")
-            item_html, item_text = d["raw_html"], d["visible_text"]
             query_kind = "item"
-            seller_context = _extract_item_seller_context(pg, item_html, item_text)
-            profile_url = str(seller_context.get("profile_url") or "") or _resolve_item_profile_url(pg, item_html)
-            display_name = seller_context.get("display_name")
-            seller_total_reviews = seller_context.get("seller_total_reviews")
-            pg.close()
+            item_url = f"https://{_MERCARI_HOST}{path}"
+            max_item_attempts = 3
+            blocked = False
+            for attempt in range(max_item_attempts):
+                try:
+                    pg = ctx.new_page()
+                    d = _capture_page(pg, item_url)
+                    item_html, item_text = d["raw_html"], d["visible_text"]
+                    seller_context = _extract_item_seller_context(pg, item_html, item_text)
+                    profile_url = str(seller_context.get("profile_url") or "") or _resolve_item_profile_url(pg, item_html)
+                    display_name = seller_context.get("display_name")
+                    seller_total_reviews = seller_context.get("seller_total_reviews")
+                    pg.close()
+                    blocked = _item_page_blocked(item_text)
+                    logger.info(
+                        "reputation_agent: item page attempt=%d profile_found=%s blocked=%s",
+                        attempt + 1,
+                        bool(profile_url),
+                        blocked,
+                    )
+                    if profile_url:
+                        break
+                    if blocked:
+                        # Flagged IP serving an empty shell — retrying only adds
+                        # load and won't clear the block. Bail out fast.
+                        break
+                except Exception as e:
+                    # Transient Mercari SPA navigation races (e.g. "page is
+                    # navigating and changing the content") must retry, not abort.
+                    logger.warning("reputation_agent: item page attempt %d failed: %s", attempt + 1, e)
+                if attempt + 1 < max_item_attempts:
+                    time.sleep(3.0)
             if not profile_url:
+                if blocked:
+                    raise RuntimeError(
+                        "Mercari returned a blocked/empty item page (likely rate-limited "
+                        "or bot-detected); retry in a few minutes."
+                    )
                 raise RuntimeError("Could not find seller profile in item page.")
         else:
             profile_url = f"https://{_MERCARI_HOST}{path}"
@@ -465,25 +539,40 @@ def _run_capture(query_url: str) -> dict:
         reviews_url = f"https://{_MERCARI_HOST}/user/reviews/{profile_id}"
         reviews_html = reviews_text = reviews_bad_text = None
         reviews_buyer_text = reviews_buyer_bad_text = None
-        try:
-            rpg = ctx.new_page()
-            rd = _capture_page(rpg, reviews_url)
-            tab_text = _capture_review_tab_texts(rpg, rd)
-            reviews_html = tab_text["reviews_html"]
-            reviews_text = tab_text["reviews_text"]
-            reviews_bad_text = tab_text["reviews_bad_text"]
-            reviews_buyer_text = tab_text["reviews_buyer_text"]
-            reviews_buyer_bad_text = tab_text["reviews_buyer_bad_text"]
-            logger.info(
-                "reputation_agent: reviews captured text_len=%d bad_len=%d buyer_len=%d buyer_bad_len=%d",
-                len(reviews_text or ""),
-                len(reviews_bad_text or ""),
-                len(reviews_buyer_text or ""),
-                len(reviews_buyer_bad_text or ""),
-            )
-            rpg.close()
-        except Exception as e:
-            logger.warning("reputation_agent: reviews capture skipped: %s", e)
+        max_review_attempts = 3
+        for attempt in range(max_review_attempts):
+            try:
+                rpg = ctx.new_page()
+                rd = _capture_page(rpg, reviews_url)
+                tab_text = _capture_review_tab_texts(rpg, rd)
+                reviews_html = tab_text["reviews_html"]
+                reviews_text = tab_text["reviews_text"]
+                reviews_bad_text = tab_text["reviews_bad_text"]
+                reviews_buyer_text = tab_text["reviews_buyer_text"]
+                reviews_buyer_bad_text = tab_text["reviews_buyer_bad_text"]
+                rpg.close()
+                degraded = _reviews_capture_degraded(reviews_text)
+                logger.info(
+                    "reputation_agent: reviews captured attempt=%d text_len=%d bad_len=%d buyer_len=%d buyer_bad_len=%d degraded=%s",
+                    attempt + 1,
+                    len(reviews_text or ""),
+                    len(reviews_bad_text or ""),
+                    len(reviews_buyer_text or ""),
+                    len(reviews_buyer_bad_text or ""),
+                    degraded,
+                )
+                if not degraded:
+                    break
+                if attempt + 1 < max_review_attempts:
+                    logger.info(
+                        "reputation_agent: reviews capture degraded, retrying (%d/%d)",
+                        attempt + 2,
+                        max_review_attempts,
+                    )
+                    time.sleep(3.0)
+            except Exception as e:
+                logger.warning("reputation_agent: reviews capture attempt %d failed: %s", attempt + 1, e)
+                time.sleep(3.0)
 
         ctx.close()
         browser.close()
