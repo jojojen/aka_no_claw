@@ -136,8 +136,10 @@ def request_reputation_snapshot(
     query_url: str,
     timeout_seconds: float = 30.0,
     poll_interval_seconds: float = 2.0,
-    job_timeout_seconds: float = 90.0,
+    job_timeout_seconds: float | None = None,
 ) -> ReputationSnapshotResult:
+    if job_timeout_seconds is None:
+        job_timeout_seconds = settings.reputation_agent_job_timeout_secs
     client = ReputationSnapshotClient(
         settings=settings,
         timeout_seconds=timeout_seconds,
