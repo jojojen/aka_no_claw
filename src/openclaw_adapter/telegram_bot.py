@@ -24,6 +24,7 @@ from price_monitor_bot.bot import (  # noqa: F401
     CatalogRenderer,
     LookupRenderer,
     PhotoLookupRenderer,
+    PhotoLookupReply,
     ResearchRenderer,
     ReputationRenderer,
     TelegramBotClient,
@@ -56,6 +57,10 @@ from .backup_command import BackupScheduler, build_backup_handler, build_recover
 from .opportunity_scorecard import build_scorecard_handler
 from .rag_daily_digest import RagDailyDigestScheduler, handle_ragdel_callback, handle_ragkeep_callback
 from .dynamic_tools import build_dynamic_tool_runner_from_settings
+from .image_translate import (
+    build_image_ocr_translate_renderer_from_settings,
+    build_image_translate_caption_recognizer,
+)
 from .knowledge_command import (
     build_knowledge_handler,
     build_knowledge_market_view_fn,
@@ -319,6 +324,122 @@ def default_photo_renderer(
         ),
         research_renderer=research_renderer,
     )
+
+
+_IMAGE_TRANSLATE_CAPTION_TOKENS = ("翻譯", "翻訳", "translate", "ocr")
+
+
+def _caption_requests_image_translation(caption: "str | None") -> bool:
+    """Closed-token routing check used by the renderer. The user-facing,
+    open-world recognition lives in the embedding recognizer
+    (build_image_translate_caption_recognizer); by the time a caption reaches the
+    renderer it is either the canonical「翻譯」token (menu / dispatch-canonicalized)
+    or a literal keyword, so a small fixed token set is enough here."""
+    if not caption:
+        return False
+    lowered = caption.strip().lower()
+    return any(token in lowered for token in _IMAGE_TRANSLATE_CAPTION_TOKENS)
+
+
+class _ImageTranslateOriginalCache:
+    """Server-side store for the OCR原文 revealed by the 顯示原文 button.
+
+    Telegram callback_data is capped at 64 bytes — far too small for full OCR
+    text — so the原文 is stashed under a short token and only the token rides in
+    the button. Mirrors _ResearchReplyCache: TTL + max-entries prune, chat_id
+    verified on read."""
+
+    def __init__(self, *, max_entries: int = 128, ttl_seconds: int = 3600) -> None:
+        self._max_entries = max(8, max_entries)
+        self._ttl_seconds = max(60, ttl_seconds)
+        self._lock = threading.Lock()
+        self._entries: dict[str, tuple[str, float, str]] = {}
+
+    def put(self, *, chat_id: str, ocr_text: str) -> str:
+        token = uuid.uuid4().hex[:8]
+        now = time.time()
+        with self._lock:
+            self._prune_locked(now)
+            self._entries[token] = (chat_id, now, ocr_text)
+            while len(self._entries) > self._max_entries:
+                self._entries.pop(next(iter(self._entries)), None)
+        return token
+
+    def get(self, *, token: str, chat_id: str) -> "str | None":
+        now = time.time()
+        with self._lock:
+            self._prune_locked(now)
+            entry = self._entries.get(token)
+            if entry is None:
+                return None
+            stored_chat_id, _created_at, ocr_text = entry
+            if stored_chat_id != chat_id:
+                return None
+            return ocr_text
+
+    def _prune_locked(self, now: float) -> None:
+        expired = [
+            token
+            for token, (_chat_id, created_at, _ocr) in self._entries.items()
+            if now - created_at > self._ttl_seconds
+        ]
+        for token in expired:
+            self._entries.pop(token, None)
+
+
+_IMAGE_TRANSLATE_ORIGINAL_CACHE = _ImageTranslateOriginalCache()
+
+
+def _build_image_translate_reply_markup(token: str) -> dict[str, object]:
+    return {"inline_keyboard": [[{"text": "顯示原文", "callback_data": f"imgtr:{token}"}]]}
+
+
+def _build_image_translate_callback_handler(
+    cache: _ImageTranslateOriginalCache,
+) -> "Callable[[str, str, str], tuple[object, str | None, object]]":
+    def handler(payload: str, original_text: str, chat_id: str) -> tuple[object, str | None, object]:
+        token = (payload or "").partition(":")[0]
+        ocr_text = cache.get(token=token, chat_id=str(chat_id))
+        if ocr_text is None:
+            return "原文已過期，請重新傳圖片翻譯。", None, None
+        return "已顯示原文", f"{original_text}\n\n【原文】\n{ocr_text}", None
+
+    return handler
+
+
+def build_photo_renderer(
+    settings: AssistantSettings,
+    *,
+    research_renderer=None,
+) -> PhotoLookupRenderer:
+    """Compose the existing TCG card-price renderer with the image OCR+translate
+    renderer, dispatching by caption: a 翻譯/translate caption routes to OCR +
+    Traditional-Chinese translation, everything else keeps card-price behavior.
+
+    Translation is shown by default; the OCR原文 is cached and surfaced behind a
+    顯示原文 button so the message stays short."""
+    base_renderer = default_photo_renderer(settings, research_renderer=research_renderer)
+    translate_renderer = build_image_ocr_translate_renderer_from_settings(settings)
+
+    def render(query: TelegramPhotoQuery):
+        if translate_renderer is not None and _caption_requests_image_translation(query.caption):
+            result = translate_renderer(query.image_path, query.caption)
+            if not result.ok:
+                return result.message
+            token = _IMAGE_TRANSLATE_ORIGINAL_CACHE.put(
+                chat_id=str(query.chat_id), ocr_text=result.ocr_text
+            )
+            text = (
+                f"🌐→🇹🇼 圖片文字翻譯（偵測語言：{result.source_language}）\n\n"
+                f"{result.translation}"
+            )
+            return PhotoLookupReply(
+                text=text,
+                reply_markup=_build_image_translate_reply_markup(token),
+            )
+        return base_renderer(query)
+
+    return render
 
 
 def default_photo_intent_analyzer(settings: AssistantSettings):
@@ -967,6 +1088,7 @@ def _build_registries(
         "snsfb": build_snsfb_callback_handler(sns_db, sns_inbox=sns_inbox),
         "oppfb": build_hunt_callback_handler(settings, opportunity_inbox=opportunity_inbox),
         "rs": _build_research_callback_handler(research_cache),
+        "imgtr": _build_image_translate_callback_handler(_IMAGE_TRANSLATE_ORIGINAL_CACHE),
     }
 
     view_handlers = {
@@ -1205,13 +1327,14 @@ def run_telegram_polling(
         lookup_renderer=lookup_renderer,
         board_loader=board_loader,
         catalog_renderer=catalog_renderer,
-        photo_renderer=photo_renderer or default_photo_renderer(settings, research_renderer=research_renderer),
+        photo_renderer=photo_renderer or build_photo_renderer(settings, research_renderer=research_renderer),
         photo_intent_analyzer=default_photo_intent_analyzer(settings),
         reputation_renderer=default_reputation_renderer(settings),
         research_renderer=research_renderer,
         fetch_renderer=default_web_fetch_renderer(settings),
         natural_language_router=build_telegram_natural_language_router_from_settings(settings),
         intent_fast_path=_build_intent_fast_path(settings),
+        image_translate_recognizer=build_image_translate_caption_recognizer(settings),
         ssl_context=build_ssl_context(settings),
         allowed_chat_ids=frozenset(settings.openclaw_telegram_chat_ids),
         status_renderer=lambda: _build_status_text(settings),
