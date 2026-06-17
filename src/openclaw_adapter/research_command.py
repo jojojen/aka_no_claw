@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import statistics
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Protocol, Sequence
@@ -29,6 +31,8 @@ SoldAverageLookupFn = Callable[[str], float | None]
 ShopReferenceFn = Callable[[str, int], "ShopReference | None"]
 GameCodeResolverFn = Callable[[str], "str | None"]
 IpHeatLookupFn = Callable[[tuple[str, ...]], dict[str, tuple[object, ...]]]
+EntityRecognizerFn = Callable[["ItemData"], "EntityProfile | None"]
+AppreciationEnricherFn = Callable[[str, tuple[WebSearchResult, ...]], "str | None"]
 ResearchStageRunner = Callable[["ResearchJobContext"], str]
 
 _MERCARI_ITEM_PATH_RE = re.compile(r"^/item/(m\d+)/?$", re.IGNORECASE)
@@ -121,6 +125,21 @@ class ItemData:
 
 
 @dataclass(frozen=True, slots=True)
+class EntityProfile:
+    """LLM+RAG entity recognition output for M2. ``canonical_query`` is the
+    cleaned, correctly-spelled search query (typos/noise removed) used to drive
+    sold/active comp retrieval; ``aliases`` are alternate spellings (incl. the
+    seller's original) folded into the knowledge DB so future lookups hit."""
+
+    canonical_query: str
+    card_name: str | None = None
+    series: str | None = None
+    character: str | None = None
+    rarity: str | None = None
+    aliases: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class PriceEvidence:
     source_site: str
     source_url: str
@@ -195,6 +214,7 @@ class ResearchJobContext:
     search_fn: SearchFn
     target: ResearchTarget | None = None
     item_data: ItemData | None = None
+    entity_profile: EntityProfile | None = None
     section_results: list[ResearchSectionResult] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     active_price_evidence: tuple[PriceEvidence, ...] = ()
@@ -202,6 +222,7 @@ class ResearchJobContext:
     sold_average_jpy: float | None = None
     shop_reference: ShopReference | None = None
     appreciation_search_results: tuple[WebSearchResult, ...] = ()
+    appreciation_enrichment: str | None = None
     seller_snapshot: SellerReputationSnapshot | None = None
     current_stage: int = 0
     current_label: str = ""
@@ -362,6 +383,8 @@ class MercariItemAdapter:
 
         condition_label = _extract_detail_value_text(soup, "商品の状態")
         if not condition_label:
+            condition_label = _extract_condition_from_embedded_json(html)
+        if not condition_label:
             condition_label = _infer_condition_from_title(title)
         seller_url = _extract_seller_url(soup, base_url=item_url)
         seller_id = _extract_seller_id(seller_url)
@@ -415,6 +438,89 @@ def _fetch_html(
         raise RuntimeError(f"Mercari item fetch failed: {exc.reason}") from exc
 
 
+def _playwright_page_content_settled(page) -> str:
+    last_exc: Exception | None = None
+    for _ in range(4):
+        try:
+            return page.content()
+        except Exception as exc:  # noqa: BLE001 — SPA mid-navigation; settle and retry
+            last_exc = exc
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=8000)
+            except Exception:
+                pass
+            page.wait_for_timeout(1500)
+    if last_exc is not None:
+        raise last_exc
+    return page.content()
+
+
+def fetch_mercari_item_html_with_playwright(url: str) -> str:
+    """Render a Mercari item page with headless Chromium so the JS-injected
+    fields (商品の状態, 出品者) appear in the HTML. The plain-HTTP shell omits
+    them — Mercari moved to client-side hydration. Same anti-detection launch
+    profile reputation_agent uses for item pages. Raises on Playwright/render
+    failure so callers can fall back to the cheap static fetch."""
+    from playwright.sync_api import sync_playwright
+
+    launch_kwargs = {
+        "headless": True,
+        "args": [
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+        ],
+    }
+    chromium_executable = os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH")
+    if chromium_executable:
+        launch_kwargs["executable_path"] = chromium_executable
+    with sync_playwright() as p:
+        browser = p.chromium.launch(**launch_kwargs)
+        try:
+            ctx = browser.new_context(
+                locale="ja-JP",
+                viewport={"width": 1440, "height": 2200},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+            )
+            ctx.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+            )
+            page = ctx.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_selector("body", timeout=15000)
+            page.wait_for_timeout(2000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                pass
+            return _playwright_page_content_settled(page)
+        finally:
+            browser.close()
+
+
+def build_research_item_fetch_html(*, enable_playwright: bool = True) -> FetchHtmlFn:
+    """Item HTML fetcher for /research: render with Playwright first (so the SPA
+    condition/seller fields exist), fall back to the plain-HTTP fetch when the
+    browser is unavailable or the render fails (still yields title+price)."""
+
+    def _fetch(url: str) -> str:
+        if enable_playwright:
+            try:
+                html = fetch_mercari_item_html_with_playwright(url)
+                if html and "出品者" in html:
+                    return html
+                logger.info("research item: Playwright shell missing 出品者, using static fetch url=%s", url)
+            except Exception:  # noqa: BLE001 — fall back to cheap fetch on any browser error
+                logger.warning("research item: Playwright fetch failed, falling back url=%s", url, exc_info=True)
+        return _fetch_html(url)
+
+    return _fetch
+
+
 def _extract_jsonld_product(soup: BeautifulSoup) -> dict[str, object]:
     for script in soup.select('script[type="application/ld+json"]'):
         raw = script.string or script.get_text()
@@ -456,6 +562,71 @@ def _extract_price_from_product(product: dict[str, object]) -> int | None:
             cleaned = raw.replace(",", "").strip()
             if cleaned.isdigit():
                 return int(cleaned)
+    return None
+
+
+# Mercari's six fixed 商品の状態 labels — a closed protocol enum, safe to hardcode
+# (Rule G permits closed-protocol values). Used to pick the condition out of the
+# embedded JSON blob (__NEXT_DATA__/dehydrated state) that the SPA renders from,
+# since the static HTML omits the field that JS injects at runtime.
+_MERCARI_CONDITION_LABELS = frozenset(
+    {
+        "新品、未使用",
+        "未使用に近い",
+        "目立った傷や汚れなし",
+        "やや傷や汚れあり",
+        "傷や汚れあり",
+        "全体的に状態が悪い",
+    }
+)
+
+
+def _extract_condition_from_embedded_json(html: str) -> str | None:
+    soup = BeautifulSoup(html, "html.parser")
+    blobs: list[str] = []
+    next_data = soup.find("script", id="__NEXT_DATA__")
+    if isinstance(next_data, Tag):
+        raw = next_data.string or next_data.get_text()
+        if raw and raw.strip():
+            blobs.append(raw)
+    for script in soup.find_all("script", attrs={"type": "application/json"}):
+        raw = script.string or script.get_text()
+        if raw and raw.strip():
+            blobs.append(raw)
+    for raw in blobs:
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            continue
+        found = _find_condition_label_in_json(payload)
+        if found:
+            return found
+    return None
+
+
+def _find_condition_label_in_json(node: object) -> str | None:
+    if isinstance(node, str):
+        return node if node in _MERCARI_CONDITION_LABELS else None
+    if isinstance(node, dict):
+        # Prefer values under condition-ish keys, but any matching label wins.
+        for key, value in node.items():
+            if "condition" in str(key).lower():
+                if isinstance(value, str) and value in _MERCARI_CONDITION_LABELS:
+                    return value
+                if isinstance(value, dict):
+                    name = value.get("name")
+                    if isinstance(name, str) and name in _MERCARI_CONDITION_LABELS:
+                        return name
+        for value in node.values():
+            found = _find_condition_label_in_json(value)
+            if found:
+                return found
+        return None
+    if isinstance(node, list):
+        for value in node:
+            found = _find_condition_label_in_json(value)
+            if found:
+                return found
     return None
 
 
@@ -769,6 +940,8 @@ class ResearchCommandService:
         shop_reference_fn: ShopReferenceFn | None = None,
         game_code_resolver_fn: GameCodeResolverFn | None = None,
         ip_heat_lookup_fn: IpHeatLookupFn | None = None,
+        entity_recognizer_fn: EntityRecognizerFn | None = None,
+        appreciation_enricher_fn: AppreciationEnricherFn | None = None,
         final_formatter: Callable[[ResearchReport], object] | None = None,
         heartbeat_interval_seconds: float = 15.0,
     ) -> None:
@@ -783,6 +956,8 @@ class ResearchCommandService:
         self._sold_average_lookup_fn = sold_average_lookup_fn or _default_sold_average_lookup
         self._shop_reference_fn = shop_reference_fn or build_shop_reference_fn(game_code_resolver_fn)
         self._ip_heat_lookup_fn = ip_heat_lookup_fn or (lambda canonicals: {})
+        self._entity_recognizer_fn = entity_recognizer_fn
+        self._appreciation_enricher_fn = appreciation_enricher_fn
         self._final_formatter = final_formatter or format_research_full_report
         self._heartbeat_interval_seconds = max(0.0, heartbeat_interval_seconds)
         self._lock = threading.Lock()
@@ -917,6 +1092,31 @@ class ResearchCommandService:
     def _stage_identify_entities(self, ctx: ResearchJobContext) -> str:
         if ctx.item_data is not None:
             self._persist_item_knowledge(ctx.item_data)
+            profile = self._recognize_entity(ctx.item_data)
+            if profile is not None:
+                ctx.entity_profile = profile
+                self._persist_entity_aliases(ctx.item_data, profile)
+                identity = " / ".join(
+                    part for part in (
+                        profile.card_name, profile.series, profile.character, profile.rarity,
+                    ) if part
+                ) or profile.canonical_query
+                summary = (
+                    f"已辨識實體：{identity}；canonical 查詢「{profile.canonical_query}」"
+                    f"（alias {len(profile.aliases)} 筆）已寫入 knowledge DB。"
+                )
+                result = ResearchSectionResult(
+                    section_name="實體辨識",
+                    status="ok",
+                    confidence=min(0.88, ctx.item_data.source_confidence + 0.1),
+                    sample_count=1,
+                    evidence_count=1,
+                    summary=summary,
+                    evidence_urls=(ctx.item_data.item_url,),
+                    warnings=(),
+                )
+                ctx.add_section_result(result)
+                return summary
             summary = "已把商品基礎事實寫入 knowledge DB（origin=research_command）"
             result = ResearchSectionResult(
                 section_name="實體辨識",
@@ -926,7 +1126,7 @@ class ResearchCommandService:
                 evidence_count=1,
                 summary=summary,
                 evidence_urls=(ctx.item_data.item_url,),
-                warnings=("M2 僅寫入商品頁基礎事實，LLM 實體辨識與 alias 展開仍待補。",),
+                warnings=("M2 僅寫入商品頁基礎事實，LLM 實體辨識未能定位 canonical 卡名（資料不足或不確定）。",),
             )
             ctx.add_section_result(result)
             return summary
@@ -969,6 +1169,29 @@ class ResearchCommandService:
             aliases=aliases,
         )
 
+    def _recognize_entity(self, item: ItemData) -> EntityProfile | None:
+        if self._entity_recognizer_fn is None:
+            return None
+        try:
+            profile = self._entity_recognizer_fn(item)
+        except Exception:  # noqa: BLE001 — recognizer is best-effort; never break the run
+            logger.warning("entity recognizer failed for %s", item.item_url, exc_info=True)
+            return None
+        if profile is None or not (profile.canonical_query or "").strip():
+            return None
+        return profile
+
+    def _persist_entity_aliases(self, item: ItemData, profile: EntityProfile) -> None:
+        if not self._knowledge_db_path:
+            return
+        entity_canonical = f"{item.source_site}:{item.item_id}"
+        candidates = [profile.canonical_query, profile.card_name, *profile.aliases]
+        db = KnowledgeDatabase(self._knowledge_db_path)
+        for alias in candidates:
+            alias = (alias or "").strip()
+            if alias:
+                db.add_alias(alias, entity_canonical)
+
     def _stage_appreciation_placeholder(self, ctx: ResearchJobContext) -> str:
         entries = self._lookup_appreciation_entries(ctx)
         heat_by_canonical = self._ip_heat_lookup_fn(tuple(entry.entity_canonical for entry in entries))
@@ -976,14 +1199,30 @@ class ResearchCommandService:
         if _should_enrich_appreciation(entries, heat_by_canonical):
             search_results = _collect_appreciation_search_results(ctx)
             ctx.appreciation_search_results = search_results
+        enrichment = self._enrich_appreciation(_build_price_query(ctx), search_results)
+        ctx.appreciation_enrichment = enrichment
         result = _build_appreciation_section_result(
             query=_build_price_query(ctx),
             entries=entries,
             heat_by_canonical=heat_by_canonical,
             search_results=search_results,
+            enrichment=enrichment,
         )
         ctx.add_section_result(result)
         return result.summary
+
+    def _enrich_appreciation(
+        self, query: str, search_results: tuple[WebSearchResult, ...]
+    ) -> str | None:
+        if self._appreciation_enricher_fn is None or not search_results or not query:
+            return None
+        try:
+            summary = self._appreciation_enricher_fn(query, search_results)
+        except Exception:  # noqa: BLE001 — enrichment is best-effort; keep the snippet fallback
+            logger.warning("appreciation enrichment failed query=%s", query, exc_info=True)
+            return None
+        summary = (summary or "").strip()
+        return summary or None
 
     def _lookup_appreciation_entries(self, ctx: ResearchJobContext) -> tuple[KnowledgeEntry, ...]:
         if not self._knowledge_db_path:
@@ -1224,6 +1463,8 @@ def build_research_handler(
     shop_reference_fn: ShopReferenceFn | None = None,
     game_code_resolver_fn: GameCodeResolverFn | None = None,
     ip_heat_lookup_fn: IpHeatLookupFn | None = None,
+    entity_recognizer_fn: EntityRecognizerFn | None = None,
+    appreciation_enricher_fn: AppreciationEnricherFn | None = None,
     final_formatter: Callable[[ResearchReport], object] | None = None,
     heartbeat_interval_seconds: float = 15.0,
 ) -> Callable[[str, str], object]:
@@ -1241,6 +1482,8 @@ def build_research_handler(
         shop_reference_fn=shop_reference_fn,
         game_code_resolver_fn=game_code_resolver_fn,
         ip_heat_lookup_fn=ip_heat_lookup_fn,
+        entity_recognizer_fn=entity_recognizer_fn,
+        appreciation_enricher_fn=appreciation_enricher_fn,
         final_formatter=final_formatter,
         heartbeat_interval_seconds=heartbeat_interval_seconds,
     )
@@ -1701,23 +1944,29 @@ def _build_appreciation_section_result(
     entries: Sequence[KnowledgeEntry],
     heat_by_canonical: dict[str, tuple[object, ...]],
     search_results: Sequence[WebSearchResult],
+    enrichment: str | None = None,
 ) -> ResearchSectionResult:
+    enrichment = (enrichment or "").strip() or None
     if not entries:
         summary = f"查詢「{query}」目前只拿到商品頁事實，尚未命中可用的 IP / 作者知識。"
-        if search_results:
+        if enrichment:
+            summary += " web 催化劑摘要：" + enrichment
+        elif search_results:
             rendered = _render_appreciation_search_results(search_results)
             summary += " " + rendered
+        if enrichment:
+            no_entry_warning = "增值潛力尚未命中 knowledge DB 既有 entity；判讀以 web 催化劑摘要為主、信心有限。"
+        else:
+            no_entry_warning = "增值潛力尚未命中 knowledge DB 既有 entity；目前只提供 search snippet 級 evidence。"
         return ResearchSectionResult(
             section_name="增值潛力分析",
-            status="partial" if search_results else "unavailable",
-            confidence=0.2 if search_results else 0.1,
+            status="partial" if (search_results or enrichment) else "unavailable",
+            confidence=(0.3 if enrichment else 0.2) if search_results else 0.1,
             sample_count=0,
             evidence_count=len(search_results),
             summary=summary,
             evidence_urls=tuple(result.url for result in search_results[:4]),
-            warnings=(
-                "增值潛力尚未命中 knowledge DB 既有 entity；目前只提供 search snippet 級 evidence。",
-            ),
+            warnings=(no_entry_warning,),
         )
 
     evidence_urls: list[str] = []
@@ -1742,17 +1991,26 @@ def _build_appreciation_section_result(
     if heat_lines:
         summary += " " + " ".join(heat_lines)
     summary += " " + " ".join(summary_parts)
-    if search_results:
+    if enrichment:
+        summary += " web 催化劑摘要：" + enrichment
+    elif search_results:
         summary += " " + _render_appreciation_search_results(search_results)
 
     status = "ok" if heat_hit else "partial"
     if not heat_hit:
         warnings.append("尚未命中 IP heat 訊號；目前僅能根據既有知識摘要做弱判讀。")
-    if search_results:
+    if enrichment:
+        pass  # page fetch + LLM catalyst summary done — no enrichment-gap warning
+    elif search_results:
         warnings.append("外部搜尋結果目前只使用 snippet，尚未做頁面抓取與 LLM 催化劑摘要。")
     else:
         warnings.append("作者軌跡 / 再販 / 官方催化劑的 web enrichment 尚未接入。")
-    confidence = 0.35 + min(0.25, 0.1 * len(entries)) + (0.15 if heat_hit else 0.0) + (0.05 if search_results else 0.0)
+    confidence = (
+        0.35
+        + min(0.25, 0.1 * len(entries))
+        + (0.15 if heat_hit else 0.0)
+        + (0.1 if enrichment else 0.05 if search_results else 0.0)
+    )
     return ResearchSectionResult(
         section_name="增值潛力分析",
         status=status,
@@ -1843,7 +2101,154 @@ def _render_appreciation_search_results(results: Sequence[WebSearchResult]) -> s
     return f"外部補證 {len(results)} 筆：{' / '.join(labels)}。"
 
 
+_ENTITY_RECOGNITION_PROMPT = """\
+你是日本卡牌/周邊二手交易的實體辨識助手。下面是一筆 Mercari 商品標題（可能含賣家錯字、雜訊、emoji、促銷詞）。
+請辨識它指的是「哪一張卡/哪一個商品」，並輸出乾淨、可用於搜尋比價的 canonical 查詢字串。
+
+規則：
+- canonical_query：修正錯字（特別是片假名外來語拼法，如 ヴァイスシュバルツ→ヴァイスシュヴァルツ）、移除雜訊/促銷詞/emoji，保留可辨識卡名+系列+角色+稀有度。
+- aliases：列出其他可能拼法，務必包含賣家原始標題中的拼法。
+- 若你無法有把握辨識（資料不足、太模糊），confident 設為 false，不要硬猜。
+- 只能依據標題與下方「已知實體」提示，不要編造不存在的系列或角色。
+
+已知實體提示（RAG，可能為空）：
+{grounding}
+
+商品標題：
+{title}
+
+只輸出 JSON，格式：
+{{"confident": true/false, "canonical_query": "...", "card_name": "...", "series": "...", "character": "...", "rarity": "...", "aliases": ["...", "..."]}}
+"""
+
+
+def build_ollama_entity_recognizer(
+    *,
+    endpoint: str,
+    model: str,
+    knowledge_db_path: str | None = None,
+    timeout_seconds: int = 90,
+) -> EntityRecognizerFn:
+    """Default M2 recognizer: one local qwen3:14b call extracting a canonical
+    search query + aliases from the (typo-prone) listing title, RAG-grounded by
+    the knowledge DB. Returns None when the model is not confident (Rule G)."""
+
+    generate_url = endpoint.rstrip("/")
+    if not generate_url.endswith("/api/generate"):
+        generate_url = f"{generate_url}/api/generate"
+
+    def _grounding(title: str) -> str:
+        if not knowledge_db_path:
+            return "（無）"
+        try:
+            db = KnowledgeDatabase(knowledge_db_path)
+            hits = db.search_semantic("entry", title, k=5)
+            names: list[str] = []
+            for canonical, _score in hits:
+                entry = db.get_entry(canonical)
+                if entry is not None and entry.summary:
+                    names.append(entry.summary[:120])
+            return "\n".join(f"- {name}" for name in names) if names else "（無）"
+        except Exception:  # noqa: BLE001 — grounding is best-effort
+            return "（無）"
+
+    def _recognize(item: ItemData) -> EntityProfile | None:
+        title = (item.title or "").strip()
+        if not title:
+            return None
+        prompt = _ENTITY_RECOGNITION_PROMPT.format(grounding=_grounding(title), title=title)
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "format": "json",
+            "think": False,
+            "options": {"temperature": 0, "num_predict": 500},
+        }
+        request = Request(
+            generate_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method="POST",
+        )
+        with urlopen(request, timeout=timeout_seconds) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        raw = str(data.get("response") or "").strip()
+        return _parse_entity_profile(raw)
+
+    return _recognize
+
+
+def _parse_entity_profile(raw: str) -> EntityProfile | None:
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\n?|\n?```$", "", text).strip()
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(parsed, dict) or not parsed.get("confident"):
+        return None
+    canonical = str(parsed.get("canonical_query") or "").strip()
+    if not canonical:
+        return None
+    raw_aliases = parsed.get("aliases") or []
+    aliases = tuple(
+        a.strip() for a in raw_aliases if isinstance(a, str) and a.strip()
+    ) if isinstance(raw_aliases, list) else ()
+
+    def _opt(key: str) -> str | None:
+        value = str(parsed.get(key) or "").strip()
+        return value or None
+
+    return EntityProfile(
+        canonical_query=canonical,
+        card_name=_opt("card_name"),
+        series=_opt("series"),
+        character=_opt("character"),
+        rarity=_opt("rarity"),
+        aliases=aliases,
+    )
+
+
+def build_appreciation_enricher(
+    *,
+    fetch_page_fn: Callable[[str], str],
+    summarize_fn: Callable[[str, tuple[WebSearchResult, ...]], str],
+    max_pages: int = 3,
+) -> AppreciationEnricherFn:
+    """A4: turn snippet-only appreciation evidence into a grounded catalyst
+    summary by fetching the top result pages and running the same LLM summariser
+    the web-research renderer uses. fetch/summarize are injected so this stays
+    decoupled from web_search/playwright and unit-testable. Reuses the existing
+    search results — no extra search calls (Rule C7)."""
+
+    def _enrich(query: str, search_results: tuple[WebSearchResult, ...]) -> str | None:
+        if not search_results or not query:
+            return None
+        sources: list[WebSearchResult] = []
+        for result in search_results[:max_pages]:
+            try:
+                content = fetch_page_fn(result.url)
+            except Exception:  # noqa: BLE001 — fall back to snippet on any fetch failure
+                logger.warning("appreciation page fetch failed url=%s", result.url, exc_info=True)
+                content = ""
+            sources.append(
+                WebSearchResult(
+                    title=result.title,
+                    url=result.url,
+                    snippet=result.snippet,
+                    content=content or result.content or result.snippet,
+                )
+            )
+        return summarize_fn(query, tuple(sources))
+
+    return _enrich
+
+
 def _build_price_query(ctx: ResearchJobContext) -> str:
+    if ctx.entity_profile is not None and ctx.entity_profile.canonical_query.strip():
+        return ctx.entity_profile.canonical_query.strip()
     if ctx.item_data is not None and ctx.item_data.title:
         return ctx.item_data.title
     if ctx.target is not None:
@@ -2358,8 +2763,33 @@ def _title_similarity_score(reference: str, candidate: str) -> float:
     return min(1.0, round(score + containment_bonus, 4))
 
 
+# Loanword orthography folding: the ヴ-row (ヴァ/ヴィ/ヴ…) is routinely written
+# with the b-row (バ/ビ/ブ…) in Japanese listings, e.g. ヴァイスシュヴァルツ vs.
+# ヴァイスシュバルツ for "Weiß Schwarz". Fold ヴ-row → b-row so the two spellings
+# normalize identically. This is deterministic orthographic normalization (akin to
+# NFKC), not open-world entity recognition — "which card is this" stays with LLM+RAG.
+_KATAKANA_VU_FOLD = (
+    ("ヴァ", "バ"),
+    ("ヴィ", "ビ"),
+    ("ヴェ", "ベ"),
+    ("ヴォ", "ボ"),
+    ("ヴュ", "ビュ"),
+    ("ヴャ", "ビャ"),
+    ("ヴョ", "ビョ"),
+    ("ヴ", "ブ"),
+)
+
+
+def _fold_katakana_variants(text: str) -> str:
+    folded = text
+    for src, dst in _KATAKANA_VU_FOLD:
+        folded = folded.replace(src, dst)
+    return folded
+
+
 def _normalize_market_title(text: str) -> str:
-    normalized = (text or "").lower()
+    normalized = unicodedata.normalize("NFKC", text or "").lower()
+    normalized = _fold_katakana_variants(normalized)
     for src, dst in (
         ("　", " "),
         ("・", " "),

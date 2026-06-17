@@ -86,10 +86,14 @@ from .voice_command import (
     build_voice_handler,
 )
 from .research_command import (
+    MercariItemAdapter,
     ResearchNotifier,
     ResearchReport,
     SellerReputationSnapshot,
+    build_appreciation_enricher,
+    build_ollama_entity_recognizer,
     build_research_handler,
+    build_research_item_fetch_html,
     format_research_compact_report,
     format_research_detail_report,
 )
@@ -807,10 +811,17 @@ def _build_registries(
     research_handler = build_research_handler(
         notifier_factory=research_notifier_factory,
         search_fn=research_search_fn,
+        item_fetcher=MercariItemAdapter(fetch_html_fn=build_research_item_fetch_html()),
         knowledge_db_path=settings.knowledge_db_path,
         seller_snapshot_lookup_fn=_build_research_seller_snapshot_lookup(settings),
         game_code_resolver_fn=_build_yuyutei_code_resolver(settings, research_search_fn),
         ip_heat_lookup_fn=_build_research_ip_heat_lookup(settings),
+        entity_recognizer_fn=build_ollama_entity_recognizer(
+            endpoint=settings.openclaw_local_text_endpoint,
+            model=settings.openclaw_local_text_model or "qwen3:14b",
+            knowledge_db_path=settings.knowledge_db_path,
+        ),
+        appreciation_enricher_fn=_build_research_appreciation_enricher(settings),
         final_formatter=_build_research_reply_formatter(research_cache),
     )
 
@@ -1066,6 +1077,31 @@ def _build_research_ip_heat_lookup(
         return result
 
     return lookup
+
+
+def _build_research_appreciation_enricher(settings: AssistantSettings):
+    """A4: build the appreciation web-enricher reusing the same page fetch + LLM
+    summariser the /research web-research renderer uses. Returns None when the
+    local text LLM isn't configured (falls back to snippet-only evidence)."""
+    backend = (settings.openclaw_local_text_backend or "").strip().lower()
+    endpoint = settings.openclaw_local_text_endpoint
+    model = _select_text_generation_model(settings)
+    if backend != "ollama" or not endpoint or not model:
+        return None
+    timeout = max(1, settings.openclaw_local_text_timeout_seconds)
+    summarize_timeout = max(timeout, 120)
+    ssl_ctx = build_ssl_context(settings) if endpoint.startswith("https://") else None
+    return build_appreciation_enricher(
+        fetch_page_fn=lambda url: fetch_page_text(url, ssl_context=ssl_ctx),
+        summarize_fn=lambda q, sources: summarize_web_sources_with_ollama(
+            q,
+            sources,
+            endpoint=endpoint,
+            model=model,
+            timeout_seconds=summarize_timeout,
+            ssl_context=ssl_ctx,
+        ),
+    )
 
 
 def _build_yuyutei_code_resolver(
