@@ -768,7 +768,7 @@ def test_research_handler_builds_price_section_from_active_and_sold_samples(tmp_
     assert "合理市價分析 [ok]" in reply
     assert "Mercari sold 樣本 3 筆，均價約 ¥7,000" in reply
     assert "active 樣本 3 筆（mercari 3筆 中位¥6,800），中位數 ¥6,800，區間 ¥6,100–¥7,200" in reply
-    assert "目前開價接近 sold 均價" in reply
+    assert "目前開價接近同條件（中古） sold 均價" in reply
     assert "流動性分析 [ok]" in reply
     assert "active 3 筆（跨平台）/ Mercari sold 3 筆；sold/active 比 1.00；樣本顯示流動性中等，仍有一定成交速度。" in reply
     assert "https://jp.mercari.com/item/s1" in reply
@@ -1364,3 +1364,59 @@ def test_research_handler_degrades_when_appreciation_search_backend_fails(tmp_pa
 
     assert "增值潛力分析" in reply
     assert "search backend boom" not in reply
+
+
+def _sold_evidence(*items: dict[str, object]) -> tuple:
+    from openclaw_adapter.research_command import _price_evidence_from_market_item
+
+    return tuple(_price_evidence_from_market_item(it, sold_status="sold") for it in items)
+
+
+def test_price_comparison_uses_same_condition_not_pooled_average() -> None:
+    # A 中古 listing at ¥2,790 against a sold sample that mixes 新品 (¥6,000) and
+    # 中古 (¥3,000): pooled avg ¥5,000 would falsely read "低於 ~44%", but the
+    # like-for-like 中古 avg ¥3,000 reads "接近". New vs used must not be mixed.
+    from openclaw_adapter.research_command import _build_price_section_result
+
+    sold = _sold_evidence(
+        {"title": "メルカリ 商品 新品未開封", "price_jpy": 6000, "url": "https://jp.mercari.com/item/n1", "source": "mercari"},
+        {"title": "メルカリ 商品 新品", "price_jpy": 6000, "url": "https://jp.mercari.com/item/n2", "source": "mercari"},
+        {"title": "メルカリ 商品 中古", "price_jpy": 3000, "url": "https://jp.mercari.com/item/u1", "source": "mercari"},
+    )
+    pooled_avg = 5000.0
+
+    result = _build_price_section_result(
+        query="メルカリ 商品",
+        listed_price_jpy=2790,
+        active_evidence=(),
+        sold_evidence=sold,
+        sold_average_jpy=pooled_avg,
+        listed_condition_label="中古",
+    )
+
+    assert "目前開價接近同條件（中古） sold 均價" in result.summary
+    assert "低於" not in result.summary  # the misleading pooled comparison is gone
+
+
+def test_price_comparison_withheld_when_no_same_condition_comp() -> None:
+    # Listed item is 新品 but every sold comp is 中古 — a cross-condition % is the
+    # exact mix we must avoid, so the comparison is withheld with a caveat.
+    from openclaw_adapter.research_command import _build_price_section_result
+
+    sold = _sold_evidence(
+        {"title": "メルカリ 商品 中古 A", "price_jpy": 3000, "url": "https://jp.mercari.com/item/u1", "source": "mercari"},
+        {"title": "メルカリ 商品 中古 B", "price_jpy": 3200, "url": "https://jp.mercari.com/item/u2", "source": "mercari"},
+    )
+
+    result = _build_price_section_result(
+        query="メルカリ 商品",
+        listed_price_jpy=6500,
+        active_evidence=(),
+        sold_evidence=sold,
+        sold_average_jpy=3100.0,
+        listed_condition_label="新品",
+    )
+
+    assert "無同條件（新品）sold 樣本，未做價差比較（避免新品／中古混比）" in result.summary
+    # The misleading "open price > used average" reading must NOT appear.
+    assert "高於" not in result.summary
