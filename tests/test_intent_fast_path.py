@@ -12,6 +12,7 @@ import math
 import pytest
 
 from openclaw_adapter.intent_fast_path import (
+    URL_SLOT_INTENTS,
     ZERO_ARG_INTENTS,
     EmbeddingIntentRouter,
 )
@@ -27,6 +28,7 @@ class WordSetEmbedder:
     _VOCAB = [
         "list", "sns", "twitter", "watch", "mercari", "status", "model",
         "tools", "help", "scan", "photo", "track", "price", "card", "buy",
+        "research", "reputation", "seller", "item", "value", "investment",
     ]
 
     def __call__(self, text: str) -> list[float] | None:
@@ -45,6 +47,15 @@ PHRASINGS = {
     "scan_help": ["scan photo card", "scan photo"],
     "add_watch": ["track price card", "watch price buy"],
     "sns_add_account": ["track sns twitter", "sns twitter track"],
+    # URL-slot intents: phrasings ship with URLs (stripped at index build).
+    "product_research": [
+        "research item value investment https://jp.mercari.com/item/m1",
+        "item value research investment",
+    ],
+    "reputation_snapshot": [
+        "reputation seller check https://jp.mercari.com/item/m1",
+        "seller reputation",
+    ],
 }
 
 
@@ -126,3 +137,45 @@ def test_zero_arg_set_is_subset_of_phrasings():
     )
     shipped = set(json.loads(path.read_text(encoding="utf-8")))
     assert ZERO_ARG_INTENTS <= shipped
+
+
+def test_url_slot_set_is_subset_of_phrasings():
+    # The URL-slot intents we fast-path must also have phrasings shipped.
+    import json
+    from pathlib import Path
+
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "data"
+        / "intent_routing_phrasings.json"
+    )
+    shipped = set(json.loads(path.read_text(encoding="utf-8")))
+    assert URL_SLOT_INTENTS <= shipped
+
+
+_MERCARI_URL = "https://jp.mercari.com/item/m32448674223"
+
+
+def test_verb_plus_mercari_url_fast_paths_product_research(router):
+    intent = router.route(f"research item value investment {_MERCARI_URL}")
+    assert intent is not None
+    assert intent.intent == "product_research"
+    assert intent.query_url == _MERCARI_URL  # URL slot lifted verbatim
+    assert intent.confidence is not None and intent.confidence >= 0.6
+
+
+def test_verb_plus_mercari_url_fast_paths_reputation(router):
+    intent = router.route(f"reputation seller check {_MERCARI_URL}")
+    assert intent is not None
+    assert intent.intent == "reputation_snapshot"
+    assert intent.query_url == _MERCARI_URL
+
+
+def test_bare_mercari_url_defers_to_llm(router):
+    # No verb residual to disambiguate research vs reputation -> defer.
+    assert router.route(_MERCARI_URL) is None
+
+
+def test_non_mercari_url_is_not_url_slot_fast_pathed(router):
+    # URL-slot only fires for Mercari product URLs; other URLs defer.
+    assert router.route("research item value https://example.com/item/1") is None

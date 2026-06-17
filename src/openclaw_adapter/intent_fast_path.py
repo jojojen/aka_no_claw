@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 
 from price_monitor_bot.natural_language import TelegramNaturalLanguageIntent
@@ -27,6 +28,23 @@ logger = logging.getLogger(__name__)
 ZERO_ARG_INTENTS = frozenset(
     {"help", "status", "tools", "scan_help", "sns_list", "list_watches"}
 )
+
+# Intents whose only slot — a Mercari product URL — is mechanically extractable
+# by regex, so they can be fast-pathed too: embed the URL-stripped residual
+# (the verb: 研究 vs 信譽) to pick which one, and lift the URL out by pattern.
+# A bare URL (no verb residual) stays None → the LLM router asks the user which.
+URL_SLOT_INTENTS = frozenset({"product_research", "reputation_snapshot"})
+
+_MERCARI_URL_RE = re.compile(
+    r"https?://(?:jp\.|www\.)?mercari\.com/"
+    r"(?:item/m\d+|shops/product/[A-Za-z0-9]+)(?:[/?#]\S*)?",
+    re.IGNORECASE,
+)
+_ANY_URL_RE = re.compile(r"https?://\S+")
+
+
+def _strip_urls(text: str) -> str:
+    return _ANY_URL_RE.sub(" ", text).strip()
 
 # Margin the winning intent must beat the runner-up by. Guards the close
 # zero-arg pair sns_list vs list_watches: a genuinely ambiguous "看清單" falls
@@ -49,14 +67,18 @@ class EmbeddingIntentRouter:
         min_score: float = _DEFAULT_MIN_SCORE,
         margin: float = _DEFAULT_MARGIN,
         zero_arg_intents=ZERO_ARG_INTENTS,
+        url_slot_intents=URL_SLOT_INTENTS,
     ) -> None:
         self._embedder = embedder
         self._min_score = min_score
         self._margin = margin
         self._zero_arg = frozenset(zero_arg_intents)
+        self._url_slot = frozenset(url_slot_intents)
         self._index: dict[str, list[list[float]]] = {}
+        # URLs carry no intent signal (and the URL-slot path matches a
+        # URL-stripped residual), so strip them before embedding the phrasings.
         for intent, examples in phrasings.items():
-            rows = embed_unit_vectors(embedder, examples)
+            rows = embed_unit_vectors(embedder, [_strip_urls(ex) for ex in examples])
             if rows:
                 self._index[intent] = rows
         self.ready = bool(self._index)
@@ -94,6 +116,55 @@ class EmbeddingIntentRouter:
             )
             return TelegramNaturalLanguageIntent(
                 intent=top_intent, confidence=float(top_score)
+            )
+
+        url_intent = self._route_url_slot(text)
+        if url_intent is not None:
+            return url_intent
+        return None
+
+    def _route_url_slot(
+        self, text: str
+    ) -> TelegramNaturalLanguageIntent | None:
+        """Fast-path verb + Mercari-URL messages (研究/信譽 <url>).
+
+        The URL slot is lifted by regex; the verb residual picks the intent via
+        embedding. A bare URL leaves no residual → None, so the LLM router keeps
+        asking the user whether they meant research vs reputation."""
+        url_match = _MERCARI_URL_RE.search(text)
+        if url_match is None:
+            return None
+        residual = _strip_urls(text)
+        if not residual:
+            return None
+        try:
+            rvec = self._embedder(residual)
+        except Exception:  # noqa: BLE001 - embed outage must not break routing
+            return None
+        rn = l2_normalize(rvec) if rvec else None
+        if rn is None:
+            return None
+        slot = [
+            (intent, max(cosine(rn, row) for row in self._index[intent]))
+            for intent in self._url_slot
+            if intent in self._index
+        ]
+        if not slot:
+            return None
+        slot.sort(key=lambda t: t[1], reverse=True)
+        top_intent, top_score = slot[0]
+        second = slot[1][1] if len(slot) > 1 else 0.0
+        if top_score >= self._min_score and (top_score - second) >= self._margin:
+            logger.info(
+                "intent fast-path URL-slot hit intent=%s score=%.3f margin=%.3f",
+                top_intent,
+                top_score,
+                top_score - second,
+            )
+            return TelegramNaturalLanguageIntent(
+                intent=top_intent,
+                query_url=url_match.group(0),
+                confidence=float(top_score),
             )
         return None
 

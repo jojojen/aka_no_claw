@@ -39,7 +39,20 @@
     "查這個賣家的信用 https://jp.mercari.com/item/m123",
     "幫我看這個 mercari 賣家評價 https://jp.mercari.com/user/profile/123",
     "check seller reputation for this url",
-    "這個連結的賣家可信嗎 截圖一下"
+    "這個連結的賣家可信嗎 截圖一下",
+    "信譽",
+    "查賣家信用",
+    "這個賣家可靠嗎"
+  ],
+  "product_research": [
+    "研究這個商品值不值得買 https://jp.mercari.com/item/m123",
+    "幫我看這個 mercari 商品的行情跟增值空間",
+    "這張卡現在的市價跟流動性如何 深度分析一下",
+    "這個商品會不會增值 適合入手嗎",
+    "deep research this mercari item investment value",
+    "研究",
+    "研究一下這個商品",
+    "研究這個商品的行情"
   ],
   "web_research": [
     "為什麼寶可夢卡那麼有人氣",
