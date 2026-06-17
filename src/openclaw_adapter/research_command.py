@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import pathlib
 import re
 import statistics
+import tempfile
 import threading
 import time
 import unicodedata
@@ -31,6 +33,31 @@ _SOLD_SCRAPE_TIMEOUT = 90.0
 _SOLD_AVG_SCRAPE_TIMEOUT = 75.0
 _SHOP_REF_SCRAPE_TIMEOUT = 75.0
 _ITEM_HTML_SCRAPE_TIMEOUT = 90.0
+
+# Cross-process yuyu-tei rate-limit state — written by the scrape subprocess when
+# it receives a 429, read by the parent before launching the next subprocess so we
+# don't naively retry a host that just told us to back off.  In-process circuit
+# breaker resets on subprocess exit; this file keeps the signal alive across calls.
+_YUYUTEI_CROSS_PROCESS_COOLDOWN_SECS = 300.0
+
+
+def _yuyutei_cooldown_path() -> pathlib.Path:
+    return pathlib.Path(tempfile.gettempdir()) / "openclaw_yuyutei_cooldown"
+
+
+def _yuyutei_cooldown_remaining() -> float:
+    try:
+        age = time.time() - _yuyutei_cooldown_path().stat().st_mtime
+        return max(0.0, _YUYUTEI_CROSS_PROCESS_COOLDOWN_SECS - age)
+    except OSError:
+        return 0.0
+
+
+def _yuyutei_trip_cross_process_cooldown() -> None:
+    try:
+        _yuyutei_cooldown_path().touch()
+    except OSError:
+        pass
 
 SearchFn = Callable[[str, int], tuple[object, ...]]
 FetchHtmlFn = Callable[[str], str]
@@ -1646,6 +1673,8 @@ def _compact_warning_label(warning: str) -> str | None:
         return "賣家快照暫時失敗"
     if "賣家評價樣本偏少" in normalized:
         return "賣家評價樣本偏少"
+    if "店舗參考價" in normalized:
+        return "遊々亭：無法取得店舗參考"
     return None
 
 
@@ -1659,6 +1688,8 @@ def _compact_price_summary(result: ResearchSectionResult) -> str:
         elif "均價約" in text and "sold" in text:
             selected.append(text)
         elif text.startswith("active 樣本") and len(selected) < 2:
+            selected.append(text)
+        elif text.startswith("遊々亭参考："):
             selected.append(text)
     if not selected:
         selected = [_truncate_research_text(result.summary, 68)]
@@ -1676,10 +1707,10 @@ def _compact_liquidity_summary(result: ResearchSectionResult) -> str:
 def _compact_seller_summary(result: ResearchSectionResult) -> str:
     parts = [_compact_whitespace(part) for part in result.summary.split("；") if part]
     for part in parts:
-        if "快照顯示" in part or "snapshot 失敗" in part:
+        if "快照顯示" in part or "快照資料不足" in part or "snapshot 失敗" in part:
             return _truncate_research_text(part, 76)
     if parts:
-        return _truncate_research_text(parts[-1], 76)
+        return _truncate_research_text(parts[0], 76)  # verdict is always first
     return _truncate_research_text(result.summary, 68)
 
 
@@ -1701,12 +1732,19 @@ def _format_research_price_detail(report: ResearchReport) -> str:
     if price is not None:
         lines.extend(_render_detail_section(price))
     if liquidity is not None:
+        if price is not None:
+            lines.append("")
         lines.extend(_render_detail_section(liquidity))
     warnings = _collect_section_warnings((price, liquidity))
     if warnings:
         lines.append("")
         lines.append("提醒：")
         lines.extend(f"- {warning}" for warning in warnings)
+    urls = _collect_section_urls((price, liquidity))
+    if urls:
+        lines.append("")
+        lines.append("來源：")
+        lines.extend(f"- {url}" for url in urls)
     return "\n".join(lines)
 
 
@@ -1722,6 +1760,11 @@ def _format_research_seller_detail(report: ResearchReport) -> str:
         lines.append("")
         lines.append("提醒：")
         lines.extend(f"- {warning}" for warning in warnings)
+    urls = _collect_section_urls((seller,))
+    if urls:
+        lines.append("")
+        lines.append("來源：")
+        lines.extend(f"- {url}" for url in urls)
     return "\n".join(lines)
 
 
@@ -1765,12 +1808,30 @@ def _detail_header(report: ResearchReport, title: str) -> list[str]:
 
 
 def _render_detail_section(result: ResearchSectionResult) -> list[str]:
+    # One claim per line so the conclusion-first ordering is actually legible,
+    # instead of a single 「；」-joined wall of text. Parts already prefixed with
+    # 「・」 are sub-breakdowns (新品／中古) and get nested deeper under their parent.
     lines = [f"{result.section_name} [{result.status}]"]
-    lines.append(result.summary)
-    if result.evidence_urls:
-        lines.append("來源：")
-        lines.extend(f"- {url}" for url in tuple(dict.fromkeys(result.evidence_urls))[:6])
+    parts = [part.strip() for part in result.summary.split("；") if part.strip()]
+    if not parts:
+        return lines
+    for part in parts:
+        if part.startswith("・"):
+            lines.append(f"      {part}")
+        else:
+            lines.append(f"  ‣ {part}")
     return lines
+
+
+def _collect_section_urls(results: Sequence[ResearchSectionResult | None]) -> tuple[str, ...]:
+    seen: dict[str, None] = {}
+    for result in results:
+        if result is None:
+            continue
+        for url in result.evidence_urls:
+            if url:
+                seen[url] = None
+    return tuple(seen)[:8]
 
 
 def _collect_section_warnings(results: Sequence[ResearchSectionResult | None]) -> tuple[str, ...]:
@@ -1885,16 +1946,16 @@ def _build_seller_snapshot_section_result(snapshot: SellerReputationSnapshot) ->
         confidence += 0.05
     confidence = round(min(0.9, confidence), 2)
 
-    summary_parts: list[str] = []
+    # verdict first so summary reads: risk → stats → meta
+    summary_parts: list[str] = [risk_text]
+    if negative_review_summary:
+        summary_parts.append(negative_review_summary)
     if meta_bits:
         summary_parts.append(" / ".join(meta_bits))
     if seller_bits:
         summary_parts.append("身為賣家：" + " / ".join(seller_bits))
     if snapshot.captured_at:
         summary_parts.append(f"快照時間 {snapshot.captured_at}")
-    summary_parts.append(risk_text)
-    if negative_review_summary:
-        summary_parts.append(negative_review_summary)
 
     return ResearchSectionResult(
         section_name="賣家風險分析",
@@ -2445,12 +2506,19 @@ def _build_price_section_result(
         status = "partial" if summary_parts else "unavailable"
         warnings.append("active 比價樣本不足（Mercari / Rakuma 均未取得）。")
 
-    shop_band_text = _format_shop_reference(shop_reference) if shop_reference is not None else ""
+    if shop_reference is not None:
+        shop_band_text = _format_shop_reference(shop_reference)
+    elif any("店舗參考價" in w for w in backend_warnings):
+        shop_band_text = "遊々亭参考：暫無法取得（rate-limited）"
+    else:
+        shop_band_text = ""
     if shop_band_text:
         summary_parts.append(shop_band_text)
         if status == "unavailable":
             status = "partial"
 
+    # ── verdict (conclusion) — prepended so summary reads verdict first ─────
+    verdict_parts: list[str] = []
     if listed_price_jpy is not None and sold_average_jpy is not None and sold_average_jpy > 0:
         # Compare like-for-like: a 中古 listing must be measured against 中古 sold
         # comps, not a pooled average that 新品 sealed stock inflates.
@@ -2479,18 +2547,20 @@ def _build_price_section_result(
             ratio = listed_price_jpy / compare_avg
             diff_pct = abs(ratio - 1.0) * 100
             if ratio <= 0.85:
-                summary_parts.append(f"目前開價低於{cond_note} sold 均價約 {diff_pct:.0f}%")
+                verdict_parts.append(f"目前開價低於{cond_note} sold 均價約 {diff_pct:.0f}%")
             elif ratio >= 1.10:
-                summary_parts.append(f"目前開價高於{cond_note} sold 均價約 {diff_pct:.0f}%")
+                verdict_parts.append(f"目前開價高於{cond_note} sold 均價約 {diff_pct:.0f}%")
             else:
-                summary_parts.append(f"目前開價接近{cond_note} sold 均價")
+                verdict_parts.append(f"目前開價接近{cond_note} sold 均價")
         elif listed_condition_label is not None and sold_classes:
             # Listed condition known but no same-condition comp; a cross-condition
             # % is exactly the 新品／中古 mix the pooled average produces, so we
             # withhold it rather than mislead.
-            summary_parts.append(
+            verdict_parts.append(
                 f"無同條件（{listed_condition_label}）sold 樣本，未做價差比較（避免新品／中古混比）"
             )
+    # conclusion first, then evidence stats
+    summary_parts = verdict_parts + summary_parts
 
     if sold_average_jpy is None and not active_prices:
         if shop_band_text:
@@ -2569,10 +2639,6 @@ def _build_liquidity_section_result(
     ratio = float(sold_count) if active_count == 0 else sold_count / active_count
     warnings: list[str] = []
     status = "ok"
-    summary_parts = [
-        f"active {active_count} 筆（跨平台）/ Mercari sold {sold_count} 筆",
-        f"sold/active 比 {ratio:.2f}",
-    ]
 
     if sold_count >= 5 and ratio >= 1.0:
         liquidity_text = "樣本顯示流動性偏高，近期換手速度看起來不慢。"
@@ -2587,7 +2653,12 @@ def _build_liquidity_section_result(
         liquidity_text = "樣本偏少，流動性暫時只能做弱判讀。"
         status = "partial"
 
-    summary_parts.append(liquidity_text)
+    # verdict first, then sample counts and ratio
+    summary_parts = [
+        liquidity_text,
+        f"active {active_count} 筆（跨平台）/ Mercari sold {sold_count} 筆",
+        f"sold/active 比 {ratio:.2f}",
+    ]
     if sold_average_jpy is not None and sold_average_jpy > 0:
         summary_parts.append(f"參考 sold 均價約 ¥{sold_average_jpy:,.0f}")
 
@@ -2740,6 +2811,15 @@ def _shop_reference_scrape_impl(
         query, price_max=price_cap, source_options=source_options
     )
     if band is None or not band.has_data:
+        # Persist a cross-process hint when the in-process circuit was tripped by a
+        # 429, so the parent's next call skips yuyu-tei until the cooldown clears
+        # instead of naively spawning another subprocess that will also get rate-limited.
+        try:
+            from market_monitor.http import _circuit_remaining
+            if _circuit_remaining("yuyu-tei.jp") > 0:
+                _yuyutei_trip_cross_process_cooldown()
+        except Exception:  # noqa: BLE001
+            pass
         return None
     return ShopReference(
         label="遊々亭",
@@ -2759,12 +2839,22 @@ def _shop_reference_scrape_impl(
 def _shop_reference_from_band(
     query: str, price_cap: int, source_options: dict[str, object] | None
 ) -> ShopReference | None:
+    # Skip the subprocess entirely if the cross-process cooldown is still active,
+    # saving one wasted Playwright spawn that would just 429 again immediately.
+    remaining = _yuyutei_cooldown_remaining()
+    if remaining > 0:
+        raise RuntimeError(f"yuyu-tei.jp rate-limited ({remaining:.0f}s cross-process cooldown)")
     result = run_in_subprocess(
         "shop_reference",
         {"query": query, "price_cap": price_cap, "source_options": source_options},
         timeout=_SHOP_REF_SCRAPE_TIMEOUT,
     )
     if not isinstance(result, dict):
+        # The subprocess may have just written the cooldown file on a fresh 429;
+        # surface it as an exception so the caller adds a user-visible warning.
+        remaining = _yuyutei_cooldown_remaining()
+        if remaining > 0:
+            raise RuntimeError(f"yuyu-tei.jp rate-limited ({remaining:.0f}s cross-process cooldown)")
         return None
     return _shop_reference_from_dict(result)
 
