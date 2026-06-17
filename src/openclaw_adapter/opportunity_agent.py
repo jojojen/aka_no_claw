@@ -39,7 +39,7 @@ from .opportunity_models import (
 from .opportunity_pipeline import CandidateProvider, OpportunityPipeline, OpportunityPipelineStats
 from .opportunity_scoring import OpportunityThresholds, reputation_passes
 from .opportunity_store import OpportunityStore, _normalize_legacy_reason
-from .web_search import WebSearchResult, search_yahoo_japan_playwright
+from .web_search import WebSearchResult, web_search
 
 logger = logging.getLogger(__name__)
 
@@ -509,7 +509,7 @@ class WebOpportunityResearcher:
         self._max_results = max(1, min(5, max_results))
         self._ssl_context = ssl_context
         self._search_fn = search_fn or (
-            lambda query, limit: search_yahoo_japan_playwright(query, max_results=limit)
+            lambda query, limit: web_search(query, max_results=limit)
         )
         self._json_call_fn = json_call_fn or _call_ollama_json
 
@@ -1252,7 +1252,7 @@ def build_opportunity_agent(settings: AssistantSettings | None = None) -> Opport
                 query,
             )
             return ()
-        return search_yahoo_japan_playwright(query, max_results=max_results)
+        return web_search(query, max_results=max_results)
 
     store = OpportunityStore(settings.opportunity_db_path)
     store.bootstrap()
@@ -1458,7 +1458,7 @@ def _build_official_store_provider(*, ssl_context):
     return OfficialStoreCandidateProvider(crawlers=crawlers, collab_store=collab_store)
 
 
-def _build_preflight_callable(*, settings: AssistantSettings, ssl_context, search_fn=search_yahoo_japan_playwright):
+def _build_preflight_callable(*, settings: AssistantSettings, ssl_context, search_fn=web_search):
     """Return a callable that the opportunity-agent invokes before every tick:
 
     - Backfill domains for one untagged SNS rule (LLM-driven).

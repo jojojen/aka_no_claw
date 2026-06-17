@@ -48,8 +48,8 @@ from .web_search import (
     fetch_page_text,
     format_web_research_answer,
     reformulate_queries_with_ollama,
-    search_yahoo_japan_playwright,
     summarize_web_sources_with_ollama,
+    web_search,
 )
 
 logger = logging.getLogger(__name__)
@@ -353,7 +353,7 @@ def _handle_web_search(args: argparse.Namespace, settings: AssistantSettings) ->
     answer = build_web_research_answer(
         query,
         max_results=args.limit,
-        search_fn=lambda q, limit: search_yahoo_japan_playwright(
+        search_fn=lambda q, limit: web_search(
             q,
             max_results=limit,
         ),

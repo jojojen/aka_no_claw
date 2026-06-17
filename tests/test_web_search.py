@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+from openclaw_adapter import web_search as ws
 from openclaw_adapter.web_search import (
     WebResearchAnswer,
     WebSearchResult,
@@ -187,3 +188,121 @@ def test_build_web_fetch_answer_success_and_validation() -> None:
         "https://a.com", "x", fetch_page_fn=lambda u: "", answer_fn=lambda u, p, c: "z",
     )
     assert "抓不到" in empty.summary
+
+
+def test_ddg_decode_href_unwraps_redirect_and_passes_plain() -> None:
+    wrapped = "//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpage%3Fa%3D1&rut=x"
+    assert ws._ddg_decode_href(wrapped) == "https://example.com/page?a=1"
+    # A plain external URL is returned unchanged.
+    assert ws._ddg_decode_href("https://example.com/x") == "https://example.com/x"
+    # Empty / None are safe.
+    assert ws._ddg_decode_href("") == ""
+    assert ws._ddg_decode_href(None) == ""
+
+
+def test_next_search_order_alternates_across_calls(monkeypatch, tmp_path) -> None:
+    counter = tmp_path / "rr"
+    monkeypatch.setattr(ws, "_search_rr_counter_path", lambda: counter)
+    monkeypatch.setattr(ws, "_SEARCH_RR_LOCK", None)
+    # Fresh counter (no file) starts at 0 → yahoo first, then flips each call.
+    first = ws._next_search_order()
+    second = ws._next_search_order()
+    third = ws._next_search_order()
+    assert first == ("yahoo", "duckduckgo")
+    assert second == ("duckduckgo", "yahoo")
+    assert third == ("yahoo", "duckduckgo")
+    # Persisted across a process restart (re-read from disk).
+    assert counter.read_text().strip() == "3"
+
+
+def test_web_search_uses_primary_then_returns(monkeypatch) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(ws, "_next_search_order", lambda: ("yahoo", "duckduckgo"))
+
+    def fake_yahoo(query, *, max_results, reuse_context=True):
+        calls.append("yahoo")
+        return (WebSearchResult("Y", "https://y.com"),)
+
+    def fake_ddg(query, *, max_results, reuse_context=True):
+        calls.append("duckduckgo")
+        return (WebSearchResult("D", "https://d.com"),)
+
+    monkeypatch.setattr(ws, "search_yahoo_japan_playwright", fake_yahoo)
+    monkeypatch.setattr(ws, "search_duckduckgo_html", fake_ddg)
+
+    results = ws.web_search("q", max_results=3)
+    assert [r.url for r in results] == ["https://y.com"]
+    # Fallback backend is never touched when the primary yields results.
+    assert calls == ["yahoo"]
+
+
+def test_web_search_falls_back_on_empty_primary(monkeypatch) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(ws, "_next_search_order", lambda: ("duckduckgo", "yahoo"))
+
+    def fake_yahoo(query, *, max_results, reuse_context=True):
+        calls.append("yahoo")
+        return (WebSearchResult("Y", "https://y.com"),)
+
+    def fake_ddg(query, *, max_results, reuse_context=True):
+        calls.append("duckduckgo")
+        return ()
+
+    monkeypatch.setattr(ws, "search_yahoo_japan_playwright", fake_yahoo)
+    monkeypatch.setattr(ws, "search_duckduckgo_html", fake_ddg)
+
+    results = ws.web_search("q", max_results=3)
+    assert [r.url for r in results] == ["https://y.com"]
+    assert calls == ["duckduckgo", "yahoo"]
+
+
+def test_web_search_falls_back_on_primary_exception(monkeypatch) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(ws, "_next_search_order", lambda: ("yahoo", "duckduckgo"))
+
+    def fake_yahoo(query, *, max_results, reuse_context=True):
+        calls.append("yahoo")
+        raise RuntimeError("yahoo boom")
+
+    def fake_ddg(query, *, max_results, reuse_context=True):
+        calls.append("duckduckgo")
+        return (WebSearchResult("D", "https://d.com"),)
+
+    monkeypatch.setattr(ws, "search_yahoo_japan_playwright", fake_yahoo)
+    monkeypatch.setattr(ws, "search_duckduckgo_html", fake_ddg)
+
+    results = ws.web_search("q", max_results=3)
+    assert [r.url for r in results] == ["https://d.com"]
+    assert calls == ["yahoo", "duckduckgo"]
+
+
+def test_web_search_returns_empty_when_both_fail(monkeypatch) -> None:
+    monkeypatch.setattr(ws, "_next_search_order", lambda: ("yahoo", "duckduckgo"))
+    monkeypatch.setattr(
+        ws, "search_yahoo_japan_playwright",
+        lambda query, *, max_results, reuse_context=True: (),
+    )
+    monkeypatch.setattr(
+        ws, "search_duckduckgo_html",
+        lambda query, *, max_results: (),
+    )
+    assert ws.web_search("q", max_results=3) == ()
+
+
+def test_web_search_forwards_reuse_flag_to_both_backends(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(ws, "_next_search_order", lambda: ("yahoo", "duckduckgo"))
+
+    def fake_yahoo(query, *, max_results, reuse_context=True):
+        captured["yahoo_reuse"] = reuse_context
+        return ()
+
+    def fake_ddg(query, *, max_results, reuse_context=True):
+        captured["ddg_reuse"] = reuse_context
+        return (WebSearchResult("D", "https://d.com"),)
+
+    monkeypatch.setattr(ws, "search_yahoo_japan_playwright", fake_yahoo)
+    monkeypatch.setattr(ws, "search_duckduckgo_html", fake_ddg)
+    ws.web_search("q", max_results=3, reuse_browser=False)
+    assert captured["yahoo_reuse"] is False
+    assert captured["ddg_reuse"] is False

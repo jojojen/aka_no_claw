@@ -123,8 +123,8 @@ from .web_search import (
     fetch_page_text,
     format_web_research_answer,
     reformulate_queries_with_ollama,
-    search_yahoo_japan_playwright,
     summarize_web_sources_with_ollama,
+    web_search,
 )
 from price_monitor_bot.bot import TelegramTextReplyPlan
 
@@ -529,10 +529,7 @@ def default_web_research_renderer(settings: AssistantSettings) -> ResearchRender
         answer = build_web_research_answer(
             query.query,
             max_results=5,
-            search_fn=lambda q, limit: search_yahoo_japan_playwright(
-                q,
-                max_results=limit,
-            ),
+            search_fn=lambda q, limit: web_search(q, max_results=limit),
             # Item 4: turn the question into a few focused search queries first.
             reformulate_fn=lambda q: reformulate_queries_with_ollama(
                 q,
@@ -923,11 +920,7 @@ def _build_registries(
     scorecard_handler = build_scorecard_handler(settings)
     research_cache = _ResearchReplyCache()
     research_search_fn = lambda q, limit: _run_research_worker_call(
-        lambda: search_yahoo_japan_playwright(
-            q,
-            max_results=limit,
-            reuse_context=False,
-        )
+        lambda: web_search(q, max_results=limit, reuse_browser=False)
     )
     research_handler = build_research_handler(
         notifier_factory=research_notifier_factory,
