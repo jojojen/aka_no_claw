@@ -9,7 +9,7 @@ from html import unescape
 from html.parser import HTMLParser
 from typing import Callable, Sequence
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 from urllib.request import Request, urlopen
 
@@ -76,6 +76,30 @@ _pw_ctx = None        # BrowserContext (persistent, keeps cookies/session)
 _pw_lock = None       # threading.Lock — lazy-init below
 
 
+def _get_pw_instance():
+    """Return the process-wide singleton Playwright handle.
+
+    Playwright's sync API permits only ONE active ``sync_playwright()`` per
+    thread, so Yahoo (persistent context) and DuckDuckGo (per-call browser) must
+    SHARE one instance — if each opened its own, the second to start would raise
+    "Playwright Sync API inside the asyncio loop" and the round-robin would
+    silently collapse to a single backend.
+    """
+    import threading
+
+    global _pw_instance, _pw_lock
+
+    if _pw_lock is None:
+        _pw_lock = threading.RLock()
+
+    with _pw_lock:
+        if _pw_instance is None:
+            from playwright.sync_api import sync_playwright
+
+            _pw_instance = sync_playwright().start()
+        return _pw_instance
+
+
 def _get_yahoo_context(profile_dir: str | None = None):
     """Return the shared persistent BrowserContext, launching it if needed."""
     import pathlib
@@ -84,7 +108,7 @@ def _get_yahoo_context(profile_dir: str | None = None):
     global _pw_instance, _pw_ctx, _pw_lock
 
     if _pw_lock is None:
-        _pw_lock = threading.Lock()
+        _pw_lock = threading.RLock()
 
     with _pw_lock:
         if _pw_ctx is not None:
@@ -101,18 +125,15 @@ def _get_yahoo_context(profile_dir: str | None = None):
                     pass
                 _pw_instance = None
 
-        from playwright.sync_api import sync_playwright
-
         profile = pathlib.Path(
             profile_dir or pathlib.Path(_YAHOO_PROFILE_DEFAULT).expanduser()
         )
         profile.mkdir(parents=True, exist_ok=True)
 
-        pw = sync_playwright().start()
+        pw = _get_pw_instance()
         ctx = bs.launch_stealth_persistent_context(
             pw, str(profile), headless=True, logger=logger
         )
-        _pw_instance = pw
         _pw_ctx = ctx
         logger.info("Yahoo Japan browser context started profile=%s", profile)
         return ctx
@@ -197,6 +218,172 @@ def _extract_yahoo_japan_results(page: object, max_results: int) -> tuple[WebSea
     return tuple(results)
 
 
+# --- DuckDuckGo backend (second source, alternated with Yahoo) ---------------
+
+DUCKDUCKGO_HTML_URL = "https://html.duckduckgo.com/html/"
+_DDG_WAIT_MS = 1500  # server-rendered html endpoint; no heavy JS to settle
+
+
+def search_duckduckgo_html(
+    query: str,
+    *,
+    max_results: int = DEFAULT_WEB_SEARCH_LIMIT,
+    reuse_context: bool = True,
+) -> tuple[WebSearchResult, ...]:
+    """DuckDuckGo web search via a stealth Playwright fetch of the
+    server-rendered ``html.duckduckgo.com/html/`` endpoint. This is the second
+    backend that :func:`web_search` alternates with Yahoo Japan so neither host
+    sees the full query load.
+
+    On the main thread (``reuse_context=True``) the per-call browser is launched
+    from the shared singleton Playwright handle so it can coexist with Yahoo's
+    persistent context; off the main thread, use a private ``sync_playwright()``.
+    """
+    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import TimeoutError as PlaywrightTimeout
+
+    cleaned_query = " ".join(query.split()).strip()
+    if not cleaned_query:
+        return ()
+
+    url = f"{DUCKDUCKGO_HTML_URL}?{urlencode({'q': cleaned_query})}"
+    logger.info("DuckDuckGo search query=%s", cleaned_query)
+
+    def _run(playwright) -> tuple[WebSearchResult, ...]:
+        browser = bs.launch_stealth_chromium(playwright, headless=True, logger=logger)
+        context = bs.new_stealth_context(browser)
+        page = context.new_page()
+        try:
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            except PlaywrightTimeout:
+                logger.warning("DuckDuckGo goto timeout; reading current DOM")
+            page.wait_for_timeout(_DDG_WAIT_MS)
+            bs.humanize(page)
+            return _extract_duckduckgo_results(page, max_results)
+        finally:
+            context.close()
+            browser.close()
+
+    if reuse_context:
+        results = _run(_get_pw_instance())
+    else:
+        with sync_playwright() as playwright:
+            results = _run(playwright)
+
+    if not results:
+        logger.warning("DuckDuckGo returned 0 results query=%s", cleaned_query)
+    return results
+
+
+def _ddg_decode_href(href: str | None) -> str:
+    """DDG result anchors point at a redirect ``//duckduckgo.com/l/?uddg=<enc>``.
+    Decode back to the real external URL; pass through anything already external."""
+    value = (href or "").strip()
+    if not value:
+        return ""
+    if value.startswith("//"):
+        value = "https:" + value
+    parsed = urlparse(value)
+    if parsed.netloc.endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
+        target = parse_qs(parsed.query).get("uddg", [""])[0]
+        return unquote(target)
+    return value
+
+
+def _extract_duckduckgo_results(page: object, max_results: int) -> tuple[WebSearchResult, ...]:
+    results: list[WebSearchResult] = []
+    for node in page.query_selector_all("div.result, div.web-result"):  # type: ignore[attr-defined]
+        if len(results) >= max_results:
+            break
+        title_el = node.query_selector("a.result__a")
+        if not title_el:
+            continue
+        real_url = _ddg_decode_href(title_el.get_attribute("href"))
+        if not _is_external_http_url(real_url):
+            continue
+        raw_title = (title_el.inner_text() or "").strip()
+        title = raw_title.splitlines()[0].strip() if raw_title else ""
+        if not title:
+            continue
+        snip_el = node.query_selector(".result__snippet")
+        snippet = (snip_el.inner_text().strip() if snip_el else "").replace("\xa0", " ")
+        results.append(WebSearchResult(title=title, url=real_url, snippet=snippet))
+    return tuple(results)
+
+
+# --- Unified search: alternate evenly between Yahoo and DuckDuckGo ------------
+
+_SEARCH_RR_LOCK = None
+
+
+def _search_rr_counter_path():
+    import pathlib
+    import tempfile
+
+    return pathlib.Path(tempfile.gettempdir()) / "openclaw_search_rr_counter"
+
+
+def _next_search_order() -> tuple[str, str]:
+    """Return ``(primary, fallback)`` backend names for this call, alternating
+    evenly across calls — and across process restarts via a small file counter —
+    so Yahoo and DuckDuckGo each take ~half the query load. Spreading requests
+    keeps either host from seeing the full rate and lowers IP-ban risk."""
+    import threading
+
+    global _SEARCH_RR_LOCK
+    if _SEARCH_RR_LOCK is None:
+        _SEARCH_RR_LOCK = threading.Lock()
+
+    with _SEARCH_RR_LOCK:
+        path = _search_rr_counter_path()
+        try:
+            count = int(path.read_text().strip())
+        except Exception:
+            count = 0
+        try:
+            path.write_text(str(count + 1))
+        except Exception:
+            pass
+
+    if count % 2 == 0:
+        return ("yahoo", "duckduckgo")
+    return ("duckduckgo", "yahoo")
+
+
+def web_search(
+    query: str,
+    *,
+    max_results: int = DEFAULT_WEB_SEARCH_LIMIT,
+    reuse_browser: bool = True,
+) -> tuple[WebSearchResult, ...]:
+    """Unified web search used by every caller. Alternates evenly between Yahoo
+    Japan and DuckDuckGo; the picked backend is primary, and if it errors or
+    returns nothing the other is tried so alternation never costs result
+    quality. ``reuse_browser=False`` forces both backends onto a private
+    one-shot ``sync_playwright()`` — required when called off the main thread,
+    where the shared singleton instance (bound to its creating thread) is unsafe
+    to touch."""
+    dispatch = {
+        "yahoo": lambda: search_yahoo_japan_playwright(
+            query, max_results=max_results, reuse_context=reuse_browser
+        ),
+        "duckduckgo": lambda: search_duckduckgo_html(
+            query, max_results=max_results, reuse_context=reuse_browser
+        ),
+    }
+    primary, fallback = _next_search_order()
+    for name in (primary, fallback):
+        try:
+            results = dispatch[name]()
+        except Exception as exc:  # noqa: BLE001 — try the other backend, never hard-fail search
+            logger.warning("web_search backend=%s failed (%s); trying fallback", name, exc)
+            continue
+        if results:
+            logger.info("web_search backend=%s returned %d results", name, len(results))
+            return results
+    logger.warning("web_search: both backends returned no results query=%s", query)
+    return ()
 
 
 def build_web_research_answer(

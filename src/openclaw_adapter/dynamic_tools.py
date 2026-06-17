@@ -1796,9 +1796,9 @@ def build_dynamic_tool_runner_from_settings(settings) -> DynamicToolRunner | Non
         distill_enabled=True,
     )
     try:
-        from .web_search import search_yahoo_japan_playwright
+        from .web_search import web_search
 
-        runner.search_fn = lambda q, max_results: search_yahoo_japan_playwright(
+        runner.search_fn = lambda q, max_results: web_search(
             q, max_results=max_results)
     except Exception:
         logger.exception("dynamic_tools: search grounding backend unavailable")
