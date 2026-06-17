@@ -37,6 +37,11 @@ class AssistantSettings:
     # zero-arg command (skipping the slow LLM router). Below this it falls
     # through to the LLM router. Lower = faster but riskier mis-routes.
     openclaw_intent_fastpath_min_score: float = 0.65
+    # Minimum bge-m3 cosine similarity for a marketplace search title to count
+    # as the queried product (research title_match). Below this the listing is
+    # treated as a different item and dropped. Lower = higher recall / more
+    # false positives.
+    openclaw_research_title_match_threshold: float = 0.72
     openclaw_ca_bundle_path: str | None = None
     openclaw_tls_insecure_skip_verify: bool = False
     reputation_agent_server_url: str = "http://127.0.0.1:5000"
@@ -160,6 +165,10 @@ def get_settings() -> AssistantSettings:
         openclaw_intent_fastpath_min_score=_as_float(
             os.getenv("OPENCLAW_INTENT_FASTPATH_MIN_SCORE"),
             default=0.65,
+        ),
+        openclaw_research_title_match_threshold=_as_float(
+            os.getenv("OPENCLAW_RESEARCH_TITLE_MATCH_THRESHOLD"),
+            default=0.72,
         ),
         openclaw_ca_bundle_path=_none_if_empty(os.getenv("OPENCLAW_CA_BUNDLE_PATH")),
         openclaw_tls_insecure_skip_verify=_as_bool(os.getenv("OPENCLAW_TLS_INSECURE_SKIP_VERIFY")),

@@ -16,6 +16,44 @@ import logging
 import sys
 
 
+def _install_semantic_title_matcher() -> None:
+    """Register the bge-m3 semantic title matcher onto the Mercari search filter.
+
+    Best-effort: if settings/embedder/Ollama are unavailable the Mercari search
+    keeps its lexical token filter, so a scrape never fails just because the
+    embedder is down — it only loses the recall improvement."""
+    try:
+        from assistant_runtime import build_ssl_context, get_settings, load_dotenv
+        from market_monitor.mercari_search import _lexical_filter_by_query, set_title_matcher
+
+        from .kb_embedder import build_kb_embedder
+        from .title_match import build_semantic_title_matcher
+
+        load_dotenv()
+        settings = get_settings()
+        embedder = build_kb_embedder(settings, ssl_context=build_ssl_context(settings))
+        if embedder is None:
+            logging.getLogger(__name__).info(
+                "scrape_worker: embedder unavailable — Mercari filter stays lexical"
+            )
+            return
+        matcher = build_semantic_title_matcher(
+            embedder,
+            threshold=settings.openclaw_research_title_match_threshold,
+            lexical_fallback=lambda query, items: _lexical_filter_by_query(items, query),
+        )
+        set_title_matcher(matcher)
+        logging.getLogger(__name__).info(
+            "scrape_worker: semantic title matcher installed (threshold=%.2f)",
+            settings.openclaw_research_title_match_threshold,
+        )
+    except Exception:  # noqa: BLE001 - never let matcher wiring break a scrape
+        logging.getLogger(__name__).warning(
+            "scrape_worker: failed to install semantic title matcher; staying lexical",
+            exc_info=True,
+        )
+
+
 def _dispatch(target: str, payload: dict) -> object:
     from openclaw_adapter import research_command as rc
 
@@ -37,6 +75,7 @@ def _dispatch(target: str, payload: dict) -> object:
 
 def main() -> None:
     logging.basicConfig(level=logging.DEBUG, stream=sys.stderr, force=True)
+    _install_semantic_title_matcher()
     raw = sys.stdin.read()
     try:
         request = json.loads(raw)
