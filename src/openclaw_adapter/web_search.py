@@ -13,6 +13,8 @@ from urllib.parse import urlencode, urlparse
 
 from urllib.request import Request, urlopen
 
+from market_monitor import browser_stealth as bs
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_WEB_SEARCH_LIMIT = 5
@@ -62,11 +64,6 @@ class WebResearchAnswer:
 
 YAHOO_JAPAN_SEARCH_URL = "https://search.yahoo.co.jp/search"
 _YAHOO_PROFILE_DEFAULT = "~/.openclaw/browser_profile/yahoo_jp"
-_PLAYWRIGHT_UA = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36"
-)
 _YAHOO_WAIT_MS = 3500  # wait after domcontentloaded for JS to render results
 
 # --- Persistent browser session (singleton per process) ---
@@ -112,11 +109,8 @@ def _get_yahoo_context(profile_dir: str | None = None):
         profile.mkdir(parents=True, exist_ok=True)
 
         pw = sync_playwright().start()
-        ctx = pw.chromium.launch_persistent_context(
-            str(profile),
-            headless=True,
-            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
-            user_agent=_PLAYWRIGHT_UA,
+        ctx = bs.launch_stealth_persistent_context(
+            pw, str(profile), headless=True, logger=logger
         )
         _pw_instance = pw
         _pw_ctx = ctx
@@ -154,6 +148,7 @@ def search_yahoo_japan_playwright(
             except PlaywrightTimeout:
                 logger.warning("Yahoo Japan goto timeout; reading current DOM")
             page.wait_for_timeout(_YAHOO_WAIT_MS)
+            bs.humanize(page)
             results = _extract_yahoo_japan_results(page, max_results)
         finally:
             page.close()
@@ -161,15 +156,8 @@ def search_yahoo_japan_playwright(
         from playwright.sync_api import sync_playwright
 
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
-            )
-            context = browser.new_context(
-                locale="ja-JP",
-                user_agent=_PLAYWRIGHT_UA,
-                viewport={"width": 1280, "height": 900},
-            )
+            browser = bs.launch_stealth_chromium(playwright, headless=True, logger=logger)
+            context = bs.new_stealth_context(browser)
             page = context.new_page()
             try:
                 try:
@@ -177,6 +165,7 @@ def search_yahoo_japan_playwright(
                 except PlaywrightTimeout:
                     logger.warning("Yahoo Japan goto timeout; reading current DOM")
                 page.wait_for_timeout(_YAHOO_WAIT_MS)
+                bs.humanize(page)
                 results = _extract_yahoo_japan_results(page, max_results)
             finally:
                 context.close()
@@ -435,7 +424,7 @@ def fetch_page_text(
     *,
     timeout_seconds: int = 15,
     max_chars: int = DEFAULT_PAGE_CHARS,
-    user_agent: str = "OpenClawWebResearch/0.1 (+https://local-dev)",
+    user_agent: str = bs.MAC_CHROME_UA,
     ssl_context: ssl.SSLContext | None = None,
     fetch_url: FetchUrl | None = None,
 ) -> str:

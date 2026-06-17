@@ -4,7 +4,6 @@ import base64
 import json
 import logging
 import os
-import random
 import re
 import subprocess
 import tempfile
@@ -16,6 +15,8 @@ from html import unescape
 from pathlib import Path
 from urllib.parse import urlencode
 from urllib.parse import urlparse
+
+from market_monitor import browser_stealth as bs
 
 logger = logging.getLogger(__name__)
 
@@ -56,91 +57,13 @@ def _get(server_url: str, api_key: str, path: str) -> dict:
         return json.loads(r.read().decode())
 
 
-# ── Anti-detection: present a consistent, human macOS Chrome fingerprint ──────
+# ── Anti-detection: one shared human macOS Chrome fingerprint ─────────────────
 #
-# The host is a Mac mini, so we advertise a *Mac* Chrome — the previous Windows
-# UA on a macOS machine was itself a detector tell (UA platform ≠ real platform).
-# Everything below is kept internally consistent (UA ↔ navigator.platform ↔ WebGL
-# ↔ timezone/locale) so the fingerprint reads like one real browser, not a
-# stitched-together bot.
-
-_MAC_CHROME_UA = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/149.0.0.0 Safari/537.36"
-)
-
-# Patches applied before any page script runs. Real Chrome (channel="chrome")
-# already satisfies most of these; they matter for the bundled-Chromium fallback
-# and are idempotent/harmless under real Chrome.
-_STEALTH_INIT_SCRIPT = """
-() => {
-  Object.defineProperty(navigator, 'webdriver', {get: () => false});
-  Object.defineProperty(navigator, 'languages', {get: () => ['ja-JP', 'ja', 'en-US', 'en']});
-  Object.defineProperty(navigator, 'platform', {get: () => 'MacIntel'});
-  Object.defineProperty(navigator, 'maxTouchPoints', {get: () => 0});
-  Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
-  try { Object.defineProperty(navigator, 'deviceMemory', {get: () => 8}); } catch (e) {}
-  Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-  window.chrome = window.chrome || { runtime: {} };
-  const origQuery = window.navigator.permissions && window.navigator.permissions.query;
-  if (origQuery) {
-    window.navigator.permissions.query = (p) => (
-      p && p.name === 'notifications'
-        ? Promise.resolve({ state: Notification.permission })
-        : origQuery(p)
-    );
-  }
-  try {
-    const getParam = WebGLRenderingContext.prototype.getParameter;
-    WebGLRenderingContext.prototype.getParameter = function (p) {
-      if (p === 37445) return 'Google Inc. (Apple)';                       // UNMASKED_VENDOR_WEBGL
-      if (p === 37446) return 'ANGLE (Apple, Apple M2, OpenGL 4.1)';       // UNMASKED_RENDERER_WEBGL
-      return getParam.call(this, p);
-    };
-  } catch (e) {}
-}
-"""
-
-
-def _stealth_context_kwargs() -> dict:
-    """new_context() kwargs that pin a coherent JP-Mac-Chrome identity."""
-    return {
-        "locale": "ja-JP",
-        "timezone_id": "Asia/Tokyo",
-        "viewport": {"width": 1512, "height": 982},  # MacBook-ish, not a 2200px bot canvas
-        "device_scale_factor": 2,
-        "is_mobile": False,
-        "has_touch": False,
-        "user_agent": _MAC_CHROME_UA,
-        "extra_http_headers": {
-            "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
-        },
-    }
-
-
-def _resolve_browser_channel() -> str | None:
-    """Prefer the real Chrome binary — it carries far fewer automation signals
-    than bundled Chromium. Override with OPENCLAW_REPUTATION_BROWSER_CHANNEL
-    (set to empty string to force bundled Chromium)."""
-    override = os.getenv("OPENCLAW_REPUTATION_BROWSER_CHANNEL")
-    if override is not None:
-        return override or None
-    if Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome").exists():
-        return "chrome"
-    return None
-
-
-def _humanize(page) -> None:
-    """A few small, randomized scrolls + pauses so a session reads less like a
-    headless bot that goes straight goto→scrape. Best-effort; never fail the
-    capture over a cosmetic gesture."""
-    try:
-        for _ in range(random.randint(2, 4)):
-            page.mouse.wheel(0, random.randint(280, 620))
-            page.wait_for_timeout(random.randint(350, 900))
-    except Exception:
-        pass
+# The capture's stealth identity (Mac Chrome UA ↔ navigator.platform ↔ WebGL ↔
+# timezone/locale, real-Chrome channel with bundled-Chromium fallback, human
+# scrolls) lives in market_monitor.browser_stealth so every scraper in the stack
+# presents the same real-browser face. We only keep the Mercari-specific block
+# cooldown local, since that back-off policy is unique to this agent.
 
 
 # ── Mercari block cooldown (cross-restart back-off) ───────────────────────────
@@ -201,7 +124,7 @@ def _capture_page(page, url: str) -> dict:
         page.wait_for_load_state("networkidle", timeout=10000)
     except Exception:
         pass
-    _humanize(page)
+    bs.humanize(page)
     return {
         "raw_html":     _page_content_settled(page),
         "visible_text": page.evaluate("() => document.body ? document.body.innerText : ''"),
@@ -596,33 +519,8 @@ def _run_capture(query_url: str) -> dict:
     is_item = "/item/" in path
 
     with sync_playwright() as p:
-        launch_kwargs = {
-            "headless": True,
-            "args": [
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
-        }
-        chromium_executable = os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH")
-        if chromium_executable:
-            launch_kwargs["executable_path"] = chromium_executable
-        channel = _resolve_browser_channel()
-        if channel and not chromium_executable:
-            try:
-                browser = p.chromium.launch(channel=channel, **launch_kwargs)
-            except Exception as exc:
-                # Real Chrome can be momentarily unavailable (auto-update, etc.);
-                # bundled Chromium + stealth scripts is the safe fallback.
-                logger.warning(
-                    "reputation_agent: channel=%s launch failed (%s); falling back to bundled chromium",
-                    channel, exc,
-                )
-                browser = p.chromium.launch(**launch_kwargs)
-        else:
-            browser = p.chromium.launch(**launch_kwargs)
-        ctx = browser.new_context(**_stealth_context_kwargs())
-        ctx.add_init_script(_STEALTH_INIT_SCRIPT)
+        browser = bs.launch_stealth_chromium(p, headless=True, logger=logger)
+        ctx = bs.new_stealth_context(browser)
 
         item_html = item_text = None
         profile_url = None
