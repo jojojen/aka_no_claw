@@ -375,6 +375,20 @@ def test_reviews_capture_degraded_flags_unsupported_browser_interstitial() -> No
     ) is True
 
 
+def test_reviews_page_hard_blocked_flags_only_the_interstitial() -> None:
+    # The interstitial is a flagged-IP hard block: the capture loop must bail
+    # immediately (no tab-clicking, no retries) so the job finishes inside the
+    # client's wait window instead of surfacing as 'snapshot still pending'.
+    assert reputation_agent._reviews_page_hard_blocked(
+        "お使いのブラウザがWebサイトに対応していない可能性があります。" + "x" * 6000
+    ) is True
+    # A long, genuinely-loaded reviews page is NOT a hard block even when the
+    # heuristic degraded-check would still want a retry.
+    assert reputation_agent._reviews_page_hard_blocked("評価一覧\n良かった (3)") is False
+    assert reputation_agent._reviews_page_hard_blocked("") is False
+    assert reputation_agent._reviews_page_hard_blocked(None) is False
+
+
 def test_reviews_capture_degraded_flags_empty_text() -> None:
     assert reputation_agent._reviews_capture_degraded("") is True
     assert reputation_agent._reviews_capture_degraded(None) is True

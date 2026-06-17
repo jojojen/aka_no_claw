@@ -149,12 +149,21 @@ def _capture_review_tab_texts(page, initial_capture: dict) -> dict:
     return tab_text
 
 
+def _reviews_page_hard_blocked(text: str | None) -> bool:
+    """True for Mercari's 'unsupported browser' interstitial — a flagged-IP hard
+    block, not a transient empty render. Retrying it or clicking through the four
+    review sub-tabs only burns minutes of Playwright timeouts without ever
+    clearing the block, so the caller must bail immediately (mirrors the
+    item-page early-out for a blocked SPA shell)."""
+    return "お使いのブラウザ" in (text or "")  # unsupported-browser interstitial served to bots
+
+
 def _reviews_capture_degraded(text: str | None) -> bool:
     """True when a reviews capture looks empty or is Mercari's degraded
     'unsupported browser' interstitial — the case that otherwise forces the
     server's slow, flaky capture_lookup_page fallback."""
     t = text or ""
-    if "お使いのブラウザ" in t:  # unsupported-browser interstitial served to bots
+    if _reviews_page_hard_blocked(t):
         return True
     if "評価一覧" in t:
         return False
@@ -544,6 +553,21 @@ def _run_capture(query_url: str) -> dict:
             try:
                 rpg = ctx.new_page()
                 rd = _capture_page(rpg, reviews_url)
+                if _reviews_page_hard_blocked(rd["visible_text"]):
+                    # Flagged-IP interstitial: the 4-tab capture and any retry
+                    # only burn minutes on a block that won't clear, which is
+                    # what pushes the job past the client's wait window. Record
+                    # what loaded and stop — fast honest 'blocked' beats a slow
+                    # timeout that surfaces as 'snapshot still pending'.
+                    reviews_html = rd["raw_html"]
+                    reviews_text = rd["visible_text"]
+                    rpg.close()
+                    logger.info(
+                        "reputation_agent: reviews page hard-blocked (bot interstitial) "
+                        "attempt=%d — skipping review tabs and retries",
+                        attempt + 1,
+                    )
+                    break
                 tab_text = _capture_review_tab_texts(rpg, rd)
                 reviews_html = tab_text["reviews_html"]
                 reviews_text = tab_text["reviews_text"]
