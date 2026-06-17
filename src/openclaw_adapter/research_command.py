@@ -18,9 +18,19 @@ from urllib.request import Request, urlopen
 from bs4 import BeautifulSoup, NavigableString, Tag
 
 from .knowledge_db import KnowledgeDatabase, KnowledgeEntry
+from .scrape_subprocess import run_in_subprocess
 from .web_search import WebSearchResult
 
 logger = logging.getLogger(__name__)
+
+# Per-scrape wall-clock budgets (seconds). Each Playwright scrape runs in its
+# own killable subprocess; on expiry the process group is SIGKILLed and the
+# stage degrades gracefully rather than hanging the whole /research job.
+_ACTIVE_SCRAPE_TIMEOUT = 120.0
+_SOLD_SCRAPE_TIMEOUT = 90.0
+_SOLD_AVG_SCRAPE_TIMEOUT = 75.0
+_SHOP_REF_SCRAPE_TIMEOUT = 75.0
+_ITEM_HTML_SCRAPE_TIMEOUT = 90.0
 
 SearchFn = Callable[[str, int], tuple[object, ...]]
 FetchHtmlFn = Callable[[str], str]
@@ -510,7 +520,12 @@ def build_research_item_fetch_html(*, enable_playwright: bool = True) -> FetchHt
     def _fetch(url: str) -> str:
         if enable_playwright:
             try:
-                html = fetch_mercari_item_html_with_playwright(url)
+                # Bounded so a wedged Playwright teardown can't hang the job; the
+                # daemon thread is abandoned on timeout and we fall back to HTTP.
+                html = _run_in_isolated_thread(
+                    lambda: fetch_mercari_item_html_with_playwright(url),
+                    timeout=_ITEM_HTML_SCRAPE_TIMEOUT,
+                )
                 if html and "出品者" in html:
                     return html
                 logger.info("research item: Playwright shell missing 出品者, using static fetch url=%s", url)
@@ -888,7 +903,7 @@ def _clean_item_title(text: str) -> str:
     return cleaned
 
 
-def _run_in_isolated_thread(func: Callable[[], object]) -> object:
+def _run_in_isolated_thread(func: Callable[[], object], *, timeout: float | None = None) -> object:
     result_box: dict[str, object] = {}
     error_box: dict[str, BaseException] = {}
     done = threading.Event()
@@ -903,7 +918,14 @@ def _run_in_isolated_thread(func: Callable[[], object]) -> object:
 
     thread = threading.Thread(target=runner, daemon=True)
     thread.start()
-    done.wait()
+    # A bounded wait is the universal backstop: a scrape wedged in Playwright
+    # teardown (browser.close() can block forever when headless chromium dies —
+    # page-level timeouts don't cover it) must not hang the whole job. The
+    # thread is daemon, so abandoning it is safe; callers catch the TimeoutError
+    # and degrade that stage gracefully. Subprocess isolation (run_in_subprocess)
+    # is the leak-free first line of defence; this guards anything still in-thread.
+    if not done.wait(timeout):
+        raise TimeoutError(f"isolated scrape exceeded {timeout}s budget")
     if "error" in error_box:
         raise error_box["error"]
     return result_box.get("value")
@@ -1343,12 +1365,18 @@ class ResearchCommandService:
         ctx.sold_price_evidence = sold_evidence
         ctx.sold_average_jpy = sold_avg
         ctx.shop_reference = shop_reference
+        listed_condition_label = (
+            _classify_condition_class(ctx.item_data.title)
+            if ctx.item_data is not None and ctx.item_data.title
+            else None
+        )
         result = _build_price_section_result(
             query=query,
             listed_price_jpy=listed_price,
             active_evidence=active_evidence,
             sold_evidence=sold_evidence,
             sold_average_jpy=sold_avg,
+            listed_condition_label=listed_condition_label,
             shop_reference=shop_reference,
             active_dropped=active_dropped,
             sold_dropped=sold_dropped,
@@ -2295,17 +2323,29 @@ def _price_evidence_from_market_item(item: dict[str, object], *, sold_status: st
     )
 
 
+def _prices_by_condition(evidence: tuple[PriceEvidence, ...]) -> dict[str, list[int]]:
+    """Bucket priced evidence into 中古 / 新品 (unlabeled defaults to 中古)."""
+    buckets: dict[str, list[int]] = {"中古": [], "新品": []}
+    for e in evidence:
+        if e.price_jpy is None:
+            continue
+        buckets.setdefault(e.condition_label or "中古", []).append(e.price_jpy)
+    return buckets
+
+
+def _condition_average(evidence: tuple[PriceEvidence, ...], label: str) -> float | None:
+    """Average sold/active price for one condition class, or None when absent."""
+    prices = _prices_by_condition(evidence).get(label) or []
+    return sum(prices) / len(prices) if prices else None
+
+
 def _condition_split_lines(evidence: tuple[PriceEvidence, ...], *, kind: str) -> list[str]:
     """Per-condition (中古 / 新品) median+range lines for a price sample.
 
     Returns lines only when BOTH classes are present — when the whole sample is
     one condition, the headline line already conveys it, so we skip the noise.
     ``kind`` is the band label (e.g. ``active``) shown in each line."""
-    buckets: dict[str, list[int]] = {"中古": [], "新品": []}
-    for e in evidence:
-        if e.price_jpy is None:
-            continue
-        buckets.setdefault(e.condition_label or "中古", []).append(e.price_jpy)
+    buckets = _prices_by_condition(evidence)
     present = [(label, buckets[label]) for label in ("中古", "新品") if buckets[label]]
     if len(present) < 2:
         return []
@@ -2363,6 +2403,7 @@ def _build_price_section_result(
     active_evidence: tuple[PriceEvidence, ...],
     sold_evidence: tuple[PriceEvidence, ...],
     sold_average_jpy: float | None,
+    listed_condition_label: str | None = None,
     shop_reference: ShopReference | None = None,
     active_dropped: int = 0,
     sold_dropped: int = 0,
@@ -2411,14 +2452,45 @@ def _build_price_section_result(
             status = "partial"
 
     if listed_price_jpy is not None and sold_average_jpy is not None and sold_average_jpy > 0:
-        ratio = listed_price_jpy / sold_average_jpy
-        diff_pct = abs(ratio - 1.0) * 100
-        if ratio <= 0.85:
-            summary_parts.append(f"目前開價低於 sold 均價約 {diff_pct:.0f}%")
-        elif ratio >= 1.10:
-            summary_parts.append(f"目前開價高於 sold 均價約 {diff_pct:.0f}%")
-        else:
-            summary_parts.append("目前開價接近 sold 均價")
+        # Compare like-for-like: a 中古 listing must be measured against 中古 sold
+        # comps, not a pooled average that 新品 sealed stock inflates.
+        sold_classes = [
+            label for label in ("中古", "新品") if _prices_by_condition(sold_evidence).get(label)
+        ]
+        compare_avg: float | None = None
+        cond_note = ""
+        if not sold_classes:
+            # Only a pooled average is available (sold avg came from the lookup
+            # endpoint with no per-item evidence to split) — be honest it's mixed.
+            compare_avg = sold_average_jpy
+            cond_note = "整體（未分新品／中古）"
+        elif listed_condition_label is not None:
+            compare_avg = _condition_average(sold_evidence, listed_condition_label)
+            if compare_avg is not None:
+                cond_note = f"同條件（{listed_condition_label}）"
+            # else: no same-condition comp → withhold below rather than cross-compare.
+        elif len(sold_classes) == 1:
+            # Listed condition unknown but the sample is one class → pooled IS it.
+            compare_avg = sold_average_jpy
+            cond_note = f"同條件（{sold_classes[0]}）"
+        # else: listed condition unknown AND sample mixed → no single fair number.
+
+        if compare_avg is not None and compare_avg > 0:
+            ratio = listed_price_jpy / compare_avg
+            diff_pct = abs(ratio - 1.0) * 100
+            if ratio <= 0.85:
+                summary_parts.append(f"目前開價低於{cond_note} sold 均價約 {diff_pct:.0f}%")
+            elif ratio >= 1.10:
+                summary_parts.append(f"目前開價高於{cond_note} sold 均價約 {diff_pct:.0f}%")
+            else:
+                summary_parts.append(f"目前開價接近{cond_note} sold 均價")
+        elif listed_condition_label is not None and sold_classes:
+            # Listed condition known but no same-condition comp; a cross-condition
+            # % is exactly the 新品／中古 mix the pooled average produces, so we
+            # withhold it rather than mislead.
+            summary_parts.append(
+                f"無同條件（{listed_condition_label}）sold 樣本，未做價差比較（避免新品／中古混比）"
+            )
 
     if sold_average_jpy is None and not active_prices:
         if shop_band_text:
@@ -2549,8 +2621,8 @@ def _build_liquidity_section_result(
     )
 
 
-def _default_active_market_search(query: str, price_cap: int, max_results: int) -> list[dict[str, object]]:
-    """Cross-platform active listing search.
+def _active_market_scrape_impl(query: str, price_cap: int, max_results: int) -> list[dict[str, object]]:
+    """Raw cross-platform active listing scrape (runs inside the scrape worker).
 
     Reuses the marketplace registry that the watchlist monitor uses
     (Mercari + Rakuma + Yuyutei, and any future source registered there) so
@@ -2560,79 +2632,141 @@ def _default_active_market_search(query: str, price_cap: int, max_results: int) 
     from price_monitor_bot.watch_monitor import default_marketplace_clients
 
     clients = default_marketplace_clients()
+    merged: list[dict[str, object]] = []
+    for source_name, client in clients.items():
+        # Yuyutei is a shop, not C2C — its 買取/販売 prices are surfaced as a
+        # separate reference band (see _default_shop_reference_fn) so they
+        # don't get averaged into the Mercari/Rakuma C2C median.
+        if source_name == "yuyutei":
+            continue
+        try:
+            listings = client.search(query, price_max=price_cap, max_results=max_results)
+        except Exception:
+            logger.exception(
+                "Research active market search failed source=%s query=%s",
+                source_name, query,
+            )
+            continue
+        for listing in listings:
+            merged.append(
+                {
+                    "source": getattr(listing, "source", source_name) or source_name,
+                    "item_id": getattr(listing, "item_id", ""),
+                    "title": getattr(listing, "title", ""),
+                    "price_jpy": getattr(listing, "price_jpy", None),
+                    "url": getattr(listing, "url", ""),
+                    "thumbnail_url": getattr(listing, "thumbnail_url", None),
+                }
+            )
+    return merged
 
-    def run() -> list[dict[str, object]]:
-        merged: list[dict[str, object]] = []
-        for source_name, client in clients.items():
-            # Yuyutei is a shop, not C2C — its 買取/販売 prices are surfaced as a
-            # separate reference band (see _default_shop_reference_fn) so they
-            # don't get averaged into the Mercari/Rakuma C2C median.
-            if source_name == "yuyutei":
-                continue
-            try:
-                listings = client.search(query, price_max=price_cap, max_results=max_results)
-            except Exception:
-                logger.exception(
-                    "Research active market search failed source=%s query=%s",
-                    source_name, query,
-                )
-                continue
-            for listing in listings:
-                merged.append(
-                    {
-                        "source": getattr(listing, "source", source_name) or source_name,
-                        "item_id": getattr(listing, "item_id", ""),
-                        "title": getattr(listing, "title", ""),
-                        "price_jpy": getattr(listing, "price_jpy", None),
-                        "url": getattr(listing, "url", ""),
-                        "thumbnail_url": getattr(listing, "thumbnail_url", None),
-                    }
-                )
-        return merged
 
-    return _run_in_isolated_thread(run)
+def _sold_market_scrape_impl(query: str, max_results: int) -> list[dict[str, object]]:
+    """Raw Mercari sold-listing scrape (runs inside the scrape worker)."""
+    from market_monitor.mercari_search import search_mercari_sold
+
+    return search_mercari_sold(query, max_results=max_results)
+
+
+def _sold_average_scrape_impl(query: str) -> float | None:
+    """Raw Mercari sold-average scrape (runs inside the scrape worker)."""
+    from market_monitor.mercari_search import fetch_avg_sold_price
+
+    return fetch_avg_sold_price(query)
+
+
+def _default_active_market_search(query: str, price_cap: int, max_results: int) -> list[dict[str, object]]:
+    result = run_in_subprocess(
+        "active",
+        {"query": query, "price_cap": price_cap, "max_results": max_results},
+        timeout=_ACTIVE_SCRAPE_TIMEOUT,
+    )
+    return list(result or [])
 
 
 def _default_sold_market_search(query: str, max_results: int) -> list[dict[str, object]]:
-    from market_monitor.mercari_search import search_mercari_sold
-
-    return _run_in_isolated_thread(
-        lambda: search_mercari_sold(query, max_results=max_results)
+    result = run_in_subprocess(
+        "sold",
+        {"query": query, "max_results": max_results},
+        timeout=_SOLD_SCRAPE_TIMEOUT,
     )
+    return list(result or [])
 
 
 def _default_sold_average_lookup(query: str) -> float | None:
-    from market_monitor.mercari_search import fetch_avg_sold_price
+    result = run_in_subprocess("sold_avg", {"query": query}, timeout=_SOLD_AVG_SCRAPE_TIMEOUT)
+    return float(result) if isinstance(result, (int, float)) else None
 
-    return _run_in_isolated_thread(lambda: fetch_avg_sold_price(query))
+
+def _shop_reference_to_dict(ref: ShopReference) -> dict[str, object]:
+    return {
+        "label": ref.label,
+        "buy_reference": ref.buy_reference,
+        "sell_reference": ref.sell_reference,
+        "stock_total": ref.stock_total,
+        "buy_count": ref.buy_count,
+        "sell_count": ref.sell_count,
+        "sample_urls": list(ref.sample_urls),
+        "buy_min": ref.buy_min,
+        "buy_max": ref.buy_max,
+        "sell_min": ref.sell_min,
+        "sell_max": ref.sell_max,
+    }
+
+
+def _shop_reference_from_dict(data: dict[str, object]) -> ShopReference:
+    return ShopReference(
+        label=str(data["label"]),
+        buy_reference=data.get("buy_reference"),
+        sell_reference=data.get("sell_reference"),
+        stock_total=int(data.get("stock_total") or 0),
+        buy_count=int(data.get("buy_count") or 0),
+        sell_count=int(data.get("sell_count") or 0),
+        sample_urls=tuple(data.get("sample_urls") or ()),
+        buy_min=data.get("buy_min"),
+        buy_max=data.get("buy_max"),
+        sell_min=data.get("sell_min"),
+        sell_max=data.get("sell_max"),
+    )
+
+
+def _shop_reference_scrape_impl(
+    query: str, price_cap: int, source_options: dict[str, object] | None
+) -> ShopReference | None:
+    """Raw Yuyu亭 reference-band scrape (runs inside the scrape worker)."""
+    from market_monitor.yuyutei_search import YuyuteiMarketplaceSearchClient
+
+    band = YuyuteiMarketplaceSearchClient().reference_band(
+        query, price_max=price_cap, source_options=source_options
+    )
+    if band is None or not band.has_data:
+        return None
+    return ShopReference(
+        label="遊々亭",
+        buy_reference=band.buy_reference,
+        sell_reference=band.sell_reference,
+        stock_total=band.sell_stock_total,
+        buy_count=len(band.buy_prices),
+        sell_count=len(band.sell_prices),
+        sample_urls=band.sample_urls,
+        buy_min=band.buy_min,
+        buy_max=band.buy_max,
+        sell_min=band.sell_min,
+        sell_max=band.sell_max,
+    )
 
 
 def _shop_reference_from_band(
     query: str, price_cap: int, source_options: dict[str, object] | None
 ) -> ShopReference | None:
-    from market_monitor.yuyutei_search import YuyuteiMarketplaceSearchClient
-
-    def run() -> ShopReference | None:
-        band = YuyuteiMarketplaceSearchClient().reference_band(
-            query, price_max=price_cap, source_options=source_options
-        )
-        if band is None or not band.has_data:
-            return None
-        return ShopReference(
-            label="遊々亭",
-            buy_reference=band.buy_reference,
-            sell_reference=band.sell_reference,
-            stock_total=band.sell_stock_total,
-            buy_count=len(band.buy_prices),
-            sell_count=len(band.sell_prices),
-            sample_urls=band.sample_urls,
-            buy_min=band.buy_min,
-            buy_max=band.buy_max,
-            sell_min=band.sell_min,
-            sell_max=band.sell_max,
-        )
-
-    return _run_in_isolated_thread(run)
+    result = run_in_subprocess(
+        "shop_reference",
+        {"query": query, "price_cap": price_cap, "source_options": source_options},
+        timeout=_SHOP_REF_SCRAPE_TIMEOUT,
+    )
+    if not isinstance(result, dict):
+        return None
+    return _shop_reference_from_dict(result)
 
 
 def build_shop_reference_fn(
