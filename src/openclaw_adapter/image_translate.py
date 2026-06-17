@@ -11,7 +11,6 @@ from __future__ import annotations
 import base64
 import io
 import json
-import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -19,6 +18,8 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from assistant_runtime import AssistantSettings, build_ssl_context
+
+from .embedding_match import cosine, embed_unit_vectors, l2_normalize
 
 VisionOcrFn = Callable[[Path], str]
 TranslateFn = Callable[[str], "tuple[str, str]"]
@@ -287,31 +288,6 @@ _IMAGE_TRANSLATE_MIN_SCORE = 0.62
 _IMAGE_TRANSLATE_MARGIN = 0.02
 
 
-def _l2_normalize(vec: "list[float]") -> "list[float] | None":
-    norm = math.sqrt(math.fsum(x * x for x in vec))
-    if not norm or not math.isfinite(norm):
-        return None
-    return [x / norm for x in vec]
-
-
-def _cosine(a: "list[float]", b: "list[float]") -> float:
-    return math.fsum(x * y for x, y in zip(a, b))
-
-
-def _embed_unit_vectors(embedder, phrasings) -> "list[list[float]]":
-    rows: list[list[float]] = []
-    for phrasing in phrasings:
-        try:
-            vec = embedder(phrasing)
-        except Exception:  # noqa: BLE001 - skip a phrasing the embedder chokes on.
-            vec = None
-        if vec:
-            unit = _l2_normalize(vec)
-            if unit is not None:
-                rows.append(unit)
-    return rows
-
-
 def build_image_translate_caption_recognizer(
     settings: AssistantSettings,
     *,
@@ -335,10 +311,10 @@ def build_image_translate_caption_recognizer(
     if embedder is None:
         return None
 
-    positives = _embed_unit_vectors(embedder, _IMAGE_TRANSLATE_PHRASINGS)
+    positives = embed_unit_vectors(embedder, _IMAGE_TRANSLATE_PHRASINGS)
     if not positives:
         return None
-    negatives = _embed_unit_vectors(embedder, _IMAGE_TRANSLATE_NEGATIVE_PHRASINGS)
+    negatives = embed_unit_vectors(embedder, _IMAGE_TRANSLATE_NEGATIVE_PHRASINGS)
 
     def recognize(caption: "str | None") -> bool:
         if not caption or not caption.strip():
@@ -349,11 +325,11 @@ def build_image_translate_caption_recognizer(
             return False
         if not qvec:
             return False
-        nq = _l2_normalize(qvec)
+        nq = l2_normalize(qvec)
         if nq is None:
             return False
-        pos = max(_cosine(nq, row) for row in positives)
-        neg = max((_cosine(nq, row) for row in negatives), default=0.0)
+        pos = max(cosine(nq, row) for row in positives)
+        neg = max((cosine(nq, row) for row in negatives), default=0.0)
         return pos >= min_score and (pos - neg) >= margin
 
     return recognize

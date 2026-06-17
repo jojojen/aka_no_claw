@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 from pathlib import Path
 
 from price_monitor_bot.natural_language import TelegramNaturalLanguageIntent
+
+from .embedding_match import cosine, embed_unit_vectors, l2_normalize
 
 logger = logging.getLogger(__name__)
 
@@ -39,17 +40,6 @@ _PHRASINGS_PATH = (
 )
 
 
-def _norm(vec: list[float]) -> list[float] | None:
-    n = math.sqrt(math.fsum(x * x for x in vec))
-    if not n or not math.isfinite(n):
-        return None
-    return [x / n for x in vec]
-
-
-def _dot(a: list[float], b: list[float]) -> float:
-    return math.fsum(x * y for x, y in zip(a, b))
-
-
 class EmbeddingIntentRouter:
     def __init__(
         self,
@@ -66,16 +56,7 @@ class EmbeddingIntentRouter:
         self._zero_arg = frozenset(zero_arg_intents)
         self._index: dict[str, list[list[float]]] = {}
         for intent, examples in phrasings.items():
-            rows: list[list[float]] = []
-            for ex in examples:
-                try:
-                    vec = embedder(ex)
-                except Exception:  # noqa: BLE001 - best effort, skip bad phrasing
-                    vec = None
-                if vec:
-                    unit = _norm(vec)
-                    if unit is not None:
-                        rows.append(unit)
+            rows = embed_unit_vectors(embedder, examples)
             if rows:
                 self._index[intent] = rows
         self.ready = bool(self._index)
@@ -90,11 +71,11 @@ class EmbeddingIntentRouter:
             return None
         if not qvec:
             return None
-        nq = _norm(qvec)
+        nq = l2_normalize(qvec)
         if nq is None:
             return None
         scored = [
-            (intent, max(_dot(nq, row) for row in rows))
+            (intent, max(cosine(nq, row) for row in rows))
             for intent, rows in self._index.items()
         ]
         scored.sort(key=lambda t: t[1], reverse=True)
