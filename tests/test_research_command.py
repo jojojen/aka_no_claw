@@ -75,6 +75,159 @@ def test_normalize_mercari_item_url_strips_tracking_query() -> None:
     ) == "https://jp.mercari.com/item/m65806654179"
 
 
+def test_normalize_market_title_folds_katakana_vu_row_variants() -> None:
+    from openclaw_adapter.research_command import _normalize_market_title
+
+    # ヴァイスシュヴァルツ (correct) vs ヴァイスシュバルツ (common b-row spelling)
+    assert _normalize_market_title("桐谷遥 世界一の笑顔 ヴァイスシュヴァルツ SR") == (
+        _normalize_market_title("桐谷遥 世界一の笑顔 ヴァイスシュバルツ SR")
+    )
+
+
+def test_comp_filter_keeps_katakana_vu_row_spelling_variant() -> None:
+    from openclaw_adapter.research_command import _filter_market_items_for_price
+
+    reference = "桐谷遥 世界一の笑顔 ヴァイスシュバルツ SR"
+    items = [
+        {"title": "ヴァイスシュヴァルツ 桐谷遥 世界一の笑顔 SR", "price": 700},
+    ]
+    kept, dropped = _filter_market_items_for_price(
+        reference_title=reference, items=items, min_similarity=0.5
+    )
+    assert dropped == 0
+    assert len(kept) == 1
+
+
+def test_appreciation_enricher_fetches_pages_and_summarizes() -> None:
+    from openclaw_adapter.research_command import build_appreciation_enricher
+
+    fetched: list[str] = []
+    captured_sources: list[tuple] = []
+
+    def _fake_fetch(url: str) -> str:
+        fetched.append(url)
+        return f"page text for {url}"
+
+    def _fake_summarize(query: str, sources) -> str:
+        captured_sources.append(sources)
+        return f"催化劑：{query} 有再販與作者新作話題"
+
+    enricher = build_appreciation_enricher(
+        fetch_page_fn=_fake_fetch, summarize_fn=_fake_summarize, max_pages=2
+    )
+    results = (
+        WebSearchResult(title="t1", url="https://a.example/1", snippet="s1"),
+        WebSearchResult(title="t2", url="https://b.example/2", snippet="s2"),
+        WebSearchResult(title="t3", url="https://c.example/3", snippet="s3"),
+    )
+
+    summary = enricher("桐谷遥 SR", results)
+
+    assert fetched == ["https://a.example/1", "https://b.example/2"]  # capped at max_pages
+    assert captured_sources[0][0].content == "page text for https://a.example/1"
+    assert summary == "催化劑：桐谷遥 SR 有再販與作者新作話題"
+
+
+def test_appreciation_section_uses_enrichment_and_drops_snippet_warning() -> None:
+    from openclaw_adapter.research_command import _build_appreciation_section_result
+
+    results = (WebSearchResult(title="t", url="https://x.example", snippet="s"),)
+    result = _build_appreciation_section_result(
+        query="桐谷遥 SR",
+        entries=(),
+        heat_by_canonical={},
+        search_results=results,
+        enrichment="催化劑：近期有再販消息",
+    )
+    assert "web 催化劑摘要：催化劑：近期有再販消息" in result.summary
+    assert all("snippet" not in w for w in result.warnings)
+    assert result.status == "partial"
+
+
+def test_parse_entity_profile_requires_confident_and_canonical() -> None:
+    from openclaw_adapter.research_command import _parse_entity_profile
+
+    assert _parse_entity_profile('{"confident": false, "canonical_query": "x"}') is None
+    assert _parse_entity_profile('{"confident": true, "canonical_query": ""}') is None
+    profile = _parse_entity_profile(
+        '```json\n{"confident": true, "canonical_query": "桐谷遥 世界一の笑顔 '
+        'ヴァイスシュヴァルツ SR", "card_name": "桐谷遥 世界一の笑顔", '
+        '"series": "ヴァイスシュヴァルツ", "rarity": "SR", '
+        '"aliases": ["ヴァイスシュバルツ 桐谷遥"]}\n```'
+    )
+    assert profile is not None
+    assert profile.canonical_query == "桐谷遥 世界一の笑顔 ヴァイスシュヴァルツ SR"
+    assert profile.series == "ヴァイスシュヴァルツ"
+    assert "ヴァイスシュバルツ 桐谷遥" in profile.aliases
+
+
+def test_identify_entities_uses_recognizer_canonical_for_price_query(tmp_path: Path) -> None:
+    from openclaw_adapter.research_command import (
+        EntityProfile,
+        ItemData,
+        ResearchBudget,
+        ResearchCommandService,
+        ResearchJobContext,
+        _build_price_query,
+    )
+
+    db_path = str(tmp_path / "knowledge.sqlite3")
+    KnowledgeDatabase(db_path).bootstrap()
+
+    captured: list[str] = []
+
+    def _recognizer(item: ItemData) -> EntityProfile:
+        captured.append(item.title)
+        return EntityProfile(
+            canonical_query="桐谷遥 世界一の笑顔 ヴァイスシュヴァルツ SR",
+            card_name="桐谷遥 世界一の笑顔",
+            series="ヴァイスシュヴァルツ",
+            rarity="SR",
+            aliases=("ヴァイスシュバルツ 桐谷遥",),
+        )
+
+    service = ResearchCommandService(
+        knowledge_db_path=db_path,
+        entity_recognizer_fn=_recognizer,
+    )
+    item = ItemData(
+        source_site="mercari",
+        item_url="https://jp.mercari.com/item/m12345678901",
+        item_id="m12345678901",
+        title="桐谷遥 世界一の笑顔 ヴァイスシュバルツ SR",
+        listed_price_jpy=1555,
+        description="",
+        condition_label=None,
+        seller_id="ゴロリ",
+        seller_url=None,
+        image_urls=(),
+        fetched_at="2026-06-17T00:00:00+00:00",
+        source_confidence=0.7,
+    )
+    ctx = ResearchJobContext(
+        raw_input=item.item_url,
+        chat_id="1",
+        notifier=FakeNotifier(),
+        budget=ResearchBudget(max_searches=5),
+        search_fn=lambda query, limit: (),
+        item_data=item,
+    )
+
+    summary = service._stage_identify_entities(ctx)
+
+    assert captured == [item.title]
+    assert ctx.entity_profile is not None
+    assert _build_price_query(ctx) == "桐谷遥 世界一の笑顔 ヴァイスシュヴァルツ SR"
+    assert "canonical" in summary
+    # the corrected canonical spelling resolves back to the item via alias
+    assert (
+        KnowledgeDatabase(db_path).lookup_canonical(
+            "桐谷遥 世界一の笑顔 ヴァイスシュヴァルツ SR"
+        )
+        == "mercari:m12345678901"
+    )
+
+
 def test_parse_research_target_treats_non_url_as_text_query() -> None:
     target = parse_research_target("  初音ミク   15th   フィギュア ")
 
@@ -364,6 +517,43 @@ def test_mercari_item_adapter_infers_new_condition_from_title_when_page_omits_fi
     item = adapter.fetch(parse_research_target("https://jp.mercari.com/item/m12345000000"))
 
     assert item.condition_label == "新品、未使用"
+
+
+def test_mercari_item_adapter_reads_condition_from_embedded_next_data_json() -> None:
+    # SPA case: static HTML has no 商品の状態 row; the real condition lives in the
+    # __NEXT_DATA__ JSON the page hydrates from. Title alone would mislabel it.
+    html = """
+    <html>
+      <head>
+        <title>桐谷遥 世界一の笑顔 ヴァイスシュバルツ SR by メルカリ</title>
+        <meta name="description" content="generic mercari description">
+        <meta name="product:price:amount" content="1555">
+      </head>
+      <body>
+        <main><p>detail rendered client-side</p></main>
+        <script id="__NEXT_DATA__" type="application/json">
+          {"props": {"pageProps": {"item": {"name": "桐谷遥",
+           "itemCondition": {"id": 3, "name": "目立った傷や汚れなし"}}}}}
+        </script>
+      </body>
+    </html>
+    """
+    adapter = MercariItemAdapter(fetch_html_fn=lambda _url: html)
+
+    item = adapter.fetch(parse_research_target("https://jp.mercari.com/item/m12345111111"))
+
+    assert item.condition_label == "目立った傷や汚れなし"
+
+
+def test_extract_condition_from_embedded_json_returns_none_without_known_label() -> None:
+    from openclaw_adapter.research_command import _extract_condition_from_embedded_json
+
+    html = (
+        '<script id="__NEXT_DATA__" type="application/json">'
+        '{"props": {"item": {"itemCondition": {"name": "なんか変な値"}}}}'
+        "</script>"
+    )
+    assert _extract_condition_from_embedded_json(html) is None
 
 
 def test_research_item_knowledge_uses_item_id_key_and_updates_same_row(tmp_path: Path) -> None:
