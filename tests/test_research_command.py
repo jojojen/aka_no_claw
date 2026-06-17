@@ -761,6 +761,7 @@ def test_research_handler_builds_price_section_from_active_and_sold_samples(tmp_
         active_market_search_fn=active_search,
         sold_market_search_fn=sold_search,
         sold_average_lookup_fn=lambda query: 9999.0,
+        shop_reference_fn=lambda q, p: None,
     )
 
     reply = handler("https://jp.mercari.com/item/m18542743389", "chat-1")
@@ -770,7 +771,7 @@ def test_research_handler_builds_price_section_from_active_and_sold_samples(tmp_
     assert "active 樣本 3 筆（mercari 3筆 中位¥6,800），中位數 ¥6,800，區間 ¥6,100–¥7,200" in reply
     assert "目前開價接近同條件（中古） sold 均價" in reply
     assert "流動性分析 [ok]" in reply
-    assert "active 3 筆（跨平台）/ Mercari sold 3 筆；sold/active 比 1.00；樣本顯示流動性中等，仍有一定成交速度。" in reply
+    assert "樣本顯示流動性中等，仍有一定成交速度。；active 3 筆（跨平台）/ Mercari sold 3 筆；sold/active 比 1.00" in reply
     assert "https://jp.mercari.com/item/s1" in reply
 
 
@@ -989,6 +990,7 @@ def test_research_handler_price_stage_works_for_text_query_without_item_page() -
         active_market_search_fn=active_search,
         sold_market_search_fn=_fake_sold_search,
         sold_average_lookup_fn=lambda query: None,
+        shop_reference_fn=lambda q, p: None,
     )
 
     reply = handler("初音ミク 15th フィギュア", "chat-1")
@@ -997,7 +999,7 @@ def test_research_handler_price_stage_works_for_text_query_without_item_page() -
     assert "合理市價分析 [partial]" in reply
     assert "active 樣本 2 筆（mercari 2筆 中位¥9,400），中位數 ¥9,400，區間 ¥9,000–¥9,800" in reply
     assert "流動性分析 [partial]" in reply
-    assert "active 2 筆（跨平台）/ Mercari sold 0 筆；sold/active 比 0.00；樣本偏少，流動性暫時只能做弱判讀。" in reply
+    assert "樣本偏少，流動性暫時只能做弱判讀。；active 2 筆（跨平台）/ Mercari sold 0 筆；sold/active 比 0.00" in reply
     assert "Mercari sold 價目前只拿到平均值接口；此查詢未回傳可用 sold avg。" in reply
 
 
@@ -1332,6 +1334,7 @@ def test_research_handler_degrades_when_market_search_backends_fail(tmp_path: Pa
         active_market_search_fn=fail_active,
         sold_market_search_fn=fail_sold,
         sold_average_lookup_fn=fail_avg,
+        shop_reference_fn=lambda q, p: None,
     )
 
     reply = handler("https://jp.mercari.com/item/m18542743389", "chat-1")
@@ -1420,3 +1423,113 @@ def test_price_comparison_withheld_when_no_same_condition_comp() -> None:
     assert "無同條件（新品）sold 樣本，未做價差比較（避免新品／中古混比）" in result.summary
     # The misleading "open price > used average" reading must NOT appear.
     assert "高於" not in result.summary
+
+
+# ── Yuyu-tei cross-process cooldown + output note ─────────────────────────────
+
+def test_yuyutei_cooldown_helpers_round_trip(tmp_path, monkeypatch) -> None:
+    from openclaw_adapter import research_command as rc
+
+    fake_file = tmp_path / "cooldown"
+    monkeypatch.setattr(rc, "_yuyutei_cooldown_path", lambda: fake_file)
+
+    assert rc._yuyutei_cooldown_remaining() == 0.0  # no file → no cooldown
+
+    rc._yuyutei_trip_cross_process_cooldown()
+    assert fake_file.exists()
+    remaining = rc._yuyutei_cooldown_remaining()
+    assert 0.0 < remaining <= 300.0
+
+
+def test_shop_reference_from_band_skips_subprocess_when_cooldown_active(monkeypatch) -> None:
+    """When the cross-process cooldown is fresh, _shop_reference_from_band must
+    raise RuntimeError before spawning a subprocess."""
+    from openclaw_adapter import research_command as rc
+
+    monkeypatch.setattr(rc, "_yuyutei_cooldown_remaining", lambda: 250.0)
+
+    launched = []
+    monkeypatch.setattr(rc, "run_in_subprocess", lambda *a, **kw: launched.append(a) or {})
+
+    import pytest
+    with pytest.raises(RuntimeError, match="rate-limited"):
+        rc._shop_reference_from_band("query", 5000, None)
+
+    assert launched == []  # subprocess never launched
+
+
+def test_shop_reference_from_band_raises_after_subprocess_writes_cooldown(monkeypatch) -> None:
+    """When the subprocess returns None AND the cooldown file was freshly written
+    (by a 429 inside the subprocess), _shop_reference_from_band must raise so
+    the caller adds a user-visible warning."""
+    from openclaw_adapter import research_command as rc
+
+    # Cooldown not active before subprocess, but written during it.
+    calls = iter([0.0, 250.0])
+    monkeypatch.setattr(rc, "_yuyutei_cooldown_remaining", lambda: next(calls))
+    monkeypatch.setattr(rc, "run_in_subprocess", lambda *a, **kw: None)
+
+    import pytest
+    with pytest.raises(RuntimeError, match="rate-limited"):
+        rc._shop_reference_from_band("query", 5000, None)
+
+
+def test_build_price_section_result_shows_yuyu_note_when_shop_failed() -> None:
+    """When shop_reference is None and backend_warnings contains the shop failure
+    string, the summary must include the "遊々亭参考：暫無法取得" note."""
+    from openclaw_adapter.research_command import _build_price_section_result
+
+    result = _build_price_section_result(
+        query="ヴァイス SP",
+        listed_price_jpy=None,
+        active_evidence=(),
+        sold_evidence=(),
+        sold_average_jpy=None,
+        shop_reference=None,
+        backend_warnings=("店舗參考價抓取失敗：yuyu-tei.jp rate-limited (280s cross-process cooldown)",),
+    )
+
+    assert "遊々亭参考：暫無法取得" in result.summary
+
+
+def test_build_price_section_result_no_yuyu_note_when_shop_legitimately_skipped() -> None:
+    """When shop_reference is None but no shop failure warning was emitted
+    (game code not found → legitimately skipped), no yuyu-tei note should appear."""
+    from openclaw_adapter.research_command import _build_price_section_result
+
+    result = _build_price_section_result(
+        query="unknown product",
+        listed_price_jpy=None,
+        active_evidence=(),
+        sold_evidence=(),
+        sold_average_jpy=None,
+        shop_reference=None,
+    )
+
+    assert "遊々亭" not in result.summary
+
+
+def test_compact_price_summary_includes_yuyu_note() -> None:
+    """_compact_price_summary should surface the 遊々亭 unavailability note."""
+    from openclaw_adapter.research_command import _compact_price_summary, ResearchSectionResult
+
+    result = ResearchSectionResult(
+        section_name="合理市價分析",
+        status="partial",
+        confidence=0.3,
+        sample_count=0,
+        evidence_count=0,
+        summary="遊々亭参考：暫無法取得（rate-limited）",
+        evidence_urls=(),
+        warnings=(),
+    )
+
+    compact = _compact_price_summary(result)
+    assert "遊々亭" in compact
+
+
+def test_compact_warning_label_recognizes_shop_failure() -> None:
+    from openclaw_adapter.research_command import _compact_warning_label
+
+    label = _compact_warning_label("店舗參考價抓取失敗：yuyu-tei.jp rate-limited (250s cross-process cooldown)")
+    assert label == "遊々亭：無法取得店舗參考"
