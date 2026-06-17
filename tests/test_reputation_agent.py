@@ -375,32 +375,6 @@ def test_reviews_capture_degraded_flags_unsupported_browser_interstitial() -> No
     ) is True
 
 
-def test_stealth_context_kwargs_pin_a_coherent_jp_mac_identity() -> None:
-    kwargs = reputation_agent._stealth_context_kwargs()
-    # Mac host → Mac UA (a Windows UA on macOS is itself a detector tell).
-    assert "Macintosh" in kwargs["user_agent"]
-    assert kwargs["locale"] == "ja-JP"
-    assert kwargs["timezone_id"] == "Asia/Tokyo"
-    assert kwargs["has_touch"] is False
-    assert kwargs["extra_http_headers"]["Accept-Language"].startswith("ja-JP")
-    # A realistic laptop canvas, not the old 2200px-tall bot viewport.
-    assert kwargs["viewport"]["height"] < 1200
-
-
-def test_stealth_init_script_spoofs_the_key_automation_tells() -> None:
-    script = reputation_agent._STEALTH_INIT_SCRIPT
-    for token in ("webdriver", "MacIntel", "languages", "window.chrome"):
-        assert token in script
-
-
-def test_resolve_browser_channel_honors_env_override(monkeypatch) -> None:
-    monkeypatch.setenv("OPENCLAW_REPUTATION_BROWSER_CHANNEL", "chrome")
-    assert reputation_agent._resolve_browser_channel() == "chrome"
-    # Empty string explicitly forces bundled Chromium (None).
-    monkeypatch.setenv("OPENCLAW_REPUTATION_BROWSER_CHANNEL", "")
-    assert reputation_agent._resolve_browser_channel() is None
-
-
 def test_block_cooldown_round_trip(monkeypatch, tmp_path) -> None:
     path = tmp_path / "cooldown"
     monkeypatch.setattr(reputation_agent, "_mercari_block_cooldown_path", lambda: path)

@@ -4,13 +4,15 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from market_monitor import browser_stealth as bs
+
 DEFAULT_ENV_PATH = Path(".env")
 
 
 @dataclass(frozen=True, slots=True)
 class AssistantSettings:
     monitor_db_path: str = "data/monitor.sqlite3"
-    yuyutei_user_agent: str = "OpenClawPriceMonitor/0.1 (+https://local-dev)"
+    yuyutei_user_agent: str = bs.MAC_CHROME_UA
     openclaw_telegram_chat_id: str | None = None  # primary (first) chat id
     openclaw_telegram_chat_ids: tuple[str, ...] = ()  # all allowed chat ids
     openclaw_telegram_bot_token: str | None = None
@@ -126,7 +128,7 @@ def get_settings() -> AssistantSettings:
     _parsed_chat_ids = _parse_chat_ids(_raw_chat_ids)
     return AssistantSettings(
         monitor_db_path=os.getenv("MONITOR_DB_PATH", "data/monitor.sqlite3"),
-        yuyutei_user_agent=os.getenv("YUYUTEI_USER_AGENT", "OpenClawPriceMonitor/0.1 (+https://local-dev)"),
+        yuyutei_user_agent=os.getenv("YUYUTEI_USER_AGENT", bs.MAC_CHROME_UA),
         openclaw_telegram_chat_id=_parsed_chat_ids[0] if _parsed_chat_ids else None,
         openclaw_telegram_chat_ids=tuple(_parsed_chat_ids),
         openclaw_telegram_bot_token=_none_if_empty(

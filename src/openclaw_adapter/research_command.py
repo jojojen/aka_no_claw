@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import pathlib
 import re
 import statistics
@@ -18,6 +17,7 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 from bs4 import BeautifulSoup, NavigableString, Tag
+from market_monitor import browser_stealth as bs
 
 from .knowledge_db import KnowledgeDatabase, KnowledgeEntry
 from .scrape_subprocess import run_in_subprocess
@@ -455,7 +455,7 @@ def _fetch_html(
     url: str,
     *,
     timeout_seconds: int = 15,
-    user_agent: str = "OpenClawResearch/0.1 (+https://local-dev)",
+    user_agent: str = bs.MAC_CHROME_UA,
 ) -> str:
     request = Request(
         url,
@@ -500,32 +500,10 @@ def fetch_mercari_item_html_with_playwright(url: str) -> str:
     failure so callers can fall back to the cheap static fetch."""
     from playwright.sync_api import sync_playwright
 
-    launch_kwargs = {
-        "headless": True,
-        "args": [
-            "--disable-blink-features=AutomationControlled",
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-        ],
-    }
-    chromium_executable = os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH")
-    if chromium_executable:
-        launch_kwargs["executable_path"] = chromium_executable
     with sync_playwright() as p:
-        browser = p.chromium.launch(**launch_kwargs)
+        browser = bs.launch_stealth_chromium(p, headless=True, logger=logger)
         try:
-            ctx = browser.new_context(
-                locale="ja-JP",
-                viewport={"width": 1440, "height": 2200},
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
-            )
-            ctx.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-            )
+            ctx = bs.new_stealth_context(browser)
             page = ctx.new_page()
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_selector("body", timeout=15000)
@@ -534,6 +512,7 @@ def fetch_mercari_item_html_with_playwright(url: str) -> str:
                 page.wait_for_load_state("networkidle", timeout=10000)
             except Exception:
                 pass
+            bs.humanize(page)
             return _playwright_page_content_settled(page)
         finally:
             browser.close()

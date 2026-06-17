@@ -1417,6 +1417,7 @@ def build_opportunity_agent(settings: AssistantSettings | None = None) -> Opport
 def _build_official_store_provider(*, ssl_context):
     """Instantiate all official-store crawlers and wrap in the provider."""
     import ssl as _ssl
+    from market_monitor import browser_stealth as bs
     from market_monitor.http import HttpClient
     from market_monitor.joshin_preorder import JoshinPreorderCrawler
     from market_monitor.yodobashi_preorder import YodobashiPreorderCrawler
@@ -1428,7 +1429,7 @@ def _build_official_store_provider(*, ssl_context):
     from .official_store_provider import OfficialStoreCandidateProvider
 
     http_client = HttpClient(
-        user_agent="OpenClawPriceMonitor/0.1 (+https://local-dev)",
+        user_agent=bs.MAC_CHROME_UA,
         timeout_seconds=25,
         ssl_context=ssl_context,
     )
