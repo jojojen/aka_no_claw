@@ -4,8 +4,10 @@ import base64
 import json
 import logging
 import os
+import random
 import re
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
@@ -23,6 +25,19 @@ _DEFAULT_POLL_SECS = 5
 _agent_thread_lock = threading.Lock()
 _agent_thread: threading.Thread | None = None
 
+# How long to politely back off after Mercari serves a bot block, so we stop
+# hammering a freshly-flagged IP (Rule C7). File-based so the cooldown survives
+# agent restarts instead of resetting the back-off every kickstart.
+_MERCARI_BLOCK_COOLDOWN_SECS = float(
+    os.getenv("OPENCLAW_REPUTATION_BLOCK_COOLDOWN_SECS", "600")
+)
+
+
+class MercariBlockedError(RuntimeError):
+    """Raised when Mercari serves a bot block (interstitial / empty SPA shell).
+    Distinct from an ordinary capture failure so the agent can trip a cooldown
+    and back off rather than retrying straight into the same wall."""
+
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 
@@ -39,6 +54,121 @@ def _get(server_url: str, api_key: str, path: str) -> dict:
     url = f"{server_url}{path}?token={api_key}"
     with urllib.request.urlopen(url, timeout=15) as r:
         return json.loads(r.read().decode())
+
+
+# ── Anti-detection: present a consistent, human macOS Chrome fingerprint ──────
+#
+# The host is a Mac mini, so we advertise a *Mac* Chrome — the previous Windows
+# UA on a macOS machine was itself a detector tell (UA platform ≠ real platform).
+# Everything below is kept internally consistent (UA ↔ navigator.platform ↔ WebGL
+# ↔ timezone/locale) so the fingerprint reads like one real browser, not a
+# stitched-together bot.
+
+_MAC_CHROME_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/149.0.0.0 Safari/537.36"
+)
+
+# Patches applied before any page script runs. Real Chrome (channel="chrome")
+# already satisfies most of these; they matter for the bundled-Chromium fallback
+# and are idempotent/harmless under real Chrome.
+_STEALTH_INIT_SCRIPT = """
+() => {
+  Object.defineProperty(navigator, 'webdriver', {get: () => false});
+  Object.defineProperty(navigator, 'languages', {get: () => ['ja-JP', 'ja', 'en-US', 'en']});
+  Object.defineProperty(navigator, 'platform', {get: () => 'MacIntel'});
+  Object.defineProperty(navigator, 'maxTouchPoints', {get: () => 0});
+  Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+  try { Object.defineProperty(navigator, 'deviceMemory', {get: () => 8}); } catch (e) {}
+  Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+  window.chrome = window.chrome || { runtime: {} };
+  const origQuery = window.navigator.permissions && window.navigator.permissions.query;
+  if (origQuery) {
+    window.navigator.permissions.query = (p) => (
+      p && p.name === 'notifications'
+        ? Promise.resolve({ state: Notification.permission })
+        : origQuery(p)
+    );
+  }
+  try {
+    const getParam = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function (p) {
+      if (p === 37445) return 'Google Inc. (Apple)';                       // UNMASKED_VENDOR_WEBGL
+      if (p === 37446) return 'ANGLE (Apple, Apple M2, OpenGL 4.1)';       // UNMASKED_RENDERER_WEBGL
+      return getParam.call(this, p);
+    };
+  } catch (e) {}
+}
+"""
+
+
+def _stealth_context_kwargs() -> dict:
+    """new_context() kwargs that pin a coherent JP-Mac-Chrome identity."""
+    return {
+        "locale": "ja-JP",
+        "timezone_id": "Asia/Tokyo",
+        "viewport": {"width": 1512, "height": 982},  # MacBook-ish, not a 2200px bot canvas
+        "device_scale_factor": 2,
+        "is_mobile": False,
+        "has_touch": False,
+        "user_agent": _MAC_CHROME_UA,
+        "extra_http_headers": {
+            "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
+        },
+    }
+
+
+def _resolve_browser_channel() -> str | None:
+    """Prefer the real Chrome binary — it carries far fewer automation signals
+    than bundled Chromium. Override with OPENCLAW_REPUTATION_BROWSER_CHANNEL
+    (set to empty string to force bundled Chromium)."""
+    override = os.getenv("OPENCLAW_REPUTATION_BROWSER_CHANNEL")
+    if override is not None:
+        return override or None
+    if Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome").exists():
+        return "chrome"
+    return None
+
+
+def _humanize(page) -> None:
+    """A few small, randomized scrolls + pauses so a session reads less like a
+    headless bot that goes straight goto→scrape. Best-effort; never fail the
+    capture over a cosmetic gesture."""
+    try:
+        for _ in range(random.randint(2, 4)):
+            page.mouse.wheel(0, random.randint(280, 620))
+            page.wait_for_timeout(random.randint(350, 900))
+    except Exception:
+        pass
+
+
+# ── Mercari block cooldown (cross-restart back-off) ───────────────────────────
+
+def _mercari_block_cooldown_path() -> Path:
+    return Path(tempfile.gettempdir()) / "openclaw_mercari_block_cooldown"
+
+
+def _mercari_block_cooldown_remaining() -> float:
+    try:
+        age = time.time() - _mercari_block_cooldown_path().stat().st_mtime
+        return max(0.0, _MERCARI_BLOCK_COOLDOWN_SECS - age)
+    except OSError:
+        return 0.0
+
+
+def _trip_mercari_block_cooldown() -> None:
+    try:
+        _mercari_block_cooldown_path().touch()
+    except OSError:
+        pass
+
+
+def _block_cooldown_message(remaining: float) -> str:
+    return (
+        "Mercari は現在この IP に bot 防護を出しています（アクセス制限）。"
+        f"約 {remaining:.0f} 秒のクールダウン後にスナップショットを再試行してください。"
+    )
 
 
 # ── Playwright helpers ────────────────────────────────────────────────────────
@@ -71,6 +201,7 @@ def _capture_page(page, url: str) -> dict:
         page.wait_for_load_state("networkidle", timeout=10000)
     except Exception:
         pass
+    _humanize(page)
     return {
         "raw_html":     _page_content_settled(page),
         "visible_text": page.evaluate("() => document.body ? document.body.innerText : ''"),
@@ -476,19 +607,22 @@ def _run_capture(query_url: str) -> dict:
         chromium_executable = os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH")
         if chromium_executable:
             launch_kwargs["executable_path"] = chromium_executable
-        browser = p.chromium.launch(**launch_kwargs)
-        ctx = browser.new_context(
-            locale="ja-JP",
-            viewport={"width": 1440, "height": 2200},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-        )
-        ctx.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        )
+        channel = _resolve_browser_channel()
+        if channel and not chromium_executable:
+            try:
+                browser = p.chromium.launch(channel=channel, **launch_kwargs)
+            except Exception as exc:
+                # Real Chrome can be momentarily unavailable (auto-update, etc.);
+                # bundled Chromium + stealth scripts is the safe fallback.
+                logger.warning(
+                    "reputation_agent: channel=%s launch failed (%s); falling back to bundled chromium",
+                    channel, exc,
+                )
+                browser = p.chromium.launch(**launch_kwargs)
+        else:
+            browser = p.chromium.launch(**launch_kwargs)
+        ctx = browser.new_context(**_stealth_context_kwargs())
+        ctx.add_init_script(_STEALTH_INIT_SCRIPT)
 
         item_html = item_text = None
         profile_url = None
@@ -532,9 +666,10 @@ def _run_capture(query_url: str) -> dict:
                     time.sleep(3.0)
             if not profile_url:
                 if blocked:
-                    raise RuntimeError(
+                    _trip_mercari_block_cooldown()
+                    raise MercariBlockedError(
                         "Mercari returned a blocked/empty item page (likely rate-limited "
-                        "or bot-detected); retry in a few minutes."
+                        "or bot-detected); backing off before retrying."
                     )
                 raise RuntimeError("Could not find seller profile in item page.")
         else:
@@ -557,14 +692,16 @@ def _run_capture(query_url: str) -> dict:
                     # Flagged-IP interstitial: the 4-tab capture and any retry
                     # only burn minutes on a block that won't clear, which is
                     # what pushes the job past the client's wait window. Record
-                    # what loaded and stop — fast honest 'blocked' beats a slow
-                    # timeout that surfaces as 'snapshot still pending'.
+                    # what loaded, trip the cooldown so the next jobs back off,
+                    # and stop — fast honest 'blocked' beats a slow timeout that
+                    # surfaces as 'snapshot still pending'.
                     reviews_html = rd["raw_html"]
                     reviews_text = rd["visible_text"]
                     rpg.close()
+                    _trip_mercari_block_cooldown()
                     logger.info(
                         "reputation_agent: reviews page hard-blocked (bot interstitial) "
-                        "attempt=%d — skipping review tabs and retries",
+                        "attempt=%d — skipping review tabs and retries, tripping cooldown",
                         attempt + 1,
                     )
                     break
@@ -640,21 +777,7 @@ def run_agent_loop(
                 time.sleep(poll_secs)
                 continue
 
-            job_id    = job["job_id"]
-            query_url = job["query_url"]
-            logger.info("reputation_agent: [job %s] %s", job_id, query_url)
-
-            try:
-                result = _run_capture(query_url)
-                out    = _post(server_url, api_key, f"/api/jobs/{job_id}/result", result)
-                logger.info("reputation_agent: [job %s] done → %s%s",
-                            job_id, server_url, out.get("proof_url", ""))
-            except Exception as exc:
-                logger.error("reputation_agent: [job %s] FAILED: %s", job_id, exc)
-                try:
-                    _post(server_url, api_key, f"/api/jobs/{job_id}/result", {"error": str(exc)})
-                except Exception:
-                    pass
+            _process_claimed_job(server_url, api_key, job)
 
         except KeyboardInterrupt:
             logger.info("reputation_agent: stopped.")
@@ -662,6 +785,44 @@ def run_agent_loop(
         except Exception as e:
             logger.error("reputation_agent: [poll error] %s", e)
             time.sleep(poll_secs)
+
+
+def _process_claimed_job(server_url: str, api_key: str, job: dict) -> None:
+    """Run one claimed job: honor the block cooldown, capture, post the result.
+
+    Extracted from the poll loop so it is unit-testable without the infinite
+    loop or a live server."""
+    job_id    = job["job_id"]
+    query_url = job["query_url"]
+
+    remaining = _mercari_block_cooldown_remaining()
+    if remaining > 0:
+        # Mercari recently blocked us; launching another browser straight into
+        # the wall just deepens the flag (Rule C7). Fail the job fast with an
+        # honest, actionable message instead of spawning a doomed capture.
+        logger.info(
+            "reputation_agent: [job %s] skipped — Mercari block cooldown %.0fs remaining",
+            job_id, remaining,
+        )
+        try:
+            _post(server_url, api_key, f"/api/jobs/{job_id}/result",
+                  {"error": _block_cooldown_message(remaining)})
+        except Exception:
+            pass
+        return
+
+    logger.info("reputation_agent: [job %s] %s", job_id, query_url)
+    try:
+        result = _run_capture(query_url)
+        out    = _post(server_url, api_key, f"/api/jobs/{job_id}/result", result)
+        logger.info("reputation_agent: [job %s] done → %s%s",
+                    job_id, server_url, out.get("proof_url", ""))
+    except Exception as exc:
+        logger.error("reputation_agent: [job %s] FAILED: %s", job_id, exc)
+        try:
+            _post(server_url, api_key, f"/api/jobs/{job_id}/result", {"error": str(exc)})
+        except Exception:
+            pass
 
 
 def start_agent_thread(
