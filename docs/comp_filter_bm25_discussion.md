@@ -60,10 +60,35 @@
 週更通知顯示「養厚中,維持純 Jaccard」。等被動水槽養厚後才會出現第一張可啟用的表。
 機制本身已用合成語料驗證(見上)。
 
-### 🔭 PR3+ — 語意層 rerank（更後面，未排期）
-- embedding / LLM rerank 打 **R1(詞彙非語意)**,解 **Mode 2**(同款不同版/跨書寫
-  系統被誤殺,如 YOASOBI CD 案)。架構走 retrieve-then-rerank(IDF 粗篩 + 語意精排)。
-- 硬約束不變:不增加對外查詢次數(不可封 IP)、過濾失敗走安全網、符合 Rule G。
+### ✅ PR3 — 語意 rerank 閘門（已實作、已部署）
+- 打到的根因 **R1(詞彙非語意)**,解 **Mode 2**(同款不同版/跨書寫系統被誤殺,
+  如 YOASOBI CD 案)。架構走 retrieve-then-rerank:**PR2 IDF 粗篩 + 地端 LLM 語意細排**。
+- **管線位置**:`research_command._stage_price_placeholder` 的 sold/active 兩處
+  比價,改呼叫 `_filter_market_items_with_semantic_gate`(原 `_filter_market_items_for_price`
+  的超集,gate=None 時行為等同 PR2)。
+- **候選選取**:`_classify_market_items_for_price` 把候選分三流 ——
+  **kept**(anchor 命中 **且** 相似度 ≥ `min_similarity=0.32`,= PR2 不變)、
+  **gray zone**(`semantic_floor=0.18` ≤ 相似度 < 0.32,**或 anchor 沒中但相似度 ≥ floor**)、
+  **hard drop**(空標題 / 評級 vs 生品矛盾 / 相似度 < floor)。送進 LLM 的池子是
+  `kept + gray`,依相似度由高到低排序後封頂 `max_semantic_candidates=20`(只截斷 gray,
+  不動 kept),避免一次打爆地端 LLM。
+- **關鍵修正**:anchor-token 閘門原本是硬丟 —— 連跨書寫系統的同物(相似度 0.447 的
+  ザ・ブック2 案)都在閘門前被殺,等於廢掉 PR3 目的。改為 anchor 沒中時**改丟 gray
+  zone**(只要 ≥ floor),交給語意層救;`kept` 仍要求 anchor+門檻,**PR2 行為不變**。
+- **語意閘門**:`build_ollama_sellable_unit_gate`(qwen3:14b @ 127.0.0.1:11434)。
+  單批一次 LLM 呼叫,`format=json`、`think=False`、`temperature=0`,回 `{"keep":[index...]}`。
+  prompt 強調「同一**可賣單位(sellable unit)**」而非「同商品族」,內含 keep/drop 範例。
+- **故障安全**:閘門逾時/壞 JSON/例外/空 keep → 回退到字面 kept 結果,**絕不清空 comp**。
+  gate 回 `None`=無法判斷(回退);回 `set`=權威採用(測試可注入空集)。生產端 Ollama
+  把「空 keep」轉成 `None` 保守處理。
+- **Rule G / C7**:無寫死別名表(純統計 + LLM 推理)、不增加任何對外市場查詢
+  (只重排已抓回的候選)。
+- **端到端實測(真 qwen3:14b,2026-06-18)**:
+  - YOASOBI Mode 2:`ザ・ブック2 …`(字面 drop)→ **救回 keep**;同時把字面誤收的
+    `THE BOOK`(第I集)、`通常盤` 收緊成 **drop**。
+  - 黒炎 BOX:同 unit **keep**、`SAR 單卡` 與裸 `黒炎の支配者` 維持 **drop**(無回歸)。
+- **測試**:5 個 PR3 測試(跨書寫救回、同族不同單位丟棄、故障回退、候選池 ≤20、
+  PR1/PR2 回歸),全測試套件 `1131 passed, 7 skipped`。
 
 ---
 

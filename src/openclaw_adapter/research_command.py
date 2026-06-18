@@ -72,6 +72,11 @@ GameCodeResolverFn = Callable[[str], "str | None"]
 IpHeatLookupFn = Callable[[tuple[str, ...]], dict[str, tuple[object, ...]]]
 EntityRecognizerFn = Callable[["ItemData"], "EntityProfile | None"]
 AppreciationEnricherFn = Callable[[str, tuple[WebSearchResult, ...]], "str | None"]
+# PR3 semantic gate: (reference_title, reference_price, candidates) -> set of kept
+# candidate indices, or None when the gate cannot decide (→ fall back to lexical).
+SemanticGateFn = Callable[
+    [str, "int | None", "list[CandidateForSemanticRerank]"], "set[int] | None"
+]
 ResearchStageRunner = Callable[["ResearchJobContext"], str]
 
 _MERCARI_ITEM_PATH_RE = re.compile(r"^/item/(m\d+)/?$", re.IGNORECASE)
@@ -972,6 +977,7 @@ class ResearchCommandService:
         ip_heat_lookup_fn: IpHeatLookupFn | None = None,
         entity_recognizer_fn: EntityRecognizerFn | None = None,
         appreciation_enricher_fn: AppreciationEnricherFn | None = None,
+        semantic_gate_fn: "SemanticGateFn | None" = None,
         final_formatter: Callable[[ResearchReport], object] | None = None,
         heartbeat_interval_seconds: float = 15.0,
     ) -> None:
@@ -988,6 +994,7 @@ class ResearchCommandService:
         self._ip_heat_lookup_fn = ip_heat_lookup_fn or (lambda canonicals: {})
         self._entity_recognizer_fn = entity_recognizer_fn
         self._appreciation_enricher_fn = appreciation_enricher_fn
+        self._semantic_gate_fn = semantic_gate_fn
         self._final_formatter = final_formatter or format_research_full_report
         self._heartbeat_interval_seconds = max(0.0, heartbeat_interval_seconds)
         self._lock = threading.Lock()
@@ -1336,10 +1343,12 @@ class ResearchCommandService:
             logger.exception("Research sold market search failed query=%s", query)
             sold_raw_all = []
             backend_warnings.append(f"Mercari sold 比價抓取失敗：{exc}")
-        sold_raw, sold_dropped = _filter_market_items_for_price(
+        sold_raw, sold_dropped = _filter_market_items_with_semantic_gate(
             reference_title=reference_title,
+            reference_price=listed_price,
             items=sold_raw_all,
             min_similarity=0.32,
+            semantic_gate_fn=self._semantic_gate_fn,
         )
         sold_evidence = tuple(_price_evidence_from_market_item(item, sold_status="sold") for item in sold_raw)
         sold_evidence, sold_outliers = _drop_price_outliers(sold_evidence)
@@ -1358,10 +1367,12 @@ class ResearchCommandService:
             logger.exception("Research active market search failed query=%s", query)
             active_raw_all = []
             backend_warnings.append(f"Mercari active 比價抓取失敗：{exc}")
-        active_raw, active_dropped = _filter_market_items_for_price(
+        active_raw, active_dropped = _filter_market_items_with_semantic_gate(
             reference_title=reference_title,
+            reference_price=listed_price,
             items=active_raw_all,
             min_similarity=0.32,
+            semantic_gate_fn=self._semantic_gate_fn,
         )
         # Harvest every comp title we already fetched into the historical title
         # corpus (free byproduct — no extra external queries). Fail-safe inside.
@@ -1514,6 +1525,7 @@ def build_research_handler(
     ip_heat_lookup_fn: IpHeatLookupFn | None = None,
     entity_recognizer_fn: EntityRecognizerFn | None = None,
     appreciation_enricher_fn: AppreciationEnricherFn | None = None,
+    semantic_gate_fn: "SemanticGateFn | None" = None,
     final_formatter: Callable[[ResearchReport], object] | None = None,
     heartbeat_interval_seconds: float = 15.0,
 ) -> Callable[[str, str], object]:
@@ -1533,6 +1545,7 @@ def build_research_handler(
         ip_heat_lookup_fn=ip_heat_lookup_fn,
         entity_recognizer_fn=entity_recognizer_fn,
         appreciation_enricher_fn=appreciation_enricher_fn,
+        semantic_gate_fn=semantic_gate_fn,
         final_formatter=final_formatter,
         heartbeat_interval_seconds=heartbeat_interval_seconds,
     )
@@ -2990,15 +3003,56 @@ def _drop_price_outliers(
     return tuple(kept), dropped
 
 
-def _filter_market_items_for_price(
+# PR3 semantic rerank gate tuning. Gray zone = the lexical band just below the
+# keep threshold where a cross-script / paraphrased *same sellable unit* (Mode 2)
+# can hide; we hand that band to the LLM instead of dropping it outright.
+_SEMANTIC_FLOOR = 0.18
+_MAX_SEMANTIC_CANDIDATES = 20
+
+
+@dataclass(frozen=True)
+class CandidateForSemanticRerank:
+    """One marketplace comp offered to the PR3 semantic gate.
+
+    ``index`` is the candidate's position in the bounded rerank pool — the gate
+    returns the indices it wants to keep.
+    """
+
+    index: int
+    title: str
+    price: int | None
+    lexical_score: float
+    item: dict[str, object]
+
+
+def _coerce_price_jpy(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        digits = re.sub(r"[^\d]", "", value)
+        return int(digits) if digits else None
+    return None
+
+
+def _classify_market_items_for_price(
     *,
     reference_title: str,
     items: list[dict[str, object]],
     min_similarity: float,
+    semantic_floor: float,
     idf_stats: "TitleIdfStats | None" = None,
-) -> tuple[list[dict[str, object]], int]:
-    kept: list[dict[str, object]] = []
-    dropped = 0
+) -> tuple[list[tuple[dict[str, object], float]], list[tuple[dict[str, object], float]], int]:
+    """Split candidates into (lexical-kept, gray-zone, hard-dropped count).
+
+    Hard drops (empty title / graded-vs-raw / anchor-token miss) never reach the
+    semantic gate. Lexical-kept = score >= ``min_similarity``. Gray zone =
+    ``semantic_floor`` <= score < ``min_similarity``. Each surviving candidate is
+    paired with its lexical score so the rerank pool can be bounded by score.
+    """
     # Load the historical IDF table once for the whole batch (the comparison runs
     # per candidate item). When no DF file exists the loader returns None and we
     # fall back to PR1's unweighted Jaccard — cold start must never break filtering.
@@ -3014,18 +3068,25 @@ def _filter_market_items_for_price(
         default_bigram_idf = idf_stats.default_bigram_idf
     specific_tokens = _specific_reference_tokens(reference_title)
     anchor_tokens = set(specific_tokens[1:] if len(specific_tokens) >= 2 else specific_tokens)
+    kept: list[tuple[dict[str, object], float]] = []
+    gray: list[tuple[dict[str, object], float]] = []
+    hard_dropped = 0
     for item in items:
         title = str(item.get("title") or "").strip()
         if not title:
-            dropped += 1
+            hard_dropped += 1
             continue
         if _looks_graded_title(title) and not _looks_graded_title(reference_title):
-            dropped += 1
+            hard_dropped += 1
             continue
         candidate_tokens = set(_market_title_tokens(_normalize_market_title(title)))
-        if anchor_tokens and not (anchor_tokens & candidate_tokens):
-            dropped += 1
-            continue
+        # Anchor-token miss is NOT an absolute hard drop: a cross-script /
+        # paraphrased *same sellable unit* (Mode 2, e.g. THE BOOK II vs ザ・ブック2)
+        # can share no anchor token yet still be the same product. Such a
+        # candidate stays out of the lexical-kept set (PR2 behaviour unchanged)
+        # but is routed to the gray zone so the semantic gate can rescue it. The
+        # semantic_floor below still keeps obvious noise out of the LLM call.
+        anchor_ok = (not anchor_tokens) or bool(anchor_tokens & candidate_tokens)
         similarity = _title_similarity_score(
             reference_title,
             title,
@@ -3034,11 +3095,234 @@ def _filter_market_items_for_price(
             default_token_idf=default_token_idf,
             default_bigram_idf=default_bigram_idf,
         )
-        if similarity < min_similarity:
-            dropped += 1
+        if anchor_ok and similarity >= min_similarity:
+            kept.append((item, similarity))
+        elif similarity >= semantic_floor:
+            gray.append((item, similarity))
+        else:
+            hard_dropped += 1
+    return kept, gray, hard_dropped
+
+
+def _filter_market_items_for_price(
+    *,
+    reference_title: str,
+    items: list[dict[str, object]],
+    min_similarity: float,
+    idf_stats: "TitleIdfStats | None" = None,
+) -> tuple[list[dict[str, object]], int]:
+    """PR2 lexical filter (unchanged contract): returns (kept, dropped_count).
+
+    Setting ``semantic_floor == min_similarity`` collapses the gray zone, so this
+    behaves exactly as before — every candidate below the threshold counts as
+    dropped. The PR3 path uses :func:`_classify_market_items_for_price` directly to
+    rescue the gray zone via the semantic gate.
+    """
+    kept, _gray, _hard = _classify_market_items_for_price(
+        reference_title=reference_title,
+        items=items,
+        min_similarity=min_similarity,
+        semantic_floor=min_similarity,
+        idf_stats=idf_stats,
+    )
+    kept_items = [item for item, _score in kept]
+    return kept_items, len(items) - len(kept_items)
+
+
+def _select_semantic_rerank_candidates(
+    scored: list[tuple[dict[str, object], float]],
+    *,
+    max_candidates: int,
+) -> list[CandidateForSemanticRerank]:
+    """Bound the pool sent to the LLM: highest lexical score first, then capped.
+
+    Score-descending ordering means lexical-kept items (score >= threshold) are
+    always retained ahead of weaker gray-zone items when the cap bites — so the
+    cap only ever truncates the speculative gray zone, never the solid keeps.
+    """
+    ordered = sorted(scored, key=lambda pair: pair[1], reverse=True)[:max_candidates]
+    return [
+        CandidateForSemanticRerank(
+            index=position,
+            title=str(item.get("title") or "").strip(),
+            price=_coerce_price_jpy(item.get("price")),
+            lexical_score=score,
+            item=item,
+        )
+        for position, (item, score) in enumerate(ordered)
+    ]
+
+
+def _filter_market_items_with_semantic_gate(
+    *,
+    reference_title: str,
+    reference_price: int | None,
+    items: list[dict[str, object]],
+    min_similarity: float,
+    idf_stats: "TitleIdfStats | None" = None,
+    semantic_gate_fn: "SemanticGateFn | None" = None,
+    semantic_floor: float = _SEMANTIC_FLOOR,
+    max_semantic_candidates: int = _MAX_SEMANTIC_CANDIDATES,
+) -> tuple[list[dict[str, object]], int]:
+    """PR3: PR2 lexical coarse filter + a semantic 'same sellable unit' gate.
+
+    ``semantic_gate_fn(reference_title, reference_price, candidates)`` returns the
+    set of candidate indices to keep, or ``None`` to signal it could not decide
+    (timeout / bad JSON / unexpectedly empty) → fall back to the lexical-kept
+    result. When ``semantic_gate_fn`` is ``None`` this is exactly the PR2 filter.
+    """
+    kept, gray, _hard = _classify_market_items_for_price(
+        reference_title=reference_title,
+        items=items,
+        min_similarity=min_similarity,
+        semantic_floor=semantic_floor,
+        idf_stats=idf_stats,
+    )
+    lexical_kept_items = [item for item, _score in kept]
+
+    def _lexical_result() -> tuple[list[dict[str, object]], int]:
+        return lexical_kept_items, len(items) - len(lexical_kept_items)
+
+    if semantic_gate_fn is None or (not kept and not gray):
+        return _lexical_result()
+
+    pool = _select_semantic_rerank_candidates(
+        kept + gray, max_candidates=max_semantic_candidates
+    )
+    try:
+        keep_positions = semantic_gate_fn(reference_title, reference_price, pool)
+    except Exception:
+        logger.exception("Semantic rerank gate raised; falling back to lexical result")
+        return _lexical_result()
+    if keep_positions is None:
+        # Gate could not decide → safe fallback to the lexical-kept result.
+        return _lexical_result()
+    final_items = [cand.item for cand in pool if cand.index in keep_positions]
+    return final_items, len(items) - len(final_items)
+
+
+# Validated against the live qwen3:14b probe (cross-script rescue + high-overlap
+# accessory traps). Emphasises *same sellable unit*, not same product family.
+_SELLABLE_UNIT_GATE_PROMPT = """あなたは中古マーケットの比較対象を選ぶ審査員です。
+「参照商品」と全く同じ『売買単位(sellable unit)』であるものだけを keep します。
+同じ商品ファミリーでも、売買単位が違うものは drop してください。
+
+keep する例:
+- 表記ゆれ・別の書記体系(漢字/カナ/ローマ字)で同一商品
+- 言い回しが少し違うだけの同一商品
+- 同じ版・同じ梱包・同じ物理単位
+
+drop する例:
+- 単品 vs BOX/セット、付属品のみ vs 本体
+- 鑑定品(PSA/BGS)vs 生品、開封済み/傷あり vs 未開封
+- 別の版/別のモデル/別の巻/別の数量
+
+参照商品:
+{reference}
+
+候補(index: 内容):
+{candidates}
+
+厳密なJSONのみを返す。説明は書かない。
+形式: {{"keep": [keepするindexの配列]}}"""
+
+
+def _format_gate_line(candidate: "CandidateForSemanticRerank") -> str:
+    if candidate.price is not None:
+        return f"{candidate.index}: {candidate.title} / ¥{candidate.price:,}"
+    return f"{candidate.index}: {candidate.title}"
+
+
+def _run_sellable_unit_gate(
+    reference_title: str,
+    reference_price: int | None,
+    candidates: "list[CandidateForSemanticRerank]",
+    *,
+    endpoint: str,
+    model: str,
+    timeout_seconds: int,
+    ssl_context=None,
+) -> "set[int] | None":
+    """One batched local-LLM call judging same sellable unit.
+
+    Returns the kept candidate indices, or ``None`` on any failure (network, bad
+    JSON) or an unexpectedly empty keep-list — the caller then falls back to the
+    lexical result so a model hiccup never wipes out every comp.
+    """
+    if not candidates:
+        return None
+    reference = reference_title
+    if reference_price is not None:
+        reference = f"{reference_title} / ¥{reference_price:,}"
+    prompt = _SELLABLE_UNIT_GATE_PROMPT.format(
+        reference=reference,
+        candidates="\n".join(_format_gate_line(c) for c in candidates),
+    )
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "think": False,
+        "format": "json",
+        "options": {"temperature": 0.0},
+    }
+    generate_url = endpoint.rstrip("/")
+    if not generate_url.endswith("/api/generate"):
+        generate_url = f"{generate_url}/api/generate"
+    request = Request(
+        generate_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=timeout_seconds, context=ssl_context) as response:
+            body = response.read().decode("utf-8", errors="replace")
+        parsed = json.loads(json.loads(body).get("response", "{}"))
+        keep_raw = parsed.get("keep", [])
+    except Exception:
+        logger.exception("Sellable-unit gate request failed; falling back to lexical")
+        return None
+    valid = {c.index for c in candidates}
+    keep: set[int] = set()
+    for value in keep_raw if isinstance(keep_raw, list) else ():
+        try:
+            idx = int(value)
+        except (TypeError, ValueError):
             continue
-        kept.append(item)
-    return kept, dropped
+        if idx in valid:
+            keep.add(idx)
+    if not keep:
+        logger.info("Sellable-unit gate kept nothing; falling back to lexical")
+        return None
+    return keep
+
+
+def build_ollama_sellable_unit_gate(
+    *,
+    endpoint: str,
+    model: str,
+    timeout_seconds: int = 60,
+    ssl_context=None,
+) -> SemanticGateFn:
+    """Production PR3 gate backed by local Ollama (qwen3:14b)."""
+
+    def gate(
+        reference_title: str,
+        reference_price: int | None,
+        candidates: "list[CandidateForSemanticRerank]",
+    ) -> "set[int] | None":
+        return _run_sellable_unit_gate(
+            reference_title,
+            reference_price,
+            candidates,
+            endpoint=endpoint,
+            model=model,
+            timeout_seconds=timeout_seconds,
+            ssl_context=ssl_context,
+        )
+
+    return gate
 
 
 def weighted_jaccard(
