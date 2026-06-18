@@ -97,6 +97,7 @@ from .research_command import (
     SellerReputationSnapshot,
     build_appreciation_enricher,
     build_ollama_entity_recognizer,
+    build_ollama_sellable_unit_gate,
     build_research_handler,
     build_research_item_fetch_html,
     format_research_compact_report,
@@ -947,6 +948,10 @@ def _build_registries(
             knowledge_db_path=settings.knowledge_db_path,
         ),
         appreciation_enricher_fn=_build_research_appreciation_enricher(settings),
+        semantic_gate_fn=build_ollama_sellable_unit_gate(
+            endpoint=settings.openclaw_local_text_endpoint,
+            model=settings.openclaw_local_text_model or "qwen3:14b",
+        ),
         final_formatter=_build_research_reply_formatter(research_cache),
     )
 

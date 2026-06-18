@@ -1927,3 +1927,151 @@ def test_compact_warning_label_recognizes_shop_failure() -> None:
 
     label = _compact_warning_label("店舗參考價抓取失敗：yuyu-tei.jp rate-limited (250s cross-process cooldown)")
     assert label == "遊々亭：無法取得店舗參考"
+
+
+# ---------------------------------------------------------------------------
+# PR3 — semantic rerank gate (spec Test 1-5). Gate is dependency-injected so
+# unit tests never touch a real Ollama. ``_keep_all_gate`` / ``_drop_card_gate``
+# stand in for the LLM's keep-index decision.
+# ---------------------------------------------------------------------------
+
+def _keep_all_gate(reference_title, reference_price, candidates):
+    return {c.index for c in candidates}
+
+
+def test_pr3_semantic_gate_rescues_cross_script_equivalent() -> None:
+    # Mode 2: same sellable unit written in a different script. Lexical overlap
+    # is weak (cross-script: book vs ブック2 share no anchor token), so it lands in
+    # the gray zone rather than the lexical-kept set — and the mocked gate rescues
+    # it. Uses the real default semantic_floor (0.18).
+    from openclaw_adapter.research_command import _filter_market_items_with_semantic_gate
+
+    reference = "YOASOBI THE BOOK II 完全生産限定盤 バインダー入CD"
+    items = [{"title": "YOASOBI ザ・ブック2 完全生産限定盤 バインダー付き", "price": 4300}]
+    kept, dropped = _filter_market_items_with_semantic_gate(
+        reference_title=reference,
+        reference_price=4400,
+        items=items,
+        min_similarity=_PROD_MIN_SIMILARITY,
+        semantic_gate_fn=_keep_all_gate,
+    )
+    assert dropped == 0
+    assert len(kept) == 1
+    assert kept[0]["title"].startswith("YOASOBI ザ・ブック2")
+
+
+def test_pr3_semantic_gate_drops_same_family_different_unit() -> None:
+    # Mode 1: same product family, different sellable unit (single card vs BOX).
+    # The mocked gate keeps only the BOX; the single card must be removed.
+    from openclaw_adapter.research_command import _filter_market_items_with_semantic_gate
+
+    reference = "黒炎の支配者 BOX シュリンク付き 未開封"
+    items = [
+        {"title": "黒炎の支配者 BOX 未開封 シュリンク付き", "price": 6000},
+        {"title": "黒炎の支配者 SAR リザードンex", "price": 3900},
+    ]
+
+    def gate(reference_title, reference_price, candidates):
+        return {c.index for c in candidates if "BOX" in c.title}
+
+    kept, dropped = _filter_market_items_with_semantic_gate(
+        reference_title=reference,
+        reference_price=14800,
+        items=items,
+        min_similarity=_PROD_MIN_SIMILARITY,
+        semantic_gate_fn=gate,
+    )
+    titles = [it["title"] for it in kept]
+    assert any("BOX" in t for t in titles)
+    assert all("SAR" not in t for t in titles)
+
+
+def test_pr3_semantic_gate_failure_falls_back_to_lexical() -> None:
+    # Gate raising OR returning None must fall back to the lexical-kept result,
+    # never wipe out every comp.
+    from openclaw_adapter.research_command import _filter_market_items_with_semantic_gate
+
+    reference = "黒炎の支配者 BOX シュリンク付き 未開封"
+    items = [{"title": "黒炎の支配者 BOX 未開封 シュリンク付き", "price": 6000}]
+
+    def boom(reference_title, reference_price, candidates):
+        raise RuntimeError("ollama down")
+
+    kept, dropped = _filter_market_items_with_semantic_gate(
+        reference_title=reference,
+        reference_price=14800,
+        items=items,
+        min_similarity=_PROD_MIN_SIMILARITY,
+        semantic_gate_fn=boom,
+    )
+    assert len(kept) == 1 and dropped == 0
+
+    def undecided(reference_title, reference_price, candidates):
+        return None
+
+    kept2, dropped2 = _filter_market_items_with_semantic_gate(
+        reference_title=reference,
+        reference_price=14800,
+        items=items,
+        min_similarity=_PROD_MIN_SIMILARITY,
+        semantic_gate_fn=undecided,
+    )
+    assert len(kept2) == 1 and dropped2 == 0
+
+
+def test_pr3_semantic_gate_bounds_candidate_pool() -> None:
+    # More candidates than max_semantic_candidates → gate sees only the bounded
+    # top-N, so we never fire a giant local-LLM call.
+    from openclaw_adapter.research_command import _filter_market_items_with_semantic_gate
+
+    reference = "黒炎の支配者 BOX シュリンク付き 未開封"
+    items = [
+        {"title": f"黒炎の支配者 BOX 未開封 シュリンク付き ロット{i:02d}", "price": 6000 + i}
+        for i in range(30)
+    ]
+    seen: dict[str, int] = {}
+
+    def gate(reference_title, reference_price, candidates):
+        seen["count"] = len(candidates)
+        return {c.index for c in candidates}
+
+    kept, _dropped = _filter_market_items_with_semantic_gate(
+        reference_title=reference,
+        reference_price=14800,
+        items=items,
+        min_similarity=_PROD_MIN_SIMILARITY,
+        semantic_gate_fn=gate,
+        max_semantic_candidates=20,
+    )
+    assert seen["count"] == 20
+    assert len(kept) <= 20
+
+
+def test_pr3_regression_subset_card_default_path_drops() -> None:
+    # PR1/PR2 must still hold: a bare single card is dropped by the lexical
+    # coarse filter on the default path (no gate) — no subset boosting.
+    from openclaw_adapter.research_command import _filter_market_items_with_semantic_gate
+
+    reference = "黒炎の支配者 BOX シュリンク付き 未開封"
+    items = [{"title": "黒炎の支配者", "price": 500}]
+
+    kept, dropped = _filter_market_items_with_semantic_gate(
+        reference_title=reference,
+        reference_price=14800,
+        items=items,
+        min_similarity=_PROD_MIN_SIMILARITY,
+        semantic_gate_fn=None,
+    )
+    assert kept == [] and dropped == 1
+
+    # ...but an explicit gate rescue can still keep it: the bare card scores in
+    # the gray zone (>= semantic_floor) so it reaches the pool and the keep-all
+    # gate rescues it. The default lexical path above still drops it.
+    kept2, dropped2 = _filter_market_items_with_semantic_gate(
+        reference_title=reference,
+        reference_price=14800,
+        items=items,
+        min_similarity=_PROD_MIN_SIMILARITY,
+        semantic_gate_fn=_keep_all_gate,
+    )
+    assert len(kept2) == 1 and dropped2 == 0

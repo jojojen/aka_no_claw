@@ -44,6 +44,9 @@ reports/
 # Regenerable spike embedding caches (compare.py rebuilds on run)
 spikes/**/emb_*.npz
 
+# Runtime-generated comp-filter IDF corpus (TitleCorpusRebuilder rebuilds weekly)
+data/market_title_df.json
+
 # OS / editor noise
 .DS_Store
 Thumbs.db
