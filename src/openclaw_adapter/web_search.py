@@ -9,7 +9,7 @@ from html import unescape
 from html.parser import HTMLParser
 from typing import Callable, Sequence
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, unquote, urlencode, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse, urlsplit, urlunsplit
 
 from urllib.request import Request, urlopen
 
@@ -745,6 +745,32 @@ def format_web_research_answer(answer: WebResearchAnswer) -> str:
     return "\n".join(lines)
 
 
+def _ascii_safe_url(url: str) -> str:
+    """Percent-encode non-ASCII characters in a URL so http.client (which
+    ASCII-encodes the request line) doesn't raise UnicodeEncodeError on links
+    with native-language paths/queries (e.g. an Amazon JP URL with Japanese in
+    its path). Idempotent: ``%`` stays in the safe set so an already-encoded URL
+    is not double-encoded. The host is IDNA-encoded only when it is non-ASCII."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+    netloc = parts.netloc
+    if netloc and not netloc.isascii():
+        host = parts.hostname or ""
+        try:
+            encoded_host = host.encode("idna").decode("ascii")
+        except Exception:  # noqa: BLE001 — fall back to the raw host on odd labels
+            encoded_host = host
+        userinfo = f"{parts.username}@" if parts.username else ""
+        port = f":{parts.port}" if parts.port else ""
+        netloc = f"{userinfo}{encoded_host}{port}"
+    path = quote(parts.path, safe="/%:@!$&'()*+,;=~-._")
+    query = quote(parts.query, safe="=&%:@!$'()*+,;/?~-._")
+    fragment = quote(parts.fragment, safe="/%:@!$&'()*+,;=~-._?")
+    return urlunsplit((parts.scheme, netloc, path, query, fragment))
+
+
 def _fetch_url(
     url: str,
     timeout_seconds: int,
@@ -752,7 +778,7 @@ def _fetch_url(
     ssl_context: ssl.SSLContext | None,
 ) -> str:
     request = Request(
-        url,
+        _ascii_safe_url(url),
         headers={
             "User-Agent": user_agent,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
