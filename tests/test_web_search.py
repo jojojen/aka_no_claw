@@ -6,9 +6,11 @@ from openclaw_adapter import web_search as ws
 from openclaw_adapter.web_search import (
     WebResearchAnswer,
     WebSearchResult,
+    _ascii_safe_url,
     build_web_fetch_answer,
     build_web_research_answer,
     extract_readable_text,
+    fetch_page_text,
     format_web_research_answer,
     summarize_web_sources_with_ollama,
 )
@@ -162,6 +164,51 @@ def test_extract_readable_text_drops_boilerplate_keeps_article() -> None:
 
     assert "標題" in text and "第一段內容。" in text
     assert "var a" not in text and "HOME ABOUT" not in text and "copyright" not in text
+
+
+def test_ascii_safe_url_percent_encodes_non_ascii_path() -> None:
+    url = "https://www.amazon.co.jp/【店舗限定特典あり】YOASOBI-BOOK/dp/B09HRM5M4T"
+
+    safe = _ascii_safe_url(url)
+
+    assert safe.isascii()
+    assert "%" in safe
+    # Host untouched (already ASCII), path encoded, item id preserved.
+    assert safe.startswith("https://www.amazon.co.jp/")
+    assert safe.endswith("/dp/B09HRM5M4T")
+
+
+def test_ascii_safe_url_is_idempotent_on_already_encoded_url() -> None:
+    encoded = "https://auctions.yahoo.co.jp/search?p=%E3%83%9D%E3%82%B1&aucmaxprice=999999999"
+
+    assert _ascii_safe_url(encoded) == encoded
+
+
+def test_fetch_page_text_encodes_non_ascii_url_before_urlopen(monkeypatch) -> None:
+    captured: dict[str, str] = {}
+
+    class _FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return "<html><body><article><p>本文</p></article></body></html>".encode("utf-8")
+
+    def fake_urlopen(request, timeout=None, context=None):
+        captured["url"] = request.full_url
+        # Mirror http.client: a non-ASCII request line would blow up here.
+        request.full_url.encode("ascii")
+        return _FakeResponse()
+
+    monkeypatch.setattr(ws, "urlopen", fake_urlopen)
+
+    text = fetch_page_text("https://www.amazon.co.jp/特典/dp/B09HRM5M4T")
+
+    assert captured["url"].isascii()
+    assert "本文" in text
 
 
 def test_build_web_research_answer_fetch_feeds_page_content_to_summarizer() -> None:
