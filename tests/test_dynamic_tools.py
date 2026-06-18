@@ -1189,6 +1189,11 @@ def test_opencode_cli_generate_strips_banner_and_ansi(tmp_path) -> None:
 
     def _fake_run(cmd, **kwargs):
         assert cmd[:5] == ["opencode", "run", "--pure", "-m", "opencode/big-pickle"]
+        env = kwargs["env"]
+        assert env["HOME"] == str(tmp_path / ".opencode-home")
+        assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path / ".opencode-home" / ".claude")
+        assert env["XDG_DATA_HOME"] == str(tmp_path / ".opencode-home" / ".local" / "share")
+        assert env["XDG_CACHE_HOME"] == str(tmp_path / ".opencode-home" / ".cache")
         return subprocess.CompletedProcess(
             cmd, 0, stdout="\x1b[0m\n> build · big-pickle\n\x1b[0m\nhello\n", stderr=""
         )
