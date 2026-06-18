@@ -69,6 +69,9 @@ SoldMarketSearchFn = Callable[[str, int], list[dict[str, object]]]
 SoldAverageLookupFn = Callable[[str], float | None]
 ShopReferenceFn = Callable[[str, int], "ShopReference | None"]
 GameCodeResolverFn = Callable[[str], "str | None"]
+# (query, matched_listing_titles) -> None. Records the item's real identity onto
+# the yuyutei code cache from titles already fetched — no extra request.
+CacheEnricherFn = Callable[[str, tuple[str, ...]], None]
 IpHeatLookupFn = Callable[[tuple[str, ...]], dict[str, tuple[object, ...]]]
 EntityRecognizerFn = Callable[["ItemData"], "EntityProfile | None"]
 AppreciationEnricherFn = Callable[[str, tuple[WebSearchResult, ...]], "str | None"]
@@ -213,6 +216,10 @@ class ShopReference:
     buy_max: int | None = None
     sell_min: int | None = None
     sell_max: int | None = None
+    # Verbatim matched-listing titles from the band (card number / rarity / set /
+    # box name), threaded through so the yuyutei code cache can record the item's
+    # real identity from data already fetched — no extra request.
+    sample_titles: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -974,6 +981,7 @@ class ResearchCommandService:
         sold_average_lookup_fn: SoldAverageLookupFn | None = None,
         shop_reference_fn: ShopReferenceFn | None = None,
         game_code_resolver_fn: GameCodeResolverFn | None = None,
+        cache_enricher_fn: "CacheEnricherFn | None" = None,
         ip_heat_lookup_fn: IpHeatLookupFn | None = None,
         entity_recognizer_fn: EntityRecognizerFn | None = None,
         appreciation_enricher_fn: AppreciationEnricherFn | None = None,
@@ -990,7 +998,9 @@ class ResearchCommandService:
         self._active_market_search_fn = active_market_search_fn or _default_active_market_search
         self._sold_market_search_fn = sold_market_search_fn or _default_sold_market_search
         self._sold_average_lookup_fn = sold_average_lookup_fn or _default_sold_average_lookup
-        self._shop_reference_fn = shop_reference_fn or build_shop_reference_fn(game_code_resolver_fn)
+        self._shop_reference_fn = shop_reference_fn or build_shop_reference_fn(
+            game_code_resolver_fn, cache_enricher_fn
+        )
         self._ip_heat_lookup_fn = ip_heat_lookup_fn or (lambda canonicals: {})
         self._entity_recognizer_fn = entity_recognizer_fn
         self._appreciation_enricher_fn = appreciation_enricher_fn
@@ -1522,6 +1532,7 @@ def build_research_handler(
     sold_average_lookup_fn: SoldAverageLookupFn | None = None,
     shop_reference_fn: ShopReferenceFn | None = None,
     game_code_resolver_fn: GameCodeResolverFn | None = None,
+    cache_enricher_fn: "CacheEnricherFn | None" = None,
     ip_heat_lookup_fn: IpHeatLookupFn | None = None,
     entity_recognizer_fn: EntityRecognizerFn | None = None,
     appreciation_enricher_fn: AppreciationEnricherFn | None = None,
@@ -1542,6 +1553,7 @@ def build_research_handler(
         sold_average_lookup_fn=sold_average_lookup_fn,
         shop_reference_fn=shop_reference_fn,
         game_code_resolver_fn=game_code_resolver_fn,
+        cache_enricher_fn=cache_enricher_fn,
         ip_heat_lookup_fn=ip_heat_lookup_fn,
         entity_recognizer_fn=entity_recognizer_fn,
         appreciation_enricher_fn=appreciation_enricher_fn,
@@ -2812,6 +2824,7 @@ def _shop_reference_to_dict(ref: ShopReference) -> dict[str, object]:
         "buy_max": ref.buy_max,
         "sell_min": ref.sell_min,
         "sell_max": ref.sell_max,
+        "sample_titles": list(ref.sample_titles),
     }
 
 
@@ -2828,6 +2841,7 @@ def _shop_reference_from_dict(data: dict[str, object]) -> ShopReference:
         buy_max=data.get("buy_max"),
         sell_min=data.get("sell_min"),
         sell_max=data.get("sell_max"),
+        sample_titles=tuple(data.get("sample_titles") or ()),
     )
 
 
@@ -2863,6 +2877,7 @@ def _shop_reference_scrape_impl(
         buy_max=band.buy_max,
         sell_min=band.sell_min,
         sell_max=band.sell_max,
+        sample_titles=getattr(band, "sample_titles", ()),
     )
 
 
@@ -2891,12 +2906,17 @@ def _shop_reference_from_band(
 
 def build_shop_reference_fn(
     game_code_resolver_fn: GameCodeResolverFn | None = None,
+    cache_enricher_fn: "CacheEnricherFn | None" = None,
 ) -> ShopReferenceFn:
     """Build the Yuyu亭 shop-band fetcher. When a ``game_code_resolver_fn`` is
     supplied, it resolves a query's yuyutei game code (e.g. プロセカ card →
     ``ws``) so the band appears even for bare card names with no game keyword.
     The resolver returns ``None`` when it can't identify a TCG game, in which
-    case Yuyutei is skipped (no fan-out, no wasted request)."""
+    case Yuyutei is skipped (no fan-out, no wasted request).
+
+    When a ``cache_enricher_fn`` is supplied, the verbatim matched-listing titles
+    on a successful band are handed back to it so the yuyutei code cache can record
+    the item's real identity — from data already fetched, no extra request."""
 
     def fn(query: str, price_cap: int) -> ShopReference | None:
         source_options: dict[str, object] | None = None
@@ -2909,7 +2929,13 @@ def build_shop_reference_fn(
             if not code:
                 return None
             source_options = {"game_code": code}
-        return _shop_reference_from_band(query, price_cap, source_options)
+        ref = _shop_reference_from_band(query, price_cap, source_options)
+        if ref is not None and cache_enricher_fn is not None and ref.sample_titles:
+            try:
+                cache_enricher_fn(query, ref.sample_titles)
+            except Exception:
+                logger.exception("Yuyutei cache enrichment hook failed query=%s", query)
+        return ref
 
     return fn
 

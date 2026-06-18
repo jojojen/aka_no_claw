@@ -43,6 +43,21 @@ def test_digest_sends_real_entry(tmp_path):
     assert "UNION ARENA" in sent[0][1]
 
 
+def test_digest_skips_operational_cache_entry(tmp_path):
+    """The 遊々亭 game-code cache is internal plumbing (kept only to avoid
+    re-searching) — it must never surface in the digest, even at confidence ≥ 0.1."""
+    sent: list = []
+    sched, db_path = _make_scheduler(tmp_path, sent)
+    db = KnowledgeDatabase(db_path)
+    db.upsert_entry(
+        entity_canonical="プロセカ 桐谷遥 SSP", entity_type="tcg",
+        summary="yuyutei_code=ws. 遊々亭一致商品「大好きを前に 桐谷遥 SSP」（単カード）. 検索語…",
+        confidence=0.6, origin="research_command",
+    )
+    sched._send_digest()
+    assert sent == [], "yuyutei_code= operational cache must not be pushed"
+
+
 def test_digest_mixed_sends_only_real(tmp_path):
     sent: list = []
     sched, db_path = _make_scheduler(tmp_path, sent)

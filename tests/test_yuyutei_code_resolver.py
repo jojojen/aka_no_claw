@@ -121,3 +121,50 @@ def test_search_grounding_null_returns_none(tmp_path) -> None:
     # Negative cached: KB now has the marker.
     entry = KnowledgeDatabase(str(db)).get_entry("謎の商品")
     assert entry is not None and "yuyutei_code=none" in entry.summary
+
+
+def test_enrich_cache_records_matched_title(tmp_path) -> None:
+    db = tmp_path / "k.sqlite3"
+    query = "プロセカ 桐谷遥 SSP"
+    # Resolve first → caches yuyutei_code=ws with no title yet.
+    _make_resolver(db, _RecordingLLM(['{"code": "ws"}'])).resolve(query)
+
+    # Enrich from already-fetched listing titles; LLM picks listing #2.
+    llm = _RecordingLLM(['{"index": 2, "kind": "single"}'])
+    resolver = _make_resolver(db, llm)
+    titles = ("無関係カード A", "大好きを前に 桐谷遥 SSP/PJSK", "別カード C")
+    resolver.enrich_cache(query, titles)
+
+    entry = KnowledgeDatabase(str(db)).get_entry(query)
+    assert entry is not None
+    # Marker stays at head (cache lookup + digest-hide both rely on it).
+    assert entry.summary.startswith("yuyutei_code=ws")
+    # Verbatim matched title recorded; kind labelled.
+    assert "大好きを前に 桐谷遥 SSP/PJSK" in entry.summary
+    assert "単カード" in entry.summary
+    # Code still resolvable from cache (no extra LLM call).
+    assert _make_resolver(db, _RecordingLLM([])).resolve(query) == "ws"
+
+
+def test_enrich_cache_no_match_leaves_entry(tmp_path) -> None:
+    db = tmp_path / "k.sqlite3"
+    query = "プロセカ 桐谷遥 SSP"
+    _make_resolver(db, _RecordingLLM(['{"code": "ws"}'])).resolve(query)
+
+    # Model isn't sure which listing matches → picks nothing, no title stored.
+    resolver = _make_resolver(db, _RecordingLLM(['{"index": null, "kind": null}']))
+    resolver.enrich_cache(query, ("無関係 A", "無関係 B"))
+
+    entry = KnowledgeDatabase(str(db)).get_entry(query)
+    assert entry is not None and entry.summary.startswith("yuyutei_code=ws")
+    assert "一致商品" not in entry.summary
+
+
+def test_enrich_cache_skips_when_no_cached_code(tmp_path) -> None:
+    db = tmp_path / "k.sqlite3"
+    # No prior resolve → nothing cached; enrich must be a no-op (no LLM call).
+    llm = _RecordingLLM(['{"index": 1, "kind": "single"}'])
+    resolver = _make_resolver(db, llm)
+    resolver.enrich_cache("未キャッシュ商品", ("何か A",))
+    assert llm.calls == 0
+    assert KnowledgeDatabase(str(db)).get_entry("未キャッシュ商品") is None

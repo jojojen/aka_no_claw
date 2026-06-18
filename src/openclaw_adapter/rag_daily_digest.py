@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -20,6 +20,7 @@ from .knowledge_db import (
     KnowledgeDatabase as KnowledgeDB,
     KnowledgeEntry,
     is_insufficient_entry,
+    is_operational_cache_entry,
 )
 
 logger = logging.getLogger(__name__)
@@ -39,8 +40,17 @@ def _seconds_until_next(hour: int) -> float:
 
 
 def _today_start_iso() -> str:
-    """ISO timestamp for today at 00:00:00 local time."""
-    return datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    """UTC ISO timestamp for the start of *today in local time*.
+
+    Returned in UTC so it compares correctly against ``created_at`` (stored in
+    UTC) in ``entries_since``'s string comparison. A naive local-midnight
+    threshold would be lexically greater than today's UTC-stamped entries in the
+    hours after local midnight (when local is ahead of UTC), silently dropping
+    them from the digest."""
+    local_midnight = datetime.now().astimezone().replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    return local_midnight.astimezone(timezone.utc).isoformat()
 
 
 def _format_entry_message(entry: KnowledgeEntry, index: int, total: int) -> str:
@@ -112,9 +122,13 @@ class RagDailyDigestScheduler:
             return
         db = KnowledgeDB(self._db_path)
         entries = db.entries_since(_today_start_iso())
-        # Never push 資料不足 no-data stubs (confidence~0 placeholders): they carry no
-        # real knowledge and only exist as an internal negative cache.
-        entries = [e for e in entries if not is_insufficient_entry(e)]
+        # Never push entries that carry no human-reviewable knowledge: 資料不足/一般常識
+        # no-data stubs (internal negative cache) and operational caches such as the
+        # 遊々亭 game-code mapping (internal plumbing kept only to avoid re-searching).
+        entries = [
+            e for e in entries
+            if not is_insufficient_entry(e) and not is_operational_cache_entry(e)
+        ]
         if not entries:
             logger.info("RagDailyDigestScheduler: no new entries today — silent")
             return

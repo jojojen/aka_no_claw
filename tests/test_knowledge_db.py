@@ -179,6 +179,7 @@ from openclaw_adapter.knowledge_db import (
     OBSERVATION_MARKER,
     OBSERVATION_SUMMARY_CAP,
     is_insufficient_entry,
+    is_operational_cache_entry,
 )
 
 
@@ -295,6 +296,20 @@ def test_is_insufficient_entry_flags_no_data_stub(db):
 def test_is_insufficient_entry_passes_real_entry(db):
     _seed_entity(db)
     assert is_insufficient_entry(db.get_entry("union_arena")) is False
+
+
+def test_is_operational_cache_entry_flags_yuyutei_marker():
+    op = KnowledgeEntry(
+        entry_id="e", entity_canonical="プロセカ 桐谷遥 SSP", entity_type="tcg",
+        summary="yuyutei_code=ws. 遊々亭一致商品「…」. 検索語「…」の遊々亭ゲームコード判定。",
+        confidence=0.6,
+    )
+    assert is_operational_cache_entry(op) is True
+
+
+def test_is_operational_cache_entry_passes_real_entry(db):
+    _seed_entity(db)
+    assert is_operational_cache_entry(db.get_entry("union_arena")) is False
 
 
 def test_is_insufficient_entry_stays_true_even_with_appended_observation(db):

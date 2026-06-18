@@ -143,8 +143,24 @@ class YuyuteiGameCodeResolver:
             return token
         return None
 
-    def _store_cache(self, query: str, code: str, *, urls: tuple[str, ...]) -> None:
-        summary = f"yuyutei_code={code}. 商品「{query}」の遊々亭ゲームコード判定。"
+    def _store_cache(
+        self,
+        query: str,
+        code: str,
+        *,
+        urls: tuple[str, ...],
+        matched_title: str | None = None,
+        kind: str | None = None,
+    ) -> None:
+        # The yuyutei_code= marker MUST stay at the head: the resolver's own cache
+        # lookup (_CACHE_MARKER_RE) and the digest's operational-cache filter both
+        # key on it. Any enriched identity is appended after, never before.
+        summary = f"yuyutei_code={code}."
+        if matched_title:
+            kind_label = {"single": "単カード", "box": "BOX/カートン"}.get(kind or "")
+            tail = f"（{kind_label}）" if kind_label else ""
+            summary += f" 遊々亭一致商品「{matched_title}」{tail}."
+        summary += f" 検索語「{query}」の遊々亭ゲームコード判定。"
         try:
             KnowledgeDatabase(self._db_path).upsert_entry(
                 entity_canonical=query,
@@ -157,6 +173,83 @@ class YuyuteiGameCodeResolver:
             )
         except Exception:
             logger.exception("Yuyutei code cache store failed query=%s code=%s", query, code)
+
+    def enrich_cache(self, query: str, titles: Sequence[str]) -> None:
+        """Best-effort: from yuyutei listing titles already fetched for *query*
+        (which carry the real card number / rarity / set / box name), have the
+        local LLM pick the listing that IS this product and record its verbatim
+        title + kind onto the cached entry. Grounded selection only — the title is
+        stored verbatim (no field hallucination), and an unsure model picks nothing
+        rather than guessing. Zero extra network (titles already fetched). Never
+        raises: a failed enrichment must not break the price path."""
+        try:
+            cleaned = " ".join((query or "").split()).strip()
+            if not cleaned:
+                return
+            candidates = [t.strip() for t in (titles or ()) if t and t.strip()]
+            if not candidates:
+                return
+            cached = self._lookup_cache(cleaned)
+            if cached is None or cached == _NEGATIVE:
+                # Only enrich a positive game-code entry the resolver already cached.
+                return
+            picked = self._pick_matching_title(cleaned, candidates)
+            if picked is None:
+                return
+            title, kind = picked
+            self._store_cache(cleaned, cached, urls=(), matched_title=title, kind=kind)
+            logger.info("Yuyutei cache enriched query=%s title=%s kind=%s", cleaned, title, kind)
+        except Exception:
+            logger.exception("Yuyutei cache enrichment failed query=%s", query)
+
+    def _pick_matching_title(
+        self, query: str, candidates: Sequence[str]
+    ) -> tuple[str, str | None] | None:
+        """Ask the LLM which listing title is the SAME product as *query*. Returns
+        ``(verbatim_title, kind)`` or ``None`` when no candidate clearly matches.
+        ``kind`` is one of ``"single" | "box" | None``."""
+        numbered = "\n".join(f"{i}. {t}" for i, t in enumerate(candidates, 1))
+        prompt = (
+            "あなたはトレカ商品の同定器です。\n"
+            f"検索語: {query}\n"
+            "次の遊々亭の在庫商品名から、検索語とまったく同じ商品を1つだけ選ぶ。\n"
+            "確実に一致するものが無ければ index は null（推測で選ばない）。\n"
+            "kind は単カードなら \"single\"、BOX/カートン等の未開封なら \"box\"、不明なら null。\n"
+            f"候補:\n{numbered}\n"
+            'JSONのみで答える: {"index": <1〜' + str(len(candidates)) + ' または null>, '
+            '"kind": "<single|box>" または null}'
+        )
+        raw = self._call_raw(prompt)
+        if not raw:
+            return None
+        try:
+            payload = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            match = re.search(r'"index"\s*:\s*(\d+)', raw)
+            if not match:
+                return None
+            payload = {"index": int(match.group(1))}
+        if not isinstance(payload, dict):
+            return None
+        index = payload.get("index")
+        if not isinstance(index, int) or not (1 <= index <= len(candidates)):
+            return None
+        kind = payload.get("kind")
+        kind = kind if kind in ("single", "box") else None
+        return candidates[index - 1], kind
+
+    def _call_raw(self, prompt: str) -> str | None:
+        try:
+            return self._json_call_fn(
+                endpoint=self._endpoint,
+                model=self._model,
+                prompt=prompt,
+                timeout_seconds=self._timeout_seconds,
+                ssl_context=self._ssl_context,
+            )
+        except Exception:
+            logger.exception("Yuyutei cache enrichment: Ollama call failed")
+            return None
 
     def _classify_direct(self, query: str) -> str | None:
         prompt = (
