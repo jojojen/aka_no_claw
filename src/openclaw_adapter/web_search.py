@@ -221,33 +221,30 @@ def _extract_yahoo_japan_results(page: object, max_results: int) -> tuple[WebSea
 # --- DuckDuckGo backend (second source, alternated with Yahoo) ---------------
 
 DUCKDUCKGO_HTML_URL = "https://html.duckduckgo.com/html/"
+BRAVE_SEARCH_URL = "https://search.brave.com/search"
+STARTPAGE_SEARCH_URL = "https://www.startpage.com/sp/search"
 _DDG_WAIT_MS = 1500  # server-rendered html endpoint; no heavy JS to settle
+_BRAVE_WAIT_MS = 2800  # JS-rendered SPA; needs time for result nodes to hydrate
+_STARTPAGE_WAIT_MS = 2800
 
 
-def search_duckduckgo_html(
-    query: str,
+def _browser_fetch(
+    url: str,
+    extract_fn,
     *,
-    max_results: int = DEFAULT_WEB_SEARCH_LIMIT,
-    reuse_context: bool = True,
+    reuse_browser: bool,
+    wait_ms: int,
+    label: str,
 ) -> tuple[WebSearchResult, ...]:
-    """DuckDuckGo web search via a stealth Playwright fetch of the
-    server-rendered ``html.duckduckgo.com/html/`` endpoint. This is the second
-    backend that :func:`web_search` alternates with Yahoo Japan so neither host
-    sees the full query load.
-
-    On the main thread (``reuse_context=True``) the per-call browser is launched
+    """Shared stealth-browser fetch used by every per-call search backend
+    (DuckDuckGo / Brave / Startpage). ``reuse_browser=True`` launches the page
     from the shared singleton Playwright handle so it can coexist with Yahoo's
-    persistent context; off the main thread, use a private ``sync_playwright()``.
+    persistent context on the same thread; off the main thread (worker), pass
+    ``False`` to use a private one-shot ``sync_playwright()``. See
+    :func:`_get_pw_instance` for why one shared instance per thread is required.
     """
     from playwright.sync_api import sync_playwright
     from playwright.sync_api import TimeoutError as PlaywrightTimeout
-
-    cleaned_query = " ".join(query.split()).strip()
-    if not cleaned_query:
-        return ()
-
-    url = f"{DUCKDUCKGO_HTML_URL}?{urlencode({'q': cleaned_query})}"
-    logger.info("DuckDuckGo search query=%s", cleaned_query)
 
     def _run(playwright) -> tuple[WebSearchResult, ...]:
         browser = bs.launch_stealth_chromium(playwright, headless=True, logger=logger)
@@ -257,23 +254,66 @@ def search_duckduckgo_html(
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=30_000)
             except PlaywrightTimeout:
-                logger.warning("DuckDuckGo goto timeout; reading current DOM")
-            page.wait_for_timeout(_DDG_WAIT_MS)
+                logger.warning("%s goto timeout; reading current DOM", label)
+            page.wait_for_timeout(wait_ms)
             bs.humanize(page)
-            return _extract_duckduckgo_results(page, max_results)
+            return extract_fn(page)
         finally:
             context.close()
             browser.close()
 
-    if reuse_context:
-        results = _run(_get_pw_instance())
-    else:
-        with sync_playwright() as playwright:
-            results = _run(playwright)
+    if reuse_browser:
+        return _run(_get_pw_instance())
+    with sync_playwright() as playwright:
+        return _run(playwright)
 
-    if not results:
-        logger.warning("DuckDuckGo returned 0 results query=%s", cleaned_query)
-    return results
+
+def _extract_css_results(
+    page,
+    max_results: int,
+    *,
+    node_sel: str,
+    anchor_sel: str,
+    title_sel: str | None = None,
+    snippet_sels: tuple[str, ...] = (),
+    href_decode=None,
+    engine_host: str | None = None,
+) -> tuple[WebSearchResult, ...]:
+    """Generic CSS-selector result extractor shared by the HTML search backends.
+
+    Each result lives in a ``node_sel`` block; ``anchor_sel`` carries the result
+    URL; ``title_sel`` (defaults to the anchor) carries the title; the first
+    non-empty of ``snippet_sels`` is the snippet. ``href_decode`` unwraps engine
+    redirect URLs; ``engine_host`` drops self-referential nav links.
+    """
+    results: list[WebSearchResult] = []
+    for node in page.query_selector_all(node_sel):
+        if len(results) >= max_results:
+            break
+        anchor = node.query_selector(anchor_sel)
+        if not anchor:
+            continue
+        href = anchor.get_attribute("href") or ""
+        if href_decode:
+            href = href_decode(href)
+        if not _is_external_http_url(href):
+            continue
+        if engine_host and urlparse(href).netloc.endswith(engine_host):
+            continue
+        title_el = node.query_selector(title_sel) if title_sel else anchor
+        raw_title = ((title_el.inner_text() if title_el else "") or "").strip()
+        title = raw_title.splitlines()[0].strip() if raw_title else ""
+        if not title:
+            continue
+        snippet = ""
+        for sel in snippet_sels:
+            el = node.query_selector(sel)
+            text = (el.inner_text().strip() if el else "")
+            if text:
+                snippet = text.replace("\xa0", " ")
+                break
+        results.append(WebSearchResult(title=title, url=href, snippet=snippet))
+    return tuple(results)
 
 
 def _ddg_decode_href(href: str | None) -> str:
@@ -291,29 +331,115 @@ def _ddg_decode_href(href: str | None) -> str:
     return value
 
 
-def _extract_duckduckgo_results(page: object, max_results: int) -> tuple[WebSearchResult, ...]:
-    results: list[WebSearchResult] = []
-    for node in page.query_selector_all("div.result, div.web-result"):  # type: ignore[attr-defined]
-        if len(results) >= max_results:
-            break
-        title_el = node.query_selector("a.result__a")
-        if not title_el:
-            continue
-        real_url = _ddg_decode_href(title_el.get_attribute("href"))
-        if not _is_external_http_url(real_url):
-            continue
-        raw_title = (title_el.inner_text() or "").strip()
-        title = raw_title.splitlines()[0].strip() if raw_title else ""
-        if not title:
-            continue
-        snip_el = node.query_selector(".result__snippet")
-        snippet = (snip_el.inner_text().strip() if snip_el else "").replace("\xa0", " ")
-        results.append(WebSearchResult(title=title, url=real_url, snippet=snippet))
-    return tuple(results)
+def search_duckduckgo_html(
+    query: str,
+    *,
+    max_results: int = DEFAULT_WEB_SEARCH_LIMIT,
+    reuse_browser: bool = True,
+) -> tuple[WebSearchResult, ...]:
+    """DuckDuckGo backend: stealth fetch of the server-rendered
+    ``html.duckduckgo.com/html/`` endpoint."""
+    cleaned_query = " ".join(query.split()).strip()
+    if not cleaned_query:
+        return ()
+    url = f"{DUCKDUCKGO_HTML_URL}?{urlencode({'q': cleaned_query})}"
+    logger.info("DuckDuckGo search query=%s", cleaned_query)
+    results = _browser_fetch(
+        url,
+        lambda page: _extract_css_results(
+            page,
+            max_results,
+            node_sel="div.result, div.web-result",
+            anchor_sel="a.result__a",
+            snippet_sels=(".result__snippet",),
+            href_decode=_ddg_decode_href,
+        ),
+        reuse_browser=reuse_browser,
+        wait_ms=_DDG_WAIT_MS,
+        label="DuckDuckGo",
+    )
+    if not results:
+        logger.warning("DuckDuckGo returned 0 results query=%s", cleaned_query)
+    return results
 
 
-# --- Unified search: alternate evenly between Yahoo and DuckDuckGo ------------
+def search_brave(
+    query: str,
+    *,
+    max_results: int = DEFAULT_WEB_SEARCH_LIMIT,
+    reuse_browser: bool = True,
+) -> tuple[WebSearchResult, ...]:
+    """Brave Search backend: independent index, stealth fetch of the web results."""
+    cleaned_query = " ".join(query.split()).strip()
+    if not cleaned_query:
+        return ()
+    url = f"{BRAVE_SEARCH_URL}?{urlencode({'q': cleaned_query})}"
+    logger.info("Brave search query=%s", cleaned_query)
+    results = _browser_fetch(
+        url,
+        lambda page: _extract_css_results(
+            page,
+            max_results,
+            node_sel="div.snippet[data-type='web']",
+            anchor_sel="a.l1",
+            title_sel=".title",
+            snippet_sels=(".generic-snippet .content", ".snippet-description"),
+            engine_host="brave.com",
+        ),
+        reuse_browser=reuse_browser,
+        wait_ms=_BRAVE_WAIT_MS,
+        label="Brave",
+    )
+    if not results:
+        logger.warning("Brave returned 0 results query=%s", cleaned_query)
+    return results
 
+
+def search_startpage(
+    query: str,
+    *,
+    max_results: int = DEFAULT_WEB_SEARCH_LIMIT,
+    reuse_browser: bool = True,
+) -> tuple[WebSearchResult, ...]:
+    """Startpage backend: Google-quality results via an anonymizing proxy."""
+    cleaned_query = " ".join(query.split()).strip()
+    if not cleaned_query:
+        return ()
+    url = f"{STARTPAGE_SEARCH_URL}?{urlencode({'query': cleaned_query})}"
+    logger.info("Startpage search query=%s", cleaned_query)
+    results = _browser_fetch(
+        url,
+        lambda page: _extract_css_results(
+            page,
+            max_results,
+            node_sel="div.w-gl__result, div.result",
+            anchor_sel="a.w-gl__result-title, a.result-link",
+            snippet_sels=("p.w-gl__description", ".w-gl__description"),
+            engine_host="startpage.com",
+        ),
+        reuse_browser=reuse_browser,
+        wait_ms=_STARTPAGE_WAIT_MS,
+        label="Startpage",
+    )
+    if not results:
+        logger.warning("Startpage returned 0 results query=%s", cleaned_query)
+    return results
+
+
+# --- Unified search: round-robin pool of stealth backends --------------------
+#
+# Every caller goes through web_search(). The pool rotates evenly across all
+# engines (one new "primary" per call, persisted across restarts via a file
+# counter) and falls through the rest on error/empty, so rotation never costs
+# result quality. Spreading load over distinct hosts also keeps any single
+# engine from seeing the full query rate, lowering IP-ban risk.
+#
+# Pool membership is empirically gated: each engine must return clean, parseable
+# external results from this IP via the shared stealth browser. Excluded after
+# testing (2026-06-18): Bing (flaky — sometimes 0 nodes), Mojeek (HTTP 403),
+# Yahoo.com-US (ad-heavy, fragile markup), Ecosia (only exposes breadcrumb URLs).
+
+_SEARCH_POOL: tuple[str, ...] = ("yahoo", "duckduckgo", "brave", "startpage")
 _SEARCH_RR_LOCK = None
 
 
@@ -324,11 +450,10 @@ def _search_rr_counter_path():
     return pathlib.Path(tempfile.gettempdir()) / "openclaw_search_rr_counter"
 
 
-def _next_search_order() -> tuple[str, str]:
-    """Return ``(primary, fallback)`` backend names for this call, alternating
-    evenly across calls — and across process restarts via a small file counter —
-    so Yahoo and DuckDuckGo each take ~half the query load. Spreading requests
-    keeps either host from seeing the full rate and lowers IP-ban risk."""
+def _next_search_rotation() -> tuple[str, ...]:
+    """Return the pool rotated so each call starts at the next engine — evenly
+    across calls and across process restarts (small file counter). The first
+    entry is this call's primary backend; the rest are ordered fallbacks."""
     import threading
 
     global _SEARCH_RR_LOCK
@@ -346,9 +471,28 @@ def _next_search_order() -> tuple[str, str]:
         except Exception:
             pass
 
-    if count % 2 == 0:
-        return ("yahoo", "duckduckgo")
-    return ("duckduckgo", "yahoo")
+    start = count % len(_SEARCH_POOL)
+    return _SEARCH_POOL[start:] + _SEARCH_POOL[:start]
+
+
+def _dispatch_backend(
+    name: str, query: str, max_results: int, reuse_browser: bool
+) -> tuple[WebSearchResult, ...]:
+    if name == "yahoo":
+        return search_yahoo_japan_playwright(
+            query, max_results=max_results, reuse_context=reuse_browser
+        )
+    if name == "duckduckgo":
+        return search_duckduckgo_html(
+            query, max_results=max_results, reuse_browser=reuse_browser
+        )
+    if name == "brave":
+        return search_brave(query, max_results=max_results, reuse_browser=reuse_browser)
+    if name == "startpage":
+        return search_startpage(
+            query, max_results=max_results, reuse_browser=reuse_browser
+        )
+    raise KeyError(f"unknown search backend: {name}")
 
 
 def web_search(
@@ -357,32 +501,25 @@ def web_search(
     max_results: int = DEFAULT_WEB_SEARCH_LIMIT,
     reuse_browser: bool = True,
 ) -> tuple[WebSearchResult, ...]:
-    """Unified web search used by every caller. Alternates evenly between Yahoo
-    Japan and DuckDuckGo; the picked backend is primary, and if it errors or
-    returns nothing the other is tried so alternation never costs result
-    quality. ``reuse_browser=False`` forces both backends onto a private
-    one-shot ``sync_playwright()`` — required when called off the main thread,
-    where the shared singleton instance (bound to its creating thread) is unsafe
-    to touch."""
-    dispatch = {
-        "yahoo": lambda: search_yahoo_japan_playwright(
-            query, max_results=max_results, reuse_context=reuse_browser
-        ),
-        "duckduckgo": lambda: search_duckduckgo_html(
-            query, max_results=max_results, reuse_context=reuse_browser
-        ),
-    }
-    primary, fallback = _next_search_order()
-    for name in (primary, fallback):
+    """Unified web search used by every caller. Rotates evenly across the search
+    engine pool (Yahoo Japan / DuckDuckGo / Brave / Startpage); the picked
+    backend is primary, and if it errors or returns nothing the next engine is
+    tried so rotation never costs result quality. ``reuse_browser=False`` forces
+    every backend onto a private one-shot ``sync_playwright()`` — required when
+    called off the main thread, where the shared singleton instance (bound to
+    its creating thread) is unsafe to touch."""
+    order = _next_search_rotation()
+    for name in order:
         try:
-            results = dispatch[name]()
-        except Exception as exc:  # noqa: BLE001 — try the other backend, never hard-fail search
-            logger.warning("web_search backend=%s failed (%s); trying fallback", name, exc)
+            results = _dispatch_backend(name, query, max_results, reuse_browser)
+        except Exception as exc:  # noqa: BLE001 — try the next backend, never hard-fail search
+            logger.warning("web_search backend=%s failed (%s); trying next", name, exc)
             continue
         if results:
             logger.info("web_search backend=%s returned %d results", name, len(results))
             return results
-    logger.warning("web_search: both backends returned no results query=%s", query)
+        logger.info("web_search backend=%s returned 0 results; trying next", name)
+    logger.warning("web_search: all %d backends empty query=%s", len(order), query)
     return ()
 
 
