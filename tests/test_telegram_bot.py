@@ -915,12 +915,12 @@ def test_command_processor_handles_natural_language_web_research_via_router() ->
         research_renderer=lambda query: seen.append(query) or "皮卡丘是寶可夢代表角色之一 [1]。\n\n參考來源：\n[1] Source\nhttps://example.com/source",
     )
 
-    plan = processor.build_reply_plan(chat_id="123", text="why pokemon card pickachu card is so popular?")
+    plan = processor.build_reply_plan(chat_id="123", text="為什麼皮卡丘的寶可夢卡這麼受歡迎？")
 
     assert plan.ack == "已理解：相當於 /search why Pikachu Pokemon cards are popular，正在搜尋資料來源並整理答案…"
     assert plan.execute() == "皮卡丘是寶可夢代表角色之一 [1]。\n\n參考來源：\n[1] Source\nhttps://example.com/source"
     assert seen == [TelegramResearchQuery(query="why Pikachu Pokemon cards are popular")]
-    assert router.seen_texts == ["why pokemon card pickachu card is so popular?"]
+    assert router.seen_texts == ["為什麼皮卡丘的寶可夢卡這麼受歡迎？"]
 
 
 def test_command_processor_handles_natural_language_opportunity_remove_via_router() -> None:
@@ -951,12 +951,28 @@ def test_command_processor_handles_natural_language_opportunity_remove_via_route
         command_handlers={"/hunt": RegisteredCommand(_stub_hunt)},
     )
 
-    plan = processor.build_reply_plan(chat_id="123", text="remove target 2 from the opportunity list")
+    plan = processor.build_reply_plan(chat_id="123", text="把機會清單的第 2 筆移除")
 
     assert plan.ack == "已理解：相當於 /hunt remove 2，正在移除。"
     assert plan.execute() == "removed:2"
     assert seen == ["2"]
-    assert router.seen_texts == ["remove target 2 from the opportunity list"]
+    assert router.seen_texts == ["把機會清單的第 2 筆移除"]
+
+
+def test_auto_translate_detection_matrix() -> None:
+    from openclaw_adapter.telegram_bot import _looks_like_foreign_text_for_translation as f
+
+    # Japanese (kana) and bare English (no Han) -> auto-translate.
+    assert f("お疲れさま、今日は大変だったね")
+    assert f("remove target 2 from the opportunity list")
+    assert f("why is this card so popular?")
+    # Chinese commands (incl. embedded English product names) -> router, not translate.
+    assert not f("幫我查 pokemon Pikachu ex 132/106 SAR sv08")
+    assert not f("ws 熱門前 5")
+    assert not f("把機會清單的第 2 筆移除")
+    # Short control tokens -> never hijacked.
+    assert not f("ok")
+    assert not f("はい")
 
 
 def test_build_processing_ack_for_heavy_actions() -> None:

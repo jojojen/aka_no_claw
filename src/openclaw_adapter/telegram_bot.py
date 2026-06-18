@@ -245,27 +245,35 @@ def _build_research_callback_handler(
 
 
 def _looks_like_foreign_text_for_translation(text: str) -> bool:
-    """Cheap, deterministic check for "this bare message is Japanese the user
+    """Cheap, deterministic check for "this bare message is foreign text the user
     pasted to read in Chinese" — used to auto-route to translation WITHOUT a slow
     LLM intent-router round-trip, so recognising the intent is effectively free.
 
-    Restricted to Japanese (presence of kana) on purpose. Kana never appears in
-    Chinese, and the bot has no Japanese commands, so kana text is unambiguously a
-    translate request. English is deliberately excluded: the bot DOES accept
-    English natural-language commands ("remove target 2 …"), so auto-translating
-    Latin text would hijack them — English keeps using /zh. Script detection by
-    unicode range is a fact about codepoints, not open-world entity recognition, so
-    it does not fall under the LLM+RAG rule. The length guard stops short control
-    words like「はい」from being hijacked."""
+    Fires on Japanese (any kana) or pure-English (Latin letters, zero Han) text.
+    This is safe because the user always issues commands with a leading「/」(already
+    excluded by the caller), so a bare non-Chinese message is never a command — it
+    is something they want translated. The "zero Han" gate for English is the key:
+    Chinese commands routinely embed English product names ("幫我查 pokemon Pikachu
+    ex"), so any Han ideograph means it's a Chinese query and goes to the normal
+    router, not translation. Script detection by unicode range is a fact about
+    codepoints, not open-world entity recognition, so it does not fall under the
+    LLM+RAG rule. The length guard stops tiny tokens like「はい」/ "ok" from being
+    hijacked."""
     s = text.strip()
     if len(s) < 4:
         return False
-    return any(
+    has_kana = any(
         (0x3040 <= ord(ch) <= 0x30FF)
         or (0x31F0 <= ord(ch) <= 0x31FF)
         or (0xFF66 <= ord(ch) <= 0xFF9D)
         for ch in s
     )
+    if has_kana:
+        return True
+    has_han = any(0x4E00 <= ord(ch) <= 0x9FFF for ch in s)
+    if has_han:
+        return False
+    return sum(1 for ch in s if "a" <= ch.lower() <= "z") >= 2
 
 
 class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
