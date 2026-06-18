@@ -1340,6 +1340,7 @@ class ResearchCommandService:
             min_similarity=0.32,
         )
         sold_evidence = tuple(_price_evidence_from_market_item(item, sold_status="sold") for item in sold_raw)
+        sold_evidence, sold_outliers = _drop_price_outliers(sold_evidence)
         sold_avg = _average_price_from_evidence(sold_evidence)
         if sold_avg is None:
             try:
@@ -1361,6 +1362,7 @@ class ResearchCommandService:
             min_similarity=0.32,
         )
         active_evidence = tuple(_price_evidence_from_market_item(item, sold_status="active") for item in active_raw)
+        active_evidence, active_outliers = _drop_price_outliers(active_evidence)
         try:
             shop_reference = self._shop_reference_fn(query, price_cap)
         except Exception as exc:
@@ -1386,6 +1388,8 @@ class ResearchCommandService:
             shop_reference=shop_reference,
             active_dropped=active_dropped,
             sold_dropped=sold_dropped,
+            active_outliers=active_outliers,
+            sold_outliers=sold_outliers,
             backend_warnings=tuple(backend_warnings),
         )
         ctx.add_section_result(result)
@@ -2283,19 +2287,30 @@ def build_appreciation_enricher(
     *,
     fetch_page_fn: Callable[[str], str],
     summarize_fn: Callable[[str, tuple[WebSearchResult, ...]], str],
+    relevance_fn: Callable[[str, tuple[WebSearchResult, ...]], tuple[WebSearchResult, ...]] | None = None,
     max_pages: int = 3,
 ) -> AppreciationEnricherFn:
     """A4: turn snippet-only appreciation evidence into a grounded catalyst
     summary by fetching the top result pages and running the same LLM summariser
     the web-research renderer uses. fetch/summarize are injected so this stays
     decoupled from web_search/playwright and unit-testable. Reuses the existing
-    search results — no extra search calls (Rule C7)."""
+    search results — no extra search calls (Rule C7). When ``relevance_fn`` is
+    given, off-topic results are dropped before any page is fetched; the gate is
+    a safety net and falls back to the original results on failure/empty."""
 
     def _enrich(query: str, search_results: tuple[WebSearchResult, ...]) -> str | None:
         if not search_results or not query:
             return None
+        relevant = search_results
+        if relevance_fn is not None:
+            try:
+                filtered = tuple(relevance_fn(query, search_results))
+            except Exception:  # noqa: BLE001 — gate must never lose good results
+                logger.warning("appreciation relevance gate failed query=%s", query, exc_info=True)
+                filtered = search_results
+            relevant = filtered or search_results
         sources: list[WebSearchResult] = []
-        for result in search_results[:max_pages]:
+        for result in relevant[:max_pages]:
             try:
                 content = fetch_page_fn(result.url)
             except Exception:  # noqa: BLE001 — fall back to snippet on any fetch failure
@@ -2447,6 +2462,8 @@ def _build_price_section_result(
     shop_reference: ShopReference | None = None,
     active_dropped: int = 0,
     sold_dropped: int = 0,
+    active_outliers: int = 0,
+    sold_outliers: int = 0,
     backend_warnings: tuple[str, ...] = (),
 ) -> ResearchSectionResult:
     active_prices = [e.price_jpy for e in active_evidence if e.price_jpy is not None]
@@ -2506,6 +2523,7 @@ def _build_price_section_result(
         ]
         compare_avg: float | None = None
         cond_note = ""
+        compare_label: str | None = None
         if not sold_classes:
             # Only a pooled average is available (sold avg came from the lookup
             # endpoint with no per-item evidence to split) — be honest it's mixed.
@@ -2515,11 +2533,13 @@ def _build_price_section_result(
             compare_avg = _condition_average(sold_evidence, listed_condition_label)
             if compare_avg is not None:
                 cond_note = f"同條件（{listed_condition_label}）"
+                compare_label = listed_condition_label
             # else: no same-condition comp → withhold below rather than cross-compare.
         elif len(sold_classes) == 1:
             # Listed condition unknown but the sample is one class → pooled IS it.
             compare_avg = sold_average_jpy
             cond_note = f"同條件（{sold_classes[0]}）"
+            compare_label = sold_classes[0]
         # else: listed condition unknown AND sample mixed → no single fair number.
 
         if compare_avg is not None and compare_avg > 0:
@@ -2531,6 +2551,9 @@ def _build_price_section_result(
                 verdict_parts.append(f"目前開價高於{cond_note} sold 均價約 {diff_pct:.0f}%")
             else:
                 verdict_parts.append(f"目前開價接近{cond_note} sold 均價")
+            driving = _driving_comp_line(sold_evidence, label=compare_label)
+            if driving:
+                verdict_parts.append(driving)
         elif listed_condition_label is not None and sold_classes:
             # Listed condition known but no same-condition comp; a cross-condition
             # % is exactly the 新品／中古 mix the pooled average produces, so we
@@ -2555,6 +2578,10 @@ def _build_price_section_result(
         warnings.append(f"sold 候選排除了 {sold_dropped} 筆低相關樣本。")
     if active_dropped:
         warnings.append(f"active 候選排除了 {active_dropped} 筆低相關樣本。")
+    if sold_outliers:
+        warnings.append(f"sold 候選再排除了 {sold_outliers} 筆價格離群樣本（MAD）。")
+    if active_outliers:
+        warnings.append(f"active 候選再排除了 {active_outliers} 筆價格離群樣本（MAD）。")
     if sold_prices and len(sold_prices) < 3:
         if status == "ok":
             status = "partial"
@@ -2897,6 +2924,59 @@ def _average_price_from_evidence(evidence: tuple[PriceEvidence, ...]) -> float |
     if not prices:
         return None
     return sum(prices) / len(prices)
+
+
+def _driving_comp_line(
+    sold_evidence: tuple[PriceEvidence, ...], *, label: str | None, head: int = 3
+) -> str:
+    """A '結論依據' line naming the sold comps the verdict's average rests on, so
+    the price call is traceable rather than a bare number. ``label`` narrows to
+    the condition class actually compared (None = the whole priced sample)."""
+    comps = [
+        e
+        for e in sold_evidence
+        if e.price_jpy is not None and (label is None or (e.condition_label or "中古") == label)
+    ]
+    if not comps:
+        return ""
+    comps.sort(key=lambda e: e.price_jpy or 0)
+    parts: list[str] = []
+    for e in comps[:head]:
+        price = f"¥{e.price_jpy:,}"
+        parts.append(f"{price} {e.source_url}" if e.source_url else price)
+    extra = f"…(+{len(comps) - head})" if len(comps) > head else ""
+    return f"結論依據 {len(comps)} 筆 sold comp：" + "；".join(parts) + extra
+
+
+def _drop_price_outliers(
+    evidence: tuple[PriceEvidence, ...], *, threshold: float = 3.5
+) -> tuple[tuple[PriceEvidence, ...], int]:
+    """Remove price outliers via the median-absolute-deviation (MAD) modified
+    z-score, so one mis-listed ¥1 or ¥999,999 comp can't drag the median/mean.
+
+    Pure numeric (robust to small, skewed samples) — not a keyword filter, so it
+    composes with the existing similarity gate without touching open-world
+    recognition (Rule G). No-ops below 4 priced comps (too few to call an
+    outlier) and when MAD is 0 (a tied cluster). Unpriced evidence is kept."""
+    prices = [e.price_jpy for e in evidence if e.price_jpy is not None]
+    if len(prices) < 4:
+        return evidence, 0
+    median = statistics.median(prices)
+    mad = statistics.median([abs(p - median) for p in prices])
+    if mad == 0:
+        return evidence, 0
+    kept: list[PriceEvidence] = []
+    dropped = 0
+    for e in evidence:
+        if e.price_jpy is None:
+            kept.append(e)
+            continue
+        modified_z = 0.6745 * (e.price_jpy - median) / mad
+        if abs(modified_z) > threshold:
+            dropped += 1
+            continue
+        kept.append(e)
+    return tuple(kept), dropped
 
 
 def _filter_market_items_for_price(

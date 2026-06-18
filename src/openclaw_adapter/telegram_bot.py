@@ -1227,6 +1227,14 @@ def _build_research_appreciation_enricher(settings: AssistantSettings):
             timeout_seconds=summarize_timeout,
             ssl_context=ssl_ctx,
         ),
+        relevance_fn=lambda q, sources: filter_relevant_sources_with_ollama(
+            q,
+            sources,
+            endpoint=endpoint,
+            model=model,
+            timeout_seconds=timeout,
+            ssl_context=ssl_ctx,
+        ),
     )
 
 

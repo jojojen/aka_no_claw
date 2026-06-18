@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -730,6 +731,162 @@ def test_format_opportunity_recommendation_includes_web_research_sources() -> No
     assert "[1] Demand source" in text
     assert "https://example.com/demand" in text
     assert "[2] Price source" in text
+
+
+def test_web_opportunity_researcher_relevance_gate_drops_offtopic_before_assessment() -> None:
+    candidate = _candidate()
+    sources = tuple(
+        WebSearchResult(title=f"r{i}", url=f"https://example.com/{i}", snippet="s")
+        for i in range(6)
+    )
+    seen: dict[str, object] = {}
+
+    def search(query: str, limit: int) -> tuple[WebSearchResult, ...]:
+        seen["limit"] = limit
+        return sources
+
+    def relevance(query: str, candidates: tuple[WebSearchResult, ...]) -> tuple[WebSearchResult, ...]:
+        seen["gate_input"] = candidates
+        return (candidates[2],)
+
+    def json_call(**kwargs) -> str:
+        seen["prompt"] = kwargs["prompt"]
+        return '{"is_relevant":true,"demand_score":90,"reason":"佐證。"}'
+
+    enriched = WebOpportunityResearcher(
+        endpoint="http://127.0.0.1:11434",
+        model="qwen3:4b",
+        timeout_seconds=30,
+        search_fn=search,
+        json_call_fn=json_call,
+        relevance_fn=relevance,
+    ).enrich(candidate)
+
+    # Pool was widened past max_results, gate saw all of it, only the kept source
+    # reached the assessment + stored evidence.
+    assert seen["limit"] > 3
+    assert len(seen["gate_input"]) == 6
+    web_sources = enriched.metadata["web_research"]["sources"]
+    assert [s["url"] for s in web_sources] == ["https://example.com/2"]
+
+
+def test_web_opportunity_researcher_relevance_gate_empty_keeps_all() -> None:
+    candidate = _candidate()
+    sources = tuple(
+        WebSearchResult(title=f"r{i}", url=f"https://example.com/{i}", snippet="s")
+        for i in range(4)
+    )
+    enriched = WebOpportunityResearcher(
+        endpoint="http://127.0.0.1:11434",
+        model="qwen3:4b",
+        timeout_seconds=30,
+        search_fn=lambda query, limit: sources,
+        json_call_fn=lambda **kwargs: '{"is_relevant":true,"demand_score":90,"reason":"佐證。"}',
+        relevance_fn=lambda query, candidates: (),
+    ).enrich(candidate)
+
+    # Empty keep-list is treated as "keep all" then truncated to max_results.
+    web_sources = enriched.metadata["web_research"]["sources"]
+    assert len(web_sources) == 3
+
+
+def test_web_opportunity_researcher_interleaves_locale_query() -> None:
+    candidate = replace(
+        _candidate(),
+        metadata={"locale_search_query": "ホエルオーex 相場 メルカリ"},
+    )
+    queries: list[str] = []
+
+    def search(query: str, limit: int) -> tuple[WebSearchResult, ...]:
+        queries.append(query)
+        return (WebSearchResult(title=query, url=f"https://example.com/{len(queries)}", snippet="s"),)
+
+    enriched = WebOpportunityResearcher(
+        endpoint="http://127.0.0.1:11434",
+        model="qwen3:4b",
+        timeout_seconds=30,
+        search_fn=search,
+        json_call_fn=lambda **kwargs: '{"is_relevant":true,"demand_score":90,"reason":"佐證。"}',
+    ).enrich(candidate)
+
+    # Both the English keyword query and the LLM-produced locale query were run.
+    assert "ホエルオーex 相場 メルカリ" in queries
+    assert any("demand popularity price trend resale" in q for q in queries)
+    urls = {s["url"] for s in enriched.metadata["web_research"]["sources"]}
+    assert len(urls) == 2
+
+
+def test_parse_sns_candidate_response_stores_source_posts_and_locale() -> None:
+    posts = [
+        SnsPost(
+            tweet_id="t1",
+            author_handle="@hunter",
+            text="ホエルオーex SAR 相場上昇",
+            created_at="2026-05-13T00:00:00+00:00",
+            rule_label="pokemon",
+        )
+    ]
+    raw = """
+    {"candidates":[{"game":"pokemon","title":"ホエルオーex","search_query":"ホエルオーex Mercari","heat_score":80,"reason":"話題。","locale_search_query":"ホエルオーex 相場 メルカリ","source_tweet_ids":["t1"]}]}
+    """
+
+    candidates = _parse_candidate_response(raw, posts=posts, limit=5)
+
+    assert len(candidates) == 1
+    meta = candidates[0].metadata
+    assert meta["locale_search_query"] == "ホエルオーex 相場 メルカリ"
+    assert meta["source_posts"] == [
+        {"tweet_id": "t1", "author_handle": "@hunter", "url": "https://x.com/hunter/status/t1"}
+    ]
+
+
+def test_format_opportunity_recommendation_includes_source_posts() -> None:
+    candidate = replace(
+        _candidate(),
+        metadata={
+            "source_posts": [
+                {"tweet_id": "t1", "author_handle": "hunter", "url": "https://x.com/hunter/status/t1"}
+            ]
+        },
+    )
+    price = PriceCheck(candidate_id=candidate.candidate_id, fair_value_jpy=10000, confidence=0.9)
+    listing = ListingOffer(
+        listing_id="m444",
+        title="Umbreon SAR",
+        price_jpy=8000,
+        url="https://jp.mercari.com/item/m444",
+    )
+    reputation = ReputationCheck(
+        listing_url=listing.url,
+        trusted=True,
+        proof_url="http://127.0.0.1:5055/p/proof_1",
+        total_reviews=100,
+        positive_rate=99.0,
+        reason="ok",
+    )
+    decision = evaluate_opportunity(
+        candidate=candidate,
+        price=price,
+        listing=listing,
+        reputation=reputation,
+        thresholds=OpportunityThresholds(),
+    )
+    text = format_opportunity_recommendation(
+        recommendation=OpportunityRecommendation(
+            recommendation_id="listing_1",
+            candidate=candidate,
+            price=price,
+            listing=listing,
+            reputation=reputation,
+            discount_pct=decision.discount_pct,
+            score=decision.score,
+            reasons=decision.reasons,
+        )
+    )
+
+    assert "訊號來源：" in text
+    assert "@hunter" in text
+    assert "https://x.com/hunter/status/t1" in text
 
 
 def _candidate(
