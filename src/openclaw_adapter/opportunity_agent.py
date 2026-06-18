@@ -36,6 +36,7 @@ from .opportunity_models import (
     merge_string_list,
     normalize_product_type,
 )
+from .market_title_corpus import record_titles as _record_market_titles
 from .opportunity_pipeline import CandidateProvider, OpportunityPipeline, OpportunityPipelineStats
 from .opportunity_scoring import OpportunityThresholds, reputation_passes
 from .opportunity_store import OpportunityStore, _normalize_legacy_reason
@@ -827,12 +828,19 @@ class MercariOpportunityListingFinder:
 
         def _run_one(q: str) -> list[dict]:
             try:
-                return list(search_mercari(
+                results = list(search_mercari(
                     q, price_max=price_max_jpy, max_results=limit, condition_ids=DEFAULT_CONDITION_IDS,
                 ))
             except Exception:
                 logger.exception("Mercari search failed query=%r", q)
                 return []
+            # Harvest the raw listing titles (the broadest, pre-filter set) into
+            # the historical title corpus for PR2 IDF. This is a free byproduct of
+            # a search we already ran — no extra external query. Fail-safe inside.
+            _record_market_titles(
+                [str(raw.get("title") or "") for raw in results], source="opportunity"
+            )
+            return results
 
         def _absorb(raw_results: list[dict]) -> None:
             for raw in raw_results:

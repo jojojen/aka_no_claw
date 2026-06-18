@@ -166,6 +166,242 @@ def test_weighted_jaccard_idf_interface_downweights_shared_common_token() -> Non
     assert weighted_jaccard(ref, cand, idf=idf) == pytest.approx(1.0 / 11.0)
 
 
+# --- PR2: historical DF/IDF weighting ---------------------------------------
+
+# Deterministic synthetic corpus: the product family words (ポケモンカード /
+# 黒炎の支配者) recur across many single-card listings → low IDF; the sealed-box
+# attributes (box / シュリンク付き / 未開封) appear in only a couple of docs →
+# high IDF. This is pure statistics (Rule G): no term is boosted by hand, the
+# weights come entirely from document frequency over these titles.
+_IDF_FIXTURE_SINGLES = (
+    "ピカチュウ", "リザードン ex", "ミュウ", "イーブイ", "ナンジャモ sar", "単品",
+    "プロモ", "ピカチュウ ar", "リザードン sar", "ミライドン", "コライドン",
+    "パオジアン ex", "セグレイブ", "サーフゴー ex", "まとめ売り", "美品", "傷あり",
+    "ペリペリ付き", "未使用", "コレクション", "おまけ付き", "値下げ", "即購入可",
+)
+
+
+def _build_idf_fixture():
+    from openclaw_adapter.research_command import build_title_idf_stats_from_titles
+
+    corpus = [f"ポケモンカード 黒炎の支配者 {s}" for s in _IDF_FIXTURE_SINGLES]
+    corpus += [
+        f"ポケモンカード {s}"
+        for s in ("151 リザードン", "クレイバースト", "スノーハザード", "vstar ユニバース")
+    ]
+    corpus += ["ポケモンカード 黒炎の支配者 box シュリンク付き 未開封"]
+    corpus += ["ポケモンカード 黒炎の支配者 box 未開封"]
+    return build_title_idf_stats_from_titles(corpus)
+
+
+def test_weighted_jaccard_uses_idf_to_penalize_missing_high_info_tokens() -> None:
+    # Unit Test 1: candidate keeps only the generic family tokens and is missing
+    # the high-IDF BOX/シュリンク付き attributes. Plain Jaccard would be 2/4=0.5;
+    # IDF weighting collapses it because the missing tokens dominate the union.
+    from openclaw_adapter.research_command import weighted_jaccard
+
+    ref = {"ポケモンカード", "黒炎の支配者", "BOX", "シュリンク付き"}
+    cand = {"ポケモンカード", "黒炎の支配者"}
+    idf = {"ポケモンカード": 1.0, "黒炎の支配者": 1.2, "BOX": 5.0, "シュリンク付き": 6.0}
+
+    plain = weighted_jaccard(ref, cand)
+    weighted = weighted_jaccard(ref, cand, idf=idf)
+    assert plain == pytest.approx(0.5)
+    assert weighted == pytest.approx(2.2 / 13.2)  # ≈ 0.1667
+    assert weighted < plain
+
+
+def test_weighted_jaccard_identical_high_info_unit_scores_one() -> None:
+    # Unit Test 2: identical sets → intersection == union → 1.0 regardless of idf.
+    from openclaw_adapter.research_command import weighted_jaccard
+
+    tokens = {"黒炎の支配者", "BOX", "シュリンク付き", "未開封"}
+    idf = {"黒炎の支配者": 1.2, "BOX": 5.0, "シュリンク付き": 6.0, "未開封": 4.0}
+    assert weighted_jaccard(tokens, set(tokens), idf=idf) == pytest.approx(1.0)
+
+
+def test_idf_formula_is_monotonic_smoothed_and_capped() -> None:
+    from openclaw_adapter.research_command import _idf_from_df
+
+    total = 1000
+    common = _idf_from_df(900, total)
+    rare = _idf_from_df(1, total)
+    unseen = _idf_from_df(0, total)
+    assert common < rare < unseen  # monotonically decreasing in df
+    assert common >= 1.0  # never negative / never below the +1.0 floor
+    # Cap protects against runaway weights from a tiny corpus.
+    assert _idf_from_df(0, 10_000_000, max_idf=8.0) == pytest.approx(8.0)
+
+
+def test_build_title_df_counts_each_title_once_per_unique_term() -> None:
+    from openclaw_adapter.research_command import build_title_df_from_titles
+
+    # "box" appears twice in one title but must contribute df 1 (set semantics).
+    payload = build_title_df_from_titles(["box box ポケモンカード", "ポケモンカード 単品"])
+    assert payload["total_docs"] == 2
+    assert payload["token_df"]["box"] == 1
+    assert payload["token_df"]["ポケモンカード"] == 2
+
+
+def test_comp_filter_case_c_drops_with_representative_idf() -> None:
+    # Integration Test 1: Case C (shares only the product family, missing the
+    # BOX/spec attributes) must DROP through the real production filter path once
+    # historical IDF is supplied. Under PR1 (idf=None) this scored 0.5455 (KEEP).
+    from openclaw_adapter.research_command import _filter_market_items_for_price
+
+    reference = "ポケモンカード 黒炎の支配者 BOX シュリンク付き"
+    items = [{"title": "ポケモンカード 黒炎の支配者", "price": 800}]
+    kept, dropped = _filter_market_items_for_price(
+        reference_title=reference,
+        items=items,
+        min_similarity=_PROD_MIN_SIMILARITY,
+        idf_stats=_build_idf_fixture(),
+    )
+    assert kept == []
+    assert dropped == 1
+
+
+def test_comp_filter_same_unit_keeps_with_idf() -> None:
+    # Integration Test 2: reordered identical sealed-box unit must still KEEP even
+    # with IDF active — the token Jaccard is 1.0 (intersection == union).
+    from openclaw_adapter.research_command import _filter_market_items_for_price
+
+    reference = "黒炎の支配者 BOX シュリンク付き 未開封"
+    items = [{"title": "黒炎の支配者 BOX 未開封 シュリンク付き", "price": 6000}]
+    kept, dropped = _filter_market_items_for_price(
+        reference_title=reference,
+        items=items,
+        min_similarity=_PROD_MIN_SIMILARITY,
+        idf_stats=_build_idf_fixture(),
+    )
+    assert len(kept) == 1
+    assert dropped == 0
+
+
+def test_comp_filter_case_a_stays_dropped_with_idf() -> None:
+    # Regression: PR1's subset drop must survive PR2. A bare single card is a
+    # strict subset of the sealed BOX and must stay DROPPED with IDF active.
+    from openclaw_adapter.research_command import _filter_market_items_for_price
+
+    reference = "黒炎の支配者 BOX シュリンク付き 未開封"
+    items = [{"title": "黒炎の支配者", "price": 500}]
+    kept, dropped = _filter_market_items_for_price(
+        reference_title=reference,
+        items=items,
+        min_similarity=_PROD_MIN_SIMILARITY,
+        idf_stats=_build_idf_fixture(),
+    )
+    assert kept == []
+    assert dropped == 1
+
+
+def test_load_title_idf_stats_missing_file_returns_none() -> None:
+    from openclaw_adapter.research_command import load_title_idf_stats
+
+    assert load_title_idf_stats(Path("/nonexistent/market_title_df.json")) is None
+
+
+def test_comp_filter_cold_start_falls_back_to_plain_jaccard(monkeypatch) -> None:
+    # Cold start: with no DF stats available the filter must behave exactly like
+    # PR1 (plain Jaccard). Case C scored 0.5455 under PR1 → still KEEP at 0.32.
+    from openclaw_adapter import research_command as rc
+
+    monkeypatch.setattr(rc, "_default_title_idf_stats", lambda: None)
+    reference = "ポケモンカード 黒炎の支配者 BOX シュリンク付き"
+    items = [{"title": "ポケモンカード 黒炎の支配者", "price": 800}]
+    kept, dropped = rc._filter_market_items_for_price(
+        reference_title=reference, items=items, min_similarity=_PROD_MIN_SIMILARITY
+    )
+    assert len(kept) == 1
+    assert dropped == 0
+
+
+def test_explain_title_similarity_reports_missing_high_idf_attributes() -> None:
+    from openclaw_adapter.research_command import explain_title_similarity
+
+    report = explain_title_similarity(
+        "ポケモンカード 黒炎の支配者 BOX シュリンク付き",
+        "ポケモンカード 黒炎の支配者",
+        idf_stats=_build_idf_fixture(),
+    )
+    assert set(report["matched_tokens"]) == {"ポケモンカード", "黒炎の支配者"}
+    assert set(report["missing_from_candidate"]) == {"box", "シュリンク付き"}
+    # Missing attributes carry strictly higher weight than the shared generics.
+    assert min(report["missing_from_candidate"].values()) > max(
+        report["matched_tokens"].values()
+    )
+    assert report["final_score"] < _PROD_MIN_SIMILARITY
+
+
+# --- PR2: activation gate (thickness threshold + canary) + hot reload --------
+
+
+def test_gate_rejects_thin_table() -> None:
+    from openclaw_adapter.research_command import gate_title_idf_stats
+
+    thin = _build_idf_fixture()  # ~29 docs
+    assert thin.total_docs < 3000
+    assert gate_title_idf_stats(thin) is None  # default min_docs gate
+    # With a low min_docs it clears thickness and the canary still holds.
+    assert gate_title_idf_stats(thin, min_docs=10) is thin
+
+
+def test_gate_rejects_off_domain_table_via_canary() -> None:
+    # A table that is "thick enough" but learned from an unrelated domain must be
+    # rejected by the canary: here every term is unseen → uniform default weight →
+    # the canary's subset-card DROP collapses back to plain Jaccard (0.2778) which
+    # is fine, but a deliberately broken table (all equal, no discrimination) on a
+    # KEEP case would fail. We assert the canary helper directly on a degenerate map.
+    from openclaw_adapter.research_command import (
+        TitleIdfStats,
+        _passes_activation_canary,
+    )
+
+    # Degenerate: every token weighted identically and bigrams too → still must
+    # preserve drop<0.32<=keep on the canary (plain-Jaccard-equivalent does).
+    sane_like_plain = TitleIdfStats(
+        total_docs=9999, token_idf={}, bigram_idf={},
+        default_token_idf=1.0, default_bigram_idf=1.0,
+    )
+    assert _passes_activation_canary(sane_like_plain) is True
+
+    # Now a pathological map that inverts importance (generic words heaviest):
+    # it lifts the subset-card canary above threshold → must be rejected.
+    inverted = TitleIdfStats(
+        total_docs=9999,
+        token_idf={"黒炎の支配者": 50.0, "box": 0.01, "シュリンク付き": 0.01, "未開封": 0.01},
+        bigram_idf={},
+        default_token_idf=0.01,
+        default_bigram_idf=0.01,
+    )
+    assert _passes_activation_canary(inverted) is False
+
+
+def test_default_idf_stats_hot_reloads_on_file_change(monkeypatch, tmp_path) -> None:
+    # The long-running bot must pick up a rebuilt DF file with no restart: a change
+    # in the file's mtime invalidates the in-memory cache on the next call.
+    from openclaw_adapter import research_command as rc
+
+    df_path = tmp_path / "market_title_df.json"
+    monkeypatch.setattr(rc, "_TITLE_DF_PATH", df_path)
+    monkeypatch.setattr(rc, "_MIN_TITLE_CORPUS_DOCS", 5)
+    monkeypatch.setattr(rc, "_idf_cache", {"key": "__unset__", "stats": None})
+
+    # Absent file → cold start (None).
+    assert rc._default_title_idf_stats() is None
+
+    # Write a thick-enough, canary-passing table built from real titles.
+    titles = [f"ポケモンカード 黒炎の支配者 単品{i}" for i in range(20)]
+    titles += ["ポケモンカード 黒炎の支配者 box シュリンク付き 未開封"]
+    payload = rc.build_title_df_from_titles(titles)
+    import json as _json
+
+    df_path.write_text(_json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    reloaded = rc._default_title_idf_stats()
+    assert reloaded is not None
+    assert reloaded.total_docs == payload["total_docs"]
+
+
 def test_appreciation_enricher_fetches_pages_and_summarizes() -> None:
     from openclaw_adapter.research_command import build_appreciation_enricher
 

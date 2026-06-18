@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import pathlib
 import re
 import statistics
@@ -11,7 +12,7 @@ import time
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable, Protocol, Sequence
+from typing import Callable, Iterable, Protocol, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
@@ -20,6 +21,7 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 from market_monitor import browser_stealth as bs
 
 from .knowledge_db import KnowledgeDatabase, KnowledgeEntry
+from .market_title_corpus import record_titles as _record_market_titles
 from .scrape_subprocess import run_in_subprocess
 from .web_search import WebSearchResult
 
@@ -1360,6 +1362,15 @@ class ResearchCommandService:
             reference_title=reference_title,
             items=active_raw_all,
             min_similarity=0.32,
+        )
+        # Harvest every comp title we already fetched into the historical title
+        # corpus (free byproduct — no extra external queries). Fail-safe inside.
+        _record_market_titles(
+            [
+                str(item.get("title") or "")
+                for item in (*sold_raw_all, *active_raw_all)
+            ],
+            source="research",
         )
         active_evidence = tuple(_price_evidence_from_market_item(item, sold_status="active") for item in active_raw)
         active_evidence, active_outliers = _drop_price_outliers(active_evidence)
@@ -2984,9 +2995,23 @@ def _filter_market_items_for_price(
     reference_title: str,
     items: list[dict[str, object]],
     min_similarity: float,
+    idf_stats: "TitleIdfStats | None" = None,
 ) -> tuple[list[dict[str, object]], int]:
     kept: list[dict[str, object]] = []
     dropped = 0
+    # Load the historical IDF table once for the whole batch (the comparison runs
+    # per candidate item). When no DF file exists the loader returns None and we
+    # fall back to PR1's unweighted Jaccard — cold start must never break filtering.
+    if idf_stats is None:
+        idf_stats = _default_title_idf_stats()
+    if idf_stats is None:
+        token_idf = bigram_idf = None
+        default_token_idf = default_bigram_idf = 1.0
+    else:
+        token_idf = idf_stats.token_idf
+        bigram_idf = idf_stats.bigram_idf
+        default_token_idf = idf_stats.default_token_idf
+        default_bigram_idf = idf_stats.default_bigram_idf
     specific_tokens = _specific_reference_tokens(reference_title)
     anchor_tokens = set(specific_tokens[1:] if len(specific_tokens) >= 2 else specific_tokens)
     for item in items:
@@ -3001,7 +3026,14 @@ def _filter_market_items_for_price(
         if anchor_tokens and not (anchor_tokens & candidate_tokens):
             dropped += 1
             continue
-        similarity = _title_similarity_score(reference_title, title)
+        similarity = _title_similarity_score(
+            reference_title,
+            title,
+            token_idf=token_idf,
+            bigram_idf=bigram_idf,
+            default_token_idf=default_token_idf,
+            default_bigram_idf=default_bigram_idf,
+        )
         if similarity < min_similarity:
             dropped += 1
             continue
@@ -3035,11 +3067,23 @@ def weighted_jaccard(
     return numerator / denominator
 
 
-def _title_similarity_score(reference: str, candidate: str) -> float:
+def _title_similarity_score(
+    reference: str,
+    candidate: str,
+    *,
+    token_idf: dict[str, float] | None = None,
+    bigram_idf: dict[str, float] | None = None,
+    default_token_idf: float = 1.0,
+    default_bigram_idf: float = 1.0,
+) -> float:
     # Deliberately no coverage path and no containment bonus: both rewarded
     # `candidate ⊂ reference`, inflating single-card subsets into false comps.
     # Aggregation is max(token weighted_jaccard, bigram weighted_jaccard); the
     # prior 0.55/0.45 token+bigram blend is dropped on purpose.
+    # PR2: historical IDF maps (when supplied) make rare, high-information
+    # attributes (BOX/シュリンク付き/完全生産限定盤) outweigh generic family
+    # tokens, so a single card sharing only the product name scores low. With
+    # idf=None this stays identical to PR1's plain weighted Jaccard.
     ref = _normalize_market_title(reference)
     cand = _normalize_market_title(candidate)
     if not ref or not cand:
@@ -3053,8 +3097,12 @@ def _title_similarity_score(reference: str, candidate: str) -> float:
     cand_bigrams = _char_ngrams(cand, 2)
 
     score = max(
-        weighted_jaccard(ref_tokens, cand_tokens),
-        weighted_jaccard(ref_bigrams, cand_bigrams),
+        weighted_jaccard(
+            ref_tokens, cand_tokens, idf=token_idf, default_idf=default_token_idf
+        ),
+        weighted_jaccard(
+            ref_bigrams, cand_bigrams, idf=bigram_idf, default_idf=default_bigram_idf
+        ),
     )
     return round(score, 4)
 
@@ -3133,3 +3181,298 @@ def _specific_reference_tokens(text: str) -> tuple[str, ...]:
         if token not in specific:
             specific.append(token)
     return tuple(specific)
+
+
+# ---------------------------------------------------------------------------
+# PR2: historical document-frequency / IDF weighting for title similarity.
+#
+# Pure-statistical only (Rule G): there is no hand-written keyword or alias
+# table here. Discriminative power is learned from how often a token/bigram
+# appears across accumulated marketplace titles — generic family words
+# (ポケモンカード / cd) land in many titles → low IDF; rare attributes
+# (box / シュリンク付き / 完全生産限定盤) land in few → high IDF.
+# ---------------------------------------------------------------------------
+
+_TITLE_DF_VERSION = 1
+_TITLE_DF_PATH = pathlib.Path(__file__).resolve().parents[2] / "data" / "market_title_df.json"
+# Cap so a small corpus can't hand any single rare term a runaway weight; with a
+# few hundred docs an unseen token would otherwise dominate the union sum.
+_MAX_TITLE_IDF = 8.0
+
+
+@dataclass(frozen=True)
+class TitleIdfStats:
+    """Precomputed IDF lookups for title tokens and character bigrams.
+
+    `default_*_idf` is the weight for a term absent from the corpus (treated as
+    document frequency 0 → the most discriminative, but bounded by the cap)."""
+
+    total_docs: int
+    token_idf: dict[str, float]
+    bigram_idf: dict[str, float]
+    default_token_idf: float
+    default_bigram_idf: float
+
+
+def _df_terms_for_title(title: str) -> tuple[set[str], set[str]]:
+    """Token + bigram sets for one title, using the exact same normalization and
+    tokenization as scoring so DF keys line up with lookup keys at query time."""
+    normalized = _normalize_market_title(title)
+    tokens = set(_market_title_tokens(normalized))
+    bigrams = _char_ngrams(normalized, 2)
+    return tokens, bigrams
+
+
+def build_title_df_from_titles(titles: Iterable[str]) -> dict[str, object]:
+    """Build a document-frequency payload from raw marketplace titles.
+
+    Each title is one document; a term contributes at most 1 to its DF per title
+    (set semantics). Blank titles that yield no terms are skipped entirely."""
+    token_df: dict[str, int] = {}
+    bigram_df: dict[str, int] = {}
+    total_docs = 0
+    for title in titles:
+        tokens, bigrams = _df_terms_for_title(str(title or ""))
+        if not tokens and not bigrams:
+            continue
+        total_docs += 1
+        for token in tokens:
+            token_df[token] = token_df.get(token, 0) + 1
+        for bigram in bigrams:
+            bigram_df[bigram] = bigram_df.get(bigram, 0) + 1
+    return {
+        "version": _TITLE_DF_VERSION,
+        "total_docs": total_docs,
+        "token_df": token_df,
+        "bigram_df": bigram_df,
+    }
+
+
+def _idf_from_df(df: int, total_docs: int, max_idf: float = _MAX_TITLE_IDF) -> float:
+    # Smoothed, monotonically decreasing in df, always >= 1.0, never divides by
+    # zero. df == 0 (unseen) gives the largest value, then capped.
+    value = math.log((total_docs + 1) / (df + 1)) + 1.0
+    return min(value, max_idf)
+
+
+def compute_idf_map(
+    df_map: dict[str, int], total_docs: int, max_idf: float = _MAX_TITLE_IDF
+) -> dict[str, float]:
+    return {
+        term: _idf_from_df(int(count), total_docs, max_idf)
+        for term, count in df_map.items()
+    }
+
+
+def title_idf_stats_from_df(
+    payload: dict[str, object], max_idf: float = _MAX_TITLE_IDF
+) -> TitleIdfStats | None:
+    """Turn a DF payload into ready-to-use IDF lookups, or None if it carries no
+    documents (an empty corpus must degrade to PR1 behaviour, not zero weights)."""
+    total_docs = int(payload.get("total_docs") or 0)
+    if total_docs <= 0:
+        return None
+    token_df = payload.get("token_df") or {}
+    bigram_df = payload.get("bigram_df") or {}
+    default_idf = _idf_from_df(0, total_docs, max_idf)
+    return TitleIdfStats(
+        total_docs=total_docs,
+        token_idf=compute_idf_map(token_df, total_docs, max_idf),  # type: ignore[arg-type]
+        bigram_idf=compute_idf_map(bigram_df, total_docs, max_idf),  # type: ignore[arg-type]
+        default_token_idf=default_idf,
+        default_bigram_idf=default_idf,
+    )
+
+
+def build_title_idf_stats_from_titles(
+    titles: Iterable[str], max_idf: float = _MAX_TITLE_IDF
+) -> TitleIdfStats | None:
+    """Convenience for tests/offline tooling: titles → DF → IDF stats in one hop."""
+    return title_idf_stats_from_df(build_title_df_from_titles(titles), max_idf)
+
+
+def load_title_idf_stats(path: pathlib.Path | None = None) -> TitleIdfStats | None:
+    """Load IDF stats from the DF JSON file. Returns None when the file is absent
+    or malformed so /research silently falls back to PR1's unweighted Jaccard."""
+    target = pathlib.Path(path) if path is not None else _TITLE_DF_PATH
+    try:
+        raw = target.read_text(encoding="utf-8")
+    except (FileNotFoundError, NotADirectoryError, OSError):
+        return None
+    try:
+        payload = json.loads(raw)
+    except (ValueError, TypeError):
+        logger.warning(
+            "Malformed market title DF at %s; using unweighted title similarity", target
+        )
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return title_idf_stats_from_df(payload)
+
+
+# Activation gate. A DF table is only trusted once it is BOTH thick enough and
+# behaviourally sane, otherwise /research silently stays on PR1 plain Jaccard:
+#   1. min docs — a thin/narrow corpus learns the wrong "which words are common"
+#      and can shift the PR1 threshold unpredictably (tunable; raise as the
+#      corpus grows).
+#   2. canary self-check — a big-but-off-domain table can still pass (1); these
+#      two synthetic cases verify the learned weights preserve the known-good
+#      ordering (subset card DROPs, reordered same unit KEEPs) before we trust it.
+_MIN_TITLE_CORPUS_DOCS = 3000
+_ACTIVATION_CANARY_DROP = ("黒炎の支配者 box シュリンク付き 未開封", "黒炎の支配者")
+_ACTIVATION_CANARY_KEEP = (
+    "黒炎の支配者 box シュリンク付き 未開封",
+    "黒炎の支配者 box 未開封 シュリンク付き",
+)
+_ACTIVATION_CANARY_THRESHOLD = 0.32
+
+
+def _passes_activation_canary(stats: TitleIdfStats) -> bool:
+    drop_score = _title_similarity_score(
+        *_ACTIVATION_CANARY_DROP,
+        token_idf=stats.token_idf,
+        bigram_idf=stats.bigram_idf,
+        default_token_idf=stats.default_token_idf,
+        default_bigram_idf=stats.default_bigram_idf,
+    )
+    keep_score = _title_similarity_score(
+        *_ACTIVATION_CANARY_KEEP,
+        token_idf=stats.token_idf,
+        bigram_idf=stats.bigram_idf,
+        default_token_idf=stats.default_token_idf,
+        default_bigram_idf=stats.default_bigram_idf,
+    )
+    return drop_score < _ACTIVATION_CANARY_THRESHOLD <= keep_score
+
+
+def gate_title_idf_stats(
+    stats: TitleIdfStats | None, *, min_docs: int | None = None
+) -> TitleIdfStats | None:
+    """Return stats only if they clear the activation gate, else None (→ PR1)."""
+    if stats is None:
+        return None
+    if min_docs is None:
+        min_docs = _MIN_TITLE_CORPUS_DOCS
+    if stats.total_docs < min_docs:
+        logger.info(
+            "Title IDF table too thin (%d < %d docs); staying on plain Jaccard",
+            stats.total_docs,
+            min_docs,
+        )
+        return None
+    if not _passes_activation_canary(stats):
+        logger.warning(
+            "Title IDF table failed activation canary (%d docs); staying on plain Jaccard",
+            stats.total_docs,
+        )
+        return None
+    return stats
+
+
+def describe_title_idf_activation(
+    stats: TitleIdfStats | None, *, min_docs: int | None = None
+) -> dict[str, object]:
+    """Explain whether *stats* would activate, for the weekly rebuild report.
+
+    Mirrors :func:`gate_title_idf_stats` but returns the decision plus *why*
+    (docs vs threshold, canary pass/fail) so the Telegram notice can say more
+    than "on" / "off".
+    """
+    if min_docs is None:
+        min_docs = _MIN_TITLE_CORPUS_DOCS
+    if stats is None:
+        return {
+            "activated": False,
+            "reason": "no_table",
+            "total_docs": 0,
+            "min_docs": min_docs,
+            "enough_docs": False,
+            "canary_pass": False,
+        }
+    enough = stats.total_docs >= min_docs
+    canary = _passes_activation_canary(stats)
+    if enough and canary:
+        reason = "activated"
+    elif not enough:
+        reason = "too_thin"
+    else:
+        reason = "canary_failed"
+    return {
+        "activated": enough and canary,
+        "reason": reason,
+        "total_docs": stats.total_docs,
+        "min_docs": min_docs,
+        "enough_docs": enough,
+        "canary_pass": canary,
+    }
+
+
+# Hot-reload cache keyed on the DF file's mtime: the long-running bot (龍蝦) picks
+# up a freshly rebuilt table on the next /research with no restart, while an
+# unchanged file is served from memory (no per-item disk reads). When the file is
+# absent the key is None and we serve the cached cold-start result.
+_idf_cache: dict[str, object] = {"key": "__unset__", "stats": None}
+
+
+def _default_title_idf_stats() -> TitleIdfStats | None:
+    try:
+        key: object = _TITLE_DF_PATH.stat().st_mtime_ns
+    except OSError:
+        key = None
+    if _idf_cache["key"] == key:
+        return _idf_cache["stats"]  # type: ignore[return-value]
+    stats = gate_title_idf_stats(load_title_idf_stats())
+    _idf_cache["key"] = key
+    _idf_cache["stats"] = stats
+    return stats
+
+
+def explain_title_similarity(
+    reference: str,
+    candidate: str,
+    *,
+    idf_stats: TitleIdfStats | None = None,
+) -> dict[str, object]:
+    """Developer-only diagnostics: show which tokens matched, which high-IDF
+    attributes the candidate is missing, and the resulting component scores.
+    Not surfaced to end users — purely for validating/tuning the IDF weighting."""
+    if idf_stats is None:
+        idf_stats = _default_title_idf_stats()
+    if idf_stats is None:
+        token_idf = bigram_idf = None
+        default_token_idf = default_bigram_idf = 1.0
+    else:
+        token_idf = idf_stats.token_idf
+        bigram_idf = idf_stats.bigram_idf
+        default_token_idf = idf_stats.default_token_idf
+        default_bigram_idf = idf_stats.default_bigram_idf
+
+    ref_norm = _normalize_market_title(reference)
+    cand_norm = _normalize_market_title(candidate)
+    ref_tokens = set(_market_title_tokens(ref_norm))
+    cand_tokens = set(_market_title_tokens(cand_norm))
+
+    def _w(term: str) -> float:
+        if token_idf is None:
+            return default_token_idf
+        return token_idf.get(term, default_token_idf)
+
+    matched = {term: _w(term) for term in sorted(ref_tokens & cand_tokens)}
+    missing = {term: _w(term) for term in sorted(ref_tokens - cand_tokens)}
+    token_score = weighted_jaccard(
+        ref_tokens, cand_tokens, idf=token_idf, default_idf=default_token_idf
+    )
+    bigram_score = weighted_jaccard(
+        _char_ngrams(ref_norm, 2),
+        _char_ngrams(cand_norm, 2),
+        idf=bigram_idf,
+        default_idf=default_bigram_idf,
+    )
+    return {
+        "matched_tokens": matched,
+        "missing_from_candidate": missing,
+        "token_score": round(token_score, 4),
+        "bigram_score": round(bigram_score, 4),
+        "final_score": round(max(token_score, bigram_score), 4),
+    }
