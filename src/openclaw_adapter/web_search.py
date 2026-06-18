@@ -17,7 +17,7 @@ from market_monitor import browser_stealth as bs
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_WEB_SEARCH_LIMIT = 5
+DEFAULT_WEB_SEARCH_LIMIT = 3
 
 # How many top results to actually download + read (item 1), and how much of
 # each page to keep when feeding the summariser. Kept small because the local
@@ -44,6 +44,7 @@ SearchFn = Callable[[str, int], tuple["WebSearchResult", ...]]
 SummarizeFn = Callable[[str, tuple["WebSearchResult", ...]], str]
 FetchPageFn = Callable[[str], str]
 ReformulateFn = Callable[[str], Sequence[str]]
+RelevanceFn = Callable[[str, tuple["WebSearchResult", ...]], tuple["WebSearchResult", ...]]
 PageAnswerFn = Callable[[str, str, str], str]
 
 
@@ -530,6 +531,7 @@ def build_web_research_answer(
     summarize_fn: SummarizeFn,
     max_results: int = DEFAULT_WEB_SEARCH_LIMIT,
     reformulate_fn: ReformulateFn | None = None,
+    relevance_fn: RelevanceFn | None = None,
     fetch_page_fn: FetchPageFn | None = None,
     fetch_page_count: int = DEFAULT_FETCH_PAGE_COUNT,
 ) -> WebResearchAnswer:
@@ -538,16 +540,26 @@ def build_web_research_answer(
     With ``reformulate_fn`` (item 4) the raw question is first turned into a few
     focused search queries whose results are merged. With ``fetch_page_fn``
     (item 1) the top results are actually downloaded so the summariser reads the
-    article body instead of only the search-engine snippet. Both default to
-    ``None``, in which case behaviour is identical to the snippet-only pipeline.
+    article body instead of only the search-engine snippet. With ``relevance_fn``
+    a wider candidate pool is gathered and an LLM drops sources that do not
+    actually address the question before the final ``max_results`` are kept — so
+    off-topic SEO hits (e.g. an unrelated brand page) never reach the summary.
+    All three default to ``None``, leaving the snippet-only pipeline unchanged.
     """
     cleaned_query = " ".join(query.split()).strip()
     if not cleaned_query:
         raise ValueError("Research query cannot be empty.")
 
     limit = max(1, min(10, max_results))
+    # With a relevance gate, cast a wider net first (same number of searches —
+    # each query just returns more rows) so there is room to drop noise and
+    # still keep ``limit`` good sources.
+    candidate_limit = min(10, max(limit, limit * 3)) if relevance_fn is not None else limit
     queries = _plan_search_queries(cleaned_query, reformulate_fn)
-    sources = _run_searches(search_fn, queries, limit)
+    sources = _run_searches(search_fn, queries, candidate_limit)
+    if relevance_fn is not None and sources:
+        sources = _apply_relevance_gate(relevance_fn, cleaned_query, sources)
+    sources = sources[:limit]
     if not sources:
         return WebResearchAnswer(
             query=cleaned_query,
@@ -622,6 +634,28 @@ def _run_searches(search_fn: SearchFn, queries: tuple[str, ...], limit: int) -> 
     return tuple(merged)
 
 
+def _apply_relevance_gate(
+    relevance_fn: RelevanceFn,
+    query: str,
+    sources: tuple[WebSearchResult, ...],
+) -> tuple[WebSearchResult, ...]:
+    """Run the relevance filter, but never make the result set worse.
+
+    If the filter raises, returns nothing, or somehow returns more than it was
+    given, fall back to the original ordered sources — the gate is an
+    improvement, not a hard dependency.
+    """
+    try:
+        filtered = relevance_fn(query, sources)
+    except Exception:
+        logger.exception("Relevance gate failed query=%s; keeping all sources", query)
+        return sources
+    if not filtered:
+        logger.info("Relevance gate dropped everything query=%s; keeping all sources", query)
+        return sources
+    return tuple(filtered)
+
+
 def _attach_page_content(
     sources: tuple[WebSearchResult, ...],
     fetch_page_fn: FetchPageFn,
@@ -686,14 +720,25 @@ def summarize_web_sources_with_ollama(
     return response_text.strip()
 
 
-def format_web_research_answer(answer: WebResearchAnswer) -> str:
-    lines = [answer.summary.strip()]
-    if not answer.sources:
-        return lines[0]
+_CITATION_RE = re.compile(r"\[(\d+)\]")
 
+
+def format_web_research_answer(answer: WebResearchAnswer) -> str:
+    summary = answer.summary.strip()
+    lines = [summary]
+    if not answer.sources:
+        return summary
+
+    # List only the sources the summary actually cited (e.g. [2]), keeping their
+    # original numbers so the in-text markers still resolve. A source that was
+    # retrieved but never cited isn't where the answer came from, so showing it
+    # is misleading. Fall back to all sources when the summary cited nothing.
+    cited = {int(n) for n in _CITATION_RE.findall(summary)}
     lines.append("")
     lines.append("參考來源：")
     for index, source in enumerate(answer.sources, start=1):
+        if cited and index not in cited:
+            continue
         title = _compact_whitespace(source.title)
         lines.append(f"[{index}] {title}")
         lines.append(source.url)
@@ -858,6 +903,86 @@ def reformulate_queries_with_ollama(
         if len(queries) >= max_queries:
             break
     return tuple(queries)
+
+
+# --- Relevance gate: drop sources that do not address the question ------------
+
+
+def _build_relevance_prompt(query: str, sources: tuple[WebSearchResult, ...]) -> str:
+    lines: list[str] = []
+    for index, source in enumerate(sources, start=1):
+        lines.append(f"[{index}] title: {source.title}")
+        lines.append(f"    url: {source.url}")
+        lines.append(f"    snippet: {source.snippet or '(no snippet)'}")
+    return (
+        "You filter web search results for relevance to a user's question.\n"
+        "Keep only the results that could plausibly help answer THIS specific "
+        "question — the right subject AND, when the question names a place, time, "
+        "or entity, results about that same place/time/entity. Drop off-topic SEO "
+        "hits, unrelated brand or social-media landing pages, and generic "
+        "encyclopedia entries that are not about the asked-about subject.\n"
+        "Judge by meaning, not keywords. Be inclusive when unsure, but cut the "
+        "clearly irrelevant.\n"
+        'Reply with STRICT JSON only: {"keep": [list of result numbers to keep]}.\n\n'
+        f"Question:\n{query}\n\n"
+        "Results:\n" + "\n".join(lines) + "\n\nJSON:"
+    )
+
+
+def filter_relevant_sources_with_ollama(
+    query: str,
+    sources: tuple[WebSearchResult, ...],
+    *,
+    endpoint: str,
+    model: str,
+    timeout_seconds: int,
+    ssl_context: ssl.SSLContext | None = None,
+) -> tuple[WebSearchResult, ...]:
+    """Drop sources the local model judges irrelevant to ``query``.
+
+    One LLM call for the whole list. Returns the kept sources in their original
+    order. On any failure (network, bad JSON, empty keep-list) returns the
+    original sources unchanged — the gate must never lose good results to noise.
+    """
+    if not sources:
+        return sources
+    payload = {
+        "model": model,
+        "prompt": _build_relevance_prompt(query, sources),
+        "stream": False,
+        "think": False,
+        "format": "json",
+        "options": {"temperature": 0.0},
+    }
+    request = Request(
+        _resolve_ollama_generate_url(endpoint),
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=timeout_seconds, context=ssl_context) as response:
+            body = response.read().decode("utf-8", errors="replace")
+        response_text = json.loads(body).get("response", "")
+        parsed = json.loads(response_text)
+        keep_raw = parsed.get("keep", [])
+    except Exception:
+        logger.exception("Relevance filter request failed query=%s; keeping all", query)
+        return sources
+
+    keep_indices: set[int] = set()
+    for value in keep_raw if isinstance(keep_raw, list) else ():
+        try:
+            keep_indices.add(int(value))
+        except (TypeError, ValueError):
+            continue
+    kept = tuple(
+        source for index, source in enumerate(sources, start=1) if index in keep_indices
+    )
+    if not kept:
+        logger.info("Relevance filter kept nothing query=%s; keeping all", query)
+        return sources
+    return kept
 
 
 # --- Item 3: fetch a single URL and answer a focused prompt about it ----------
