@@ -169,6 +169,37 @@ def test_build_web_research_answer_reformulate_merges_and_dedupes() -> None:
     assert [s.url for s in answer.sources] == ["https://a.com/x", "https://b.com"]
 
 
+def test_run_searches_interleaves_so_later_query_is_not_starved() -> None:
+    # First query alone returns `limit` results; the locale-translated second
+    # query must still contribute its top hit instead of being starved.
+    first = tuple(WebSearchResult(f"A{i}", f"https://a.com/{i}") for i in range(5))
+    second = (WebSearchResult("JP", "https://eiga.example/jp"),) + tuple(
+        WebSearchResult(f"B{i}", f"https://b.com/{i}") for i in range(4)
+    )
+    table = {"orig": first, "jp": second}
+    merged = ws._run_searches(lambda q, limit: table[q], ("orig", "jp"), 5)
+    urls = [s.url for s in merged]
+    assert "https://eiga.example/jp" in urls
+    assert urls[0] == "https://a.com/0"
+    assert urls[1] == "https://eiga.example/jp"
+    assert len(merged) == 5
+
+
+def test_reformulation_prompt_carries_locale_rule() -> None:
+    prompt = ws._build_reformulation_prompt("奧德賽電影 日本上映日", 3)
+    assert "LOCALE RULE" in prompt
+    assert "locale's primary language" in prompt
+    assert "奧德賽電影 日本上映日" in prompt
+
+
+def test_summary_prompt_carries_grounding_strictness() -> None:
+    sources = (WebSearchResult(title="台灣站", url="https://tw.example/x", snippet="台灣 7/17 上映"),)
+    prompt = ws._build_summary_prompt("奧德賽在日本何時上映", sources)
+    assert "GROUNDING STRICTNESS" in prompt
+    assert "country, region, date, or" in prompt
+    assert "do NOT present the other" in prompt
+
+
 def test_build_web_fetch_answer_success_and_validation() -> None:
     ok = build_web_fetch_answer(
         "https://a.com/article",

@@ -592,15 +592,26 @@ def _run_searches(search_fn: SearchFn, queries: tuple[str, ...], limit: int) -> 
     if len(queries) == 1:
         return tuple(search_fn(queries[0], limit))
 
-    merged: list[WebSearchResult] = []
-    seen: set[str] = set()
+    # Gather every query's results first, then interleave by rank. Draining the
+    # first query to the limit would starve later queries — e.g. a locale-
+    # translated (Japanese) query never contributes if the original query
+    # already returned `limit` results. Round-robin by rank guarantees each
+    # query's top hits make it into the merged set.
+    per_query: list[list[WebSearchResult]] = []
     for query in queries:
         try:
-            results = search_fn(query, limit)
+            per_query.append(list(search_fn(query, limit)))
         except Exception:
             logger.exception("Search failed for reformulated query=%s", query)
-            continue
-        for result in results:
+            per_query.append([])
+
+    merged: list[WebSearchResult] = []
+    seen: set[str] = set()
+    for rank in range(limit):
+        for results in per_query:
+            if rank >= len(results):
+                continue
+            result = results[rank]
             key = _canonical_url_key(result.url)
             if key in seen:
                 continue
@@ -731,6 +742,12 @@ def _build_summary_prompt(query: str, sources: tuple[WebSearchResult, ...]) -> s
         "When a source includes 'Page content', prefer it over the short snippet and "
         "ground your answer in that text. Use only the provided sources; if they are "
         "weak or do not answer the question, say so plainly instead of guessing.\n"
+        "GROUNDING STRICTNESS: never transfer a fact across a country, region, date, or "
+        "entity boundary. If the question asks about one place (e.g. Japan) but the "
+        "sources only describe another place (e.g. Taiwan), do NOT present the other "
+        "place's fact as the answer — state that the asked-about place's specific "
+        "information was not found in the sources, and note what the sources actually "
+        "cover instead.\n"
         "Keep the answer concise and useful.\n"
         "Cite claims with bracketed source numbers like [1] or [2].\n\n"
         f"User question:\n{query}\n\n"
@@ -781,6 +798,23 @@ def extract_readable_text(html: str) -> str:
 # --- Item 4: reformulate a question into focused search queries ---------------
 
 
+def _build_reformulation_prompt(cleaned: str, max_queries: int) -> str:
+    return (
+        "You write web search queries. Given a user's question, output up to "
+        f"{max_queries} concise search queries that would find authoritative pages.\n"
+        "Rules: one query per line, no numbering, no quotes, no commentary. "
+        "Keep proper nouns (song titles, names) intact and in their original language "
+        "(Japanese/English) rather than translating them.\n"
+        "LOCALE RULE: if the question is about what happens in a specific country, "
+        "region, or market (e.g. a release date, price, or availability *in Japan*), "
+        "include at least one query written in that locale's primary language, because "
+        "local-language queries surface that country's authoritative sources, while the "
+        "asker's language tends to return only their own country's pages. Decide the "
+        "language yourself from the question; keep proper nouns intact.\n\n"
+        f"Question: {cleaned}\n\nQueries:"
+    )
+
+
 def reformulate_queries_with_ollama(
     query: str,
     *,
@@ -797,14 +831,7 @@ def reformulate_queries_with_ollama(
     cleaned = " ".join(query.split()).strip()
     if not cleaned:
         return ()
-    prompt = (
-        "You write web search queries. Given a user's question, output up to "
-        f"{max_queries} concise search queries that would find authoritative pages.\n"
-        "Rules: one query per line, no numbering, no quotes, no commentary. "
-        "Keep proper nouns (song titles, names) intact and in their original language "
-        "(Japanese/English) rather than translating them.\n\n"
-        f"Question: {cleaned}\n\nQueries:"
-    )
+    prompt = _build_reformulation_prompt(cleaned, max_queries)
     payload = {"model": model, "prompt": prompt, "stream": False, "think": False, "options": {"temperature": 0.2}}
     request = Request(
         _resolve_ollama_generate_url(endpoint),
