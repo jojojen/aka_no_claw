@@ -1321,6 +1321,7 @@ def run_telegram_polling(
     research_renderer = default_web_research_renderer(settings)
     feedback_service = _build_feedback_service(watch_db)
     _start_backup_scheduler(settings)
+    _start_title_corpus_rebuilder(settings)
     rag_digest_scheduler = _start_rag_daily_digest(settings)
     quiz_daily_scheduler = start_quiz_daily_scheduler(settings)
     dynamic_tool_runner = build_dynamic_tool_runner_from_settings(settings)
@@ -1542,6 +1543,19 @@ def _build_backup_notify(settings):
             client.send_message(chat_id=chat_id, text=text)
 
     return _notify
+
+
+def _start_title_corpus_rebuilder(settings) -> None:
+    """Weekly: rebuild the comp-filter IDF table from the passive title corpus
+    and post a Telegram notice saying whether it activated. Reads only locally
+    cached titles — zero new external queries (Rule C7)."""
+    try:
+        from .title_corpus_rebuilder import TitleCorpusRebuilder
+    except Exception:
+        logger.exception("_start_title_corpus_rebuilder: import failed — skipping")
+        return
+    notify = _build_backup_notify(settings) or (lambda _text: None)
+    TitleCorpusRebuilder(notify_fn=notify).start()
 
 
 def _start_card_image_crawler(watch_db: MonitorDatabase):
