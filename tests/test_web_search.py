@@ -200,109 +200,183 @@ def test_ddg_decode_href_unwraps_redirect_and_passes_plain() -> None:
     assert ws._ddg_decode_href(None) == ""
 
 
-def test_next_search_order_alternates_across_calls(monkeypatch, tmp_path) -> None:
+_POOL = ("yahoo", "duckduckgo", "brave", "startpage")
+
+
+def _stub_pool(monkeypatch, *, calls, returns):
+    """Replace every pool backend with a fake that records the call and returns
+    a configured value (or raises if the value is an Exception)."""
+
+    def make(name):
+        def fn(query, *, max_results, reuse_context=True, reuse_browser=True):
+            calls.append(name)
+            value = returns.get(name, ())
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        return fn
+
+    monkeypatch.setattr(ws, "search_yahoo_japan_playwright", make("yahoo"))
+    monkeypatch.setattr(ws, "search_duckduckgo_html", make("duckduckgo"))
+    monkeypatch.setattr(ws, "search_brave", make("brave"))
+    monkeypatch.setattr(ws, "search_startpage", make("startpage"))
+
+
+def test_next_search_rotation_cycles_whole_pool(monkeypatch, tmp_path) -> None:
     counter = tmp_path / "rr"
     monkeypatch.setattr(ws, "_search_rr_counter_path", lambda: counter)
     monkeypatch.setattr(ws, "_SEARCH_RR_LOCK", None)
-    # Fresh counter (no file) starts at 0 → yahoo first, then flips each call.
-    first = ws._next_search_order()
-    second = ws._next_search_order()
-    third = ws._next_search_order()
-    assert first == ("yahoo", "duckduckgo")
-    assert second == ("duckduckgo", "yahoo")
-    assert third == ("yahoo", "duckduckgo")
+    monkeypatch.setattr(ws, "_SEARCH_POOL", _POOL)
+    rotations = [ws._next_search_rotation() for _ in range(5)]
+    assert rotations[0] == ("yahoo", "duckduckgo", "brave", "startpage")
+    assert rotations[1] == ("duckduckgo", "brave", "startpage", "yahoo")
+    assert rotations[2] == ("brave", "startpage", "yahoo", "duckduckgo")
+    assert rotations[3] == ("startpage", "yahoo", "duckduckgo", "brave")
+    assert rotations[4] == ("yahoo", "duckduckgo", "brave", "startpage")  # wraps
     # Persisted across a process restart (re-read from disk).
-    assert counter.read_text().strip() == "3"
+    assert counter.read_text().strip() == "5"
 
 
 def test_web_search_uses_primary_then_returns(monkeypatch) -> None:
     calls: list[str] = []
-    monkeypatch.setattr(ws, "_next_search_order", lambda: ("yahoo", "duckduckgo"))
-
-    def fake_yahoo(query, *, max_results, reuse_context=True):
-        calls.append("yahoo")
-        return (WebSearchResult("Y", "https://y.com"),)
-
-    def fake_ddg(query, *, max_results, reuse_context=True):
-        calls.append("duckduckgo")
-        return (WebSearchResult("D", "https://d.com"),)
-
-    monkeypatch.setattr(ws, "search_yahoo_japan_playwright", fake_yahoo)
-    monkeypatch.setattr(ws, "search_duckduckgo_html", fake_ddg)
-
+    monkeypatch.setattr(ws, "_next_search_rotation", lambda: _POOL)
+    _stub_pool(
+        monkeypatch, calls=calls,
+        returns={"yahoo": (WebSearchResult("Y", "https://y.com"),)},
+    )
     results = ws.web_search("q", max_results=3)
     assert [r.url for r in results] == ["https://y.com"]
-    # Fallback backend is never touched when the primary yields results.
+    # No other pool member is touched once the primary yields results.
     assert calls == ["yahoo"]
 
 
-def test_web_search_falls_back_on_empty_primary(monkeypatch) -> None:
+def test_web_search_falls_through_pool_on_empty(monkeypatch) -> None:
     calls: list[str] = []
-    monkeypatch.setattr(ws, "_next_search_order", lambda: ("duckduckgo", "yahoo"))
-
-    def fake_yahoo(query, *, max_results, reuse_context=True):
-        calls.append("yahoo")
-        return (WebSearchResult("Y", "https://y.com"),)
-
-    def fake_ddg(query, *, max_results, reuse_context=True):
-        calls.append("duckduckgo")
-        return ()
-
-    monkeypatch.setattr(ws, "search_yahoo_japan_playwright", fake_yahoo)
-    monkeypatch.setattr(ws, "search_duckduckgo_html", fake_ddg)
-
+    monkeypatch.setattr(
+        ws, "_next_search_rotation",
+        lambda: ("duckduckgo", "brave", "startpage", "yahoo"),
+    )
+    _stub_pool(
+        monkeypatch, calls=calls,
+        returns={"brave": (WebSearchResult("B", "https://b.com"),)},
+    )
     results = ws.web_search("q", max_results=3)
-    assert [r.url for r in results] == ["https://y.com"]
-    assert calls == ["duckduckgo", "yahoo"]
+    assert [r.url for r in results] == ["https://b.com"]
+    # ddg empty → brave returns; startpage/yahoo never reached.
+    assert calls == ["duckduckgo", "brave"]
 
 
-def test_web_search_falls_back_on_primary_exception(monkeypatch) -> None:
+def test_web_search_skips_exception_backend(monkeypatch) -> None:
     calls: list[str] = []
-    monkeypatch.setattr(ws, "_next_search_order", lambda: ("yahoo", "duckduckgo"))
-
-    def fake_yahoo(query, *, max_results, reuse_context=True):
-        calls.append("yahoo")
-        raise RuntimeError("yahoo boom")
-
-    def fake_ddg(query, *, max_results, reuse_context=True):
-        calls.append("duckduckgo")
-        return (WebSearchResult("D", "https://d.com"),)
-
-    monkeypatch.setattr(ws, "search_yahoo_japan_playwright", fake_yahoo)
-    monkeypatch.setattr(ws, "search_duckduckgo_html", fake_ddg)
-
+    monkeypatch.setattr(ws, "_next_search_rotation", lambda: _POOL)
+    _stub_pool(
+        monkeypatch, calls=calls,
+        returns={
+            "yahoo": RuntimeError("yahoo boom"),
+            "duckduckgo": (WebSearchResult("D", "https://d.com"),),
+        },
+    )
     results = ws.web_search("q", max_results=3)
     assert [r.url for r in results] == ["https://d.com"]
     assert calls == ["yahoo", "duckduckgo"]
 
 
-def test_web_search_returns_empty_when_both_fail(monkeypatch) -> None:
-    monkeypatch.setattr(ws, "_next_search_order", lambda: ("yahoo", "duckduckgo"))
-    monkeypatch.setattr(
-        ws, "search_yahoo_japan_playwright",
-        lambda query, *, max_results, reuse_context=True: (),
-    )
-    monkeypatch.setattr(
-        ws, "search_duckduckgo_html",
-        lambda query, *, max_results: (),
-    )
+def test_web_search_returns_empty_when_all_backends_fail(monkeypatch) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(ws, "_next_search_rotation", lambda: _POOL)
+    _stub_pool(monkeypatch, calls=calls, returns={})
     assert ws.web_search("q", max_results=3) == ()
+    # Every pool member was attempted before giving up.
+    assert calls == ["yahoo", "duckduckgo", "brave", "startpage"]
 
 
-def test_web_search_forwards_reuse_flag_to_both_backends(monkeypatch) -> None:
+def test_web_search_forwards_reuse_flag_to_backends(monkeypatch) -> None:
     captured: dict[str, object] = {}
-    monkeypatch.setattr(ws, "_next_search_order", lambda: ("yahoo", "duckduckgo"))
+    monkeypatch.setattr(ws, "_next_search_rotation", lambda: _POOL)
 
     def fake_yahoo(query, *, max_results, reuse_context=True):
-        captured["yahoo_reuse"] = reuse_context
+        captured["yahoo"] = reuse_context
         return ()
 
-    def fake_ddg(query, *, max_results, reuse_context=True):
-        captured["ddg_reuse"] = reuse_context
-        return (WebSearchResult("D", "https://d.com"),)
+    def fake_ddg(query, *, max_results, reuse_browser=True):
+        captured["ddg"] = reuse_browser
+        return ()
+
+    def fake_brave(query, *, max_results, reuse_browser=True):
+        captured["brave"] = reuse_browser
+        return (WebSearchResult("B", "https://b.com"),)
 
     monkeypatch.setattr(ws, "search_yahoo_japan_playwright", fake_yahoo)
     monkeypatch.setattr(ws, "search_duckduckgo_html", fake_ddg)
+    monkeypatch.setattr(ws, "search_brave", fake_brave)
     ws.web_search("q", max_results=3, reuse_browser=False)
-    assert captured["yahoo_reuse"] is False
-    assert captured["ddg_reuse"] is False
+    # The Yahoo persistent-context flag and the per-call browser flag both flip.
+    assert captured["yahoo"] is False
+    assert captured["ddg"] is False
+    assert captured["brave"] is False
+
+
+class _FakeEl:
+    def __init__(self, text="", attrs=None, children=None):
+        self._text = text
+        self._attrs = attrs or {}
+        self._children = children or {}
+
+    def inner_text(self):
+        return self._text
+
+    def get_attribute(self, key):
+        return self._attrs.get(key)
+
+    def query_selector(self, sel):
+        return self._children.get(sel)
+
+
+class _FakePage:
+    def __init__(self, nodes):
+        self._nodes = nodes
+
+    def query_selector_all(self, sel):
+        return self._nodes
+
+
+def test_extract_css_results_title_snippet_filters_and_cap() -> None:
+    anchor = _FakeEl(text="Real Title\ntrailing", attrs={"href": "https://ext.com/a"})
+    snippet = _FakeEl(text="the snippet\xa0text")
+    good = _FakeEl(children={"a.x": anchor, ".title": anchor, ".empty": _FakeEl(""), ".s": snippet})
+    # Self-referential nav link to the engine's own host is dropped.
+    self_anchor = _FakeEl(text="Nav", attrs={"href": "https://brave.com/about"})
+    selfnode = _FakeEl(children={"a.x": self_anchor, ".title": self_anchor})
+    extra = _FakeEl(children={"a.x": _FakeEl("X", {"href": "https://ext.com/b"}), ".title": _FakeEl("X", {"href": "https://ext.com/b"})})
+
+    page = _FakePage([good, selfnode, extra])
+    res = ws._extract_css_results(
+        page, 5,
+        node_sel="div", anchor_sel="a.x", title_sel=".title",
+        snippet_sels=(".empty", ".s"), engine_host="brave.com",
+    )
+    assert [(r.title, r.url, r.snippet) for r in res] == [
+        ("Real Title", "https://ext.com/a", "the snippet text"),
+        ("X", "https://ext.com/b", ""),
+    ]
+
+    # max_results caps the output.
+    capped = ws._extract_css_results(
+        page, 1, node_sel="div", anchor_sel="a.x", title_sel=".title",
+        snippet_sels=(".s",), engine_host="brave.com",
+    )
+    assert len(capped) == 1
+
+
+def test_extract_css_results_applies_href_decode() -> None:
+    anchor = _FakeEl(
+        text="T",
+        attrs={"href": "//duckduckgo.com/l/?uddg=https%3A%2F%2Freal.com%2Fp"},
+    )
+    node = _FakeEl(children={"a.r": anchor})
+    page = _FakePage([node])
+    res = ws._extract_css_results(
+        page, 5, node_sel="div", anchor_sel="a.r", href_decode=ws._ddg_decode_href,
+    )
+    assert res[0].url == "https://real.com/p"
