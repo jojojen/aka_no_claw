@@ -3009,7 +3009,37 @@ def _filter_market_items_for_price(
     return kept, dropped
 
 
+def weighted_jaccard(
+    reference_tokens: set[str],
+    candidate_tokens: set[str],
+    idf: dict[str, float] | None = None,
+    default_idf: float = 1.0,
+) -> float:
+    """IDF-weighted Jaccard. With idf=None this degenerates to ordinary Jaccard.
+    The idf interface is intentionally preserved for PR2, where historical DF/IDF
+    weights will down-weight shared product-name tokens against missing specs."""
+    union = reference_tokens | candidate_tokens
+    intersection = reference_tokens & candidate_tokens
+    if not union:
+        return 0.0
+
+    def weight(token: str) -> float:
+        if idf is None:
+            return default_idf
+        return idf.get(token, default_idf)
+
+    numerator = sum(weight(token) for token in intersection)
+    denominator = sum(weight(token) for token in union)
+    if denominator == 0:
+        return 0.0
+    return numerator / denominator
+
+
 def _title_similarity_score(reference: str, candidate: str) -> float:
+    # Deliberately no coverage path and no containment bonus: both rewarded
+    # `candidate ⊂ reference`, inflating single-card subsets into false comps.
+    # Aggregation is max(token weighted_jaccard, bigram weighted_jaccard); the
+    # prior 0.55/0.45 token+bigram blend is dropped on purpose.
     ref = _normalize_market_title(reference)
     cand = _normalize_market_title(candidate)
     if not ref or not cand:
@@ -3019,31 +3049,14 @@ def _title_similarity_score(reference: str, candidate: str) -> float:
 
     ref_tokens = set(_market_title_tokens(ref))
     cand_tokens = set(_market_title_tokens(cand))
-    token_score = 0.0
-    token_coverage = 0.0
-    if ref_tokens and cand_tokens:
-        overlap = ref_tokens & cand_tokens
-        token_score = len(overlap) / len(ref_tokens | cand_tokens)
-        token_coverage = len(overlap) / len(cand_tokens)
-
     ref_bigrams = _char_ngrams(ref, 2)
     cand_bigrams = _char_ngrams(cand, 2)
-    bigram_score = 0.0
-    bigram_coverage = 0.0
-    if ref_bigrams and cand_bigrams:
-        overlap = ref_bigrams & cand_bigrams
-        bigram_score = len(overlap) / len(ref_bigrams | cand_bigrams)
-        bigram_coverage = len(overlap) / len(cand_bigrams)
-
-    containment_bonus = 0.0
-    if ref in cand or cand in ref:
-        containment_bonus = 0.15
 
     score = max(
-        token_score * 0.55 + bigram_score * 0.45,
-        token_coverage * 0.55 + bigram_coverage * 0.45,
+        weighted_jaccard(ref_tokens, cand_tokens),
+        weighted_jaccard(ref_bigrams, cand_bigrams),
     )
-    return min(1.0, round(score + containment_bonus, 4))
+    return round(score, 4)
 
 
 # Loanword orthography folding: the ヴ-row (ヴァ/ヴィ/ヴ…) is routinely written
