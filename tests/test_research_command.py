@@ -98,6 +98,74 @@ def test_comp_filter_keeps_katakana_vu_row_spelling_variant() -> None:
     assert len(kept) == 1
 
 
+# Production min_similarity gate; assert keep/drop rather than raw scores so the
+# 0.32 threshold boundary is actually exercised.
+_PROD_MIN_SIMILARITY = 0.32
+
+
+def test_comp_filter_drops_subset_candidate_case_a() -> None:
+    # candidate ⊂ reference: a bare single card must not pass as the same
+    # sellable unit as the sealed BOX. Previously coverage + containment_bonus
+    # inflated this above threshold; both are now gone.
+    from openclaw_adapter.research_command import _filter_market_items_for_price
+
+    reference = "黒炎の支配者 BOX シュリンク付き 未開封"
+    items = [{"title": "黒炎の支配者", "price": 500}]
+    kept, dropped = _filter_market_items_for_price(
+        reference_title=reference, items=items, min_similarity=_PROD_MIN_SIMILARITY
+    )
+    assert kept == []
+    assert dropped == 1
+
+
+def test_comp_filter_keeps_same_sellable_unit_case_b() -> None:
+    # Same tokens, different word order → still the same sealed BOX → KEEP.
+    from openclaw_adapter.research_command import _filter_market_items_for_price
+
+    reference = "黒炎の支配者 BOX シュリンク付き 未開封"
+    items = [{"title": "黒炎の支配者 BOX 未開封 シュリンク付き", "price": 6000}]
+    kept, dropped = _filter_market_items_for_price(
+        reference_title=reference, items=items, min_similarity=_PROD_MIN_SIMILARITY
+    )
+    assert len(kept) == 1
+    assert dropped == 0
+
+
+def test_comp_filter_case_c_scores_below_case_b() -> None:
+    # Shares product name but missing the BOX/spec tokens. PR1 (idf=None = plain
+    # Jaccard) only removes subset inflation; it does NOT promise to drop this
+    # 2-token overlap — that needs PR2 IDF. We assert the ordering (C < B) and
+    # document that C may still pass the 0.32 gate under PR1.
+    from openclaw_adapter.research_command import _title_similarity_score
+
+    reference = "ポケモンカード 黒炎の支配者 BOX シュリンク付き"
+    case_b_score = _title_similarity_score(
+        reference, "ポケモンカード 黒炎の支配者 BOX シュリンク付き"
+    )
+    case_c_score = _title_similarity_score(reference, "ポケモンカード 黒炎の支配者")
+    assert case_c_score < case_b_score
+
+
+def test_weighted_jaccard_degenerates_to_plain_jaccard_when_idf_none() -> None:
+    from openclaw_adapter.research_command import weighted_jaccard
+
+    ref = {"a", "b", "c", "d"}
+    cand = {"a", "b"}
+    assert weighted_jaccard(ref, cand) == pytest.approx(2 / 4)
+    assert weighted_jaccard(set(), set()) == 0.0
+
+
+def test_weighted_jaccard_idf_interface_downweights_shared_common_token() -> None:
+    from openclaw_adapter.research_command import weighted_jaccard
+
+    ref = {"common", "rare"}
+    cand = {"common"}
+    idf = {"common": 1.0, "rare": 10.0}
+    # Shared token is common (low idf); plain Jaccard would be 1/2, but with idf
+    # the missing rare token dominates the union weight → much lower.
+    assert weighted_jaccard(ref, cand, idf=idf) == pytest.approx(1.0 / 11.0)
+
+
 def test_appreciation_enricher_fetches_pages_and_summarizes() -> None:
     from openclaw_adapter.research_command import build_appreciation_enricher
 
