@@ -4,6 +4,39 @@
 > 相關程式碼片段已內嵌。目標：評估「把市場比價 comp 的相似度篩選換成
 > BM25 / 其他技術」能否解決目前觀察到的兩個失敗模式。
 
+## 實作進度（做到哪 / 再來幹嘛）
+
+> 對照下面的根因 R1/R2/R3。每個 PR 只動一層,分階段驗收。
+
+### ✅ PR1 — 移除 subset 灌水（已實作、已部署）
+- commit `2eadf58`（`aka_no_claw/main`）。
+- 內容:`_title_similarity_score` 移除 coverage 兩條路徑 + `containment_bonus`;
+  新增 `weighted_jaccard(ref, cand, idf=None, default_idf=1.0)`,`idf=None` 退化成
+  純 Jaccard,**保留 idf 介面給 PR2**;aggregation 改 `max(weighted_jaccard(tokens),
+  weighted_jaccard(bigrams))`(刻意放棄原 0.55/0.45 token+bigram blend)。
+- **打到的根因:R3(coverage/containment 灌水)** + R2 的「子集靠灌水過關」這一面。
+- 受控驗證:Case A `黒炎の支配者` ⊂ ref 舊 0.43 → 新 **0.2778** → 過 0.32 門檻 **DROP**;
+  Case B 同 token 換序 **1.0 KEEP**;Case C 2-token 共享 0.5455(仍 keep,如預期待 PR2)。
+  全套 **1103 passed**。
+- ⚠️ **live 真實 comp 上的驗證未完成**:2026-06-18 重啟後跑 live e2e,Mercari
+  sold/active 與 Yahoo 搜尋引擎當下全部 `Page.goto Timeout`(對外網路抽風,非本次
+  改動造成 —— 三條 scrape 都倒在 goto,過濾函式根本沒被呼叫)。**待網路恢復**,用已知
+  高量商品(黒炎 BOX)重跑,確認 sold 不再混入 ¥3,900/¥5,500 單卡(Mode 1 的實況驗收)。
+
+### ⏭ PR2 — 接 historical IDF（下一步）
+- 給 `weighted_jaccard` 的 `idf` 參數接真實 DF/IDF 表(token + bigram 各一)。
+- **打到的根因:R2(所有詞等權重)** —— 讓 BOX/シュリンク 這類高鑑別詞蓋過
+  ポケモンカード/未開封 這類通用詞;這才真正壓得掉「2-token 共享雜訊」
+  (Case C、以及 ¥3,900/¥5,500 那種共享商品名的單卡)。
+- **PR2 完成 = Mode 1 才算真解。** PR1 只是必要不充分的第一步。
+
+### 🔭 PR3+ — 語意層 rerank（更後面，未排期）
+- embedding / LLM rerank 打 **R1(詞彙非語意)**,解 **Mode 2**(同款不同版/跨書寫
+  系統被誤殺,如 YOASOBI CD 案)。架構走 retrieve-then-rerank(IDF 粗篩 + 語意精排)。
+- 硬約束不變:不增加對外查詢次數(不可封 IP)、過濾失敗走安全網、符合 Rule G。
+
+---
+
 ## 背景
 
 `/research`（深度商品研究）會對一個 Mercari 商品，抓「現在在賣(active)」與
