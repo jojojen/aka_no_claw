@@ -128,6 +128,39 @@ def test_appreciation_enricher_fetches_pages_and_summarizes() -> None:
     assert summary == "催化劑：桐谷遥 SR 有再販與作者新作話題"
 
 
+def test_appreciation_enricher_relevance_gate_drops_offtopic_before_fetch() -> None:
+    from openclaw_adapter.research_command import build_appreciation_enricher
+
+    fetched: list[str] = []
+
+    def _fake_fetch(url: str) -> str:
+        fetched.append(url)
+        return f"page text for {url}"
+
+    def _fake_summarize(query: str, sources) -> str:
+        return "催化劑"
+
+    def _gate(query: str, sources):
+        # Keep only the second source — the off-topic ones must never be fetched.
+        return (sources[1],)
+
+    enricher = build_appreciation_enricher(
+        fetch_page_fn=_fake_fetch,
+        summarize_fn=_fake_summarize,
+        relevance_fn=_gate,
+        max_pages=3,
+    )
+    results = (
+        WebSearchResult(title="t1", url="https://a.example/1", snippet="s1"),
+        WebSearchResult(title="t2", url="https://b.example/2", snippet="s2"),
+        WebSearchResult(title="t3", url="https://c.example/3", snippet="s3"),
+    )
+
+    enricher("桐谷遥 SR", results)
+
+    assert fetched == ["https://b.example/2"]
+
+
 def test_appreciation_section_uses_enrichment_and_drops_snippet_warning() -> None:
     from openclaw_adapter.research_command import _build_appreciation_section_result
 
@@ -1423,6 +1456,63 @@ def test_price_comparison_withheld_when_no_same_condition_comp() -> None:
     assert "無同條件（新品）sold 樣本，未做價差比較（避免新品／中古混比）" in result.summary
     # The misleading "open price > used average" reading must NOT appear.
     assert "高於" not in result.summary
+
+
+def test_drop_price_outliers_removes_extreme_comp() -> None:
+    from openclaw_adapter.research_command import _drop_price_outliers
+
+    evidence = _sold_evidence(
+        {"title": "商品 A", "price_jpy": 3000, "url": "https://jp.mercari.com/item/a", "source": "mercari"},
+        {"title": "商品 B", "price_jpy": 3100, "url": "https://jp.mercari.com/item/b", "source": "mercari"},
+        {"title": "商品 C", "price_jpy": 2950, "url": "https://jp.mercari.com/item/c", "source": "mercari"},
+        {"title": "商品 D", "price_jpy": 3050, "url": "https://jp.mercari.com/item/d", "source": "mercari"},
+        {"title": "誤植 99万", "price_jpy": 999999, "url": "https://jp.mercari.com/item/x", "source": "mercari"},
+    )
+
+    kept, dropped = _drop_price_outliers(evidence)
+
+    assert dropped == 1
+    assert all(e.price_jpy != 999999 for e in kept)
+
+
+def test_drop_price_outliers_noop_small_sample() -> None:
+    from openclaw_adapter.research_command import _drop_price_outliers
+
+    evidence = _sold_evidence(
+        {"title": "商品 A", "price_jpy": 3000, "url": "https://jp.mercari.com/item/a", "source": "mercari"},
+        {"title": "誤植", "price_jpy": 999999, "url": "https://jp.mercari.com/item/x", "source": "mercari"},
+    )
+
+    kept, dropped = _drop_price_outliers(evidence)
+
+    # Fewer than 4 priced comps → too few to call an outlier, keep everything.
+    assert dropped == 0
+    assert len(kept) == 2
+
+
+def test_price_section_surfaces_outlier_drop_and_driving_comps() -> None:
+    from openclaw_adapter.research_command import _build_price_section_result
+
+    sold = _sold_evidence(
+        {"title": "メルカリ 商品 中古 A", "price_jpy": 3000, "url": "https://jp.mercari.com/item/u1", "source": "mercari"},
+        {"title": "メルカリ 商品 中古 B", "price_jpy": 3100, "url": "https://jp.mercari.com/item/u2", "source": "mercari"},
+        {"title": "メルカリ 商品 中古 C", "price_jpy": 2900, "url": "https://jp.mercari.com/item/u3", "source": "mercari"},
+    )
+
+    result = _build_price_section_result(
+        query="メルカリ 商品",
+        listed_price_jpy=3000,
+        active_evidence=(),
+        sold_evidence=sold,
+        sold_average_jpy=3000.0,
+        listed_condition_label="中古",
+        sold_outliers=2,
+    )
+
+    # Outlier drop is surfaced as a warning, and the verdict names the comps it rests on.
+    assert any("價格離群" in w for w in result.warnings)
+    assert "結論依據" in result.summary
+    assert "https://jp.mercari.com/item/u1" in result.summary
 
 
 # ── Yuyu-tei cross-process cooldown + output note ─────────────────────────────

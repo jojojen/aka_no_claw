@@ -39,7 +39,11 @@ from .opportunity_models import (
 from .opportunity_pipeline import CandidateProvider, OpportunityPipeline, OpportunityPipelineStats
 from .opportunity_scoring import OpportunityThresholds, reputation_passes
 from .opportunity_store import OpportunityStore, _normalize_legacy_reason
-from .web_search import WebSearchResult, web_search
+from .web_search import (
+    WebSearchResult,
+    filter_relevant_sources_with_ollama,
+    web_search,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -502,6 +506,7 @@ class WebOpportunityResearcher:
         ssl_context: ssl.SSLContext | None = None,
         search_fn=None,
         json_call_fn=None,
+        relevance_fn=None,
     ) -> None:
         self._endpoint = endpoint
         self._model = model
@@ -512,10 +517,71 @@ class WebOpportunityResearcher:
             lambda query, limit: web_search(query, max_results=limit)
         )
         self._json_call_fn = json_call_fn or _call_ollama_json
+        self._relevance_fn = relevance_fn
+
+    def _interleave_searches(
+        self, queries: Sequence[str], limit: int
+    ) -> tuple[WebSearchResult, ...]:
+        """Round-robin merge of per-query results by rank, deduped by URL.
+
+        Same anti-starvation shape as web_search._run_searches: taking rank-0 of
+        every query before rank-1 keeps a locale query from being buried under a
+        full page of the first (e.g. English) query's hits."""
+        per_query: list[list[WebSearchResult]] = []
+        for query in queries:
+            try:
+                per_query.append(list(self._search_fn(query, limit)))
+            except Exception:
+                logger.exception("Opportunity search failed query=%s", query)
+                per_query.append([])
+        merged: list[WebSearchResult] = []
+        seen: set[str] = set()
+        for rank in range(limit):
+            for results in per_query:
+                if rank >= len(results):
+                    continue
+                result = results[rank]
+                key = (result.url or "").strip().lower() or result.title
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(result)
+        return tuple(merged)
+
+    def _fetch_relevant_sources(self, queries: Sequence[str]) -> tuple[WebSearchResult, ...]:
+        """Search one or more queries, then drop off-topic hits before assessment.
+
+        Mirrors web_search's relevance gate: widen the candidate pool, filter by
+        meaning, then truncate to max_results. The gate is a safety net — on
+        failure or an empty keep-list it returns the original sources.
+        """
+        cleaned = [q for q in dict.fromkeys(q.strip() for q in queries) if q]
+        if not cleaned:
+            return ()
+        per_query_limit = (
+            self._max_results
+            if self._relevance_fn is None
+            else min(10, max(self._max_results, self._max_results * 3))
+        )
+        merged = self._interleave_searches(cleaned, per_query_limit)
+        if self._relevance_fn is None or not merged:
+            return merged[: self._max_results]
+        try:
+            filtered = tuple(self._relevance_fn(cleaned[0], merged))
+        except Exception:
+            logger.exception("Opportunity relevance gate failed query=%s; keeping all", cleaned[0])
+            filtered = merged
+        if not filtered:
+            filtered = merged
+        return filtered[: self._max_results]
 
     def enrich(self, candidate: OpportunityCandidate) -> OpportunityCandidate:
         query = _build_opportunity_research_query(candidate)
-        sources = tuple(self._search_fn(query, self._max_results))
+        queries = [query]
+        locale_query = _locale_research_query(candidate)
+        if locale_query:
+            queries.append(locale_query)
+        sources = self._fetch_relevant_sources(queries)
         if not sources:
             healed = _normalize_legacy_reason(candidate.reason)
             if healed == candidate.reason:
@@ -1353,6 +1419,14 @@ def build_opportunity_agent(settings: AssistantSettings | None = None) -> Opport
                 timeout_seconds=settings.opportunity_llm_timeout_seconds,
                 ssl_context=ssl_context,
                 search_fn=lambda query, limit: _budgeted_ddg_search(query, max_results=limit),
+                relevance_fn=lambda query, sources: filter_relevant_sources_with_ollama(
+                    query,
+                    sources,
+                    endpoint=settings.openclaw_local_text_endpoint,
+                    model=text_model,
+                    timeout_seconds=settings.opportunity_llm_timeout_seconds,
+                    ssl_context=ssl_context,
+                ),
             ),
             min_interval_seconds=settings.opportunity_web_search_min_interval_seconds,
         )
@@ -1654,6 +1728,14 @@ def format_opportunity_recommendation(recommendation: OpportunityRecommendation)
             lines.append(f"[{index}] {title}")
             if url:
                 lines.append(url)
+    source_posts = _source_posts_from_metadata(c.metadata)
+    if source_posts:
+        lines.extend(["", "訊號來源："])
+        for post in source_posts[:3]:
+            handle = post.get("author_handle") or ""
+            url = post.get("url") or ""
+            label = f"@{handle}" if handle else (url or post.get("tweet_id") or "post")
+            lines.append(label if not url else f"{label} {url}".strip())
     lines.extend([
         "",
         f"合理價：約 ¥{p.fair_value_jpy:,}",
@@ -2056,6 +2138,9 @@ def _build_sns_candidate_prompt(posts: Sequence[SnsPost], *, limit: int) -> str:
         "- related_keywords：跟這個商品「**不同但市場連動**」的關鍵字（同 IP 的新弾、相關角色、會拉抬此商品需求的話題）。",
         "    例：寶可夢 SAR 卡會被「MEGA ドリームex」新弾話題拉抬 → 加進 related_keywords。",
         "    最多 5 個，不確定就留 []。不是同商品的別名就不要放這裡。",
+        "- locale_search_query：用「該商品母市場的當地語言」寫一句最能查到當地行情/再販/人氣討論的搜尋字串。",
+        "    語言由你依商品判斷（多數日系卡為日文，但不要硬套；歐美商品就用英文等），保留專有名詞原樣。",
+        "    例：日系卡 → 「ホエルオーex 201/165 SAR 相場 メルカリ 再販」。無法判斷就留空字串 \"\"。",
         "",
         "拆分規則（重要）：",
         "- 如果同一則貼文同時提到多個不同 product_type 的商品（例如「擴充包系列」+「Start Deck 產品」），必須拆成多個 candidate，每個 candidate 只描述一個具體商品。",
@@ -2068,7 +2153,7 @@ def _build_sns_candidate_prompt(posts: Sequence[SnsPost], *, limit: int) -> str:
         f"最多輸出 {limit} 個候選。",
         "",
         "請嚴格輸出 JSON，不要 markdown：",
-        '{"candidates":[{"game":"pokemon|ws|yugioh|union_arena","product_type":"single_card|booster_pack|sealed_box|starter_deck|promo|other","title":"商品名","product_identifier":"卡號或set code或null","search_query":"Mercari 關鍵字","heat_score":0-100,"reason":"一句話原因","aliases":["..."],"related_keywords":["..."],"source_tweet_ids":["..."]}]}',
+        '{"candidates":[{"game":"pokemon|ws|yugioh|union_arena","product_type":"single_card|booster_pack|sealed_box|starter_deck|promo|other","title":"商品名","product_identifier":"卡號或set code或null","search_query":"Mercari 關鍵字","heat_score":0-100,"reason":"一句話原因","aliases":["..."],"related_keywords":["..."],"locale_search_query":"當地語言行情查詢字串","source_tweet_ids":["..."]}]}',
         "",
         "正確例子：",
         "- 貼文「インフェルノX・スタートデッキ100 抽選情報」",
@@ -2114,6 +2199,20 @@ def _build_opportunity_research_query(candidate: OpportunityCandidate) -> str:
         joined = " OR ".join(f'"{a}"' for a in candidate.aliases[:2])
         alias_segment = f" OR ({joined})"
     return f"{topic}{alias_segment} {game_label} demand popularity price trend resale"
+
+
+def _locale_research_query(candidate: OpportunityCandidate) -> str:
+    """A locale-language market query the extraction LLM produced, if any.
+
+    The English `_build_opportunity_research_query` keywords bias engines toward
+    Western SERPs; for a Japanese product the local market pages (相場/再販/note)
+    live behind native-language queries. The language is chosen by the LLM
+    (`locale_search_query` field), never a hardcoded keyword table — Rule G."""
+    metadata = candidate.metadata
+    if not isinstance(metadata, MappingABC):
+        return ""
+    value = metadata.get("locale_search_query")
+    return value.strip() if isinstance(value, str) else ""
 
 
 def _build_opportunity_web_assessment_prompt(
@@ -2308,6 +2407,21 @@ def _call_ollama_json(
     ) from last_exc
 
 
+def _sns_post_source_url(post: SnsPost) -> str:
+    """Best-effort permalink for an originating SNS post.
+
+    Web-snippet pseudo-posts already carry a URL as their tweet_id (see
+    `_snippets_to_pseudo_posts`); real X posts get a status permalink built from
+    the handle + id. Anything else returns "" (id surfaces without a link)."""
+    tweet_id = (post.tweet_id or "").strip()
+    if tweet_id.startswith(("http://", "https://")):
+        return tweet_id
+    handle = (post.author_handle or "").strip().lstrip("@")
+    if post.source == "x" and handle and tweet_id:
+        return f"https://x.com/{handle}/status/{tweet_id}"
+    return ""
+
+
 def _parse_candidate_response(raw: str, *, posts: Sequence[SnsPost], limit: int) -> list[OpportunityCandidate]:
     try:
         payload = json.loads(_strip_json_fence(raw))
@@ -2319,6 +2433,7 @@ def _parse_candidate_response(raw: str, *, posts: Sequence[SnsPost], limit: int)
         return []
 
     known_tweet_ids = {post.tweet_id for post in posts}
+    posts_by_id = {post.tweet_id: post for post in posts}
     candidates: list[OpportunityCandidate] = []
     for item in raw_candidates:
         if not isinstance(item, dict):
@@ -2354,6 +2469,18 @@ def _parse_candidate_response(raw: str, *, posts: Sequence[SnsPost], limit: int)
             for source_id in item.get("source_tweet_ids", [])
             if str(source_id) in known_tweet_ids
         ] if isinstance(item.get("source_tweet_ids"), list) else []
+        # B+E attribution: keep the originating posts so the recommendation can
+        # link back to "why" (which @account / tweet drove this candidate), not
+        # just the bare ids. posts_by_id is built once below from the validated set.
+        source_posts = [
+            {
+                "tweet_id": post.tweet_id,
+                "author_handle": post.author_handle,
+                "url": _sns_post_source_url(post),
+            }
+            for source_id in source_ids
+            if (post := posts_by_id.get(source_id)) is not None
+        ]
         aliases_raw = item.get("aliases", [])
         aliases = (
             merge_string_list((), aliases_raw, max_len=8, skip=(title, search_query))
@@ -2365,6 +2492,10 @@ def _parse_candidate_response(raw: str, *, posts: Sequence[SnsPost], limit: int)
             merge_string_list((), related_raw, max_len=5, skip=(title, search_query))
             if isinstance(related_raw, list)
             else ()
+        )
+        locale_query_raw = item.get("locale_search_query")
+        locale_search_query = (
+            locale_query_raw.strip() if isinstance(locale_query_raw, str) else ""
         )
         candidates.append(
             OpportunityCandidate(
@@ -2383,7 +2514,11 @@ def _parse_candidate_response(raw: str, *, posts: Sequence[SnsPost], limit: int)
                 heat_score=heat_score,
                 reason=str(item.get("reason") or "SNS discussion signal").strip(),
                 source_kind="sns_llm",
-                metadata={"source_tweet_ids": source_ids},
+                metadata={
+                    "source_tweet_ids": source_ids,
+                    "source_posts": source_posts,
+                    "locale_search_query": locale_search_query,
+                },
                 aliases=aliases,
                 related_keywords=related_keywords,
             )
@@ -2515,6 +2650,28 @@ def _web_research_sources_from_metadata(metadata: object) -> list[dict[str, str]
         if not url:
             continue
         normalized.append({"title": title or url, "url": url})
+    return normalized
+
+
+def _source_posts_from_metadata(metadata: object) -> list[dict[str, str]]:
+    if not isinstance(metadata, MappingABC):
+        return []
+    source_posts = metadata.get("source_posts")
+    if not isinstance(source_posts, list):
+        return []
+    normalized: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for entry in source_posts:
+        if not isinstance(entry, MappingABC):
+            continue
+        handle = str(entry.get("author_handle") or "").strip().lstrip("@")
+        url = str(entry.get("url") or "").strip()
+        tweet_id = str(entry.get("tweet_id") or "").strip()
+        key = url or tweet_id or handle
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        normalized.append({"author_handle": handle, "url": url, "tweet_id": tweet_id})
     return normalized
 
 
