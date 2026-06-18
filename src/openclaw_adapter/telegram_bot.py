@@ -117,10 +117,12 @@ from .reputation_snapshot import (
     request_reputation_snapshot,
 )
 from .web_search import (
+    DEFAULT_WEB_SEARCH_LIMIT,
     answer_page_with_ollama,
     build_web_fetch_answer,
     build_web_research_answer,
     fetch_page_text,
+    filter_relevant_sources_with_ollama,
     format_web_research_answer,
     reformulate_queries_with_ollama,
     summarize_web_sources_with_ollama,
@@ -528,11 +530,20 @@ def default_web_research_renderer(settings: AssistantSettings) -> ResearchRender
             return _LLM_NOT_CONFIGURED_MESSAGE
         answer = build_web_research_answer(
             query.query,
-            max_results=5,
+            max_results=DEFAULT_WEB_SEARCH_LIMIT,
             search_fn=lambda q, limit: web_search(q, max_results=limit),
             # Item 4: turn the question into a few focused search queries first.
             reformulate_fn=lambda q: reformulate_queries_with_ollama(
                 q,
+                endpoint=endpoint,
+                model=model,
+                timeout_seconds=timeout,
+                ssl_context=ssl_ctx,
+            ),
+            # Drop off-topic SEO hits before they reach the summary / source list.
+            relevance_fn=lambda q, sources: filter_relevant_sources_with_ollama(
+                q,
+                sources,
                 endpoint=endpoint,
                 model=model,
                 timeout_seconds=timeout,

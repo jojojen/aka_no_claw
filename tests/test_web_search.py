@@ -42,7 +42,7 @@ def test_build_web_research_answer_passes_sources_to_summarizer() -> None:
     assert answer.sources == sources
 
 
-def test_format_web_research_answer_includes_reference_urls() -> None:
+def test_format_web_research_answer_lists_only_cited_sources() -> None:
     answer = WebResearchAnswer(
         query="why are Pikachu cards popular",
         summary="皮卡丘是寶可夢代表角色之一 [1]。",
@@ -56,10 +56,42 @@ def test_format_web_research_answer_includes_reference_urls() -> None:
 
     assert "皮卡丘是寶可夢代表角色之一 [1]。" in text
     assert "參考來源：" in text
+    # Only the cited source [1] is listed; the retrieved-but-uncited [2] is hidden.
     assert "[1] Mascot source" in text
     assert "https://example.com/mascot" in text
-    assert "[2] Demand source" in text
-    assert "https://example.com/demand" in text
+    assert "Demand source" not in text
+    assert "https://example.com/demand" not in text
+
+
+def test_format_web_research_answer_keeps_original_numbers_when_some_cited() -> None:
+    answer = WebResearchAnswer(
+        query="q",
+        summary="日本上映日為 9 月 11 日 [2]。",
+        sources=(
+            WebSearchResult(title="TW page", url="https://tw/x"),
+            WebSearchResult(title="JP official", url="https://jp/x"),
+            WebSearchResult(title="JP news", url="https://jp/news"),
+        ),
+    )
+    text = format_web_research_answer(answer)
+    assert "[2] JP official" in text
+    assert "https://jp/x" in text
+    assert "TW page" not in text
+    assert "JP news" not in text
+
+
+def test_format_web_research_answer_falls_back_to_all_when_no_citations() -> None:
+    answer = WebResearchAnswer(
+        query="q",
+        summary="找不到明確來源，但這些頁面相關。",
+        sources=(
+            WebSearchResult(title="A", url="https://a"),
+            WebSearchResult(title="B", url="https://b"),
+        ),
+    )
+    text = format_web_research_answer(answer)
+    assert "[1] A" in text
+    assert "[2] B" in text
 
 
 def test_summarize_web_sources_with_ollama_posts_sources(monkeypatch) -> None:
@@ -167,6 +199,85 @@ def test_build_web_research_answer_reformulate_merges_and_dedupes() -> None:
     )
 
     assert [s.url for s in answer.sources] == ["https://a.com/x", "https://b.com"]
+
+
+def test_relevance_gate_filters_before_summary_and_limit() -> None:
+    pool = tuple(WebSearchResult(f"T{i}", f"https://s/{i}", snippet=f"snip{i}") for i in range(8))
+    seen: dict[str, object] = {}
+
+    def relevance(query: str, sources: tuple[WebSearchResult, ...]) -> tuple[WebSearchResult, ...]:
+        seen["gate_input"] = sources
+        # keep only the even-indexed ones (the "relevant" subset)
+        return tuple(s for s in sources if s.url in {"https://s/0", "https://s/2", "https://s/4"})
+
+    def summarize(query: str, sources: tuple[WebSearchResult, ...]) -> str:
+        seen["summary_sources"] = sources
+        return "ok"
+
+    answer = build_web_research_answer(
+        "q",
+        search_fn=lambda q, limit: pool[:limit],
+        summarize_fn=summarize,
+        relevance_fn=relevance,
+        max_results=3,
+    )
+    # Wider candidate pool was gathered (limit*3=9 capped by available 8) and fed to the gate.
+    assert len(seen["gate_input"]) > 3
+    # Only the relevant survivors reach the summary, trimmed to max_results.
+    assert [s.url for s in answer.sources] == ["https://s/0", "https://s/2", "https://s/4"]
+    assert seen["summary_sources"] == answer.sources
+
+
+def test_relevance_gate_empty_result_keeps_all() -> None:
+    pool = (WebSearchResult("A", "https://a"), WebSearchResult("B", "https://b"))
+    answer = build_web_research_answer(
+        "q",
+        search_fn=lambda q, limit: pool[:limit],
+        summarize_fn=lambda q, s: ",".join(x.url for x in s),
+        relevance_fn=lambda q, s: (),  # gate drops everything → must fall back
+        max_results=3,
+    )
+    assert [s.url for s in answer.sources] == ["https://a", "https://b"]
+
+
+def test_filter_relevant_sources_parses_keep_list(monkeypatch) -> None:
+    sources = tuple(WebSearchResult(f"T{i}", f"https://s/{i}", snippet="x") for i in range(1, 5))
+
+    def fake_urlopen(request, timeout=None, context=None):
+        class _R:
+            def read(self_inner):
+                return json.dumps({"response": json.dumps({"keep": [2, 4]})}).encode("utf-8")
+            def __enter__(self_inner):
+                return self_inner
+            def __exit__(self_inner, *a):
+                return False
+        return _R()
+
+    monkeypatch.setattr(ws, "urlopen", fake_urlopen)
+    kept = ws.filter_relevant_sources_with_ollama(
+        "q", sources, endpoint="http://x", model="m", timeout_seconds=5
+    )
+    assert [s.url for s in kept] == ["https://s/2", "https://s/4"]
+
+
+def test_filter_relevant_sources_bad_json_keeps_all(monkeypatch) -> None:
+    sources = (WebSearchResult("A", "https://a"), WebSearchResult("B", "https://b"))
+
+    def fake_urlopen(request, timeout=None, context=None):
+        class _R:
+            def read(self_inner):
+                return json.dumps({"response": "not json at all"}).encode("utf-8")
+            def __enter__(self_inner):
+                return self_inner
+            def __exit__(self_inner, *a):
+                return False
+        return _R()
+
+    monkeypatch.setattr(ws, "urlopen", fake_urlopen)
+    kept = ws.filter_relevant_sources_with_ollama(
+        "q", sources, endpoint="http://x", model="m", timeout_seconds=5
+    )
+    assert kept == sources
 
 
 def test_run_searches_interleaves_so_later_query_is_not_starved() -> None:
