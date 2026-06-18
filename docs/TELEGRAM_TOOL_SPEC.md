@@ -20,7 +20,9 @@ The Telegram assistant can reach these tools:
     Ollama; `OPENCLAW_CODEGEN_BACKEND=opencode` opts into OpenCode Big Pickle for
     generation/repair/validation while keeping OpenClaw's sandboxed execution.
     The opencode backend uses `opencode run --pure` directly; direct HTTP is not
-    used because the endpoint blocks non-browser clients on this machine.
+    used because the endpoint blocks non-browser clients on this machine. The
+    CLI subprocess runs with an isolated `HOME` so global Claude/Codex memory
+    files cannot leak style rules into generated answers.
   - Example: `/new 幫我查0050今年以來到5月的年化報酬`.
   - This is an explicit command (handled before NL routing); a dedicated NL
     intent is not yet wired.

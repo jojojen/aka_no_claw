@@ -12,7 +12,8 @@
 > sandbox、manifest/reuse 流程執行。實測 direct HTTP 被 Cloudflare 1010
 > `browser_signature_banned` 擋住，所以 runtime 直接走
 > `opencode run --pure -m opencode/big-pickle`。`opencode run -m opencode/big-pickle "hi"`
-> 可作為機器 smoke test。
+> 可作為機器 smoke test。CLI subprocess 會使用隔離的 `HOME` / `CLAUDE_CONFIG_DIR`，
+> 避免讀到 `~/.claude/CLAUDE.md` 這類全域協作規則並污染 `/new` 答案格式。
 
 ## 驗收標準（使用者定義）
 反覆「開發→測試→修正」直到兩個 benchmark 數字正確或誤差很小（幾 %）：

@@ -419,10 +419,21 @@ class OpenCodeCliTextClient:
         self.model = model
         self.timeout_seconds = max(1, timeout_seconds)
         self.cwd = str(cwd or tempfile.gettempdir())
+        self.home_dir = str(Path(self.cwd) / ".opencode-home")
         self.num_ctx: int | None = None
         self.num_predict: int | None = None
 
     def generate(self, prompt: str, *, temperature: float = 0.0, think: bool = False) -> str:
+        Path(self.home_dir).mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ)
+        # Keep opencode's config from the real XDG config dir, but isolate HOME
+        # so Claude/Codex global memories like ~/.claude/CLAUDE.md cannot leak
+        # into generated tool answers.
+        env.setdefault("XDG_CONFIG_HOME", str(Path.home() / ".config"))
+        env["HOME"] = self.home_dir
+        env["XDG_DATA_HOME"] = str(Path(self.home_dir) / ".local" / "share")
+        env["XDG_CACHE_HOME"] = str(Path(self.home_dir) / ".cache")
+        env["CLAUDE_CONFIG_DIR"] = str(Path(self.home_dir) / ".claude")
         cmd = [
             "opencode", "run", "--pure", "-m", self.model,
             "--dir", self.cwd, prompt,
@@ -435,6 +446,7 @@ class OpenCodeCliTextClient:
                 timeout=self.timeout_seconds,
                 capture_output=True,
                 text=True,
+                env=env,
             )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(f"OpenCode CLI timeout >{self.timeout_seconds}s") from exc
