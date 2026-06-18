@@ -1240,6 +1240,27 @@ def is_insufficient_entry(entry: KnowledgeEntry) -> bool:
     return head == "" or head in (NO_DATA_SUMMARY, COMMON_KNOWLEDGE_SUMMARY)
 
 
+# An operational-cache entry is a non-knowledge lookup marker the system writes purely
+# to avoid repeating an expensive step — e.g. the 遊々亭 game-code resolver caches each
+# item→code mapping so the same item never pays a second /search (priority #2「不被封鎖」).
+# The marker is a fixed protocol token (a closed enum, NOT open-world entity recognition),
+# so detecting it here does not violate the no-hardcode rule. Like a no-data stub it is a
+# real cache the system needs, but it carries no human-reviewable knowledge and must never
+# be surfaced in the daily digest. NOTE: origin can't distinguish these — both the yuyutei
+# cache and real /research entity knowledge share origin="research_command" — so the summary
+# marker is the robust signal (and matches what YuyuteiGameCodeResolver itself keys on).
+YUYUTEI_CACHE_MARKER = "yuyutei_code="
+OPERATIONAL_CACHE_MARKERS = (YUYUTEI_CACHE_MARKER,)
+
+
+def is_operational_cache_entry(entry: KnowledgeEntry) -> bool:
+    """True iff *entry* is an internal operational cache marker rather than
+    human-reviewable knowledge. Detected by a fixed protocol marker at the
+    head of the summary."""
+    head = _summary_head(entry.summary)
+    return any(head.startswith(marker) for marker in OPERATIONAL_CACHE_MARKERS)
+
+
 def _build_observation_bullet(
     *,
     observed_at: str,
