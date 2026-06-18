@@ -30,6 +30,8 @@ from price_monitor_bot.bot import (  # noqa: F401
     TelegramBotClient,
     TelegramFileAttachment,
     TelegramLookupQuery,
+    TelegramPhotoIntentAnalysis,
+    TelegramPhotoIntentOption,
     TelegramPhotoQuery,
     TelegramResearchQuery,
     TelegramReputationDelivery,
@@ -37,7 +39,6 @@ from price_monitor_bot.bot import (  # noqa: F401
     TelegramTextReplyPlan,
     RegisteredCommand,
     build_processing_ack,
-    default_photo_intent_analyzer as _base_default_photo_intent_analyzer,
     default_board_loader as _base_default_board_loader,
     default_lookup_renderer as _base_default_lookup_renderer,
     default_photo_renderer as _base_default_photo_renderer,
@@ -243,6 +244,30 @@ def _build_research_callback_handler(
     return handler
 
 
+def _looks_like_foreign_text_for_translation(text: str) -> bool:
+    """Cheap, deterministic check for "this bare message is Japanese the user
+    pasted to read in Chinese" — used to auto-route to translation WITHOUT a slow
+    LLM intent-router round-trip, so recognising the intent is effectively free.
+
+    Restricted to Japanese (presence of kana) on purpose. Kana never appears in
+    Chinese, and the bot has no Japanese commands, so kana text is unambiguously a
+    translate request. English is deliberately excluded: the bot DOES accept
+    English natural-language commands ("remove target 2 …"), so auto-translating
+    Latin text would hijack them — English keeps using /zh. Script detection by
+    unicode range is a fact about codepoints, not open-world entity recognition, so
+    it does not fall under the LLM+RAG rule. The length guard stops short control
+    words like「はい」from being hijacked."""
+    s = text.strip()
+    if len(s) < 4:
+        return False
+    return any(
+        (0x3040 <= ord(ch) <= 0x30FF)
+        or (0x31F0 <= ord(ch) <= 0x31FF)
+        or (0xFF66 <= ord(ch) <= 0xFF9D)
+        for ch in s
+    )
+
+
 class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
     """OpenClaw compatibility wrapper around the reusable Telegram processor."""
 
@@ -298,10 +323,50 @@ class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
             return youtube_plan
         return super().build_pending_text_reply_plan(chat_id=chat_id, text=text)
 
+    def _zh_translate_handler(self) -> "Callable[[str, str], str] | None":
+        if self._settings is None:
+            return None
+        handler = getattr(self, "_cached_zh_translate_handler", None)
+        if handler is None:
+            handler = build_translate_handler(self._settings, target="zh")
+            self._cached_zh_translate_handler = handler
+        return handler
+
+    def _build_auto_translate_plan(
+        self,
+        *,
+        chat_id: str | int,
+        text: str | None,
+    ) -> TelegramTextReplyPlan | None:
+        if not self.is_allowed_chat(chat_id) or text is None:
+            return None
+        content = text.strip()
+        if not content or content.startswith("/"):
+            return None
+        # Never hijack a reply the user is giving to a pending clarification.
+        if self.get_pending_photo_clarification(chat_id) is not None:
+            return None
+        if self.get_pending_text_clarification(chat_id) is not None:
+            return None
+        if not _looks_like_foreign_text_for_translation(content):
+            return None
+        handler = self._zh_translate_handler()
+        if handler is None:
+            return None
+        return TelegramTextReplyPlan(
+            ack="收到，看起來是外文，直接翻成繁體中文…",
+            reply=None,
+            reply_factory=lambda: handler(content, str(chat_id)),
+            run_in_background=True,
+        )
+
     def build_reply_plan(self, *, chat_id: str | int, text: str | None) -> TelegramTextReplyPlan:
         youtube_plan = self._build_youtube_like_song_plan(chat_id=chat_id, text=text)
         if youtube_plan is not None:
             return youtube_plan
+        translate_plan = self._build_auto_translate_plan(chat_id=chat_id, text=text)
+        if translate_plan is not None:
+            return translate_plan
         return super().build_reply_plan(chat_id=chat_id, text=text)
 
 
@@ -445,19 +510,44 @@ def build_photo_renderer(
     return render
 
 
+# (action_key, button prompt, synthetic_caption). Order is the menu order the
+# user sees; translation first, then per-game card/box price lookups. The
+# synthetic_caption is what _execute_pending_photo_lookup feeds back into the
+# photo renderer once a button is tapped — "翻譯" routes to OCR+translate, the
+# "/scan <game>" captions route to the card-price pipeline. Box vs single-card
+# is keyed off action_key (=="pokemon_box_price") downstream, not the caption.
+_PHOTO_MENU_OPTIONS: tuple[tuple[str, str, str], ...] = (
+    ("ocr_translate", "翻譯繁體中文", "翻譯"),
+    ("pokemon_card_price", "查市價 — 寶可夢單卡", "/scan pokemon"),
+    ("pokemon_box_price", "查市價 — 寶可夢卡盒", "/scan pokemon"),
+    ("yugioh_card_price", "查市價 — 遊戲王單卡", "/scan yugioh"),
+    ("ws_card_price", "查市價 — Weiss Schwarz 單卡", "/scan ws"),
+    ("union_arena_card_price", "查市價 — Union Arena 單卡", "/scan union_arena"),
+)
+
+
 def default_photo_intent_analyzer(settings: AssistantSettings):
-    return _base_default_photo_intent_analyzer(
-        db_path=settings.monitor_db_path,
-        tesseract_path=settings.openclaw_tesseract_path,
-        tessdata_dir=settings.openclaw_tessdata_dir,
-        vision_settings=TcgVisionSettings(
-            backend=settings.openclaw_local_vision_backend or "",
-            endpoint=settings.openclaw_local_vision_endpoint,
-            model=settings.openclaw_local_vision_model,
-            timeout_seconds=settings.openclaw_local_vision_timeout_seconds,
-            ssl_context=build_ssl_context(settings),
-        ),
+    """Return a fixed full action menu for every photo WITHOUT reading the image.
+
+    The user wants every option listed up-front rather than the bot guessing
+    intent from a vision/OCR parse, so this skips image analysis entirely and is
+    effectively instant. The actual image is only read later, after the user taps
+    a button (the chosen option's synthetic_caption drives the real lookup via the
+    existing popt-callback + _execute_pending_photo_lookup path)."""
+    options = tuple(
+        TelegramPhotoIntentOption(
+            option_number=index + 1,
+            action_key=action_key,
+            prompt=prompt,
+            synthetic_caption=caption,
+        )
+        for index, (action_key, prompt, caption) in enumerate(_PHOTO_MENU_OPTIONS)
     )
+
+    def analyze(query: TelegramPhotoQuery) -> TelegramPhotoIntentAnalysis:
+        return TelegramPhotoIntentAnalysis(options=options)
+
+    return analyze
 
 
 def default_board_loader(settings: AssistantSettings | None = None) -> tuple:
