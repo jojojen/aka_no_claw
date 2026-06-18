@@ -46,6 +46,7 @@ from .telegram_bot import (
 from .web_search import (
     build_web_research_answer,
     fetch_page_text,
+    filter_relevant_sources_with_ollama,
     format_web_research_answer,
     reformulate_queries_with_ollama,
     summarize_web_sources_with_ollama,
@@ -359,6 +360,14 @@ def _handle_web_search(args: argparse.Namespace, settings: AssistantSettings) ->
         ),
         reformulate_fn=lambda q: reformulate_queries_with_ollama(
             q,
+            endpoint=endpoint,
+            model=model,
+            timeout_seconds=timeout,
+            ssl_context=ssl_ctx,
+        ),
+        relevance_fn=lambda q, sources: filter_relevant_sources_with_ollama(
+            q,
+            sources,
             endpoint=endpoint,
             model=model,
             timeout_seconds=timeout,
