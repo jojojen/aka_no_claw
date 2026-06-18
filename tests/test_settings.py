@@ -108,6 +108,22 @@ def test_get_settings_reads_local_text_router_environment_keys(monkeypatch) -> N
     assert settings.openclaw_local_text_timeout_seconds == 30
 
 
+def test_get_settings_reads_opencode_codegen_environment_keys(monkeypatch) -> None:
+    monkeypatch.setenv("OPENCLAW_CODEGEN_BACKEND", "opencode")
+    monkeypatch.setenv("OPENCLAW_OPENCODE_BASE_URL", "https://example.test/v1")
+    monkeypatch.setenv("OPENCLAW_OPENCODE_MODEL", "big-pickle")
+    monkeypatch.setenv("OPENCLAW_OPENCODE_API_KEY", "opencode-key")
+    monkeypatch.setenv("OPENCLAW_OPENCODE_TIMEOUT_SECONDS", "321")
+
+    settings = get_settings()
+
+    assert settings.openclaw_codegen_backend == "opencode"
+    assert settings.openclaw_opencode_base_url == "https://example.test/v1"
+    assert settings.openclaw_opencode_model == "big-pickle"
+    assert settings.openclaw_opencode_api_key == "opencode-key"
+    assert settings.openclaw_opencode_timeout_seconds == 321
+
+
 def test_get_settings_reads_local_tts_environment_keys(monkeypatch) -> None:
     monkeypatch.setenv("OPENCLAW_LOCAL_TTS_ENDPOINT", "http://127.0.0.1:10101")
     monkeypatch.setenv("OPENCLAW_LOCAL_TTS_TIMEOUT_SECONDS", "25")

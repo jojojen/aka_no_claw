@@ -1,14 +1,16 @@
 """Dynamic self-writing tools for the ``/new`` Telegram command.
 
-When a request isn't covered by a fixed tool, ``DynamicToolRunner`` asks a local
-Ollama model to WRITE a single-file Python tool, runs it under a lightweight
-guardrail, and returns the answer. Codegen uses a model-tier cascade: a fast
-code-specialized model (qwen2.5-coder:7b) writes first, escalating to the
-stronger qwen3:14b (then its reasoning mode) only on repeated failure. Tools persist in
+When a request isn't covered by a fixed tool, ``DynamicToolRunner`` asks a text
+generation backend to WRITE a single-file Python tool, runs it under a
+lightweight guardrail, and returns the answer. Default codegen uses local
+Ollama with a model-tier cascade: a fast code-specialized model writes first,
+escalating to the stronger model only on repeated failure. Optionally,
+``OPENCLAW_CODEGEN_BACKEND=opencode`` routes generation/repair/validation to
+OpenCode Big Pickle while keeping OpenClaw's execution guardrails. Tools persist in
 a gitignored ``generated_tools/`` folder (+ ``manifest.json``) so similar
 requests can be reused instead of regenerated.
 
-Everything is local / free — no paid frontier API.
+Default mode is local / free — no paid frontier API.
 
 Pipeline (see DynamicToolRunner.run_detailed):
   1. reuse-check: ask the model whether an existing manifest tool fits
@@ -28,6 +30,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -36,6 +39,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from hashlib import sha1
 from pathlib import Path
+from typing import Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -44,6 +48,8 @@ logger = logging.getLogger(__name__)
 
 _OLLAMA_MAX_RETRIES = 3       # transient-error retries in generate()
 _OLLAMA_RETRY_BASE_SEC = 1.0  # first backoff; doubles each attempt (1, 2, 4 s)
+_OPENCODE_MAX_RETRIES = 3
+_OPENCODE_RETRY_BASE_SEC = 1.0
 
 ANSWER_START = "===ANSWER==="
 ANSWER_END = "===END==="
@@ -60,6 +66,7 @@ _MODULE_NOT_FOUND_RE = re.compile(r"ModuleNotFoundError: No module named ['\"]([
 # hardcoding domain formulas in the DB; the pages are fetched and distilled
 # per-request (_ground_references).
 _REF_URL_RE = re.compile(r"參考:\s*(https?://[^\s）)」』]+)")
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 # Safe environment variables passed through to generated scripts. Everything
 # else (notably all OPENCLAW_* secrets and tokens) is stripped.
 _SAFE_ENV_KEYS = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR")
@@ -169,6 +176,17 @@ class DynamicToolResult:
     raw_stdout: str = ""
 
 
+class TextGenerationClient(Protocol):
+    model: str
+    timeout_seconds: int
+    num_ctx: int | None
+    num_predict: int | None
+
+    def generate(self, prompt: str, *, temperature: float = 0.0,
+                 think: bool = False) -> str:
+        ...
+
+
 def probe_ollama(endpoint: str, *, timeout: float = 3.0) -> bool:
     """Return True when Ollama's /api/tags endpoint responds within *timeout* s."""
     base = endpoint.rstrip("/")
@@ -180,6 +198,45 @@ def probe_ollama(endpoint: str, *, timeout: float = 3.0) -> bool:
         with urlopen(Request(f"{base}/api/tags", method="GET"), timeout=timeout):
             return True
     except Exception:
+        return False
+
+
+def probe_opencode(
+    base_url: str,
+    *,
+    model: str = "big-pickle",
+    api_key: str | None = None,
+    timeout: float = 5.0,
+) -> bool:
+    """Return True when the OpenCode OpenAI-compatible completions endpoint works."""
+    client = OpenCodeTextClient(
+        base_url=base_url,
+        model=model,
+        timeout_seconds=max(1, int(timeout)),
+        api_key=api_key,
+        max_tokens=4,
+    )
+    try:
+        client.generate("Reply with: ok", temperature=0.0)
+        return True
+    except Exception as exc:
+        logger.warning("dynamic_tools: OpenCode probe failed: %s", exc)
+        return False
+
+
+def probe_opencode_cli(
+    *,
+    model: str = "opencode/big-pickle",
+    timeout: float = 20.0,
+) -> bool:
+    """Return True when the opencode CLI can produce one non-empty response."""
+    if not shutil.which("opencode"):
+        return False
+    client = OpenCodeCliTextClient(model=model, timeout_seconds=max(1, int(timeout)))
+    try:
+        return bool(client.generate("Only output exactly: ok", temperature=0.0).strip())
+    except Exception as exc:
+        logger.warning("dynamic_tools: OpenCode CLI probe failed: %s", exc)
         return False
 
 
@@ -260,11 +317,147 @@ class OllamaTextClient:
         return _THINK_RE.sub("", text).strip()
 
 
+class OpenCodeTextClient:
+    """OpenCode Zen OpenAI-compatible completions client for Big Pickle."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        model: str = "big-pickle",
+        timeout_seconds: int = 900,
+        api_key: str | None = None,
+        max_tokens: int | None = 32000,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.timeout_seconds = max(1, timeout_seconds)
+        self.api_key = api_key
+        # DynamicToolRunner mutates these attributes across tiers. OpenCode does
+        # not use num_ctx and maps num_predict to max_tokens when present.
+        self.num_ctx: int | None = None
+        self.num_predict: int | None = max_tokens
+
+    def _url(self) -> str:
+        if self.base_url.endswith("/completions"):
+            return self.base_url
+        return f"{self.base_url}/completions"
+
+    def generate(self, prompt: str, *, temperature: float = 0.0, think: bool = False) -> str:
+        payload: dict[str, object] = {
+            "model": self.model,
+            "prompt": prompt,
+            "temperature": temperature,
+            "stream": False,
+        }
+        if self.num_predict is not None:
+            payload["max_tokens"] = self.num_predict
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        request = Request(
+            self._url(),
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        last_exc: RuntimeError | None = None
+        body = ""
+        for attempt in range(1, _OPENCODE_MAX_RETRIES + 1):
+            try:
+                with urlopen(request, timeout=self.timeout_seconds) as response:
+                    body = response.read().decode("utf-8", errors="replace")
+                last_exc = None
+                break
+            except HTTPError as exc:
+                if exc.code < 500:
+                    detail = ""
+                    try:
+                        detail = exc.read().decode("utf-8", errors="replace")[:400]
+                    except Exception:
+                        detail = ""
+                    raise RuntimeError(f"OpenCode HTTP {exc.code}: {detail}") from exc
+                last_exc = RuntimeError(f"OpenCode HTTP {exc.code}")
+            except URLError as exc:
+                last_exc = RuntimeError(f"OpenCode request failed: {exc.reason}")
+            if attempt < _OPENCODE_MAX_RETRIES:
+                delay = _OPENCODE_RETRY_BASE_SEC * (2.0 ** (attempt - 1))
+                logger.warning(
+                    "OpenCode transient error attempt %d/%d; retrying in %.0fs: %s",
+                    attempt, _OPENCODE_MAX_RETRIES, delay, last_exc,
+                )
+                time.sleep(delay)
+        if last_exc is not None:
+            raise RuntimeError(
+                f"OpenCode 無回應（已重試 {_OPENCODE_MAX_RETRIES} 次）"
+            ) from last_exc
+        parsed = json.loads(body)
+        choices = parsed.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise RuntimeError("OpenCode response missing choices")
+        first = choices[0]
+        if not isinstance(first, dict):
+            raise RuntimeError("OpenCode choice was not an object")
+        text = first.get("text")
+        if text is None and isinstance(first.get("message"), dict):
+            text = first["message"].get("content")
+        if not isinstance(text, str):
+            raise RuntimeError(f"OpenCode response text type was {type(text).__name__}")
+        return _THINK_RE.sub("", text).strip()
+
+
+class OpenCodeCliTextClient:
+    """Fallback transport through ``opencode run`` when direct HTTP is blocked."""
+
+    def __init__(
+        self,
+        *,
+        model: str = "opencode/big-pickle",
+        timeout_seconds: int = 900,
+        cwd: str | Path | None = None,
+    ) -> None:
+        self.model = model
+        self.timeout_seconds = max(1, timeout_seconds)
+        self.cwd = str(cwd or tempfile.gettempdir())
+        self.num_ctx: int | None = None
+        self.num_predict: int | None = None
+
+    def generate(self, prompt: str, *, temperature: float = 0.0, think: bool = False) -> str:
+        cmd = [
+            "opencode", "run", "--pure", "-m", self.model,
+            "--dir", self.cwd, prompt,
+        ]
+        try:
+            proc = subprocess.run(
+                cmd,
+                shell=False,
+                cwd=self.cwd,
+                timeout=self.timeout_seconds,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"OpenCode CLI timeout >{self.timeout_seconds}s") from exc
+        if proc.returncode != 0:
+            detail = _tail((proc.stderr or proc.stdout or "").strip(), 800)
+            raise RuntimeError(f"OpenCode CLI failed: {detail}")
+        text = _ANSI_RE.sub("", proc.stdout or "")
+        lines: list[str] = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("> build") or stripped.startswith("> "):
+                continue
+            lines.append(line)
+        return _THINK_RE.sub("", "\n".join(lines)).strip()
+
+
 class DynamicToolRunner:
     def __init__(
         self,
         *,
-        client: OllamaTextClient,
+        client: TextGenerationClient,
         tools_dir: Path,
         knowledge_db: "object | None" = None,
         exec_timeout_seconds: int = 90,
@@ -708,14 +901,17 @@ class DynamicToolRunner:
         venv_python = self._ensure_venv()
         tool_dir = tool_path.parent
         env = self._clean_env(tool_dir)
-        cmd: list[str] = [str(venv_python), str(tool_path)]
+        base_cmd: list[str] = [str(venv_python), str(tool_path)]
+        cmd = list(base_cmd)
         # Wrap with sandbox-exec on macOS if available (SEC-4).
         import shutil
+        used_sandbox = False
         if shutil.which("sandbox-exec"):
             profile = self._SANDBOX_PROFILE_TEMPLATE.format(tool_dir=str(tool_dir))
             cmd = ["sandbox-exec", "-p", profile, *cmd]
+            used_sandbox = True
         try:
-            return subprocess.run(
+            proc = subprocess.run(
                 cmd,
                 shell=False,
                 cwd=str(tool_dir),
@@ -724,6 +920,20 @@ class DynamicToolRunner:
                 text=True,
                 env=env,
             )
+            if used_sandbox and proc.returncode != 0 and _sandbox_wrapper_failed(proc.stderr or ""):
+                logger.warning(
+                    "dynamic_tools: sandbox-exec unavailable at runtime; retrying without wrapper"
+                )
+                proc = subprocess.run(
+                    base_cmd,
+                    shell=False,
+                    cwd=str(tool_dir),
+                    timeout=self.exec_timeout_seconds,
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                )
+            return proc
         except subprocess.TimeoutExpired as exc:
             return subprocess.CompletedProcess(
                 args=exc.cmd, returncode=124,
@@ -1737,18 +1947,50 @@ def _tail(text: str, limit: int) -> str:
     return text if len(text) <= limit else "…" + text[-limit:]
 
 
+def _sandbox_wrapper_failed(stderr: str) -> bool:
+    low = (stderr or "").lower()
+    return "sandbox-exec" in low and (
+        "sandbox_apply" in low
+        or "operation not permitted" in low
+        or "profile" in low
+    )
+
+
 def _first_line(text: str, limit: int) -> str:
     line = (text or "").strip().splitlines()[0] if text.strip() else ""
     return line[:limit]
 
 
+def _opencode_cli_model(model: str) -> str:
+    model = (model or "big-pickle").strip()
+    return model if "/" in model else f"opencode/{model}"
+
+
 def build_dynamic_tool_runner_from_settings(settings) -> DynamicToolRunner | None:
-    """Build a runner from AssistantSettings, or None when no usable local text
-    model / non-ollama backend (mirrors natural_language.py builder style)."""
+    """Build a runner from AssistantSettings.
+
+    Default behavior stays local Ollama. ``OPENCLAW_CODEGEN_BACKEND=opencode``
+    opts /new into OpenCode Big Pickle for text generation while preserving the
+    existing generated-tool sandbox, manifest reuse, validation, and repairs.
+    """
+    codegen_backend = (getattr(settings, "openclaw_codegen_backend", None) or "").strip().lower()
+    if codegen_backend == "opencode":
+        model = (getattr(settings, "openclaw_opencode_model", "big-pickle") or "big-pickle").strip()
+        timeout = max(60, int(getattr(settings, "openclaw_opencode_timeout_seconds", 900)))
+        cli_model = _opencode_cli_model(model)
+        if probe_opencode_cli(model=cli_model, timeout=min(timeout, 30)):
+            client = OpenCodeCliTextClient(model=cli_model, timeout_seconds=timeout)
+            logger.info("dynamic_tools: using OpenCode CLI codegen backend model=%s", cli_model)
+            return _build_runner_with_client(
+                settings, client, fast_model=cli_model, strong_model=cli_model)
+        logger.warning("dynamic_tools: OpenCode CLI unavailable; falling back to Ollama if configured")
+    elif codegen_backend and codegen_backend != "ollama":
+        logger.warning("dynamic_tools: unsupported codegen backend=%s; falling back to Ollama", codegen_backend)
+
     backend = (settings.openclaw_local_text_backend or "").strip().lower()
     if backend != "ollama":
         if backend:
-            logger.warning("dynamic_tools: unsupported backend=%s", backend)
+            logger.warning("dynamic_tools: unsupported local text backend=%s", backend)
         return None
     strong_model = _select_model(settings.openclaw_local_text_model)
     if not strong_model:
@@ -1777,6 +2019,17 @@ def build_dynamic_tool_runner_from_settings(settings) -> DynamicToolRunner | Non
         num_ctx=8192,
         num_predict=2000,
     )
+    return _build_runner_with_client(settings, client, fast_model=fast_model, strong_model=strong_model)
+
+
+def _build_runner_with_client(
+    settings,
+    client: TextGenerationClient,
+    *,
+    fast_model: str,
+    strong_model: str,
+) -> DynamicToolRunner:
+    """Shared runner wiring after selecting the text generation backend."""
 
     knowledge_db = None
     try:

@@ -17,6 +17,8 @@ import pytest
 from openclaw_adapter.dynamic_tools import (
     DynamicToolRunner,
     OllamaTextClient,
+    OpenCodeCliTextClient,
+    OpenCodeTextClient,
     _extract_answer,
     _extract_code,
     _check_numeric,
@@ -25,6 +27,7 @@ from openclaw_adapter.dynamic_tools import (
     _is_truncation_error,
     _defaults_schema_from_code,
     _ensure_stdlib_imports,
+    build_dynamic_tool_runner_from_settings,
     probe_ollama,
 )
 from openclaw_adapter.knowledge_db import KnowledgeDatabase
@@ -1133,3 +1136,143 @@ def test_ollama_generate_does_not_retry_on_4xx() -> None:
             client.generate("test prompt")
 
     assert call_count[0] == 1  # no retry on 4xx
+
+
+def test_opencode_generate_posts_openai_completion_payload() -> None:
+    import unittest.mock as mock
+
+    captured = {}
+
+    class _FakeResp:
+        def read(self):
+            return b'{"choices": [{"text": "  hello\\n"}]}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+    def _fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["timeout"] = timeout
+        captured["headers"] = dict(req.header_items())
+        captured["payload"] = json.loads(req.data.decode("utf-8"))
+        return _FakeResp()
+
+    client = OpenCodeTextClient(
+        base_url="https://opencode.ai/zen/v1",
+        model="big-pickle",
+        timeout_seconds=123,
+        api_key="secret",
+        max_tokens=99,
+    )
+    with mock.patch("openclaw_adapter.dynamic_tools.urlopen", _fake_urlopen):
+        out = client.generate("write code", temperature=0.2)
+
+    assert out == "hello"
+    assert captured["url"] == "https://opencode.ai/zen/v1/completions"
+    assert captured["timeout"] == 123
+    assert captured["payload"] == {
+        "model": "big-pickle",
+        "prompt": "write code",
+        "temperature": 0.2,
+        "stream": False,
+        "max_tokens": 99,
+    }
+    assert captured["headers"]["Authorization"] == "Bearer secret"
+
+
+def test_opencode_cli_generate_strips_banner_and_ansi(tmp_path) -> None:
+    import subprocess
+    import unittest.mock as mock
+
+    def _fake_run(cmd, **kwargs):
+        assert cmd[:5] == ["opencode", "run", "--pure", "-m", "opencode/big-pickle"]
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout="\x1b[0m\n> build · big-pickle\n\x1b[0m\nhello\n", stderr=""
+        )
+
+    client = OpenCodeCliTextClient(
+        model="opencode/big-pickle",
+        timeout_seconds=123,
+        cwd=tmp_path,
+    )
+    with mock.patch("openclaw_adapter.dynamic_tools.subprocess.run", _fake_run):
+        out = client.generate("say hello")
+
+    assert out == "hello"
+
+
+def test_builder_uses_opencode_cli_when_codegen_backend_enabled(tmp_path) -> None:
+    import unittest.mock as mock
+
+    settings = SimpleNamespace(
+        openclaw_codegen_backend="opencode",
+        openclaw_opencode_base_url="https://opencode.ai/zen/v1",
+        openclaw_opencode_model="big-pickle",
+        openclaw_opencode_api_key=None,
+        openclaw_opencode_timeout_seconds=321,
+        openclaw_local_text_backend=None,
+        openclaw_local_text_model=None,
+        openclaw_local_text_endpoint="http://127.0.0.1:11434",
+        openclaw_local_text_timeout_seconds=45,
+        openclaw_codegen_fast_model=None,
+        knowledge_db_path=str(tmp_path / "knowledge.sqlite3"),
+    )
+    with mock.patch("openclaw_adapter.dynamic_tools.probe_opencode_cli", return_value=True):
+        runner = build_dynamic_tool_runner_from_settings(settings)
+
+    assert isinstance(runner.client, OpenCodeCliTextClient)
+    assert runner.fast_model == "opencode/big-pickle"
+    assert runner.strong_model == "opencode/big-pickle"
+    assert runner.client.timeout_seconds == 321
+
+
+def test_builder_does_not_probe_opencode_http_when_codegen_backend_enabled(tmp_path) -> None:
+    import unittest.mock as mock
+
+    settings = SimpleNamespace(
+        openclaw_codegen_backend="opencode",
+        openclaw_opencode_base_url="https://opencode.ai/zen/v1",
+        openclaw_opencode_model="big-pickle",
+        openclaw_opencode_api_key=None,
+        openclaw_opencode_timeout_seconds=321,
+        openclaw_local_text_backend=None,
+        openclaw_local_text_model=None,
+        openclaw_local_text_endpoint="http://127.0.0.1:11434",
+        openclaw_local_text_timeout_seconds=45,
+        openclaw_codegen_fast_model=None,
+        knowledge_db_path=str(tmp_path / "knowledge.sqlite3"),
+    )
+    with mock.patch("openclaw_adapter.dynamic_tools.probe_opencode") as http_probe, \
+         mock.patch("openclaw_adapter.dynamic_tools.probe_opencode_cli", return_value=True):
+        runner = build_dynamic_tool_runner_from_settings(settings)
+
+    http_probe.assert_not_called()
+    assert isinstance(runner.client, OpenCodeCliTextClient)
+
+
+def test_builder_falls_back_to_ollama_when_opencode_probe_fails(tmp_path) -> None:
+    import unittest.mock as mock
+
+    settings = SimpleNamespace(
+        openclaw_codegen_backend="opencode",
+        openclaw_opencode_base_url="https://opencode.ai/zen/v1",
+        openclaw_opencode_model="big-pickle",
+        openclaw_opencode_api_key=None,
+        openclaw_opencode_timeout_seconds=321,
+        openclaw_local_text_backend="ollama",
+        openclaw_local_text_model="qwen3:14b",
+        openclaw_local_text_endpoint="http://127.0.0.1:11434",
+        openclaw_local_text_timeout_seconds=75,
+        openclaw_codegen_fast_model="qwen2.5-coder:7b",
+        knowledge_db_path=str(tmp_path / "knowledge.sqlite3"),
+    )
+    with mock.patch("openclaw_adapter.dynamic_tools.probe_opencode_cli", return_value=False), \
+         mock.patch("openclaw_adapter.dynamic_tools.probe_ollama", return_value=True):
+        runner = build_dynamic_tool_runner_from_settings(settings)
+
+    assert isinstance(runner.client, OllamaTextClient)
+    assert runner.fast_model == "qwen2.5-coder:7b"
+    assert runner.strong_model == "qwen3:14b"
