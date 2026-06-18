@@ -31,6 +31,13 @@ class AssistantSettings:
     # Fast, code-specialized tier-1 model for /new codegen. Escalates to the
     # (larger) openclaw_local_text_model only when this tier exhausts repairs.
     openclaw_codegen_fast_model: str | None = "qwen2.5-coder:7b"
+    # /new codegen backend override. Empty/ollama preserves the local-only
+    # behavior; opencode uses the OpenCode Zen OpenAI-compatible endpoint.
+    openclaw_codegen_backend: str | None = None
+    openclaw_opencode_base_url: str = "https://opencode.ai/zen/v1"
+    openclaw_opencode_model: str = "big-pickle"
+    openclaw_opencode_api_key: str | None = None
+    openclaw_opencode_timeout_seconds: int = 900
     openclaw_local_text_timeout_seconds: int = 45
     # KB semantic retrieval. Multilingual embed model served by the local text
     # endpoint (Ollama). Empty string disables KB embedding (pure-lexical).
@@ -158,6 +165,16 @@ def get_settings() -> AssistantSettings:
         openclaw_local_tts_speaker_id=_as_optional_int(os.getenv("OPENCLAW_LOCAL_TTS_SPEAKER_ID")),
         openclaw_codegen_fast_model=_none_if_empty(
             os.getenv("OPENCLAW_CODEGEN_FAST_MODEL", "qwen2.5-coder:7b")
+        ),
+        openclaw_codegen_backend=_none_if_empty(os.getenv("OPENCLAW_CODEGEN_BACKEND")),
+        openclaw_opencode_base_url=os.getenv(
+            "OPENCLAW_OPENCODE_BASE_URL", "https://opencode.ai/zen/v1"
+        ),
+        openclaw_opencode_model=os.getenv("OPENCLAW_OPENCODE_MODEL", "big-pickle"),
+        openclaw_opencode_api_key=_none_if_empty(os.getenv("OPENCLAW_OPENCODE_API_KEY")),
+        openclaw_opencode_timeout_seconds=_as_int(
+            os.getenv("OPENCLAW_OPENCODE_TIMEOUT_SECONDS"),
+            default=900,
         ),
         openclaw_local_text_timeout_seconds=_as_int(
             os.getenv("OPENCLAW_LOCAL_TEXT_TIMEOUT_SECONDS"),

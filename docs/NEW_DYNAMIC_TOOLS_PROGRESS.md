@@ -4,6 +4,15 @@
 > 目標：Telegram `/new <需求>` → 本地 qwen3:14b 自己寫 Python 工具 → 護欄下執行 →
 > 回答案，並把工具存進 gitignored `generated_tools/`（含 manifest）供重用。全程地端、零 API 費用。
 > 完整設計見 plan：`/Users/jen/.claude/plans/3-ollama-modular-trinket.md`。
+>
+> 2026-06 update：預設仍維持全地端 Ollama。若需要更穩定 codegen，可設定
+> `OPENCLAW_CODEGEN_BACKEND=opencode` 讓 `/new` 的文字生成/修復/驗證走 OpenCode Big Pickle
+> (`OPENCLAW_OPENCODE_BASE_URL=https://opencode.ai/zen/v1`,
+> `OPENCLAW_OPENCODE_MODEL=big-pickle`)；生成後的 Python 工具仍由 OpenClaw 的 venv、
+> sandbox、manifest/reuse 流程執行。實測 direct HTTP 被 Cloudflare 1010
+> `browser_signature_banned` 擋住，所以 runtime 直接走
+> `opencode run --pure -m opencode/big-pickle`。`opencode run -m opencode/big-pickle "hi"`
+> 可作為機器 smoke test。
 
 ## 驗收標準（使用者定義）
 反覆「開發→測試→修正」直到兩個 benchmark 數字正確或誤差很小（幾 %）：
@@ -17,6 +26,8 @@
 ## 環境事實（已驗證）
 - ollama 在線 `http://127.0.0.1:11434`，有 `qwen3:14b`（最強 text model）。
 - `.env`：`OPENCLAW_LOCAL_TEXT_MODEL=qwen3:14b`、`OPENCLAW_LOCAL_TEXT_TIMEOUT_SECONDS=75`。
+- OpenCode Big Pickle 是 opt-in：`.env` 設 `OPENCLAW_CODEGEN_BACKEND=opencode` 才啟用；
+  endpoint/model 預設 `https://opencode.ai/zen/v1` / `big-pickle`。
 - Yahoo Finance chart API 可連（`query1.finance.yahoo.com/v8/finance/chart/0050.TW`）。
 - knowledge DB 路徑：`settings.knowledge_db_path`（預設 `data/knowledge.sqlite3`）。
 - aka venv：`aka_no_claw/.venv`。

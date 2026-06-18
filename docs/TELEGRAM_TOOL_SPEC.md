@@ -15,9 +15,12 @@ The Telegram assistant can reach these tools:
   - Use when the user explicitly asks for all available tools or capabilities in catalog form.
 
 - `/new <request>`
-  - When no fixed tool covers a request, the bot uses the strongest local model
-    (qwen3:14b) to WRITE and run a one-off Python tool, reusing a prior generated
-    tool when one fits. Local-only, no paid API.
+  - When no fixed tool covers a request, the bot writes and runs a one-off Python
+    tool, reusing a prior generated tool when one fits. Default codegen is local
+    Ollama; `OPENCLAW_CODEGEN_BACKEND=opencode` opts into OpenCode Big Pickle for
+    generation/repair/validation while keeping OpenClaw's sandboxed execution.
+    The opencode backend uses `opencode run --pure` directly; direct HTTP is not
+    used because the endpoint blocks non-browser clients on this machine.
   - Example: `/new 幫我查0050今年以來到5月的年化報酬`.
   - This is an explicit command (handled before NL routing); a dedicated NL
     intent is not yet wired.
