@@ -23,12 +23,42 @@
   改動造成 —— 三條 scrape 都倒在 goto,過濾函式根本沒被呼叫)。**待網路恢復**,用已知
   高量商品(黒炎 BOX)重跑,確認 sold 不再混入 ¥3,900/¥5,500 單卡(Mode 1 的實況驗收)。
 
-### ⏭ PR2 — 接 historical IDF（下一步）
+### ✅ PR2 — 接 historical IDF（已實作、已部署）
+- commit `f3ef7e6`（`aka_no_claw/main`，2026-06-18）。
 - 給 `weighted_jaccard` 的 `idf` 參數接真實 DF/IDF 表(token + bigram 各一)。
+  IDF 採平滑封頂公式:`idf = min(log((N+1)/(df+1)) + 1.0, 8.0)`,
+  df = 含該詞的**相異標題數**(每標題最多計 1,set 語意);冷啟動(無表)
+  `idf=None` → 退化純 Jaccard(= PR1 行為,零風險)。
 - **打到的根因:R2(所有詞等權重)** —— 讓 BOX/シュリンク 這類高鑑別詞蓋過
   ポケモンカード/未開封 這類通用詞;這才真正壓得掉「2-token 共享雜訊」
   (Case C、以及 ¥3,900/¥5,500 那種共享商品名的單卡)。
-- **PR2 完成 = Mode 1 才算真解。** PR1 只是必要不充分的第一步。
+- 受控驗證(注入合成語料):Case A `黒炎の支配者` ⊂ ref **0.11 DROP**;
+  Case B 同 unit 換序 **1.0 KEEP**;Case C 2-token 共享 **0.27 DROP**(PR1 是 0.55 keep)。
+- **PR2 完成 = Mode 1 才算真解。** Mode 2 仍待 PR3,不在本 PR 範圍。
+
+#### PR2 的自動成長管線（讓 IDF 表自己養厚、自動上線、免重啟）
+真實語料一開始太薄(只有 ~28 筆相異標題,多為離題單卡),硬上線反而讓 Case C
+沒解、Case A 變危險。所以 PR2 不是「一次建表」,而是一條被動管線:
+
+1. **語料水槽** `market_title_corpus.py`(fail-safe WAL SQLite)。標題是 /research
+   與 /opportunity **已經做的查詢的免費副產品**,被動撿入、去重 —— **零額外對外
+   查詢(Rule C7)**。採集點:`research_command._stage_price_placeholder`(sold+active
+   comp)、`opportunity_agent.MercariOfferFinder._run_one`(Mercari 原始結果,過濾前)。
+2. **離線建表** `scripts/build_market_title_df.py` → `data/market_title_df.json`。
+3. **活化閘門** `gate_title_idf_stats`:① 文件數門檻 `_MIN_TITLE_CORPUS_DOCS=3000`
+   **加** ② 行為金絲雀 `_passes_activation_canary`(子集標題必須 DROP、換序同 unit
+   必須 KEEP)。光看數量擋不住「厚但離題」的表 —— 金絲雀就是為此存在。任一不過
+   → 退回冷啟動。
+4. **mtime 熱重載** `_default_title_idf_stats` 以 df.json 的 mtime 為 cache key,
+   重建後**下一次 /research 自動生效,龍蝦不需重啟**。
+5. **週更 daemon** `title_corpus_rebuilder.TitleCorpusRebuilder`,隨龍蝦啟動
+   (`telegram_bot._start_title_corpus_rebuilder`),每週重蒸餾語料 → 評估閘門 →
+   發 Telegram 通知(已啟用 / 養厚中 / 未過金絲雀)。表一律寫出,啟用與否由讀取端
+   閘門決定,故寫檔本身零風險。
+
+**目前狀態(2026-06-18)**:正式環境仍走冷啟動 —— 真實語料 28 筆 < 3000,
+週更通知顯示「養厚中,維持純 Jaccard」。等被動水槽養厚後才會出現第一張可啟用的表。
+機制本身已用合成語料驗證(見上)。
 
 ### 🔭 PR3+ — 語意層 rerank（更後面，未排期）
 - embedding / LLM rerank 打 **R1(詞彙非語意)**,解 **Mode 2**(同款不同版/跨書寫
