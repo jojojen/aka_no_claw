@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ from openclaw_adapter.research_command import (
     MercariItemAdapter,
     ResearchBudget,
     ResearchReport,
+    ResearchSectionResult,
     SellerReputationSnapshot,
     ShopReference,
     build_budgeted_search_fn,
@@ -2075,3 +2077,101 @@ def test_pr3_regression_subset_card_default_path_drops() -> None:
         semantic_gate_fn=_keep_all_gate,
     )
     assert len(kept2) == 1 and dropped2 == 0
+
+
+# ── Phase 2: parallel independent stages (3/4/6) ────────────────────────────────
+
+
+def _section_stage(section_name: str, *, delay: float = 0.0, order_box: list | None = None):
+    def run(ctx) -> str:
+        if delay:
+            time.sleep(delay)
+        if order_box is not None:
+            order_box.append(section_name)
+        ctx.add_section_result(
+            ResearchSectionResult(
+                section_name=section_name,
+                status="ok",
+                confidence=1.0,
+                sample_count=0,
+                evidence_count=0,
+                summary=f"{section_name} stub",
+            )
+        )
+        return f"{section_name} note"
+
+    return run
+
+
+def test_research_parallel_stages_preserve_report_order() -> None:
+    # Stage 6 (賣家風險) finishes first while 3/4 sleep, so section_results is
+    # appended out of canonical order — the report must still be reordered.
+    finish_order: list[str] = []
+    handler = build_research_handler(
+        notifier_factory=lambda chat_id: FakeNotifier(),
+        stage_runners=(
+            _parse_stage,
+            _placeholder("item"),
+            _placeholder("entity"),
+            _section_stage("增值潛力分析", delay=0.25, order_box=finish_order),
+            _section_stage("合理市價分析", delay=0.25, order_box=finish_order),
+            _placeholder("liquidity"),
+            _section_stage("賣家風險分析", delay=0.0, order_box=finish_order),
+        ),
+        active_market_search_fn=_fake_active_search,
+        sold_market_search_fn=_fake_sold_search,
+        sold_average_lookup_fn=_fake_sold_average,
+        final_formatter=lambda report: report,
+    )
+
+    report = handler("https://jp.mercari.com/item/m65806654179", "chat-1")
+
+    assert finish_order[0] == "賣家風險分析"  # out-of-order completion confirmed
+    names = [section.section_name for section in report.section_results]
+    assert names == ["增值潛力分析", "合理市價分析", "賣家風險分析"]
+
+
+def test_research_parallel_stages_run_concurrently() -> None:
+    # Three independent stages each sleep 0.3s. Serial would be ~0.9s; running
+    # them on the thread pool overlaps the sleeps to ~0.3s wall-clock.
+    handler = build_research_handler(
+        notifier_factory=lambda chat_id: FakeNotifier(),
+        stage_runners=(
+            _parse_stage,
+            _placeholder("item"),
+            _placeholder("entity"),
+            _section_stage("增值潛力分析", delay=0.3),
+            _section_stage("合理市價分析", delay=0.3),
+            _placeholder("liquidity"),
+            _section_stage("賣家風險分析", delay=0.3),
+        ),
+        active_market_search_fn=_fake_active_search,
+        sold_market_search_fn=_fake_sold_search,
+        sold_average_lookup_fn=_fake_sold_average,
+        final_formatter=lambda report: report,
+    )
+
+    start = time.monotonic()
+    handler("https://jp.mercari.com/item/m65806654179", "chat-1")
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 0.7
+
+
+def test_research_budget_consume_is_thread_safe() -> None:
+    budget = ResearchBudget(max_searches=1000)
+
+    def worker() -> None:
+        for _ in range(100):
+            try:
+                budget.consume()
+            except BudgetExhaustedError:
+                pass
+
+    threads = [threading.Thread(target=worker) for _ in range(10)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert budget.searches_used == 1000
