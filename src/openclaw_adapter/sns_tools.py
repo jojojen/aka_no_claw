@@ -4,11 +4,54 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 from pathlib import Path
 
 from assistant_runtime import AssistantSettings, build_ssl_context
 
 logger = logging.getLogger(__name__)
+
+
+def _load_ip_entity_catalog(settings: AssistantSettings):
+    try:
+        from sns_monitor.ip_entity_catalog import IpEntityCatalog
+    except Exception:
+        logger.exception("SNS buzz: IP entity catalog module unavailable")
+        return None
+
+    raw_env = (os.getenv("OPENCLAW_SNS_IP_CATALOG_PATH") or "").strip()
+    candidates: list[Path] = []
+    if raw_env:
+        candidates.append(Path(raw_env).expanduser())
+    try:
+        candidates.append(Path(settings.knowledge_db_path).with_name("sns_ip_catalog.json"))
+    except Exception:
+        pass
+    candidates.append(Path(__file__).resolve().parents[2] / "data" / "sns_ip_catalog.json")
+
+    seen: set[Path] = set()
+    for path in candidates:
+        try:
+            resolved = path.resolve()
+        except Exception:
+            resolved = path
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if not path.exists():
+            continue
+        try:
+            catalog = IpEntityCatalog.from_path(path)
+            logger.info(
+                "SNS buzz: IP entity catalog loaded path=%s profiles=%d",
+                path,
+                len(catalog.profiles),
+            )
+            return catalog
+        except Exception:
+            logger.exception("SNS buzz: failed to load IP entity catalog path=%s", path)
+    logger.info("SNS buzz: no IP entity catalog found")
+    return IpEntityCatalog.empty()
 
 
 def bootstrap_sns_db(settings: AssistantSettings):
@@ -50,6 +93,8 @@ def _build_sns_buzz_fn(settings: AssistantSettings, x_client, ssl_context=None,
             heat_store = IpHeatStore(_Path(settings.knowledge_db_path).with_name("ip_heat.sqlite3"))
         except Exception:
             logger.exception("SNS buzz: failed to open IpHeatStore — heat recording disabled")
+
+    ip_catalog = _load_ip_entity_catalog(settings)
 
     # A percentile is only meaningful once there's enough history to rank
     # against; below this, IpHeatStore necessarily returns ~100% (the current
@@ -109,6 +154,32 @@ def _build_sns_buzz_fn(settings: AssistantSettings, x_client, ssl_context=None,
         if has_signal:
             # Concrete observation: nouns + catalyst + heat, never sentiment.
             action_bits: list[str] = []
+            targets = getattr(result, "targets", ()) or ()
+            if targets:
+                grouped: dict[str, list[str]] = {}
+                labels = {
+                    "group": "團體",
+                    "character": "角色",
+                    "event": "活動",
+                    "gacha": "卡池",
+                    "card": "單卡",
+                    "card_box": "卡盒",
+                    "product": "商品",
+                    "other": "其他",
+                }
+                for target in targets[:8]:
+                    label = labels.get(getattr(target, "category", "other"), "其他")
+                    name = getattr(target, "name", "")
+                    if name:
+                        grouped.setdefault(label, []).append(name)
+                if grouped:
+                    action_bits.append(
+                        "分類標的："
+                        + "；".join(
+                            f"{label}=" + "、".join(names[:4])
+                            for label, names in grouped.items()
+                        )
+                    )
             if result.hot_items:
                 action_bits.append("標的：" + "、".join(result.hot_items[:5]))
             if result.catalyst:
@@ -180,6 +251,18 @@ def _build_sns_buzz_fn(settings: AssistantSettings, x_client, ssl_context=None,
         def deep_context_fn(tweets):
             return fourchan_client.deep_context(tweets, top_n=3)
 
+    entity_context_fn = None
+    if ip_catalog is not None:
+        def entity_context_fn(query, aliases, tweets, deep_context):
+            evidence_parts = [deep_context]
+            for tweet in tweets[:8]:
+                evidence_parts.append(tweet.text)
+            return ip_catalog.build_context(
+                query,
+                aliases=aliases,
+                evidence_text="\n".join(evidence_parts),
+            )
+
     def buzz(query: str) -> str:
         # RAG-expand the user term to canonical + aliases so 'pjsk' matches a
         # '/psg/ - Project SEKAI General' thread. Heat is recorded under the
@@ -194,6 +277,7 @@ def _build_sns_buzz_fn(settings: AssistantSettings, x_client, ssl_context=None,
             ssl_context=llm_ssl,
             llm_call_fn=llm_call_fn,
             deep_context_fn=deep_context_fn,
+            entity_context_fn=entity_context_fn,
             search_aliases=aliases,
         )
         if result is None:

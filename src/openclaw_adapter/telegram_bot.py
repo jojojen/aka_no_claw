@@ -1163,12 +1163,12 @@ def _build_registries(
         "/sns_delete": RegisteredCommand(build_sns_delete_handler(sns_db, sns_inbox=sns_inbox)),
         "/snsbuzz": RegisteredCommand(
             build_sns_buzz_handler(buzz_fn),
-            ack="收到，正在抓取 X 熱門討論並交給 LLM 整理…",
+            ack="收到，正在掃描 4chan 收藏/IP 討論並交給 LLM 整理…",
             background=True,
         ),
         "/sns_buzz": RegisteredCommand(
             build_sns_buzz_handler(buzz_fn),
-            ack="收到，正在抓取 X 熱門討論並交給 LLM 整理…",
+            ack="收到，正在掃描 4chan 收藏/IP 討論並交給 LLM 整理…",
             background=True,
         ),
         "/snsclearfilter": RegisteredCommand(

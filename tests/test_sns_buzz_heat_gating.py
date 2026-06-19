@@ -18,7 +18,7 @@ import sns_monitor.digest as digest_mod
 from assistant_runtime import AssistantSettings
 from openclaw_adapter.knowledge_db import KnowledgeDatabase
 import openclaw_adapter.sns_tools as sns_tools
-from sns_monitor.digest import BuzzResult
+from sns_monitor.digest import BuzzResult, BuzzTarget
 
 
 class _FakeFourchan:
@@ -95,6 +95,30 @@ def test_signal_writes_concrete_observation(monkeypatch):
         assert "4chan熱度 value=200" in entry.summary
 
 
+def test_signal_writes_categorized_targets(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        settings = _settings(tmpdir)
+        db = _seed_entry(settings)
+        result = BuzzResult(
+            query="chainsaw man",
+            summary="具體標的：卡盒：UA 鏈鋸人 BOX。收藏訊號：高。",
+            sources=[],
+            fetched_count=12,
+            targets=(
+                BuzzTarget(category="card_box", name="UA 鏈鋸人 BOX", confidence=80),
+                BuzzTarget(category="character", name="デンジ", confidence=70),
+            ),
+            catalyst="新彈上市",
+            collectible_signal="high",
+        )
+        buzz = _build(settings, _FakeFourchan(200.0, 5), result, monkeypatch)
+        buzz("chainsaw man")
+
+        entry = db.get_entry("chainsaw man")
+        assert entry is not None
+        assert "分類標的：卡盒=UA 鏈鋸人 BOX；角色=デンジ" in entry.summary
+
+
 def test_cloud_distiller_wired_with_local_fallback(monkeypatch):
     """When the cloud enricher is available, buzz wires an llm_call_fn (cloud
     with single local fallback) + a deep_context_fn into the digest."""
@@ -131,8 +155,40 @@ def test_cloud_distiller_wired_with_local_fallback(monkeypatch):
 
     assert captured["deep_context_fn"] is not None
     assert captured["llm_call_fn"] is not None
+    assert captured["entity_context_fn"] is not None
     # Cloud raises CloudBackendUnavailable → llm_call_fn degrades to local once.
     assert captured["llm_call_fn"]("prompt") == "LOCAL_FALLBACK_OK"
+
+
+def test_ip_catalog_context_wired_from_data_file(monkeypatch):
+    captured = {}
+
+    def fake_summarize(query, **kw):
+        captured.update(kw)
+        return None
+
+    monkeypatch.setattr(digest_mod, "summarize_topic_sync", fake_summarize)
+
+    class _FC:
+        def deep_context(self, tweets, *, top_n=3):
+            return "Current Gacha Past Fragments Luka Shizuku"
+
+        def measure_ip_heat_sync(self, q, aliases=()):
+            return (0.0, 0)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        settings = _settings(tmpdir)
+        buzz = sns_tools._build_sns_buzz_fn(settings, x_client=object(), fourchan_client=_FC())
+        buzz("pjsk")
+
+    entity_context = captured["entity_context_fn"](
+        "pjsk",
+        ("Project Sekai",),
+        [],
+        "Current Gacha Past Fragments Luka Shizuku",
+    )
+    assert "IP: Project SEKAI" in entity_context
+    assert "巡音ルカ" in entity_context
 
 
 def test_query_expands_to_aliases_for_search_and_heat(monkeypatch):

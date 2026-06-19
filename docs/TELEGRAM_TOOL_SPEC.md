@@ -118,8 +118,10 @@ Free-text values are accepted (normalised to lowercase). Untagged rules are auto
 - 已含該 filter 的帳號會被跳過（idempotent）。
 
 - `/snsbuzz <keyword>`
-  - Summarise Reddit's top discussion on a topic via LLM.
-  - Usage: `/snsbuzz amd`
+  - Summarise 4chan collectible/IP discussion via LLM.
+  - Uses `data/sns_ip_catalog.json` (or `OPENCLAW_SNS_IP_CATALOG_PATH`) to normalize concrete targets across multiple IPs: groups, characters, events, gacha/card boxes, cards, and products.
+  - Low-signal general chatter should not be written to RAG as new knowledge.
+  - Usage: `/snsbuzz pjsk`
 
 - `/hunt status`
   - Show recent opportunity candidates and recommendation decisions.
