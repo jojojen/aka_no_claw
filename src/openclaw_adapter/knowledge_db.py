@@ -1242,14 +1242,19 @@ def is_insufficient_entry(entry: KnowledgeEntry) -> bool:
 
 # An operational-cache entry is a non-knowledge lookup marker the system writes purely
 # to avoid repeating an expensive step — e.g. the 遊々亭 game-code resolver caches each
-# item→code mapping so the same item never pays a second /search (priority #2「不被封鎖」).
-# The marker is a fixed protocol token (a closed enum, NOT open-world entity recognition),
-# so detecting it here does not violate the no-hardcode rule. Like a no-data stub it is a
-# real cache the system needs, but it carries no human-reviewable knowledge and must never
-# be surfaced in the daily digest. NOTE: origin can't distinguish these — both the yuyutei
-# cache and real /research entity knowledge share origin="research_command" — so the summary
-# marker is the robust signal (and matches what YuyuteiGameCodeResolver itself keys on).
+# item→code mapping so the same item never pays a second /search (priority #2「不被封鎖」),
+# and /research caches Mercari item-page facts so the same item URL/title can be found
+# again. These are real caches the system needs, but they carry no human-reviewable RAG
+# knowledge and must never be surfaced in the daily digest.
+#
+# The markers below are fixed protocol tokens (closed enums, NOT open-world entity
+# recognition), so detecting them here does not violate the no-hardcode rule. NOTE:
+# origin alone can't distinguish these — operational caches and real /research entity
+# knowledge share origin="research_command" — so summary/canonical protocol markers are
+# the robust signal.
 YUYUTEI_CACHE_MARKER = "yuyutei_code="
+MERCARI_ITEM_CACHE_PREFIX = "mercari:"
+MERCARI_ITEM_CACHE_SUMMARY_PREFIX = "Mercari 商品頁資料："
 OPERATIONAL_CACHE_MARKERS = (YUYUTEI_CACHE_MARKER,)
 
 
@@ -1258,7 +1263,14 @@ def is_operational_cache_entry(entry: KnowledgeEntry) -> bool:
     human-reviewable knowledge. Detected by a fixed protocol marker at the
     head of the summary."""
     head = _summary_head(entry.summary)
-    return any(head.startswith(marker) for marker in OPERATIONAL_CACHE_MARKERS)
+    if any(head.startswith(marker) for marker in OPERATIONAL_CACHE_MARKERS):
+        return True
+    return (
+        entry.origin == "research_command"
+        and entry.entity_type == "product"
+        and entry.entity_canonical.startswith(MERCARI_ITEM_CACHE_PREFIX)
+        and head.startswith(MERCARI_ITEM_CACHE_SUMMARY_PREFIX)
+    )
 
 
 def _build_observation_bullet(

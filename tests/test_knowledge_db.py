@@ -307,6 +307,21 @@ def test_is_operational_cache_entry_flags_yuyutei_marker():
     assert is_operational_cache_entry(op) is True
 
 
+def test_is_operational_cache_entry_flags_mercari_item_cache():
+    op = KnowledgeEntry(
+        entry_id="e",
+        entity_canonical="mercari:m93045899435",
+        entity_type="product",
+        summary=(
+            "Mercari 商品頁資料：ヴァイスシュヴァルツ いっぱいの祝福 桐谷遥 SSP。 "
+            "標示價格 ¥26,999。 商品狀態：目立った傷や汚れなし。"
+        ),
+        confidence=0.85,
+        origin="research_command",
+    )
+    assert is_operational_cache_entry(op) is True
+
+
 def test_is_operational_cache_entry_passes_real_entry(db):
     _seed_entity(db)
     assert is_operational_cache_entry(db.get_entry("union_arena")) is False
