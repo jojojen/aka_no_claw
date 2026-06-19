@@ -6,8 +6,9 @@ into ``data/market_title_df.json``, then evaluates the activation gate
 (``research_command.describe_title_idf_activation``: enough docs **and** the
 behavioural canary). It writes the table unconditionally — the gate is enforced
 at *read* time on every /research, so a thin or off-domain table simply stays on
-cold-start (plain Jaccard / PR1). Each run posts a Telegram notice saying it ran,
-how big the corpus is, and whether the IDF weighting is now active.
+cold-start (plain Jaccard / PR1). Runs can optionally post a Telegram notice
+saying they ran, how big the corpus is, and whether the IDF weighting is now
+active.
 
 Rebuilding reads only titles already cached locally — **zero** new external
 queries (Rule C7).
@@ -104,7 +105,7 @@ def format_rebuild_notice(report: RebuildReport) -> str:
 
 
 class TitleCorpusRebuilder:
-    """Daemon that rebuilds the IDF table weekly and reports on Telegram."""
+    """Daemon that rebuilds the IDF table weekly, optionally reporting on Telegram."""
 
     def __init__(
         self,
@@ -114,12 +115,14 @@ class TitleCorpusRebuilder:
         out_path: Path | None = None,
         interval_seconds: float = _WEEKLY_SECONDS,
         initial_delay_seconds: float = 600,
+        notify_enabled: bool = True,
     ) -> None:
         self._notify_fn = notify_fn
         self._corpus_path = corpus_path
         self._out_path = out_path
         self._interval = interval_seconds
         self._initial_delay = initial_delay_seconds
+        self._notify_enabled = notify_enabled
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
@@ -155,8 +158,9 @@ class TitleCorpusRebuilder:
             report.activated,
             report.reason,
         )
-        try:
-            self._notify_fn(format_rebuild_notice(report))
-        except Exception:
-            logger.exception("TitleCorpusRebuilder: Telegram notify failed")
+        if self._notify_enabled:
+            try:
+                self._notify_fn(format_rebuild_notice(report))
+            except Exception:
+                logger.exception("TitleCorpusRebuilder: Telegram notify failed")
         return report

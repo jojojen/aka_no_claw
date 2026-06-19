@@ -92,6 +92,24 @@ def test_run_once_is_fail_safe_when_notify_raises(tmp_path) -> None:
     assert report is not None
 
 
+def test_run_once_skips_notify_when_disabled(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(rc, "_MIN_TITLE_CORPUS_DOCS", 5)
+    corpus = tmp_path / "corpus.sqlite3"
+    mtc.record_titles(_canary_passing_titles(), source="research", path=corpus)
+    sent: list[str] = []
+    rebuilder = tcr.TitleCorpusRebuilder(
+        notify_fn=sent.append,
+        corpus_path=corpus,
+        out_path=tmp_path / "df.json",
+        notify_enabled=False,
+    )
+
+    report = rebuilder.run_once()
+
+    assert report is not None and report.activated is True
+    assert sent == []
+
+
 def test_format_rebuild_notice_branches() -> None:
     base = dict(corpus_titles=10, total_docs=10, token_vocab=5, bigram_vocab=3, min_docs=3000)
     activated = tcr.format_rebuild_notice(
