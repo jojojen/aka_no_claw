@@ -1652,15 +1652,14 @@ def _build_backup_notify(settings):
 
 def _start_title_corpus_rebuilder(settings) -> None:
     """Weekly: rebuild the comp-filter IDF table from the passive title corpus
-    and post a Telegram notice saying whether it activated. Reads only locally
-    cached titles — zero new external queries (Rule C7)."""
+    without noisy Telegram notices from the always-on bot runtime. Reads only
+    locally cached titles — zero new external queries (Rule C7)."""
     try:
         from .title_corpus_rebuilder import TitleCorpusRebuilder
     except Exception:
         logger.exception("_start_title_corpus_rebuilder: import failed — skipping")
         return
-    notify = _build_backup_notify(settings) or (lambda _text: None)
-    TitleCorpusRebuilder(notify_fn=notify).start()
+    TitleCorpusRebuilder(notify_fn=lambda _text: None, notify_enabled=False).start()
 
 
 def _start_card_image_crawler(watch_db: MonitorDatabase):
