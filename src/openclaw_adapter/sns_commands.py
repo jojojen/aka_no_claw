@@ -410,7 +410,7 @@ def build_sns_buzz_handler(buzz_fn) -> Callable[[str, str], str]:
 
     def handler(raw: str, chat_id: str) -> str:
         if buzz_fn is None:
-            return "SNS Buzz 功能尚未啟用（需要 X 客戶端與 LLM endpoint）。"
+            return "SNS Buzz 功能尚未啟用（需要 4chan client 與 LLM endpoint）。"
         query = raw.strip()
         if not query:
             return "請提供關鍵字。例如：/snsbuzz amd"

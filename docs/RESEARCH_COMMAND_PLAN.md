@@ -40,7 +40,7 @@ URL 先去除 tracking query（`afid`/`utm_*`/`source_location`），只留 cano
 | 網頁抓取 | `/fetch`（telegram_bot 既有） | 抓單頁內容 |
 | 知識庫 | `knowledge_db.py` `KnowledgeDatabase`（`data/knowledge.sqlite3`） | 查 IP/作者/商品既有 grounded 知識 |
 | 背景補知識 | `entity_researcher.py`（web search → LLM 濃縮 → upsert `origin='web_research'`） | 遇到不認識的 entity 時補課 |
-| IP 熱度 | `ip_heat_store.py`、`google_trends_tracker.py`、`/snsbuzz`（Reddit JSON） | 增值潛力的熱度面 |
+| IP 熱度 | `ip_heat_store.py`、`google_trends_tracker.py`、`/snsbuzz`（4chan JSON + IP catalog） | 增值潛力的熱度面 |
 | 行情/流動性 | `/trend` `/hot` `/liquidity` 板（`cross_signal_aggregator.py`、snkrdunk rank、yuyutei） | 市價與流動性（沿用 `docs/LIQUIDITY_METHODOLOGY.md`） |
 | 賣家信譽 | `reputation_agent.py`（`_MERCARI_HOST="jp.mercari.com"`，snapshot 服務 `127.0.0.1:5000`）＋ `/snapshot` `/repcheck` | 賣家評價快照、差評內容 |
 | LLM | 本機 Ollama——**一律用當下最聰明的模型**（現役＝qwen3:14b；模型名走 config，升級即換） | 實體辨識、摘要、綜合判斷（Rule G：不寫關鍵字表） |

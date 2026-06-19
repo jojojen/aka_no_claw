@@ -39,6 +39,47 @@ cd /path/to/aka_no_claw
 /snsdelete rule_id
 ```
 
+### 查看 4chan IP 熱門討論
+```
+/snsbuzz pjsk
+```
+
+`/snsbuzz` 不是 X 熱門討論，也不是 Reddit；它走 4chan public JSON API，
+再交給 LLM 萃取收藏訊號。若只有 general thread 閒聊，回覆應明確說沒有
+具體收藏催化或入手標的，且不寫入 RAG。
+
+IP/角色/活動/商品正規化資料在：
+
+```
+data/sns_ip_catalog.json
+```
+
+可用 `OPENCLAW_SNS_IP_CATALOG_PATH=/path/to/catalog.json` 覆蓋。catalog 是多 IP
+設計，新增 IP 時加一個 `ips[]` entry，不要把 IP 專名硬寫進 prompt 或程式碼。
+
+最小格式：
+
+```json
+{
+  "version": 1,
+  "ips": [
+    {
+      "ip_id": "project_sekai",
+      "canonical": "Project SEKAI",
+      "aliases": ["pjsk", "プロセカ"],
+      "entities": [
+        {"category": "group", "name": "25時、ナイトコードで。", "aliases": ["Niigo"]},
+        {"category": "character", "name": "巡音ルカ", "aliases": ["Luka"]},
+        {"category": "gacha", "name": "限定ガチャ", "aliases": ["Limited Gacha"]}
+      ]
+    }
+  ]
+}
+```
+
+允許的 `category`：`group`, `character`, `event`, `gacha`, `card`,
+`card_box`, `product`, `other`。
+
 ---
 
 ## 📊 預期輸出

@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "ips": [
+    {
+      "ip_id": "project_sekai",
+      "canonical": "Project SEKAI",
+      "aliases": ["pjsk", "Project Sekai", "Project SEKAI", "プロセカ", "プロジェクトセカイ"],
+      "entities": [
+        {"category": "group", "name": "Leo/need", "aliases": ["L/n", "レオニ"]},
+        {"category": "group", "name": "MORE MORE JUMP!", "aliases": ["MMJ", "モモジャン"]},
+        {"category": "group", "name": "Vivid BAD SQUAD", "aliases": ["VBS", "ビビバス"]},
+        {"category": "group", "name": "Wonderlands x Showtime", "aliases": ["WxS", "ワンダショ"]},
+        {"category": "group", "name": "25時、ナイトコードで。", "aliases": ["25-ji", "Niigo", "ニーゴ"]},
+        {"category": "group", "name": "Virtual Singer", "aliases": ["バーチャル・シンガー"]},
+        {"category": "character", "name": "初音ミク", "aliases": ["Miku", "Hatsune Miku"]},
+        {"category": "character", "name": "鏡音リン", "aliases": ["Rin", "Kagamine Rin"]},
+        {"category": "character", "name": "鏡音レン", "aliases": ["Len", "Kagamine Len"]},
+        {"category": "character", "name": "巡音ルカ", "aliases": ["Luka", "Megurine Luka"]},
+        {"category": "character", "name": "MEIKO", "aliases": ["Meiko"]},
+        {"category": "character", "name": "KAITO", "aliases": ["Kaito"]},
+        {"category": "character", "name": "星乃一歌", "aliases": ["Ichika", "Ichika Hoshino"], "meta": {"unit": "Leo/need"}},
+        {"category": "character", "name": "天馬咲希", "aliases": ["Saki", "Saki Tenma"], "meta": {"unit": "Leo/need"}},
+        {"category": "character", "name": "望月穂波", "aliases": ["Honami", "Honami Mochizuki"], "meta": {"unit": "Leo/need"}},
+        {"category": "character", "name": "日野森志歩", "aliases": ["Shiho", "Shiho Hinomori"], "meta": {"unit": "Leo/need"}},
+        {"category": "character", "name": "花里みのり", "aliases": ["Minori", "Minori Hanasato"], "meta": {"unit": "MORE MORE JUMP!"}},
+        {"category": "character", "name": "桐谷遥", "aliases": ["Haruka", "Haruka Kiritani"], "meta": {"unit": "MORE MORE JUMP!"}},
+        {"category": "character", "name": "桃井愛莉", "aliases": ["Airi", "Airi Momoi"], "meta": {"unit": "MORE MORE JUMP!"}},
+        {"category": "character", "name": "日野森雫", "aliases": ["Shizuku", "Shizuku Hinomori"], "meta": {"unit": "MORE MORE JUMP!"}},
+        {"category": "character", "name": "小豆沢こはね", "aliases": ["Kohane", "Kohane Azusawa"], "meta": {"unit": "Vivid BAD SQUAD"}},
+        {"category": "character", "name": "白石杏", "aliases": ["An", "An Shiraishi"], "meta": {"unit": "Vivid BAD SQUAD"}},
+        {"category": "character", "name": "東雲彰人", "aliases": ["Akito", "Akito Shinonome"], "meta": {"unit": "Vivid BAD SQUAD"}},
+        {"category": "character", "name": "青柳冬弥", "aliases": ["Toya", "Toya Aoyagi"], "meta": {"unit": "Vivid BAD SQUAD"}},
+        {"category": "character", "name": "天馬司", "aliases": ["Tsukasa", "Tsukasa Tenma"], "meta": {"unit": "Wonderlands x Showtime"}},
+        {"category": "character", "name": "鳳えむ", "aliases": ["Emu", "Emu Otori"], "meta": {"unit": "Wonderlands x Showtime"}},
+        {"category": "character", "name": "草薙寧々", "aliases": ["Nene", "Nene Kusanagi"], "meta": {"unit": "Wonderlands x Showtime"}},
+        {"category": "character", "name": "神代類", "aliases": ["Rui", "Rui Kamishiro"], "meta": {"unit": "Wonderlands x Showtime"}},
+        {"category": "character", "name": "宵崎奏", "aliases": ["Kanade", "Kanade Yoisaki"], "meta": {"unit": "25時、ナイトコードで。"}},
+        {"category": "character", "name": "朝比奈まふゆ", "aliases": ["Mafuyu", "Mafuyu Asahina"], "meta": {"unit": "25時、ナイトコードで。"}},
+        {"category": "character", "name": "東雲絵名", "aliases": ["Ena", "Ena Shinonome"], "meta": {"unit": "25時、ナイトコードで。"}},
+        {"category": "character", "name": "暁山瑞希", "aliases": ["Mizuki", "Mizuki Akiyama"], "meta": {"unit": "25時、ナイトコードで。"}},
+        {"category": "gacha", "name": "限定ガチャ", "aliases": ["Limited Gacha", "limited"]},
+        {"category": "event", "name": "World Link", "aliases": ["WL"]},
+        {"category": "product", "name": "ヴァイスシュヴァルツ Project SEKAI", "aliases": ["Weiss Schwarz Project SEKAI", "WS PJSK"]},
+        {"category": "card", "name": "SSP", "aliases": ["サインカード"]}
+      ]
+    },
+    {
+      "ip_id": "pokemon_tcg",
+      "canonical": "Pokemon TCG",
+      "aliases": ["pokemon", "ptcg", "Pokemon Card", "ポケカ", "ポケモンカード"],
+      "entities": [
+        {"category": "product", "name": "Pokemon Trading Card Game", "aliases": ["PTCG", "ポケモンカードゲーム"]},
+        {"category": "card_box", "name": "Booster Box", "aliases": ["未開封BOX", "booster box"]},
+        {"category": "card", "name": "SAR", "aliases": ["Special Art Rare"]},
+        {"category": "card", "name": "AR", "aliases": ["Art Rare"]},
+        {"category": "card", "name": "Promo", "aliases": ["プロモ"]},
+        {"category": "character", "name": "ピカチュウ", "aliases": ["Pikachu"]},
+        {"category": "character", "name": "リザードン", "aliases": ["Charizard"]},
+        {"category": "character", "name": "リーリエ", "aliases": ["Lillie"]}
+      ]
+    }
+  ]
+}
