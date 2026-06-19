@@ -253,6 +253,25 @@ def probe_opencode_cli(
         return False
 
 
+def build_research_cloud_text_client(
+    settings: "object", *, timeout_seconds: int = 180
+) -> "OpenCodeCliTextClient | None":
+    """Cloud (OpenCode big-pickle) text client for /research appreciation
+    enrichment, probed once at build time. Returns None when
+    ``OPENCLAW_RESEARCH_CLOUD_ENRICHER`` isn't "opencode" or the CLI can't be
+    used. Deliberately carries NONE of the /new runner's cloud-failover restart
+    behavior — /research degrades in-process, it must never restart the bot."""
+    backend = (getattr(settings, "openclaw_research_cloud_enricher", None) or "").strip().lower()
+    if backend != "opencode":
+        return None
+    raw_model = (getattr(settings, "openclaw_opencode_model", None) or "big-pickle").strip()
+    model = raw_model if "/" in raw_model else f"opencode/{raw_model}"
+    if not probe_opencode_cli(model=model, timeout=20.0):
+        logger.warning("dynamic_tools: /research cloud enricher requested but CLI probe failed")
+        return None
+    return OpenCodeCliTextClient(model=model, timeout_seconds=max(1, int(timeout_seconds)))
+
+
 class OllamaTextClient:
     """Minimal stdlib POST to Ollama /api/generate (non-streaming)."""
 
