@@ -1455,7 +1455,7 @@ def run_telegram_polling(
         image_translate_recognizer=build_image_translate_caption_recognizer(settings),
         ssl_context=build_ssl_context(settings),
         allowed_chat_ids=frozenset(settings.openclaw_telegram_chat_ids),
-        status_renderer=lambda: _build_status_text(settings),
+        status_renderer=lambda: _build_status_text(settings, dynamic_tool_runner),
         command_handlers=command_handlers,
         callback_handlers=callback_handlers,
         view_handlers=view_handlers,
@@ -1809,7 +1809,7 @@ def require_telegram_chat_id(settings: AssistantSettings) -> str:
     return chat_id
 
 
-def _build_status_text(settings: AssistantSettings) -> str:
+def _build_status_text(settings: AssistantSettings, dynamic_tool_runner=None) -> str:
     allowed_chats = ", ".join(settings.openclaw_telegram_chat_ids) if settings.openclaw_telegram_chat_ids else "not restricted"
     configured = _load_status_configuration_snapshot()
     tesseract = settings.openclaw_tesseract_path or configured.get("OPENCLAW_TESSERACT_PATH") or "PATH lookup"
@@ -1853,6 +1853,7 @@ def _build_status_text(settings: AssistantSettings) -> str:
                 timeout_seconds=configured_vision_timeout,
                 endpoint=configured_vision_endpoint,
             ),
+            f"/new codegen: {dynamic_tool_runner.backend_label if dynamic_tool_runner is not None else 'disabled'}",
             f"image scan OCR: engine=tesseract | binary={tesseract} | tessdata={tessdata}",
             "price lookup / trend / watch: model=none | source-driven matching and pricing rules",
             f"reputation snapshot: model=none | server={reputation_host} | poll={settings.reputation_agent_poll_secs}s | renderer=playwright chromium",

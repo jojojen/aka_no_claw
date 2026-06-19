@@ -509,6 +509,19 @@ class DynamicToolRunner:
 
     # ── public ──────────────────────────────────────────────────────────────
 
+    @property
+    def backend_label(self) -> str:
+        """Concise codegen backend+model tag, surfaced in /status and /new replies
+        so the operator can confirm which model is actually wired (e.g. whether
+        OpenCode big-pickle is live vs the local Ollama cascade)."""
+        client_name = type(self.client).__name__
+        if "OpenCode" in client_name:
+            model = self.fast_model.split("/")[-1] if self.fast_model else "?"
+            return f"opencode · {model}"
+        if self.fast_model == self.strong_model:
+            return f"ollama · {self.fast_model}"
+        return f"ollama · {self.fast_model}→{self.strong_model}"
+
     def run(self, request: str) -> str:
         """Telegram-facing entry: returns a human-readable string."""
         req = (request or "").strip()
@@ -521,10 +534,13 @@ class DynamicToolRunner:
             return f"動態工具執行失敗：{exc}"
         if result.ok:
             prefix = "♻️ 重用既有工具\n" if result.reused else "🛠 新生成工具\n"
-            return prefix + result.answer
+            reuse_note = "（本次重用，未重新生成）" if result.reused else ""
+            footer = f"\n—\n🤖 codegen：{self.backend_label}{reuse_note}"
+            return prefix + result.answer + footer
         if result.generations == 0:
-            return f"⚠️ 無法完成\n{result.error}"
-        return f"⚠️ 無法完成（生成 {result.generations} 次仍失敗）\n{result.error}"
+            return f"⚠️ 無法完成\n{result.error}\n—\n🤖 codegen：{self.backend_label}"
+        return (f"⚠️ 無法完成（生成 {result.generations} 次仍失敗）\n{result.error}"
+                f"\n—\n🤖 codegen：{self.backend_label}")
 
     def run_detailed(self, request: str) -> DynamicToolResult:
         req = request.strip()
@@ -699,7 +715,8 @@ class DynamicToolRunner:
         # it hallucinates endpoints for data we already hold.
         references = self._ground_references(request, knowledge_rows)
         if references is None:
-            references = self._search_ground(request)
+            if self._needs_search_grounding(request, ""):
+                references = self._search_ground(request)
         elif self._needs_search_grounding(request, references):
             extra = self._search_ground(request)
             if extra:
