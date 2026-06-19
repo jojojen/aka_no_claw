@@ -2,7 +2,7 @@
 
 Tracks multi-source IP popularity metrics over time:
   - x_mention    : X/Twitter hashtag/mention volume (7-day window)
-  - reddit       : subreddit post/comment activity
+  - 4chan        : collectible/IP board thread activity (sum of reply counts)
   - google_trends: relative search interest (0-100 scale from Google)
 
 One row per (ip_canonical, source, measured_at) — measured_at is truncated
@@ -27,7 +27,7 @@ from typing import Iterator
 
 logger = logging.getLogger(__name__)
 
-SOURCES: tuple[str, ...] = ("x_mention", "reddit", "google_trends")
+SOURCES: tuple[str, ...] = ("x_mention", "4chan", "google_trends")
 
 _SCHEMA = """
 PRAGMA foreign_keys = ON;

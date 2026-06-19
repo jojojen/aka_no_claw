@@ -975,7 +975,7 @@ def test_research_handler_builds_appreciation_section_from_knowledge_and_heat(tm
         return {
             "evangelion": (
                 FakeHeatSignal("google_trends", 88.0),
-                FakeHeatSignal("reddit", 71.0),
+                FakeHeatSignal("4chan", 71.0),
             ),
         }
 
@@ -993,7 +993,7 @@ def test_research_handler_builds_appreciation_section_from_knowledge_and_heat(tm
 
     assert "增值潛力分析 [ok]" in reply
     assert "命中知識庫 2 筆：evangelion(ip)、rei ayanami(creator)。" in reply
-    assert "evangelion 近期 熱度高（google_trends 88pct / reddit 71pct）。" in reply
+    assert "evangelion 近期 熱度高（google_trends 88pct / 4chan 71pct）。" in reply
     assert "rei ayanami：綾波レイ是 EVA 核心角色" in reply
 
 

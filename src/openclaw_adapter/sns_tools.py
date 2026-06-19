@@ -21,8 +21,15 @@ def bootstrap_sns_db(settings: AssistantSettings):
     return db
 
 
-def _build_sns_buzz_fn(settings: AssistantSettings, x_client, ssl_context=None):
-    """Build the /snsbuzz callback: search X by keyword, summarize via LLM, return Telegram-ready text."""
+def _build_sns_buzz_fn(settings: AssistantSettings, x_client, ssl_context=None,
+                       fourchan_client=None):
+    """Build the /snsbuzz callback: search 4chan by keyword, distill an IP-heat
+    conclusion via the local LLM, persist the heat signal, return Telegram text.
+
+    When ``fourchan_client`` is supplied the same client's cached catalogs are
+    reused to compute an IP-heat value, which is recorded to the IpHeatStore
+    (the same ``ip_heat.sqlite3`` /research reads) and, best-effort, appended as
+    an observation to the knowledge DB for any IP that already has an entry."""
     from sns_monitor.digest import summarize_topic_sync, format_buzz_reply
 
     backend = (settings.openclaw_local_text_backend or "").strip().lower()
@@ -35,18 +42,166 @@ def _build_sns_buzz_fn(settings: AssistantSettings, x_client, ssl_context=None):
                        backend, endpoint, model)
         return None
 
+    heat_store = None
+    if fourchan_client is not None:
+        try:
+            from pathlib import Path as _Path
+            from .ip_heat_store import IpHeatStore
+            heat_store = IpHeatStore(_Path(settings.knowledge_db_path).with_name("ip_heat.sqlite3"))
+        except Exception:
+            logger.exception("SNS buzz: failed to open IpHeatStore — heat recording disabled")
+
+    # A percentile is only meaningful once there's enough history to rank
+    # against; below this, IpHeatStore necessarily returns ~100% (the current
+    # value is its own max), which is misleading, so we suppress it.
+    _MIN_HISTORY_FOR_PCT = 5
+
+    def _expand_aliases(query: str) -> tuple[str, tuple[str, ...]]:
+        """RAG query-expansion: resolve the user term to its canonical name plus
+        every known alias from the knowledge DB, so a 4chan thread titled with
+        any alias ('Project SEKAI', 'プロセカ') matches a user who typed 'pjsk'.
+
+        The alias table IS the RAG source — no hardcoded alias map (Rule G).
+        Returns (recording_key, aliases) where recording_key is the canonical
+        (stable heat-history key) and aliases includes the canonical itself."""
+        try:
+            from .knowledge_db import KnowledgeDatabase
+            db = KnowledgeDatabase(settings.knowledge_db_path)
+            canonical = db.lookup_canonical(query) or query
+            aliases = [a for a, c in db.all_aliases() if c == canonical]
+        except Exception:
+            logger.exception("SNS buzz: alias expansion failed query=%s", query)
+            return query, ()
+        return canonical, tuple(aliases)
+
+    def _record_ip_heat(query: str, result, aliases: tuple[str, ...] = ()) -> str:
+        """Record 4chan IP heat to the store, and — only when the scan produced a
+        substantive collectible signal — append a concrete observation to the
+        knowledge DB. Returns a heat line to append to the reply (empty when no
+        matches / not configured)."""
+        if heat_store is None or fourchan_client is None:
+            return ""
+        try:
+            value, matched = fourchan_client.measure_ip_heat_sync(query, aliases)
+        except Exception:
+            logger.exception("SNS buzz: 4chan heat measurement failed query=%s", query)
+            return ""
+        if matched <= 0:
+            return ""
+        try:
+            signal = heat_store.record(
+                ip_canonical=query, source="4chan", value=value, window_days=1,
+            )
+        except Exception:
+            logger.exception("SNS buzz: IpHeatStore.record failed query=%s", query)
+            return ""
+
+        # Percentile honesty: only trust/show it once we have real history.
+        pct = None
+        try:
+            history = heat_store.history(query, "4chan", days=30)
+            if len(history) >= _MIN_HISTORY_FOR_PCT:
+                pct = signal.percentile
+        except Exception:
+            logger.exception("SNS buzz: heat history lookup failed query=%s", query)
+
+        has_signal = bool(result is not None and result.has_signal)
+        if has_signal:
+            # Concrete observation: nouns + catalyst + heat, never sentiment.
+            action_bits: list[str] = []
+            if result.hot_items:
+                action_bits.append("標的：" + "、".join(result.hot_items[:5]))
+            if result.catalyst:
+                action_bits.append("催化：" + result.catalyst)
+            if result.actionable:
+                action_bits.append("可留意：" + result.actionable)
+            heat_bit = f"4chan熱度 value={value:.0f}（{matched}串）" + (
+                f" / {pct:.0f}pct" if pct is not None else "")
+            action_bits.append(heat_bit)
+            try:
+                from datetime import datetime, timezone
+                from .knowledge_db import KnowledgeDatabase
+                KnowledgeDatabase(settings.knowledge_db_path).append_observation(
+                    entity_alias_or_canonical=query,
+                    observed_at=datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+                    rationale=(result.summary or "").strip()[:500],
+                    suggested_action=" ｜ ".join(action_bits),
+                    tweet_url="",
+                )
+            except Exception:
+                logger.exception("SNS buzz: knowledge_db observation append failed query=%s", query)
+
+        pct_bit = f"，30日百分位 {pct:.0f}%" if pct is not None else ""
+        tail = "（已存收藏訊號入知識庫）" if has_signal else "（常態討論，僅記錄熱度數字）"
+        return f"\n\n🌡 IP 熱度（4chan）：{value:.0f}（{matched} 串{pct_bit}）{tail}"
+
+    # Distillation engine. Picking "which specific card set / single card /
+    # character / unit / product has appreciation potential" out of raw 4chan
+    # chatter is the abstract, hard step — local qwen3:14b is weak at it, so we
+    # offload it to cloud big-pickle when configured. A cloud outage or empty
+    # reply degrades to a SINGLE in-process local call; it must NEVER restart
+    # the bot (that failover belongs to /new only).
+    llm_ssl = ssl_context if endpoint.startswith("https://") else None
+
+    cloud_client = None
+    try:
+        from .dynamic_tools import build_research_cloud_text_client
+        cloud_client = build_research_cloud_text_client(settings)
+    except Exception:
+        logger.exception("SNS buzz: cloud distiller probe failed — using local LLM")
+        cloud_client = None
+
+    def _local_call(prompt: str) -> str:
+        from sns_monitor.digest import _call_ollama
+        return _call_ollama(endpoint, model, prompt, timeout=timeout, ssl_context=llm_ssl)
+
+    llm_call_fn = None
+    if cloud_client is not None:
+        from .dynamic_tools import CloudBackendUnavailable
+
+        def llm_call_fn(prompt: str) -> str:
+            try:
+                text = (cloud_client.generate(prompt, temperature=0.2) or "").strip()
+            except CloudBackendUnavailable:
+                logger.warning(
+                    "SNS buzz cloud distiller unavailable; single local fallback",
+                    exc_info=True,
+                )
+                return _local_call(prompt)
+            return text or _local_call(prompt)
+
+        logger.info("SNS buzz distiller: cloud big-pickle (local fallback)")
+
+    # Deep-dive the top-3 busiest matched threads so the distiller reads the
+    # actual replies (specific cards/sets/characters/prices), not board-general
+    # subject lines. None when there's no 4chan client (e.g. tests).
+    deep_context_fn = None
+    if fourchan_client is not None:
+        def deep_context_fn(tweets):
+            return fourchan_client.deep_context(tweets, top_n=3)
+
     def buzz(query: str) -> str:
+        # RAG-expand the user term to canonical + aliases so 'pjsk' matches a
+        # '/psg/ - Project SEKAI General' thread. Heat is recorded under the
+        # canonical for a stable history key.
+        recording_key, aliases = _expand_aliases(query)
         result = summarize_topic_sync(
             query,
             x_client=x_client,
             llm_endpoint=endpoint,
             llm_model=model,
             llm_timeout=timeout,
-            ssl_context=ssl_context if endpoint.startswith("https://") else None,
+            ssl_context=llm_ssl,
+            llm_call_fn=llm_call_fn,
+            deep_context_fn=deep_context_fn,
+            search_aliases=aliases,
         )
         if result is None:
-            return f"找不到關於「{query}」的推文。"
-        return format_buzz_reply(result)
+            heat_line = _record_ip_heat(recording_key, None, aliases)
+            base = f"在 4chan 收藏品/IP 板上找不到關於「{query}」的討論串。"
+            return base + heat_line if heat_line else base
+        heat_line = _record_ip_heat(recording_key, result, aliases)
+        return format_buzz_reply(result) + heat_line
 
     return buzz
 
@@ -169,19 +324,18 @@ def _start_sns_monitor(
         logger.error("SNS monitor: failed to import required modules: %s", exc)
         return None, None
 
-    logger.info("SNS monitor: timeline via Nitter RSS, /snsbuzz search via Reddit JSON API")
+    logger.info("SNS monitor: timeline via Nitter RSS, /snsbuzz search via 4chan JSON API")
 
     try:
-        from sns_monitor.reddit_buzz import RedditBuzzClient
-        from sns_monitor.sources import RedditSource, XSource
+        from sns_monitor.fourchan_buzz import FourchanBuzzClient
+        from sns_monitor.sources import XSource
 
         db = bootstrap_sns_db(settings)
-        reddit_client = RedditBuzzClient()
-        x_client = XClient(buzz_search_backend=reddit_client)
+        fourchan_client = FourchanBuzzClient()
+        x_client = XClient(buzz_search_backend=fourchan_client)
 
         sources = {
             "x": XSource(x_client),
-            "reddit": RedditSource(client=reddit_client),
         }
 
         def notify_fn(
@@ -212,15 +366,16 @@ def _start_sns_monitor(
                     started, monitor.is_running(), sorted(sources.keys()),
                     "on" if classifier_kwargs else "off")
         if started:
-            print("[sns-monitor] ✅ SNS monitor started (interval=60s, sources=x+reddit)")
-            print("[sns-monitor] 📱 Monitoring X timelines + Reddit subreddits per watch rules")
+            print("[sns-monitor] ✅ SNS monitor started (interval=60s, sources=x)")
+            print("[sns-monitor] 📱 Monitoring X timelines per watch rules")
             if classifier_kwargs:
                 print("[sns-monitor] 🧠 Two-opportunity classifier enabled "
                       f"(min_score={settings.sns_classifier_min_score})")
 
-        buzz_fn = _build_sns_buzz_fn(settings, x_client, ssl_context=ssl_context)
+        buzz_fn = _build_sns_buzz_fn(settings, x_client, ssl_context=ssl_context,
+                                     fourchan_client=fourchan_client)
         if buzz_fn is not None:
-            print("[sns-monitor] ✨ /snsbuzz enabled (Reddit + LLM)")
+            print("[sns-monitor] ✨ /snsbuzz enabled (4chan + LLM + IP-heat)")
         return db, buzz_fn
     except Exception as exc:
         logger.exception("SNS monitor startup failed: %s", exc)

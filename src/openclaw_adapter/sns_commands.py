@@ -41,7 +41,7 @@ def _resolve_sns_rule_id(sns_db, target: str) -> str | None:
     source_filter = "x"
     had_source_prefix = False
     body = cleaned
-    for src in ("reddit:", "x:"):
+    for src in ("x:",):
         if cleaned.lower().startswith(src):
             source_filter = src[:-1]
             had_source_prefix = True
@@ -55,20 +55,6 @@ def _resolve_sns_rule_id(sns_db, target: str) -> str | None:
         handle = body.lstrip("@").lower()
         for rule in rules:
             if getattr(rule, "screen_name", "").lower() == handle and _source_matches(rule):
-                return rule.rule_id
-        return None
-
-    if body.lower().startswith("r/"):
-        sub = body[2:].strip().lower()
-        for rule in rules:
-            if (
-                getattr(rule, "screen_name", "").lower() == sub
-                and (
-                    getattr(rule, "source", "x") == "reddit"
-                    if not had_source_prefix
-                    else _source_matches(rule)
-                )
-            ):
                 return rule.rule_id
         return None
 
@@ -157,10 +143,8 @@ def build_sns_add_handler(sns_db, sns_inbox=None) -> Callable[[str, str], str]:
             ("x", "account"): _DEFAULT_SCHEDULE_MINUTES,
             ("x", "keyword"): _DEFAULT_SCHEDULE_MINUTES,
             ("x", "trend"): _DEFAULT_SCHEDULE_MINUTES,
-            ("reddit", "account"): _DEFAULT_SCHEDULE_MINUTES,
-            ("reddit", "keyword"): _DEFAULT_SCHEDULE_MINUTES,
         }
-        source_label = {"x": "X", "reddit": "Reddit"}
+        source_label = {"x": "X"}
 
         try:
             raw = raw.strip()
@@ -170,16 +154,12 @@ def build_sns_add_handler(sns_db, sns_inbox=None) -> Callable[[str, str], str]:
                     '     /snsadd x:@username filter[抽選] domain[pokemon] schedule:30\n'
                     '     /snsadd x:keyword:搜尋詞 domain[gundam]\n'
                     '     /snsadd x:trend:trending\n'
-                    '     /snsadd reddit:r/PokemonTCG domain[pokemon] schedule:30\n'
-                    '     /snsadd reddit:keyword:Umbreon ex domain[pokemon]'
+                    '（關鍵字風向請改用 /snsbuzz <關鍵字>，走 4chan）'
                 )
 
             raw = rewrite_social_url(raw)
             schedule_override, raw = extract_schedule_minutes(raw)
             source, body = split_source_prefix(raw)
-
-            if source == "reddit" and body.lower().startswith("trend:"):
-                return "Reddit 來源不支援 trend 追蹤。請改用 reddit:r/<subreddit> 或 reddit:keyword:<關鍵字>。"
 
             account_target = parse_account_watch_text(body)
             if account_target is not None:
@@ -195,7 +175,7 @@ def build_sns_add_handler(sns_db, sns_inbox=None) -> Callable[[str, str], str]:
                     else getattr(existing_rule, "schedule_minutes", None)
                     or default_schedules.get((source, "account"), _DEFAULT_SCHEDULE_MINUTES)
                 )
-                display = f"r/{screen_name}" if source == "reddit" else f"@{screen_name}"
+                display = f"@{screen_name}"
                 rule = AccountWatch(
                     rule_id=rule_id,
                     screen_name=screen_name,
@@ -221,7 +201,7 @@ def build_sns_add_handler(sns_db, sns_inbox=None) -> Callable[[str, str], str]:
                 )
                 filter_line = f"\n篩選：{', '.join(include_keywords)}" if include_keywords else ""
                 domain_line = f"\n領域：{', '.join(resolved_domains)}" if resolved_domains else ""
-                kind_label = "subreddit" if source == "reddit" else "帳號"
+                kind_label = "帳號"
                 return (
                     f"✓ 已新增 {source_label.get(source, source)} {kind_label}追蹤：{display}"
                     f"{filter_line}{domain_line}\n排程：每 {schedule_minutes} 分鐘\nID: {rule_id[:8]}…"
@@ -314,7 +294,7 @@ def build_sns_add_handler(sns_db, sns_inbox=None) -> Callable[[str, str], str]:
                 '不認識的格式。用法：\n'
                 '  /snsadd x:@username [filter[…] domain[…] schedule:NN]\n'
                 '  /snsadd x:keyword:搜尋詞 / x:trend:trending\n'
-                '  /snsadd reddit:r/<subreddit> / reddit:keyword:<關鍵字>'
+                '（關鍵字風向請改用 /snsbuzz <關鍵字>，走 4chan）'
             )
         except Exception as exc:
             logger.exception("SNS add failed raw=%s chat_id=%s", raw, chat_id)
@@ -345,7 +325,7 @@ def build_snslist_view_fn(sns_db) -> Callable[..., tuple[str, "dict | None", int
             query_text = getattr(rule, "query", None)
             category = getattr(rule, "category", None)
             if screen_name:
-                handle_display = f"r/{screen_name}" if source == "reddit" else f"@{screen_name}"
+                handle_display = f"@{screen_name}"
                 include_kw = getattr(rule, "include_keywords", ()) or ()
                 filters = f" filter[{', '.join(include_kw)}]" if include_kw else ""
                 info = f"{handle_display}{filters}"
