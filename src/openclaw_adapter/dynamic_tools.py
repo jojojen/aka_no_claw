@@ -53,6 +53,17 @@ _OLLAMA_RETRY_BASE_SEC = 1.0  # first backoff; doubles each attempt (1, 2, 4 s)
 _OPENCODE_MAX_RETRIES = 3
 _OPENCODE_RETRY_BASE_SEC = 1.0
 
+
+class CloudBackendUnavailable(RuntimeError):
+    """The cloud codegen backend (OpenCode big-pickle) could not be reached or
+    used for this request — a timeout/hang or a CLI-level failure, NOT a bad
+    generation (a bad generation still returns text). It subclasses RuntimeError
+    so existing ``except RuntimeError`` sites keep their old behavior, but the
+    request path re-raises it specifically so ``run()`` can fail over: when the
+    cloud is down mid-request, restarting the launchd-managed bot makes the
+    relaunch re-probe the backend and (cloud still down) build the local Ollama
+    runner instead."""
+
 ANSWER_START = "===ANSWER==="
 ANSWER_END = "===END==="
 _CODE_MARK = "===CODE==="
@@ -451,10 +462,11 @@ class OpenCodeCliTextClient:
                 env=env,
             )
         except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(f"OpenCode CLI timeout >{self.timeout_seconds}s") from exc
+            raise CloudBackendUnavailable(
+                f"OpenCode CLI timeout >{self.timeout_seconds}s") from exc
         if proc.returncode != 0:
             detail = _tail((proc.stderr or proc.stdout or "").strip(), 800)
-            raise RuntimeError(f"OpenCode CLI failed: {detail}")
+            raise CloudBackendUnavailable(f"OpenCode CLI failed: {detail}")
         text = _ANSI_RE.sub("", proc.stdout or "")
         lines: list[str] = []
         for line in text.splitlines():
@@ -483,6 +495,7 @@ class DynamicToolRunner:
         validator_client: "TextGenerationClient | None" = None,
         validator_model: str | None = None,
         validator_timeout_seconds: float = 25.0,
+        cloud_failover_restart: bool = False,
     ) -> None:
         self.client = client
         # Cascade: fast_model handles explore + tier-1 codegen; strong_model is
@@ -506,6 +519,15 @@ class DynamicToolRunner:
         # verdict (= pre-cross-validation behavior): we lose the second opinion
         # for this one request but never let a slow local model stall the reply.
         self.validator_timeout_seconds = validator_timeout_seconds
+        # When the cloud backend is the generator, a mid-request outage can't be
+        # recovered in-process (the runner is built once, with the cloud client
+        # wired in). Instead, restart the launchd-managed bot so the relaunch
+        # re-probes the backend and falls to the local Ollama cascade. Only the
+        # cloud-backed runner sets this; the local runner has nowhere to fail
+        # over to. A cooldown marker stops an intermittent cloud (probe passes,
+        # requests fail) from looping restarts.
+        self.cloud_failover_restart = cloud_failover_restart
+        self._cloud_failover_cooldown_seconds = 300.0
         self.tools_dir = Path(tools_dir)
         self.knowledge_db = knowledge_db
         self.exec_timeout_seconds = exec_timeout_seconds
@@ -553,6 +575,13 @@ class DynamicToolRunner:
             return "用法：/new <你的需求>，例如 /new 幫我查0050今年以來到5月的年化報酬"
         try:
             result = self.run_detailed(req)
+        except CloudBackendUnavailable as exc:
+            logger.warning("dynamic_tools: cloud backend unavailable: %s", exc)
+            if self.cloud_failover_restart and self._trigger_cloud_failover_restart():
+                return ("⚠️ 雲端 codegen 後端（big-pickle）連不上，正在重啟龍蝦改用地端模型，"
+                        "約 30 秒後請重試一次同樣的指令。")
+            return ("⚠️ 雲端 codegen 後端（big-pickle）連不上。"
+                    "若剛重啟過仍未恢復，請稍後再試或檢查後端狀態。")
         except Exception as exc:  # defensive — never crash the bot loop
             logger.exception("dynamic_tools: run failed")
             return f"動態工具執行失敗：{exc}"
@@ -565,6 +594,52 @@ class DynamicToolRunner:
             return f"⚠️ 無法完成\n{result.error}\n—\n🤖 codegen：{self.backend_label}"
         return (f"⚠️ 無法完成（生成 {result.generations} 次仍失敗）\n{result.error}"
                 f"\n—\n🤖 codegen：{self.backend_label}")
+
+    # launchd service label for the bot (see CLAUDE.md "restarting 龍蝦"). Fixed
+    # protocol value, not open-world data — safe to hardcode.
+    _LAUNCHD_LABEL = "local.openclaw.telegram"
+
+    def _trigger_cloud_failover_restart(self) -> bool:
+        """Cloud backend is down mid-request: kickstart the launchd-managed bot so
+        the relaunch re-probes the backend and builds the local Ollama runner.
+        Returns True if a restart was issued. Guarded by a cooldown marker so an
+        intermittent cloud (probe passes at startup, requests fail) can't loop
+        restarts — the second failure inside the window just reports the outage.
+        The kickstart is deferred a few seconds in a detached process so this
+        request's reply is delivered before the process is killed."""
+        marker = self.tools_dir / "_cloud_failover_restart.ts"
+        now = time.time()
+        try:
+            last = float(marker.read_text(encoding="utf-8").strip())
+        except Exception:
+            last = 0.0
+        if now - last < self._cloud_failover_cooldown_seconds:
+            logger.warning(
+                "dynamic_tools: cloud failover restart suppressed (within %.0fs cooldown)",
+                self._cloud_failover_cooldown_seconds,
+            )
+            return False
+        try:
+            marker.write_text(str(now), encoding="utf-8")
+        except Exception:
+            logger.debug("dynamic_tools: could not write failover marker", exc_info=True)
+        label = f"gui/{os.getuid()}/{self._LAUNCHD_LABEL}"
+        logger.warning(
+            "dynamic_tools: cloud backend down — scheduling kickstart %s for local failover",
+            label,
+        )
+        try:
+            # Detach + delay so the user's "restarting…" reply goes out first;
+            # kickstart -k then kills and relaunches this process under launchd.
+            subprocess.Popen(
+                ["bash", "-c", f"sleep 3; launchctl kickstart -k {label}"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception:
+            logger.exception("dynamic_tools: failover restart failed to launch")
+            return False
+        return True
 
     def run_detailed(self, request: str) -> DynamicToolResult:
         req = request.strip()
@@ -615,6 +690,8 @@ class DynamicToolRunner:
         try:
             raw = self.client.generate(prompt, temperature=0.0)
             data = _load_json_object(raw)
+        except CloudBackendUnavailable:
+            raise  # surface fast so run() can fail over to local
         except Exception:
             logger.exception("dynamic_tools: intent split failed; using request as-is")
             return request, ""
@@ -675,6 +752,8 @@ class DynamicToolRunner:
         )
         try:
             raw = self.client.generate(prompt, temperature=0.0)
+        except CloudBackendUnavailable:
+            raise  # surface fast so run() can fail over to local
         except Exception:
             logger.exception("dynamic_tools: param extraction call failed")
             return None
@@ -1175,6 +1254,8 @@ class DynamicToolRunner:
                 try:
                     extract = self.client.generate(
                         prompt, temperature=0.0, think=False).strip()
+                except CloudBackendUnavailable:
+                    raise  # surface fast so run() can fail over to local
                 except Exception as exc:
                     logger.info("dynamic_tools: reference distillation failed: %s", exc)
                     continue
@@ -1245,6 +1326,8 @@ class DynamicToolRunner:
             # grounding succeeded).
             self.client.model = self.strong_model
             ans = self.client.generate(prompt, temperature=0.0, think=False).strip()
+        except CloudBackendUnavailable:
+            raise  # surface fast so run() can fail over to local
         except Exception:
             logger.exception("dynamic_tools: search-grounding gate failed; assuming NO")
             return False
@@ -1387,6 +1470,8 @@ class DynamicToolRunner:
             self.client.timeout_seconds = max(120, saved_to // 4)
             raw = self.client.generate(explorer_prompt, temperature=0.0, think=False)
             explorer_code = _extract_code(raw)
+        except CloudBackendUnavailable:
+            raise  # surface fast so run() can fail over to local
         except Exception as exc:
             logger.info("dynamic_tools: explorer generation failed: %s", exc)
             return None
@@ -1648,6 +1733,8 @@ class DynamicToolRunner:
         )
         try:
             ans = self.client.generate(prompt, temperature=0.0).strip()
+        except CloudBackendUnavailable:
+            raise  # surface fast so run() can fail over to local
         except Exception:
             return None
         ans = ans.splitlines()[0].strip() if ans else ""
@@ -2158,7 +2245,8 @@ def build_dynamic_tool_runner_from_settings(settings) -> DynamicToolRunner | Non
             validator_client, validator_model = _build_local_validator(settings)
             return _build_runner_with_client(
                 settings, client, fast_model=cli_model, strong_model=cli_model,
-                validator_client=validator_client, validator_model=validator_model)
+                validator_client=validator_client, validator_model=validator_model,
+                cloud_failover_restart=True)
         logger.warning("dynamic_tools: OpenCode CLI unavailable; falling back to Ollama if configured")
     elif codegen_backend and codegen_backend != "ollama":
         logger.warning("dynamic_tools: unsupported codegen backend=%s; falling back to Ollama", codegen_backend)
@@ -2206,6 +2294,7 @@ def _build_runner_with_client(
     strong_model: str,
     validator_client: "TextGenerationClient | None" = None,
     validator_model: str | None = None,
+    cloud_failover_restart: bool = False,
 ) -> DynamicToolRunner:
     """Shared runner wiring after selecting the text generation backend."""
 
@@ -2223,6 +2312,7 @@ def _build_runner_with_client(
         client=client, tools_dir=tools_dir, knowledge_db=knowledge_db,
         fast_model=fast_model, strong_model=strong_model,
         validator_client=validator_client, validator_model=validator_model,
+        cloud_failover_restart=cloud_failover_restart,
         # Self-learning: abstract hard-won repairs into transferable RAG rules so
         # novel question types get easier over time instead of relying on seeds.
         distill_enabled=True,

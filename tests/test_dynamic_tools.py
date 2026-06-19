@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from openclaw_adapter.dynamic_tools import (
+    CloudBackendUnavailable,
     DynamicToolRunner,
     OllamaTextClient,
     OpenCodeCliTextClient,
@@ -1439,3 +1440,68 @@ def test_builder_enables_cross_validation_for_opencode(tmp_path):
     assert isinstance(runner.validator_client, OllamaTextClient)
     assert runner.validator_model == "qwen3:14b"
     assert "驗證" in runner.backend_label
+    # Cloud generator → enable restart-on-outage failover to the local runner.
+    assert runner.cloud_failover_restart is True
+
+
+class _DownCloudClient:
+    """Stands in for the cloud client when big-pickle is unreachable: every
+    generate() raises CloudBackendUnavailable, like the CLI timing out/failing."""
+
+    def __init__(self):
+        self.model = "opencode/big-pickle"
+        self.num_predict = None
+        self.num_ctx = None
+        self.timeout_seconds = 900
+
+    def generate(self, prompt, *, temperature=0.0, think=False):
+        raise CloudBackendUnavailable("OpenCode CLI failed: boom")
+
+
+def test_cloud_unavailable_propagates_from_request_path(tmp_path):
+    # The very first cloud call (intent split) raises; it must surface as
+    # CloudBackendUnavailable, not be swallowed into a request-as-is fallback.
+    runner = _make_runner(tmp_path, _DownCloudClient())
+    with pytest.raises(CloudBackendUnavailable):
+        runner.run_detailed("夏威夷天氣")
+
+
+def test_run_issues_failover_restart_when_cloud_down(tmp_path):
+    import unittest.mock as mock
+
+    runner = _make_runner(tmp_path, _DownCloudClient())
+    runner.cloud_failover_restart = True
+    with mock.patch("openclaw_adapter.dynamic_tools.subprocess.Popen") as popen:
+        msg = runner.run("夏威夷天氣")
+    assert "正在重啟" in msg
+    popen.assert_called_once()
+    # Cooldown marker recorded so a follow-up failure won't loop the restart.
+    assert (runner.tools_dir / "_cloud_failover_restart.ts").exists()
+
+
+def test_run_failover_restart_suppressed_within_cooldown(tmp_path):
+    import unittest.mock as mock
+
+    runner = _make_runner(tmp_path, _DownCloudClient())
+    runner.cloud_failover_restart = True
+    runner.tools_dir.mkdir(parents=True, exist_ok=True)
+    (runner.tools_dir / "_cloud_failover_restart.ts").write_text(
+        str(time.time()), encoding="utf-8")
+    with mock.patch("openclaw_adapter.dynamic_tools.subprocess.Popen") as popen:
+        msg = runner.run("夏威夷天氣")
+    popen.assert_not_called()
+    assert "正在重啟" not in msg
+    assert "連不上" in msg
+
+
+def test_run_no_failover_restart_when_disabled(tmp_path):
+    # Local-generation runner (cloud_failover_restart False) must never restart.
+    import unittest.mock as mock
+
+    runner = _make_runner(tmp_path, _DownCloudClient())
+    assert runner.cloud_failover_restart is False
+    with mock.patch("openclaw_adapter.dynamic_tools.subprocess.Popen") as popen:
+        msg = runner.run("夏威夷天氣")
+    popen.assert_not_called()
+    assert "正在重啟" not in msg
+    assert "連不上" in msg
