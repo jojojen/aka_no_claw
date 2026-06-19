@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
@@ -674,6 +675,7 @@ def test_search_grounding_injects_block_and_burns_budget(tmp_path):
     # fetch → distillation → 參考資料 block with source URLs; budget counted.
     client = FakeClient(code_responses=[GOOD_SCRIPT],
                         ground_response="- 政策金利 0.75%（2026-01 起）",
+                        needs_search_response="YES（缺現行政策金利）",
                         searchq_response="日銀 政策金利 現在")
     runner = _make_runner(tmp_path, client)
     searched: list[tuple[str, int]] = []
@@ -702,7 +704,8 @@ def test_search_grounding_cache_hit_skips_search(tmp_path):
         "date": date.today().isoformat(), "count": 3,
         "cache": {request: "- 政策金利 0.75%\n來源:\nhttps://example.jp/boj"},
     }), encoding="utf-8")
-    client = FakeClient(code_responses=[GOOD_SCRIPT])
+    client = FakeClient(code_responses=[GOOD_SCRIPT],
+                        needs_search_response="YES（缺現行政策金利）")
     runner = _make_runner(tmp_path, client)
 
     def no_search(q, n):
@@ -720,7 +723,8 @@ def test_search_grounding_skips_engine_internal_and_pdf_urls(tmp_path):
     # Engine-internal links and PDFs (HTML-only extractor) must not consume the
     # 2-page fetch budget; the real article behind them gets fetched instead.
     client = FakeClient(code_responses=[GOOD_SCRIPT],
-                        ground_response="- 現行 0.75%（自2026-01）")
+                        ground_response="- 現行 0.75%（自2026-01）",
+                        needs_search_response="YES（缺現行政策金利）")
     runner = _make_runner(tmp_path, client)
     runner.search_fn = lambda q, n: [
         SimpleNamespace(url="https://www.boj.or.jp/press/speech.pdf"),
@@ -748,7 +752,8 @@ def test_search_grounding_cache_stores_raw_texts_and_redistills(tmp_path):
                             "sources": ["https://example.jp/boj"]}},
     }), encoding="utf-8")
     client = FakeClient(code_responses=[GOOD_SCRIPT],
-                        ground_response="- 現行 0.75%（自2026-01）；另有檢討中的 1%，尚未生效")
+                        ground_response="- 現行 0.75%（自2026-01）；另有檢討中的 1%，尚未生效",
+                        needs_search_response="YES（缺現行政策金利）")
     runner = _make_runner(tmp_path, client)
 
     def no_search(q, n):
@@ -770,7 +775,8 @@ def test_search_grounding_budget_exhausted_skips(tmp_path):
     state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text(json.dumps({
         "date": date.today().isoformat(), "count": 4, "cache": {}}), encoding="utf-8")
-    client = FakeClient(code_responses=[GOOD_SCRIPT])
+    client = FakeClient(code_responses=[GOOD_SCRIPT],
+                        needs_search_response="YES（缺現行政策金利）")
     runner = _make_runner(tmp_path, client)
     searched: list[str] = []
     runner.search_fn = lambda q, n: searched.append(q) or []
@@ -785,7 +791,8 @@ def test_search_grounding_budget_exhausted_skips(tmp_path):
 def test_search_grounding_failure_fails_open_but_burns_budget(tmp_path):
     # Backend blows up mid-search → /new continues without grounding, and the
     # query still counts against the budget (it may have reached Yahoo).
-    client = FakeClient(code_responses=[GOOD_SCRIPT])
+    client = FakeClient(code_responses=[GOOD_SCRIPT],
+                        needs_search_response="YES（缺現行政策金利）")
     runner = _make_runner(tmp_path, client)
 
     def boom(q, n):
@@ -1281,3 +1288,154 @@ def test_builder_falls_back_to_ollama_when_opencode_probe_fails(tmp_path) -> Non
     assert isinstance(runner.client, OllamaTextClient)
     assert runner.fast_model == "qwen2.5-coder:7b"
     assert runner.strong_model == "qwen3:14b"
+
+
+# ── cross-validation (generator/critic split) ────────────────────────────────
+
+
+def _make_cross_runner(tmp_path, primary, validator):
+    runner = _make_runner(tmp_path, primary)
+    runner.validator_client = validator
+    runner.validator_model = "qwen3:14b"
+    return runner
+
+
+def test_validate_answer_no_validator_unchanged(tmp_path):
+    # validator_client None → single self-validation, reason passed through verbatim.
+    primary = FakeClient(code_responses=[], validate_responses=["FAIL: 主題不符"])
+    runner = _make_runner(tmp_path, primary)
+    valid, reason = runner._validate_answer("x", "y")
+    assert valid is False
+    assert reason == "主題不符"
+
+
+def test_validate_answer_both_pass(tmp_path):
+    primary = FakeClient(code_responses=[])
+    validator = FakeClient(code_responses=[])  # both default to PASS
+    runner = _make_cross_runner(tmp_path, primary, validator)
+    valid, reason = runner._validate_answer("夏威夷天氣", "夏威夷 25度")
+    assert valid is True
+    assert primary.calls["validate"] == 1
+    assert validator.calls["validate"] == 1
+
+
+def test_validate_answer_disagreement_marked(tmp_path):
+    # Generator self-approves; independent local validator dissents → not valid,
+    # tagged [歧見] so the repair loop can react and later fall back.
+    primary = FakeClient(code_responses=[])  # PASS
+    validator = FakeClient(code_responses=[],
+                           validate_responses=["FAIL: 地點是東京不是夏威夷"])
+    runner = _make_cross_runner(tmp_path, primary, validator)
+    valid, reason = runner._validate_answer("夏威夷天氣", "東京 25度")
+    assert valid is False
+    assert reason.startswith("[歧見]")
+    assert "東京" in reason
+
+
+def test_validate_answer_both_fail_no_disagreement_tag(tmp_path):
+    primary = FakeClient(code_responses=[], validate_responses=["FAIL: 空洞"])
+    validator = FakeClient(code_responses=[], validate_responses=["FAIL: 也空洞"])
+    runner = _make_cross_runner(tmp_path, primary, validator)
+    valid, reason = runner._validate_answer("x", "y")
+    assert valid is False
+    assert not reason.startswith("[歧見]")
+
+
+class _SlowValidator:
+    """Validator stub whose generate() blocks longer than the timeout cap."""
+
+    def __init__(self, delay, verdict="PASS"):
+        self.delay = delay
+        self.verdict = verdict
+        self.model = "qwen3:14b"
+        self.calls = 0
+
+    def generate(self, prompt, *, temperature=0.0, think=False):
+        self.calls += 1
+        time.sleep(self.delay)
+        return self.verdict
+
+
+def test_validate_answer_slow_validator_times_out_to_primary_pass(tmp_path):
+    # Local validator hangs past the cap → fall back to the primary verdict
+    # (here PASS) instead of stalling the reply.
+    primary = FakeClient(code_responses=[])  # PASS
+    validator = _SlowValidator(delay=5.0)
+    runner = _make_cross_runner(tmp_path, primary, validator)
+    runner.validator_timeout_seconds = 0.2
+    t0 = time.time()
+    valid, reason = runner._validate_answer("夏威夷天氣", "夏威夷 25度")
+    assert valid is True
+    assert reason == ""
+    assert time.time() - t0 < 3.0  # did not wait for the 5s validator
+
+
+def test_validate_answer_slow_validator_times_out_keeps_primary_fail(tmp_path):
+    # Primary FAILs and the validator is too slow → return the primary FAIL
+    # reason verbatim, not a [歧見] tag (no second opinion arrived).
+    primary = FakeClient(code_responses=[], validate_responses=["FAIL: 主題不符"])
+    validator = _SlowValidator(delay=5.0)
+    runner = _make_cross_runner(tmp_path, primary, validator)
+    runner.validator_timeout_seconds = 0.2
+    valid, reason = runner._validate_answer("x", "y")
+    assert valid is False
+    assert reason == "主題不符"
+    assert not reason.startswith("[歧見]")
+
+
+def test_prewarm_validator_pokes_local_model(tmp_path):
+    # Pre-warm fires one trivial generate at the validator so its model loads
+    # during generation; restores the validator's model afterwards.
+    primary = FakeClient(code_responses=[])
+    validator = _SlowValidator(delay=0.0)
+    runner = _make_cross_runner(tmp_path, primary, validator)
+    runner._prewarm_validator()
+    assert validator.calls == 1
+    assert validator.model == "qwen3:14b"  # restored
+
+
+def test_prewarm_validator_noop_without_validator(tmp_path):
+    runner = _make_runner(tmp_path, FakeClient(code_responses=[]))
+    runner._prewarm_validator()  # must not raise when validator_client is None
+
+
+def test_cross_validation_disputed_fallback_on_exhaustion(tmp_path):
+    # Generator approves every attempt but the local validator always dissents.
+    # Repairs exhaust → ship the generator-approved answer WITH a caveat rather
+    # than hard-failing, and do NOT register it for reuse.
+    primary = FakeClient(code_responses=[GOOD_SCRIPT + f"\n# v{i}" for i in range(7)])
+    validator = FakeClient(code_responses=[],
+                           validate_responses=["FAIL: 地點是東京不是夏威夷"] * 7)
+    runner = _make_cross_runner(tmp_path, primary, validator)
+    res = runner.run_detailed("夏威夷天氣")
+    assert res.ok
+    assert res.generations == 7
+    assert "本地交叉驗證有疑慮" in res.answer
+    assert "東京" in res.answer
+    assert len(runner._load_manifest()) == 0
+
+
+def test_builder_enables_cross_validation_for_opencode(tmp_path):
+    import unittest.mock as mock
+
+    settings = SimpleNamespace(
+        openclaw_codegen_backend="opencode",
+        openclaw_opencode_base_url="https://opencode.ai/zen/v1",
+        openclaw_opencode_model="big-pickle",
+        openclaw_opencode_api_key=None,
+        openclaw_opencode_timeout_seconds=321,
+        openclaw_local_text_backend="ollama",
+        openclaw_local_text_model="qwen3:14b",
+        openclaw_local_text_endpoint="http://127.0.0.1:11434",
+        openclaw_local_text_timeout_seconds=75,
+        openclaw_codegen_fast_model=None,
+        knowledge_db_path=str(tmp_path / "knowledge.sqlite3"),
+    )
+    with mock.patch("openclaw_adapter.dynamic_tools.probe_opencode_cli", return_value=True), \
+         mock.patch("openclaw_adapter.dynamic_tools.probe_ollama", return_value=True):
+        runner = build_dynamic_tool_runner_from_settings(settings)
+
+    assert isinstance(runner.client, OpenCodeCliTextClient)
+    assert isinstance(runner.validator_client, OllamaTextClient)
+    assert runner.validator_model == "qwen3:14b"
+    assert "驗證" in runner.backend_label

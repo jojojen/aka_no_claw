@@ -26,6 +26,7 @@ Pipeline (see DynamicToolRunner.run_detailed):
 from __future__ import annotations
 
 import ast
+import concurrent.futures
 import json
 import logging
 import os
@@ -34,6 +35,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
@@ -260,14 +262,6 @@ class OllamaTextClient:
         return f"{path}/api/generate"
 
     def generate(self, prompt: str, *, temperature: float = 0.0, think: bool = False) -> str:
-        # qwen3 respects /no_think / /think directives in the prompt prefix.
-        # This is more reliable than the "think" API option across Ollama versions.
-        # Non-thinking models (e.g. qwen2.5-coder) have no such mode, so the
-        # directive is just spurious prompt text there — only prepend for qwen3.
-        if think or not _is_thinking_model(self.model):
-            full_prompt = prompt
-        else:
-            full_prompt = f"/no_think\n{prompt}"
         options: dict = {"temperature": temperature}
         if self.num_ctx is not None:
             options["num_ctx"] = self.num_ctx
@@ -275,10 +269,18 @@ class OllamaTextClient:
             options["num_predict"] = self.num_predict
         payload = {
             "model": self.model,
-            "prompt": full_prompt,
+            "prompt": prompt,
             "stream": False,
             "options": options,
         }
+        # qwen3 (hybrid reasoning) honors the API-level `think` flag; the older
+        # `/no_think` prompt prefix is silently ignored, so the model burns the
+        # whole num_predict budget on a <think> block and leaves no answer
+        # (which a short cap then strips to empty — a validator that rubber-stamps
+        # PASS). The API flag actually disables reasoning. Non-thinking models
+        # (e.g. qwen2.5-coder) have no such field, so only set it for qwen3.
+        if _is_thinking_model(self.model):
+            payload["think"] = think
         request = Request(
             self._url(),
             data=json.dumps(payload).encode("utf-8"),
@@ -478,6 +480,9 @@ class DynamicToolRunner:
         distill_enabled: bool = False,
         fast_model: str | None = None,
         strong_model: str | None = None,
+        validator_client: "TextGenerationClient | None" = None,
+        validator_model: str | None = None,
+        validator_timeout_seconds: float = 25.0,
     ) -> None:
         self.client = client
         # Cascade: fast_model handles explore + tier-1 codegen; strong_model is
@@ -486,6 +491,21 @@ class DynamicToolRunner:
         self.fast_model = fast_model or client.model
         self.strong_model = strong_model or client.model
         self.client.model = self.fast_model
+        # Independent cross-validator: a DIFFERENT model family (the idle local
+        # Ollama qwen3:14b) that re-grades the generator's own answer. Set only
+        # when the generator is the cloud model — a model rarely flags its own
+        # blind spots, so a second, independent pair of eyes catches errors the
+        # self-validation rubber-stamps (e.g. copying a format template's example
+        # location/date instead of the real query). None -> self-validation only.
+        self.validator_client = validator_client
+        self.validator_model = validator_model
+        # Hard wall-clock cap on the independent (local) validation. The local
+        # qwen3:14b is slow — especially on a cold model load — and validation is
+        # serial after generation, so an unbounded wait makes /new feel hung. If
+        # the local critic doesn't answer in time, fail open to the primary-only
+        # verdict (= pre-cross-validation behavior): we lose the second opinion
+        # for this one request but never let a slow local model stall the reply.
+        self.validator_timeout_seconds = validator_timeout_seconds
         self.tools_dir = Path(tools_dir)
         self.knowledge_db = knowledge_db
         self.exec_timeout_seconds = exec_timeout_seconds
@@ -517,10 +537,14 @@ class DynamicToolRunner:
         client_name = type(self.client).__name__
         if "OpenCode" in client_name:
             model = self.fast_model.split("/")[-1] if self.fast_model else "?"
-            return f"opencode · {model}"
-        if self.fast_model == self.strong_model:
-            return f"ollama · {self.fast_model}"
-        return f"ollama · {self.fast_model}→{self.strong_model}"
+            label = f"opencode · {model}"
+        elif self.fast_model == self.strong_model:
+            label = f"ollama · {self.fast_model}"
+        else:
+            label = f"ollama · {self.fast_model}→{self.strong_model}"
+        if self.validator_client is not None:
+            label += f" + 驗證 ollama·{self.validator_model}"
+        return label
 
     def run(self, request: str) -> str:
         """Telegram-facing entry: returns a human-readable string."""
@@ -693,6 +717,15 @@ class DynamicToolRunner:
                 ok=False, generations=0,
                 error=f"此需求需要的資料沒有免金鑰的公開資料源，無法以生成工具取得：{why}",
             )
+        # Pre-warm the independent local validator while the (cloud) generator
+        # works: loading qwen3:14b is the slow part, and the local GPU is idle
+        # during big-pickle's ~tens of seconds of generation. By the time the
+        # answer is ready the validator is hot, so cross-validation costs only a
+        # few seconds of inference instead of paying a cold model load. Cloud and
+        # local run on independent compute, so this overlaps for free. No-op when
+        # there is no validator (local-generation path self-validates).
+        if self.validator_client is not None:
+            threading.Thread(target=self._prewarm_validator, daemon=True).start()
         if selected is None:
             knowledge_rows = (
                 self._keyword_fallback_rules(request, always_on)
@@ -736,6 +769,13 @@ class DynamicToolRunner:
         generations = 0
         last_error = ""
         last_stdout = ""
+        # Cross-validation safety net: the most recent answer the PRIMARY validator
+        # approved but the independent validator disputed. If repairs run out with
+        # no clean (both-PASS) success, we ship this with a caveat rather than hard
+        # failing — never let the weaker independent model block a generator-approved
+        # answer. Not registered for reuse (it may be wrong); next run regenerates.
+        disputed_fallback: DynamicToolResult | None = None
+        disputed_reason = ""
 
         # The escalation path mutates client.model / num_predict / timeout; the
         # syntax gate may also bump num_predict. Save and restore so a complex
@@ -792,6 +832,14 @@ class DynamicToolRunner:
                                 self._distill_failure(request, code, last_error)
                             self._mark_knowledge_applied(knowledge_rows)
                             return exec_result
+                        if reason.startswith("[歧見]"):
+                            # Primary approved, independent dissented. Remember it
+                            # as a last-resort answer, then keep repairing to try
+                            # to satisfy both validators.
+                            exec_result.slug = slug
+                            exec_result.generations = generations
+                            disputed_fallback = exec_result
+                            disputed_reason = reason[len("[歧見]"):].strip()
                         last_error = (
                             "答案驗證未通過（程式執行成功但輸出內容不符需求）：" + reason
                             + "\n（修正方向：改程式邏輯，讓輸出的依據取自真實資料點、"
@@ -823,6 +871,15 @@ class DynamicToolRunner:
                                                   think=think, api_structure=api_structure,
                                                   references=references)
 
+            if disputed_fallback is not None:
+                # Repairs exhausted but the generator approved this answer; ship it
+                # with a visible caveat instead of failing on the weaker model's word.
+                disputed_fallback.answer = (
+                    disputed_fallback.answer
+                    + f"\n—\n⚠️ 本地交叉驗證有疑慮：{disputed_reason}"
+                )
+                disputed_fallback.generations = generations
+                return disputed_fallback
             return DynamicToolResult(
                 ok=False, slug=slug, generations=generations,
                 error=_tail(last_error, 600), raw_stdout=last_stdout,
@@ -1648,23 +1705,85 @@ class DynamicToolRunner:
             f"答案：\n{_tail(answer, 800)}\n"
             "只輸出一行：PASS 或 FAIL: <一句原因>。不要任何解說。"
         )
-        saved_model = self.client.model
+        # Primary verdict: the generator grading its own output (strong model).
+        # The gate is the last line of defense; the fast model rubber-stamped
+        # period/scope mismatches the strong one catches.
+        if self.validator_client is None:
+            return self._run_one_validation(self.client, self.strong_model, prompt)
+
+        # Cross-validation: a DIFFERENT model family (idle local Ollama) re-grades
+        # the same answer with the same rubric. The two clients are independent
+        # objects on independent compute (cloud CLI vs local HTTP), so run both
+        # concurrently — latency ≈ max, not sum.
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
         try:
-            # The gate is the last line of defense for answer quality; the fast
-            # model rubber-stamped period/scope mismatches the strong one catches.
-            self.client.model = self.strong_model
-            raw = self.client.generate(prompt, temperature=0.0, think=False).strip()
+            primary_fut = pool.submit(
+                self._run_one_validation, self.client, self.strong_model, prompt)
+            indep_fut = pool.submit(
+                self._run_one_validation, self.validator_client, self.validator_model, prompt)
+            primary_valid, primary_reason = primary_fut.result()
+            try:
+                indep_valid, indep_reason = indep_fut.result(
+                    timeout=self.validator_timeout_seconds)
+            except concurrent.futures.TimeoutError:
+                logger.info(
+                    "dynamic_tools: independent validator timed out after %ss; "
+                    "falling back to primary-only verdict",
+                    self.validator_timeout_seconds)
+                return primary_valid, primary_reason
+        finally:
+            # Never block the reply on a slow/orphaned local validation thread:
+            # on timeout the qwen3 call keeps running but we don't wait for it.
+            pool.shutdown(wait=False)
+
+        if primary_valid and indep_valid:
+            return True, ""
+        if not primary_valid and not indep_valid:
+            return False, primary_reason or indep_reason
+        # Disagreement: mark it so the repair loop can both (a) try to fix what the
+        # dissenter flagged and (b) fall back to the primary-approved answer with a
+        # caveat if repairs run out — a weaker independent model must never hard-block
+        # a generator-approved answer.
+        dissenting = indep_reason if primary_valid else primary_reason
+        return False, "[歧見] " + (dissenting or "獨立驗證與主驗證判定不一致")
+
+    def _run_one_validation(self, client, model: str,
+                            prompt: str) -> tuple[bool, str]:
+        """Run the validation prompt on one client at a fixed model. Fails open
+        (True) on any error so a sick validator can never brick /new."""
+        saved_model = client.model
+        try:
+            client.model = model
+            raw = client.generate(prompt, temperature=0.0, think=False).strip()
         except Exception:
             logger.exception("dynamic_tools: answer validation call failed; failing open")
             return True, ""
         finally:
-            self.client.model = saved_model
+            client.model = saved_model
         first = raw.splitlines()[0].strip() if raw else ""
         if first.upper().startswith("FAIL"):
             normalized = first.replace("：", ":", 1)
             reason = normalized.split(":", 1)[1].strip() if ":" in normalized else ""
             return False, reason
         return True, ""
+
+    def _prewarm_validator(self) -> None:
+        """Fire a trivial generate at the local validator to force its model into
+        memory ahead of the validation phase. Best-effort: any failure is
+        swallowed (the validation call would just pay the cold load itself)."""
+        client = self.validator_client
+        if client is None:
+            return
+        try:
+            saved_model = client.model
+            try:
+                client.model = self.validator_model
+                client.generate("ok", temperature=0.0, think=False)
+            finally:
+                client.model = saved_model
+        except Exception:
+            logger.debug("dynamic_tools: validator prewarm failed (non-fatal)",
+                         exc_info=True)
 
     def _preflight(self, request: str, topical: list) -> tuple[bool, str, list | None]:
         """One strong-model call doing both pre-codegen judgments (they used to
@@ -1995,6 +2114,31 @@ def _opencode_cli_model(model: str) -> str:
     return model if "/" in model else f"opencode/{model}"
 
 
+def _build_local_validator(settings) -> "tuple[TextGenerationClient | None, str | None]":
+    """Build an independent local Ollama validator (qwen3:14b) for cross-checking
+    the cloud generator's answers. Returns (None, None) when local Ollama is
+    unconfigured or unreachable, so the runner degrades to self-validation."""
+    backend = (settings.openclaw_local_text_backend or "").strip().lower()
+    if backend != "ollama":
+        return None, None
+    model = _select_model(settings.openclaw_local_text_model)
+    endpoint = settings.openclaw_local_text_endpoint
+    if not model or not probe_ollama(endpoint):
+        logger.warning("dynamic_tools: local validator unavailable; using self-validation only")
+        return None, None
+    client = OllamaTextClient(
+        endpoint=endpoint,
+        model=model,
+        timeout_seconds=max(60, settings.openclaw_local_text_timeout_seconds),
+        num_ctx=8192,
+        # The verdict is one short line ("PASS" / "FAIL: <reason>"); a tight cap
+        # keeps the slow local model's generation time down.
+        num_predict=256,
+    )
+    logger.info("dynamic_tools: cross-validation enabled with local validator model=%s", model)
+    return client, model
+
+
 def build_dynamic_tool_runner_from_settings(settings) -> DynamicToolRunner | None:
     """Build a runner from AssistantSettings.
 
@@ -2010,8 +2154,11 @@ def build_dynamic_tool_runner_from_settings(settings) -> DynamicToolRunner | Non
         if probe_opencode_cli(model=cli_model, timeout=min(timeout, 30)):
             client = OpenCodeCliTextClient(model=cli_model, timeout_seconds=timeout)
             logger.info("dynamic_tools: using OpenCode CLI codegen backend model=%s", cli_model)
+            # Cloud generates; idle local model independently cross-validates.
+            validator_client, validator_model = _build_local_validator(settings)
             return _build_runner_with_client(
-                settings, client, fast_model=cli_model, strong_model=cli_model)
+                settings, client, fast_model=cli_model, strong_model=cli_model,
+                validator_client=validator_client, validator_model=validator_model)
         logger.warning("dynamic_tools: OpenCode CLI unavailable; falling back to Ollama if configured")
     elif codegen_backend and codegen_backend != "ollama":
         logger.warning("dynamic_tools: unsupported codegen backend=%s; falling back to Ollama", codegen_backend)
@@ -2057,6 +2204,8 @@ def _build_runner_with_client(
     *,
     fast_model: str,
     strong_model: str,
+    validator_client: "TextGenerationClient | None" = None,
+    validator_model: str | None = None,
 ) -> DynamicToolRunner:
     """Shared runner wiring after selecting the text generation backend."""
 
@@ -2073,6 +2222,7 @@ def _build_runner_with_client(
     runner = DynamicToolRunner(
         client=client, tools_dir=tools_dir, knowledge_db=knowledge_db,
         fast_model=fast_model, strong_model=strong_model,
+        validator_client=validator_client, validator_model=validator_model,
         # Self-learning: abstract hard-won repairs into transferable RAG rules so
         # novel question types get easier over time instead of relying on seeds.
         distill_enabled=True,
