@@ -1532,3 +1532,141 @@ def test_research_seller_snapshot_lookup_extracts_negative_review_excerpts(monke
     assert snapshot.display_name == "risk seller"
     assert snapshot.seller_negative == 2
     assert snapshot.seller_negative_excerpts == ("発送が遅かったです。", "梱包が雑でした。")
+
+
+# --- Phase 1: /research appreciation cloud offload ---------------------------
+
+
+def _research_enricher_settings(**overrides) -> AssistantSettings:
+    base = dict(
+        openclaw_telegram_chat_id="123",
+        openclaw_local_text_backend="ollama",
+        openclaw_local_text_endpoint="http://127.0.0.1:11434",
+        openclaw_local_text_model="qwen3:14b",
+    )
+    base.update(overrides)
+    return AssistantSettings(**base)
+
+
+class _FakeCloudTextClient:
+    def __init__(self, *, reply: str = "", raises: Exception | None = None) -> None:
+        self._reply = reply
+        self._raises = raises
+        self.calls = 0
+
+    def generate(self, prompt: str, *, temperature: float = 0.0, think: bool = False) -> str:
+        self.calls += 1
+        if self._raises is not None:
+            raise self._raises
+        return self._reply
+
+
+def _one_appreciation_result():
+    from openclaw_adapter.web_search import WebSearchResult
+
+    return (WebSearchResult(title="t1", url="https://a.example/1", snippet="s1"),)
+
+
+def test_research_enricher_uses_cloud_summary(monkeypatch) -> None:
+    from openclaw_adapter.telegram_bot import _build_research_appreciation_enricher
+
+    fake = _FakeCloudTextClient(reply="雲端增值結論 [1]")
+    monkeypatch.setattr(
+        "openclaw_adapter.telegram_bot.build_research_cloud_text_client",
+        lambda settings: fake,
+    )
+    monkeypatch.setattr(
+        "openclaw_adapter.telegram_bot.fetch_page_text", lambda url, **kw: "page text"
+    )
+
+    def _local_must_not_run(*args, **kwargs):
+        raise AssertionError("local summarize must not run on cloud success")
+
+    monkeypatch.setattr(
+        "openclaw_adapter.telegram_bot.summarize_web_sources_with_ollama",
+        _local_must_not_run,
+    )
+
+    settings = _research_enricher_settings(openclaw_research_cloud_enricher="opencode")
+    enricher = _build_research_appreciation_enricher(settings)
+    assert enricher is not None
+
+    out = enricher("某卡 行情", _one_appreciation_result())
+    assert out == "雲端增值結論 [1]"
+    assert fake.calls == 1
+
+
+def test_research_enricher_falls_back_to_local_on_cloud_outage(monkeypatch) -> None:
+    from openclaw_adapter.dynamic_tools import CloudBackendUnavailable
+    from openclaw_adapter.telegram_bot import _build_research_appreciation_enricher
+
+    fake = _FakeCloudTextClient(raises=CloudBackendUnavailable("cloud down"))
+    monkeypatch.setattr(
+        "openclaw_adapter.telegram_bot.build_research_cloud_text_client",
+        lambda settings: fake,
+    )
+    monkeypatch.setattr(
+        "openclaw_adapter.telegram_bot.fetch_page_text", lambda url, **kw: "page text"
+    )
+    local_calls = {"n": 0}
+
+    def _local_summarize(q, sources, **kwargs):
+        local_calls["n"] += 1
+        return "地端 fallback 結論"
+
+    monkeypatch.setattr(
+        "openclaw_adapter.telegram_bot.summarize_web_sources_with_ollama",
+        _local_summarize,
+    )
+
+    settings = _research_enricher_settings(openclaw_research_cloud_enricher="opencode")
+    enricher = _build_research_appreciation_enricher(settings)
+
+    out = enricher("某卡 行情", _one_appreciation_result())
+    assert out == "地端 fallback 結論"
+    assert fake.calls == 1
+    assert local_calls["n"] == 1
+
+
+def test_research_enricher_local_path_keeps_relevance_gate_when_cloud_disabled(monkeypatch) -> None:
+    from openclaw_adapter.telegram_bot import _build_research_appreciation_enricher
+
+    monkeypatch.setattr(
+        "openclaw_adapter.telegram_bot.build_research_cloud_text_client",
+        lambda settings: None,
+    )
+    monkeypatch.setattr(
+        "openclaw_adapter.telegram_bot.fetch_page_text", lambda url, **kw: "page text"
+    )
+    monkeypatch.setattr(
+        "openclaw_adapter.telegram_bot.summarize_web_sources_with_ollama",
+        lambda q, sources, **kwargs: "地端結論",
+    )
+    relevance = {"called": False}
+
+    def _filter(q, sources, **kwargs):
+        relevance["called"] = True
+        return sources
+
+    monkeypatch.setattr(
+        "openclaw_adapter.telegram_bot.filter_relevant_sources_with_ollama", _filter
+    )
+
+    settings = _research_enricher_settings()
+    enricher = _build_research_appreciation_enricher(settings)
+    assert enricher is not None
+
+    out = enricher("某卡 行情", _one_appreciation_result())
+    assert out == "地端結論"
+    assert relevance["called"] is True
+
+
+def test_research_enricher_none_when_no_backend(monkeypatch) -> None:
+    from openclaw_adapter.telegram_bot import _build_research_appreciation_enricher
+
+    monkeypatch.setattr(
+        "openclaw_adapter.telegram_bot.build_research_cloud_text_client",
+        lambda settings: None,
+    )
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    assert _build_research_appreciation_enricher(settings) is None

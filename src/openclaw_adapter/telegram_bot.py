@@ -57,7 +57,11 @@ from tcg_tracker.image_lookup import TcgVisionSettings
 from .backup_command import BackupScheduler, build_backup_handler, build_recover_handler
 from .opportunity_scorecard import build_scorecard_handler
 from .rag_daily_digest import RagDailyDigestScheduler, handle_ragdel_callback, handle_ragkeep_callback
-from .dynamic_tools import build_dynamic_tool_runner_from_settings
+from .dynamic_tools import (
+    CloudBackendUnavailable,
+    build_dynamic_tool_runner_from_settings,
+    build_research_cloud_text_client,
+)
 from .image_translate import (
     build_image_ocr_translate_renderer_from_settings,
     build_image_translate_caption_recognizer,
@@ -120,6 +124,7 @@ from .reputation_snapshot import (
 )
 from .web_search import (
     DEFAULT_WEB_SEARCH_LIMIT,
+    _build_summary_prompt,
     answer_page_with_ollama,
     build_web_fetch_answer,
     build_web_research_answer,
@@ -1312,26 +1317,66 @@ def _build_research_ip_heat_lookup(
 
 def _build_research_appreciation_enricher(settings: AssistantSettings):
     """A4: build the appreciation web-enricher reusing the same page fetch + LLM
-    summariser the /research web-research renderer uses. Returns None when the
-    local text LLM isn't configured (falls back to snippet-only evidence)."""
+    summariser the /research web-research renderer uses. Returns None when neither
+    the local text LLM nor the cloud enricher is configured (falls back to
+    snippet-only evidence).
+
+    Phase-1 cloud offload: when ``OPENCLAW_RESEARCH_CLOUD_ENRICHER=opencode`` and
+    the OpenCode CLI probes ok, the summariser (the open-ended, abstract step)
+    runs on cloud big-pickle while the price gate stays local. A cloud outage
+    (``CloudBackendUnavailable``) or empty reply degrades to a single in-process
+    local summarise — it must NOT trigger /new's bot-restart failover. The local
+    relevance gate is skipped in cloud mode so stage 3 doesn't queue a second
+    call on the same local Ollama as the price gate."""
     backend = (settings.openclaw_local_text_backend or "").strip().lower()
     endpoint = settings.openclaw_local_text_endpoint
     model = _select_text_generation_model(settings)
-    if backend != "ollama" or not endpoint or not model:
-        return None
+    local_ready = backend == "ollama" and bool(endpoint) and bool(model)
     timeout = max(1, settings.openclaw_local_text_timeout_seconds)
     summarize_timeout = max(timeout, 120)
-    ssl_ctx = build_ssl_context(settings) if endpoint.startswith("https://") else None
-    return build_appreciation_enricher(
-        fetch_page_fn=lambda url: fetch_page_text(url, ssl_context=ssl_ctx),
-        summarize_fn=lambda q, sources: summarize_web_sources_with_ollama(
+    ssl_ctx = build_ssl_context(settings) if (endpoint or "").startswith("https://") else None
+
+    def _local_summarize(q, sources):
+        return summarize_web_sources_with_ollama(
             q,
             sources,
             endpoint=endpoint,
             model=model,
             timeout_seconds=summarize_timeout,
             ssl_context=ssl_ctx,
-        ),
+        )
+
+    cloud_client = build_research_cloud_text_client(settings)
+    if cloud_client is not None:
+        def _cloud_summarize(q, sources):
+            if not sources:
+                return f"我找不到足夠有用的網路來源來回答：{q}"
+            prompt = _build_summary_prompt(q, sources)
+            try:
+                text = (cloud_client.generate(prompt, temperature=0.2) or "").strip()
+            except CloudBackendUnavailable:
+                logger.warning(
+                    "research appreciation cloud enricher unavailable; "
+                    "falling back to local for this request",
+                    exc_info=True,
+                )
+                return _local_summarize(q, sources) if local_ready else ""
+            if text:
+                return text
+            return _local_summarize(q, sources) if local_ready else ""
+
+        logger.info("research appreciation enricher: cloud big-pickle (local fallback)")
+        return build_appreciation_enricher(
+            fetch_page_fn=lambda url: fetch_page_text(url, ssl_context=ssl_ctx),
+            summarize_fn=_cloud_summarize,
+            relevance_fn=None,
+        )
+
+    if not local_ready:
+        return None
+    return build_appreciation_enricher(
+        fetch_page_fn=lambda url: fetch_page_text(url, ssl_context=ssl_ctx),
+        summarize_fn=_local_summarize,
         relevance_fn=lambda q, sources: filter_relevant_sources_with_ollama(
             q,
             sources,

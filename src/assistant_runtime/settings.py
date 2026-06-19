@@ -38,6 +38,10 @@ class AssistantSettings:
     openclaw_opencode_model: str = "big-pickle"
     openclaw_opencode_api_key: str | None = None
     openclaw_opencode_timeout_seconds: int = 900
+    # /research appreciation enrichment backend, decoupled from /new's codegen
+    # backend above. "opencode" routes the appreciation summariser to cloud
+    # big-pickle (with single in-process local fallback); empty keeps it local.
+    openclaw_research_cloud_enricher: str | None = None
     openclaw_local_text_timeout_seconds: int = 45
     # KB semantic retrieval. Multilingual embed model served by the local text
     # endpoint (Ollama). Empty string disables KB embedding (pure-lexical).
@@ -175,6 +179,9 @@ def get_settings() -> AssistantSettings:
         openclaw_opencode_timeout_seconds=_as_int(
             os.getenv("OPENCLAW_OPENCODE_TIMEOUT_SECONDS"),
             default=900,
+        ),
+        openclaw_research_cloud_enricher=_none_if_empty(
+            os.getenv("OPENCLAW_RESEARCH_CLOUD_ENRICHER")
         ),
         openclaw_local_text_timeout_seconds=_as_int(
             os.getenv("OPENCLAW_LOCAL_TEXT_TIMEOUT_SECONDS"),
