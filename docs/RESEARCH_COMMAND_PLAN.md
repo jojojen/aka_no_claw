@@ -1,7 +1,22 @@
-# /research 深度商品研究功能規劃（草案，尚未實作）
+# /research 深度商品研究功能規劃與實作現況
 
-> 狀態：M3 開發中。2026-06-12 起草；同日已落地 `/research` registry 覆蓋、`/resaerch` alias、progress notifier／budget／單 chat 鎖骨架；目前已接上 Mercari item adapter、`ItemData`/`ResearchSectionResult` contract、knowledge DB `research_command` origin、seller reputation snapshot、seller 差評內容摘要、第一版合理市價分析（Mercari active 樣本 + sold evidence URL / sold avg）、以及基於 sold/active 樣本的第一版流動性判讀。仍待接的是 IP/作者熱度證據與更完整的流動性 methodology。
+> 狀態：已實作並上線。2026-06-12 起草，2026-06-19 已完成 `/research` 主流程、Mercari item adapter、`ItemData` / `ResearchSectionResult` contract、knowledge DB `research_command` origin、seller reputation snapshot、第一版合理市價分析、基於 sold/active 樣本的流動性分析，以及 `/research` appreciation 雲端 offload + stage 3/4/6 平行化。
 > 注意：使用者輸入打成 `/resaerch` 也應容錯（dispatcher 加 alias）。
+
+## 2026-06-19 最終落地狀態
+
+- `/research` 已不再只是 `/search` 別名，而是由 aka_no_claw registry 接管的背景指令。
+- Phase 1 已完成：`OPENCLAW_RESEARCH_CLOUD_ENRICHER=opencode` 會把 appreciation summarizer 下放到 OpenCode Big Pickle；雲端失敗只會單次回退到本地，不會觸發 `/new` 那套 bot restart failover。
+- Phase 2 也已完成：stage 3（增值潛力）、4（合理市價）、6（賣家風險）會平行執行，stage 5（流動性）在 stage 4 完成後再跑。
+- `ResearchBudget.consume()` 已加鎖，避免平行階段誤算 Yahoo 搜尋預算。
+- cloud mode 會停用本地 relevance gate，避免 stage 3 的第二次地端 LLM 呼叫和 stage 4 price gate 擠同一顆 Ollama。
+- 報告輸出順序已做固定排序，所以即使 3/4/6 完成順序不同，最終報告仍維持穩定。
+
+### 與原 offload 討論稿的差異
+
+- 外部 review 建議的「stage 回傳 result object、主執行緒再 apply 到 ctx」沒有原樣採用。
+- 目前實作是讓 stage 3/4/6 直接寫入各自分離的 `ctx` 欄位，並對 `section_results` / `warnings` 追加加 lock，再於最終格式化前按 section name 固定排序。
+- 這不是文件字面上的架構，但它已解決當初 review 想避免的兩個核心問題：共享 append 競態與最終輸出順序不穩。
 
 ## 目標
 
@@ -180,19 +195,23 @@ M2 前先定義資料 contract，避免各階段用 dict 傳不穩定欄位。
 4. **Rule G**：實體辨識、紅旗判讀一律 LLM+RAG，不維護關鍵字清單。
 5. 名稱模式不做賣家風險（無賣家可查），報告只含 1–3 節。
 
-## 實作里程碑（批准後才動工）
+## 實作里程碑（已完成）
 
-- **M1 骨架**：`_build_registries()` 註冊 `/research`（+`/resaerch` alias）+
-  `research_command.py`（aka_no_claw 新模組）+ URL/名稱解析 +
-  `ResearchNotifier` + `ResearchBudget`。pytest：解析、registry 遮蔽（/research 不再落到 web search）、
-  單 job 鎖、progress fake notifier、budget 耗盡。
-- **M2 資料層**：`ItemData` / `PriceEvidence` / `ResearchSectionResult` contract +
-  Mercari item adapter spike + 實體辨識 + knowledge DB 查/寫 + `research_command` origin 白名單 +
-  `search_fn` 注入貫通。
-  pytest：fake fetcher、origin 白名單、資料不足降級、依賴共用同一 budgeted search。
-- **M3 四大分析**：增值潛力 / 市價 / 流動性 / 賣家風險，各自獨立可失敗。
-- **M4 整合驗證**：真實 mercari URL E2E（Rule C 親自跑、live 驗證）+ 重啟
-  `launchctl kickstart -k gui/$(id -u)/local.openclaw.telegram` + log 確認。
+- **M1 骨架**：已完成。`_build_registries()` 已註冊 `/research`（+`/resaerch` alias），`research_command.py` 已接上 URL/名稱解析、`ResearchNotifier`、`ResearchBudget`、單 chat 鎖與 progress notifier。
+- **M2 資料層**：已完成。`ItemData` / `PriceEvidence` / `ResearchSectionResult` contract、Mercari item adapter、實體辨識、knowledge DB 查/寫、`research_command` origin 白名單、`search_fn` 注入都已落地。
+- **M3 四大分析**：已完成首版。增值潛力 / 市價 / 流動性 / 賣家風險均可獨立降級，不會單節失敗就毀全局。
+- **M4 整合驗證**：已完成。真實 Telegram smoke test、全量 pytest 回歸、以及 `/research` cloud offload / parallel stages 的專項測試都已跑過。
+
+### `/research` offload / parallelization 驗證
+
+- `tests/test_telegram_bot.py`
+  - 驗證 cloud summary success
+  - 驗證 `CloudBackendUnavailable` 時單次本地 fallback
+  - 驗證 cloud disabled 時保留原本 local relevance gate
+- `tests/test_research_command.py`
+  - 驗證 stage 3/4/6 會平行執行
+  - 驗證最終報告順序穩定
+  - 驗證 `ResearchBudget.consume()` thread-safe
 
 ## 已拍板決議（2026-06-12）
 
