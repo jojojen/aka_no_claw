@@ -176,6 +176,7 @@ def _apply_knowledge_inbox_request(knowledge_db, req: dict) -> None:
 def _run_sns_inbox_poller(sns_db, sns_inbox_path, stop_event: threading.Event) -> None:
     from sns_monitor.inbox import SnsInbox
     inbox = SnsInbox(sns_inbox_path)
+    inbox.bootstrap()
     logger.info("sns_inbox poller started path=%s", sns_inbox_path)
     while not stop_event.is_set():
         try:
@@ -195,6 +196,7 @@ def _run_sns_inbox_poller(sns_db, sns_inbox_path, stop_event: threading.Event) -
 def _run_knowledge_inbox_poller(knowledge_db, knowledge_inbox_path, stop_event: threading.Event) -> None:
     from openclaw_adapter.knowledge_inbox import KnowledgeInbox
     inbox = KnowledgeInbox(knowledge_inbox_path)
+    inbox.bootstrap()
     logger.info("knowledge_inbox poller started path=%s", knowledge_inbox_path)
     while not stop_event.is_set():
         try:

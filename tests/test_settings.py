@@ -4,7 +4,11 @@ import logging
 from pathlib import Path
 
 from assistant_runtime.logging_utils import configure_logging, mask_identifier
-from assistant_runtime.settings import AssistantSettings, get_settings, load_dotenv
+from assistant_runtime.settings import (
+    AssistantSettings,
+    get_settings,
+    load_dotenv,
+)
 
 
 def test_load_dotenv_reads_monitor_settings(tmp_path, monkeypatch) -> None:
@@ -31,11 +35,12 @@ def test_load_dotenv_reads_monitor_settings(tmp_path, monkeypatch) -> None:
     load_dotenv(env_file)
     settings = get_settings()
 
-    assert settings.monitor_db_path == "data/custom.sqlite3"
+    expected_root = Path(__file__).resolve().parents[1]
+    assert settings.monitor_db_path == str((expected_root / "data/custom.sqlite3").resolve())
     assert settings.yuyutei_user_agent == "CustomAgent/1.0"
     assert settings.openclaw_telegram_bot_token == "secret-token"
     assert settings.openclaw_tls_insecure_skip_verify is True
-    assert settings.log_file_path == "logs/test-openclaw.log"
+    assert settings.log_file_path == str((expected_root / "logs/test-openclaw.log").resolve())
     assert settings.log_raw_result_limit == 7
 
 
@@ -134,3 +139,18 @@ def test_get_settings_reads_local_tts_environment_keys(monkeypatch) -> None:
     assert settings.openclaw_local_tts_endpoint == "http://127.0.0.1:10101"
     assert settings.openclaw_local_tts_timeout_seconds == 25
     assert settings.openclaw_local_tts_speaker_id == 888753760
+
+
+def test_get_settings_resolves_runtime_db_paths_against_repo_root(monkeypatch) -> None:
+    monkeypatch.setenv("SNS_DB_PATH", "data/sns.sqlite3")
+    monkeypatch.setenv("SNS_INBOX_DB_PATH", "data/sns_inbox.sqlite3")
+    monkeypatch.setenv("KNOWLEDGE_INBOX_DB_PATH", "data/knowledge_inbox.sqlite3")
+    monkeypatch.setenv("OPENCLAW_OPPORTUNITY_DB_PATH", "data/opportunities.sqlite3")
+
+    settings = get_settings()
+    expected_root = Path(__file__).resolve().parents[1]
+
+    assert settings.sns_db_path == str((expected_root / "data/sns.sqlite3").resolve())
+    assert settings.sns_inbox_db_path == str((expected_root / "data/sns_inbox.sqlite3").resolve())
+    assert settings.knowledge_inbox_db_path == str((expected_root / "data/knowledge_inbox.sqlite3").resolve())
+    assert settings.opportunity_db_path == str((expected_root / "data/opportunities.sqlite3").resolve())

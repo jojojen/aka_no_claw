@@ -34,7 +34,8 @@ class TestSettingsLoadsXEnv:
         """Verify settings.py exposes SNS db path. Nitter RSS needs no credentials."""
         settings = get_settings()
         assert hasattr(settings, "sns_db_path")
-        assert settings.sns_db_path == "data/sns.sqlite3"
+        expected = Path(__file__).resolve().parents[1] / "data" / "sns.sqlite3"
+        assert settings.sns_db_path == str(expected.resolve())
 
 
 class TestSnsDatabase:

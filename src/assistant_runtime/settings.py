@@ -7,6 +7,7 @@ from pathlib import Path
 from market_monitor import browser_stealth as bs
 
 DEFAULT_ENV_PATH = Path(".env")
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +118,19 @@ class AssistantSettings:
     opportunity_sns_auto_discovery_min_confidence: float = 0.7
 
 
+def _resolve_runtime_path(value: str) -> str:
+    """Resolve relative runtime paths against the repo root instead of cwd.
+
+    Launchd and other background runners do not reliably start in the project
+    directory, so keeping DB/log paths cwd-relative causes producer/consumer
+    services to silently diverge onto different files or fail to create them.
+    """
+    path = Path(value)
+    if path.is_absolute():
+        return str(path)
+    return str((_REPO_ROOT / path).resolve())
+
+
 def load_dotenv(path: str | Path = DEFAULT_ENV_PATH, *, override: bool = False) -> None:
     env_path = Path(path)
     if not env_path.exists():
@@ -138,7 +152,7 @@ def get_settings() -> AssistantSettings:
     _raw_chat_ids = _getenv_any("OPENCLAW_TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_ID")
     _parsed_chat_ids = _parse_chat_ids(_raw_chat_ids)
     return AssistantSettings(
-        monitor_db_path=os.getenv("MONITOR_DB_PATH", "data/monitor.sqlite3"),
+        monitor_db_path=_resolve_runtime_path(os.getenv("MONITOR_DB_PATH", "data/monitor.sqlite3")),
         yuyutei_user_agent=os.getenv("YUYUTEI_USER_AGENT", bs.MAC_CHROME_UA),
         openclaw_telegram_chat_id=_parsed_chat_ids[0] if _parsed_chat_ids else None,
         openclaw_telegram_chat_ids=tuple(_parsed_chat_ids),
@@ -208,15 +222,15 @@ def get_settings() -> AssistantSettings:
         ),
         monitor_env=os.getenv("MONITOR_ENV", "development"),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
-        log_file_path=os.getenv("LOG_FILE_PATH", "logs/openclaw.log"),
+        log_file_path=_resolve_runtime_path(os.getenv("LOG_FILE_PATH", "logs/openclaw.log")),
         log_raw_result_limit=_as_int(os.getenv("LOG_RAW_RESULT_LIMIT"), default=20),
-        sns_db_path=os.getenv("SNS_DB_PATH", "data/sns.sqlite3"),
-        sns_inbox_db_path=os.getenv("SNS_INBOX_DB_PATH", "data/sns_inbox.sqlite3"),
-        knowledge_db_path=os.getenv("KNOWLEDGE_DB_PATH", "data/knowledge.sqlite3"),
-        knowledge_inbox_db_path=os.getenv("KNOWLEDGE_INBOX_DB_PATH", "data/knowledge_inbox.sqlite3"),
-        opportunity_inbox_db_path=os.getenv("OPPORTUNITY_INBOX_DB_PATH", "data/opportunity_inbox.sqlite3"),
-        watch_inbox_db_path=os.getenv("WATCH_INBOX_DB_PATH", "data/watch_inbox.sqlite3"),
-        quiz_db_path=os.getenv("OPENCLAW_QUIZ_DB_PATH", "data/quiz.sqlite3"),
+        sns_db_path=_resolve_runtime_path(os.getenv("SNS_DB_PATH", "data/sns.sqlite3")),
+        sns_inbox_db_path=_resolve_runtime_path(os.getenv("SNS_INBOX_DB_PATH", "data/sns_inbox.sqlite3")),
+        knowledge_db_path=_resolve_runtime_path(os.getenv("KNOWLEDGE_DB_PATH", "data/knowledge.sqlite3")),
+        knowledge_inbox_db_path=_resolve_runtime_path(os.getenv("KNOWLEDGE_INBOX_DB_PATH", "data/knowledge_inbox.sqlite3")),
+        opportunity_inbox_db_path=_resolve_runtime_path(os.getenv("OPPORTUNITY_INBOX_DB_PATH", "data/opportunity_inbox.sqlite3")),
+        watch_inbox_db_path=_resolve_runtime_path(os.getenv("WATCH_INBOX_DB_PATH", "data/watch_inbox.sqlite3")),
+        quiz_db_path=_resolve_runtime_path(os.getenv("OPENCLAW_QUIZ_DB_PATH", "data/quiz.sqlite3")),
         openclaw_backup_dir=os.getenv("OPENCLAW_BACKUP_DIR", "/Volumes/JEN_SSD/claw_data"),
         openclaw_backup_hour=_as_int(
             os.getenv("OPENCLAW_BACKUP_HOUR"), default=23
@@ -228,7 +242,7 @@ def get_settings() -> AssistantSettings:
             os.getenv("OPENCLAW_SNS_CLASSIFIER_MIN_SCORE"), default=60
         ),
         opportunity_agent_enabled=_as_bool(os.getenv("OPENCLAW_OPPORTUNITY_AGENT_ENABLED")),
-        opportunity_db_path=os.getenv("OPENCLAW_OPPORTUNITY_DB_PATH", "data/opportunities.sqlite3"),
+        opportunity_db_path=_resolve_runtime_path(os.getenv("OPENCLAW_OPPORTUNITY_DB_PATH", "data/opportunities.sqlite3")),
         opportunity_interval_seconds=_as_int(
             os.getenv("OPENCLAW_OPPORTUNITY_INTERVAL_SECONDS"),
             default=900,
