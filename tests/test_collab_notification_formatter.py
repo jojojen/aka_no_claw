@@ -107,7 +107,7 @@ def test_segment1_product_name_present():
 def test_segment1_heat_percentile_shown():
     n = _minimal_notification(
         ip_heat_percentile=87.0,
-        heat_sources=["x_mention", "reddit"],
+        heat_sources=["x_mention", "4chan"],
     )
     out = format_collab_notification(n)
     assert "percentile=87" in out

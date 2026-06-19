@@ -41,7 +41,7 @@ class _FakeCandidate:
 
 
 def test_find_dual_signals_hot_ip_with_candidates(store):
-    _record(store, "chainsaw man", sources={"x_mention": 500, "reddit": 400})
+    _record(store, "chainsaw man", sources={"x_mention": 500, "4chan": 400})
     # second record at different time to create history
     _record(store, "chainsaw man", sources={"x_mention": 100}, base=datetime.now(timezone.utc) - timedelta(days=5))
 
@@ -87,12 +87,12 @@ def test_find_dual_signals_respects_min_percentile(store):
 
 
 def test_find_dual_signals_source_percentiles_included(store):
-    _record(store, "ip_x", sources={"x_mention": 100, "reddit": 200})
+    _record(store, "ip_x", sources={"x_mention": 100, "4chan": 200})
     agg = CrossSignalAggregator(store)
     results = agg.find_dual_signals(min_percentile=0.0)
     found = next((d for d in results if d.ip_canonical == "ip_x"), None)
     assert found is not None
-    assert "x_mention" in found.source_percentiles or "reddit" in found.source_percentiles
+    assert "x_mention" in found.source_percentiles or "4chan" in found.source_percentiles
 
 
 # ── CrossSignalAggregator.check_ip ────────────────────────────────────────
@@ -144,7 +144,7 @@ def test_check_ip_finder_exception_returns_empty_candidates(store):
 
 
 def test_heat_block_includes_known_entities(store):
-    _record(store, "chainsaw man", sources={"x_mention": 100, "reddit": 200})
+    _record(store, "chainsaw man", sources={"x_mention": 100, "4chan": 200})
     block = build_heat_block_for_entities(("chainsaw man",), store)
     assert "chainsaw man" in block
     assert "percentile" in block
@@ -168,7 +168,7 @@ def test_heat_block_hot_badge_at_80_plus(store):
 
 def test_heat_block_multiple_entities(store):
     _record(store, "entity_a", sources={"x_mention": 100})
-    _record(store, "entity_b", sources={"reddit": 200})
+    _record(store, "entity_b", sources={"4chan": 200})
     block = build_heat_block_for_entities(("entity_a", "entity_b"), store)
     assert "entity_a" in block
     assert "entity_b" in block

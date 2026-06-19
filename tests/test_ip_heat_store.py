@@ -109,11 +109,11 @@ def test_percentile_top_value_is_100(store):
 
 def test_latest_for_ip_returns_one_per_source(store):
     store.record(ip_canonical="jjk", source="x_mention", value=800)
-    store.record(ip_canonical="jjk", source="reddit", value=150)
+    store.record(ip_canonical="jjk", source="4chan", value=150)
     store.record(ip_canonical="jjk", source="google_trends", value=65)
     signals = store.latest_for_ip("jjk")
     sources = {s.source for s in signals}
-    assert sources == {"x_mention", "reddit", "google_trends"}
+    assert sources == {"x_mention", "4chan", "google_trends"}
     assert len(signals) == 3
 
 
@@ -129,7 +129,7 @@ def test_latest_for_ip_missing_source_excluded(store):
 
 def test_max_percentile_returns_highest(store):
     store.record(ip_canonical="ip_g", source="x_mention", value=900)
-    store.record(ip_canonical="ip_g", source="reddit", value=50)
+    store.record(ip_canonical="ip_g", source="4chan", value=50)
     store.record(ip_canonical="ip_h", source="x_mention", value=200)
     store.record(ip_canonical="ip_h", source="x_mention", value=900)
 

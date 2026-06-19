@@ -752,7 +752,7 @@ def _build_openclaw_help_text() -> str:
             "/snsadd trend:trending",
             "/snslist",
             "/snsdelete <rule_id>",
-            "/snsbuzz amd            # Reddit 即時討論熱度",
+            "/snsbuzz amd            # 4chan 收藏品 IP 熱度",
             "",
             "--- JLPT 日文測驗 (Miku 歌詞) ---",
             "/quiz                   # 出題選單",
@@ -1596,16 +1596,17 @@ def _open_sns_db_readonly(settings):
 
 
 def _build_buzz_fn_standalone(settings, ssl_context=None):
-    """Build /snsbuzz using only the Reddit client — no full SNS monitor needed."""
+    """Build /snsbuzz using only the 4chan client — no full SNS monitor needed."""
     try:
-        from sns_monitor.reddit_buzz import RedditBuzzClient
+        from sns_monitor.fourchan_buzz import FourchanBuzzClient
         from sns_monitor.x_client_web import XClientWeb as _XClient
         from .sns_tools import _build_sns_buzz_fn
-        reddit_client = RedditBuzzClient()
-        x_client = _XClient(buzz_search_backend=reddit_client)
-        buzz_fn = _build_sns_buzz_fn(settings, x_client, ssl_context=ssl_context)
+        fourchan_client = FourchanBuzzClient()
+        x_client = _XClient(buzz_search_backend=fourchan_client)
+        buzz_fn = _build_sns_buzz_fn(settings, x_client, ssl_context=ssl_context,
+                                     fourchan_client=fourchan_client)
         if buzz_fn is not None:
-            logger.info("telegram: /snsbuzz enabled (Reddit + LLM)")
+            logger.info("telegram: /snsbuzz enabled (4chan + LLM + IP-heat)")
         return buzz_fn
     except Exception:
         logger.exception("telegram: failed to build buzz_fn standalone")
