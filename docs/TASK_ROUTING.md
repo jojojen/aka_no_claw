@@ -8,8 +8,8 @@ Last reviewed: 2026-06-20
 |---|---|---|---|
 | Add or change Telegram command | `aka_no_claw` | `src/openclaw_adapter/telegram_bot.py`, `toolset.py` | Keep command wiring thin. Move business logic to dedicated modules. |
 | Change CLI command | `aka_no_claw` | `src/openclaw_adapter/toolset.py`, `__main__.py` | Update docs and verification matrix if entry points change. |
-| Change card matching or card aliases | `aka_no_claw` | `src/tcg_tracker` | Do not put TCG rules in `market_monitor`. |
-| Change generic price source logic | `aka_no_claw` | `src/market_monitor` | Keep domain-specific rules out. |
+| Change card matching or card aliases | `price_monitor_bot` | `src/tcg_tracker` | `aka_no_claw` imports this package through `requirements.txt`; do not put TCG rules in `market_monitor`. |
+| Change generic price source logic | `price_monitor_bot` | `src/market_monitor` | `aka_no_claw` imports this package through `requirements.txt`; keep domain-specific rules out. |
 | Change price command formatting | `aka_no_claw` / `price_monitor_bot` | `openclaw_adapter`, historical bot formatter paths | Inspect integration boundary first. |
 | Change liquidity scoring | `aka_no_claw` | `cross_signal_aggregator.py`, `LIQUIDITY_METHODOLOGY.md` | Update methodology docs with behavior changes. |
 | Change `/research` | `aka_no_claw` | `research_command.py`, `telegram_bot.py` | Respect Yahoo budget, progress notifications, and stage ordering. |
@@ -19,7 +19,7 @@ Last reviewed: 2026-06-20
 | Change Mercari proof capture | `reputation_snapshot` | `services/*`, parser/proof modules | Watch parser drift and proof schema compatibility. |
 | Change `/snapshot` behavior | `aka_no_claw` + `reputation_snapshot` | Telegram/reputation adapter + API | Verify both request path and proof artifact delivery. |
 | Change opportunity recommendations | `aka_no_claw` | `opportunity_agent.py`, `opportunity_pipeline.py`, `opportunity_scoring.py` | Preserve rejection reasons and feedback hooks. |
-| Update dashboard display | `aka_no_claw` | `dashboard.py`, `dashboard_assets/` | Avoid silently changing data semantics in UI work. |
+| Update dashboard display | `aka_no_claw` | `dashboard.py`, `src/openclaw_adapter/dashboard_assets/` | Avoid silently changing data semantics in UI work. |
 | Update launchd/service behavior | `aka_no_claw` | settings, service modules, launchers | Verify cwd-independent paths and logs. |
 | Update docs only | `aka_no_claw` | `docs/`, `README.md` | No runtime tests required unless docs describe changed behavior. |
 
@@ -28,9 +28,9 @@ Last reviewed: 2026-06-20
 1. Is it assistant runtime, CLI, Telegram, dashboard, or launchd wiring?
    Go to `aka_no_claw/src/openclaw_adapter` or `src/assistant_runtime`.
 2. Is it generic market monitoring, source catalog, or price aggregation?
-   Go to `aka_no_claw/src/market_monitor`.
+   Go to `price_monitor_bot/src/market_monitor`.
 3. Is it card-specific parsing, aliases, matching, rarity, or TCG source behavior?
-   Go to `aka_no_claw/src/tcg_tracker`.
+   Go to `price_monitor_bot/src/tcg_tracker`.
 4. Is it SNS polling, rule storage, tweet dedupe, classifier, feedback, or reminders?
    Go to sibling repo `sns_monitor_bot`, then check `aka_no_claw` adapter wiring.
 5. Is it Mercari proof capture, verification, signed payloads, or capture UI/API?

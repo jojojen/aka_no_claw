@@ -6,6 +6,7 @@ Last reviewed: 2026-06-20
 
 | Document | Status | Owner area | Purpose |
 |---|---|---|---|
+| [SYSTEM_MANIFEST.yaml](../SYSTEM_MANIFEST.yaml) | Current | agent-maintenance | Machine-readable compact system truth index. |
 | [AGENT_ONBOARDING.md](AGENT_ONBOARDING.md) | Current | agent-maintenance | Fast first-read guide for future agents. |
 | [SYSTEM_MAP.md](SYSTEM_MAP.md) | Current | architecture | Repo map, runtime flows, data ownership, and high-risk boundaries. |
 | [CURRENT_STATE.md](CURRENT_STATE.md) | Current | agent-maintenance | Truth table for shipped/beta/partial/planned subsystem status. |

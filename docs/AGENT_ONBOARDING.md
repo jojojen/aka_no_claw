@@ -12,10 +12,11 @@ OpenClaw watches SNS and market signals, evaluates price and liquidity, checks M
 
 1. [Constitution.md](../Constitution.md)
 2. [README.md](../README.md)
-3. [docs/SYSTEM_MAP.md](SYSTEM_MAP.md)
-4. [docs/CURRENT_STATE.md](CURRENT_STATE.md)
-5. [docs/TASK_ROUTING.md](TASK_ROUTING.md)
-6. [docs/VERIFICATION_MATRIX.md](VERIFICATION_MATRIX.md)
+3. [SYSTEM_MANIFEST.yaml](../SYSTEM_MANIFEST.yaml)
+4. [docs/SYSTEM_MAP.md](SYSTEM_MAP.md)
+5. [docs/CURRENT_STATE.md](CURRENT_STATE.md)
+6. [docs/TASK_ROUTING.md](TASK_ROUTING.md)
+7. [docs/VERIFICATION_MATRIX.md](VERIFICATION_MATRIX.md)
 
 ## Mental Model
 
