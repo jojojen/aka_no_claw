@@ -4,6 +4,28 @@
 
 開始任何 substantial work 前，先讀 [Constitution.md](Constitution.md)。
 
+## Future Agent Start Here
+
+`aka_no_claw` 是 OpenClaw 的 primary orchestrator。它負責 assistant runtime、TCG/market monitoring 整合、SNS signal monitoring 整合、Mercari reputation proofing、Telegram、dashboard、opportunity agents 與 service wiring。
+
+新的 agent 請照這個順序建立 mental model：
+
+1. [Constitution.md](Constitution.md)
+2. [docs/AGENT_ONBOARDING.md](docs/AGENT_ONBOARDING.md)
+3. [docs/SYSTEM_MAP.md](docs/SYSTEM_MAP.md)
+4. [docs/CURRENT_STATE.md](docs/CURRENT_STATE.md)
+5. [docs/TASK_ROUTING.md](docs/TASK_ROUTING.md)
+6. [docs/VERIFICATION_MATRIX.md](docs/VERIFICATION_MATRIX.md)
+7. [docs/DOCS_INDEX.md](docs/DOCS_INDEX.md)
+
+Related repositories:
+
+| Repo | Role |
+|---|---|
+| `price_monitor_bot` | TCG price-monitoring / historical Telegram bot package. |
+| `sns_monitor_bot` | SNS/X monitoring, classifier, feedback, reminders, and 4chan buzz package. |
+| `reputation_snapshot` | Mercari reputation proof capture and verification service. |
+
 另外，協作規則以外部 skill 為準：先讀
 `https://raw.githubusercontent.com/jojojen/claude-collab-rules/main/SKILL.md`。
 這條不是可選建議；它是 session-start 規則。尤其在任何 `git push` 前，必須先依
