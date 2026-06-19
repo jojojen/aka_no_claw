@@ -16,8 +16,8 @@ Last reviewed: 2026-06-20
 | Layer | Path | Responsibility |
 |---|---|---|
 | Runtime | `src/assistant_runtime` | Settings, logging, TLS, registry, and generic assistant runtime foundations. |
-| Generic market core | `src/market_monitor` | Generic monitoring and source-management logic. Keep card-specific heuristics out. |
-| TCG domain | `src/tcg_tracker` | Card aliases, matching, TCG source adapters, and TCG-specific lookup behavior. |
+| Generic market core | `price_monitor_bot/src/market_monitor` | Generic monitoring and source-management logic imported through the sibling package. Keep card-specific heuristics out. |
+| TCG domain | `price_monitor_bot/src/tcg_tracker` | Card aliases, matching, TCG source adapters, and TCG-specific lookup behavior imported through the sibling package. |
 | OpenClaw adapter | `src/openclaw_adapter` | CLI, Telegram, dashboard, dynamic tools, `/research`, SNS integration, opportunity agent, and sibling repo adapters. |
 
 ## Main Runtime Flow
@@ -46,8 +46,8 @@ Primary paths:
 
 - `src/openclaw_adapter/telegram_bot.py`
 - `src/openclaw_adapter/toolset.py`
-- `src/tcg_tracker`
-- `src/market_monitor`
+- sibling repo `price_monitor_bot/src/tcg_tracker`
+- sibling repo `price_monitor_bot/src/market_monitor`
 
 ### `/snapshot`
 
@@ -128,7 +128,7 @@ python -m openclaw_adapter serve-dashboard
 Primary paths:
 
 - `src/openclaw_adapter/dashboard.py`
-- `dashboard_assets/`
+- `src/openclaw_adapter/dashboard_assets/`
 
 ### `/research`
 
@@ -167,5 +167,5 @@ Runtime paths are resolved through `assistant_runtime.settings`; keep docs gener
 - Telegram should not write directly to `sns.sqlite3`; use the inbox queue.
 - `opportunity_agent` should own writes to `opportunities.sqlite3`; Telegram writes requests through `opportunity_inbox`.
 - Runtime DB and log paths must be repo-root resolved, not current-working-directory guesses.
-- TCG-specific matching belongs in `tcg_tracker`, not `market_monitor`.
-- Generic source and price aggregation behavior belongs in `market_monitor`, not Telegram handlers.
+- TCG-specific matching belongs in sibling package `tcg_tracker`, not `market_monitor`.
+- Generic source and price aggregation behavior belongs in sibling package `market_monitor`, not Telegram handlers.

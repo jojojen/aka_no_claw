@@ -11,12 +11,13 @@
 新的 agent 請照這個順序建立 mental model：
 
 1. [Constitution.md](Constitution.md)
-2. [docs/AGENT_ONBOARDING.md](docs/AGENT_ONBOARDING.md)
-3. [docs/SYSTEM_MAP.md](docs/SYSTEM_MAP.md)
-4. [docs/CURRENT_STATE.md](docs/CURRENT_STATE.md)
-5. [docs/TASK_ROUTING.md](docs/TASK_ROUTING.md)
-6. [docs/VERIFICATION_MATRIX.md](docs/VERIFICATION_MATRIX.md)
-7. [docs/DOCS_INDEX.md](docs/DOCS_INDEX.md)
+2. [SYSTEM_MANIFEST.yaml](SYSTEM_MANIFEST.yaml)
+3. [docs/AGENT_ONBOARDING.md](docs/AGENT_ONBOARDING.md)
+4. [docs/SYSTEM_MAP.md](docs/SYSTEM_MAP.md)
+5. [docs/CURRENT_STATE.md](docs/CURRENT_STATE.md)
+6. [docs/TASK_ROUTING.md](docs/TASK_ROUTING.md)
+7. [docs/VERIFICATION_MATRIX.md](docs/VERIFICATION_MATRIX.md)
+8. [docs/DOCS_INDEX.md](docs/DOCS_INDEX.md)
 
 Related repositories:
 
@@ -31,13 +32,14 @@ Related repositories:
 這條不是可選建議；它是 session-start 規則。尤其在任何 `git push` 前，必須先依
 該 `SKILL.md` 的 push protocol 做 summary，並等使用者明確確認。
 
-目前我們先把底層拆成三層：
+目前系統拆成 OpenClaw 本 repo 的 runtime/adapter 層，以及透過 `requirements.txt`
+editable install 進來的 sibling packages：
 
 - `assistant_runtime`
   - 通用 tool registry、`.env` 載入、assistant runtime 基礎元件。
-- `market_monitor`
+- `market_monitor`（由 `../price_monitor_bot` 提供）
   - 可重用的追價核心，之後除了卡牌，也能擴充到色紙、二手 J-Pop CD、模型等品項。
-- `tcg_tracker`
+- `tcg_tracker`（由 `../price_monitor_bot` 提供）
   - 卡牌專用模組，先支援 Pokemon / Weiss Schwarz 的卡片正規化與遊々亭查價。
 - `openclaw_adapter`
   - OpenClaw / Telegram / CLI 的接點，負責把底層能力註冊成 assistant tools。
@@ -47,8 +49,6 @@ Related repositories:
 ```text
 src/
   assistant_runtime/  # 通用 assistant tool runtime
-  market_monitor/     # 通用追價核心
-  tcg_tracker/        # TCG 專用模組
   openclaw_adapter/   # OpenClaw / CLI / Telegram 入口
 tests/
 config/
@@ -56,6 +56,9 @@ data/
 launchers/            # 一鍵啟動腳本（.bat / .sh / .command）
 docs/                 # 設計文件、方法論、部署說明、測試紀錄
 ```
+
+注意：`market_monitor` 與 `tcg_tracker` 是從 sibling repo `../price_monitor_bot`
+以 editable install 載入，不在這個 repo 的 `src/` 目錄內。
 
 ## Python 開發流程
 

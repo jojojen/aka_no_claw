@@ -1,0 +1,438 @@
+schema_version: 1
+last_reviewed: "2026-06-20"
+system_name: OpenClaw
+primary_repo: aka_no_claw
+status_vocabulary:
+  - shipped
+  - beta
+  - partial
+  - planned
+  - deprecated
+  - unclear
+system_summary: >-
+  Personal assistant workspace that monitors SNS and market signals, evaluates
+  TCG price and liquidity, checks Mercari seller reputation, runs user-triggered
+  research and dynamic tools, and sends results through Telegram, CLI, dashboard,
+  and local services.
+
+repos:
+  aka_no_claw:
+    role: primary_orchestrator
+    default_branch: main
+    responsibility:
+      - assistant runtime
+      - CLI and Telegram adapter
+      - dashboard
+      - TCG and market integration
+      - SNS monitor integration
+      - reputation snapshot integration
+      - research command
+      - dynamic tools
+      - opportunity agent
+      - service wiring
+      - system truth docs
+    key_paths:
+      - Constitution.md
+      - README.md
+      - SYSTEM_MANIFEST.yaml
+      - docs/AGENT_ONBOARDING.md
+      - docs/SYSTEM_MAP.md
+      - docs/CURRENT_STATE.md
+      - docs/TASK_ROUTING.md
+      - docs/VERIFICATION_MATRIX.md
+      - docs/DOCS_INDEX.md
+      - src/assistant_runtime
+      - src/openclaw_adapter
+      - requirements.txt
+
+  price_monitor_bot:
+    role: tcg_price_monitor_package
+    default_branch: master
+    responsibility:
+      - historical TCG price monitoring behavior
+      - historical Telegram bot domain logic
+      - reusable price-monitoring helpers
+    integration_status: partially_integrated
+    key_paths:
+      - price_monitor_bot/src/market_monitor
+      - price_monitor_bot/src/tcg_tracker
+      - price_monitor_bot/src/price_monitor_bot
+
+  sns_monitor_bot:
+    role: sns_signal_monitor_package
+    default_branch: main
+    responsibility:
+      - SNS/X account watches
+      - keyword and trend watches
+      - signal collection and dedupe
+      - classifier and feedback hooks
+      - event reminders
+      - 4chan buzz digest support
+    integration_status: integrated_via_openclaw_adapter
+    key_paths:
+      - sns_monitor_bot/src/sns_monitor
+
+  reputation_snapshot:
+    role: mercari_reputation_proof_service
+    default_branch: master
+    responsibility:
+      - Mercari capture jobs
+      - profile and review parsing
+      - signed proof generation
+      - proof verification UI/API
+    integration_status: integrated_via_snapshot_agent
+    key_paths:
+      - reputation_snapshot
+
+subsystems:
+  telegram:
+    status: beta
+    owner_repo: aka_no_claw
+    owner_paths:
+      - src/openclaw_adapter/telegram_bot.py
+      - src/openclaw_adapter/toolset.py
+    entrypoints:
+      - python -m openclaw_adapter telegram-poll --notify-startup
+      - python -m openclaw_adapter telegram-send-test
+    docs:
+      - README.md
+      - docs/AGENT_ONBOARDING.md
+      - docs/SYSTEM_MAP.md
+    data_stores:
+      - data/sns_inbox.sqlite3
+      - data/knowledge_inbox.sqlite3
+      - data/opportunity_inbox.sqlite3
+    risks:
+      - requires Telegram token and chat ID in .env
+      - never hardcode credentials or chat IDs
+      - Telegram writes SNS/opportunity changes through inbox queues
+
+  cli_registry:
+    status: shipped
+    owner_repo: aka_no_claw
+    owner_paths:
+      - src/openclaw_adapter/__main__.py
+      - src/openclaw_adapter/toolset.py
+      - src/assistant_runtime/registry.py
+    entrypoints:
+      - python -m openclaw_adapter list-tools
+    docs:
+      - docs/AGENT_ONBOARDING.md
+      - docs/VERIFICATION_MATRIX.md
+    verification:
+      - .venv/bin/python -m openclaw_adapter list-tools
+
+  price_lookup:
+    status: beta
+    owner_repo: aka_no_claw
+    sibling_dependencies:
+      - price_monitor_bot
+    owner_paths:
+      - src/openclaw_adapter/toolset.py
+      - src/openclaw_adapter/telegram_bot.py
+      - src/openclaw_adapter/commands.py
+      - price_monitor_bot/src/tcg_tracker
+      - price_monitor_bot/src/market_monitor
+    entrypoints:
+      - python -m openclaw_adapter lookup-card
+      - Telegram /price
+    docs:
+      - README.md
+      - docs/LIQUIDITY_METHODOLOGY.md
+      - docs/TASK_ROUTING.md
+    risks:
+      - keep TCG-specific logic out of market_monitor
+      - preserve source provenance
+      - verify source drift before changing parsers
+
+  liquidity_board:
+    status: beta
+    owner_repo: aka_no_claw
+    owner_paths:
+      - src/openclaw_adapter/cross_signal_aggregator.py
+      - src/openclaw_adapter/dashboard.py
+      - price_monitor_bot/src/tcg_tracker
+    entrypoints:
+      - Telegram /liquidity
+      - python -m openclaw_adapter serve-dashboard --open-browser
+    docs:
+      - docs/LIQUIDITY_METHODOLOGY.md
+      - docs/CURRENT_STATE.md
+    risks:
+      - do not let one source dominate liquidity without documenting the methodology
+      - update docs when scoring semantics change
+
+  research:
+    status: beta
+    owner_repo: aka_no_claw
+    owner_paths:
+      - src/openclaw_adapter/research_command.py
+      - src/openclaw_adapter/telegram_bot.py
+      - src/openclaw_adapter/dynamic_tools.py
+    entrypoints:
+      - Telegram /research
+      - Telegram /resaerch
+    docs:
+      - docs/RESEARCH_COMMAND_PLAN.md
+      - docs/LIQUIDITY_METHODOLOGY.md
+    data_stores:
+      - data/knowledge.sqlite3
+    verification:
+      - .venv/bin/python -m pytest tests/test_research_command.py
+      - .venv/bin/python -m pytest tests/test_telegram_bot.py
+    risks:
+      - preserve Yahoo search budget
+      - keep progress messages so long jobs do not look stalled
+      - cloud offload must fall back in-process and not restart the bot
+
+  dynamic_tools:
+    status: beta
+    owner_repo: aka_no_claw
+    owner_paths:
+      - src/openclaw_adapter/dynamic_tools.py
+      - generated_tools
+    entrypoints:
+      - Telegram /new
+      - python -m openclaw_adapter.dynamic_tools selftest
+    docs:
+      - docs/NEW_DYNAMIC_TOOLS_PROGRESS.md
+      - docs/NEW_E2E_DISCRIMINATING_TESTS.md
+    data_stores:
+      - data/knowledge.sqlite3
+      - generated_tools
+    risks:
+      - generated tools are runtime artifacts and must remain out of git
+      - OpenCode Big Pickle is opt-in for codegen
+      - isolate external prompt context from generated outputs
+
+  sns_monitor:
+    status: beta
+    owner_repo: sns_monitor_bot
+    integration_repo: aka_no_claw
+    owner_paths:
+      - sns_monitor_bot/src/sns_monitor
+      - src/openclaw_adapter/sns_tools.py
+      - src/openclaw_adapter/sns_monitor_service.py
+      - src/openclaw_adapter/telegram_bot.py
+    entrypoints:
+      - python -m openclaw_adapter sns-monitor-service
+      - Telegram /snsadd
+      - Telegram /snslist
+      - Telegram /snsdelete
+    docs:
+      - docs/SNS_MONITOR_USAGE.md
+      - docs/SNS_MONITOR_TROUBLESHOOTING.md
+      - docs/SYSTEM_MAP.md
+    data_stores:
+      - data/sns.sqlite3
+      - data/sns_inbox.sqlite3
+      - data/knowledge_inbox.sqlite3
+    risks:
+      - X/Twitter auth and rate limiting
+      - cookies and credentials must not be committed
+      - Telegram should not write directly to sns.sqlite3
+
+  snsbuzz:
+    status: beta
+    owner_repo: sns_monitor_bot
+    integration_repo: aka_no_claw
+    owner_paths:
+      - sns_monitor_bot/src/sns_monitor/fourchan_buzz.py
+      - sns_monitor_bot/src/sns_monitor/digest.py
+      - sns_monitor_bot/src/sns_monitor/ip_entity_catalog.py
+      - src/openclaw_adapter/sns_tools.py
+      - data/sns_ip_catalog.json
+    entrypoints:
+      - Telegram /snsbuzz
+    docs:
+      - docs/SYSTEM_MAP.md
+      - docs/SNS_MONITOR_USAGE.md
+    risks:
+      - current source is 4chan, not X trending
+      - low-signal general chatter should not become RAG knowledge
+      - keep IP catalog extensible beyond one IP
+
+  reputation_snapshot:
+    status: beta
+    owner_repo: reputation_snapshot
+    integration_repo: aka_no_claw
+    owner_paths:
+      - reputation_snapshot
+      - src/openclaw_adapter/reputation_snapshot.py
+      - src/openclaw_adapter/reputation_agent.py
+      - src/openclaw_adapter/telegram_bot.py
+    entrypoints:
+      - python -m openclaw_adapter reputation-agent
+      - Telegram /snapshot
+      - Telegram /proof
+      - Telegram /repcheck
+      - Telegram /reputation
+    docs:
+      - README.md
+      - docs/SYSTEM_MAP.md
+      - docs/TASK_ROUTING.md
+    risks:
+      - Playwright and Mercari page drift
+      - proof schema compatibility
+      - admin token must stay in .env
+
+  opportunity_agent:
+    status: partial
+    owner_repo: aka_no_claw
+    owner_paths:
+      - src/openclaw_adapter/opportunity_agent.py
+      - src/openclaw_adapter/opportunity_pipeline.py
+      - src/openclaw_adapter/opportunity_store.py
+      - src/openclaw_adapter/opportunity_inbox.py
+      - src/openclaw_adapter/opportunity_scoring.py
+    upstream_inputs:
+      - sns_monitor
+      - price_lookup
+      - reputation_snapshot
+      - liquidity_board
+    downstream_outputs:
+      - telegram
+      - dashboard
+      - data/opportunities.sqlite3
+    entrypoints:
+      - python -m openclaw_adapter opportunity-agent
+      - python -m openclaw_adapter opportunity-status
+      - Telegram /hunt
+      - Telegram /opportunity
+    docs:
+      - docs/OPPORTUNITY_AGENT_SPEC.md
+      - docs/OPPORTUNITY_AGENT_HANDOFF.md
+      - docs/CURRENT_STATE.md
+    risks:
+      - do not hide rejection reasons
+      - do not silently change qualification semantics
+      - opportunity DB writes should be owned by the agent service
+
+  dashboard:
+    status: beta
+    owner_repo: aka_no_claw
+    owner_paths:
+      - src/openclaw_adapter/dashboard.py
+      - src/openclaw_adapter/dashboard_assets
+    entrypoints:
+      - python -m openclaw_adapter serve-dashboard --open-browser
+    docs:
+      - README.md
+      - docs/SYSTEM_MAP.md
+    risks:
+      - avoid changing data semantics in display-only work
+      - run a browser smoke test for UI changes
+
+  knowledge_rag:
+    status: beta
+    owner_repo: aka_no_claw
+    owner_paths:
+      - src/openclaw_adapter/knowledge_db.py
+      - src/openclaw_adapter/knowledge_command.py
+      - src/openclaw_adapter/knowledge_inbox.py
+      - src/openclaw_adapter/rag_daily_digest.py
+    entrypoints:
+      - Telegram /know
+      - daily digest scripts/services
+    docs:
+      - docs/KB_EMBEDDING_PLAN.md
+      - docs/CURRENT_STATE.md
+    data_stores:
+      - data/knowledge.sqlite3
+      - data/knowledge_inbox.sqlite3
+    risks:
+      - store grounded facts, not formulas or raw transient listing summaries
+      - preserve source URLs and confidence
+
+  quiz_teaching:
+    status: partial
+    owner_repo: aka_no_claw
+    owner_paths:
+      - src/openclaw_adapter/quiz_command.py
+      - src/openclaw_adapter/quiz_db.py
+      - src/openclaw_adapter/quiz_generator.py
+    entrypoints:
+      - Telegram /quiz
+    docs:
+      - docs/QUIZ_AUTHORING_PROGRESS.md
+      - docs/QUIZ_VOCAB_AUTHORING_PROGRESS.md
+      - docs/QUIZ_TEACHING_LOOP.md
+      - docs/QUIZ_REVIEWS.md
+    data_stores:
+      - data/quiz.sqlite3
+    risks:
+      - not part of the core market/reputation pipeline
+      - keep review state and generated assets out of unrelated changes
+
+docs:
+  onboarding:
+    path: docs/AGENT_ONBOARDING.md
+    status: current
+  system_map:
+    path: docs/SYSTEM_MAP.md
+    status: current
+  current_state:
+    path: docs/CURRENT_STATE.md
+    status: current
+  task_routing:
+    path: docs/TASK_ROUTING.md
+    status: current
+  verification_matrix:
+    path: docs/VERIFICATION_MATRIX.md
+    status: current
+  docs_index:
+    path: docs/DOCS_INDEX.md
+    status: current
+  research_command:
+    path: docs/RESEARCH_COMMAND_PLAN.md
+    status: current
+  liquidity_methodology:
+    path: docs/LIQUIDITY_METHODOLOGY.md
+    status: current
+  dynamic_tools:
+    path: docs/NEW_DYNAMIC_TOOLS_PROGRESS.md
+    status: current
+
+agent_rules:
+  required_reading_order:
+    - Constitution.md
+    - README.md
+    - SYSTEM_MANIFEST.yaml
+    - docs/AGENT_ONBOARDING.md
+    - docs/SYSTEM_MAP.md
+    - docs/CURRENT_STATE.md
+    - docs/TASK_ROUTING.md
+    - docs/VERIFICATION_MATRIX.md
+    - docs/DOCS_INDEX.md
+  never:
+    - hardcode secrets, chat IDs, tokens, cookies, or local absolute paths
+    - document planned behavior as shipped behavior
+    - collapse generic monitor logic into openclaw_adapter
+    - put TCG-specific matching rules in market_monitor
+    - change DB schemas without checking all readers and writers
+    - commit runtime DBs, logs, caches, generated tools, cookies, or .env
+  before_editing:
+    - identify subsystem
+    - identify owner repo
+    - identify runtime layer
+    - read the relevant docs
+    - choose verification from docs/VERIFICATION_MATRIX.md
+
+verification:
+  docs_only:
+    - git diff --check
+    - local Markdown link existence check
+  basic_runtime_import:
+    - .venv/bin/python -m openclaw_adapter list-tools
+  full_repo_when_runtime_changes:
+    - .venv/bin/python -m pytest
+
+issue_tracking:
+  github_repo: jojojen/aka_no_claw
+  implemented_for:
+    - issue: 3
+      title: "docs: establish Agent Onboarding / System Truth docs"
+      status: implemented
+    - issue: 4
+      title: "docs: establish SYSTEM_MANIFEST.yaml as machine-readable system truth index"
+      status: implemented
