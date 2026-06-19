@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Iterable, Protocol, Sequence
@@ -125,17 +126,21 @@ class BudgetExhaustedError(RuntimeError):
 class ResearchBudget:
     max_searches: int = 5
     searches_used: int = 0
+    # Guards searches_used so stages 3/4/6 running on parallel threads can't
+    # race the counter (Phase 2 parallelisation).
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     @property
     def remaining(self) -> int:
         return max(0, self.max_searches - self.searches_used)
 
     def consume(self) -> None:
-        if self.searches_used >= self.max_searches:
-            raise BudgetExhaustedError(
-                f"Yahoo 搜尋預算已用盡（{self.searches_used}/{self.max_searches}）。"
-            )
-        self.searches_used += 1
+        with self._lock:
+            if self.searches_used >= self.max_searches:
+                raise BudgetExhaustedError(
+                    f"Yahoo 搜尋預算已用盡（{self.searches_used}/{self.max_searches}）。"
+                )
+            self.searches_used += 1
 
 
 def build_budgeted_search_fn(search_fn: SearchFn, budget: ResearchBudget) -> SearchFn:
@@ -280,6 +285,9 @@ class ResearchJobContext:
     heartbeat_interval_seconds: float = 15.0
     stage_started_monotonic: float = 0.0
     last_heartbeat_monotonic: float = 0.0
+    # Serialises section_results/warnings appends across stages 3/4/6 when they
+    # run on parallel threads (Phase 2 parallelisation).
+    _section_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def heartbeat(self, note: str = "仍在處理…") -> None:
         now = time.monotonic()
@@ -292,8 +300,9 @@ class ResearchJobContext:
         self.notifier.send(f"⏳ [{self.current_stage}/6] {self.current_label}：{note}")
 
     def add_section_result(self, result: ResearchSectionResult) -> None:
-        self.section_results.append(result)
-        self.warnings.extend(result.warnings)
+        with self._section_lock:
+            self.section_results.append(result)
+            self.warnings.extend(result.warnings)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1035,7 +1044,15 @@ class ResearchCommandService:
         )
         try:
             notifier.send("⏳ /research 已開始，先抓商品頁與市場資料…")
-            for (stage_no, label), runner in zip(self._STAGES, self._stage_runners, strict=True):
+            stage_by_no = {
+                stage_no: (label, runner)
+                for (stage_no, label), runner in zip(
+                    self._STAGES, self._stage_runners, strict=True
+                )
+            }
+
+            def _run_tracked(stage_no: int) -> str:
+                label, runner = stage_by_no[stage_no]
                 ctx.current_stage = stage_no
                 ctx.current_label = label
                 ctx.stage_started_monotonic = time.monotonic()
@@ -1044,6 +1061,35 @@ class ResearchCommandService:
                 milestone = self._MILESTONE_STAGES.get(stage_no)
                 if milestone:
                     notifier.send(f"✅ {milestone}：{note}")
+                return note
+
+            # Stages 0-2 are a true chain: parse → fetch item → entity profile,
+            # and stages 3/4/6 all read their outputs. Run them in order first.
+            for stage_no in (0, 1, 2):
+                _run_tracked(stage_no)
+
+            # Stages 3 (增值潛力), 4 (合理市價) and 6 (賣家風險) are mutually
+            # independent — each reads only stage 0-2 outputs and writes disjoint
+            # ctx fields. Run them concurrently so a cloud-offloaded appreciation
+            # enricher overlaps the local price gate instead of queueing behind it.
+            parallel_notes: dict[int, str] = {}
+            with ThreadPoolExecutor(
+                max_workers=3, thread_name_prefix="research-stage"
+            ) as pool:
+                futures = {
+                    pool.submit(stage_by_no[stage_no][1], ctx): stage_no
+                    for stage_no in (3, 4, 6)
+                }
+                for future in as_completed(futures):
+                    parallel_notes[futures[future]] = future.result()
+            milestone = self._MILESTONE_STAGES.get(4)
+            if milestone:
+                notifier.send(f"✅ {milestone}：{parallel_notes.get(4, '')}")
+
+            # Stage 5 (流動性) consumes stage 4's price evidence, so it must run
+            # after the parallel batch completes.
+            _run_tracked(5)
+
             report = build_research_report(ctx)
             return self._final_formatter(report)
         finally:
@@ -1564,9 +1610,27 @@ def build_research_handler(
     return service.run
 
 
+# Canonical report ordering. Stages 3/4/6 may complete out of order under Phase 2
+# parallelisation, so section_results is sorted by this map before formatting to
+# keep the report deterministic regardless of thread finish order. Unknown names
+# sort to the end, preserving their relative insertion order (stable sort).
+_SECTION_ORDER: dict[str, int] = {
+    "取得商品資料": 1,
+    "實體辨識": 2,
+    "增值潛力分析": 3,
+    "合理市價分析": 4,
+    "流動性分析": 5,
+    "賣家風險分析": 6,
+}
+
+
 def build_research_report(ctx: ResearchJobContext) -> ResearchReport:
     assert ctx.target is not None
     mode_label = "Mercari 商品網址" if ctx.target.mode == "mercari_url" else "商品名稱"
+    ordered_sections = sorted(
+        ctx.section_results,
+        key=lambda result: _SECTION_ORDER.get(result.section_name, len(_SECTION_ORDER) + 1),
+    )
     return ResearchReport(
         chat_id=ctx.chat_id,
         mode_label=mode_label,
@@ -1575,7 +1639,7 @@ def build_research_report(ctx: ResearchJobContext) -> ResearchReport:
         budget_max=ctx.budget.max_searches,
         item_data=ctx.item_data,
         seller_snapshot=ctx.seller_snapshot,
-        section_results=tuple(ctx.section_results),
+        section_results=tuple(ordered_sections),
         warnings=tuple(dict.fromkeys(ctx.warnings)),
     )
 
