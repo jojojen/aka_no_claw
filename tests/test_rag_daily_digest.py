@@ -58,6 +58,25 @@ def test_digest_skips_operational_cache_entry(tmp_path):
     assert sent == [], "yuyutei_code= operational cache must not be pushed"
 
 
+def test_digest_skips_mercari_item_page_cache(tmp_path):
+    sent: list = []
+    sched, db_path = _make_scheduler(tmp_path, sent)
+    db = KnowledgeDatabase(db_path)
+    db.upsert_entry(
+        entity_canonical="mercari:m93045899435",
+        entity_type="product",
+        summary=(
+            "Mercari 商品頁資料：ヴァイスシュヴァルツ いっぱいの祝福 桐谷遥 SSP。 "
+            "標示價格 ¥26,999。 商品狀態：目立った傷や汚れなし。"
+        ),
+        source_urls=("https://jp.mercari.com/item/m93045899435",),
+        confidence=0.85,
+        origin="research_command",
+    )
+    sched._send_digest()
+    assert sent == [], "Mercari item-page cache must not be pushed as RAG news"
+
+
 def test_digest_mixed_sends_only_real(tmp_path):
     sent: list = []
     sched, db_path = _make_scheduler(tmp_path, sent)
