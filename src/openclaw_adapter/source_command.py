@@ -72,7 +72,8 @@ def build_source_handler(
             return f"來源查詢失敗：{exc}"
         if rec is None:
             return f"找不到來源 {token.upper()}。"
-        dom = get_domain(rec.domain or rec.canonical_url)
+        domain_key = rec.domain_id or rec.domain or rec.canonical_url
+        dom = get_domain(domain_key)
         lines = [
             f"🔗 來源 {rec.source_id}",
             f"標題：{rec.title or '（無）'}",
@@ -84,10 +85,10 @@ def build_source_handler(
                 f"信任度：{dom.trust_score:.0%}",
             ]
         else:
-            stype = get_source_type(rec.domain or rec.canonical_url)
+            stype = get_source_type(domain_key)
             lines += [
                 f"來源類型：{source_type_label(stype)}（未收錄網域，採預設）",
-                f"信任度：{get_domain_trust(rec.domain or rec.canonical_url):.0%}",
+                f"信任度：{get_domain_trust(domain_key):.0%}",
             ]
         lines += [
             f"擷取時間：{rec.fetched_at or '（無）'}",

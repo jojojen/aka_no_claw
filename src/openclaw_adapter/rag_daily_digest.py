@@ -23,7 +23,7 @@ from .knowledge_db import (
     is_operational_cache_entry,
     is_source_id,
 )
-from .domain_registry import domain_citation_label
+from .domain_registry import domain_citation_label, get_domain
 from .url_canonicalize import source_domain
 
 logger = logging.getLogger(__name__)
@@ -94,8 +94,13 @@ def _render_citation(ref: str, db: KnowledgeDB | None) -> str:
     if is_source_id(ref):
         rec = db.get_source(ref) if db is not None else None
         if rec is not None:
-            host = rec.domain or source_domain(rec.canonical_url) or rec.canonical_url
-            return f"[{rec.source_id}] {domain_citation_label(host)}"
+            # Prefer the stored domain_id (canonical, alias-collapsed) when it
+            # resolves to a seeded record; otherwise fall back to the bare host
+            # so unseeded sources still render a readable label, not a dom_* id.
+            key = rec.domain_id if get_domain(rec.domain_id) is not None else (
+                rec.domain or source_domain(rec.canonical_url) or rec.canonical_url
+            )
+            return f"[{rec.source_id}] {domain_citation_label(key)}"
         return f"[{ref}]"
     return domain_citation_label(ref) or source_domain(ref) or ref
 
