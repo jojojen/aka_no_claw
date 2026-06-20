@@ -163,10 +163,17 @@ def _listing_to_candidate(
     if listing.price_jpy:
         reason_parts.append(f"定価 ¥{listing.price_jpy:,}")
 
+    ip_canonical = _infer_ip_canonical(listing.title, game)
+
     metadata: dict[str, object] = {
         "source_store": listing.store_name,
         "listing_status": listing.status,
         "listing_url": listing.url,
+        # Carried for the CollectibleSignal bridge (issue #8). Official-store
+        # listings are authoritative product truth, hence a high source
+        # confidence; a known price/code firms it up further.
+        "ip_canonical": ip_canonical,
+        "source_confidence": 0.9 if listing.price_jpy is not None else 0.75,
     }
     if listing.price_jpy is not None:
         metadata["official_price_jpy"] = listing.price_jpy
@@ -179,7 +186,6 @@ def _listing_to_candidate(
 
     # Attach collab inference if provider is wired in
     if collab_similarity is not None:
-        ip_canonical = _infer_ip_canonical(listing.title, game)
         try:
             inference = collab_similarity.infer(ip_canonical, game)
             if inference.n_samples > 0:
