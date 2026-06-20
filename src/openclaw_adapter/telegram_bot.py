@@ -72,6 +72,7 @@ from .knowledge_command import (
     build_knowledge_coding_view_fn,
     build_knowledge_item_deleters,
 )
+from .source_command import build_source_handler
 from .sns_commands import (
     build_sns_add_handler,
     build_snslist_handler,
@@ -1142,6 +1143,7 @@ def _build_registries(
         "/kb": RegisteredCommand(
             build_knowledge_handler(settings, knowledge_inbox=knowledge_inbox)
         ),
+        "/source": RegisteredCommand(build_source_handler(settings)),
         "/research": RegisteredCommand(
             research_handler,
             ack="收到，正在進行深度商品研究（會分階段回報進度）…",

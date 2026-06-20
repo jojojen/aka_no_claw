@@ -77,6 +77,46 @@ def test_digest_skips_mercari_item_page_cache(tmp_path):
     assert sent == [], "Mercari item-page cache must not be pushed as RAG news"
 
 
+def test_digest_renders_compact_source_citation(tmp_path):
+    """Issue #9 D5: S-id source refs render as ``[S1] domain``, never the raw
+    multi-thousand-char redirect URL."""
+    sent: list = []
+    sched, db_path = _make_scheduler(tmp_path, sent)
+    db = KnowledgeDatabase(db_path)
+    sid = db.intern_source(
+        "https://www.google.com/url?q=https%3A%2F%2Fwww.suruga-ya.jp%2Fitem%2F1"
+        "&utm_source=x",
+        title="Suruga-ya item",
+    )
+    db.upsert_entry(
+        entity_canonical="union_arena", entity_type="tcg",
+        summary="UNION ARENA。Bandai 旗下 TCG。", confidence=0.7,
+        source_urls=(sid,), origin="web_research",
+    )
+    sched._send_digest()
+    assert len(sent) == 1
+    text = sent[0][1]
+    assert f"[{sid}] suruga-ya.jp" in text
+    assert "google.com/url" not in text  # no raw redirect wrapper leaked
+    assert "utm_source" not in text
+
+
+def test_digest_legacy_raw_url_degrades_to_domain(tmp_path):
+    """Pre-registry raw URLs (not S-ids) still render as a clean domain label."""
+    sent: list = []
+    sched, db_path = _make_scheduler(tmp_path, sent)
+    db = KnowledgeDatabase(db_path)
+    db.upsert_entry(
+        entity_canonical="union_arena", entity_type="tcg",
+        summary="UNION ARENA。Bandai 旗下 TCG。", confidence=0.7,
+        source_urls=("https://www.suruga-ya.jp/item/9?utm_source=x",),
+        origin="web_research",
+    )
+    sched._send_digest()
+    assert len(sent) == 1
+    assert "suruga-ya.jp" in sent[0][1]
+
+
 def test_digest_mixed_sends_only_real(tmp_path):
     sent: list = []
     sched, db_path = _make_scheduler(tmp_path, sent)
