@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from openclaw_adapter.reputation_snapshot import SnapshotStillPending
 from openclaw_adapter.research_command import (
     BudgetExhaustedError,
     ItemData,
@@ -2175,3 +2176,67 @@ def test_research_budget_consume_is_thread_safe() -> None:
         thread.join()
 
     assert budget.searches_used == 1000
+
+
+# ── SnapshotStillPending: background followup ────────────────────────────────
+
+
+def test_research_handler_dispatches_followup_on_snapshot_still_pending(tmp_path: Path) -> None:
+    item_fetcher = MercariItemAdapter(
+        fetch_html_fn=lambda _url: _load_fixture("mercari_item_m18542743389.html")
+    )
+    followup_calls: list[tuple] = []
+
+    def pending_lookup(_seller_url: str) -> SellerReputationSnapshot:
+        def fake_poll():
+            return None
+        raise SnapshotStillPending("job_slow", poll_fn=fake_poll)
+
+    def followup_fn(seller_url: str, poll_fn, notifier) -> None:
+        followup_calls.append((seller_url, poll_fn, notifier))
+
+    handler = build_research_handler(
+        notifier_factory=lambda chat_id: FakeNotifier(),
+        item_fetcher=item_fetcher,
+        knowledge_db_path=str(tmp_path / "knowledge.sqlite3"),
+        seller_snapshot_lookup_fn=pending_lookup,
+        seller_snapshot_followup_fn=followup_fn,
+        active_market_search_fn=_fake_active_search,
+        sold_market_search_fn=_fake_sold_search,
+        sold_average_lookup_fn=_fake_sold_average,
+    )
+
+    reply = handler("https://jp.mercari.com/item/m18542743389", "chat-1")
+
+    # Section shows processing, not failure.
+    assert "賣家風險分析 [partial]" in reply
+    assert "處理中" in reply
+    assert "snapshot server unavailable" not in reply
+    # Followup fn was called exactly once with the right seller URL.
+    assert len(followup_calls) == 1
+    assert followup_calls[0][0] == "https://jp.mercari.com/user/profile/146184751"
+    assert callable(followup_calls[0][1])
+
+
+def test_research_handler_no_followup_fn_degrades_gracefully_on_still_pending(tmp_path: Path) -> None:
+    item_fetcher = MercariItemAdapter(
+        fetch_html_fn=lambda _url: _load_fixture("mercari_item_m18542743389.html")
+    )
+
+    def pending_lookup(_seller_url: str) -> SellerReputationSnapshot:
+        raise SnapshotStillPending("job_slow", poll_fn=lambda: None)
+
+    handler = build_research_handler(
+        notifier_factory=lambda chat_id: FakeNotifier(),
+        item_fetcher=item_fetcher,
+        knowledge_db_path=str(tmp_path / "knowledge.sqlite3"),
+        seller_snapshot_lookup_fn=pending_lookup,
+        seller_snapshot_followup_fn=None,
+        active_market_search_fn=_fake_active_search,
+        sold_market_search_fn=_fake_sold_search,
+        sold_average_lookup_fn=_fake_sold_average,
+    )
+
+    reply = handler("https://jp.mercari.com/item/m18542743389", "chat-1")
+    assert "賣家風險分析 [partial]" in reply
+    assert "處理中" in reply
