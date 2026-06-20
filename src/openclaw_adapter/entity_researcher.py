@@ -2,9 +2,12 @@
 
 When the SNS signal classifier encounters an entity (IP / product / set /
 event / creator / store) it has no grounded knowledge of, this researcher
-runs a web search, asks an LLM to condense the top results into a 300-500
-char summary tailored to TCG collector buy/sell judgment, and upserts the
-result with ``origin='web_research'`` and ``confidence=0.5``.
+runs a web search and — only if the results actually mention the entity
+(deterministic grounding gate) — asks an LLM to condense them into a
+strictly source-grounded summary, upserting with ``origin='web_research'``
+and ``confidence=0.5``. Snippets that don't mention the entity, or an LLM
+that can't confirm the entity from them, are rejected (no hallucinated
+fallback content).
 
 Designed to run in the background (a daemon thread) so the classifier
 isn't blocked by network / LLM latency — the current tweet uses whatever
@@ -46,8 +49,48 @@ class ResearchResult:
 
 
 def _build_research_query(entity_name: str) -> str:
-    """Bilingual JP/EN query optimised for TCG collector context."""
-    return f'"{entity_name}" TCG カード IP 客群 市場'
+    """Plain phrase-quoted query.
+
+    The old query stuffed ``TCG カード IP 客群 市場`` after the name, which
+    dragged results toward generic TCG/market junk that never mentioned the
+    actual entity (and fed the LLM hallucination-inducing context). A bare
+    phrase-quoted name keeps the search anchored on the entity itself."""
+    return f'"{entity_name}"'
+
+
+def _grounding_token(entity_name: str) -> str:
+    """The most specific token to verify against search snippets.
+
+    For multi-segment names like ``プロジェクトセカイ 鳳えむ`` the broad IP token
+    (プロジェクトセカイ) matches unrelated junk while the entity itself (鳳えむ)
+    is absent, so we anchor the grounding check on the last, most-specific
+    segment. Single-token names use the whole name."""
+    cleaned = entity_name.strip().strip('"').strip()
+    segments = [seg for seg in cleaned.split() if seg]
+    if not segments:
+        return ""
+    return segments[-1]
+
+
+def _snippets_ground_entity(
+    entity_name: str, snippets: Sequence[WebSearchResult]
+) -> bool:
+    """Deterministic pre-gate: do the search snippets actually mention this entity?
+
+    Cheap substring check on the most-specific token (case-insensitive over
+    title + snippet). If nothing references it, the results are junk and we
+    reject *before* calling the LLM — saving tokens and, more importantly,
+    preventing the model from fabricating a confident summary out of
+    irrelevant context."""
+    token = _grounding_token(entity_name)
+    if not token:
+        return True  # nothing specific to anchor on → don't block
+    needle = token.casefold()
+    for snippet in snippets:
+        haystack = f"{snippet.title or ''} {snippet.snippet or ''}".casefold()
+        if needle in haystack:
+            return True
+    return False
 
 
 def _build_common_knowledge_prompt(entity_name: str) -> str:
@@ -77,30 +120,31 @@ def _build_condensation_prompt(
         snippet_lines.append(f"[{idx}] {text}\n   {snippet.url}")
 
     return (
-        "你是 TCG / 收藏品市場分析助手。為下面的 entity 寫一段 300-500 字的繁體中文知識摘要，\n"
-        "供 SNS 推文 relevance 分類器當作 grounded context 使用。\n"
-        f"\nEntity 名稱：{entity_name}\n\n"
-        "請判斷此 entity 屬於哪個類型（並用其中一個字串作為 entity_type）：\n"
+        "你是 TCG / 收藏品知識庫的事實萃取助手。下面是針對某個 entity 的網路搜尋片段，\n"
+        "你只能『根據這些片段』寫一段繁體中文事實摘要，供分類器當 grounded context 使用。\n\n"
+        "鐵則（違反即視為失敗）：\n"
+        "  - 只能寫片段中明確出現的事實。嚴禁臆測、補完、或用你自己的背景知識填空。\n"
+        "  - 不知道就不要寫；不要用「不明」「推測」「可能」這類詞硬湊內容。沒有字數下限，\n"
+        "    片段講多少就寫多少，寧可短而正確，也不要長而捏造。\n"
+        f"  - 先判斷：這些片段是否真的在描述「{entity_name}」這個 entity 本身？\n"
+        "    如果片段其實在講別的東西、或根本沒提到它 → confident=false。\n\n"
+        f"Entity 名稱：{entity_name}\n\n"
+        "請判斷此 entity 屬於哪個類型（用其中一個字串作為 entity_type）：\n"
         f"  {' / '.join(ENTITY_TYPES)}\n"
         "  - ip = 動漫/遊戲/VTuber 等 IP 本身（pokemon / pjsk / ホロライブ）\n"
         "  - product = 具體商品（一卡、一盒、一個週邊）\n"
         "  - set = 卡片擴充包 / 系列（アビスアイ / クリムゾンヘイズ）\n"
-        "  - creator = 角色 / 創作者個人（特定 VTuber 名）\n"
+        "  - creator = 角色 / 創作者個人（含作品中登場的角色、特定 VTuber 名）\n"
         "  - event = 限時活動 / 抽選 / 展覽\n"
         "  - store = 通路 / 店鋪（Joshin / カードラッシュ）\n"
         "  - other = 都不像\n\n"
-        "摘要必須包含（缺則寫「不明」）：\n"
-        "  1. 是什麼（一句話）\n"
-        "  2. 主要客群 / 收藏者特徵\n"
-        "  3. 二手 / 卡片 / 週邊市場狀況（熱度、價格走勢、稀有度）\n"
-        "  4. 對 TCG 投資判斷有用的關鍵事實（如發行週期、EOL 風險、抽選機制慣例）\n"
-        "  5. 常見別名 / 簡稱 / 英日中對照\n\n"
         "搜尋片段：\n"
         + "\n".join(snippet_lines)
-        + "\n\n請嚴格回 JSON：\n"
-        '{"entity_type": "...", "summary": "300-500 字繁體中文摘要", '
+        + "\n\n請嚴格只回 JSON：\n"
+        '{"entity_type": "...", "summary": "只根據片段的事實摘要", '
         '"aliases": ["..."], "confident": true/false}\n'
-        "若搜尋片段資訊不足判斷此 entity，confident=false 並寫一句話 summary 標註 ‘資料不足’。"
+        "若片段不足以確認這就是該 entity、或內容與它無關，confident=false、"
+        "summary 只寫一句『資料不足』。"
     )
 
 
@@ -321,6 +365,14 @@ class EntityResearcher:
             logger.exception("EntityResearcher: web search failed for %s", entity_name)
             return None
         if not snippets:
+            return None
+
+        if not _snippets_ground_entity(entity_name, snippets):
+            logger.info(
+                "EntityResearcher: search snippets do not mention %s — "
+                "rejecting before LLM (grounding gate)",
+                entity_name,
+            )
             return None
 
         prompt = _build_condensation_prompt(entity_name, snippets)
