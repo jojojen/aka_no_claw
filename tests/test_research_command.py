@@ -1830,14 +1830,18 @@ def test_price_section_surfaces_outlier_drop_and_driving_comps() -> None:
 
 def test_yuyutei_cooldown_helpers_round_trip(tmp_path, monkeypatch) -> None:
     from openclaw_adapter import research_command as rc
+    from market_monitor import http as http_module
 
-    fake_file = tmp_path / "cooldown"
-    monkeypatch.setattr(rc, "_yuyutei_cooldown_path", lambda: fake_file)
+    # The helpers delegate to the shared cross-process circuit breaker. Isolate
+    # its marker file to tmp_path so the test never reads or deletes the real
+    # cooldown a live OpenClaw process may have set for yuyu-tei.
+    monkeypatch.setattr(
+        http_module, "_circuit_file_path", lambda host: tmp_path / f"circuit_{host}"
+    )
 
-    assert rc._yuyutei_cooldown_remaining() == 0.0  # no file → no cooldown
+    assert rc._yuyutei_cooldown_remaining() == 0.0  # no marker → no cooldown
 
     rc._yuyutei_trip_cross_process_cooldown()
-    assert fake_file.exists()
     remaining = rc._yuyutei_cooldown_remaining()
     assert 0.0 < remaining <= 300.0
 
