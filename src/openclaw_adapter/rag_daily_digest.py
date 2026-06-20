@@ -65,6 +65,13 @@ _PRODUCT_INTEL_ENTITY_TYPES: frozenset[str] = frozenset({"product", "store"})
 _SECTION_DURABLE = "📚 今日 RAG 新知（長效知識）"
 _SECTION_PRODUCT_INTEL = "🛒 今日 RAG 新知（商品情報）"
 
+# Human labels for the structured signal vocabularies, kept tiny and local.
+_ACTIONABILITY_LABEL: dict[str, str] = {
+    "actionable": "可下手",
+    "informational": "情報",
+    "blocked": "暫不推薦",
+}
+
 
 def _is_product_intelligence(entry: KnowledgeEntry) -> bool:
     return entry.entity_type in _PRODUCT_INTEL_ENTITY_TYPES
@@ -113,6 +120,51 @@ def _format_entry_message(
     return "\n".join(lines)
 
 
+def _format_signal_message(
+    signal,
+    index: int,
+    total: int,
+    *,
+    section_title: str,
+) -> str:
+    """Render one CollectibleSignal as the product-intelligence digest entry.
+
+    Signals are the structured product-intel source of truth (issue #8 finding
+    4): they already carry product identity / price band / official code / market
+    evidence, so they replace the ad-hoc ``product`` knowledge entries here."""
+    headline = signal.title.strip() or signal.ip_canonical.strip() or signal.signal_id
+    detail_bits: list[str] = []
+    if signal.ip_canonical and signal.ip_canonical != headline:
+        detail_bits.append(f"IP：{signal.ip_canonical}")
+    if signal.product_type and signal.product_type != "other":
+        detail_bits.append(f"類別：{signal.product_type}")
+    if signal.official_code:
+        detail_bits.append(f"型番：{signal.official_code}")
+    if signal.retail_price_jpy:
+        detail_bits.append(f"定価 ¥{signal.retail_price_jpy:,}")
+    state = _ACTIONABILITY_LABEL.get(signal.actionability, signal.actionability)
+    if signal.actionability == "blocked" and signal.block_reason:
+        state = f"{state}（{signal.block_reason}）"
+
+    citations = [source_domain(u) or u for u in signal.source_urls[:2]]
+    sources = "、".join(c for c in citations if c)
+
+    lines = [
+        f"{section_title}（{index}/{total}）",
+        "",
+        f"【{headline}】",
+    ]
+    if detail_bits:
+        lines.append(" ｜ ".join(detail_bits))
+    if sources:
+        lines += ["", f"來源：{sources}"]
+    lines += [
+        "",
+        f"狀態：{state}　領域：{signal.collectible_domain}　信心：{signal.confidence:.0%}",
+    ]
+    return "\n".join(lines)
+
+
 def _make_reply_markup(entry_id: str) -> dict:
     return {
         "inline_keyboard": [[
@@ -132,11 +184,16 @@ class RagDailyDigestScheduler:
         chat_ids: tuple[str, ...],
         send_fn: SendFn,
         hour: int = _DIGEST_HOUR,
+        signal_db_path: str | Path | None = None,
     ) -> None:
         self._db_path = Path(db_path)
         self._chat_ids = chat_ids
         self._send_fn = send_fn
         self._hour = hour
+        # When set, the 商品情報 section reads structured signals from the
+        # collectible signal store instead of ``product`` knowledge entries
+        # (issue #8 finding 4).
+        self._signal_db_path = Path(signal_db_path) if signal_db_path else None
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
@@ -162,6 +219,21 @@ class RagDailyDigestScheduler:
             # Sleep 23h to avoid double-firing in the same minute
             time.sleep(23 * 3600)
 
+    def _load_today_signals(self) -> list:
+        """Today's structured product-intelligence signals, or [] when the store
+        is not wired / unavailable. Blocked signals are skipped — they are not
+        product news the user should triage."""
+        if self._signal_db_path is None or not self._signal_db_path.exists():
+            return []
+        try:
+            from .collectible_signal_store import CollectibleSignalStore
+            store = CollectibleSignalStore(self._signal_db_path)
+            signals = store.signals_since(_today_start_iso())
+        except Exception:
+            logger.exception("RagDailyDigestScheduler: signal store read failed")
+            return []
+        return [s for s in signals if s.actionability != "blocked"]
+
     def _send_digest(self) -> None:
         if not self._db_path.exists():
             return
@@ -174,20 +246,32 @@ class RagDailyDigestScheduler:
             e for e in entries
             if not is_insufficient_entry(e) and not is_operational_cache_entry(e)
         ]
-        if not entries:
+        durable = [e for e in entries if not _is_product_intelligence(e)]
+
+        # Product intelligence source of truth (issue #8 finding 4): the
+        # structured signal store when wired, otherwise the legacy ``product``
+        # knowledge entries (keeps behaviour identical where no store is set).
+        signals = self._load_today_signals()
+        if self._signal_db_path is not None:
+            product_entries: list = []
+        else:
+            product_entries = [e for e in entries if _is_product_intelligence(e)]
+
+        if not durable and not product_entries and not signals:
             logger.info("RagDailyDigestScheduler: no new entries today — silent")
             return
-        # Durable knowledge first, then product intelligence — each its own
-        # section with independent numbering so the user can triage them apart.
-        durable = [e for e in entries if not _is_product_intelligence(e)]
-        product_intel = [e for e in entries if _is_product_intelligence(e)]
         logger.info(
-            "RagDailyDigestScheduler: sending %d durable + %d product-intel digests",
-            len(durable), len(product_intel),
+            "RagDailyDigestScheduler: sending %d durable + %d product-intel(entries) "
+            "+ %d product-intel(signals) digests",
+            len(durable), len(product_entries), len(signals),
         )
+
+        # Durable knowledge (with keep/delete buttons), then legacy product
+        # entries (same buttons), then structured signals (no buttons — the
+        # intelligence layer is auto-curated, not hand-triaged here).
         for section_title, group in (
             (_SECTION_DURABLE, durable),
-            (_SECTION_PRODUCT_INTEL, product_intel),
+            (_SECTION_PRODUCT_INTEL, product_entries),
         ):
             total = len(group)
             for i, entry in enumerate(group, 1):
@@ -203,6 +287,20 @@ class RagDailyDigestScheduler:
                             "RagDailyDigestScheduler: send failed chat_id=%s entry_id=%s",
                             chat_id, entry.entry_id,
                         )
+
+        total_signals = len(signals)
+        for i, signal in enumerate(signals, 1):
+            text = _format_signal_message(
+                signal, i, total_signals, section_title=_SECTION_PRODUCT_INTEL,
+            )
+            for chat_id in self._chat_ids:
+                try:
+                    self._send_fn(chat_id, text, None)
+                except Exception:
+                    logger.exception(
+                        "RagDailyDigestScheduler: signal send failed chat_id=%s id=%s",
+                        chat_id, signal.signal_id,
+                    )
 
 
 def handle_ragkeep_callback(

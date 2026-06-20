@@ -1646,6 +1646,11 @@ def _start_rag_daily_digest(settings) -> RagDailyDigestScheduler | None:
             db_path=settings.knowledge_db_path,
             chat_ids=chat_ids,
             send_fn=_send,
+            signal_db_path=(
+                settings.collectible_signal_db_path
+                if settings.collectible_signal_store_enabled
+                else None
+            ),
         )
         scheduler.start()
         return scheduler

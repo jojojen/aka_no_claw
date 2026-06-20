@@ -71,6 +71,18 @@ def _decode_json_list(value: object) -> tuple[str, ...]:
     return tuple(str(item) for item in parsed if isinstance(item, str) and item.strip())
 
 
+def _union(*groups: tuple[str, ...]) -> tuple[str, ...]:
+    """Order-stable union: first occurrence wins, later duplicates dropped."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for group in groups:
+        for item in group:
+            if item and item not in seen:
+                seen.add(item)
+                out.append(item)
+    return tuple(out)
+
+
 def _decode_json_map(value: object) -> dict:
     if not value:
         return {}
@@ -103,48 +115,88 @@ class CollectibleSignalStore:
             connection.executescript(SCHEMA)
 
     def upsert_signal(self, signal: CollectibleSignal) -> None:
-        """Insert or update a signal by its derived id.
+        """Insert or merge a signal by its derived id.
 
-        ``heat_score``, ``evidence_count`` and ``confidence`` accumulate
-        monotonically (MAX) across repeated observations of the same product
-        so a later weaker echo never demotes accumulated evidence.
+        Repeated observations of the same product accumulate evidence rather
+        than overwrite it (issue #8 finding 3):
+          - ``source_urls`` and ``anchor_types`` are **unioned** (order-stable),
+            so a second source for the same signal never erases the first's URLs.
+          - ``metadata`` dicts are **merged** (incoming keys win per-key, prior
+            keys preserved), so e.g. a ``promotion`` block added later does not
+            drop an earlier ``candidate_id``.
+          - ``confidence`` / ``heat_score`` take MAX (a weaker echo never demotes
+            accumulated strength); ``evidence_count`` is monotonic and reflects
+            at least the number of distinct evidence URLs.
+        Scalar identity/description fields take the latest non-null write
+        (COALESCE for the optional ``official_code`` / ``release_window`` /
+        ``retail_price_jpy`` so a sparse echo doesn't blank them out).
         """
         now = utc_now_iso()
         with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM collectible_signals WHERE signal_id = ?",
+                (signal.signal_id,),
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    """
+                    INSERT INTO collectible_signals (
+                        signal_id, source_kind, collectible_domain, ip_canonical,
+                        title, entity_kind, product_family, product_type,
+                        official_code, release_window, retail_price_jpy,
+                        source_urls_json, confidence, evidence_count, actionability,
+                        block_reason, heat_score, anchor_types_json, metadata_json,
+                        created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        signal.signal_id,
+                        signal.source_kind,
+                        signal.collectible_domain,
+                        signal.ip_canonical,
+                        signal.title,
+                        signal.entity_kind,
+                        signal.product_family,
+                        signal.product_type,
+                        signal.official_code,
+                        signal.release_window,
+                        signal.retail_price_jpy,
+                        _json(list(signal.source_urls)),
+                        signal.confidence,
+                        signal.evidence_count,
+                        signal.actionability,
+                        signal.block_reason,
+                        signal.heat_score,
+                        _json(list(signal.anchor_types)),
+                        _json(dict(signal.metadata)),
+                        signal.created_at or now,
+                        now,
+                    ),
+                )
+                return
+
+            existing = _signal_from_row(row)
+            merged_urls = _union(existing.source_urls, signal.source_urls)
+            merged_anchors = _union(existing.anchor_types, signal.anchor_types)
+            merged_meta = {**dict(existing.metadata), **dict(signal.metadata)}
+            confidence = max(existing.confidence, signal.confidence)
+            heat_score = max(existing.heat_score, signal.heat_score)
+            evidence_count = max(
+                existing.evidence_count, signal.evidence_count, len(merged_urls)
+            )
             connection.execute(
                 """
-                INSERT INTO collectible_signals (
-                    signal_id, source_kind, collectible_domain, ip_canonical,
-                    title, entity_kind, product_family, product_type,
-                    official_code, release_window, retail_price_jpy,
-                    source_urls_json, confidence, evidence_count, actionability,
-                    block_reason, heat_score, anchor_types_json, metadata_json,
-                    created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(signal_id) DO UPDATE SET
-                    source_kind=excluded.source_kind,
-                    collectible_domain=excluded.collectible_domain,
-                    ip_canonical=excluded.ip_canonical,
-                    title=excluded.title,
-                    entity_kind=excluded.entity_kind,
-                    product_family=excluded.product_family,
-                    product_type=excluded.product_type,
-                    official_code=COALESCE(excluded.official_code, collectible_signals.official_code),
-                    release_window=COALESCE(excluded.release_window, collectible_signals.release_window),
-                    retail_price_jpy=COALESCE(excluded.retail_price_jpy, collectible_signals.retail_price_jpy),
-                    source_urls_json=excluded.source_urls_json,
-                    confidence=MAX(collectible_signals.confidence, excluded.confidence),
-                    evidence_count=MAX(collectible_signals.evidence_count, excluded.evidence_count),
-                    actionability=excluded.actionability,
-                    block_reason=excluded.block_reason,
-                    heat_score=MAX(collectible_signals.heat_score, excluded.heat_score),
-                    anchor_types_json=excluded.anchor_types_json,
-                    metadata_json=excluded.metadata_json,
-                    updated_at=excluded.updated_at
+                UPDATE collectible_signals SET
+                    source_kind=?, collectible_domain=?, ip_canonical=?, title=?,
+                    entity_kind=?, product_family=?, product_type=?,
+                    official_code=?, release_window=?, retail_price_jpy=?,
+                    source_urls_json=?, confidence=?, evidence_count=?,
+                    actionability=?, block_reason=?, heat_score=?,
+                    anchor_types_json=?, metadata_json=?, updated_at=?
+                WHERE signal_id=?
                 """,
                 (
-                    signal.signal_id,
                     signal.source_kind,
                     signal.collectible_domain,
                     signal.ip_canonical,
@@ -152,19 +204,21 @@ class CollectibleSignalStore:
                     signal.entity_kind,
                     signal.product_family,
                     signal.product_type,
-                    signal.official_code,
-                    signal.release_window,
-                    signal.retail_price_jpy,
-                    _json(list(signal.source_urls)),
-                    signal.confidence,
-                    signal.evidence_count,
+                    signal.official_code or existing.official_code,
+                    signal.release_window or existing.release_window,
+                    signal.retail_price_jpy
+                    if signal.retail_price_jpy is not None
+                    else existing.retail_price_jpy,
+                    _json(list(merged_urls)),
+                    confidence,
+                    evidence_count,
                     signal.actionability,
                     signal.block_reason,
-                    signal.heat_score,
-                    _json(list(signal.anchor_types)),
-                    _json(dict(signal.metadata)),
-                    signal.created_at or now,
+                    heat_score,
+                    _json(list(merged_anchors)),
+                    _json(merged_meta),
                     now,
+                    signal.signal_id,
                 ),
             )
 
@@ -199,6 +253,24 @@ class CollectibleSignalStore:
                 + where
                 + " ORDER BY heat_score DESC, updated_at DESC LIMIT ?",
                 params,
+            ).fetchall()
+        return [_signal_from_row(row) for row in rows]
+
+    def signals_since(
+        self,
+        since_iso: str,
+        *,
+        limit: int = 200,
+    ) -> list[CollectibleSignal]:
+        """Signals updated at/after *since_iso* (UTC ISO), hottest first.
+
+        Used by the daily digest to surface today's structured product
+        intelligence (issue #8 finding 4)."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM collectible_signals WHERE updated_at >= ?"
+                " ORDER BY heat_score DESC, updated_at DESC LIMIT ?",
+                (since_iso, limit),
             ).fetchall()
         return [_signal_from_row(row) for row in rows]
 

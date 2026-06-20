@@ -110,6 +110,13 @@ class AssistantSettings:
     opportunity_web_search_hourly_budget: int = 1
     opportunity_web_search_daily_budget: int = 10
     opportunity_official_store_provider_enabled: bool = True
+    # ── collectible intelligence funnel (issue #8) ──────────────────────────
+    # Standalone signal store shared (via the SQLite file) by the opportunity
+    # daemon (writes official-store/marketplace signals), the telegram process
+    # (writes SNS catalysts, reads for the daily digest). Lives next to the
+    # opportunity DB.
+    collectible_signal_db_path: str = "data/collectible_signals.sqlite3"
+    collectible_signal_store_enabled: bool = True
     # ── SNS rule domain backfill / auto-discovery (Provider E + backfill) ────
     opportunity_sns_domain_backfill_enabled: bool = True
     opportunity_sns_auto_discovery_enabled: bool = True
@@ -324,6 +331,13 @@ def get_settings() -> AssistantSettings:
         ),
         opportunity_official_store_provider_enabled=_as_bool(
             os.getenv("OPENCLAW_OPPORTUNITY_OFFICIAL_STORE_PROVIDER_ENABLED"),
+            default=True,
+        ),
+        collectible_signal_db_path=_resolve_runtime_path(
+            os.getenv("OPENCLAW_COLLECTIBLE_SIGNAL_DB_PATH", "data/collectible_signals.sqlite3")
+        ),
+        collectible_signal_store_enabled=_as_bool(
+            os.getenv("OPENCLAW_COLLECTIBLE_SIGNAL_STORE_ENABLED"),
             default=True,
         ),
         opportunity_sns_domain_backfill_enabled=_as_bool(

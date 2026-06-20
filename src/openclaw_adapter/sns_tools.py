@@ -12,6 +12,51 @@ from assistant_runtime import AssistantSettings, build_ssl_context
 logger = logging.getLogger(__name__)
 
 
+def _build_collectible_signal_store(settings: AssistantSettings):
+    """Open the shared CollectibleSignalStore (issue #8) for the telegram process.
+
+    The opportunity daemon and this process write to the same SQLite file (WAL),
+    so SNS catalysts and official-store signals land in one intelligence layer.
+    Returns ``None`` when disabled or unavailable — callers degrade silently."""
+    if not getattr(settings, "collectible_signal_store_enabled", True):
+        return None
+    try:
+        from .collectible_signal_store import CollectibleSignalStore
+        store = CollectibleSignalStore(settings.collectible_signal_db_path)
+        store.bootstrap()
+        logger.info(
+            "SNS: CollectibleSignalStore ready db=%s", settings.collectible_signal_db_path
+        )
+        return store
+    except Exception:
+        logger.exception("SNS: could not open CollectibleSignalStore")
+        return None
+
+
+def _persist_sns_signal(store, *, text: str, source_kind: str, source_url: str, llm_fn) -> None:
+    """Route one already-concrete SNS / 4chan observation through the LLM evidence
+    gate and persist it if it names a concrete product anchor (issue #8 D3).
+
+    Called only on post-gate substantive observations (the SNS monitor / snsbuzz
+    already discarded chatter), so this adds at most one bounded LLM call per
+    real catalyst — never per raw tweet (C7: no rate-limit amplification)."""
+    if store is None or llm_fn is None or not (text or "").strip():
+        return
+    try:
+        from .collectible_sns_gate import classify_sns_post
+        signal = classify_sns_post(
+            text=text, source_kind=source_kind, source_url=source_url, llm_fn=llm_fn,
+        )
+        if signal is not None:
+            store.upsert_signal(signal)
+            logger.info(
+                "SNS collectible signal stored id=%s ip=%s domain=%s",
+                signal.signal_id, signal.ip_canonical, signal.collectible_domain,
+            )
+    except Exception:
+        logger.exception("SNS: classify/persist collectible signal failed")
+
+
 def _load_ip_entity_catalog(settings: AssistantSettings):
     try:
         from sns_monitor.ip_entity_catalog import IpEntityCatalog
@@ -95,6 +140,7 @@ def _build_sns_buzz_fn(settings: AssistantSettings, x_client, ssl_context=None,
             logger.exception("SNS buzz: failed to open IpHeatStore — heat recording disabled")
 
     ip_catalog = _load_ip_entity_catalog(settings)
+    signal_store = _build_collectible_signal_store(settings)
 
     # A percentile is only meaningful once there's enough history to rank
     # against; below this, IpHeatStore necessarily returns ~100% (the current
@@ -201,6 +247,16 @@ def _build_sns_buzz_fn(settings: AssistantSettings, x_client, ssl_context=None,
                 )
             except Exception:
                 logger.exception("SNS buzz: knowledge_db observation append failed query=%s", query)
+
+            # Structure the same concrete 4chan catalyst into the collectible
+            # intelligence layer (issue #8). 4chan → source_kind "fourchan".
+            _persist_sns_signal(
+                signal_store,
+                text=(result.summary or "").strip(),
+                source_kind="fourchan",
+                source_url="",
+                llm_fn=(llm_call_fn or _local_call),
+            )
 
         pct_bit = f"，30日百分位 {pct:.0f}%" if pct is not None else ""
         tail = "（已存收藏訊號入知識庫）" if has_signal else "（常態討論，僅記錄熱度數字）"
@@ -320,6 +376,8 @@ def _build_classifier_deps(settings: AssistantSettings, ssl_context=None):
     knowledge_db = KnowledgeDatabase(settings.knowledge_db_path)
     logger.info("SNS classifier: knowledge DB ready path=%s", settings.knowledge_db_path)
 
+    signal_store = _build_collectible_signal_store(settings)
+
     llm_ssl = ssl_context if endpoint.startswith("https://") else None
 
     def llm_fn(prompt: str) -> str:
@@ -379,6 +437,19 @@ def _build_classifier_deps(settings: AssistantSettings, ssl_context=None):
             )
         except Exception:
             logger.exception("knowledge_appender failed payload=%s", payload)
+
+        # Also structure this concrete SNS catalyst into the collectible
+        # intelligence layer (issue #8 D3). The monitor only pushes substantive
+        # observations here, so the gate runs on real catalysts, not chatter.
+        _persist_sns_signal(
+            signal_store,
+            text="\n".join(
+                p for p in (payload.get("rationale", ""), payload.get("suggested_action", "")) if p
+            ),
+            source_kind="sns",
+            source_url=payload.get("tweet_url", ""),
+            llm_fn=llm_fn,
+        )
 
     return {
         "classifier_llm_fn": llm_fn,
