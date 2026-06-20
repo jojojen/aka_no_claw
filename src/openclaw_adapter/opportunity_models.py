@@ -126,6 +126,7 @@ class OpportunityCandidate:
     aliases: tuple[str, ...] = ()
     related_keywords: tuple[str, ...] = ()
     is_target: bool = False                # 🎯 user-declared target (lenient thresholds) vs 🔍 system-discovered opportunity
+    entity_id: str | None = None           # canonical Market Entity join key (issue #12); None when unresolved/ambiguous
 
 
 @dataclass(frozen=True, slots=True)
