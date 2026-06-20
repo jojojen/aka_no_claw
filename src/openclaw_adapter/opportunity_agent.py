@@ -1438,6 +1438,23 @@ def build_opportunity_agent(settings: AssistantSettings | None = None) -> Opport
             ),
             min_interval_seconds=settings.opportunity_web_search_min_interval_seconds,
         )
+    signal_store = None
+    if settings.collectible_signal_store_enabled:
+        try:
+            from .collectible_signal_store import CollectibleSignalStore
+            signal_store = CollectibleSignalStore(settings.collectible_signal_db_path)
+            signal_store.bootstrap()
+            logger.info(
+                "build_opportunity_agent: CollectibleSignalStore ready db=%s",
+                settings.collectible_signal_db_path,
+            )
+        except Exception:
+            logger.exception(
+                "build_opportunity_agent: could not build CollectibleSignalStore; "
+                "collectible intelligence persistence disabled"
+            )
+            signal_store = None
+
     pipeline = OpportunityPipeline(
         store=store,
         candidate_provider=candidate_provider,
@@ -1456,6 +1473,7 @@ def build_opportunity_agent(settings: AssistantSettings | None = None) -> Opport
         candidate_limit=settings.opportunity_candidate_limit,
         listing_limit=settings.opportunity_listing_limit,
         candidate_check_interval_seconds=settings.opportunity_candidate_check_interval_seconds,
+        signal_store=signal_store,
     )
 
     preflight_fn = _build_preflight_callable(

@@ -14,10 +14,19 @@ from .opportunity_models import (
 )
 from .opportunity_scoring import OpportunityThresholds, evaluate_opportunity, target_price_for
 from .opportunity_store import OpportunityStore, recommendation_id_for
+from .collectible_signal import candidate_to_signal
+from .collectible_signal_store import CollectibleSignalStore
+from .collectible_valuation import (
+    MarketValuation,
+    TcgMarketValuationProvider,
+    promote_signal,
+)
 
 logger = logging.getLogger(__name__)
 
 SEALED_BOX_MIN_PROFIT_PCT: float = 10.0  # skip official-store notifications below this return %
+
+OFFICIAL_STORE_SOURCE_KIND = "official_store_preorder"
 
 
 class CandidateProvider(Protocol):
@@ -70,6 +79,7 @@ class OpportunityPipeline:
         candidate_limit: int = 8,
         listing_limit: int = 5,
         candidate_check_interval_seconds: int = 30 * 60,
+        signal_store: CollectibleSignalStore | None = None,
     ) -> None:
         self._store = store
         self._candidate_provider = candidate_provider
@@ -81,6 +91,12 @@ class OpportunityPipeline:
         self._candidate_limit = candidate_limit
         self._listing_limit = listing_limit
         self._candidate_check_interval_seconds = candidate_check_interval_seconds
+        # Collectible intelligence layer (issue #8). When wired, official-store
+        # candidates are persisted as structured CollectibleSignals *alongside*
+        # the existing TCG opportunity flow, which is left untouched. Recording
+        # is always best-effort: a signal-store failure must never break a
+        # recommendation (C4 — logged, not swallowed silently).
+        self._signal_store = signal_store
 
     def run_once(self) -> OpportunityPipelineStats:
         stats = _MutableStats()
@@ -88,6 +104,7 @@ class OpportunityPipeline:
         stats.discovered = len(discovered)
         for candidate in discovered:
             self._store.upsert_candidate(candidate)
+            self._record_discovery_signal(candidate)
 
         has_any_target = self._store.has_any_target()
         due_candidates = self._store.list_due_candidates(
@@ -201,6 +218,7 @@ class OpportunityPipeline:
             score=candidate.heat_score * 100,
             reasons=("official_store_preorder",),
         )
+        self._promote_and_record_signal(candidate, synthetic_price)
         self._store.record_recommendation(recommendation, accepted=True)
         self._notifier.notify(recommendation)
         self._store.mark_notified(recommendation.recommendation_id)
@@ -209,6 +227,53 @@ class OpportunityPipeline:
             "Official store pre-order notification sent candidate=%s url=%s",
             candidate.title, official_url,
         )
+
+    def _record_discovery_signal(self, candidate: OpportunityCandidate) -> None:
+        """Persist an official-store candidate as structured intelligence on first
+        sight (issue #8 finding 2). Only official-store listings are product
+        truth; other provider candidates (web-trend / hot-card guesses) are not
+        promoted into the signal layer here to keep it clean."""
+        if self._signal_store is None:
+            return
+        if candidate.source_kind != OFFICIAL_STORE_SOURCE_KIND:
+            return
+        try:
+            self._signal_store.upsert_signal(candidate_to_signal(candidate))
+        except Exception:
+            logger.exception(
+                "OpportunityPipeline: signal record failed candidate=%s",
+                candidate.candidate_id,
+            )
+
+    def _promote_and_record_signal(
+        self,
+        candidate: OpportunityCandidate,
+        price: PriceCheck,
+    ) -> None:
+        """Run the market-valuation/promote gate for an official-store candidate
+        and persist the (merged) decision signal — realizing the funnel's
+        ``signal → valuation/promote gate`` step at runtime (issue #8 finding 1).
+
+        Reuses the price already computed for the recommendation, so it adds no
+        extra price check (C5/C7 — no rate-limit amplification)."""
+        if self._signal_store is None:
+            return
+        try:
+            signal = candidate_to_signal(candidate)
+            valuation = MarketValuation(
+                fair_value_jpy=price.fair_value_jpy,
+                confidence=price.confidence,
+                sample_count=price.sample_count,
+                notes=price.notes,
+            )
+            provider = TcgMarketValuationProvider(lambda _s: valuation)
+            decision = promote_signal(signal, provider)
+            self._signal_store.upsert_signal(decision.signal)
+        except Exception:
+            logger.exception(
+                "OpportunityPipeline: signal promotion failed candidate=%s",
+                candidate.candidate_id,
+            )
 
     def _run_listing(
         self,
