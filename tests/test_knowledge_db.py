@@ -10,6 +10,7 @@ from openclaw_adapter.knowledge_db import (
     KnowledgeEntry,
     ORIGINS,
     format_knowledge_block,
+    is_source_id,
 )
 
 
@@ -34,7 +35,41 @@ def test_upsert_and_get_entry_roundtrip(db):
     assert entry.entity_type == "ip"
     assert entry.confidence == pytest.approx(0.7)
     assert "プロセカ" in entry.summary
-    assert entry.source_urls == ("https://example.com/a",)
+    # source URLs are interned through the registry (issue #9 D4): the entry
+    # stores a stable S-id, and it resolves back to the canonical URL.
+    assert len(entry.source_urls) == 1
+    sid = entry.source_urls[0]
+    assert is_source_id(sid)
+    rec = db.get_source(sid)
+    assert rec is not None and rec.canonical_url == "https://example.com/a"
+
+
+def test_upsert_entry_interns_raw_urls_and_drops_opaque(db):
+    """issue #9 D4: every producer is forced through the registry at upsert.
+
+    Raw URLs become S-ids; an already-interned S-id passes through unchanged; an
+    opaque redirect (untraceable offline) is dropped rather than stored raw."""
+    pre = db.intern_source("https://example.com/already")
+    assert pre is not None
+    db.upsert_entry(
+        entity_canonical="union_arena",
+        entity_type="tcg",
+        summary="UNION ARENA。",
+        source_urls=(
+            "https://www.suruga-ya.jp/item/9?utm_source=x",  # raw → interned
+            pre,                                              # S-id → kept
+            "https://rd.listing.yahoo.co.jp/abc123",         # opaque → dropped
+        ),
+        confidence=0.7,
+        origin="web_research",
+    )
+    entry = db.get_entry("union_arena")
+    assert entry is not None
+    assert all(is_source_id(s) for s in entry.source_urls)
+    assert pre in entry.source_urls
+    resolved = [db.get_source(s).canonical_url for s in entry.source_urls]
+    assert "https://www.suruga-ya.jp/item/9" in resolved
+    assert not any("yahoo.co.jp" in u for u in resolved)  # opaque refused
 
 
 def test_get_entry_is_case_insensitive(db):

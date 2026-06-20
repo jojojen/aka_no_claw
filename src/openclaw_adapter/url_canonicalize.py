@@ -15,8 +15,9 @@ encoded in a query parameter of a *known redirector host* — purely string
 work, no HTTP request. Resolving an opaque redirect (e.g. Yahoo's
 ``rd.listing.yahoo.co.jp`` blob) would require fetching a third-party host,
 which risks IP rate-limiting / bans (priority ②不被封鎖, SKILL.md C7). Such
-opaque URLs are left as-is; the registry still stores them and renders a
-compact domain label, so citations stay clean and traceable.
+opaque URLs are **refused** by the registry (see ``is_traceable_source``):
+because they can never be expanded back to the original article offline, they
+earn no ``[S]`` citation. The snippet text still feeds the LLM summary.
 """
 
 from __future__ import annotations
