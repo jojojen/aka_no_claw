@@ -72,6 +72,25 @@ def test_upsert_entry_interns_raw_urls_and_drops_opaque(db):
     assert not any("yahoo.co.jp" in u for u in resolved)  # opaque refused
 
 
+def test_upsert_entry_drops_dangling_source_id(db):
+    """issue #9: an S-id is only traceable if it resolves to a sources row.
+
+    A formally-shaped but non-existent id (e.g. ``S999``) must be dropped, not
+    stored, so the entry never carries an unresolvable citation."""
+    assert db.get_source("S999") is None
+    db.upsert_entry(
+        entity_canonical="union_arena",
+        entity_type="tcg",
+        summary="UNION ARENA。",
+        source_urls=("S999",),
+        confidence=0.7,
+        origin="web_research",
+    )
+    entry = db.get_entry("union_arena")
+    assert entry is not None
+    assert entry.source_urls == ()  # dangling id dropped
+
+
 def test_get_entry_is_case_insensitive(db):
     db.upsert_entry(entity_canonical="PJSK", entity_type="ip",
                     summary="x", source_urls=(), confidence=0.5, origin="manual", aliases=())
