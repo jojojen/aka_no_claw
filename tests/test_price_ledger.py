@@ -121,6 +121,43 @@ def test_snapshot_sparse_and_empty(ledger):
     assert one.min_price == one.max_price == one.median_price == Decimal("50")
 
 
+def test_currency_is_part_of_observation_identity(ledger):
+    # Same entity/source/time/price/quote but different currency → distinct rows.
+    base = dict(entity_id="ent_a", source_id="S1", price_amount="100",
+                quote_type="listing", observed_at="2026-06-20T00:00:00+00:00")
+    jpy = ledger.record_observation(currency="JPY", **base)
+    usd = ledger.record_observation(currency="USD", **base)
+    assert jpy.observation_id != usd.observation_id
+    assert {o.currency for o in ledger.observations_for("ent_a")} == {"JPY", "USD"}
+    assert len(ledger.observations_for("ent_a")) == 2
+
+
+def test_observed_at_ordering_across_timezone_offsets(ledger):
+    # +09:00 00:30 == 15:30 UTC, which is EARLIER than 16:00 UTC. Raw-string
+    # ordering would wrongly call the +09:00 row newest.
+    ledger.record_observation(entity_id="ent_a", source_id="S1", price_amount="100",
+                              observed_at="2026-06-21T00:30:00+09:00")
+    ledger.record_observation(entity_id="ent_a", source_id="S1", price_amount="200",
+                              observed_at="2026-06-20T16:00:00+00:00")
+    snap = ledger.get_market_snapshot("ent_a")
+    assert snap.latest_price == Decimal("200")
+    assert snap.latest_observed_at == "2026-06-20T16:00:00+00:00"
+    # newest-first history reflects true chronology too
+    assert [o.price_amount for o in ledger.observations_for("ent_a")] == [
+        Decimal("200"), Decimal("100"),
+    ]
+
+
+def test_same_instant_different_offsets_dedups(ledger):
+    # 00:30+09:00 and 15:30+00:00 are the same instant → one immutable row.
+    a = ledger.record_observation(entity_id="ent_a", source_id="S1", price_amount="100",
+                                  observed_at="2026-06-21T00:30:00+09:00")
+    b = ledger.record_observation(entity_id="ent_a", source_id="S1", price_amount="100",
+                                  observed_at="2026-06-20T15:30:00+00:00")
+    assert a.observation_id == b.observation_id
+    assert len(ledger.observations_for("ent_a")) == 1
+
+
 def test_snapshot_currency_scope(ledger):
     ledger.record_observation(entity_id="ent_a", source_id="S1",
                               price_amount="100", currency="JPY")

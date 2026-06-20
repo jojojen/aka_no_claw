@@ -79,6 +79,17 @@ def _norm_currency(value: str | None) -> str:
     return (value or "JPY").strip().upper() or "JPY"
 
 
+def _normalize_observed_at(ts: str) -> str:
+    """Canonical UTC ISO-8601 for a timestamp, so stored values sort
+    chronologically by raw string (offsets like ``+09:00`` would otherwise sort
+    lexically wrong) and the same instant interns to one identity regardless of
+    the offset it arrived in. Unparseable input is kept verbatim (best-effort)."""
+    dt = _parse_iso(ts)
+    if dt is None:
+        return (ts or "").strip()
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+
+
 def build_observation_id(
     *,
     entity_id: str,
@@ -86,14 +97,16 @@ def build_observation_id(
     observed_at: str,
     price_amount: str,
     quote_type: str,
+    currency: str | None = None,
     condition: str | None = None,
 ) -> str:
     """Deterministic id so the same observation interned twice collapses to one
-    immutable row, while any difference (price, time, condition, …) is a new
-    observation."""
+    immutable row, while any difference (price, time, currency, condition, …) is a
+    new observation. ``currency`` is part of the identity so e.g. ¥100 and $100 at
+    the same instant stay distinct rows."""
     key = "|".join((
         entity_id, source_id, observed_at, price_amount,
-        quote_type, condition or "",
+        quote_type, _norm_currency(currency), condition or "",
     ))
     return "obs_" + sha1(key.encode("utf-8")).hexdigest()[:16]
 
@@ -213,11 +226,12 @@ class PriceLedger:
         amount = _to_decimal(price_amount)
         cur = _norm_currency(currency)
         qtype = _snap(quote_type, QUOTE_TYPES, DEFAULT_QUOTE_TYPE)
-        when = (observed_at or "").strip() or _utc_now_iso()
+        when = _normalize_observed_at((observed_at or "").strip() or _utc_now_iso())
         amount_str = format(amount, "f")  # canonical, non-scientific
         obs_id = build_observation_id(
             entity_id=entity_id, source_id=source_id, observed_at=when,
-            price_amount=amount_str, quote_type=qtype, condition=condition,
+            price_amount=amount_str, quote_type=qtype, currency=cur,
+            condition=condition,
         )
         now = _utc_now_iso()
         with self.connect() as conn:
@@ -265,8 +279,11 @@ class PriceLedger:
             clauses.append("quote_type = ?")
             params.append(_snap(quote_type, QUOTE_TYPES, DEFAULT_QUOTE_TYPE))
         if since:
+            # Stored timestamps are UTC-normalized, so normalize the bound too —
+            # otherwise a since with a different offset would compare lexically
+            # against UTC strings and filter the wrong rows.
             clauses.append("observed_at >= ?")
-            params.append(since)
+            params.append(_normalize_observed_at(since))
         sql = (
             "SELECT * FROM price_observations WHERE " + " AND ".join(clauses)
             + " ORDER BY observed_at DESC, observation_id"
