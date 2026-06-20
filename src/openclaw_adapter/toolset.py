@@ -36,6 +36,7 @@ from .sns_tools import (
     _handle_sns_list,
     _handle_sns_toggle,
 )
+from .chat_web import serve_chat_web
 from .telegram_bot import (
     default_board_loader,
     default_lookup_renderer,
@@ -93,6 +94,15 @@ def build_tool_registry(settings: AssistantSettings | None = None) -> ToolRegist
             configure_parser=_configure_dashboard_parser,
             handler=lambda args: _handle_serve_dashboard(args, settings, registry),
             aliases=("serve-dashboard",),
+        )
+    )
+    registry.register(
+        AssistantTool(
+            name="assistant.chat-web",
+            description="Run the local-only web chat test page (browser → existing /zh handler). Bound to 127.0.0.1.",
+            configure_parser=_configure_chat_web_parser,
+            handler=lambda args: _handle_chat_web(args, settings),
+            aliases=("chat-web",),
         )
     )
     registry.register(
@@ -278,6 +288,15 @@ def _configure_telegram_poll_parser(parser: argparse.ArgumentParser) -> None:
                         help="Port for the auto-started dashboard (default: 8765).")
 
 
+def _configure_chat_web_parser(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="Bind host for the local chat page (default: 127.0.0.1, localhost only).")
+    parser.add_argument("--port", type=int, default=8780,
+                        help="Port for the local chat page (default: 8780).")
+    parser.add_argument("--open-browser", action="store_true",
+                        help="Open the chat page in the default browser on start.")
+
+
 def _configure_telegram_send_test_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--message", default="OpenClaw Telegram test successful.")
 
@@ -444,6 +463,16 @@ def _handle_serve_dashboard(
     return serve_dashboard(
         settings=settings,
         registry=registry,
+        host=args.host,
+        port=args.port,
+        open_browser=args.open_browser,
+    )
+
+
+def _handle_chat_web(args: argparse.Namespace, settings: AssistantSettings) -> int:
+    logger.info("CLI chat-web command received host=%s port=%s", args.host, args.port)
+    return serve_chat_web(
+        settings=settings,
         host=args.host,
         port=args.port,
         open_browser=args.open_browser,

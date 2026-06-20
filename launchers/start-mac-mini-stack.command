@@ -33,6 +33,7 @@ LAUNCHCTL_TELEGRAM_LABEL="local.openclaw.telegram"
 LAUNCHCTL_OPPORTUNITY_LABEL="local.openclaw.opportunity"
 LAUNCHCTL_SNS_MONITOR_LABEL="local.openclaw.sns_monitor"
 LAUNCHCTL_PRICE_MONITOR_LABEL="local.openclaw.price_monitor"
+LAUNCHCTL_CHAT_WEB_LABEL="local.openclaw.chat_web"
 LAUNCHCTL_AIVIS_LABEL="local.openclaw.aivis"
 
 AIVIS_HOST="${AIVIS_HOST:-127.0.0.1}"
@@ -40,6 +41,12 @@ AIVIS_PORT="${AIVIS_PORT:-10101}"
 AIVIS_APP_PATH="${AIVIS_APP_PATH:-${HOME}/Applications/AivisSpeech.app}"
 AIVIS_ENGINE_RUN="${AIVIS_APP_PATH}/Contents/Resources/AivisSpeech-Engine/run"
 AIVIS_READY_TIMEOUT_SECONDS="${AIVIS_READY_TIMEOUT_SECONDS:-60}"
+
+# Bind on all interfaces so the user's phone can reach the page over the mesh
+# VPN; access is still restricted to loopback + meshnet (100.64.0.0/10) by the
+# chat-web app-layer guard, so LAN/public clients get 403.
+CHAT_WEB_HOST="${CHAT_WEB_HOST:-0.0.0.0}"
+CHAT_WEB_PORT="${CHAT_WEB_PORT:-8780}"
 
 mkdir -p "${RUN_DIR}" "${LOG_DIR}"
 
@@ -984,7 +991,7 @@ stop_launchctl_jobs() {
     return
   fi
   local label
-  for label in "${LAUNCHCTL_OLLAMA_LABEL}" "${LAUNCHCTL_AIVIS_LABEL}" "${LAUNCHCTL_REPUTATION_LABEL}" "${LAUNCHCTL_TELEGRAM_LABEL}" "${LAUNCHCTL_SNS_MONITOR_LABEL}" "${LAUNCHCTL_PRICE_MONITOR_LABEL}" "${LAUNCHCTL_OPPORTUNITY_LABEL}"; do
+  for label in "${LAUNCHCTL_OLLAMA_LABEL}" "${LAUNCHCTL_AIVIS_LABEL}" "${LAUNCHCTL_REPUTATION_LABEL}" "${LAUNCHCTL_TELEGRAM_LABEL}" "${LAUNCHCTL_SNS_MONITOR_LABEL}" "${LAUNCHCTL_PRICE_MONITOR_LABEL}" "${LAUNCHCTL_OPPORTUNITY_LABEL}" "${LAUNCHCTL_CHAT_WEB_LABEL}"; do
     if launchctl_job_exists "${label}"; then
       log "Stopping launchctl job ${label}."
       launchctl remove "${label}" >/dev/null 2>&1 || true
@@ -1215,6 +1222,26 @@ start_price_monitor_service() {
   )
 }
 
+start_chat_web_service() {
+  log "Starting OpenClaw local web chat (http://${CHAT_WEB_HOST}:${CHAT_WEB_PORT}/chat)..."
+  if use_launchctl_services; then
+    launchctl submit -l "${LAUNCHCTL_CHAT_WEB_LABEL}" \
+      -o "${LOG_DIR}/openclaw_chat_web.log" \
+      -e "${LOG_DIR}/openclaw_chat_web.log" \
+      -- /bin/bash -lc "source '${RUNTIME_ENV_FILE}'; cd '${AKA_DIR}'; export PYTHONPATH='.:src'; exec '${AKA_VENV}/bin/python' -m openclaw_adapter chat-web --host '${CHAT_WEB_HOST}' --port '${CHAT_WEB_PORT}'"
+    local pid
+    pid="$(launchctl_job_pid "${LAUNCHCTL_CHAT_WEB_LABEL}")"
+    [[ -n "${pid}" ]] && echo "${pid}" >> "${PID_FILE}"
+    return
+  fi
+
+  (
+    cd "${AKA_DIR}"
+    nohup "${AKA_VENV}/bin/python" -m openclaw_adapter chat-web --host "${CHAT_WEB_HOST}" --port "${CHAT_WEB_PORT}" >> "${LOG_DIR}/openclaw_chat_web.log" 2>&1 &
+    echo $! >> "${PID_FILE}"
+  )
+}
+
 start_opportunity_agent() {
   if ! opportunity_agent_enabled; then
     log "Skipping opportunity agent because OPENCLAW_OPPORTUNITY_AGENT_ENABLED=0."
@@ -1261,6 +1288,7 @@ main() {
   start_openclaw_telegram
   start_sns_monitor_service
   start_price_monitor_service
+  start_chat_web_service
   start_opportunity_agent
 
   log "Started."
@@ -1270,6 +1298,7 @@ main() {
   log "  ${LOG_DIR}/openclaw_telegram.log"
   log "  ${LOG_DIR}/openclaw_sns_monitor.log"
   log "  ${LOG_DIR}/openclaw_price_monitor.log"
+  log "  ${LOG_DIR}/openclaw_chat_web.log"
   log "  ${LOG_DIR}/opportunity_agent.log"
   log "  ${LOG_DIR}/aivis_speech.log"
   if use_launchctl_services; then
