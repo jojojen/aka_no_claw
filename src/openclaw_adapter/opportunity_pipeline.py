@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol, Sequence
 
 from .opportunity_models import (
@@ -162,6 +162,7 @@ class OpportunityPipeline:
         immediately on first discovery. Dedup via listing_seen(source_url)."""
         official_url = str(candidate.metadata.get("listing_url") or candidate.source_url)
         if not official_url:
+            self._record_skip_signal(candidate, reason="missing_listing_url")
             return
         if self._store.listing_seen(official_url):
             return
@@ -179,6 +180,14 @@ class OpportunityPipeline:
                         "Official store sealed box skipped — profit below threshold candidate=%s "
                         "lottery=%d fair_value=%d pct=%.1f",
                         candidate.title, price_jpy, market.fair_value_jpy, discount_pct,
+                    )
+                    self._record_skip_signal(
+                        candidate,
+                        reason="profit_below_threshold",
+                        fair_value_jpy=market.fair_value_jpy,
+                        retail_price_jpy=price_jpy,
+                        profit_pct=round(discount_pct, 1),
+                        threshold_pct=SEALED_BOX_MIN_PROFIT_PCT,
                     )
                     return
                 fair_value_jpy = market.fair_value_jpy
@@ -232,16 +241,70 @@ class OpportunityPipeline:
         """Persist an official-store candidate as structured intelligence on first
         sight (issue #8 finding 2). Only official-store listings are product
         truth; other provider candidates (web-trend / hot-card guesses) are not
-        promoted into the signal layer here to keep it clean."""
+        promoted into the signal layer here to keep it clean.
+
+        Discovery is "seen, not yet evaluated": the valuation/promote gate is the
+        sole authority for ``actionable``. So a first-sighting is recorded as
+        ``informational`` (never the optimistic ``actionable`` default), and a
+        re-sighting must not clobber a verdict the gate has since written — both
+        avoid showing a 可下手 the runtime has not confirmed (issue #8 review)."""
         if self._signal_store is None:
             return
         if candidate.source_kind != OFFICIAL_STORE_SOURCE_KIND:
             return
         try:
-            self._signal_store.upsert_signal(candidate_to_signal(candidate))
+            signal = candidate_to_signal(candidate)
+            existing = self._signal_store.get_signal(signal.signal_id)
+            if existing is None:
+                signal = replace(
+                    signal, actionability="informational", block_reason=None
+                )
+            else:
+                signal = replace(
+                    signal,
+                    actionability=existing.actionability,
+                    block_reason=existing.block_reason,
+                )
+            self._signal_store.upsert_signal(signal)
         except Exception:
             logger.exception(
                 "OpportunityPipeline: signal record failed candidate=%s",
+                candidate.candidate_id,
+            )
+
+    def _record_skip_signal(
+        self,
+        candidate: OpportunityCandidate,
+        *,
+        reason: str,
+        **diagnostics,
+    ) -> None:
+        """Persist a non-actionable final state for an official-store candidate the
+        runtime evaluated but did **not** recommend, so the intelligence layer and
+        the real recommendation outcome stay consistent (issue #8 review).
+
+        The candidate is genuine product intelligence (a real official-store
+        listing), it is just not a buy — recorded as ``informational`` with a
+        structured ``skip`` note explaining why, never left at ``actionable``."""
+        if self._signal_store is None:
+            return
+        if candidate.source_kind != OFFICIAL_STORE_SOURCE_KIND:
+            return
+        try:
+            signal = candidate_to_signal(candidate)
+            signal = replace(
+                signal,
+                actionability="informational",
+                block_reason=None,
+                metadata={
+                    **dict(signal.metadata),
+                    "skip": {"reason": reason, **diagnostics},
+                },
+            )
+            self._signal_store.upsert_signal(signal)
+        except Exception:
+            logger.exception(
+                "OpportunityPipeline: skip signal record failed candidate=%s",
                 candidate.candidate_id,
             )
 
