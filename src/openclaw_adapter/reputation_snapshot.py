@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import dataclass
 from typing import Callable
@@ -9,6 +10,8 @@ from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 
 from assistant_runtime import AssistantSettings, build_ssl_context
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class SnapshotStillPending(RuntimeError):
@@ -65,12 +68,26 @@ class ReputationSnapshotClient:
         job_id = str(payload.get("job_id") or "").strip()
         if not job_id:
             raise RuntimeError("reputation_snapshot did not return a proof link or job id.")
+        _LOGGER.info("reputation snapshot job created job_id=%s", job_id)
         return self._wait_for_job(job_id)
 
     def _wait_for_job(self, job_id: str) -> ReputationSnapshotResult:
         deadline = time.monotonic() + self._job_timeout_seconds
         while time.monotonic() < deadline:
-            payload = self._request_json(f"/api/jobs/{job_id}", method="GET")
+            try:
+                payload = self._request_json(f"/api/jobs/{job_id}", method="GET")
+            except Exception as exc:
+                # A transient poll failure (e.g. socket timeout while the agent is
+                # busy serializing captures) must NOT be reported as a permanent
+                # snapshot failure. Tolerate it and let the budget fall through to
+                # SnapshotStillPending so background follow-up is scheduled.
+                _LOGGER.warning(
+                    "reputation snapshot poll request failed job_id=%s, retrying: %s",
+                    job_id,
+                    exc,
+                )
+                time.sleep(self._poll_interval_seconds)
+                continue
             status = str(payload.get("status") or "").strip().lower()
             if status == "done":
                 return self._build_result(payload, job_id=job_id)
@@ -78,6 +95,12 @@ class ReputationSnapshotClient:
                 error = str(payload.get("error") or "Unknown reputation snapshot error.")
                 raise RuntimeError(error)
             time.sleep(self._poll_interval_seconds)
+        _LOGGER.info(
+            "reputation snapshot job still pending after %.0fs budget job_id=%s; "
+            "registering background follow-up",
+            self._job_timeout_seconds,
+            job_id,
+        )
         raise SnapshotStillPending(
             job_id,
             poll_fn=lambda: self._poll_until_done(job_id, max_seconds=900.0),

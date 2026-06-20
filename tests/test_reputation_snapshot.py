@@ -84,6 +84,32 @@ def test_reputation_snapshot_client_times_out_raises_snapshot_still_pending(monk
     assert callable(exc_info.value.poll_fn)
 
 
+def test_wait_for_job_tolerates_transient_poll_timeout_then_pends(monkeypatch) -> None:
+    # Regression (issue #6): a socket timeout during polling escaped _wait_for_job
+    # as a generic RuntimeError("...timed out") and was rendered as a permanent
+    # seller-snapshot failure, so no background follow-up was scheduled. The poll
+    # loop must now tolerate the transient failure and fall through to
+    # SnapshotStillPending once the budget is exhausted.
+    calls = {"get": 0}
+
+    def fake_request_json(self, path: str, *, method: str, body: dict[str, object] | None = None) -> dict[str, object]:
+        if path == "/api/captures":
+            return {"job_id": "job_t1", "status": "pending"}
+        calls["get"] += 1
+        raise RuntimeError("reputation_snapshot request failed: timed out")
+
+    monkeypatch.setattr(ReputationSnapshotClient, "_request_json", fake_request_json)
+    client = ReputationSnapshotClient(
+        settings=_settings(), poll_interval_seconds=0.0, job_timeout_seconds=0.05
+    )
+
+    import pytest
+    with pytest.raises(SnapshotStillPending) as exc_info:
+        client.create_or_reuse_snapshot("https://jp.mercari.com/item/m123456789")
+    assert exc_info.value.job_id == "job_t1"
+    assert calls["get"] >= 1  # we actually polled and tolerated the timeout
+
+
 def test_request_reputation_snapshot_uses_settings_job_timeout(monkeypatch) -> None:
     # Regression: the hard-coded 90 s client default gave up before slow jobs
     # (~133 s observed) finished. The poll budget must come from settings.

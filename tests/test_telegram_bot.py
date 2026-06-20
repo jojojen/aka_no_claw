@@ -19,7 +19,7 @@ from price_monitor_bot.bot import (
 
 from openclaw_adapter.formatters import format_lookup_result_telegram
 from openclaw_adapter.natural_language import TelegramNaturalLanguageIntent
-from openclaw_adapter.reputation_snapshot import ReputationSnapshotResult
+from openclaw_adapter.reputation_snapshot import ReputationSnapshotResult, SnapshotStillPending
 from openclaw_adapter.telegram_bot import (
     TelegramCommandProcessor,
     TelegramFileAttachment,
@@ -1532,6 +1532,40 @@ def test_research_seller_snapshot_lookup_extracts_negative_review_excerpts(monke
     assert snapshot.display_name == "risk seller"
     assert snapshot.seller_negative == 2
     assert snapshot.seller_negative_excerpts == ("発送が遅かったです。", "梱包が雑でした。")
+
+
+def test_research_seller_snapshot_lookup_proof_fetch_timeout_pends(monkeypatch) -> None:
+    # Regression (issue #6): the snapshot job completed, but the proof-document
+    # fetch timed out transiently. This must not surface as a permanent failure;
+    # it should raise SnapshotStillPending so /research schedules the background
+    # follow-up that re-fetches the proof.
+    monkeypatch.setattr(
+        "openclaw_adapter.telegram_bot.request_reputation_snapshot",
+        lambda *, settings, query_url: ReputationSnapshotResult(
+            proof_url="http://127.0.0.1:5000/p/proof_done",
+            proof_id="proof_done",
+            reused=False,
+            job_id="job_done",
+        ),
+    )
+
+    def _timing_out_fetch(*, settings, proof_id):
+        raise RuntimeError("reputation_snapshot request failed: timed out")
+
+    monkeypatch.setattr(
+        "openclaw_adapter.telegram_bot.fetch_reputation_proof_document",
+        _timing_out_fetch,
+    )
+    settings = AssistantSettings(reputation_agent_server_url="http://127.0.0.1:5000")
+
+    lookup = _build_research_seller_snapshot_lookup(settings)
+
+    import pytest
+
+    with pytest.raises(SnapshotStillPending) as exc_info:
+        lookup("https://jp.mercari.com/user/profile/123")
+    assert exc_info.value.job_id == "job_done"
+    assert callable(exc_info.value.poll_fn)
 
 
 # --- Phase 1: /research appreciation cloud offload ---------------------------

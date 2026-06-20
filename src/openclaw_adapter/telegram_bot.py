@@ -1242,11 +1242,39 @@ def _build_research_seller_snapshot_lookup(
 ) -> "Callable[[str], SellerReputationSnapshot]":
     def lookup(seller_url: str) -> SellerReputationSnapshot:
         result = request_reputation_snapshot(settings=settings, query_url=seller_url)
-        proof_document = (
-            fetch_reputation_proof_document(settings=settings, proof_id=result.proof_id)
-            if result.proof_id
-            else {}
-        )
+        try:
+            proof_document = (
+                fetch_reputation_proof_document(settings=settings, proof_id=result.proof_id)
+                if result.proof_id
+                else {}
+            )
+        except Exception as exc:
+            # Job completed but the proof document fetch failed transiently (e.g.
+            # socket timeout). Do not report a permanent failure: convert to a
+            # pending state so /research schedules the background follow-up, which
+            # re-fetches the proof once it is reachable.
+            if not result.proof_id:
+                raise
+            logger.warning(
+                "seller snapshot proof fetch failed after job done proof_id=%s, "
+                "scheduling follow-up: %s",
+                result.proof_id,
+                exc,
+            )
+
+            def _poll_proof() -> "ReputationSnapshotResult | None":
+                deadline = time.monotonic() + 900.0
+                while time.monotonic() < deadline:
+                    try:
+                        fetch_reputation_proof_document(
+                            settings=settings, proof_id=result.proof_id
+                        )
+                        return result
+                    except Exception:
+                        time.sleep(2.0)
+                return None
+
+            raise SnapshotStillPending(result.job_id or result.proof_id, poll_fn=_poll_proof)
         subject = proof_document.get("subject", {}) if isinstance(proof_document, dict) else {}
         metrics = proof_document.get("metrics", {}) if isinstance(proof_document, dict) else {}
         quality = proof_document.get("quality", {}) if isinstance(proof_document, dict) else {}
