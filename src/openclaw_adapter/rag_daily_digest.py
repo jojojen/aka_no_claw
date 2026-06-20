@@ -21,7 +21,9 @@ from .knowledge_db import (
     KnowledgeEntry,
     is_insufficient_entry,
     is_operational_cache_entry,
+    is_source_id,
 )
+from .url_canonicalize import source_domain
 
 logger = logging.getLogger(__name__)
 
@@ -68,11 +70,37 @@ def _is_product_intelligence(entry: KnowledgeEntry) -> bool:
     return entry.entity_type in _PRODUCT_INTEL_ENTITY_TYPES
 
 
+def _render_citation(ref: str, db: KnowledgeDB | None) -> str:
+    """Render one source ref as a compact, traceable citation.
+
+    - ``S<n>`` source ids resolve (via *db*) to ``[S1] domain`` — the compact
+      form issue #9 wants in place of multi-thousand-char redirect URLs.
+    - Legacy raw URLs (interned before the registry, or when interning failed)
+      degrade to their domain label so citations stay readable either way.
+    """
+    ref = (ref or "").strip()
+    if not ref:
+        return ""
+    if is_source_id(ref):
+        rec = db.get_source(ref) if db is not None else None
+        if rec is not None:
+            label = rec.domain or source_domain(rec.canonical_url) or rec.canonical_url
+            return f"[{rec.source_id}] {label}"
+        return f"[{ref}]"
+    return source_domain(ref) or ref
+
+
 def _format_entry_message(
-    entry: KnowledgeEntry, index: int, total: int, *, section_title: str
+    entry: KnowledgeEntry,
+    index: int,
+    total: int,
+    *,
+    section_title: str,
+    db: KnowledgeDB | None = None,
 ) -> str:
     summary = entry.summary[:400] if entry.summary else "（無摘要）"
-    sources = "、".join(entry.source_urls[:2]) if entry.source_urls else ""
+    citations = [c for c in (_render_citation(r, db) for r in entry.source_urls[:2]) if c]
+    sources = "、".join(citations)
     lines = [
         f"{section_title}（{index}/{total}）",
         "",
@@ -163,7 +191,9 @@ class RagDailyDigestScheduler:
         ):
             total = len(group)
             for i, entry in enumerate(group, 1):
-                text = _format_entry_message(entry, i, total, section_title=section_title)
+                text = _format_entry_message(
+                    entry, i, total, section_title=section_title, db=db,
+                )
                 markup = _make_reply_markup(entry.entry_id)
                 for chat_id in self._chat_ids:
                     try:

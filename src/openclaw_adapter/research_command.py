@@ -21,7 +21,7 @@ from urllib.request import Request, urlopen
 from bs4 import BeautifulSoup, NavigableString, Tag
 from market_monitor import browser_stealth as bs
 
-from .knowledge_db import KnowledgeDatabase, KnowledgeEntry
+from .knowledge_db import KnowledgeDatabase, KnowledgeEntry, is_source_id
 from .market_title_corpus import record_titles as _record_market_titles
 from .reputation_snapshot import SnapshotStillPending
 from .scrape_subprocess import run_in_subprocess
@@ -1301,12 +1301,18 @@ class ResearchCommandService:
             ctx.appreciation_search_results = search_results
         enrichment = self._enrich_appreciation(_build_price_query(ctx), search_results)
         ctx.appreciation_enrichment = enrichment
+        db = (
+            KnowledgeDatabase(self._knowledge_db_path)
+            if self._knowledge_db_path
+            else None
+        )
         result = _build_appreciation_section_result(
             query=_build_price_query(ctx),
             entries=entries,
             heat_by_canonical=heat_by_canonical,
             search_results=search_results,
             enrichment=enrichment,
+            db=db,
         )
         ctx.add_section_result(result)
         return result.summary
@@ -2143,6 +2149,22 @@ def _shorten_review_excerpt(text: str, limit: int = 34) -> str:
     return text[: limit - 1].rstrip() + "…"
 
 
+def _resolve_evidence_url(ref: str, db: "KnowledgeDatabase | None") -> str:
+    """Resolve a stored source ref to a usable URL.
+
+    Source registry ids (``S<n>``) resolve to their canonical URL so /research
+    evidence shows a real link, not the opaque ``S1`` token. Legacy raw URLs
+    pass through unchanged."""
+    ref = (ref or "").strip()
+    if not ref:
+        return ""
+    if db is not None and is_source_id(ref):
+        rec = db.get_source(ref)
+        if rec is not None:
+            return rec.canonical_url
+    return ref
+
+
 def _build_appreciation_section_result(
     *,
     query: str,
@@ -2150,6 +2172,7 @@ def _build_appreciation_section_result(
     heat_by_canonical: dict[str, tuple[object, ...]],
     search_results: Sequence[WebSearchResult],
     enrichment: str | None = None,
+    db: "KnowledgeDatabase | None" = None,
 ) -> ResearchSectionResult:
     enrichment = (enrichment or "").strip() or None
     if not entries:
@@ -2183,7 +2206,9 @@ def _build_appreciation_section_result(
 
     for entry in entries:
         matched_labels.append(f"{entry.entity_canonical}({entry.entity_type})")
-        evidence_urls.extend(url for url in entry.source_urls[:2] if url)
+        evidence_urls.extend(
+            url for url in (_resolve_evidence_url(r, db) for r in entry.source_urls[:2]) if url
+        )
         summary_parts.append(_summarize_knowledge_entry(entry))
         signals = tuple(heat_by_canonical.get(entry.entity_canonical) or ())
         if signals:

@@ -403,10 +403,22 @@ class EntityResearcher:
         aliases = tuple(
             str(a).strip() for a in aliases_raw if isinstance(a, str) and a.strip()
         )
+        # Intern each snippet URL into the source registry and store the stable
+        # compact id (issue #9 D4) — never the raw redirect/tracking URL — so
+        # findings stay compact and citations dedup. Sources that cannot be
+        # traced back to their origin (opaque redirects, non-http) are dropped
+        # rather than cited: a citation must resolve to a real article.
+        source_refs: list[str] = []
+        for snippet in snippets:
+            if not snippet.url:
+                continue
+            sid = self._db.intern_source(snippet.url, title=snippet.title or None)
+            if sid:
+                source_refs.append(sid)
         return ResearchResult(
             entity_canonical=_normalize_canonical(entity_name),
             entity_type=entity_type,
             summary=summary,
             aliases=aliases,
-            source_urls=tuple(s.url for s in snippets if s.url),
+            source_urls=tuple(source_refs),
         )

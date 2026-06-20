@@ -25,6 +25,7 @@ import array
 import json
 import logging
 import math
+import re
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -32,6 +33,8 @@ from datetime import datetime, timezone
 from hashlib import sha1
 from pathlib import Path
 from typing import Iterator, Protocol, runtime_checkable
+
+from .url_canonicalize import canonicalize_url, is_traceable_source, source_domain
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +122,22 @@ CREATE TABLE IF NOT EXISTS embeddings (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (kind, ref_id)
 );
+
+-- Source registry (issue #9): each distinct canonical_url is stored once and
+-- addressed by a stable compact id "S<rowid>". RAG findings cite these ids
+-- instead of embedding multi-thousand-char redirect/tracking URLs. AUTOINCREMENT
+-- guarantees ids are never reused, so a citation stays valid forever.
+CREATE TABLE IF NOT EXISTS sources (
+    source_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    canonical_url TEXT NOT NULL UNIQUE,
+    raw_url       TEXT,
+    title         TEXT,
+    domain        TEXT,
+    fetched_at    TEXT
+);
 """
+
+_SOURCE_ID_RE = re.compile(r"^S(\d+)$", re.IGNORECASE)
 
 
 # Allowed entity_type values. Free-text values are accepted (the writer side
@@ -168,6 +186,21 @@ def _normalize_canonical(name: str) -> str:
 
 def build_entry_id(*, entity_canonical: str, entity_type: str) -> str:
     return sha1(f"{entity_canonical}|{entity_type}".encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class SourceRecord:
+    source_id: str          # compact, stable: "S1", "S2", …
+    canonical_url: str
+    raw_url: str | None = None
+    title: str | None = None
+    domain: str | None = None
+    fetched_at: str | None = None
+
+
+def is_source_id(token: str) -> bool:
+    """True if *token* is a source-registry citation id (``S<n>``)."""
+    return bool(_SOURCE_ID_RE.match((token or "").strip()))
 
 
 # ── Codegen methodology RAG ──────────────────────────────────────────────────
@@ -252,6 +285,71 @@ class KnowledgeDatabase:
                 (canonical,),
             ).fetchone()
         return _row_to_entry(row) if row else None
+
+    # ── Source registry (issue #9) ──────────────────────────────────────────
+
+    def intern_source(
+        self, raw_url: str, *, title: str | None = None, fetched_at: str | None = None
+    ) -> str | None:
+        """Canonicalize *raw_url*, store it once, and return its stable id
+        ``S<n>``. Different redirect/tracking wrappers around the same
+        destination canonicalize identically and collapse to one record (D3).
+        Returns None when *raw_url* has no usable http(s) URL, or when it is an
+        opaque redirect that cannot be traced back to its origin (issue #9
+        requires every stored source be expandable to a real article)."""
+        if not is_traceable_source(raw_url):
+            return None
+        canonical = canonicalize_url(raw_url)
+        if not canonical:
+            return None
+        domain = source_domain(canonical) or None
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT source_id FROM sources WHERE canonical_url = ?", (canonical,)
+            ).fetchone()
+            if row is not None:
+                sid = int(row["source_id"])
+                if title:
+                    conn.execute(
+                        "UPDATE sources SET title = ? "
+                        "WHERE source_id = ? AND (title IS NULL OR title = '')",
+                        (title, sid),
+                    )
+                return f"S{sid}"
+            cur = conn.execute(
+                "INSERT INTO sources (canonical_url, raw_url, title, domain, fetched_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    canonical,
+                    (raw_url or "").strip() or None,
+                    title or None,
+                    domain,
+                    fetched_at or _utc_now_iso(),
+                ),
+            )
+            return f"S{int(cur.lastrowid)}"
+
+    def get_source(self, source_id: str) -> SourceRecord | None:
+        """Look up a source by its ``S<n>`` id. Returns None for an unknown or
+        malformed id."""
+        match = _SOURCE_ID_RE.match((source_id or "").strip())
+        if not match:
+            return None
+        rowid = int(match.group(1))
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM sources WHERE source_id = ?", (rowid,)
+            ).fetchone()
+        if row is None:
+            return None
+        return SourceRecord(
+            source_id=f"S{int(row['source_id'])}",
+            canonical_url=str(row["canonical_url"]),
+            raw_url=row["raw_url"],
+            title=row["title"],
+            domain=row["domain"],
+            fetched_at=row["fetched_at"],
+        )
 
     def upsert_entry(
         self,
