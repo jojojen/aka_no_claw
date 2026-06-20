@@ -34,6 +34,7 @@ from hashlib import sha1
 from pathlib import Path
 from typing import Iterator, Protocol, runtime_checkable
 
+from .domain_registry import build_domain_id, get_domain
 from .url_canonicalize import canonicalize_url, is_traceable_source, source_domain
 
 logger = logging.getLogger(__name__)
@@ -127,12 +128,17 @@ CREATE TABLE IF NOT EXISTS embeddings (
 -- addressed by a stable compact id "S<rowid>". RAG findings cite these ids
 -- instead of embedding multi-thousand-char redirect/tracking URLs. AUTOINCREMENT
 -- guarantees ids are never reused, so a citation stays valid forever.
+-- domain_id references the canonical Domain Registry record (issue #11) by id,
+-- collapsing host aliases (twitter.com → dom_xcom) instead of repeating the
+-- bare host string. Derived deterministically from the canonical host so the
+-- reference stays valid forever; NULL only for legacy rows with no host.
 CREATE TABLE IF NOT EXISTS sources (
     source_id     INTEGER PRIMARY KEY AUTOINCREMENT,
     canonical_url TEXT NOT NULL UNIQUE,
     raw_url       TEXT,
     title         TEXT,
     domain        TEXT,
+    domain_id     TEXT,
     fetched_at    TEXT
 );
 """
@@ -188,6 +194,19 @@ def build_entry_id(*, entity_canonical: str, entity_type: str) -> str:
     return sha1(f"{entity_canonical}|{entity_type}".encode("utf-8")).hexdigest()
 
 
+def _resolve_domain_id(domain: str | None) -> str | None:
+    """Canonical Domain Registry id for a source host (issue #11).
+
+    A seeded host (incl. an alias like ``twitter.com``) collapses to its
+    canonical record's id (``dom_xcom``); an unseeded host gets a deterministic
+    ``dom_*`` id from ``build_domain_id`` so the reference is stable even before
+    the domain is seeded. Returns None only when there is no host."""
+    if not domain:
+        return None
+    rec = get_domain(domain)
+    return rec.domain_id if rec is not None else build_domain_id(domain)
+
+
 @dataclass(frozen=True)
 class SourceRecord:
     source_id: str          # compact, stable: "S1", "S2", …
@@ -195,6 +214,7 @@ class SourceRecord:
     raw_url: str | None = None
     title: str | None = None
     domain: str | None = None
+    domain_id: str | None = None  # canonical Domain Registry id (issue #11)
     fetched_at: str | None = None
 
 
@@ -272,6 +292,26 @@ class KnowledgeDatabase:
     def bootstrap(self) -> None:
         with self.connect() as conn:
             conn.executescript(_SCHEMA)
+            self._migrate_source_domain_id(conn)
+
+    @staticmethod
+    def _migrate_source_domain_id(conn: sqlite3.Connection) -> None:
+        """Add sources.domain_id to pre-#11 DBs and backfill it from the stored
+        domain. CREATE TABLE IF NOT EXISTS won't alter an existing table, so an
+        old `sources` keeps its original columns until this runs."""
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(sources)")}
+        if "domain_id" not in cols:
+            conn.execute("ALTER TABLE sources ADD COLUMN domain_id TEXT")
+        for row in conn.execute(
+            "SELECT source_id, domain FROM sources "
+            "WHERE domain_id IS NULL AND domain IS NOT NULL"
+        ).fetchall():
+            domain_id = _resolve_domain_id(row["domain"])
+            if domain_id:
+                conn.execute(
+                    "UPDATE sources SET domain_id = ? WHERE source_id = ?",
+                    (domain_id, int(row["source_id"])),
+                )
 
     # ── Entry CRUD ──────────────────────────────────────────────────────────
 
@@ -303,6 +343,7 @@ class KnowledgeDatabase:
         if not canonical:
             return None
         domain = source_domain(canonical) or None
+        domain_id = _resolve_domain_id(domain)
         with self.connect() as conn:
             row = conn.execute(
                 "SELECT source_id FROM sources WHERE canonical_url = ?", (canonical,)
@@ -317,13 +358,14 @@ class KnowledgeDatabase:
                     )
                 return f"S{sid}"
             cur = conn.execute(
-                "INSERT INTO sources (canonical_url, raw_url, title, domain, fetched_at) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO sources (canonical_url, raw_url, title, domain, domain_id, fetched_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     canonical,
                     (raw_url or "").strip() or None,
                     title or None,
                     domain,
+                    domain_id,
                     fetched_at or _utc_now_iso(),
                 ),
             )
@@ -378,6 +420,7 @@ class KnowledgeDatabase:
             raw_url=row["raw_url"],
             title=row["title"],
             domain=row["domain"],
+            domain_id=row["domain_id"],
             fetched_at=row["fetched_at"],
         )
 
