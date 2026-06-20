@@ -1,5 +1,9 @@
 # /new 端到端鑑別度測試（E2E Discriminating Tests）
 
+Last reviewed: 2026-06-20
+Status: Current
+Owner area: dynamic-tools
+
 目的：用三題無法靠訓練資料矇混的問題，驗證 /new 從「蒐集資料」到「實作工具」
 的整套流程。三題分別打中不同的管線段：
 

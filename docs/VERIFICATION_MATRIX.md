@@ -1,5 +1,8 @@
 # Verification Matrix
 
+Status: Current
+Owner area: verification
+
 Last reviewed: 2026-06-20
 
 ## Verification By Change Type

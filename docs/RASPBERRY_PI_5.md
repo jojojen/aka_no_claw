@@ -1,5 +1,9 @@
 # Raspberry Pi 5 Quick Run
 
+Last reviewed: 2026-06-20
+Status: Needs review
+Owner area: operations
+
 Put these three folders under the same parent directory on the Raspberry Pi:
 
 ```text

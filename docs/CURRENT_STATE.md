@@ -1,5 +1,8 @@
 # Current State
 
+Status: Current
+Owner area: agent-maintenance
+
 Last reviewed: 2026-06-20
 
 ## Status Legend

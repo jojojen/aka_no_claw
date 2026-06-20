@@ -1,5 +1,8 @@
 # System Map
 
+Status: Current
+Owner area: architecture
+
 Last reviewed: 2026-06-20
 
 ## Repo Map

@@ -1,5 +1,8 @@
 # Task Routing
 
+Status: Current
+Owner area: agent-maintenance
+
 Last reviewed: 2026-06-20
 
 ## Quick Routing Table

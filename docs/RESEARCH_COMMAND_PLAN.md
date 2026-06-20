@@ -1,5 +1,9 @@
 # /research 深度商品研究功能規劃與實作現況
 
+Last reviewed: 2026-06-20
+Status: Current
+Owner area: research
+
 > 狀態：已實作並上線。2026-06-12 起草，2026-06-19 已完成 `/research` 主流程、Mercari item adapter、`ItemData` / `ResearchSectionResult` contract、knowledge DB `research_command` origin、seller reputation snapshot、第一版合理市價分析、基於 sold/active 樣本的流動性分析，以及 `/research` appreciation 雲端 offload + stage 3/4/6 平行化。
 > 注意：使用者輸入打成 `/resaerch` 也應容錯（dispatcher 加 alias）。
 

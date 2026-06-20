@@ -1,5 +1,8 @@
 # Agent Onboarding
 
+Status: Current
+Owner area: agent-maintenance
+
 Last reviewed: 2026-06-20
 
 ## Read This First

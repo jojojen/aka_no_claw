@@ -1,5 +1,9 @@
 # SNS Monitor 故障排除指南
 
+Last reviewed: 2026-06-20
+Status: Current
+Owner area: sns
+
 ## 問題: 沒有收到 X (Twitter) 通知
 
 ### 症狀

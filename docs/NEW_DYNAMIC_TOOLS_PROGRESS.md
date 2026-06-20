@@ -1,5 +1,9 @@
 # `/new` 動態自寫工具 — 開發進度與接手指南
 
+Last reviewed: 2026-06-20
+Status: Current
+Owner area: dynamic-tools
+
 > 給接手者（人或 codex）：本檔是 single source of truth。每完成一段落會更新。
 > 目標：Telegram `/new <需求>` → 本地 qwen3:14b 自己寫 Python 工具 → 護欄下執行 →
 > 回答案，並把工具存進 gitignored `generated_tools/`（含 manifest）供重用。全程地端、零 API 費用。

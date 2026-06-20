@@ -24,6 +24,7 @@ Full inventory with recommended actions is in [DOC_AUDIT.md](DOC_AUDIT.md).
 | [DOCUMENTATION_GOVERNANCE.md](DOCUMENTATION_GOVERNANCE.md) | Current | agent-maintenance | Truth ownership, lifecycle stages, update rules, where new docs go. |
 | [DOC_AUDIT.md](DOC_AUDIT.md) | Current | agent-maintenance | Full doc inventory with status, owner, recommended action. |
 | [DOC_DRIFT_CHECKLIST.md](DOC_DRIFT_CHECKLIST.md) | Current | agent-maintenance | Pre-push consistency check across the five linked truth sources. |
+| [DOCS_CHANGE_TEMPLATE.md](DOCS_CHANGE_TEMPLATE.md) | Current | agent-maintenance | PR checklist for doc/status/wiring changes; mirrors the automated checks. |
 
 ## Design / Methodology
 

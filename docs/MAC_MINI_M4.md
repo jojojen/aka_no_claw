@@ -1,5 +1,9 @@
 # Mac mini M4 Quick Run
 
+Last reviewed: 2026-06-20
+Status: Current
+Owner area: operations
+
 This launcher mirrors the Raspberry Pi stack launcher, but targets a Mac mini M4 / Apple Silicon setup.
 
 Keep these three folders under the same parent directory:

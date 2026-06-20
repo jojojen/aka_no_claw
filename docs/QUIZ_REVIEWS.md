@@ -1,5 +1,9 @@
 # /quiz cross-agent review log (`quiz_reviews` table)
 
+Last reviewed: 2026-06-20
+Status: Current
+Owner area: quiz
+
 This is how review feedback flows between the agents that author `/quiz`
 questions (currently **codex**, **Claude**, **qwen3:14b**). One agent reviews
 another agent's questions and records a verdict + comment per question in the

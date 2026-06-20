@@ -1,5 +1,9 @@
 # /quiz Favorite Songs
 
+Last reviewed: 2026-06-20
+Status: Current
+Owner area: quiz
+
 Last updated: 2026-06-05 JST
 
 ## Command

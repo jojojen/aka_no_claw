@@ -1,5 +1,9 @@
 # ✨ 完全自動化啟動指南
 
+Last reviewed: 2026-06-20
+Status: Needs review
+Owner area: operations
+
 **無需任何手動操作** - 所有 Cookies 獲取和登錄已整合到服務啟動過程中。
 
 ---

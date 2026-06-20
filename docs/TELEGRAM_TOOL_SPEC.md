@@ -1,5 +1,9 @@
 # OpenClaw Telegram Tool Spec
 
+Last reviewed: 2026-06-20
+Status: Needs review
+Owner area: telegram
+
 The Telegram assistant can reach these tools:
 
 - `/help`

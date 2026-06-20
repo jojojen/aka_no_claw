@@ -1,5 +1,9 @@
 # Logging Guide
 
+Last reviewed: 2026-06-20
+Status: Current
+Owner area: operations
+
 ## Overview
 
 OpenClaw now writes detailed runtime logs for the main assistant entrypoints and the TCG lookup pipeline.
