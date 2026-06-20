@@ -332,16 +332,25 @@ class KnowledgeDatabase:
     def _intern_source_refs(self, source_urls: tuple[str, ...]) -> tuple[str, ...]:
         """Normalize an entry's source refs to stable registry ids (issue #9 D4).
 
-        Already-interned ``S<n>`` ids pass through unchanged (e.g. EntityResearcher
-        interns at the producer); raw URLs are interned to their id; opaque /
-        non-traceable URLs are dropped — a stored citation must resolve back to a
-        real article."""
+        Already-interned ``S<n>`` ids pass through *only when they resolve* to a
+        real registry row (e.g. EntityResearcher interns at the producer); raw
+        URLs are interned to their id; opaque / non-traceable URLs and dangling
+        ids (matching the shape but with no ``sources`` row) are dropped — a
+        stored citation must resolve back to a real article."""
         refs: list[str] = []
         for ref in source_urls:
             ref = (ref or "").strip()
             if not ref:
                 continue
             if is_source_id(ref):
+                # Shape alone is not traceability: drop an id with no registry
+                # row so we never store a dangling, unresolvable citation.
+                if self.get_source(ref) is None:
+                    logger.warning(
+                        "upsert_entry: dropping dangling source id %r (no sources row)",
+                        ref,
+                    )
+                    continue
                 if ref not in refs:
                     refs.append(ref)
                 continue
