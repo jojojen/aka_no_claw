@@ -6,7 +6,6 @@ import math
 import pathlib
 import re
 import statistics
-import tempfile
 import threading
 import time
 import unicodedata
@@ -38,29 +37,31 @@ _SOLD_AVG_SCRAPE_TIMEOUT = 75.0
 _SHOP_REF_SCRAPE_TIMEOUT = 75.0
 _ITEM_HTML_SCRAPE_TIMEOUT = 90.0
 
-# Cross-process yuyu-tei rate-limit state — written by the scrape subprocess when
-# it receives a 429, read by the parent before launching the next subprocess so we
-# don't naively retry a host that just told us to back off.  In-process circuit
-# breaker resets on subprocess exit; this file keeps the signal alive across calls.
+# Cross-process yuyu-tei rate-limit state. The per-host circuit breaker in
+# market_monitor.http persists a wall-clock cooldown to a tempdir marker file on
+# any 429, so a background process (opportunity-agent, watchlist monitor) that
+# trips yuyu-tei is visible to the foreground /research worker before it fires a
+# fresh live request. We delegate to that shared breaker rather than keeping a
+# second, independent cooldown file that could drift out of sync.
 _YUYUTEI_CROSS_PROCESS_COOLDOWN_SECS = 300.0
-
-
-def _yuyutei_cooldown_path() -> pathlib.Path:
-    return pathlib.Path(tempfile.gettempdir()) / "openclaw_yuyutei_cooldown"
+_YUYUTEI_COOLDOWN_URL = "https://yuyu-tei.jp/"
 
 
 def _yuyutei_cooldown_remaining() -> float:
     try:
-        age = time.time() - _yuyutei_cooldown_path().stat().st_mtime
-        return max(0.0, _YUYUTEI_CROSS_PROCESS_COOLDOWN_SECS - age)
-    except OSError:
+        from market_monitor.http import host_cooldown_remaining
+
+        return host_cooldown_remaining(_YUYUTEI_COOLDOWN_URL)
+    except Exception:  # noqa: BLE001 — cooldown read must never break a research run
         return 0.0
 
 
 def _yuyutei_trip_cross_process_cooldown() -> None:
     try:
-        _yuyutei_cooldown_path().touch()
-    except OSError:
+        from market_monitor.http import trip_host_cooldown
+
+        trip_host_cooldown(_YUYUTEI_COOLDOWN_URL, _YUYUTEI_CROSS_PROCESS_COOLDOWN_SECS)
+    except Exception:  # noqa: BLE001 — best-effort signal; never break a research run
         pass
 
 SearchFn = Callable[[str, int], tuple[object, ...]]
