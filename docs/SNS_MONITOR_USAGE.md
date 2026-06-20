@@ -1,5 +1,9 @@
 # SNS Monitor 使用指南
 
+Last reviewed: 2026-06-20
+Status: Current
+Owner area: sns
+
 SNS Monitor 讓你在 X (Twitter) 上追蹤帳號、關鍵字和熱門話題，並在 Telegram 上接收通知。
 
 ## 快速開始

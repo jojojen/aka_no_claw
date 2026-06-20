@@ -1,5 +1,8 @@
 # /quiz vocabulary-card expansion progress
 
+Last reviewed: 2026-06-20
+Owner area: quiz
+
 Last updated: 2026-06-13 JST
 
 ## Goal

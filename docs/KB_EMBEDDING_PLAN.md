@@ -1,5 +1,9 @@
 # KB Embedding 檢索 — 落地計畫
 
+Last reviewed: 2026-06-20
+Status: Needs review
+Owner area: knowledge
+
 狀態：設計確定，實作中。最後更新 2026-06-16。
 Spike：`spikes/embedding_retrieval/`（可獨立重跑，`rm -rf` 即移除）。
 

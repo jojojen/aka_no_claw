@@ -31,6 +31,7 @@ for which question each one answers.
 | `DOC_AUDIT.md` | Current | agent-maintenance | This file; refresh during each governance pass. |
 | `DOCUMENTATION_GOVERNANCE.md` | Current | agent-maintenance | Keep; lifecycle + update rules. |
 | `DOC_DRIFT_CHECKLIST.md` | Current | agent-maintenance | Keep; run before doc-touching pushes. |
+| `DOCS_CHANGE_TEMPLATE.md` | Current | agent-maintenance | Keep; PR checklist mirroring the automated checks (`scripts/check_docs_*`). |
 
 ## Design / methodology (active)
 

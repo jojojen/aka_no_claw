@@ -1,5 +1,9 @@
 # OpenClaw + Telegram TCG 監控系統規劃
 
+Last reviewed: 2026-06-20
+Status: Needs review
+Owner area: price/tcg
+
 最後更新：2026-04-14
 
 ## 1. 文件目的

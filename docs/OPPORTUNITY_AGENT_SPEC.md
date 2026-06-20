@@ -1,5 +1,8 @@
 # OpenClaw Opportunity Agent Spec
 
+Last reviewed: 2026-06-20
+Owner area: opportunity
+
 Status: production. Last updated 2026-05-16.
 Owner layer: `aka_no_claw` integration runtime
 Runtime command: `python -m openclaw_adapter opportunity-agent`

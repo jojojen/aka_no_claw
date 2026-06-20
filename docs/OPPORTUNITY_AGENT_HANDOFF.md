@@ -1,5 +1,9 @@
 # Opportunity Agent Handoff
 
+Last reviewed: 2026-06-20
+Status: Needs review
+Owner area: opportunity
+
 Last updated: 2026-05-16
 
 ## Phase Log

@@ -1,5 +1,9 @@
 # /quiz 出題進度與交接紀錄
 
+Last reviewed: 2026-06-20
+Status: Current
+Owner area: quiz
+
 Last updated: 2026-06-13 JST
 
 ## Runtime Notes

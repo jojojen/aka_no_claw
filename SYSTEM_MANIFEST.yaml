@@ -448,3 +448,6 @@ issue_tracking:
     - issue: 5
       title: "docs: Documentation Consolidation & Governance Pass"
       status: implemented
+    - issue: 7
+      title: "docs/tooling: Documentation Health & Drift Enforcement"
+      status: implemented

@@ -1,5 +1,9 @@
 # Liquidity / Trend Methodology
 
+Last reviewed: 2026-06-20
+Status: Current
+Owner area: price/liquidity
+
 Last updated: 2026-04-17
 
 這份文件說明 dashboard 上 `Pokemon Liquidity Board` 與 `WS Liquidity Board` 目前怎麼排序，以及為什麼這次把邏輯從「單一店家買盤 proxy」改成「近期交易熱度 + 買方承接 + SNS 注意力」的混合模型。
