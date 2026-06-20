@@ -39,6 +39,12 @@ from typing import Callable
 
 from assistant_runtime import AssistantSettings
 
+from .domain_registry import (
+    get_domain,
+    get_domain_trust,
+    get_source_type,
+    source_type_label,
+)
 from .knowledge_db import is_source_id
 
 logger = logging.getLogger(__name__)
@@ -66,10 +72,24 @@ def build_source_handler(
             return f"來源查詢失敗：{exc}"
         if rec is None:
             return f"找不到來源 {token.upper()}。"
+        dom = get_domain(rec.domain or rec.canonical_url)
         lines = [
             f"🔗 來源 {rec.source_id}",
             f"標題：{rec.title or '（無）'}",
             f"網域：{rec.domain or '（無）'}",
+        ]
+        if dom is not None:
+            lines += [
+                f"來源類型：{dom.display_name}（{source_type_label(dom.source_type)}）",
+                f"信任度：{dom.trust_score:.0%}",
+            ]
+        else:
+            stype = get_source_type(rec.domain or rec.canonical_url)
+            lines += [
+                f"來源類型：{source_type_label(stype)}（未收錄網域，採預設）",
+                f"信任度：{get_domain_trust(rec.domain or rec.canonical_url):.0%}",
+            ]
+        lines += [
             f"擷取時間：{rec.fetched_at or '（無）'}",
             "",
             f"連結：{rec.canonical_url}",

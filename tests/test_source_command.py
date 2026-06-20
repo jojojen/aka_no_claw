@@ -31,6 +31,24 @@ def test_source_lookup_shows_traceable_fields(tmp_path):
     assert "https://www.suruga-ya.jp/item/1" in out  # canonical, resolves to real source
 
 
+def test_source_lookup_shows_domain_registry_metadata(tmp_path):
+    """A seeded domain enriches /source with display name, type and trust (#11)."""
+    handler, db = _handler(tmp_path)
+    sid = db.intern_source("https://www.suruga-ya.jp/item/2", title="Suruga-ya item 2")
+    out = handler(sid, "123")
+    assert "Suruga-ya（Marketplace）" in out
+    assert "信任度：" in out
+
+
+def test_source_lookup_unseeded_domain_uses_default(tmp_path):
+    """An unseeded host falls back to the default source-type / trust prior."""
+    handler, db = _handler(tmp_path)
+    sid = db.intern_source("https://example.com/article", title="Some article")
+    out = handler(sid, "123")
+    assert "未收錄網域" in out
+    assert "信任度：" in out
+
+
 def test_source_unknown_id(tmp_path):
     handler, _ = _handler(tmp_path)
     assert "找不到" in handler("S999", "123")
