@@ -23,6 +23,7 @@ from .knowledge_db import (
     is_operational_cache_entry,
     is_source_id,
 )
+from .domain_registry import domain_citation_label
 from .url_canonicalize import source_domain
 
 logger = logging.getLogger(__name__)
@@ -80,8 +81,10 @@ def _is_product_intelligence(entry: KnowledgeEntry) -> bool:
 def _render_citation(ref: str, db: KnowledgeDB | None) -> str:
     """Render one source ref as a compact, traceable citation.
 
-    - ``S<n>`` source ids resolve (via *db*) to ``[S1] domain`` — the compact
-      form issue #9 wants in place of multi-thousand-char redirect URLs.
+    - ``S<n>`` source ids resolve (via *db*) to ``[S1] Suruga-ya (Marketplace)``
+      — the compact form issue #9 wants, now enriched with the issue #11 domain
+      label (display name + source type) for seeded hosts, falling back to the
+      bare domain for unseeded ones.
     - Legacy raw URLs (interned before the registry, or when interning failed)
       degrade to their domain label so citations stay readable either way.
     """
@@ -91,10 +94,10 @@ def _render_citation(ref: str, db: KnowledgeDB | None) -> str:
     if is_source_id(ref):
         rec = db.get_source(ref) if db is not None else None
         if rec is not None:
-            label = rec.domain or source_domain(rec.canonical_url) or rec.canonical_url
-            return f"[{rec.source_id}] {label}"
+            host = rec.domain or source_domain(rec.canonical_url) or rec.canonical_url
+            return f"[{rec.source_id}] {domain_citation_label(host)}"
         return f"[{ref}]"
-    return source_domain(ref) or ref
+    return domain_citation_label(ref) or source_domain(ref) or ref
 
 
 def _format_entry_message(
@@ -146,7 +149,8 @@ def _format_signal_message(
     if signal.actionability == "blocked" and signal.block_reason:
         state = f"{state}（{signal.block_reason}）"
 
-    citations = [source_domain(u) or u for u in signal.source_urls[:2]]
+    citations = [domain_citation_label(u) or source_domain(u) or u
+                 for u in signal.source_urls[:2]]
     sources = "、".join(c for c in citations if c)
 
     lines = [

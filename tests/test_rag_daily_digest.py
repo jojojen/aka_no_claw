@@ -98,7 +98,7 @@ def test_digest_renders_compact_source_citation(tmp_path):
     sched._send_digest()
     assert len(sent) == 1
     text = sent[0][1]
-    assert f"[{sid}] suruga-ya.jp" in text
+    assert f"[{sid}] Suruga-ya (Marketplace)" in text  # issue #11 enriched label
     assert "google.com/url" not in text  # no raw redirect wrapper leaked
     assert "utm_source" not in text
 
@@ -125,7 +125,9 @@ def test_digest_legacy_raw_url_degrades_to_domain(tmp_path):
         )
     sched._send_digest()
     assert len(sent) == 1
-    assert "suruga-ya.jp" in sent[0][1]
+    # legacy raw url → seeded domain label (issue #11), not the raw wrapper
+    assert "Suruga-ya (Marketplace)" in sent[0][1]
+    assert "utm_source" not in sent[0][1]
 
 
 def test_digest_mixed_sends_only_real(tmp_path):
