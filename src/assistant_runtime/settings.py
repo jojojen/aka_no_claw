@@ -70,6 +70,7 @@ class AssistantSettings:
     sns_inbox_db_path: str = "data/sns_inbox.sqlite3"
     knowledge_db_path: str = "data/knowledge.sqlite3"
     market_entity_db_path: str = "data/market_entities.sqlite3"
+    price_ledger_db_path: str = "data/price_ledger.sqlite3"
     knowledge_inbox_db_path: str = "data/knowledge_inbox.sqlite3"
     opportunity_inbox_db_path: str = "data/opportunity_inbox.sqlite3"
     watch_inbox_db_path: str = "data/watch_inbox.sqlite3"
@@ -236,6 +237,7 @@ def get_settings() -> AssistantSettings:
         sns_inbox_db_path=_resolve_runtime_path(os.getenv("SNS_INBOX_DB_PATH", "data/sns_inbox.sqlite3")),
         knowledge_db_path=_resolve_runtime_path(os.getenv("KNOWLEDGE_DB_PATH", "data/knowledge.sqlite3")),
         market_entity_db_path=_resolve_runtime_path(os.getenv("MARKET_ENTITY_DB_PATH", "data/market_entities.sqlite3")),
+        price_ledger_db_path=_resolve_runtime_path(os.getenv("PRICE_LEDGER_DB_PATH", "data/price_ledger.sqlite3")),
         knowledge_inbox_db_path=_resolve_runtime_path(os.getenv("KNOWLEDGE_INBOX_DB_PATH", "data/knowledge_inbox.sqlite3")),
         opportunity_inbox_db_path=_resolve_runtime_path(os.getenv("OPPORTUNITY_INBOX_DB_PATH", "data/opportunity_inbox.sqlite3")),
         watch_inbox_db_path=_resolve_runtime_path(os.getenv("WATCH_INBOX_DB_PATH", "data/watch_inbox.sqlite3")),
