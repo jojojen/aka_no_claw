@@ -4,6 +4,7 @@ from assistant_runtime import AssistantSettings
 
 from openclaw_adapter.reputation_snapshot import (
     ReputationSnapshotClient,
+    SnapshotStillPending,
     request_reputation_snapshot,
 )
 
@@ -67,7 +68,7 @@ def test_reputation_snapshot_client_polls_until_job_finishes(monkeypatch) -> Non
     assert result.proof_url == "http://127.0.0.1:5000/p/proof_new"
 
 
-def test_reputation_snapshot_client_times_out_with_agent_hint(monkeypatch) -> None:
+def test_reputation_snapshot_client_times_out_raises_snapshot_still_pending(monkeypatch) -> None:
     def fake_request_json(self, path: str, *, method: str, body: dict[str, object] | None = None) -> dict[str, object]:
         assert path == "/api/captures"
         assert method == "POST"
@@ -76,12 +77,11 @@ def test_reputation_snapshot_client_times_out_with_agent_hint(monkeypatch) -> No
     monkeypatch.setattr(ReputationSnapshotClient, "_request_json", fake_request_json)
     client = ReputationSnapshotClient(settings=_settings(), poll_interval_seconds=0.0, job_timeout_seconds=0.0)
 
-    try:
+    import pytest
+    with pytest.raises(SnapshotStillPending) as exc_info:
         client.create_or_reuse_snapshot("https://jp.mercari.com/item/m123456789")
-    except RuntimeError as exc:
-        assert "reputation agent" in str(exc)
-    else:  # pragma: no cover - defensive.
-        raise AssertionError("Expected a timeout error when no reputation agent is available.")
+    assert exc_info.value.job_id == "job_123"
+    assert callable(exc_info.value.poll_fn)
 
 
 def test_request_reputation_snapshot_uses_settings_job_timeout(monkeypatch) -> None:
@@ -117,3 +117,55 @@ def test_request_reputation_snapshot_uses_settings_job_timeout(monkeypatch) -> N
     )
 
     assert captured["job_timeout_seconds"] == 300.0
+
+
+def test_poll_until_done_returns_result_when_job_completes(monkeypatch) -> None:
+    responses = iter([
+        {"status": "processing"},
+        {"status": "done", "proof_id": "proof_bg", "proof_url": "/p/proof_bg"},
+    ])
+
+    def fake_request_json(self, path: str, *, method: str, body=None):
+        return next(responses)
+
+    monkeypatch.setattr(ReputationSnapshotClient, "_request_json", fake_request_json)
+    client = ReputationSnapshotClient(settings=_settings(), poll_interval_seconds=0.0)
+    result = client._poll_until_done("job_bg", max_seconds=60.0)
+    assert result is not None
+    assert result.proof_id == "proof_bg"
+
+
+def test_poll_until_done_returns_none_on_failure(monkeypatch) -> None:
+    def fake_request_json(self, path: str, *, method: str, body=None):
+        return {"status": "failed", "error": "Mercari blocked"}
+
+    monkeypatch.setattr(ReputationSnapshotClient, "_request_json", fake_request_json)
+    client = ReputationSnapshotClient(settings=_settings(), poll_interval_seconds=0.0)
+    result = client._poll_until_done("job_fail", max_seconds=60.0)
+    assert result is None
+
+
+def test_poll_until_done_returns_none_on_hard_cap(monkeypatch) -> None:
+    def fake_request_json(self, path: str, *, method: str, body=None):
+        return {"status": "processing"}
+
+    monkeypatch.setattr(ReputationSnapshotClient, "_request_json", fake_request_json)
+    client = ReputationSnapshotClient(settings=_settings(), poll_interval_seconds=0.0)
+    result = client._poll_until_done("job_cap", max_seconds=0.0)
+    assert result is None
+
+
+def test_poll_until_done_tolerates_transient_http_errors(monkeypatch) -> None:
+    calls = [0]
+
+    def fake_request_json(self, path: str, *, method: str, body=None):
+        calls[0] += 1
+        if calls[0] < 3:
+            raise RuntimeError("transient")
+        return {"status": "done", "proof_id": "proof_ok", "proof_url": "/p/proof_ok"}
+
+    monkeypatch.setattr(ReputationSnapshotClient, "_request_json", fake_request_json)
+    client = ReputationSnapshotClient(settings=_settings(), poll_interval_seconds=0.0)
+    result = client._poll_until_done("job_retry", max_seconds=60.0)
+    assert result is not None
+    assert result.proof_id == "proof_ok"

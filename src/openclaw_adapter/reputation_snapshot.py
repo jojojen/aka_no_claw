@@ -3,11 +3,31 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
+from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 
 from assistant_runtime import AssistantSettings, build_ssl_context
+
+
+class SnapshotStillPending(RuntimeError):
+    """Raised when a job did not complete within the initial poll budget.
+
+    Carries poll_fn so callers can background-track the job and deliver
+    the result asynchronously without discarding it.
+    """
+
+    def __init__(
+        self,
+        job_id: str,
+        poll_fn: "Callable[[], ReputationSnapshotResult | None]",
+    ) -> None:
+        super().__init__(
+            f"Snapshot job {job_id} is still pending (background tracking available)"
+        )
+        self.job_id = job_id
+        self.poll_fn = poll_fn
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,10 +78,33 @@ class ReputationSnapshotClient:
                 error = str(payload.get("error") or "Unknown reputation snapshot error.")
                 raise RuntimeError(error)
             time.sleep(self._poll_interval_seconds)
-        raise RuntimeError(
-            "Snapshot job is still pending. Make sure a reputation agent is running, "
-            "for example start OpenClaw with --with-reputation-agent."
+        raise SnapshotStillPending(
+            job_id,
+            poll_fn=lambda: self._poll_until_done(job_id, max_seconds=900.0),
         )
+
+    def _poll_until_done(
+        self, job_id: str, *, max_seconds: float
+    ) -> "ReputationSnapshotResult | None":
+        """Keep polling until done/failed/cap; tolerates transient HTTP errors.
+
+        Returns None on timeout or explicit failure (not an exception) so the
+        background thread can send a clean "timed out" message rather than crash.
+        """
+        deadline = time.monotonic() + max_seconds
+        while time.monotonic() < deadline:
+            try:
+                payload = self._request_json(f"/api/jobs/{job_id}", method="GET")
+            except Exception:
+                time.sleep(self._poll_interval_seconds)
+                continue
+            status = str(payload.get("status") or "").strip().lower()
+            if status == "done":
+                return self._build_result(payload, job_id=job_id)
+            if status == "failed":
+                return None
+            time.sleep(self._poll_interval_seconds)
+        return None
 
     def _build_result(
         self,

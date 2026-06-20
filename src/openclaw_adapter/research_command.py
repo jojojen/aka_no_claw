@@ -23,6 +23,7 @@ from market_monitor import browser_stealth as bs
 
 from .knowledge_db import KnowledgeDatabase, KnowledgeEntry
 from .market_title_corpus import record_titles as _record_market_titles
+from .reputation_snapshot import SnapshotStillPending
 from .scrape_subprocess import run_in_subprocess
 from .web_search import WebSearchResult
 
@@ -65,6 +66,10 @@ def _yuyutei_trip_cross_process_cooldown() -> None:
 SearchFn = Callable[[str, int], tuple[object, ...]]
 FetchHtmlFn = Callable[[str], str]
 SellerSnapshotLookupFn = Callable[[str], "SellerReputationSnapshot"]
+SellerSnapshotFollowupFn = Callable[
+    [str, Callable, "ResearchNotifier"],
+    None,
+]
 ActiveMarketSearchFn = Callable[[str, int, int], list[dict[str, object]]]
 SoldMarketSearchFn = Callable[[str, int], list[dict[str, object]]]
 SoldAverageLookupFn = Callable[[str], float | None]
@@ -985,6 +990,7 @@ class ResearchCommandService:
         item_fetcher: MercariItemAdapter | None = None,
         knowledge_db_path: str | None = None,
         seller_snapshot_lookup_fn: SellerSnapshotLookupFn | None = None,
+        seller_snapshot_followup_fn: "SellerSnapshotFollowupFn | None" = None,
         active_market_search_fn: ActiveMarketSearchFn | None = None,
         sold_market_search_fn: SoldMarketSearchFn | None = None,
         sold_average_lookup_fn: SoldAverageLookupFn | None = None,
@@ -1004,6 +1010,7 @@ class ResearchCommandService:
         self._item_fetcher = item_fetcher or MercariItemAdapter()
         self._knowledge_db_path = knowledge_db_path
         self._seller_snapshot_lookup_fn = seller_snapshot_lookup_fn
+        self._seller_snapshot_followup_fn = seller_snapshot_followup_fn
         self._active_market_search_fn = active_market_search_fn or _default_active_market_search
         self._sold_market_search_fn = sold_market_search_fn or _default_sold_market_search
         self._sold_average_lookup_fn = sold_average_lookup_fn or _default_sold_average_lookup
@@ -1541,6 +1548,30 @@ class ResearchCommandService:
 
         try:
             snapshot = self._seller_snapshot_lookup_fn(snapshot_query_url)
+        except SnapshotStillPending as exc:
+            if self._seller_snapshot_followup_fn is not None:
+                self._seller_snapshot_followup_fn(
+                    snapshot_query_url, exc.poll_fn, ctx.notifier
+                )
+            summary = (
+                f"賣家快照處理中（Mercari 評價頁載入慢，job={exc.job_id}），"
+                "完成後自動補送結果。"
+            )
+            result = ResearchSectionResult(
+                section_name="賣家風險分析",
+                status="partial",
+                confidence=0.2,
+                sample_count=0,
+                evidence_count=1,
+                summary=summary,
+                evidence_urls=(snapshot_query_url,),
+                warnings=(
+                    summary,
+                    f"建議跟進：/snapshot {snapshot_query_url}",
+                ),
+            )
+            ctx.add_section_result(result)
+            return summary
         except Exception as exc:
             summary = f"賣家 reputation snapshot 失敗：{exc}"
             result = ResearchSectionResult(
@@ -1573,6 +1604,7 @@ def build_research_handler(
     item_fetcher: MercariItemAdapter | None = None,
     knowledge_db_path: str | None = None,
     seller_snapshot_lookup_fn: SellerSnapshotLookupFn | None = None,
+    seller_snapshot_followup_fn: "SellerSnapshotFollowupFn | None" = None,
     active_market_search_fn: ActiveMarketSearchFn | None = None,
     sold_market_search_fn: SoldMarketSearchFn | None = None,
     sold_average_lookup_fn: SoldAverageLookupFn | None = None,
@@ -1594,6 +1626,7 @@ def build_research_handler(
         item_fetcher=item_fetcher,
         knowledge_db_path=knowledge_db_path,
         seller_snapshot_lookup_fn=seller_snapshot_lookup_fn,
+        seller_snapshot_followup_fn=seller_snapshot_followup_fn,
         active_market_search_fn=active_market_search_fn,
         sold_market_search_fn=sold_market_search_fn,
         sold_average_lookup_fn=sold_average_lookup_fn,

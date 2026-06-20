@@ -107,6 +107,7 @@ from .research_command import (
     build_research_item_fetch_html,
     format_research_compact_report,
     format_research_detail_report,
+    _build_seller_snapshot_section_result,
 )
 from .natural_language import build_telegram_natural_language_router_from_settings
 from .quiz_favorite_songs import extract_first_youtube_url
@@ -119,6 +120,7 @@ from .opportunity_command import (
 from .reputation_agent import ensure_agent_thread
 from .reputation_snapshot import (
     ReputationSnapshotResult,
+    SnapshotStillPending,
     fetch_reputation_proof_document,
     request_reputation_snapshot,
 )
@@ -1044,6 +1046,7 @@ def _build_registries(
         item_fetcher=MercariItemAdapter(fetch_html_fn=build_research_item_fetch_html()),
         knowledge_db_path=settings.knowledge_db_path,
         seller_snapshot_lookup_fn=_build_research_seller_snapshot_lookup(settings),
+        seller_snapshot_followup_fn=_build_research_seller_snapshot_followup(settings),
         game_code_resolver_fn=_yuyutei_resolver.resolve if _yuyutei_resolver else None,
         cache_enricher_fn=_yuyutei_resolver.enrich_cache if _yuyutei_resolver else None,
         ip_heat_lookup_fn=_build_research_ip_heat_lookup(settings),
@@ -1273,6 +1276,73 @@ def _build_research_seller_snapshot_lookup(
         )
 
     return lookup
+
+
+def _build_research_seller_snapshot_followup(
+    settings: "AssistantSettings",
+) -> "Callable[[str, Callable, ResearchNotifier], None]":
+    """Return a followup fn that background-polls a pending snapshot and pushes the result."""
+    import threading as _threading
+
+    def _proof_doc_to_seller_snapshot(
+        seller_url: str,
+        result: ReputationSnapshotResult,
+        proof_doc: dict,
+    ) -> SellerReputationSnapshot:
+        subject = proof_doc.get("subject", {}) if isinstance(proof_doc, dict) else {}
+        metrics = proof_doc.get("metrics", {}) if isinstance(proof_doc, dict) else {}
+        quality = proof_doc.get("quality", {}) if isinstance(proof_doc, dict) else {}
+        review_entries = proof_doc.get("review_entries", ()) if isinstance(proof_doc, dict) else ()
+        as_seller = quality.get("as_seller") if isinstance(quality, dict) else None
+        as_buyer = quality.get("as_buyer") if isinstance(quality, dict) else None
+        overall = quality.get("overall") if isinstance(quality, dict) else None
+        return SellerReputationSnapshot(
+            seller_url=seller_url,
+            proof_url=result.proof_url,
+            proof_id=result.proof_id,
+            reused=result.reused,
+            display_name=subject.get("display_name") if isinstance(subject, dict) else None,
+            captured_at=proof_doc.get("captured_at") if isinstance(proof_doc, dict) else None,
+            total_reviews=metrics.get("total_reviews") if isinstance(metrics, dict) else None,
+            listing_count=metrics.get("listing_count") if isinstance(metrics, dict) else None,
+            followers_count=metrics.get("followers_count") if isinstance(metrics, dict) else None,
+            following_count=metrics.get("following_count") if isinstance(metrics, dict) else None,
+            seller_positive=as_seller.get("positive") if isinstance(as_seller, dict) else None,
+            seller_negative=as_seller.get("negative") if isinstance(as_seller, dict) else None,
+            seller_rate=as_seller.get("rate") if isinstance(as_seller, dict) else None,
+            buyer_positive=as_buyer.get("positive") if isinstance(as_buyer, dict) else None,
+            buyer_negative=as_buyer.get("negative") if isinstance(as_buyer, dict) else None,
+            buyer_rate=as_buyer.get("rate") if isinstance(as_buyer, dict) else None,
+            overall_rate=overall.get("rate") if isinstance(overall, dict) else None,
+            seller_negative_excerpts=_extract_negative_seller_review_excerpts(review_entries),
+        )
+
+    def followup(seller_url: str, poll_fn: "Callable", notifier: ResearchNotifier) -> None:
+        def _bg() -> None:
+            try:
+                result = poll_fn()
+                if result is None:
+                    notifier.send(
+                        f"⏰ 賣家快照逾時或失敗，請手動查詢：/snapshot {seller_url}"
+                    )
+                    return
+                proof_doc = (
+                    fetch_reputation_proof_document(settings=settings, proof_id=result.proof_id)
+                    if result.proof_id
+                    else {}
+                )
+                snapshot = _proof_doc_to_seller_snapshot(seller_url, result, proof_doc)
+                section = _build_seller_snapshot_section_result(snapshot)
+                notifier.send(f"📋 賣家風險分析（補送）\n{section.summary}")
+            except Exception as exc:
+                logger.error("seller snapshot followup failed seller_url=%s: %s", seller_url, exc)
+                notifier.send(
+                    f"⚠️ 賣家快照補送失敗：{exc}\n請手動查詢：/snapshot {seller_url}"
+                )
+
+        _threading.Thread(target=_bg, daemon=True, name="reputation-followup").start()
+
+    return followup
 
 
 def _extract_negative_seller_review_excerpts(review_entries: object) -> tuple[str, ...]:
