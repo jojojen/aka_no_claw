@@ -138,6 +138,88 @@ def test_official_path_runs_promote_gate_and_stores_decision(tmp_path):
     assert stored.metadata["promotion"]["fair_value_jpy"] == 6000
 
 
+def test_skipped_official_path_leaves_non_actionable_signal(tmp_path):
+    # codex repro: market price barely above retail → profit below the sealed-box
+    # threshold → 0 recommendations, and the signal must NOT remain 可下手.
+    candidate = _official_candidate()  # retail ¥4180, sealed_box
+    signal_store = CollectibleSignalStore(tmp_path / "sig.sqlite3")
+    signal_store.bootstrap()
+
+    class _ThinMarginPriceChecker:
+        def check(self, cand):
+            return PriceCheck(
+                candidate_id=cand.candidate_id,
+                fair_value_jpy=4300,  # ~2.9% over retail, below SEALED_BOX_MIN_PROFIT_PCT
+                confidence=0.8,
+                sample_count=9,
+            )
+
+    pipeline = _pipeline(
+        tmp_path,
+        provider=_OneShotProvider(candidate),
+        price_checker=_ThinMarginPriceChecker(),
+        signal_store=signal_store,
+    )
+
+    pipeline.run_once()
+
+    assert pipeline._notifier.sent == []  # not recommended
+    stored = signal_store.get_signal(candidate_to_signal(candidate).signal_id)
+    assert stored is not None
+    assert stored.actionability != "actionable"  # no misleading 可下手
+    assert stored.metadata["skip"]["reason"] == "profit_below_threshold"
+
+
+def test_discovery_does_not_clobber_promoted_actionable(tmp_path):
+    # Once the gate promotes a signal to actionable, a later re-discovery (which
+    # happens every run) must not downgrade it back to informational.
+    candidate = _official_candidate()
+    signal_store = CollectibleSignalStore(tmp_path / "sig.sqlite3")
+    signal_store.bootstrap()
+
+    class _StrongPriceChecker:
+        def check(self, cand):
+            return PriceCheck(
+                candidate_id=cand.candidate_id,
+                fair_value_jpy=6000,
+                confidence=0.8,
+                sample_count=12,
+            )
+
+    pipeline = _pipeline(
+        tmp_path,
+        provider=_OneShotProvider(candidate),
+        price_checker=_StrongPriceChecker(),
+        signal_store=signal_store,
+    )
+
+    sid = candidate_to_signal(candidate).signal_id
+    pipeline._run_official_store_candidate(candidate, _MutableStats())
+    assert signal_store.get_signal(sid).actionability == "actionable"
+
+    # Re-discovery on a subsequent run must preserve the gate verdict.
+    pipeline._record_discovery_signal(candidate)
+    assert signal_store.get_signal(sid).actionability == "actionable"
+
+
+def test_first_discovery_signal_is_informational(tmp_path):
+    candidate = _official_candidate()
+    signal_store = CollectibleSignalStore(tmp_path / "sig.sqlite3")
+    signal_store.bootstrap()
+    pipeline = _pipeline(
+        tmp_path,
+        provider=_OneShotProvider(candidate),
+        price_checker=_NullPriceChecker(),
+        signal_store=signal_store,
+    )
+
+    pipeline._record_discovery_signal(candidate)
+
+    stored = signal_store.get_signal(candidate_to_signal(candidate).signal_id)
+    assert stored is not None
+    assert stored.actionability == "informational"  # seen, not yet gated
+
+
 def test_pipeline_without_signal_store_is_noop(tmp_path):
     # No signal store wired → official path still works, just no intelligence.
     candidate = _official_candidate()
