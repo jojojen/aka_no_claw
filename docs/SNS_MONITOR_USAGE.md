@@ -268,7 +268,7 @@ python -m openclaw_adapter sns.add-trend trending --chat-id <YOUR_CHAT_ID>
 ## 支援
 
 如遇問題，請查看：
-1. [SNS 集成測試報告](SNS_INTEGRATION_TEST_REPORT.md)
+1. [SNS 集成測試報告](archive/SNS_INTEGRATION_TEST_REPORT.md)（歷史快照）
 2. [Telegram 工具規範](TELEGRAM_TOOL_SPEC.md)
 3. 系統日誌: `logs/openclaw.log`
 4. 數據庫: `data/sns.sqlite3` (SQLite)

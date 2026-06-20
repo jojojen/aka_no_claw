@@ -383,6 +383,15 @@ docs:
   docs_index:
     path: docs/DOCS_INDEX.md
     status: current
+  documentation_governance:
+    path: docs/DOCUMENTATION_GOVERNANCE.md
+    status: current
+  doc_audit:
+    path: docs/DOC_AUDIT.md
+    status: current
+  doc_drift_checklist:
+    path: docs/DOC_DRIFT_CHECKLIST.md
+    status: current
   research_command:
     path: docs/RESEARCH_COMMAND_PLAN.md
     status: current
@@ -435,4 +444,7 @@ issue_tracking:
       status: implemented
     - issue: 4
       title: "docs: establish SYSTEM_MANIFEST.yaml as machine-readable system truth index"
+      status: implemented
+    - issue: 5
+      title: "docs: Documentation Consolidation & Governance Pass"
       status: implemented
