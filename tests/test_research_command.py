@@ -23,7 +23,7 @@ from openclaw_adapter.research_command import (
     normalize_mercari_shops_url,
     parse_research_target,
 )
-from openclaw_adapter.knowledge_db import KnowledgeDatabase
+from openclaw_adapter.knowledge_db import KnowledgeDatabase, is_source_id
 from openclaw_adapter.web_search import WebSearchResult
 
 
@@ -782,7 +782,11 @@ def test_research_handler_fetches_mercari_item_and_persists_knowledge(tmp_path: 
     assert "Mercari 商品頁資料" in entry.summary
     assert "賣家 ID：146184751。" in entry.summary
     assert "商品狀態：新品、未使用。" in entry.summary
-    assert "https://jp.mercari.com/item/m18542743389" in entry.source_urls
+    # source URLs are interned through the registry (issue #9 D4): the entry
+    # stores S-ids that resolve back to the Mercari item URL.
+    assert entry.source_urls and all(is_source_id(s) for s in entry.source_urls)
+    resolved = [db.get_source(s).canonical_url for s in entry.source_urls]
+    assert any("jp.mercari.com/item/m18542743389" in u for u in resolved)
     assert db.lookup_canonical("エヴァンゲリオン 30周年フェス限定 綾波レイ ユニオンアリーナ プロモカード") == "mercari:m18542743389"
 
 

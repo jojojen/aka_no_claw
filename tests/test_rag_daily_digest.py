@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from openclaw_adapter.knowledge_db import KnowledgeDatabase, NO_DATA_SUMMARY
 from openclaw_adapter.rag_daily_digest import RagDailyDigestScheduler
 
@@ -102,16 +104,25 @@ def test_digest_renders_compact_source_citation(tmp_path):
 
 
 def test_digest_legacy_raw_url_degrades_to_domain(tmp_path):
-    """Pre-registry raw URLs (not S-ids) still render as a clean domain label."""
+    """Pre-registry raw URLs (not S-ids) still render as a clean domain label.
+
+    upsert_entry now interns sources, so a *legacy* raw-url row is simulated by
+    writing source_urls_json directly — the case real pre-#9 rows present."""
     sent: list = []
     sched, db_path = _make_scheduler(tmp_path, sent)
     db = KnowledgeDatabase(db_path)
     db.upsert_entry(
         entity_canonical="union_arena", entity_type="tcg",
         summary="UNION ARENA。Bandai 旗下 TCG。", confidence=0.7,
-        source_urls=("https://www.suruga-ya.jp/item/9?utm_source=x",),
         origin="web_research",
     )
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE knowledge_entries SET source_urls_json = ? "
+            "WHERE entity_canonical = ?",
+            (json.dumps(["https://www.suruga-ya.jp/item/9?utm_source=x"]),
+             "union_arena"),
+        )
     sched._send_digest()
     assert len(sent) == 1
     assert "suruga-ya.jp" in sent[0][1]

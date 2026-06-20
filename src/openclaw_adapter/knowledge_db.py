@@ -329,6 +329,27 @@ class KnowledgeDatabase:
             )
             return f"S{int(cur.lastrowid)}"
 
+    def _intern_source_refs(self, source_urls: tuple[str, ...]) -> tuple[str, ...]:
+        """Normalize an entry's source refs to stable registry ids (issue #9 D4).
+
+        Already-interned ``S<n>`` ids pass through unchanged (e.g. EntityResearcher
+        interns at the producer); raw URLs are interned to their id; opaque /
+        non-traceable URLs are dropped — a stored citation must resolve back to a
+        real article."""
+        refs: list[str] = []
+        for ref in source_urls:
+            ref = (ref or "").strip()
+            if not ref:
+                continue
+            if is_source_id(ref):
+                if ref not in refs:
+                    refs.append(ref)
+                continue
+            sid = self.intern_source(ref)
+            if sid and sid not in refs:
+                refs.append(sid)
+        return tuple(refs)
+
     def get_source(self, source_id: str) -> SourceRecord | None:
         """Look up a source by its ``S<n>`` id. Returns None for an unknown or
         malformed id."""
@@ -371,6 +392,10 @@ class KnowledgeDatabase:
             raise ValueError("entity_canonical cannot be empty")
         if origin not in ORIGINS:
             logger.warning("upsert_entry: unknown origin=%r (allowed: %s)", origin, ORIGINS)
+        # Force every producer's sources through the registry (issue #9 D4): the
+        # entry stores stable S<n> ids, never raw redirect/tracking URLs. Done
+        # before the write transaction so each intern uses its own connection.
+        source_refs = self._intern_source_refs(source_urls)
         now = _utc_now_iso()
         entry_id = build_entry_id(entity_canonical=canonical, entity_type=entity_type)
 
@@ -405,7 +430,7 @@ class KnowledgeDatabase:
                     """,
                     (
                         entry_id, canonical, entity_type, summary,
-                        json.dumps(list(source_urls), ensure_ascii=False),
+                        json.dumps(list(source_refs), ensure_ascii=False),
                         float(confidence), origin, created_at, now,
                     ),
                 )

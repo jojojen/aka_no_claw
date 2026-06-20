@@ -20,8 +20,9 @@ it back to the original:
     fbclid, gclid …) are stripped, host is lower-cased, fragment + trailing
     slash dropped. Opaque redirects (e.g. Yahoo listing blobs) are **not**
     fetched — resolving them would mean an extra third-party request and risks
-    rate-limiting / bans (priority ②不被封鎖, SKILL.md C7); they are kept as-is
-    so the record is still traceable via its domain label.
+    rate-limiting / bans (priority ②不被封鎖, SKILL.md C7). Because they cannot
+    be expanded back to the original article offline, they are **refused** at
+    intern time (``is_traceable_source``) and never become source records.
   * ``raw_url`` — the original, pre-canonicalization URL, kept for audit /
     manual recovery when canonicalization changed the link.
   * ``title`` / ``domain`` — display labels (``domain`` powers ``[S1] domain``).
