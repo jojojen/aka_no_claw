@@ -53,11 +53,28 @@ def _today_start_iso() -> str:
     return local_midnight.astimezone(timezone.utc).isoformat()
 
 
-def _format_entry_message(entry: KnowledgeEntry, index: int, total: int) -> str:
+# Product-intelligence entries are tied to a specific product / store and are
+# inherently time-sensitive (prices, availability) — the user triages them
+# differently from durable knowledge (IP / character / set / creator facts that
+# stay true). The split is by the entry's *structured* entity_type, not by
+# scanning text, so it adds no open-world recognition (Rule G).
+_PRODUCT_INTEL_ENTITY_TYPES: frozenset[str] = frozenset({"product", "store"})
+
+_SECTION_DURABLE = "📚 今日 RAG 新知（長效知識）"
+_SECTION_PRODUCT_INTEL = "🛒 今日 RAG 新知（商品情報）"
+
+
+def _is_product_intelligence(entry: KnowledgeEntry) -> bool:
+    return entry.entity_type in _PRODUCT_INTEL_ENTITY_TYPES
+
+
+def _format_entry_message(
+    entry: KnowledgeEntry, index: int, total: int, *, section_title: str
+) -> str:
     summary = entry.summary[:400] if entry.summary else "（無摘要）"
     sources = "、".join(entry.source_urls[:2]) if entry.source_urls else ""
     lines = [
-        f"📚 今日 RAG 新知（{index}/{total}）",
+        f"{section_title}（{index}/{total}）",
         "",
         f"【{entry.entity_canonical}】",
         summary,
@@ -132,19 +149,30 @@ class RagDailyDigestScheduler:
         if not entries:
             logger.info("RagDailyDigestScheduler: no new entries today — silent")
             return
-        total = len(entries)
-        logger.info("RagDailyDigestScheduler: sending %d entry digests", total)
-        for i, entry in enumerate(entries, 1):
-            text = _format_entry_message(entry, i, total)
-            markup = _make_reply_markup(entry.entry_id)
-            for chat_id in self._chat_ids:
-                try:
-                    self._send_fn(chat_id, text, markup)
-                except Exception:
-                    logger.exception(
-                        "RagDailyDigestScheduler: send failed chat_id=%s entry_id=%s",
-                        chat_id, entry.entry_id,
-                    )
+        # Durable knowledge first, then product intelligence — each its own
+        # section with independent numbering so the user can triage them apart.
+        durable = [e for e in entries if not _is_product_intelligence(e)]
+        product_intel = [e for e in entries if _is_product_intelligence(e)]
+        logger.info(
+            "RagDailyDigestScheduler: sending %d durable + %d product-intel digests",
+            len(durable), len(product_intel),
+        )
+        for section_title, group in (
+            (_SECTION_DURABLE, durable),
+            (_SECTION_PRODUCT_INTEL, product_intel),
+        ):
+            total = len(group)
+            for i, entry in enumerate(group, 1):
+                text = _format_entry_message(entry, i, total, section_title=section_title)
+                markup = _make_reply_markup(entry.entry_id)
+                for chat_id in self._chat_ids:
+                    try:
+                        self._send_fn(chat_id, text, markup)
+                    except Exception:
+                        logger.exception(
+                            "RagDailyDigestScheduler: send failed chat_id=%s entry_id=%s",
+                            chat_id, entry.entry_id,
+                        )
 
 
 def handle_ragkeep_callback(
