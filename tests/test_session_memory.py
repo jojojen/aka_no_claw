@@ -121,7 +121,18 @@ def test_retention_trims_to_max_messages(store):
     assert stored["messages"][0]["id"] == str(50)
 
 
-# --- retention: byte budget -----------------------------------------------
+# --- retention: byte budget (hard limit) ----------------------------------
+def test_retention_single_huge_message_dropped_to_empty(store, monkeypatch):
+    # MAX_BYTES is a hard limit: a single message that alone exceeds the budget
+    # must be dropped, leaving an empty list (not an over-budget snapshot).
+    monkeypatch.setattr("openclaw_adapter.session_memory.MAX_BYTES", 200)
+    big = "x" * 500  # one message serialized ≈ 550 bytes > 200
+    stored = store.save({"messages": [{"id": "1", "role": "assistant", "text": big}]})
+    assert stored["messages"] == []
+    size = len(json.dumps(stored, ensure_ascii=False).encode("utf-8"))
+    assert size <= 200
+
+
 def test_retention_trims_to_byte_budget(store, monkeypatch):
     # Shrink the budget so a few fat messages exceed it without building 5MB.
     monkeypatch.setattr("openclaw_adapter.session_memory.MAX_BYTES", 2000)
@@ -132,6 +143,34 @@ def test_retention_trims_to_byte_budget(store, monkeypatch):
     assert size <= 2000
     assert len(stored["messages"]) < 10  # oldest dropped to fit
     assert stored["messages"][-1]["id"] == "9"  # newest survives
+
+
+# --- delete: OSError must not return false success -------------------------
+def test_clear_oserror_is_reraised(store):
+    from unittest.mock import patch
+
+    store.save({"messages": []})
+
+    def boom(self, missing_ok=False):
+        raise OSError("Permission denied")
+
+    with patch.object(type(store._path), "unlink", boom):
+        with pytest.raises(OSError):
+            store.clear()
+
+
+def test_bridge_clear_failure_returns_error(tmp_path):
+    from unittest.mock import patch
+
+    b = _bridge(tmp_path)
+    b.save_session({"messages": [{"id": "1", "role": "user", "text": "hi"}]})
+
+    def boom(self, missing_ok=False):
+        raise OSError("Permission denied")
+
+    with patch.object(type(b._sessions()._path), "unlink", boom):
+        res = b.clear_session()
+    assert res["status"] == "error"
 
 
 # --- bridge wiring ---------------------------------------------------------
