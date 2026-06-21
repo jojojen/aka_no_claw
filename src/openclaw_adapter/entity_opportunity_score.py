@@ -18,6 +18,7 @@ neutral 50):
     valuation gap : ±35   (cheap vs fair → +,  premium → −)
     liquidity     : +15 / −10   (liquid → +,  illiquid → − and a visible risk)
     demand        : +15   (rising demand → +; absent → no contribution)
+    supply        : +10   (scarce/shrinking supply → +; reprint risk → visible risk)
 """
 from __future__ import annotations
 
@@ -51,6 +52,7 @@ MAX_VALUATION_CONTRIB = 35.0
 MAX_LIQUIDITY_BONUS = 15.0
 MAX_LIQUIDITY_PENALTY = 10.0
 MAX_DEMAND_CONTRIB = 15.0
+MAX_SUPPLY_CONTRIB = 10.0
 
 # A score needs at least this confidence to earn an actionable (buy) category;
 # below it, a good-looking score is "speculative" rather than "strong_buy".
@@ -84,6 +86,23 @@ class DemandSignal:
     reasons: tuple[str, ...] = ()
 
 
+# ── supply interface (#18 Supply & Scarcity Intelligence Layer) ───────────────
+@dataclass(frozen=True, slots=True)
+class SupplySignal:
+    """Normalized supply/scarcity snapshot for an entity. ``scarcity_score`` ∈
+    [0,1] is the single value the scorer consumes (higher ⇒ scarcer ⇒ stronger
+    opportunity when demand holds); the optional breakdown (reprint risk, EOL,
+    availability trend) preserves the raw signals for explanation/audit. Kept
+    small so the #18 supply pipeline can populate it without changing the scoring
+    contract."""
+    entity_id: str
+    scarcity_score: float
+    reprint_risk: float | None = None
+    eol: bool = False
+    availability_trend: str | None = None
+    reasons: tuple[str, ...] = ()
+
+
 # ── Deliverable 1: opportunity score model ────────────────────────────────────
 @dataclass(frozen=True, slots=True)
 class OpportunityScore:
@@ -103,6 +122,7 @@ def score_opportunity(
     mispricing: MispricingSignal | None,
     liquidity: LiquidityMetrics | None = None,
     demand: DemandSignal | None = None,
+    supply: SupplySignal | None = None,
     scored_at: str | None = None,
 ) -> OpportunityScore:
     """Deterministically score an entity opportunity from valuation, liquidity,
@@ -181,6 +201,18 @@ def score_opportunity(
     else:
         reasons.append("demand signals not yet available")
 
+    # ── supply / scarcity component (#18) ─────────────────────────────────────
+    if supply is not None:
+        sc = _clamp(supply.scarcity_score, 0.0, 1.0)
+        score += MAX_SUPPLY_CONTRIB * sc
+        if sc >= 0.6:
+            reasons.append("scarce / shrinking supply")
+        if supply.eol:
+            reasons.append("end-of-life — no fresh supply")
+        if supply.reprint_risk is not None and supply.reprint_risk >= 0.5:
+            risks.append("reprint/restock risk could expand supply")
+        reasons.extend(supply.reasons)
+
     # ── Deliverable 6: thin-evidence risks ───────────────────────────────────
     if estimate.evidence_count < MIN_SOLD_FOR_SUPPORT:
         risks.append("limited sold-comp history")
@@ -246,7 +278,8 @@ class OpportunityScorer:
         )
 
     def score(
-        self, entity_id: str, *, demand: DemandSignal | None = None
+        self, entity_id: str, *, demand: DemandSignal | None = None,
+        supply: SupplySignal | None = None,
     ) -> OpportunityScore:
         estimate = self.engine.estimate(entity_id, currency=self.currency)
         observed = None
@@ -261,7 +294,7 @@ class OpportunityScorer:
         liquidity = self._liquidity_for(entity_id)
         return score_opportunity(
             entity_id, estimate=estimate, mispricing=mispricing,
-            liquidity=liquidity, demand=demand,
+            liquidity=liquidity, demand=demand, supply=supply,
         )
 
     def get_top_opportunities(
@@ -269,6 +302,7 @@ class OpportunityScorer:
         entity_ids: Iterable[str],
         *,
         demand_by_entity: dict[str, DemandSignal] | None = None,
+        supply_by_entity: dict[str, SupplySignal] | None = None,
         limit: int | None = None,
         include_insufficient: bool = False,
     ) -> list[OpportunityScore]:
@@ -278,8 +312,10 @@ class OpportunityScorer:
         (confidence is the tie-breaker). ``insufficient_data`` rows are excluded
         by default but can be surfaced with ``include_insufficient=True``."""
         demand_by_entity = demand_by_entity or {}
+        supply_by_entity = supply_by_entity or {}
         scored = [
-            self.score(eid, demand=demand_by_entity.get(eid))
+            self.score(eid, demand=demand_by_entity.get(eid),
+                       supply=supply_by_entity.get(eid))
             for eid in entity_ids
         ]
         if not include_insufficient:
