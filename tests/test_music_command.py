@@ -415,6 +415,85 @@ def test_playbest_empty_favorites_message(settings, proc_table):
     assert proc_table["spawned"] == []
 
 
+# --- playbest path validation (issue #34 codex review) ---------------------
+# A favorite is a persisted path that may predate a music-root change or be
+# hand-edited; playbest must apply the same root/suffix check as single play and
+# NEVER play an existing-but-out-of-root file.
+def _favorites_store(settings):
+    from openclaw_adapter.music_favorites import FavoritesStore
+
+    return FavoritesStore(settings.openclaw_music_best_path)
+
+
+def test_scheduler_skips_out_of_root_with_validator(settings, music_dir, tmp_path):
+    outside = tmp_path / "outside" / "rogue.flac"
+    outside.parent.mkdir(parents=True)
+    outside.write_bytes(b"fake-flac-bytes")
+    in_root = sorted(p for p in music_dir.rglob("*.flac") if not p.name.startswith("._"))[0]
+    favs = [
+        {"id": "ok", "name": "ok", "path": str(in_root)},
+        {"id": "rogue", "name": "rogue", "path": str(outside)},
+    ]
+    validator = lambda p: mc.validate_song_path(p, settings.openclaw_music_dir)
+    sch = mc.PlaybestScheduler(lambda: favs, exists_fn=validator, shuffler=lambda x: None)
+    got = [sch.next()["id"] for _ in range(4)]
+    assert "rogue" not in got
+    assert set(got) <= {"ok"}
+
+
+def test_play_best_rejects_existing_out_of_root_favorite(settings, music_dir, tmp_path, proc_table):
+    # An existing .flac that lives OUTSIDE the music root.
+    outside = tmp_path / "outside" / "rogue.flac"
+    outside.parent.mkdir(parents=True)
+    outside.write_bytes(b"fake-flac-bytes")
+    assert outside.exists()  # os.path.exists() alone would have admitted it
+    store = _favorites_store(settings)
+    store.add(str(outside), "rogue")
+    reply = mc.build_music_handler(settings)("playbest", "chat-1")
+    assert "沒有可播放" in reply
+    assert proc_table["spawned"] == []  # must NOT spawn the out-of-root file
+    assert not mc._PLAYBEST.is_active()
+
+
+def test_play_best_skips_favorite_from_old_root(settings, music_dir, tmp_path, proc_table):
+    # A favorite that was valid under a previous music root: file still exists,
+    # but is no longer under the current OPENCLAW_MUSIC_DIR → must be skipped.
+    old_song = tmp_path / "OldMusic" / "album" / "old.flac"
+    old_song.parent.mkdir(parents=True)
+    old_song.write_bytes(b"fake-flac-bytes")
+    store = _favorites_store(settings)
+    store.add(str(old_song), "old")
+    reply = mc.build_music_handler(settings)("playbest", "chat-1")
+    assert "沒有可播放" in reply
+    assert proc_table["spawned"] == []
+
+
+def test_play_best_never_spawns_out_of_root_when_mixed(settings, music_dir, tmp_path, proc_table, monkeypatch):
+    # In-root favorite + out-of-root favorite: the loop may play the valid one,
+    # but the out-of-root path must never be spawned, even on auto-advance.
+    monkeypatch.setattr(mc, "_PLAYBEST_POLL_SECONDS", 0.01)
+    outside = tmp_path / "outside" / "rogue.flac"
+    outside.parent.mkdir(parents=True)
+    outside.write_bytes(b"fake-flac-bytes")
+    in_root = sorted(p for p in music_dir.rglob("*.flac") if not p.name.startswith("._"))[0]
+    store = _favorites_store(settings)
+    store.add(str(in_root), in_root.stem)
+    store.add(str(outside), "rogue")
+    handler = mc.build_music_handler(settings)
+    assert "開始連續" in handler("playbest", "chat-1")
+    import time as _t
+
+    # Drive several advance cycles by ending whatever is currently playing.
+    for _ in range(40):
+        for pid in list(proc_table["alive"]):
+            proc_table["alive"].discard(pid)
+        _t.sleep(0.01)
+    handler("stop", "chat-1")
+    spawned_paths = {p for _pid, p in proc_table["spawned"]}
+    assert str(outside) not in spawned_paths
+    assert spawned_paths <= {str(in_root)}
+
+
 # --- musicnowbest ----------------------------------------------------------
 def test_musicnowbest_adds_current_song(settings, proc_table):
     play = mc.build_music_handler(settings)

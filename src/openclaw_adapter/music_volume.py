@@ -36,28 +36,42 @@ _VOLUME_STEP = 10
 _VOLUME_DEFAULT = 70
 
 
+class VolumeControlError(RuntimeError):
+    """Raised when the macOS mixer change (osascript) actually fails — a
+    non-zero exit, a timeout, or a missing ``osascript`` — so the command layer
+    can report the real failure instead of a false success."""
+
+
+def _run_osascript(expr: str) -> None:
+    """Run one ``osascript`` statement, raising :class:`VolumeControlError` on
+    any failure. AppleScript reports errors via a non-zero exit + stderr, so we
+    must inspect both rather than fire-and-forget."""
+    try:
+        proc = subprocess.run(
+            ["osascript", "-e", expr],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=5,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise VolumeControlError("osascript 逾時，未能變更系統音量") from exc
+    except OSError as exc:  # osascript missing / not executable
+        raise VolumeControlError(f"無法執行 osascript：{exc}") from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or b"").decode("utf-8", "replace").strip()
+        raise VolumeControlError(detail or f"osascript 失敗（return {proc.returncode}）")
+
+
 # --- system mixer primitives (module-level so tests can monkeypatch) -------
 def _set_system_volume(volume: int) -> None:
-    subprocess.run(
-        ["osascript", "-e", f"set volume output volume {int(volume)}"],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        timeout=5,
-        check=False,
-    )
+    _run_osascript(f"set volume output volume {int(volume)}")
 
 
 def _set_system_muted(muted: bool) -> None:
     flag = "true" if muted else "false"
-    subprocess.run(
-        ["osascript", "-e", f"set volume output muted {flag}"],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        timeout=5,
-        check=False,
-    )
+    _run_osascript(f"set volume output muted {flag}")
 
 
 def _clamp(volume: int) -> int:
@@ -106,11 +120,18 @@ def _status_text(volume: int, muted: bool) -> str:
 
 
 # --- command entry points --------------------------------------------------
+# Apply to the system mixer FIRST, then persist only on success: a failed
+# osascript must surface a clear error and must not leave the saved state
+# diverging from the real macOS volume/mute.
 def mute_music(settings: AssistantSettings) -> str:
     store = VolumeStore(settings.openclaw_music_volume_state_path)
     state = store.load()
+    try:
+        _apply(state["volume"], True)
+    except VolumeControlError as exc:
+        logger.warning("music volume: mute failed: %s", exc)
+        return f"靜音失敗：{exc}"
     saved = store.save(volume=state["volume"], muted=True)
-    _apply(saved["volume"], True)
     return _status_text(saved["volume"], True)
 
 
@@ -121,8 +142,12 @@ def _adjust(settings: AssistantSettings, delta: int) -> str:
     store = VolumeStore(settings.openclaw_music_volume_state_path)
     state = store.load()
     new_volume = _clamp(state["volume"] + delta)
+    try:
+        _apply(new_volume, False)
+    except VolumeControlError as exc:
+        logger.warning("music volume: adjust failed: %s", exc)
+        return f"調整音量失敗：{exc}"
     saved = store.save(volume=new_volume, muted=False)
-    _apply(saved["volume"], False)
     return _status_text(saved["volume"], False)
 
 

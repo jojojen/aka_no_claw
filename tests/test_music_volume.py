@@ -113,6 +113,69 @@ def test_volume_ops_do_not_touch_player_state(settings, mixer, tmp_path):
     assert sp.read_text() == before  # player state untouched by volume control
 
 
+# --- failure handling: osascript errors must not report false success ------
+def test_mute_failure_reports_error_and_does_not_persist(settings, monkeypatch):
+    def boom(_m):
+        raise mv.VolumeControlError("System Events got an error")
+
+    monkeypatch.setattr(mv, "_set_system_volume", lambda v: None)
+    monkeypatch.setattr(mv, "_set_system_muted", boom)
+    msg = mv.mute_music(settings)
+    assert "失敗" in msg
+    # state must NOT have been flipped to muted on a failed apply
+    assert _state(settings) == {"volume": 70, "muted": False}
+
+
+def test_louder_failure_reports_error_and_does_not_persist(settings, monkeypatch):
+    def boom(_v):
+        raise mv.VolumeControlError("osascript 失敗（return 1）")
+
+    monkeypatch.setattr(mv, "_set_system_volume", boom)
+    monkeypatch.setattr(mv, "_set_system_muted", lambda m: None)
+    msg = mv.louder_music(settings)
+    assert "失敗" in msg
+    assert _state(settings)["volume"] == 70  # unchanged
+
+
+def test_run_osascript_raises_on_nonzero(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        mv.subprocess, "run",
+        lambda *a, **k: SimpleNamespace(returncode=1, stderr=b"boom"),
+    )
+    with pytest.raises(mv.VolumeControlError, match="boom"):
+        mv._run_osascript("set volume output volume 50")
+
+
+def test_run_osascript_raises_on_timeout(monkeypatch):
+    def timeout(*a, **k):
+        raise mv.subprocess.TimeoutExpired(cmd="osascript", timeout=5)
+
+    monkeypatch.setattr(mv.subprocess, "run", timeout)
+    with pytest.raises(mv.VolumeControlError, match="逾時"):
+        mv._run_osascript("set volume output muted true")
+
+
+def test_run_osascript_raises_on_missing_binary(monkeypatch):
+    def missing(*a, **k):
+        raise FileNotFoundError("osascript")
+
+    monkeypatch.setattr(mv.subprocess, "run", missing)
+    with pytest.raises(mv.VolumeControlError):
+        mv._run_osascript("set volume output volume 50")
+
+
+def test_run_osascript_ok_on_zero(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        mv.subprocess, "run",
+        lambda *a, **k: SimpleNamespace(returncode=0, stderr=b""),
+    )
+    mv._run_osascript("set volume output volume 50")  # no raise
+
+
 # --- callback routing ------------------------------------------------------
 def test_music_callbacks_route_volume(settings, mixer):
     cb = mb.build_music_callback_handler(settings)
