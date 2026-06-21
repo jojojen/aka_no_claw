@@ -126,6 +126,13 @@ class AssistantSettings:
     opportunity_sns_auto_discovery_interval_hours: int = 6
     opportunity_sns_auto_discovery_max_new_per_run: int = 2
     opportunity_sns_auto_discovery_min_confidence: float = 0.7
+    # ── local music playback (issue #33) ────────────────────────────────────
+    # Mac mini local music folder; /music plays .flac from here via afplay.
+    openclaw_music_dir: str = "/Volumes/JEN_SSD/Music"
+    # Index + player-state caches live under the gitignored .openclaw_tmp/ so no
+    # cache/state is ever written into a git-tracked path.
+    openclaw_music_index_path: str = ".openclaw_tmp/music_index.json"
+    openclaw_music_player_state_path: str = ".openclaw_tmp/music_player_state.json"
 
 
 def _resolve_runtime_path(value: str) -> str:
@@ -365,6 +372,13 @@ def get_settings() -> AssistantSettings:
         opportunity_sns_auto_discovery_min_confidence=_as_float(
             os.getenv("OPENCLAW_OPPORTUNITY_SNS_AUTO_DISCOVERY_MIN_CONFIDENCE"),
             default=0.7,
+        ),
+        openclaw_music_dir=os.getenv("OPENCLAW_MUSIC_DIR", "/Volumes/JEN_SSD/Music"),
+        openclaw_music_index_path=_resolve_runtime_path(
+            os.getenv("OPENCLAW_MUSIC_INDEX_PATH", ".openclaw_tmp/music_index.json")
+        ),
+        openclaw_music_player_state_path=_resolve_runtime_path(
+            os.getenv("OPENCLAW_MUSIC_PLAYER_STATE_PATH", ".openclaw_tmp/music_player_state.json")
         ),
     )
 
