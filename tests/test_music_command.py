@@ -47,13 +47,14 @@ def settings(tmp_path, music_dir):
 @pytest.fixture
 def proc_table(monkeypatch):
     """Stub the module-level process primitives with an in-memory pid table."""
-    state = {"next_pid": 1000, "alive": set(), "spawned": [], "killed": []}
+    state = {"next_pid": 1000, "alive": set(), "spawned": [], "killed": [], "start": {}}
 
     def _spawn(path):
         state["next_pid"] += 1
         pid = state["next_pid"]
         state["alive"].add(pid)
         state["spawned"].append((pid, path))
+        state["start"][pid] = f"start-{pid}"  # stable per-process identity token
         return pid
 
     def _alive(pid):
@@ -62,6 +63,9 @@ def proc_table(monkeypatch):
     def _is_player(pid):
         return pid in state["alive"]  # everything we spawn is "afplay"
 
+    def _start_time(pid):
+        return state["start"].get(pid) if pid in state["alive"] else None
+
     def _terminate(pid):
         state["killed"].append(pid)
         state["alive"].discard(pid)
@@ -69,6 +73,7 @@ def proc_table(monkeypatch):
     monkeypatch.setattr(mc, "_spawn_player", _spawn)
     monkeypatch.setattr(mc, "_pid_alive", _alive)
     monkeypatch.setattr(mc, "_pid_is_player", _is_player)
+    monkeypatch.setattr(mc, "_pid_start_time", _start_time)
     monkeypatch.setattr(mc, "_terminate", _terminate)
     return state
 
@@ -118,9 +123,9 @@ def test_index_rebuilds_when_file_renamed(settings, music_dir):
 # --- search ----------------------------------------------------------------
 def test_search_substring_match(settings):
     idx = mc.load_or_build_index(settings.openclaw_music_dir, settings.openclaw_music_index_path)
-    entry = mc._search(idx.entries, "Get Lucky")
-    assert entry is not None
-    assert entry["name"] == "Daft Punk - Get Lucky"
+    result = mc._search(idx.entries, "Get Lucky")
+    assert result.kind == "single"
+    assert result.entry["name"] == "Daft Punk - Get Lucky"
 
 
 def test_search_handles_unicode_normalization(settings):
@@ -128,14 +133,26 @@ def test_search_handles_unicode_normalization(settings):
     import unicodedata
     # query in NFD (decomposed) must still match an NFC-stored filename
     query = unicodedata.normalize("NFD", "地球存在しない説")
-    entry = mc._search(idx.entries, query)
-    assert entry is not None
-    assert "地球存在しない説" in entry["name"]
+    result = mc._search(idx.entries, query)
+    assert result.kind in ("exact", "single")
+    assert "地球存在しない説" in result.entry["name"]
 
 
 def test_search_no_match_returns_none(settings):
     idx = mc.load_or_build_index(settings.openclaw_music_dir, settings.openclaw_music_index_path)
-    assert mc._search(idx.entries, "zzz-not-a-real-song-xyz") is None
+    assert mc._search(idx.entries, "zzz-not-a-real-song-xyz").kind == "none"
+
+
+def test_search_ambiguous_returns_candidates(settings):
+    idx = mc.load_or_build_index(settings.openclaw_music_dir, settings.openclaw_music_index_path)
+    # broad query (album/artist) matches both ずっと真夜中 tracks → must not guess
+    result = mc._search(idx.entries, "ずっと真夜中でいいのに")
+    assert result.kind == "ambiguous"
+    names = {e["name"] for e in result.candidates}
+    assert names == {
+        "01 ずっと真夜中でいいのに。 - 地球存在しない説",
+        "02 ずっと真夜中でいいのに。 - 間人間",
+    }
 
 
 # --- playback --------------------------------------------------------------
@@ -162,6 +179,15 @@ def test_starting_new_song_stops_previous(settings, proc_table):
     handler("間人間", "chat-1")
     assert first_pid in proc_table["killed"]  # previous track was stopped
     assert len(proc_table["spawned"]) == 2
+
+
+def test_music_ambiguous_query_returns_list_without_playing(settings, proc_table):
+    handler = mc.build_music_handler(settings)
+    reply = handler("ずっと真夜中でいいのに", "chat-1")
+    assert "請輸入更精確的名稱" in reply
+    assert "地球存在しない説" in reply
+    assert "間人間" in reply
+    assert proc_table["spawned"] == []  # ambiguous => never plays
 
 
 def test_stop_terminates_current(settings, proc_table):
@@ -208,6 +234,20 @@ def test_stop_does_not_kill_unrelated_reused_pid(settings, proc_table, monkeypat
     reply = handler("stop", "chat-1")
     assert reply == "目前沒有由龍蝦播放中的音樂。"
     assert pid not in proc_table["killed"]
+
+
+def test_stop_does_not_kill_reused_pid_that_is_a_different_afplay(settings, proc_table):
+    # The recorded pid is alive AND is an afplay — but it's a *different* afplay
+    # the OS handed our pid to (e.g. user's own playback). The start-time mismatch
+    # must protect it from /music stop.
+    handler = mc.build_music_handler(settings)
+    handler("random", "chat-1")
+    pid = proc_table["spawned"][0][0]
+    proc_table["start"][pid] = "start-DIFFERENT-PROCESS"  # pid reused, new identity
+    reply = handler("stop", "chat-1")
+    assert reply == "目前沒有由龍蝦播放中的音樂。"
+    assert pid not in proc_table["killed"]
+    assert not Path(settings.openclaw_music_player_state_path).exists()
 
 
 # --- error handling --------------------------------------------------------

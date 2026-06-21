@@ -17,8 +17,19 @@ signature over every indexed file's path/size/mtime, so adding, removing or
 renaming files transparently rebuilds the index on the next play. AppleDouble
 metadata sidecars (``._*.flac``) are excluded and never selectable.
 
+A play only ever targets a *single* unambiguous song: an exact filename match or
+a lone substring/fuzzy hit. When a query is broad enough to match several songs
+(e.g. an artist or album name) the handler returns a short candidate list rather
+than guessing and audibly playing the wrong track.
+
+To stop *only* OpenClaw's own player and never an unrelated ``afplay`` the user
+launched themselves, the persisted state records the process *identity* — pid
+plus its start time — and ``/music stop`` re-verifies both before signalling, so
+a recorded pid that the OS later reused for a different ``afplay`` is left alone.
+
 The process helpers (``_spawn_player`` / ``_pid_alive`` / ``_pid_is_player`` /
-``_terminate``) are module-level so tests can stub real playback.
+``_pid_start_time`` / ``_terminate``) are module-level so tests can stub real
+playback.
 """
 
 from __future__ import annotations
@@ -34,6 +45,7 @@ import subprocess
 import threading
 import unicodedata
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -88,6 +100,23 @@ def _pid_is_player(pid: int) -> bool:
     except Exception:  # noqa: BLE001 — ps missing/erroring => treat as not ours
         return False
     return (out.stdout or "").strip().endswith(_PLAYER_BINARY)
+
+
+def _pid_start_time(pid: int) -> str | None:
+    """The process's absolute start time (``ps -o lstart``), used as a stable
+    identity token alongside the pid. If the OS later reuses this pid for a
+    different process, its start time differs, so we can tell it is not the
+    afplay we launched and refuse to signal it."""
+    try:
+        out = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "lstart="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:  # noqa: BLE001 — ps missing/erroring => unknown identity
+        return None
+    return (out.stdout or "").strip() or None
 
 
 def _terminate(pid: int) -> None:
@@ -168,7 +197,16 @@ def load_or_build_index(music_dir: str, index_path: str) -> MusicIndex:
         if isinstance(entries, list):
             return MusicIndex(entries=entries, signature=sig, rebuilt=False)
     entries = _entries_from_scan(scanned)
-    _write_json(index_path, {"signature": sig, "entries": entries})
+    _write_json(
+        index_path,
+        {
+            "signature": sig,
+            "root": str(root),
+            "indexed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "count": len(entries),
+            "entries": entries,
+        },
+    )
     return MusicIndex(entries=entries, signature=sig, rebuilt=True)
 
 
@@ -179,25 +217,49 @@ def _normalize(text: str) -> str:
     return unicodedata.normalize("NFKC", text or "").casefold().strip()
 
 
-def _search(entries: list[dict], query: str) -> dict | None:
+_MAX_CANDIDATES = 5
+
+
+@dataclass(frozen=True)
+class SearchResult:
+    """Outcome of a query against the index.
+
+    ``kind`` is one of:
+      * ``"exact"`` / ``"single"`` — one unambiguous song in ``entry``; play it.
+      * ``"ambiguous"`` — several close songs in ``candidates``; ask, don't play.
+      * ``"none"`` — nothing matched.
+    """
+
+    kind: str
+    entry: dict | None = None
+    candidates: tuple[dict, ...] = ()
+
+
+def _search(entries: list[dict], query: str) -> SearchResult:
     nq = _normalize(query)
     if not nq:
-        return None
+        return SearchResult("none")
     substring: list[tuple[int, int, dict]] = []
     for e in entries:
         nn = _normalize(e.get("name", ""))
         if nq == nn:
-            return e  # exact normalized match wins outright
+            return SearchResult("exact", entry=e)  # exact normalized match wins
         if nq in nn:
             substring.append((0 if nn.startswith(nq) else 1, len(nn), e))
     if substring:
         substring.sort(key=lambda t: (t[0], t[1]))
-        return substring[0][2]
+        ordered = [t[2] for t in substring]
+        if len(ordered) == 1:
+            return SearchResult("single", entry=ordered[0])
+        return SearchResult("ambiguous", candidates=tuple(ordered[:_MAX_CANDIDATES]))
     names = [_normalize(e.get("name", "")) for e in entries]
-    close = difflib.get_close_matches(nq, names, n=1, cutoff=0.6)
-    if close:
-        return entries[names.index(close[0])]
-    return None
+    close = difflib.get_close_matches(nq, names, n=_MAX_CANDIDATES, cutoff=0.6)
+    if not close:
+        return SearchResult("none")
+    matched = [entries[names.index(c)] for c in close]
+    if len(matched) == 1:
+        return SearchResult("single", entry=matched[0])
+    return SearchResult("ambiguous", candidates=tuple(matched))
 
 
 # --- player state ----------------------------------------------------------
@@ -211,10 +273,17 @@ def _current_running(state_path: str) -> dict | None:
     if not isinstance(pid, int) or pid <= 0:
         _clear_state(state_path)
         return None
-    if _pid_alive(pid) and _pid_is_player(pid):
-        return state
-    _clear_state(state_path)
-    return None
+    if not (_pid_alive(pid) and _pid_is_player(pid)):
+        _clear_state(state_path)
+        return None
+    # Even a live afplay on this pid is only ours if its start time still
+    # matches what we recorded — otherwise the OS reused the pid for a
+    # different (possibly user-launched) afplay and we must not signal it.
+    recorded_start = state.get("start")
+    if not recorded_start or recorded_start != _pid_start_time(pid):
+        _clear_state(state_path)
+        return None
+    return state
 
 
 def _clear_state(state_path: str) -> None:
@@ -254,7 +323,15 @@ def _play(entry: dict, state_path: str) -> str:
     except Exception as exc:  # noqa: BLE001
         logger.exception("music: playback failed path=%s", entry.get("path"))
         return f"播放失敗：{exc}"
-    _write_json(state_path, {"pid": pid, "name": entry["name"], "path": entry["path"]})
+    _write_json(
+        state_path,
+        {
+            "pid": pid,
+            "name": entry["name"],
+            "path": entry["path"],
+            "start": _pid_start_time(pid),
+        },
+    )
     return f"正在播放：\n{entry['name']}"
 
 
@@ -286,12 +363,20 @@ def build_music_handler(settings: AssistantSettings) -> Callable[[str, str], str
 
         if arg.lower() == "random":
             return _play(random.choice(index.entries), state_path)
-        entry = _search(index.entries, arg)
-        if entry is None:
-            return f"找不到符合「{arg}」的歌曲。"
-        return _play(entry, state_path)
+        result = _search(index.entries, arg)
+        if result.kind in ("exact", "single"):
+            return _play(result.entry, state_path)
+        if result.kind == "ambiguous":
+            return _candidates_text(arg, result.candidates)
+        return f"找不到符合「{arg}」的歌曲。"
 
     return handler
+
+
+def _candidates_text(query: str, candidates: tuple[dict, ...]) -> str:
+    lines = [f"找到多首符合「{query}」的歌曲，請輸入更精確的名稱："]
+    lines.extend(f"{i}. {e['name']}" for i, e in enumerate(candidates, 1))
+    return "\n".join(lines)
 
 
 def _usage_text() -> str:
