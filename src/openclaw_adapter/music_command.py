@@ -425,13 +425,13 @@ class PlaybestController:
         with self._lock:
             return self._active
 
-    def start(self, entries_provider, state_path: str, on_play=None) -> None:
+    def start(self, entries_provider, state_path: str, on_play=None, is_playable=None) -> None:
         self.stop()
         with self._lock:
             self._active = True
             thread = threading.Thread(
                 target=self._loop,
-                args=(entries_provider, state_path, on_play),
+                args=(entries_provider, state_path, on_play, is_playable),
                 daemon=True,
                 name="music-playbest",
             )
@@ -455,12 +455,18 @@ class PlaybestController:
             thread.join(timeout=2.0)
         return was_active
 
-    def _loop(self, entries_provider, state_path: str, on_play) -> None:
-        scheduler = PlaybestScheduler(entries_provider)
+    def _loop(self, entries_provider, state_path: str, on_play, is_playable=None) -> None:
+        scheduler = PlaybestScheduler(entries_provider, exists_fn=is_playable)
         while self.is_active():
             entry = scheduler.next()
             if entry is None:  # favorites empty / all missing → stop cleanly
                 break
+            # Defence in depth: re-validate immediately before spawning so an
+            # auto-advanced favorite that escapes the music root (stale-root or
+            # hand-edited path) is skipped, not played — matching play_path().
+            if is_playable is not None and not is_playable(entry.get("path", "")):
+                logger.warning("playbest: skipping unplayable favorite path=%s", entry.get("path"))
+                continue
             try:
                 pid = _start_song(entry, state_path)
             except Exception:  # noqa: BLE001
@@ -487,17 +493,26 @@ class PlaybestController:
 _PLAYBEST = PlaybestController()
 
 
-def _play_best(store: FavoritesStore, state_path: str) -> str:
+def _play_best(store: FavoritesStore, state_path: str, music_dir: str) -> str:
     favorites = store.list()
     if not favorites:
         return "最愛清單是空的，無法開始連續播放。"
-    playable = [e for e in favorites if os.path.exists(e.get("path", ""))]
+
+    # Favorites are persisted paths that may predate a music-root change or be
+    # hand-edited, so playbest must apply the SAME root/suffix/sidecar check as
+    # the single-play callback (play_path) — never just os.path.exists, which
+    # would let a still-present file outside OPENCLAW_MUSIC_DIR be played.
+    def is_playable(path: str) -> bool:
+        return validate_song_path(path, music_dir)
+
+    playable = [e for e in favorites if is_playable(e.get("path", ""))]
     if not playable:
-        return "最愛清單中的歌曲檔案都不存在，無法播放。"
+        return "最愛清單中沒有可播放的歌曲（檔案不存在、不是 .flac、或已不在音樂資料夾內）。"
     _PLAYBEST.start(
         entries_provider=store.list,
         state_path=state_path,
         on_play=lambda e: store.mark_played(e.get("id", "")),
+        is_playable=is_playable,
     )
     return "開始連續隨機播放最愛歌曲。用 /music stop 可停止。"
 
@@ -533,7 +548,9 @@ def stop_playback(settings: AssistantSettings) -> str:
 
 
 def start_playbest(settings: AssistantSettings, store: FavoritesStore) -> str:
-    return _play_best(store, settings.openclaw_music_player_state_path)
+    return _play_best(
+        store, settings.openclaw_music_player_state_path, settings.openclaw_music_dir
+    )
 
 
 def add_current_to_favorites(settings: AssistantSettings, store: FavoritesStore) -> str:
@@ -577,7 +594,7 @@ def build_music_handler(
         if low == "stop":
             return _stop(state_path)
         if low == "playbest":
-            return _play_best(store, state_path)
+            return _play_best(store, state_path, music_dir)
 
         problem = _music_dir_problem(music_dir)
         if problem:
