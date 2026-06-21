@@ -22,6 +22,7 @@ from openclaw_adapter.command_bridge import CommandBridge
 from openclaw_adapter.session_memory import (
     MAX_BYTES,
     MAX_MESSAGES,
+    MAX_SCALAR_LEN,
     SCHEMA_VERSION,
     SessionMemoryStore,
     empty_session,
@@ -143,6 +144,31 @@ def test_retention_trims_to_byte_budget(store, monkeypatch):
     assert size <= 2000
     assert len(stored["messages"]) < 10  # oldest dropped to fit
     assert stored["messages"][-1]["id"] == "9"  # newest survives
+
+
+# --- retention: scalar field cap ------------------------------------------
+def test_scalar_bloat_does_not_exceed_byte_budget(store, monkeypatch):
+    # Reviewer finding: a huge active_job_id bypassed MAX_BYTES because _trim
+    # only trimmed messages. Now _normalize caps each scalar at MAX_SCALAR_LEN
+    # (512) so the saved snapshot is bounded well under the real 5MB limit.
+    # Use MAX_BYTES=5000: the 10000-char job_id (>5000 bytes raw) is capped to
+    # 512 chars, making the total snapshot ~667 bytes, safely under 5000.
+    monkeypatch.setattr("openclaw_adapter.session_memory.MAX_BYTES", 5000)
+    huge_job_id = "j" * 10000
+    stored = store.save({"messages": [], "active_job_id": huge_job_id})
+    size = len(json.dumps(stored, ensure_ascii=False).encode("utf-8"))
+    assert size <= 5000
+
+
+def test_huge_scalar_is_truncated_to_max_scalar_len(store):
+    huge = "x" * (MAX_SCALAR_LEN + 100)
+    stored = store.save({"messages": [], "active_job_id": huge})
+    assert len(stored["active_job_id"]) == MAX_SCALAR_LEN
+
+
+def test_non_string_scalar_is_set_to_none(store):
+    stored = store.save({"messages": [], "mode": {"attack": "vector"}})
+    assert stored["mode"] is None
 
 
 # --- delete: OSError must not return false success -------------------------

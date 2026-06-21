@@ -35,6 +35,7 @@ _SESSION_FILENAME = "default_session.json"
 MAX_MESSAGES = 100
 MAX_BYTES = 5 * 1024 * 1024  # 5 MB serialized snapshot
 MAX_AGE_SECONDS = 7 * 24 * 60 * 60  # 7 days
+MAX_SCALAR_LEN = 512  # per-field cap so scalar bloat can't bypass MAX_BYTES
 
 # Top-level scalar fields we round-trip (besides ``messages``). Anything else in
 # an incoming snapshot is ignored so a future frontend field can't bloat the
@@ -108,11 +109,15 @@ class SessionMemoryStore:
         if not isinstance(snapshot, dict):
             raise SessionWriteError("session snapshot must be a JSON object")
         normalized = self._normalize(snapshot)
-        normalized = self._trim(normalized)
         normalized["updated_at"] = time.time()
         normalized["schema_version"] = SCHEMA_VERSION
+        normalized = self._trim(normalized)
 
         body = json.dumps(normalized, ensure_ascii=False).encode("utf-8")
+        if len(body) > MAX_BYTES:
+            raise SessionWriteError(
+                f"snapshot exceeds MAX_BYTES after trimming ({len(body)} > {MAX_BYTES})"
+            )
         try:
             self._dir.mkdir(parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile(
@@ -146,7 +151,12 @@ class SessionMemoryStore:
         out["messages"] = list(raw_messages) if isinstance(raw_messages, list) else []
         for field in _SCALAR_FIELDS:
             if field in data:
-                out[field] = data[field]
+                val = data[field]
+                if isinstance(val, str):
+                    val = val[:MAX_SCALAR_LEN]
+                elif val is not None:
+                    val = None  # reject non-string, non-None scalars
+                out[field] = val
         if isinstance(data.get("updated_at"), (int, float)):
             out["updated_at"] = data["updated_at"]
         return out
