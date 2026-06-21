@@ -127,6 +127,58 @@ class OpportunityCandidate:
     related_keywords: tuple[str, ...] = ()
     is_target: bool = False                # 🎯 user-declared target (lenient thresholds) vs 🔍 system-discovered opportunity
     entity_id: str | None = None           # canonical Market Entity join key (issue #12); None when unresolved/ambiguous
+    # Fair-value snapshot from the #15 engine, attached via attach_fair_value().
+    # All optional: a candidate with no resolved entity / insufficient evidence
+    # simply carries None and the pipeline treats valuation as unknown.
+    fair_value_jpy: int | None = None
+    fair_value_confidence: float | None = None
+    discount_to_fair_value: float | None = None   # >0 ⇔ cheapest ask is below fair value
+    liquidity_adjustment: float | None = None
+    valuation_reasons: tuple[str, ...] = ()
+
+
+def attach_fair_value(candidate: "OpportunityCandidate", engine) -> "OpportunityCandidate":
+    """Compute a fair-value snapshot for *candidate* via the #15 ``FairValueEngine``
+    and return a copy with the valuation fields populated (Deliverable 7).
+
+    The valuation is keyed on the candidate's canonical ``entity_id``; without one
+    there is nothing to value against, so the candidate is returned unchanged. The
+    cheapest current ask (from the price ledger) is the "buyable" price compared
+    against fair value to derive the discount. Insufficient evidence degrades to a
+    valuation-reasons note rather than a fabricated number."""
+    from dataclasses import replace
+
+    eid = (candidate.entity_id or "").strip()
+    if not eid:
+        return candidate
+
+    estimate = engine.estimate(eid)
+    if not estimate.has_value or estimate.fair_value is None:
+        return replace(
+            candidate,
+            valuation_reasons=tuple(estimate.explanation) or ("insufficient market evidence",),
+        )
+
+    observed = None
+    if getattr(engine, "price_ledger", None) is not None:
+        snapshot = engine.price_ledger.get_market_snapshot(eid)
+        observed = snapshot.min_price  # cheapest ask = the price you could buy at
+
+    discount = None
+    reasons = list(estimate.explanation)
+    if observed is not None:
+        mispricing = engine.evaluate_mispricing(eid, observed)
+        discount = mispricing.discount_to_fair_value
+        reasons.extend(mispricing.reasons)
+
+    return replace(
+        candidate,
+        fair_value_jpy=int(estimate.fair_value),
+        fair_value_confidence=round(float(estimate.confidence), 4),
+        discount_to_fair_value=discount,
+        liquidity_adjustment=estimate.liquidity_adjustment,
+        valuation_reasons=tuple(reasons),
+    )
 
 
 @dataclass(frozen=True, slots=True)

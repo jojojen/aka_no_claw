@@ -25,6 +25,7 @@ from openclaw_adapter.fair_value import (
     FairValueEngine,
     compute_fair_value,
     evaluate_mispricing,
+    make_source_trust_resolver,
 )
 from openclaw_adapter.liquidity import SoldComparable, SoldCompLedger, compute_liquidity_metrics
 from openclaw_adapter.price_ledger import MarketSnapshot, PriceLedger
@@ -38,10 +39,10 @@ def _iso(days_ago: float = 0) -> str:
     return (_now() - timedelta(days=days_ago)).isoformat()
 
 
-def _sold(price, *, days_ago=1.0, eid="ent_x") -> SoldComparable:
+def _sold(price, *, days_ago=1.0, eid="ent_x", src="S-mercari") -> SoldComparable:
     return SoldComparable(
-        sold_comp_id=f"sc_{price}_{days_ago}",
-        entity_id=eid, source_id="S-mercari", sold_price=Decimal(str(price)),
+        sold_comp_id=f"sc_{price}_{days_ago}_{src}",
+        entity_id=eid, source_id=src, sold_price=Decimal(str(price)),
         currency="JPY", sold_at=_iso(days_ago),
     )
 
@@ -206,3 +207,69 @@ def test_engine_end_to_end(tmp_path):
 
     signal = engine.evaluate_mispricing(eid, 4400, currency="JPY")  # retail well below
     assert signal.recommendation_band in (BAND_UNDERVALUED, BAND_INSUFFICIENT)
+
+
+# --- D (reopened): source-trust weighting -------------------------------------
+
+def test_source_trust_weights_the_median():
+    """A cluster of low-trust sources quoting a cheap price must not drag fair
+    value down as far as it would under an unweighted median."""
+    sold = (
+        [_sold(5000, days_ago=i + 1, src="spam") for i in range(3)]   # cheap, untrusted
+        + [_sold(10000, days_ago=i + 1, src="trusted") for i in range(2)]  # real, trusted
+    )
+
+    def trust(sid: str) -> float:
+        return 0.05 if sid == "spam" else 0.95
+
+    weighted = compute_fair_value("ent_x", snapshot=None, sold_comps=sold,
+                                  source_trust_fn=trust)
+    plain = compute_fair_value("ent_x", snapshot=None, sold_comps=sold)
+    # unweighted median sits at the cheap spam cluster; trust pulls it up
+    assert plain.fair_value == Decimal("5000")
+    assert weighted.fair_value > plain.fair_value
+
+
+def test_low_trust_sources_lower_confidence():
+    """Agreement among low-trust sources earns less corroboration credit than the
+    same breadth of high-trust sources."""
+    snap = _snapshot(count=5, median=10000, lo=9800, hi=10200,
+                     sources=("S-a", "S-b", "S-c"))
+    sold = [_sold(10000, days_ago=i + 1, src=f"S-{i}") for i in range(5)]
+
+    high = compute_fair_value("ent_x", snapshot=snap, sold_comps=sold,
+                              source_trust_fn=lambda sid: 0.95)
+    low = compute_fair_value("ent_x", snapshot=snap, sold_comps=sold,
+                             source_trust_fn=lambda sid: 0.10)
+    assert high.confidence > low.confidence
+
+
+def test_engine_uses_registry_trust_resolver(tmp_path):
+    """The engine wires a Source-Registry/Domain-Registry-backed resolver by
+    default so production valuations down-weight low-trust provenance."""
+    from openclaw_adapter.knowledge_db import KnowledgeDatabase
+
+    kdb = KnowledgeDatabase(tmp_path / "k.db")
+    kdb.bootstrap()
+    # Seed two sources: a high-trust marketplace and an unseeded/low-trust host.
+    trusted_id = kdb.intern_source("https://www.suruga-ya.jp/product/12345")
+    spam_id = kdb.intern_source("https://random-spam-host.example/listing/9")
+    assert trusted_id and spam_id
+
+    resolver = make_source_trust_resolver(kdb)
+    assert resolver(trusted_id) > resolver(spam_id)
+
+    scl = SoldCompLedger(tmp_path / "sold.db")
+    scl.bootstrap()
+    eid = "ent_trust"
+    for i in range(3):
+        scl.record_sold_comp(entity_id=eid, source_id=spam_id, sold_price=5000,
+                             sold_at=_iso(i + 1), currency="JPY")
+    for i in range(2):
+        scl.record_sold_comp(entity_id=eid, source_id=trusted_id, sold_price=10000,
+                             sold_at=_iso(i + 1), currency="JPY")
+
+    engine = FairValueEngine(sold_comp_ledger=scl, knowledge_db=kdb)
+    est = engine.estimate(eid, currency="JPY")
+    # trusted ¥10000 comps outweigh the spam ¥5000 cluster despite being fewer
+    assert est.fair_value is not None and est.fair_value > Decimal("5000")

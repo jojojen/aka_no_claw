@@ -10,6 +10,7 @@ from .opportunity_models import (
     OpportunityRecommendation,
     PriceCheck,
     ReputationCheck,
+    attach_fair_value,
     build_listing_key,
 )
 from .opportunity_scoring import OpportunityThresholds, evaluate_opportunity, target_price_for
@@ -80,6 +81,7 @@ class OpportunityPipeline:
         listing_limit: int = 5,
         candidate_check_interval_seconds: int = 30 * 60,
         signal_store: CollectibleSignalStore | None = None,
+        fair_value_engine=None,
     ) -> None:
         self._store = store
         self._candidate_provider = candidate_provider
@@ -97,12 +99,18 @@ class OpportunityPipeline:
         # is always best-effort: a signal-store failure must never break a
         # recommendation (C4 — logged, not swallowed silently).
         self._signal_store = signal_store
+        # #15 D7: when wired, each discovered candidate with a canonical entity is
+        # stamped with a fair-value snapshot (fair value / discount / liquidity
+        # adjustment / reasons) before persistence. Best-effort: a valuation
+        # failure must never block discovery (C4 — logged, not swallowed).
+        self._fair_value_engine = fair_value_engine
 
     def run_once(self) -> OpportunityPipelineStats:
         stats = _MutableStats()
         discovered = list(self._candidate_provider.discover(limit=self._candidate_limit))
         stats.discovered = len(discovered)
         for candidate in discovered:
+            candidate = self._attach_fair_value(candidate)
             self._store.upsert_candidate(candidate)
             self._record_discovery_signal(candidate)
 
@@ -236,6 +244,24 @@ class OpportunityPipeline:
             "Official store pre-order notification sent candidate=%s url=%s",
             candidate.title, official_url,
         )
+
+    def _attach_fair_value(self, candidate: OpportunityCandidate) -> OpportunityCandidate:
+        """Stamp a #15 fair-value snapshot onto a candidate before persistence.
+
+        Best-effort and entity-gated: with no engine or no resolved ``entity_id``
+        the candidate is returned untouched. A valuation error is logged (C4) but
+        never aborts discovery — the candidate still persists without valuation."""
+        if self._fair_value_engine is None or not candidate.entity_id:
+            return candidate
+        try:
+            return attach_fair_value(candidate, self._fair_value_engine)
+        except Exception:
+            logger.exception(
+                "Opportunity pipeline: fair-value attach failed candidate_id=%s entity_id=%s",
+                candidate.candidate_id,
+                candidate.entity_id,
+            )
+            return candidate
 
     def _record_discovery_signal(self, candidate: OpportunityCandidate) -> None:
         """Persist an official-store candidate as structured intelligence on first
