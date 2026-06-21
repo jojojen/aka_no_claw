@@ -141,6 +141,12 @@ class AssistantSettings:
     # Persisted {volume, muted} for /musicmute /musiclouder /musiclower (issue
     # #35). Gitignored runtime data — never committed.
     openclaw_music_volume_state_path: str = ".openclaw_tmp/music_volume.json"
+    # ── web console session memory (issue #32) ─────────────────────────────
+    # Server-side short-term memory for aka_no_claw_web: the latest console
+    # snapshot (conversation + selected mode/backend) so a phone that reloads or
+    # reconnects restores its session from the Mac mini. Gitignored runtime data
+    # under .openclaw_tmp/, never committed and never written to knowledge.sqlite3.
+    openclaw_web_memory_dir: str = ".openclaw_tmp/web_console_memory"
 
 
 def _resolve_runtime_path(value: str) -> str:
@@ -396,6 +402,9 @@ def get_settings() -> AssistantSettings:
         ),
         openclaw_music_volume_state_path=_resolve_runtime_path(
             os.getenv("OPENCLAW_MUSIC_VOLUME_STATE_PATH", ".openclaw_tmp/music_volume.json")
+        ),
+        openclaw_web_memory_dir=_resolve_runtime_path(
+            os.getenv("OPENCLAW_WEB_MEMORY_DIR", ".openclaw_tmp/web_console_memory")
         ),
     )
 
