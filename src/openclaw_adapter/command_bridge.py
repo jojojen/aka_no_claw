@@ -29,6 +29,7 @@ from uuid import uuid4
 
 from assistant_runtime import AssistantSettings, build_ssl_context
 
+from .session_memory import SessionMemoryStore, SessionWriteError, empty_session
 from .command_bridge_models import (
     CHAT_BACKEND_CLOUD_PICKLE,
     CHAT_BACKEND_LOCAL,
@@ -138,6 +139,8 @@ class CommandBridge:
         self._item_deleter_handlers: dict | None = None
         self._registry_lock = threading.Lock()
         self._jobs = _JobManager()
+        self._session_store: SessionMemoryStore | None = None
+        self._session_lock = threading.Lock()
 
     # --- handler registry (lazy, shared with the Telegram bot) ------------
     def _ensure_registries(self) -> None:
@@ -440,6 +443,47 @@ class CommandBridge:
         text, markup, _ = renderer(page=0, mode=LIST_VIEW_MODE_EDIT)
         return {"status": STATUS_OK, "message": str(text or ""),
                 "actions": self._markup_to_actions(markup)}
+
+    # --- web console session memory (issue #32) --------------------------
+    def _sessions(self) -> SessionMemoryStore:
+        if self._session_store is None:
+            with self._session_lock:
+                if self._session_store is None:
+                    self._session_store = SessionMemoryStore(
+                        self.settings.openclaw_web_memory_dir
+                    )
+        return self._session_store
+
+    def load_session(self) -> dict:
+        """GET — the latest saved console snapshot, or an empty session. Never
+        raises; a missing/corrupt/expired file falls back to a blank session."""
+        try:
+            return {"status": STATUS_OK, "session": self._sessions().load()}
+        except Exception as exc:  # noqa: BLE001 — must never crash the API
+            logger.exception("session memory: load failed")
+            return {"status": STATUS_ERROR, "message": f"讀取 session 失敗：{exc}",
+                    "session": empty_session()}
+
+    def save_session(self, snapshot: object) -> dict:
+        """POST — replace the saved snapshot. A failed write returns a
+        structured error (the frontend keeps its in-memory conversation)."""
+        try:
+            stored = self._sessions().save(snapshot)
+        except SessionWriteError as exc:
+            return {"status": STATUS_ERROR, "message": f"儲存 session 失敗：{exc}"}
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("session memory: save failed")
+            return {"status": STATUS_ERROR, "message": f"儲存 session 失敗：{exc}"}
+        return {"status": STATUS_OK, "updated_at": stored.get("updated_at")}
+
+    def clear_session(self) -> dict:
+        """DELETE — drop the saved snapshot (idempotent)."""
+        try:
+            self._sessions().clear()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("session memory: clear failed")
+            return {"status": STATUS_ERROR, "message": f"清除 session 失敗：{exc}"}
+        return {"status": STATUS_OK}
 
     def _stream_ollama_chat(self, prompt: str) -> Iterator[dict]:
         endpoint = self.settings.openclaw_local_text_endpoint.rstrip("/")
