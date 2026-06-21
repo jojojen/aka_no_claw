@@ -78,6 +78,8 @@ def _build_handler(bridge: CommandBridge, *, lan_enabled: bool) -> type[BaseHTTP
                 self._handle_stream()
             elif path == "/api/command/async":
                 self._handle_async()
+            elif path == "/api/command/action":
+                self._handle_action()
             else:
                 self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
@@ -106,6 +108,23 @@ def _build_handler(bridge: CommandBridge, *, lan_enabled: bool) -> type[BaseHTTP
             result = bridge.start_async(req)
             status = HTTPStatus.OK if result.get("status") == "accepted" else HTTPStatus.BAD_REQUEST
             self._write_json(result, status=status)
+
+        def _handle_action(self) -> None:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            try:
+                raw = self.rfile.read(length) if length else b""
+                data = json.loads(raw.decode("utf-8")) if raw else {}
+            except (ValueError, UnicodeDecodeError) as exc:
+                self._write_json({"status": "error", "message": f"無效的請求：{exc}"},
+                                 status=HTTPStatus.BAD_REQUEST)
+                return
+            job_id = str(data.get("job_id") or "")
+            callback_data = str(data.get("callback_data") or "")
+            if not job_id or not callback_data:
+                self._write_json({"status": "error", "message": "缺少 job_id 或 callback_data。"},
+                                 status=HTTPStatus.BAD_REQUEST)
+                return
+            self._write_json(bridge.run_action(job_id, callback_data))
 
         def _handle_blocking(self) -> None:
             try:

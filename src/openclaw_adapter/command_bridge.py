@@ -77,6 +77,7 @@ class _Job:
         self.status = JOB_RUNNING
         self.progress: list[str] = []
         self.message: str = ""
+        self.actions: list[dict] = []
         self.error: str | None = None
         self.created_at = time.monotonic()
         self.lock = threading.Lock()
@@ -132,33 +133,69 @@ class CommandBridge:
     def __init__(self, settings: AssistantSettings) -> None:
         self.settings = settings
         self._command_handlers: dict | None = None
+        self._callback_handlers: dict | None = None
         self._registry_lock = threading.Lock()
         self._jobs = _JobManager()
 
     # --- handler registry (lazy, shared with the Telegram bot) ------------
-    def _handlers(self) -> dict:
+    def _ensure_registries(self) -> None:
         if self._command_handlers is None:
             with self._registry_lock:
                 if self._command_handlers is None:
                     from .telegram_bot import _build_registries
 
-                    command_handlers, *_ = _build_registries(
+                    command_handlers, callback_handlers, *_ = _build_registries(
                         self.settings,
                         None,
                         research_notifier_factory=lambda chat_id: _JobNotifier(
                             self._jobs, str(chat_id)
                         ),
                     )
+                    self._callback_handlers = callback_handlers
                     self._command_handlers = command_handlers
-        return self._command_handlers
+
+    def _handlers(self) -> dict:
+        self._ensure_registries()
+        return self._command_handlers  # type: ignore[return-value]
+
+    def _callbacks(self) -> dict:
+        self._ensure_registries()
+        return self._callback_handlers or {}
 
     def _run_command(self, command: str, remainder: str,
                      chat_id: str = _BRIDGE_CHAT_ID) -> str:
+        text, _ = self._run_command_raw(command, remainder, chat_id=chat_id)
+        return text
+
+    def _run_command_raw(self, command: str, remainder: str,
+                         chat_id: str = _BRIDGE_CHAT_ID) -> tuple[str, object]:
+        """Run a handler and keep both the text and any Telegram reply_markup
+        (inline_keyboard), so the web console can render the same follow-up
+        buttons 龍蝦 shows after /research."""
         registered = self._handlers()[command]
         result = registered.handler(remainder, chat_id)
-        if isinstance(result, tuple):  # (text, reply_markup) — keep text only
-            result = result[0]
-        return str(result) if result is not None else ""
+        if isinstance(result, tuple):
+            text = result[0]
+            markup = result[1] if len(result) > 1 else None
+            return (str(text) if text is not None else "", markup)
+        return (str(result) if result is not None else "", None)
+
+    @staticmethod
+    def _markup_to_actions(markup: object) -> list[dict]:
+        """Flatten a Telegram inline_keyboard into web action buttons. Each
+        button keeps its ``callback_data`` so a click can re-invoke the same
+        callback handler (e.g. switch the /research view)."""
+        actions: list[dict] = []
+        if isinstance(markup, dict):
+            for row in markup.get("inline_keyboard", []):
+                for btn in row:
+                    if not isinstance(btn, dict):
+                        continue
+                    cb = btn.get("callback_data")
+                    label = btn.get("text")
+                    if cb and label:
+                        actions.append({"label": str(label), "callback_data": str(cb)})
+        return actions
 
     # --- blocking entrypoint ---------------------------------------------
     def handle(self, req: WebCommandRequest) -> WebCommandResponse:
@@ -253,9 +290,12 @@ class CommandBridge:
 
         def _worker() -> None:
             try:
-                message = self._run_command("/research", text, chat_id=job.id)
+                message, markup = self._run_command_raw(
+                    "/research", text, chat_id=job.id
+                )
                 with job.lock:
                     job.message = message
+                    job.actions = self._markup_to_actions(markup)
                     job.status = JOB_DONE
             except Exception as exc:  # noqa: BLE001
                 logger.exception("async research failed job=%s", job.id)
@@ -268,7 +308,8 @@ class CommandBridge:
 
     def poll_job(self, job_id: str) -> dict:
         """Snapshot a job: status (running/done/error), the staged progress
-        accumulated so far, and the final report once done."""
+        accumulated so far, the final report once done, and any follow-up
+        action buttons (龍蝦's /research views)."""
         job = self._jobs.get(job_id)
         if job is None:
             return {"job_status": JOB_ERROR, "not_found": True,
@@ -278,8 +319,34 @@ class CommandBridge:
                 "job_status": job.status,
                 "progress": list(job.progress),
                 "message": job.message,
+                "actions": list(job.actions),
                 "error": job.error,
             }
+
+    def run_action(self, job_id: str, callback_data: str) -> dict:
+        """Re-invoke a research follow-up button (e.g. ``rs:<token>:price``).
+        The report is cached under the job id as its chat id, so the click must
+        carry the originating job id — matching how 龍蝦 keys callbacks by chat."""
+        if self._jobs.get(job_id) is None:
+            return {"status": STATUS_ERROR,
+                    "message": "找不到此研究結果（可能已過期，請重新執行研究）。"}
+        prefix, _, payload = (callback_data or "").partition(":")
+        handler = self._callbacks().get(prefix)
+        if handler is None:
+            return {"status": STATUS_ERROR, "message": f"未知的動作：{prefix or callback_data}"}
+        try:
+            result = handler(payload, "", job_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("research action failed job=%s cb=%s", job_id, callback_data)
+            return {"status": STATUS_ERROR, "message": f"動作執行失敗：{exc}"}
+        ack, detail, markup = (list(result) + [None, None, None])[:3] \
+            if isinstance(result, tuple) else (result, None, None)
+        message = detail if detail else ack
+        return {
+            "status": STATUS_OK,
+            "message": str(message) if message is not None else "",
+            "actions": self._markup_to_actions(markup),
+        }
 
     def _stream_ollama_chat(self, prompt: str) -> Iterator[dict]:
         endpoint = self.settings.openclaw_local_text_endpoint.rstrip("/")
