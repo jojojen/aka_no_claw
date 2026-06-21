@@ -138,6 +138,9 @@ class AssistantSettings:
     # limit. Both are gitignored runtime data and must never be committed.
     openclaw_music_best_path: str = ".openclaw_tmp/music_best.json"
     openclaw_music_token_cache_path: str = ".openclaw_tmp/music_tokens.json"
+    # Persisted {volume, muted} for /musicmute /musiclouder /musiclower (issue
+    # #35). Gitignored runtime data — never committed.
+    openclaw_music_volume_state_path: str = ".openclaw_tmp/music_volume.json"
 
 
 def _resolve_runtime_path(value: str) -> str:
@@ -390,6 +393,9 @@ def get_settings() -> AssistantSettings:
         ),
         openclaw_music_token_cache_path=_resolve_runtime_path(
             os.getenv("OPENCLAW_MUSIC_TOKEN_CACHE_PATH", ".openclaw_tmp/music_tokens.json")
+        ),
+        openclaw_music_volume_state_path=_resolve_runtime_path(
+            os.getenv("OPENCLAW_MUSIC_VOLUME_STATE_PATH", ".openclaw_tmp/music_volume.json")
         ),
     )
 

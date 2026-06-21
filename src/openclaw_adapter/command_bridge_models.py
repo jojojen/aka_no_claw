@@ -18,6 +18,11 @@ from dataclasses import dataclass, field
 MODE_CHAT = "chat"
 MODE_TRANSLATION = "translation"
 MODE_INVESTMENT = "investment"
+# 生活 (lifestyle) mode — music control surface (aka_no_claw_web#3). Its actions
+# are driven through the dedicated /api/command/music route (callback buttons),
+# not the blocking /api/command router, so it is intentionally not in _MODES.
+MODE_LIFE = "life"
+SUBMODE_MUSIC = "music"
 _MODES = {MODE_CHAT, MODE_TRANSLATION, MODE_INVESTMENT}
 
 # --- Submodes -------------------------------------------------------------

@@ -80,6 +80,8 @@ def _build_handler(bridge: CommandBridge, *, lan_enabled: bool) -> type[BaseHTTP
                 self._handle_async()
             elif path == "/api/command/action":
                 self._handle_action()
+            elif path == "/api/command/music":
+                self._handle_music()
             else:
                 self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
@@ -125,6 +127,29 @@ def _build_handler(bridge: CommandBridge, *, lan_enabled: bool) -> type[BaseHTTP
                                  status=HTTPStatus.BAD_REQUEST)
                 return
             self._write_json(bridge.run_action(job_id, callback_data))
+
+        def _handle_music(self) -> None:
+            """生活 mode music surface (aka_no_claw_web#3/#4). A button press
+            carries ``callback_data`` (re-invoke the matching music/list
+            callback); a text box carries ``input`` (play/search); an empty
+            body returns the music menu + control buttons."""
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            try:
+                raw = self.rfile.read(length) if length else b""
+                data = json.loads(raw.decode("utf-8")) if raw else {}
+            except (ValueError, UnicodeDecodeError) as exc:
+                self._write_json({"status": "error", "message": f"無效的請求：{exc}"},
+                                 status=HTTPStatus.BAD_REQUEST)
+                return
+            if not isinstance(data, dict):
+                self._write_json({"status": "error", "message": "請求必須是 JSON 物件。"},
+                                 status=HTTPStatus.BAD_REQUEST)
+                return
+            callback_data = str(data.get("callback_data") or "")
+            if callback_data:
+                self._write_json(bridge.run_music_action(callback_data))
+                return
+            self._write_json(bridge.run_music_command(str(data.get("input") or "")))
 
         def _handle_blocking(self) -> None:
             try:

@@ -438,6 +438,122 @@ def test_handle_stream_closes_generator_on_client_disconnect(monkeypatch):
     assert closed["v"], "generator was not closed on client disconnect"
 
 
+# --- 生活 mode: music control surface (aka_no_claw_web#3 / #4) -------------
+def test_music_command_runs_music_handler(bridge, monkeypatch):
+    markup = {"inline_keyboard": [[{"text": "🔇 靜音", "callback_data": "music:mute"}]]}
+    monkeypatch.setattr(bridge, "_run_command_raw",
+                        lambda command, text, **k: (f"[music]{command}:{text}", markup))
+    res = bridge.run_music_command("")
+    assert res["status"] == STATUS_OK
+    assert res["message"] == "[music]/music:"
+    assert res["actions"][0]["callback_data"] == "music:mute"
+
+
+def test_music_action_volume_routes_to_music_callback(bridge, monkeypatch):
+    def _music_cb(payload, original_text, chat_id):
+        assert payload == "louder"
+        return ("目前音量：80/100。", None, None)  # toast only
+
+    monkeypatch.setattr(bridge, "_callbacks", lambda: {"music": _music_cb})
+    res = bridge.run_music_action("music:louder")
+    assert res["status"] == STATUS_OK
+    assert res["message"] == "目前音量：80/100。"
+    assert res["actions"] == []
+
+
+def test_music_action_browse_returns_rerender_text_and_buttons(bridge, monkeypatch):
+    markup = {"inline_keyboard": [[{"text": "🎵 song", "callback_data": "music:sd:tok"}]]}
+
+    def _music_cb(payload, original_text, chat_id):
+        return (None, "📁 資料夾內容", markup)  # new_text -> rerender
+
+    monkeypatch.setattr(bridge, "_callbacks", lambda: {"music": _music_cb})
+    res = bridge.run_music_action("music:ls:root:0")
+    assert res["message"] == "📁 資料夾內容"
+    assert res["actions"][0]["callback_data"] == "music:sd:tok"
+
+
+def test_music_action_list_pg_routes_to_view(bridge, monkeypatch):
+    markup = {"inline_keyboard": [[{"text": "▶️ fav", "callback_data": "music:pf:1"}]]}
+    monkeypatch.setattr(bridge, "_views",
+                        lambda: {"mb": lambda page, mode: ("最愛清單", markup, page)})
+    res = bridge.run_music_action("pg:mb:0:r")
+    assert res["status"] == STATUS_OK
+    assert res["message"] == "最愛清單"
+    assert res["actions"][0]["callback_data"] == "music:pf:1"
+
+
+def test_music_action_list_del_then_rerenders_edit(bridge, monkeypatch):
+    deleted: list[str] = []
+    monkeypatch.setattr(bridge, "_deleters",
+                        lambda: {"mb": (lambda i: deleted.append(i) or True, "最愛")})
+    monkeypatch.setattr(bridge, "_views",
+                        lambda: {"mb": lambda page, mode: (f"清單[{mode}]", None, page)})
+    res = bridge.run_music_action("del:mb:abc")
+    assert deleted == ["abc"]
+    assert res["status"] == STATUS_OK
+    assert "清單[" in res["message"]
+
+
+def test_music_action_close_clears(bridge):
+    res = bridge.run_music_action("close:mb")
+    assert res["status"] == STATUS_OK
+    assert res["actions"] == []
+
+
+def test_music_action_unknown_prefix_is_error(bridge):
+    res = bridge.run_music_action("bogus:thing")
+    assert res["status"] == STATUS_ERROR
+
+
+def test_server_music_route_dispatches_callback(monkeypatch):
+    """POST /api/command/music with callback_data → run_music_action; with
+    input → run_music_command; empty body → music menu."""
+    from http.server import BaseHTTPRequestHandler
+
+    from openclaw_adapter import command_bridge_server as srv
+
+    seen: dict[str, object] = {}
+
+    class _FakeBridge:
+        def run_music_action(self, cb):
+            seen["action"] = cb
+            return {"status": STATUS_OK, "message": "act", "actions": []}
+
+        def run_music_command(self, text):
+            seen["command"] = text
+            return {"status": STATUS_OK, "message": "cmd", "actions": []}
+
+    def _invoke(body: bytes) -> dict:
+        handler_cls = srv._build_handler(_FakeBridge(), lan_enabled=False)
+        h = handler_cls.__new__(handler_cls)
+        h.headers = {"Content-Length": str(len(body))}
+        h.rfile = io.BytesIO(body)
+        h.wfile = io.BytesIO()
+        h.request_version = "HTTP/1.1"
+        h.protocol_version = "HTTP/1.0"
+        h.requestline = "POST /api/command/music HTTP/1.1"
+        h.responses = BaseHTTPRequestHandler.responses
+        h.client_address = ("127.0.0.1", 1)
+        h._handle_music()
+        raw = h.wfile.getvalue().split(b"\r\n\r\n", 1)[1]
+        import json as _json
+        return _json.loads(raw.decode("utf-8"))
+
+    out = _invoke(b'{"callback_data":"music:louder"}')
+    assert seen["action"] == "music:louder"
+    assert out["message"] == "act"
+
+    seen.clear()
+    out = _invoke(b'{"input":"\\u30ed\\u30c3\\u30af"}')
+    assert seen["command"] == "ロック"
+    assert out["message"] == "cmd"
+
+    seen.clear()
+    out = _invoke(b"{}")
+    assert seen["command"] == ""
+
+
 # --- client allowlist -----------------------------------------------------
 def test_loopback_allowed_lan_blocked_by_default():
     from openclaw_adapter.command_bridge_server import _is_allowed_client

@@ -50,6 +50,9 @@ def test_command_registry_has_expected_keys(tmp_path):
         "/snsbuzz",
         "/sns_buzz",
         "/snsclearfilter",
+        "/musicmute",
+        "/musiclouder",
+        "/musiclower",
     }
     assert expected <= set(command_handlers)
     assert all(isinstance(v, RegisteredCommand) for v in command_handlers.values())
