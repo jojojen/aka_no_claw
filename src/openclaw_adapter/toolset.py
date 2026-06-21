@@ -37,6 +37,7 @@ from .sns_tools import (
     _handle_sns_toggle,
 )
 from .chat_web import serve_chat_web
+from .command_bridge_server import serve_command_bridge
 from .telegram_bot import (
     default_board_loader,
     default_lookup_renderer,
@@ -103,6 +104,15 @@ def build_tool_registry(settings: AssistantSettings | None = None) -> ToolRegist
             configure_parser=_configure_chat_web_parser,
             handler=lambda args: _handle_chat_web(args, settings),
             aliases=("chat-web",),
+        )
+    )
+    registry.register(
+        AssistantTool(
+            name="assistant.command-bridge",
+            description="Run the local command bridge for aka_no_claw_web (POST /api/command + /api/command/stream). Localhost by default; --lan for phone access.",
+            configure_parser=_configure_command_bridge_parser,
+            handler=lambda args: _handle_command_bridge(args, settings),
+            aliases=("command-bridge",),
         )
     )
     registry.register(
@@ -297,6 +307,15 @@ def _configure_chat_web_parser(parser: argparse.ArgumentParser) -> None:
                         help="Open the chat page in the default browser on start.")
 
 
+def _configure_command_bridge_parser(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--host", default=None,
+                        help="Bind host (default: 127.0.0.1; 0.0.0.0 when --lan).")
+    parser.add_argument("--port", type=int, default=8781,
+                        help="Port for the command bridge (default: 8781).")
+    parser.add_argument("--lan", action="store_true",
+                        help="Opt in to LAN access (phone on the same Wi-Fi). Off by default.")
+
+
 def _configure_telegram_send_test_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--message", default="OpenClaw Telegram test successful.")
 
@@ -476,6 +495,17 @@ def _handle_chat_web(args: argparse.Namespace, settings: AssistantSettings) -> i
         host=args.host,
         port=args.port,
         open_browser=args.open_browser,
+    )
+
+
+def _handle_command_bridge(args: argparse.Namespace, settings: AssistantSettings) -> int:
+    logger.info("CLI command-bridge received host=%s port=%s lan=%s",
+                args.host, args.port, args.lan)
+    return serve_command_bridge(
+        settings=settings,
+        host=args.host,
+        port=args.port,
+        lan=args.lan,
     )
 
 
