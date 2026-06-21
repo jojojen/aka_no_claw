@@ -1,0 +1,449 @@
+"""Local command bridge for aka_no_claw_web (issue #30).
+
+Routes the three MVP modes from the mobile console — Chat, Translation,
+Investment Research — onto the *existing* OpenClaw handlers, so the web UI never
+reimplements command logic and never drifts from the Telegram bot:
+
+* Chat       → local Ollama model or cloud big-pickle, pure chat (Phase 1, no
+               tool calls), with a streaming path for long output.
+* Translation→ the existing ``/zh`` handler (text). Image translation is
+               reported as a structured ``unsupported`` until the bridge grows a
+               multipart file route (doc-allowed for MVP).
+* Investment → ``商品深入研究`` reuses the existing ``/research`` handler. Seller
+               reputation snapshot is ``unsupported`` for MVP.
+
+Handlers are pulled from :func:`telegram_bot._build_registries` (the same
+registry the bot uses) so there is one source of truth.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import threading
+import time
+from collections.abc import Iterator
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+from uuid import uuid4
+
+from assistant_runtime import AssistantSettings, build_ssl_context
+
+from .command_bridge_models import (
+    CHAT_BACKEND_CLOUD_PICKLE,
+    CHAT_BACKEND_LOCAL,
+    MODE_CHAT,
+    MODE_INVESTMENT,
+    MODE_TRANSLATION,
+    STATUS_ERROR,
+    STATUS_OK,
+    STATUS_UNSUPPORTED,
+    SUBMODE_DEEP_PRODUCT_RESEARCH,
+    SUBMODE_IMAGE_TRANSLATION,
+    SUBMODE_SELLER_REPUTATION_SNAPSHOT,
+    SUBMODE_TEXT_TRANSLATION,
+    WebCommandRequest,
+    WebCommandResponse,
+    stream_delta,
+    stream_done,
+    stream_error,
+    stream_heartbeat,
+    stream_start,
+)
+
+logger = logging.getLogger(__name__)
+
+_BRIDGE_CHAT_ID = "web-bridge"
+_HEARTBEAT_SECONDS = 10.0
+# Finished jobs linger this long so a phone that reconnects after a screen-lock
+# can still fetch the final report, then they are garbage-collected.
+_JOB_TTL_SECONDS = 1800.0
+
+_IMAGE_UNSUPPORTED_MSG = "圖片翻譯目前尚未由本地 command bridge 支援。"
+_SELLER_UNSUPPORTED_MSG = "賣家信譽快照目前尚未由本地 command bridge 支援。"
+
+JOB_RUNNING = "running"
+JOB_DONE = "done"
+JOB_ERROR = "error"
+
+
+class _Job:
+    """A long-running command (e.g. ``/research``) decoupled from any HTTP
+    connection. Staged ``notifier.send`` milestones accumulate in ``progress``
+    so a polling client can show 龍蝦-style progress and survive disconnects."""
+
+    def __init__(self, job_id: str) -> None:
+        self.id = job_id
+        self.status = JOB_RUNNING
+        self.progress: list[str] = []
+        self.message: str = ""
+        self.error: str | None = None
+        self.created_at = time.monotonic()
+        self.lock = threading.Lock()
+
+
+class _JobManager:
+    def __init__(self) -> None:
+        self._jobs: dict[str, _Job] = {}
+        self._lock = threading.Lock()
+
+    def create(self) -> _Job:
+        job = _Job(uuid4().hex)
+        with self._lock:
+            self._gc_locked()
+            self._jobs[job.id] = job
+        return job
+
+    def get(self, job_id: str) -> _Job | None:
+        with self._lock:
+            return self._jobs.get(job_id)
+
+    def append_progress(self, job_id: str, text: str) -> None:
+        job = self.get(job_id)
+        if job is not None:
+            with job.lock:
+                job.progress.append(text)
+
+    def _gc_locked(self) -> None:
+        cutoff = time.monotonic() - _JOB_TTL_SECONDS
+        stale = [
+            jid for jid, j in self._jobs.items()
+            if j.status != JOB_RUNNING and j.created_at < cutoff
+        ]
+        for jid in stale:
+            self._jobs.pop(jid, None)
+
+
+class _JobNotifier:
+    """ResearchNotifier that appends staged progress to a job, keyed by job id
+    (passed as the research ``chat_id``)."""
+
+    def __init__(self, jobs: _JobManager, job_id: str) -> None:
+        self._jobs = jobs
+        self._job_id = job_id
+
+    def send(self, text: str) -> None:
+        self._jobs.append_progress(self._job_id, text)
+
+
+class CommandBridge:
+    """Stateless-per-request router over the existing OpenClaw handlers."""
+
+    def __init__(self, settings: AssistantSettings) -> None:
+        self.settings = settings
+        self._command_handlers: dict | None = None
+        self._registry_lock = threading.Lock()
+        self._jobs = _JobManager()
+
+    # --- handler registry (lazy, shared with the Telegram bot) ------------
+    def _handlers(self) -> dict:
+        if self._command_handlers is None:
+            with self._registry_lock:
+                if self._command_handlers is None:
+                    from .telegram_bot import _build_registries
+
+                    command_handlers, *_ = _build_registries(
+                        self.settings,
+                        None,
+                        research_notifier_factory=lambda chat_id: _JobNotifier(
+                            self._jobs, str(chat_id)
+                        ),
+                    )
+                    self._command_handlers = command_handlers
+        return self._command_handlers
+
+    def _run_command(self, command: str, remainder: str,
+                     chat_id: str = _BRIDGE_CHAT_ID) -> str:
+        registered = self._handlers()[command]
+        result = registered.handler(remainder, chat_id)
+        if isinstance(result, tuple):  # (text, reply_markup) — keep text only
+            result = result[0]
+        return str(result) if result is not None else ""
+
+    # --- blocking entrypoint ---------------------------------------------
+    def handle(self, req: WebCommandRequest) -> WebCommandResponse:
+        try:
+            if req.mode == MODE_CHAT:
+                return self._handle_chat_blocking(req)
+            if req.mode == MODE_TRANSLATION:
+                return self._handle_translation(req)
+            if req.mode == MODE_INVESTMENT:
+                return self._handle_investment(req)
+            return WebCommandResponse(
+                status=STATUS_ERROR,
+                message=f"未知的模式：{req.mode}",
+                mode=req.mode,
+            )
+        except Exception as exc:  # noqa: BLE001 — surface as structured error
+            logger.exception("command bridge failed mode=%s", req.mode)
+            return WebCommandResponse(
+                status=STATUS_ERROR,
+                message=f"後端處理失敗：{exc}",
+                mode=req.mode,
+                submode=req.submode,
+            )
+
+    # --- streaming entrypoint (chat) -------------------------------------
+    def stream(self, req: WebCommandRequest, request_id: str) -> Iterator[dict]:
+        """Yield streaming event dicts. Chat streams token-by-token (local) or
+        in one block with heartbeats (cloud); non-chat modes run blocking and
+        emit a single done event so the frontend can use one code path."""
+        yield stream_start(request_id)
+        try:
+            if req.mode == MODE_CHAT:
+                yield from self._stream_chat(req)
+                return
+            # Non-chat modes (translation): reuse the blocking router, emit as
+            # one event. Long research runs via the async job + poll endpoints
+            # instead, so a mobile screen-lock can't drop a held connection.
+            response = self.handle(req)
+            if response.status == STATUS_ERROR:
+                yield stream_error(response.message)
+            else:
+                yield stream_done(response.message)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("command bridge stream failed mode=%s", req.mode)
+            yield stream_error(f"後端處理失敗：{exc}")
+
+    # --- chat ------------------------------------------------------------
+    def _handle_chat_blocking(self, req: WebCommandRequest) -> WebCommandResponse:
+        prompt = (req.input or "").strip()
+        if not prompt:
+            return WebCommandResponse(
+                status=STATUS_ERROR, message="請輸入訊息。", mode=MODE_CHAT
+            )
+        if req.chat_backend == CHAT_BACKEND_CLOUD_PICKLE:
+            client = self._build_cloud_chat_client()
+            if client is None:
+                return WebCommandResponse(
+                    status=STATUS_ERROR,
+                    message="cloud pickle 後端目前無法使用（OpenCode 未設定或無法連線）。",
+                    mode=MODE_CHAT,
+                )
+            message = client.generate(prompt, temperature=0.7)
+        else:
+            message = self._ollama_generate_blocking(prompt)
+        return WebCommandResponse(status=STATUS_OK, message=message, mode=MODE_CHAT)
+
+    def _stream_chat(self, req: WebCommandRequest) -> Iterator[dict]:
+        prompt = (req.input or "").strip()
+        if not prompt:
+            yield stream_error("請輸入訊息。")
+            return
+        if req.chat_backend == CHAT_BACKEND_CLOUD_PICKLE:
+            yield from self._stream_cloud_chat(prompt)
+        else:
+            yield from self._stream_ollama_chat(prompt)
+
+    # --- async job + poll (long research, decoupled from the connection) --
+    def start_async(self, req: WebCommandRequest) -> dict:
+        """Kick off a long command in a background thread and return a job id
+        immediately. Only investment deep research is async for the MVP; the
+        client then polls :meth:`poll_job` for staged progress + final report,
+        which survives mobile screen-locks and connection drops."""
+        if req.mode != MODE_INVESTMENT or req.submode not in (
+            None, SUBMODE_DEEP_PRODUCT_RESEARCH
+        ):
+            return {"status": STATUS_ERROR,
+                    "message": "非同步任務目前僅支援商品深入研究。"}
+        text = (req.input or "").strip()
+        if not text:
+            return {"status": STATUS_ERROR, "message": "請貼上商品 URL 或輸入商品名稱。"}
+        job = self._jobs.create()
+
+        def _worker() -> None:
+            try:
+                message = self._run_command("/research", text, chat_id=job.id)
+                with job.lock:
+                    job.message = message
+                    job.status = JOB_DONE
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("async research failed job=%s", job.id)
+                with job.lock:
+                    job.error = str(exc)
+                    job.status = JOB_ERROR
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return {"status": "accepted", "job_id": job.id}
+
+    def poll_job(self, job_id: str) -> dict:
+        """Snapshot a job: status (running/done/error), the staged progress
+        accumulated so far, and the final report once done."""
+        job = self._jobs.get(job_id)
+        if job is None:
+            return {"job_status": JOB_ERROR, "not_found": True,
+                    "message": "找不到此任務（可能已過期，請重新查詢）。"}
+        with job.lock:
+            return {
+                "job_status": job.status,
+                "progress": list(job.progress),
+                "message": job.message,
+                "error": job.error,
+            }
+
+    def _stream_ollama_chat(self, prompt: str) -> Iterator[dict]:
+        endpoint = self.settings.openclaw_local_text_endpoint.rstrip("/")
+        model = self._local_model()
+        ssl_ctx = build_ssl_context(self.settings) if endpoint.startswith("https://") else None
+        url = endpoint if endpoint.endswith("/api/generate") else f"{endpoint}/api/generate"
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "stream": True,
+            "think": False,
+            "options": {"temperature": 0.7},
+        }
+        request = Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Accept": "application/x-ndjson"},
+            method="POST",
+        )
+        full: list[str] = []
+        try:
+            with urlopen(request, timeout=self.settings.openclaw_local_text_timeout_seconds,
+                         context=ssl_ctx) as response:
+                for raw_line in response:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                    except ValueError:
+                        continue
+                    piece = chunk.get("response")
+                    if piece:
+                        full.append(piece)
+                        yield stream_delta(piece)
+                    if chunk.get("done"):
+                        break
+        except HTTPError as exc:
+            yield stream_error(f"本地模型 HTTP {exc.code}。")
+            return
+        except URLError as exc:
+            yield stream_error(f"本地模型無回應：{exc.reason}")
+            return
+        yield stream_done("".join(full).strip())
+
+    def _stream_cloud_chat(self, prompt: str) -> Iterator[dict]:
+        client = self._build_cloud_chat_client()
+        if client is None:
+            yield stream_error("cloud pickle 後端目前無法使用（OpenCode 未設定或無法連線）。")
+            return
+        # The cloud client is blocking; run it off-thread and emit heartbeats so
+        # idle gaps don't trip client/proxy timeouts, then deliver as one delta.
+        result: dict[str, object] = {}
+        done = threading.Event()
+
+        def _worker() -> None:
+            try:
+                result["text"] = client.generate(prompt, temperature=0.7)
+            except Exception as exc:  # noqa: BLE001
+                result["error"] = str(exc)
+            finally:
+                done.set()
+
+        worker = threading.Thread(target=_worker, daemon=True)
+        worker.start()
+        while not done.wait(timeout=_HEARTBEAT_SECONDS):
+            yield stream_heartbeat()
+        if "error" in result:
+            yield stream_error(f"cloud pickle 後端失敗：{result['error']}")
+            return
+        text = str(result.get("text") or "").strip()
+        if text:
+            yield stream_delta(text)
+        yield stream_done(text)
+
+    def _ollama_generate_blocking(self, prompt: str) -> str:
+        from .dynamic_tools import OllamaTextClient
+
+        client = OllamaTextClient(
+            endpoint=self.settings.openclaw_local_text_endpoint,
+            model=self._local_model(),
+            timeout_seconds=self.settings.openclaw_local_text_timeout_seconds,
+        )
+        return client.generate(prompt, temperature=0.7)
+
+    def _build_cloud_chat_client(self):
+        """Big-pickle chat client: direct HTTP when an API key is configured,
+        else the opencode CLI, else None when neither is usable."""
+        from .dynamic_tools import (
+            OpenCodeCliTextClient,
+            OpenCodeTextClient,
+            probe_opencode_cli,
+        )
+
+        raw_model = (self.settings.openclaw_opencode_model or "big-pickle").strip()
+        if self.settings.openclaw_opencode_api_key:
+            model = raw_model.split("/")[-1] if "/" in raw_model else raw_model
+            return OpenCodeTextClient(
+                base_url=self.settings.openclaw_opencode_base_url,
+                model=model,
+                api_key=self.settings.openclaw_opencode_api_key,
+                timeout_seconds=180,
+            )
+        cli_model = raw_model if "/" in raw_model else f"opencode/{raw_model}"
+        if probe_opencode_cli(model=cli_model, timeout=20.0):
+            return OpenCodeCliTextClient(model=cli_model, timeout_seconds=180)
+        return None
+
+    def _local_model(self) -> str:
+        return (self.settings.openclaw_local_text_model or "qwen3:14b").split(",")[0].strip()
+
+    # --- translation -----------------------------------------------------
+    def _handle_translation(self, req: WebCommandRequest) -> WebCommandResponse:
+        if req.submode == SUBMODE_IMAGE_TRANSLATION or req.has_image_attachment:
+            return WebCommandResponse(
+                status=STATUS_UNSUPPORTED,
+                message=_IMAGE_UNSUPPORTED_MSG,
+                mode=MODE_TRANSLATION,
+                submode=SUBMODE_IMAGE_TRANSLATION,
+            )
+        text = (req.input or "").strip()
+        if not text:
+            return WebCommandResponse(
+                status=STATUS_ERROR,
+                message="請輸入要翻譯的文字。",
+                mode=MODE_TRANSLATION,
+                submode=SUBMODE_TEXT_TRANSLATION,
+            )
+        message = self._run_command("/zh", text)
+        return WebCommandResponse(
+            status=STATUS_OK,
+            message=message,
+            mode=MODE_TRANSLATION,
+            submode=SUBMODE_TEXT_TRANSLATION,
+        )
+
+    # --- investment ------------------------------------------------------
+    def _handle_investment(self, req: WebCommandRequest) -> WebCommandResponse:
+        if req.submode == SUBMODE_SELLER_REPUTATION_SNAPSHOT:
+            return WebCommandResponse(
+                status=STATUS_UNSUPPORTED,
+                message=_SELLER_UNSUPPORTED_MSG,
+                mode=MODE_INVESTMENT,
+                submode=SUBMODE_SELLER_REPUTATION_SNAPSHOT,
+            )
+        if req.submode in (None, SUBMODE_DEEP_PRODUCT_RESEARCH):
+            text = (req.input or "").strip()
+            if not text:
+                return WebCommandResponse(
+                    status=STATUS_ERROR,
+                    message="請貼上商品 URL 或輸入商品名稱。",
+                    mode=MODE_INVESTMENT,
+                    submode=SUBMODE_DEEP_PRODUCT_RESEARCH,
+                )
+            message = self._run_command("/research", text)
+            return WebCommandResponse(
+                status=STATUS_OK,
+                message=message,
+                mode=MODE_INVESTMENT,
+                submode=SUBMODE_DEEP_PRODUCT_RESEARCH,
+            )
+        return WebCommandResponse(
+            status=STATUS_UNSUPPORTED,
+            message=f"投資研究子模式尚未支援：{req.submode}",
+            mode=MODE_INVESTMENT,
+            submode=req.submode,
+        )
