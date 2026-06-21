@@ -188,6 +188,37 @@ def test_live_429_trips_durable_cooldown(monkeypatch):
     assert cd.last_status == 429
 
 
+def test_429_does_not_amplify_with_curl_fallback(monkeypatch):
+    """C7 / review finding 1: once a 429 opens the host cooldown, the curl
+    fallback must be skipped — one 429 must not spawn a second request."""
+    def fake_urlopen(*a, **k):
+        raise HTTPError(YUYU_URL, 429, "Too Many Requests", {}, None)
+
+    monkeypatch.setattr("market_monitor.http.urlopen", fake_urlopen)
+    # The pre-fetch check must see the circuit open (0s) so the request proceeds
+    # to the network; the 429 then trips the circuit, so the *curl guard* sees it
+    # closed (>0s). Model that progression statefully (overrides the autouse
+    # neutraliser for this test only).
+    calls = {"n": 0}
+
+    def _circuit(host):
+        calls["n"] += 1
+        return 0.0 if calls["n"] == 1 else 300.0
+
+    monkeypatch.setattr("market_monitor.http._circuit_remaining", _circuit)
+
+    curl_calls = []
+    monkeypatch.setattr(
+        HttpClient, "_get_text_with_curl",
+        lambda self, **kw: curl_calls.append(kw) or "SHOULD-NOT-BE-USED",
+    )
+    client = HttpClient()
+    with pytest.raises(HTTPError):
+        client.get_text(YUYU_URL, retries=1, curl_fallback=True,
+                        priority=PRIORITY_MANUAL_RESEARCH, requester=REQUESTER_RESEARCH)
+    assert curl_calls == []  # no amplification
+
+
 def test_yuyutei_client_skips_network_when_cooling_down(monkeypatch):
     from market_monitor.yuyutei_search import YuyuteiMarketplaceSearchClient
 
