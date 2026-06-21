@@ -149,14 +149,20 @@ def _build_handler(bridge: CommandBridge, *, lan_enabled: bool) -> type[BaseHTTP
             self.send_header("Cache-Control", "no-store, max-age=0")
             self.send_header("Connection", "close")
             self.end_headers()
+            stream = bridge.stream(req, request_id)
             try:
-                for event in bridge.stream(req, request_id):
+                for event in stream:
                     line = (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
                     self.wfile.write(line)
                     self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 # Client cancelled (AbortController) — stop quietly.
                 logger.info("command bridge stream: client disconnected request_id=%s", request_id)
+            finally:
+                # Close the generator deterministically (don't wait for GC) so a
+                # GeneratorExit fires inside bridge.stream and any in-flight model
+                # worker is aborted the moment the client goes away.
+                stream.close()
 
         def log_message(self, format: str, *args: object) -> None:
             return

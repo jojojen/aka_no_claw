@@ -9,7 +9,10 @@ are stubbed so the routing — not the network — is what's under test.
 """
 from __future__ import annotations
 
+import io
+import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -301,6 +304,138 @@ def test_poll_unknown_job_is_not_found():
     snap = b.poll_job("does-not-exist")
     assert snap["not_found"] is True
     assert snap["job_status"] == "error"
+
+
+# --- streaming cancellation on client disconnect (#30 review gap) ---------
+def test_stream_cloud_disconnect_aborts_worker(bridge, monkeypatch):
+    """When the phone drops mid-stream the generator is closed; the cloud model
+    worker must be aborted, not left running until its 180s timeout."""
+    monkeypatch.setattr(
+        "openclaw_adapter.command_bridge._HEARTBEAT_SECONDS", 0.02, raising=False
+    )
+
+    class _BlockingClient:
+        def __init__(self) -> None:
+            self.started = threading.Event()
+            self.aborted = threading.Event()
+
+        def generate(self, prompt, *, temperature=0.0):
+            self.started.set()
+            if self.aborted.wait(timeout=5.0):
+                raise RuntimeError("aborted by disconnect")
+            return "should never finish"
+
+        def abort(self) -> None:
+            self.aborted.set()
+
+    client = _BlockingClient()
+    monkeypatch.setattr(bridge, "_build_cloud_chat_client", lambda: client)
+
+    gen = bridge._stream_cloud_chat("hello")
+    first = next(gen)  # worker now running, blocked; we get a heartbeat
+    assert first["type"] == "heartbeat"
+    assert client.started.wait(1.0)
+    gen.close()  # simulate client disconnect -> GeneratorExit
+    assert client.aborted.wait(1.0), "cloud worker was not aborted on disconnect"
+
+
+def test_stream_ollama_disconnect_closes_response(monkeypatch):
+    """Closing the local stream generator must close the upstream HTTP response
+    so the Ollama read aborts instead of draining the whole reply."""
+    settings = SimpleNamespace(
+        openclaw_local_text_endpoint="http://localhost:11434",
+        openclaw_local_text_model="qwen3:14b",
+        openclaw_local_text_timeout_seconds=30,
+    )
+    b = CommandBridge(settings=settings)
+
+    class _FakeResp:
+        def __init__(self) -> None:
+            self.closed = False
+            self._lines = [b'{"response":"hi"}\n', b'{"response":" there"}\n']
+            self._i = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.close()
+            return False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self._i >= len(self._lines):
+                raise StopIteration
+            line = self._lines[self._i]
+            self._i += 1
+            return line
+
+        def close(self):
+            self.closed = True
+
+    resp = _FakeResp()
+    monkeypatch.setattr(
+        "openclaw_adapter.command_bridge.urlopen", lambda *a, **k: resp, raising=True
+    )
+    gen = b._stream_ollama_chat("hi")
+    first = next(gen)
+    assert first == {"type": "delta", "text": "hi"}
+    gen.close()  # client disconnect mid-stream
+    assert resp.closed, "upstream Ollama response was not closed on disconnect"
+
+
+def test_handle_stream_closes_generator_on_client_disconnect(monkeypatch):
+    """The server's _handle_stream must close the bridge generator in a finally
+    block when the socket write fails, so GeneratorExit fires and any in-flight
+    worker is cancelled — not left dangling for the GC."""
+    from http.server import BaseHTTPRequestHandler
+
+    from openclaw_adapter import command_bridge_server as srv
+
+    closed = {"v": False}
+
+    class _Gen:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return {"type": "heartbeat"}
+
+        def close(self):
+            closed["v"] = True
+
+    class _FakeBridge:
+        def stream(self, req, request_id):
+            return _Gen()
+
+    class _FakeWFile:
+        def __init__(self) -> None:
+            self.writes = 0
+
+        def write(self, _b):
+            self.writes += 1
+            if self.writes >= 2:  # headers flush ok, first data line drops
+                raise BrokenPipeError("client gone")
+
+        def flush(self):
+            pass
+
+    handler_cls = srv._build_handler(_FakeBridge(), lan_enabled=False)
+    h = handler_cls.__new__(handler_cls)
+    body = b'{"mode":"chat","input":"hi"}'
+    h.headers = {"Content-Length": str(len(body))}
+    h.rfile = io.BytesIO(body)
+    h.wfile = _FakeWFile()
+    h.request_version = "HTTP/1.1"
+    h.protocol_version = "HTTP/1.0"
+    h.requestline = "POST /api/command/stream HTTP/1.1"
+    h.responses = BaseHTTPRequestHandler.responses
+    h.client_address = ("127.0.0.1", 12345)
+
+    h._handle_stream()
+    assert closed["v"], "generator was not closed on client disconnect"
 
 
 # --- client allowlist -----------------------------------------------------
