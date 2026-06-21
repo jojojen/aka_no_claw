@@ -43,7 +43,12 @@ CREATE TABLE IF NOT EXISTS opportunity_candidates (
     aliases_json TEXT NOT NULL DEFAULT '[]',
     related_keywords_json TEXT NOT NULL DEFAULT '[]',
     is_target INTEGER NOT NULL DEFAULT 0,
-    entity_id TEXT
+    entity_id TEXT,
+    fair_value_jpy INTEGER,
+    fair_value_confidence REAL,
+    discount_to_fair_value REAL,
+    liquidity_adjustment REAL,
+    valuation_reasons_json TEXT NOT NULL DEFAULT '[]'
 );
 
 CREATE TABLE IF NOT EXISTS opportunity_price_checks (
@@ -155,6 +160,27 @@ class OpportunityStore:
                 connection.execute(
                     "ALTER TABLE opportunity_candidates ADD COLUMN entity_id TEXT"
                 )
+            # #15 D7: fair-value snapshot columns on pre-valuation DBs.
+            if "fair_value_jpy" not in column_names:
+                connection.execute(
+                    "ALTER TABLE opportunity_candidates ADD COLUMN fair_value_jpy INTEGER"
+                )
+            if "fair_value_confidence" not in column_names:
+                connection.execute(
+                    "ALTER TABLE opportunity_candidates ADD COLUMN fair_value_confidence REAL"
+                )
+            if "discount_to_fair_value" not in column_names:
+                connection.execute(
+                    "ALTER TABLE opportunity_candidates ADD COLUMN discount_to_fair_value REAL"
+                )
+            if "liquidity_adjustment" not in column_names:
+                connection.execute(
+                    "ALTER TABLE opportunity_candidates ADD COLUMN liquidity_adjustment REAL"
+                )
+            if "valuation_reasons_json" not in column_names:
+                connection.execute(
+                    "ALTER TABLE opportunity_candidates ADD COLUMN valuation_reasons_json TEXT NOT NULL DEFAULT '[]'"
+                )
             rec_columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(opportunity_recommendations)")
             }
@@ -189,9 +215,11 @@ class OpportunityStore:
                     candidate_id, game, product_type, title, product_identifier,
                     search_query, heat_score, reason,
                     source_kind, source_url, metadata_json, created_at, updated_at,
-                    aliases_json, related_keywords_json, is_target, entity_id
+                    aliases_json, related_keywords_json, is_target, entity_id,
+                    fair_value_jpy, fair_value_confidence, discount_to_fair_value,
+                    liquidity_adjustment, valuation_reasons_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(candidate_id) DO UPDATE SET
                     game=excluded.game,
                     product_type=excluded.product_type,
@@ -211,7 +239,16 @@ class OpportunityStore:
                     aliases_json=excluded.aliases_json,
                     related_keywords_json=excluded.related_keywords_json,
                     is_target=MAX(opportunity_candidates.is_target, excluded.is_target),
-                    entity_id=COALESCE(excluded.entity_id, opportunity_candidates.entity_id)
+                    entity_id=COALESCE(excluded.entity_id, opportunity_candidates.entity_id),
+                    fair_value_jpy=COALESCE(excluded.fair_value_jpy, opportunity_candidates.fair_value_jpy),
+                    fair_value_confidence=COALESCE(excluded.fair_value_confidence, opportunity_candidates.fair_value_confidence),
+                    discount_to_fair_value=COALESCE(excluded.discount_to_fair_value, opportunity_candidates.discount_to_fair_value),
+                    liquidity_adjustment=COALESCE(excluded.liquidity_adjustment, opportunity_candidates.liquidity_adjustment),
+                    valuation_reasons_json=CASE
+                        WHEN excluded.valuation_reasons_json = '[]'
+                        THEN opportunity_candidates.valuation_reasons_json
+                        ELSE excluded.valuation_reasons_json
+                    END
                 """,
                 (
                     candidate.candidate_id,
@@ -231,6 +268,11 @@ class OpportunityStore:
                     _json(list(merged_related)),
                     1 if candidate.is_target else 0,
                     candidate.entity_id,
+                    candidate.fair_value_jpy,
+                    candidate.fair_value_confidence,
+                    candidate.discount_to_fair_value,
+                    candidate.liquidity_adjustment,
+                    _json(list(candidate.valuation_reasons)),
                 ),
             )
 
@@ -626,6 +668,31 @@ def _candidate_from_row(row: sqlite3.Row) -> OpportunityCandidate:
     )
     is_target = bool(row["is_target"]) if "is_target" in row_keys else False
     entity_id = row["entity_id"] if "entity_id" in row_keys else None
+    fair_value_jpy = (
+        int(row["fair_value_jpy"])
+        if "fair_value_jpy" in row_keys and row["fair_value_jpy"] is not None
+        else None
+    )
+    fair_value_confidence = (
+        float(row["fair_value_confidence"])
+        if "fair_value_confidence" in row_keys and row["fair_value_confidence"] is not None
+        else None
+    )
+    discount_to_fair_value = (
+        float(row["discount_to_fair_value"])
+        if "discount_to_fair_value" in row_keys and row["discount_to_fair_value"] is not None
+        else None
+    )
+    liquidity_adjustment = (
+        float(row["liquidity_adjustment"])
+        if "liquidity_adjustment" in row_keys and row["liquidity_adjustment"] is not None
+        else None
+    )
+    valuation_reasons = (
+        _decode_json_list(row["valuation_reasons_json"])
+        if "valuation_reasons_json" in row_keys
+        else ()
+    )
     return OpportunityCandidate(
         candidate_id=row["candidate_id"],
         game=row["game"],
@@ -643,6 +710,11 @@ def _candidate_from_row(row: sqlite3.Row) -> OpportunityCandidate:
         related_keywords=related,
         is_target=is_target,
         entity_id=entity_id,
+        fair_value_jpy=fair_value_jpy,
+        fair_value_confidence=fair_value_confidence,
+        discount_to_fair_value=discount_to_fair_value,
+        liquidity_adjustment=liquidity_adjustment,
+        valuation_reasons=valuation_reasons,
     )
 
 

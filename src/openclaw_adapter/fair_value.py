@@ -20,10 +20,19 @@ import statistics
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Sequence
+from typing import Callable, Sequence
 
+from .domain_registry import get_domain_trust
 from .liquidity import LiquidityMetrics, SoldCompLedger, compute_liquidity_metrics
 from .price_ledger import MarketSnapshot, PriceLedger
+
+# A resolver mapping an opaque ``source_id`` to a [0,1] trust prior. Injected so
+# valuation logic stays pure/unit-testable; the engine wires a registry-backed
+# default (see ``make_source_trust_resolver``).
+SourceTrustFn = Callable[[str], float]
+# Neutral prior used when a source can't be resolved to a trust score; matches
+# the Domain Registry's "other" fallback so unknown sources aren't over-credited.
+NEUTRAL_SOURCE_TRUST = get_domain_trust("__unseeded__")
 
 # ── vocabularies ──────────────────────────────────────────────────────────────
 
@@ -86,6 +95,55 @@ def _trimmed_median(values: Sequence[Decimal]) -> Decimal | None:
     return (core[mid - 1] + core[mid]) / Decimal(2)
 
 
+def _weighted_median(pairs: Sequence[tuple[Decimal, float]]) -> Decimal | None:
+    """Trust-weighted median over (price, weight) pairs. A low-trust source pulls
+    the centre of mass less than a high-trust one, so spammy/unreliable listings
+    can't drag fair value around. With uniform weights this reduces to the plain
+    median, so it's a safe drop-in when all sources share a trust prior."""
+    usable = [(p, float(w)) for p, w in pairs if p is not None and p > 0 and w > 0]
+    if not usable:
+        return None
+    usable.sort(key=lambda x: x[0])
+    total = sum(w for _, w in usable)
+    half = total / 2.0
+    cum = 0.0
+    for i, (price, weight) in enumerate(usable):
+        cum += weight
+        if cum > half:
+            return price
+        if cum == half:  # exact split → average across the boundary
+            nxt = usable[i + 1][0] if i + 1 < len(usable) else price
+            return (price + nxt) / Decimal(2)
+    return usable[-1][0]
+
+
+def make_source_trust_resolver(knowledge_db=None) -> SourceTrustFn:
+    """Build a ``source_id → trust`` resolver backed by the #9 Source Registry and
+    #11 Domain Registry. A source id (``S<n>``) resolves to its canonical domain,
+    whose trust prior is returned; unresolvable ids fall back to the neutral prior
+    so unknown provenance is neither rewarded nor harshly punished. Results are
+    cached per id since trust is stable within a valuation pass."""
+    cache: dict[str, float] = {}
+
+    def resolve(source_id: str) -> float:
+        key = (source_id or "").strip()
+        if key in cache:
+            return cache[key]
+        trust = NEUTRAL_SOURCE_TRUST
+        if key:
+            rec = knowledge_db.get_source(key) if knowledge_db is not None else None
+            if rec is not None and (rec.domain_id or rec.domain):
+                trust = get_domain_trust(rec.domain_id or rec.domain)
+            else:
+                # Allow callers that already pass a domain/host as the source id.
+                resolved = get_domain_trust(key)
+                trust = resolved if resolved != NEUTRAL_SOURCE_TRUST else NEUTRAL_SOURCE_TRUST
+        cache[key] = trust
+        return trust
+
+    return resolve
+
+
 # ── Deliverable 1: fair value result model ────────────────────────────────────
 @dataclass(frozen=True, slots=True)
 class FairValueEstimate:
@@ -128,6 +186,7 @@ def compute_fair_value(
     liquidity: LiquidityMetrics | None = None,
     currency: str | None = None,
     valuation_at: str | None = None,
+    source_trust_fn: SourceTrustFn | None = None,
 ) -> FairValueEstimate:
     """Deterministically estimate fair value from market evidence.
 
@@ -143,33 +202,65 @@ def compute_fair_value(
     cur = currency or (snapshot.currency if snapshot else None)
     explanation: list[str] = []
 
-    sold_prices = [
-        p for p in (_to_decimal(getattr(sc, "sold_price", None)) for sc in sold_comps)
-        if p is not None and p > 0
+    sold_pairs = [
+        (_to_decimal(getattr(sc, "sold_price", None)), getattr(sc, "source_id", None))
+        for sc in sold_comps
     ]
+    sold_pairs = [(p, sid) for p, sid in sold_pairs if p is not None and p > 0]
+    sold_prices = [p for p, _ in sold_pairs]
+    contributing_source_ids: tuple[str, ...] = ()
 
     if sold_prices:
-        base = _trimmed_median(sold_prices)
         method = METHOD_SOLD_COMP
         evidence_count = len(sold_prices)
+        contributing_source_ids = tuple(sid for _, sid in sold_pairs if sid)
+        if source_trust_fn is not None and contributing_source_ids:
+            weighted = [
+                (p, _clamp(source_trust_fn(sid) if sid else NEUTRAL_SOURCE_TRUST))
+                for p, sid in sold_pairs
+            ]
+            base = _weighted_median(weighted) or _trimmed_median(sold_prices)
+            explanation.append(
+                f"{evidence_count} sold comp(s) → trust-weighted median ¥{base}"
+                + ("" if evidence_count >= MIN_SOLD_FOR_SUPPORT else " (sparse, range widened)")
+            )
+        else:
+            base = _trimmed_median(sold_prices)
+            explanation.append(
+                f"{evidence_count} sold comp(s) → trimmed-median ¥{base}"
+                + ("" if evidence_count >= MIN_SOLD_FOR_SUPPORT else " (sparse, range widened)")
+            )
         lo, hi = _spread_bounds(sold_prices, supported=evidence_count >= MIN_SOLD_FOR_SUPPORT)
-        explanation.append(
-            f"{evidence_count} sold comp(s) → trimmed-median ¥{base}"
-            + ("" if evidence_count >= MIN_SOLD_FOR_SUPPORT else " (sparse, range widened)")
-        )
     elif snapshot is not None and snapshot.count > 0 and snapshot.median_price is not None:
-        base = snapshot.median_price
         method = METHOD_LISTING
         evidence_count = snapshot.count
+        contributing_source_ids = tuple(snapshot.source_ids)
+        listing_pairs = [
+            (_to_decimal(getattr(o, "price_amount", None)), getattr(o, "source_id", None))
+            for o in snapshot.latest_observations
+        ]
+        listing_pairs = [(p, sid) for p, sid in listing_pairs if p is not None and p > 0]
+        if source_trust_fn is not None and any(sid for _, sid in listing_pairs):
+            weighted = [
+                (p, _clamp(source_trust_fn(sid) if sid else NEUTRAL_SOURCE_TRUST))
+                for p, sid in listing_pairs
+            ]
+            base = _weighted_median(weighted) or snapshot.median_price
+            explanation.append(
+                f"no sold comps; {evidence_count} listing(s) → trust-weighted median "
+                f"¥{base} (asking prices, weaker evidence)"
+            )
+        else:
+            base = snapshot.median_price
+            explanation.append(
+                f"no sold comps; {evidence_count} listing(s) → median ¥{base} "
+                "(asking prices, weaker evidence)"
+            )
         listing_prices = [
             p for p in (snapshot.min_price, snapshot.median_price, snapshot.max_price)
             if p is not None
         ]
         lo, hi = _spread_bounds(listing_prices, supported=False)
-        explanation.append(
-            f"no sold comps; {evidence_count} listing(s) → median ¥{base} "
-            "(asking prices, weaker evidence)"
-        )
     else:
         explanation.append("no sold comps and no listings → insufficient data")
         return FairValueEstimate(
@@ -197,6 +288,8 @@ def compute_fair_value(
         snapshot=snapshot,
         liquidity=liquidity,
         explanation=explanation,
+        source_ids=contributing_source_ids,
+        source_trust_fn=source_trust_fn,
     )
 
     return FairValueEstimate(
@@ -242,15 +335,17 @@ def _confidence(
     snapshot: MarketSnapshot | None,
     liquidity: LiquidityMetrics | None,
     explanation: list[str],
+    source_ids: Sequence[str] = (),
+    source_trust_fn: SourceTrustFn | None = None,
 ) -> float:
     """Blend evidence volume, recency, source corroboration, and liquidity into a
     [0,1] confidence. Sold comps start higher than listing-only estimates.
 
-    Source quality here is *corroboration* (how many distinct sources agree), not
-    a per-source trust score: the snapshot carries opaque ``source_id`` provenance
-    that isn't reliably resolvable to a domain trust prior at this layer, so
-    weighting by it would be false precision. A source→trust resolver can be
-    layered in later without changing this contract."""
+    Source corroboration (how many distinct sources agree) is scaled by the mean
+    *trust* of those sources when a ``source_trust_fn`` is supplied: agreement
+    among reputable marketplaces earns full credit, while agreement among
+    low-trust sources is discounted. With no resolver the trust multiplier is 1.0,
+    so the count-only behaviour is preserved for callers that don't wire one."""
     base = 0.40 if method == METHOD_SOLD_COMP else 0.15
 
     # evidence volume (diminishing returns)
@@ -267,14 +362,25 @@ def _confidence(
         elif days <= 90:
             recency = 0.02
 
-    # source corroboration: independent agreement across distinct sources
-    corroboration = 0.0
-    if snapshot is not None:
-        n_sources = len(snapshot.source_ids)
-        if n_sources >= 3:
-            corroboration = 0.10
-        elif n_sources >= 2:
-            corroboration = 0.05
+    # source corroboration, weighted by per-source trust (#9/#11)
+    distinct = {sid for sid in source_ids if sid}
+    if not distinct and snapshot is not None:
+        distinct = {sid for sid in snapshot.source_ids if sid}
+    n_sources = len(distinct)
+    if n_sources >= 3:
+        breadth = 0.10
+    elif n_sources >= 2:
+        breadth = 0.05
+    else:
+        breadth = 0.0
+    trust_multiplier = 1.0
+    if source_trust_fn is not None and distinct:
+        trusts = [_clamp(source_trust_fn(sid)) for sid in distinct]
+        trust_multiplier = sum(trusts) / len(trusts)
+        explanation.append(
+            f"{n_sources} source(s), mean trust {trust_multiplier:.2f}"
+        )
+    corroboration = breadth * trust_multiplier
 
     # liquidity: demonstrated, brisk turnover raises confidence
     liquidity_component = 0.0
@@ -352,10 +458,21 @@ class FairValueEngine:
         price_ledger: PriceLedger | None = None,
         sold_comp_ledger: SoldCompLedger | None = None,
         window_days: int = DEFAULT_WINDOW_DAYS,
+        knowledge_db=None,
+        source_trust_fn: SourceTrustFn | None = None,
     ) -> None:
         self.price_ledger = price_ledger
         self.sold_comp_ledger = sold_comp_ledger
         self.window_days = max(1, int(window_days))
+        # Down-weight low-trust sources using the #9 Source Registry → #11 Domain
+        # Registry trust priors. An explicit fn wins; otherwise build one from the
+        # knowledge DB when available; otherwise leave None (no weighting).
+        if source_trust_fn is not None:
+            self.source_trust_fn: SourceTrustFn | None = source_trust_fn
+        elif knowledge_db is not None:
+            self.source_trust_fn = make_source_trust_resolver(knowledge_db)
+        else:
+            self.source_trust_fn = None
 
     def estimate(
         self, entity_id: str, *, currency: str | None = None
@@ -386,6 +503,7 @@ class FairValueEngine:
         return compute_fair_value(
             entity_id, snapshot=snapshot, sold_comps=sold_comps,
             liquidity=liquidity, currency=currency,
+            source_trust_fn=self.source_trust_fn,
         )
 
     def evaluate_mispricing(

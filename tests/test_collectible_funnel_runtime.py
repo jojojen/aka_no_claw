@@ -232,6 +232,52 @@ def test_pipeline_without_signal_store_is_noop(tmp_path):
     pipeline.run_once()  # must not raise
 
 
+# --- #15 D7: discovery stamps a fair-value snapshot onto the candidate ---------
+
+def test_run_once_attaches_fair_value(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    from openclaw_adapter.fair_value import FairValueEngine
+    from openclaw_adapter.liquidity import SoldCompLedger
+    from openclaw_adapter.price_ledger import PriceLedger
+
+    def _iso(days_ago):
+        return (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
+
+    eid = "ent_ua_csm"
+    pl = PriceLedger(tmp_path / "p.db")
+    scl = SoldCompLedger(tmp_path / "s.db")
+    scl.bootstrap()
+    for i in range(5):
+        scl.record_sold_comp(entity_id=eid, source_id="S-mercari", sold_price=10000,
+                             sold_at=_iso(i + 1), currency="JPY")
+    pl.record_observation(entity_id=eid, source_id="S-mercari", price_amount=7000,
+                          currency="JPY", quote_type="listing")
+    engine = FairValueEngine(price_ledger=pl, sold_comp_ledger=scl)
+
+    candidate = _official_candidate(entity_id=eid)
+    store = OpportunityStore(tmp_path / "opp.sqlite3")
+    store.bootstrap()
+    pipeline = OpportunityPipeline(
+        store=store,
+        candidate_provider=_OneShotProvider(candidate),
+        price_checker=_NullPriceChecker(),
+        listing_finder=_NullPriceChecker(),
+        reputation_checker=_NullPriceChecker(),
+        notifier=_MockNotifier(),
+        thresholds=OpportunityThresholds(),
+        fair_value_engine=engine,
+    )
+
+    pipeline.run_once()
+
+    fetched = store.get_candidate(candidate.candidate_id)
+    assert fetched is not None
+    assert fetched.fair_value_jpy is not None and fetched.fair_value_jpy > 0
+    assert fetched.discount_to_fair_value is not None and fetched.discount_to_fair_value > 0
+    assert fetched.valuation_reasons
+
+
 # --- finding 3: upsert merges evidence instead of overwriting -----------------
 
 def test_upsert_merges_urls_anchors_and_metadata(tmp_path):

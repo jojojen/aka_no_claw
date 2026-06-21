@@ -1455,6 +1455,40 @@ def build_opportunity_agent(settings: AssistantSettings | None = None) -> Opport
             )
             signal_store = None
 
+    # #15 D7: entity-level fair-value engine over the #13 price ledger + #14
+    # sold-comp ledger, with source-trust priors resolved through the #9 source
+    # registry → #11 domain registry. Best-effort: if the ledgers can't be opened
+    # the pipeline simply runs without fair-value attachment (C4 — logged).
+    fair_value_engine = None
+    try:
+        from .fair_value import FairValueEngine
+        from .knowledge_db import KnowledgeDatabase
+        from .liquidity import SoldCompLedger
+        from .price_ledger import PriceLedger
+
+        _sold_ledger = SoldCompLedger(settings.sold_comp_db_path)
+        _sold_ledger.bootstrap()
+        _price_ledger = PriceLedger(settings.price_ledger_db_path)
+        _price_ledger.bootstrap()
+        _kdb = KnowledgeDatabase(settings.knowledge_db_path)
+        _kdb.bootstrap()
+        fair_value_engine = FairValueEngine(
+            price_ledger=_price_ledger,
+            sold_comp_ledger=_sold_ledger,
+            knowledge_db=_kdb,
+        )
+        logger.info(
+            "build_opportunity_agent: FairValueEngine ready price_ledger=%s sold_comp=%s",
+            settings.price_ledger_db_path,
+            settings.sold_comp_db_path,
+        )
+    except Exception:
+        logger.exception(
+            "build_opportunity_agent: could not build FairValueEngine; "
+            "fair-value attachment disabled"
+        )
+        fair_value_engine = None
+
     pipeline = OpportunityPipeline(
         store=store,
         candidate_provider=candidate_provider,
@@ -1474,6 +1508,7 @@ def build_opportunity_agent(settings: AssistantSettings | None = None) -> Opport
         listing_limit=settings.opportunity_listing_limit,
         candidate_check_interval_seconds=settings.opportunity_candidate_check_interval_seconds,
         signal_store=signal_store,
+        fair_value_engine=fair_value_engine,
     )
 
     preflight_fn = _build_preflight_callable(
