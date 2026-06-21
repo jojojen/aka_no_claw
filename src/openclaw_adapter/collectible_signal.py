@@ -208,6 +208,7 @@ class CollectibleSignal:
     block_reason: str | None = None       # BLOCK_REASONS when actionability == "blocked"
     heat_score: float = 0.0
     anchor_types: tuple[str, ...] = ()     # concrete anchors that justified evidence
+    entity_id: str | None = None           # canonical Market Entity join key (issue #12); None when unresolved/ambiguous
     metadata: Mapping[str, object] = field(default_factory=dict)
     created_at: str = field(default_factory=utc_now_iso)
 
@@ -287,6 +288,7 @@ def candidate_to_signal(
         actionability=actionability,
         heat_score=candidate.heat_score,
         anchor_types=anchors,
+        entity_id=candidate.entity_id,
         metadata={
             "candidate_id": candidate.candidate_id,
             "game": candidate.game,
@@ -314,6 +316,7 @@ def make_signal(
     block_reason: str | None = None,
     heat_score: float = 0.0,
     anchor_types: Iterable[str] = (),
+    entity_id: str | None = None,
     metadata: Mapping[str, object] | None = None,
 ) -> CollectibleSignal:
     """Construct a normalized CollectibleSignal with a stable derived id."""
@@ -350,5 +353,6 @@ def make_signal(
         block_reason=reason,
         heat_score=float(heat_score),
         anchor_types=tuple(a for a in anchor_types if isinstance(a, str) and a.strip()),
+        entity_id=(entity_id or None),
         metadata=dict(metadata or {}),
     )

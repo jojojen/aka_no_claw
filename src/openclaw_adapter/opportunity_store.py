@@ -42,7 +42,8 @@ CREATE TABLE IF NOT EXISTS opportunity_candidates (
     updated_at TEXT NOT NULL,
     aliases_json TEXT NOT NULL DEFAULT '[]',
     related_keywords_json TEXT NOT NULL DEFAULT '[]',
-    is_target INTEGER NOT NULL DEFAULT 0
+    is_target INTEGER NOT NULL DEFAULT 0,
+    entity_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS opportunity_price_checks (
@@ -150,6 +151,10 @@ class OpportunityStore:
                 connection.execute(
                     "ALTER TABLE opportunity_candidates ADD COLUMN cooldown_until TEXT"
                 )
+            if "entity_id" not in column_names:
+                connection.execute(
+                    "ALTER TABLE opportunity_candidates ADD COLUMN entity_id TEXT"
+                )
             rec_columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(opportunity_recommendations)")
             }
@@ -184,9 +189,9 @@ class OpportunityStore:
                     candidate_id, game, product_type, title, product_identifier,
                     search_query, heat_score, reason,
                     source_kind, source_url, metadata_json, created_at, updated_at,
-                    aliases_json, related_keywords_json, is_target
+                    aliases_json, related_keywords_json, is_target, entity_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(candidate_id) DO UPDATE SET
                     game=excluded.game,
                     product_type=excluded.product_type,
@@ -205,7 +210,8 @@ class OpportunityStore:
                     updated_at=excluded.updated_at,
                     aliases_json=excluded.aliases_json,
                     related_keywords_json=excluded.related_keywords_json,
-                    is_target=MAX(opportunity_candidates.is_target, excluded.is_target)
+                    is_target=MAX(opportunity_candidates.is_target, excluded.is_target),
+                    entity_id=COALESCE(excluded.entity_id, opportunity_candidates.entity_id)
                 """,
                 (
                     candidate.candidate_id,
@@ -224,6 +230,7 @@ class OpportunityStore:
                     _json(list(merged_aliases)),
                     _json(list(merged_related)),
                     1 if candidate.is_target else 0,
+                    candidate.entity_id,
                 ),
             )
 
@@ -618,6 +625,7 @@ def _candidate_from_row(row: sqlite3.Row) -> OpportunityCandidate:
         else ()
     )
     is_target = bool(row["is_target"]) if "is_target" in row_keys else False
+    entity_id = row["entity_id"] if "entity_id" in row_keys else None
     return OpportunityCandidate(
         candidate_id=row["candidate_id"],
         game=row["game"],
@@ -634,6 +642,7 @@ def _candidate_from_row(row: sqlite3.Row) -> OpportunityCandidate:
         aliases=aliases,
         related_keywords=related,
         is_target=is_target,
+        entity_id=entity_id,
     )
 
 
