@@ -213,26 +213,29 @@ def test_stream_non_chat_error_emits_error_event(bridge):
 
 
 # --- async job + poll (long research) -------------------------------------
+def _wait_job(bridge, job_id, want):
+    snap = bridge.poll_job(job_id)
+    for _ in range(100):
+        snap = bridge.poll_job(job_id)
+        if snap["job_status"] == want:
+            break
+        time.sleep(0.02)
+    return snap
+
+
 def test_async_research_accumulates_progress_then_done(bridge, monkeypatch):
-    def _fake_run(command, remainder, chat_id="web-bridge"):
+    def _fake_run_raw(command, remainder, chat_id="web-bridge"):
         assert command == "/research"
         bridge._jobs.append_progress(chat_id, "⏳ 開始")
         bridge._jobs.append_progress(chat_id, "✅ 抓到商品頁")
-        return f"[research]{remainder}"
+        return (f"[research]{remainder}", {"inline_keyboard": []})
 
-    monkeypatch.setattr(bridge, "_run_command", _fake_run)
+    monkeypatch.setattr(bridge, "_run_command_raw", _fake_run_raw)
     req = parse_request({"mode": "investment", "submode": "deep_product_research",
                          "input": "寶可夢 BOX"})
     start = bridge.start_async(req)
     assert start["status"] == "accepted"
-    job_id = start["job_id"]
-
-    snap = bridge.poll_job(job_id)
-    for _ in range(100):
-        snap = bridge.poll_job(job_id)
-        if snap["job_status"] == "done":
-            break
-        time.sleep(0.02)
+    snap = _wait_job(bridge, start["job_id"], "done")
     assert snap["job_status"] == "done"
     assert snap["message"] == "[research]寶可夢 BOX"
     assert snap["progress"] == ["⏳ 開始", "✅ 抓到商品頁"]
@@ -242,16 +245,49 @@ def test_async_research_handler_error_becomes_error_job(bridge, monkeypatch):
     def _boom(command, remainder, chat_id="web-bridge"):
         raise RuntimeError("scrape exploded")
 
-    monkeypatch.setattr(bridge, "_run_command", _boom)
+    monkeypatch.setattr(bridge, "_run_command_raw", _boom)
     req = parse_request({"mode": "investment", "input": "X"})
-    job_id = bridge.start_async(req)["job_id"]
-    for _ in range(100):
-        snap = bridge.poll_job(job_id)
-        if snap["job_status"] == "error":
-            break
-        time.sleep(0.02)
+    snap = _wait_job(bridge, bridge.start_async(req)["job_id"], "error")
     assert snap["job_status"] == "error"
     assert "scrape exploded" in (snap["error"] or "")
+
+
+# --- research follow-up buttons (龍蝦 inline_keyboard → web actions) -------
+def test_research_actions_surface_in_poll(bridge, monkeypatch):
+    markup = {"inline_keyboard": [
+        [{"text": "摘要", "callback_data": "rs:tok:summary"},
+         {"text": "看市價", "callback_data": "rs:tok:price"}],
+        [{"text": "看賣家", "callback_data": "rs:tok:seller"}],
+    ]}
+    monkeypatch.setattr(bridge, "_run_command_raw",
+                        lambda *a, **k: ("[research]X", markup))
+    job_id = bridge.start_async(parse_request({"mode": "investment", "input": "X"}))["job_id"]
+    snap = _wait_job(bridge, job_id, "done")
+    assert [a["label"] for a in snap["actions"]] == ["摘要", "看市價", "看賣家"]
+    assert snap["actions"][0]["callback_data"] == "rs:tok:summary"
+
+
+def test_run_action_switches_view(bridge, monkeypatch):
+    monkeypatch.setattr(bridge, "_run_command_raw",
+                        lambda *a, **k: ("[research]X", {"inline_keyboard": []}))
+    job_id = bridge.start_async(parse_request({"mode": "investment", "input": "X"}))["job_id"]
+    _wait_job(bridge, job_id, "done")
+
+    def _rs(payload, original_text, chat_id):
+        token, _, view = payload.partition(":")
+        return ("已切換研究視圖", f"detail:{view}:{chat_id}",
+                {"inline_keyboard": [[{"text": "摘要", "callback_data": f"rs:{token}:summary"}]]})
+
+    monkeypatch.setattr(bridge, "_callbacks", lambda: {"rs": _rs})
+    res = bridge.run_action(job_id, "rs:tok:price")
+    assert res["status"] == STATUS_OK
+    assert res["message"] == f"detail:price:{job_id}"
+    assert res["actions"][0]["label"] == "摘要"
+
+
+def test_run_action_unknown_job_is_error(bridge):
+    res = bridge.run_action("nope", "rs:tok:price")
+    assert res["status"] == STATUS_ERROR
 
 
 def test_async_rejects_non_research():
