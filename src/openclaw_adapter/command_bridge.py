@@ -29,6 +29,7 @@ from uuid import uuid4
 
 from assistant_runtime import AssistantSettings, build_ssl_context
 
+from .job_store import JobStore
 from .session_memory import SessionMemoryStore, SessionWriteError, empty_session
 from .command_bridge_models import (
     CHAT_BACKEND_CLOUD_PICKLE,
@@ -66,6 +67,7 @@ _SELLER_UNSUPPORTED_MSG = "賣家信譽快照目前尚未由本地 command bridg
 JOB_RUNNING = "running"
 JOB_DONE = "done"
 JOB_ERROR = "error"
+JOB_INTERRUPTED = "interrupted"  # persisted running job whose in-memory worker is gone
 
 
 class _Job:
@@ -139,6 +141,8 @@ class CommandBridge:
         self._item_deleter_handlers: dict | None = None
         self._registry_lock = threading.Lock()
         self._jobs = _JobManager()
+        self._job_store_inst: JobStore | None = None
+        self._job_store_lock = threading.Lock()
         self._session_store: SessionMemoryStore | None = None
         self._session_lock = threading.Lock()
 
@@ -293,6 +297,18 @@ class CommandBridge:
             yield from self._stream_ollama_chat(prompt)
 
     # --- async job + poll (long research, decoupled from the connection) --
+    def _get_job_store(self) -> JobStore:
+        if self._job_store_inst is None:
+            with self._job_store_lock:
+                if self._job_store_inst is None:
+                    import os
+                    dir_path = (
+                        getattr(self.settings, "openclaw_web_jobs_dir", None)
+                        or os.path.join(".openclaw_tmp", "web_jobs")
+                    )
+                    self._job_store_inst = JobStore(dir_path)
+        return self._job_store_inst
+
     def start_async(self, req: WebCommandRequest) -> dict:
         """Kick off a long command in a background thread and return a job id
         immediately. Only investment deep research is async for the MVP; the
@@ -307,6 +323,19 @@ class CommandBridge:
         if not text:
             return {"status": STATUS_ERROR, "message": "請貼上商品 URL 或輸入商品名稱。"}
         job = self._jobs.create()
+        store = self._get_job_store()
+        job_created_at = time.time()
+        store.save({
+            "job_id": job.id,
+            "status": JOB_RUNNING,
+            "progress": [],
+            "message": "",
+            "actions": [],
+            "error": None,
+            "created_at": job_created_at,
+            "updated_at": job_created_at,
+        })
+        store.purge_expired()
 
         def _worker() -> None:
             try:
@@ -317,31 +346,84 @@ class CommandBridge:
                     job.message = message
                     job.actions = self._markup_to_actions(markup)
                     job.status = JOB_DONE
+                store.save({
+                    "job_id": job.id,
+                    "status": JOB_DONE,
+                    "progress": list(job.progress),
+                    "message": message,
+                    "actions": list(job.actions),
+                    "error": None,
+                    "created_at": job_created_at,
+                    "updated_at": time.time(),
+                })
             except Exception as exc:  # noqa: BLE001
                 logger.exception("async research failed job=%s", job.id)
                 with job.lock:
                     job.error = str(exc)
                     job.status = JOB_ERROR
+                store.save({
+                    "job_id": job.id,
+                    "status": JOB_ERROR,
+                    "progress": list(job.progress),
+                    "message": "",
+                    "actions": [],
+                    "error": str(exc),
+                    "created_at": job_created_at,
+                    "updated_at": time.time(),
+                })
 
         threading.Thread(target=_worker, daemon=True).start()
         return {"status": "accepted", "job_id": job.id}
 
     def poll_job(self, job_id: str) -> dict:
-        """Snapshot a job: status (running/done/error), the staged progress
-        accumulated so far, the final report once done, and any follow-up
-        action buttons (龍蝦's /research views)."""
+        """Snapshot a job: status, staged progress, final report, follow-up actions.
+
+        Falls back to the persisted JobStore when the in-memory job is missing
+        (browser reload, bridge restart) and returns the correct terminal state
+        or "interrupted" so the client can show a clear message instead of
+        confusing not_found.
+        """
         job = self._jobs.get(job_id)
-        if job is None:
+        if job is not None:
+            with job.lock:
+                return {
+                    "job_status": job.status,
+                    "progress": list(job.progress),
+                    "message": job.message,
+                    "actions": list(job.actions),
+                    "error": job.error,
+                }
+
+        # In-memory job is gone — check the persisted snapshot.
+        persisted = self._get_job_store().load(job_id)
+        if persisted is None:
             return {"job_status": JOB_ERROR, "not_found": True,
                     "message": "找不到此任務（可能已過期，請重新查詢）。"}
-        with job.lock:
+        status = persisted.get("status")
+        if status == JOB_DONE:
             return {
-                "job_status": job.status,
-                "progress": list(job.progress),
-                "message": job.message,
-                "actions": list(job.actions),
-                "error": job.error,
+                "job_status": JOB_DONE,
+                "progress": persisted.get("progress") or [],
+                "message": persisted.get("message") or "",
+                "actions": persisted.get("actions") or [],
+                "error": None,
             }
+        if status == JOB_ERROR:
+            return {
+                "job_status": JOB_ERROR,
+                "progress": persisted.get("progress") or [],
+                "message": "",
+                "actions": [],
+                "error": persisted.get("error") or "任務失敗",
+            }
+        # status == running but in-memory worker gone: bridge was restarted.
+        return {
+            "job_status": JOB_INTERRUPTED,
+            "message": "研究任務因系統重啟而中斷，請重新執行 /research。",
+            "progress": persisted.get("progress") or [],
+            "actions": [],
+            "error": None,
+        }
 
     def run_action(self, job_id: str, callback_data: str) -> dict:
         """Re-invoke a research follow-up button (e.g. ``rs:<token>:price``).
