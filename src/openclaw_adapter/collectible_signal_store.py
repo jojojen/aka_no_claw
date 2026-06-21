@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS collectible_signals (
     block_reason TEXT,
     heat_score REAL NOT NULL DEFAULT 0.0,
     anchor_types_json TEXT NOT NULL DEFAULT '[]',
+    entity_id TEXT,
     metadata_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -113,6 +114,16 @@ class CollectibleSignalStore:
     def bootstrap(self) -> None:
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(collectible_signals)"
+                ).fetchall()
+            }
+            if "entity_id" not in columns:
+                connection.execute(
+                    "ALTER TABLE collectible_signals ADD COLUMN entity_id TEXT"
+                )
 
     def upsert_signal(self, signal: CollectibleSignal) -> None:
         """Insert or merge a signal by its derived id.
@@ -145,10 +156,10 @@ class CollectibleSignalStore:
                         title, entity_kind, product_family, product_type,
                         official_code, release_window, retail_price_jpy,
                         source_urls_json, confidence, evidence_count, actionability,
-                        block_reason, heat_score, anchor_types_json, metadata_json,
-                        created_at, updated_at
+                        block_reason, heat_score, anchor_types_json, entity_id,
+                        metadata_json, created_at, updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         signal.signal_id,
@@ -169,6 +180,7 @@ class CollectibleSignalStore:
                         signal.block_reason,
                         signal.heat_score,
                         _json(list(signal.anchor_types)),
+                        signal.entity_id,
                         _json(dict(signal.metadata)),
                         signal.created_at or now,
                         now,
@@ -193,7 +205,7 @@ class CollectibleSignalStore:
                     official_code=?, release_window=?, retail_price_jpy=?,
                     source_urls_json=?, confidence=?, evidence_count=?,
                     actionability=?, block_reason=?, heat_score=?,
-                    anchor_types_json=?, metadata_json=?, updated_at=?
+                    anchor_types_json=?, entity_id=?, metadata_json=?, updated_at=?
                 WHERE signal_id=?
                 """,
                 (
@@ -216,6 +228,7 @@ class CollectibleSignalStore:
                     signal.block_reason,
                     heat_score,
                     _json(list(merged_anchors)),
+                    signal.entity_id or existing.entity_id,
                     _json(merged_meta),
                     now,
                     signal.signal_id,
@@ -298,6 +311,7 @@ def _signal_from_row(row: sqlite3.Row) -> CollectibleSignal:
         block_reason=row["block_reason"],
         heat_score=row["heat_score"] or 0.0,
         anchor_types=_decode_json_list(row["anchor_types_json"]),
+        entity_id=row["entity_id"] if "entity_id" in row.keys() else None,
         metadata=_decode_json_map(row["metadata_json"]),
         created_at=row["created_at"],
     )
