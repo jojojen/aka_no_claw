@@ -75,6 +75,7 @@ from .knowledge_command import (
 from .source_command import build_source_handler
 from .music_command import build_music_handler, build_musicnowbest_handler
 from .music_browser import build_musiclistall_handler, build_music_callback_handler
+from .music_volume import mute_music, louder_music, lower_music
 from .music_favorites import (
     FavoritesStore,
     MUSIC_BEST_LIST_KIND,
@@ -1164,6 +1165,9 @@ def _build_registries(
         "/musiclistall": RegisteredCommand(build_musiclistall_handler(settings)),
         "/musiclistbest": RegisteredCommand(_musiclistbest_handler),
         "/musicnowbest": RegisteredCommand(build_musicnowbest_handler(settings)),
+        "/musicmute": RegisteredCommand(lambda r, c: mute_music(settings)),
+        "/musiclouder": RegisteredCommand(lambda r, c: louder_music(settings)),
+        "/musiclower": RegisteredCommand(lambda r, c: lower_music(settings)),
         "/research": RegisteredCommand(
             research_handler,
             ack="收到，正在進行深度商品研究（會分階段回報進度）…",

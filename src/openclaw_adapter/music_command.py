@@ -620,7 +620,8 @@ def _candidates_text(query: str, candidates: tuple[dict, ...]) -> str:
 def _menu_text() -> str:
     return (
         "🎵 音樂控制\n"
-        "也可直接輸入：/music random、/music <歌曲名>、/music stop、/music playbest"
+        "也可直接輸入：/music random、/music <歌曲名>、/music stop、/music playbest\n"
+        "音量：/musicmute、/musiclouder、/musiclower"
     )
 
 
@@ -637,5 +638,10 @@ def _menu_markup() -> dict:
                 {"text": "▶️ 播放最愛", "callback_data": "music:pb"},
             ],
             [{"text": "⭐ 收藏目前歌曲", "callback_data": "music:now"}],
+            [
+                {"text": "🔇 靜音", "callback_data": "music:mute"},
+                {"text": "🔉 音量降低", "callback_data": "music:lower"},
+                {"text": "🔊 音量提高", "callback_data": "music:louder"},
+            ],
         ]
     }

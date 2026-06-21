@@ -134,6 +134,8 @@ class CommandBridge:
         self.settings = settings
         self._command_handlers: dict | None = None
         self._callback_handlers: dict | None = None
+        self._view_handlers: dict | None = None
+        self._item_deleter_handlers: dict | None = None
         self._registry_lock = threading.Lock()
         self._jobs = _JobManager()
 
@@ -144,7 +146,12 @@ class CommandBridge:
                 if self._command_handlers is None:
                     from .telegram_bot import _build_registries
 
-                    command_handlers, callback_handlers, *_ = _build_registries(
+                    (
+                        command_handlers,
+                        callback_handlers,
+                        view_handlers,
+                        item_deleter_handlers,
+                    ) = _build_registries(
                         self.settings,
                         None,
                         research_notifier_factory=lambda chat_id: _JobNotifier(
@@ -153,6 +160,8 @@ class CommandBridge:
                     )
                     self._callback_handlers = callback_handlers
                     self._command_handlers = command_handlers
+                    self._view_handlers = view_handlers
+                    self._item_deleter_handlers = item_deleter_handlers
 
     def _handlers(self) -> dict:
         self._ensure_registries()
@@ -161,6 +170,14 @@ class CommandBridge:
     def _callbacks(self) -> dict:
         self._ensure_registries()
         return self._callback_handlers or {}
+
+    def _views(self) -> dict:
+        self._ensure_registries()
+        return self._view_handlers or {}
+
+    def _deleters(self) -> dict:
+        self._ensure_registries()
+        return self._item_deleter_handlers or {}
 
     def _run_command(self, command: str, remainder: str,
                      chat_id: str = _BRIDGE_CHAT_ID) -> str:
@@ -347,6 +364,82 @@ class CommandBridge:
             "message": str(message) if message is not None else "",
             "actions": self._markup_to_actions(markup),
         }
+
+    # --- 生活 mode: music control surface (aka_no_claw_web#3 / #4) ---------
+    def run_music_command(self, text: str) -> dict:
+        """Run the ``/music`` handler for the 生活 mode text box — an empty box
+        returns the music menu (text + control buttons); a query plays/searches
+        a song. The same handler the Telegram bot uses, so no logic is duped."""
+        message, markup = self._run_command_raw("/music", (text or "").strip())
+        return {
+            "status": STATUS_OK,
+            "message": message,
+            "actions": self._markup_to_actions(markup),
+        }
+
+    def run_music_action(self, callback_data: str) -> dict:
+        """Re-invoke a music callback button for the web 生活 mode. Handles the
+        ``music:`` family (browse / play / favorite / volume) plus the generic
+        list callbacks (``pg`` / ``del`` / ``close``) the favorites list uses —
+        the very same handlers the Telegram bot dispatches, so playback safety
+        (path re-validation under the music root) is enforced identically."""
+        prefix, _, payload = (callback_data or "").partition(":")
+        if prefix == "music":
+            handler = self._callbacks().get("music")
+            if handler is None:
+                return {"status": STATUS_ERROR, "message": "音樂功能尚未啟用。", "actions": []}
+            try:
+                result = handler(payload, "", _BRIDGE_CHAT_ID)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("music action failed cb=%s", callback_data)
+                return {"status": STATUS_ERROR, "message": f"動作執行失敗：{exc}", "actions": []}
+            toast, new_text, markup = (list(result) + [None, None, None])[:3] \
+                if isinstance(result, tuple) else (result, None, None)
+            message = new_text if new_text else toast
+            return {
+                "status": STATUS_OK,
+                "message": str(message) if message is not None else "",
+                "actions": self._markup_to_actions(markup),
+            }
+        if prefix in ("pg", "del", "close"):
+            return self._run_list_action(prefix, payload)
+        return {"status": STATUS_ERROR, "message": f"未知的音樂動作：{callback_data}", "actions": []}
+
+    def _run_list_action(self, prefix: str, payload: str) -> dict:
+        """Generic paginated-list callbacks (favorites use list kind ``mb``):
+        ``pg`` repaginate/toggle mode, ``del`` remove a row then re-render in
+        edit mode, ``close`` clear the list."""
+        from price_monitor_bot.list_view import LIST_VIEW_MODE_EDIT
+
+        if prefix == "close":
+            return {"status": STATUS_OK, "message": "已關閉清單。", "actions": []}
+        if prefix == "pg":
+            try:
+                kind, page_str, mode = payload.split(":", 2)
+            except ValueError:
+                return {"status": STATUS_ERROR, "message": "清單動作格式錯誤。", "actions": []}
+            renderer = self._views().get(kind)
+            if renderer is None:
+                return {"status": STATUS_ERROR, "message": "找不到這個清單。", "actions": []}
+            page = int(page_str) if page_str.lstrip("-").isdigit() else 0
+            text, markup, _ = renderer(page=page, mode=mode)
+            return {"status": STATUS_OK, "message": str(text or ""),
+                    "actions": self._markup_to_actions(markup)}
+        # prefix == "del"
+        kind, _, item_id = payload.partition(":")
+        deleter_entry = self._deleters().get(kind)
+        renderer = self._views().get(kind)
+        if deleter_entry is None or renderer is None:
+            return {"status": STATUS_ERROR, "message": "找不到這個清單。", "actions": []}
+        deleter, _label = deleter_entry
+        try:
+            deleter(item_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("music: favorite delete failed id=%s", item_id)
+            return {"status": STATUS_ERROR, "message": f"刪除失敗：{exc}", "actions": []}
+        text, markup, _ = renderer(page=0, mode=LIST_VIEW_MODE_EDIT)
+        return {"status": STATUS_OK, "message": str(text or ""),
+                "actions": self._markup_to_actions(markup)}
 
     def _stream_ollama_chat(self, prompt: str) -> Iterator[dict]:
         endpoint = self.settings.openclaw_local_text_endpoint.rstrip("/")

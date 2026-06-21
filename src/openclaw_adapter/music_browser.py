@@ -27,6 +27,7 @@ from pathlib import Path
 from assistant_runtime import AssistantSettings
 
 from . import music_command as mc
+from . import music_volume as mv
 from .music_favorites import FavoritesStore, stable_id
 
 logger = logging.getLogger(__name__)
@@ -236,6 +237,12 @@ def build_music_callback_handler(settings: AssistantSettings):
             return mc.start_playbest(settings, store), None, None
         if action == "now":
             return mc.add_current_to_favorites(settings, store), None, None
+        if action == "mute":
+            return mv.mute_music(settings), None, None
+        if action == "louder":
+            return mv.louder_music(settings), None, None
+        if action == "lower":
+            return mv.lower_music(settings), None, None
 
         if action == "ls":
             token, _, page_str = rest.partition(":")
