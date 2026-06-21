@@ -2972,9 +2972,14 @@ def _shop_reference_scrape_impl(
     query: str, price_cap: int, source_options: dict[str, object] | None
 ) -> ShopReference | None:
     """Raw Yuyu亭 reference-band scrape (runs inside the scrape worker)."""
+    from market_monitor.host_budget import PRIORITY_MANUAL_RESEARCH, REQUESTER_RESEARCH
     from market_monitor.yuyutei_search import YuyuteiMarketplaceSearchClient
 
-    band = YuyuteiMarketplaceSearchClient().reference_band(
+    # /research is user-driven: claim Yuyutei's single concurrency slot at manual
+    # priority so a background enrichment fetch can't make the user wait.
+    band = YuyuteiMarketplaceSearchClient(
+        requester=REQUESTER_RESEARCH, priority=PRIORITY_MANUAL_RESEARCH,
+    ).reference_band(
         query, price_max=price_cap, source_options=source_options
     )
     if band is None or not band.has_data:

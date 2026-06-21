@@ -375,7 +375,11 @@ class TestSnsMonitor:
 
     def test_monitor_start_stop(self):
         """Test monitor starts and stops correctly."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        # ensure_monitor starts a daemon thread that ticks immediately and opens
+        # the SQLite DB (creating -wal/-shm files) inside this tempdir. That tick
+        # can race the dir teardown; ignore_cleanup_errors stops the race from
+        # failing an assertion-passing test.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             db_path = Path(tmpdir) / "test.db"
 
             from sns_monitor.storage import SnsDatabase
