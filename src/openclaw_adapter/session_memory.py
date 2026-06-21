@@ -128,13 +128,16 @@ class SessionMemoryStore:
 
     # --- clear -----------------------------------------------------------
     def clear(self) -> None:
-        """Delete the saved snapshot. Missing file is a no-op (idempotent)."""
+        """Delete the saved snapshot. Missing file is a no-op (idempotent).
+        Any other OSError is re-raised so callers can report a genuine failure
+        rather than silently returning success (DELETE false-success fix)."""
         try:
             self._path.unlink()
         except FileNotFoundError:
             return
-        except OSError as exc:
-            logger.warning("session memory: clear failed at %s: %s", self._path, exc)
+        except OSError:
+            logger.warning("session memory: clear failed at %s", self._path, exc_info=True)
+            raise
 
     # --- helpers ---------------------------------------------------------
     def _normalize(self, data: dict) -> dict:
@@ -152,9 +155,10 @@ class SessionMemoryStore:
         messages = snapshot.get("messages") or []
         if len(messages) > MAX_MESSAGES:
             messages = messages[-MAX_MESSAGES:]
-        # Drop oldest until the serialized snapshot fits the byte budget. Keep at
-        # least one message so a single huge message still round-trips.
-        while len(messages) > 1:
+        # Drop oldest until the serialized snapshot fits the byte budget.
+        # MAX_BYTES is a hard limit: if even a single message exceeds the budget,
+        # drop to an empty list rather than persist an over-budget snapshot.
+        while messages:
             snapshot["messages"] = messages
             if len(json.dumps(snapshot, ensure_ascii=False).encode("utf-8")) <= MAX_BYTES:
                 break
