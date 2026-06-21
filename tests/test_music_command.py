@@ -41,6 +41,8 @@ def settings(tmp_path, music_dir):
         openclaw_music_dir=str(music_dir),
         openclaw_music_index_path=str(tmp_path / ".openclaw_tmp" / "music_index.json"),
         openclaw_music_player_state_path=str(tmp_path / ".openclaw_tmp" / "music_state.json"),
+        openclaw_music_best_path=str(tmp_path / ".openclaw_tmp" / "music_best.json"),
+        openclaw_music_token_cache_path=str(tmp_path / ".openclaw_tmp" / "music_tokens.json"),
     )
 
 
@@ -75,7 +77,8 @@ def proc_table(monkeypatch):
     monkeypatch.setattr(mc, "_pid_is_player", _is_player)
     monkeypatch.setattr(mc, "_pid_start_time", _start_time)
     monkeypatch.setattr(mc, "_terminate", _terminate)
-    return state
+    yield state
+    mc._PLAYBEST.stop()  # never leak a playbest thread across tests
 
 
 # --- index build / cache / invalidation -----------------------------------
@@ -256,6 +259,8 @@ def test_missing_folder_message(tmp_path, proc_table):
         openclaw_music_dir=str(tmp_path / "does_not_exist"),
         openclaw_music_index_path=str(tmp_path / "idx.json"),
         openclaw_music_player_state_path=str(tmp_path / "state.json"),
+        openclaw_music_best_path=str(tmp_path / "best.json"),
+        openclaw_music_token_cache_path=str(tmp_path / "tok.json"),
     )
     reply = mc.build_music_handler(settings)("random", "chat-1")
     assert "找不到音樂資料夾" in reply
@@ -268,6 +273,8 @@ def test_path_not_a_directory_message(tmp_path, proc_table):
         openclaw_music_dir=str(f),
         openclaw_music_index_path=str(tmp_path / "idx.json"),
         openclaw_music_player_state_path=str(tmp_path / "state.json"),
+        openclaw_music_best_path=str(tmp_path / "best.json"),
+        openclaw_music_token_cache_path=str(tmp_path / "tok.json"),
     )
     reply = mc.build_music_handler(settings)("random", "chat-1")
     assert "不是資料夾" in reply
@@ -280,6 +287,8 @@ def test_empty_folder_message(tmp_path, proc_table):
         openclaw_music_dir=str(empty),
         openclaw_music_index_path=str(tmp_path / "idx.json"),
         openclaw_music_player_state_path=str(tmp_path / "state.json"),
+        openclaw_music_best_path=str(tmp_path / "best.json"),
+        openclaw_music_token_cache_path=str(tmp_path / "tok.json"),
     )
     reply = mc.build_music_handler(settings)("random", "chat-1")
     assert "找不到可播放的音檔" in reply
@@ -300,7 +309,148 @@ def test_playback_failure_message(settings, monkeypatch, proc_table):
     assert "播放失敗" in reply
 
 
-def test_empty_arg_returns_usage(settings, proc_table):
+def test_empty_arg_returns_button_menu(settings, proc_table):
     reply = mc.build_music_handler(settings)("", "chat-1")
-    assert "/music random" in reply
-    assert "/music stop" in reply
+    assert isinstance(reply, tuple)
+    text, markup = reply
+    assert "音樂控制" in text
+    cbs = {b["callback_data"] for row in markup["inline_keyboard"] for b in row}
+    assert {"music:rnd", "music:stop", "music:ls:root:0", "pg:mb:0:r", "music:pb", "music:now"} <= cbs
+
+
+# --- playbest scheduler (pure round logic) ---------------------------------
+def _favs(*names):
+    return [{"id": n, "name": n, "path": f"/m/{n}.flac"} for n in names]
+
+
+def test_scheduler_no_repeat_within_round():
+    favs = _favs("a", "b", "c")
+    sch = mc.PlaybestScheduler(lambda: favs, exists_fn=lambda p: True, shuffler=lambda x: None)
+    first_round = [sch.next()["id"] for _ in range(3)]
+    assert sorted(first_round) == ["a", "b", "c"]  # every favorite once, no repeat
+
+
+def test_scheduler_reshuffles_only_after_full_round():
+    favs = _favs("a", "b", "c")
+    sch = mc.PlaybestScheduler(lambda: favs, exists_fn=lambda p: True, shuffler=lambda x: None)
+    seen = [sch.next()["id"] for _ in range(6)]  # two full rounds
+    assert seen[:3].count("a") == 1 and seen[3:].count("a") == 1  # one play per round
+
+
+def test_scheduler_skips_missing_files():
+    favs = _favs("a", "gone", "c")
+    exists = lambda p: not p.endswith("gone.flac")
+    sch = mc.PlaybestScheduler(lambda: favs, exists_fn=exists, shuffler=lambda x: None)
+    got = [sch.next()["id"] for _ in range(4)]
+    assert "gone" not in got
+    assert set(got) <= {"a", "c"}
+
+
+def test_scheduler_returns_none_when_empty():
+    sch = mc.PlaybestScheduler(lambda: [], exists_fn=lambda p: True)
+    assert sch.next() is None
+
+
+# --- playbest controller + stop integration --------------------------------
+def _write_favorites(settings, music_dir):
+    """Register two real songs as favorites and return the store."""
+    from openclaw_adapter.music_favorites import FavoritesStore
+
+    store = FavoritesStore(settings.openclaw_music_best_path)
+    songs = sorted(music_dir.rglob("*.flac"))
+    songs = [s for s in songs if not s.name.startswith("._")][:2]
+    for s in songs:
+        store.add(str(s), s.stem)
+    return store, [str(s) for s in songs]
+
+
+def test_playbest_starts_and_stop_halts_it(settings, music_dir, proc_table, monkeypatch):
+    monkeypatch.setattr(mc, "_PLAYBEST_POLL_SECONDS", 0.01)
+    _write_favorites(settings, music_dir)
+    handler = mc.build_music_handler(settings)
+    reply = handler("playbest", "chat-1")
+    assert "開始連續" in reply
+    # wait for the loop to spawn at least one song
+    import time as _t
+    for _ in range(200):
+        if proc_table["spawned"]:
+            break
+        _t.sleep(0.01)
+    assert proc_table["spawned"], "playbest should have started a song"
+    assert mc._PLAYBEST.is_active()
+
+    stop_reply = handler("stop", "chat-1")
+    assert "已停止" in stop_reply
+    assert not mc._PLAYBEST.is_active()  # stop halts playbest, no auto-restart
+    # give the loop a moment; it must not spawn anything new after stop
+    n = len(proc_table["spawned"])
+    _t.sleep(0.05)
+    assert len(proc_table["spawned"]) == n
+
+
+def test_playbest_auto_advances_when_song_ends(settings, music_dir, proc_table, monkeypatch):
+    monkeypatch.setattr(mc, "_PLAYBEST_POLL_SECONDS", 0.01)
+    _write_favorites(settings, music_dir)
+    handler = mc.build_music_handler(settings)
+    handler("playbest", "chat-1")
+    import time as _t
+    # song "ends" => drop the live pid; loop should advance and spawn the next
+    for _ in range(200):
+        if proc_table["spawned"]:
+            break
+        _t.sleep(0.01)
+    first = proc_table["spawned"][0][0]
+    proc_table["alive"].discard(first)  # simulate song finishing on its own
+    for _ in range(200):
+        if len(proc_table["spawned"]) >= 2:
+            break
+        _t.sleep(0.01)
+    assert len(proc_table["spawned"]) >= 2  # auto-advanced to the next favorite
+    handler("stop", "chat-1")
+
+
+def test_playbest_empty_favorites_message(settings, proc_table):
+    reply = mc.build_music_handler(settings)("playbest", "chat-1")
+    assert "最愛清單是空的" in reply
+    assert proc_table["spawned"] == []
+
+
+# --- musicnowbest ----------------------------------------------------------
+def test_musicnowbest_adds_current_song(settings, proc_table):
+    play = mc.build_music_handler(settings)
+    play("random", "chat-1")
+    reply = mc.build_musicnowbest_handler(settings)("", "chat-1")
+    assert reply.startswith("已加入最愛")
+    from openclaw_adapter.music_favorites import FavoritesStore
+    assert len(FavoritesStore(settings.openclaw_music_best_path).list()) == 1
+
+
+def test_musicnowbest_no_duplicate(settings, proc_table):
+    mc.build_music_handler(settings)("random", "chat-1")
+    now = mc.build_musicnowbest_handler(settings)
+    assert now("", "chat-1").startswith("已加入最愛")
+    assert "已經在最愛" in now("", "chat-1")  # second add is a no-op
+
+
+def test_musicnowbest_nothing_playing(settings, proc_table):
+    reply = mc.build_musicnowbest_handler(settings)("", "chat-1")
+    assert "目前沒有播放中" in reply
+
+
+# --- callback path safety --------------------------------------------------
+def test_validate_song_path_rejects_outside_root(settings, tmp_path):
+    outside = tmp_path / "evil.flac"
+    outside.write_bytes(b"x")
+    assert mc.validate_song_path(str(outside), settings.openclaw_music_dir) is False
+
+
+def test_validate_song_path_rejects_appledouble_and_non_flac(settings, music_dir):
+    assert mc.validate_song_path(str(music_dir / "misc" / "._Daft Punk - Get Lucky.flac"),
+                                 settings.openclaw_music_dir) is False
+    assert mc.validate_song_path(str(music_dir / "misc" / "cover.jpg"),
+                                 settings.openclaw_music_dir) is False
+
+
+def test_validate_song_path_accepts_real_song(settings, music_dir):
+    song = music_dir / "misc" / "Daft Punk - Get Lucky.flac"
+    assert mc.validate_song_path(str(song), settings.openclaw_music_dir) is True

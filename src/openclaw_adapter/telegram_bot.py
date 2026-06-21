@@ -73,7 +73,15 @@ from .knowledge_command import (
     build_knowledge_item_deleters,
 )
 from .source_command import build_source_handler
-from .music_command import build_music_handler
+from .music_command import build_music_handler, build_musicnowbest_handler
+from .music_browser import build_musiclistall_handler, build_music_callback_handler
+from .music_favorites import (
+    FavoritesStore,
+    MUSIC_BEST_LIST_KIND,
+    build_music_best_view_fn,
+    build_music_best_item_deleter,
+)
+from price_monitor_bot.list_view import LIST_VIEW_MODE_READ as _MB_READ
 from .sns_commands import (
     build_sns_add_handler,
     build_snslist_handler,
@@ -1073,6 +1081,13 @@ def _build_registries(
             return "/new 尚未啟用（需有本地 text model）。"
         return dynamic_tool_runner.run(remainder)
 
+    music_favorites_store = FavoritesStore(settings.openclaw_music_best_path)
+    _music_best_view_fn = build_music_best_view_fn(music_favorites_store)
+
+    def _musiclistbest_handler(remainder: str, chat_id: str):
+        text, markup, _ = _music_best_view_fn(page=0, mode=_MB_READ)
+        return text, markup
+
     command_handlers: dict[str, RegisteredCommand] = {
         "/quiz": RegisteredCommand(
             quiz_handler,
@@ -1146,6 +1161,9 @@ def _build_registries(
         ),
         "/source": RegisteredCommand(build_source_handler(settings)),
         "/music": RegisteredCommand(build_music_handler(settings)),
+        "/musiclistall": RegisteredCommand(build_musiclistall_handler(settings)),
+        "/musiclistbest": RegisteredCommand(_musiclistbest_handler),
+        "/musicnowbest": RegisteredCommand(build_musicnowbest_handler(settings)),
         "/research": RegisteredCommand(
             research_handler,
             ack="收到，正在進行深度商品研究（會分階段回報進度）…",
@@ -1210,6 +1228,7 @@ def _build_registries(
         "oppfb": build_hunt_callback_handler(settings, opportunity_inbox=opportunity_inbox),
         "rs": _build_research_callback_handler(research_cache),
         "imgtr": _build_image_translate_callback_handler(_IMAGE_TRANSLATE_ORIGINAL_CACHE),
+        "music": build_music_callback_handler(settings),
     }
 
     view_handlers = {
@@ -1217,11 +1236,13 @@ def _build_registries(
         "kc": build_knowledge_coding_view_fn(settings),
         "sl": build_snslist_view_fn(sns_db),
         "hl": build_huntlist_view_fn(settings),
+        MUSIC_BEST_LIST_KIND: _music_best_view_fn,
     }
     item_deleter_handlers = {
         **build_knowledge_item_deleters(settings),
         "sl": build_sns_rule_deleter(sns_db, sns_inbox=sns_inbox),
         "hl": build_huntlist_item_deleter(settings, opportunity_inbox=opportunity_inbox),
+        MUSIC_BEST_LIST_KIND: build_music_best_item_deleter(music_favorites_store),
     }
 
     return command_handlers, callback_handlers, view_handlers, item_deleter_handlers

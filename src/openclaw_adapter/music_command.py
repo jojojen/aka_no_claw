@@ -43,6 +43,7 @@ import random
 import signal
 import subprocess
 import threading
+import time
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -50,6 +51,8 @@ from pathlib import Path
 from typing import Callable
 
 from assistant_runtime import AssistantSettings
+
+from .music_favorites import FavoritesStore
 
 logger = logging.getLogger(__name__)
 
@@ -210,6 +213,27 @@ def load_or_build_index(music_dir: str, index_path: str) -> MusicIndex:
     return MusicIndex(entries=entries, signature=sig, rebuilt=True)
 
 
+# --- callback path safety --------------------------------------------------
+def validate_song_path(path: str, music_dir: str) -> bool:
+    """True iff ``path`` is safe to play from a Telegram callback: it resolves
+    to a real ``.flac`` file (not an AppleDouble ``._*`` sidecar) located under
+    ``music_dir``. Tokens come from user-clickable buttons, so a resolved path
+    must be re-validated before playback to prevent escaping the music root."""
+    try:
+        resolved = Path(path).resolve()
+        root = Path(music_dir).resolve()
+    except OSError:
+        return False
+    if root != resolved and root not in resolved.parents:
+        return False
+    name = resolved.name
+    if name.startswith("._"):
+        return False
+    if not name.lower().endswith(_AUDIO_SUFFIXES):
+        return False
+    return resolved.is_file()
+
+
 # --- search ----------------------------------------------------------------
 def _normalize(text: str) -> str:
     # NFKC + casefold so half/full-width and composed/decomposed Japanese
@@ -295,34 +319,24 @@ def _clear_state(state_path: str) -> None:
         logger.warning("music: could not clear player state %s", state_path)
 
 
-def _stop(state_path: str) -> str:
+def _terminate_running(state_path: str) -> None:
+    """Stop and clear the currently recorded OpenClaw track, if any."""
     running = _current_running(state_path)
     if running is None:
-        return "目前沒有由龍蝦播放中的音樂。"
+        return
     try:
         _terminate(int(running["pid"]))
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("music: stop failed")
-        return f"停止播放失敗：{exc}"
+    except Exception:  # noqa: BLE001 — best-effort
+        logger.exception("music: failed to stop previous track")
     _clear_state(state_path)
-    return "已停止目前由龍蝦播放的音樂。"
 
 
-def _play(entry: dict, state_path: str) -> str:
-    # Stop any previous OpenClaw-started track first so we never leave two
-    # playing at once.
-    running = _current_running(state_path)
-    if running is not None:
-        try:
-            _terminate(int(running["pid"]))
-        except Exception:  # noqa: BLE001 — best-effort; we overwrite state below
-            logger.exception("music: failed to stop previous track")
-        _clear_state(state_path)
-    try:
-        pid = _spawn_player(entry["path"])
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("music: playback failed path=%s", entry.get("path"))
-        return f"播放失敗：{exc}"
+def _start_song(entry: dict, state_path: str) -> int:
+    """Stop the previous track, spawn ``entry``, persist its identity, return
+    the pid. Shared by user-initiated plays and the playbest loop; callers that
+    are *not* the playbest loop must stop playbest first (see :func:`_play`)."""
+    _terminate_running(state_path)
+    pid = _spawn_player(entry["path"])
     _write_json(
         state_path,
         {
@@ -332,27 +346,242 @@ def _play(entry: dict, state_path: str) -> str:
             "start": _pid_start_time(pid),
         },
     )
+    return pid
+
+
+def _stop(state_path: str) -> str:
+    # /music stop ends both the current song AND the playbest continuous mode,
+    # and playbest must not auto-restart afterward.
+    was_playbest = _PLAYBEST.stop()
+    running = _current_running(state_path)
+    if running is not None:
+        try:
+            _terminate(int(running["pid"]))
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("music: stop failed")
+            return f"停止播放失敗：{exc}"
+        _clear_state(state_path)
+        return "已停止目前由龍蝦播放的音樂。"
+    if was_playbest:
+        return "已停止連續播放最愛。"
+    return "目前沒有由龍蝦播放中的音樂。"
+
+
+def _play(entry: dict, state_path: str) -> str:
+    # A user-initiated single play cancels playbest so the loop never fights it
+    # for the player (and never leaves two OpenClaw songs playing at once).
+    _PLAYBEST.stop()
+    try:
+        _start_song(entry, state_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("music: playback failed path=%s", entry.get("path"))
+        return f"播放失敗：{exc}"
     return f"正在播放：\n{entry['name']}"
 
 
+# --- playbest: continuous shuffled favorite playback -----------------------
+_PLAYBEST_POLL_SECONDS = 1.0
+
+
+class PlaybestScheduler:
+    """Yields favorites to play with round semantics: every favorite plays once
+    per round before any repeats, then the list reshuffles for the next round.
+    Missing files are skipped so a deleted favorite never stalls the loop.
+
+    Pure and synchronous (no threads/sleeps) so the round/no-repeat/skip rules
+    are unit-testable directly; the threaded controller drives it."""
+
+    def __init__(self, entries_provider, exists_fn=None, shuffler=None) -> None:
+        self._provider = entries_provider
+        self._exists = exists_fn or os.path.exists
+        self._shuffle = shuffler or random.shuffle
+        self._round: list[dict] = []
+
+    def next(self) -> dict | None:
+        while True:
+            if not self._round:
+                fresh = [e for e in self._provider() if self._exists(e.get("path", ""))]
+                if not fresh:
+                    return None
+                self._shuffle(fresh)
+                self._round = fresh
+            entry = self._round.pop(0)
+            if self._exists(entry.get("path", "")):  # may have vanished mid-round
+                return entry
+
+
+class PlaybestController:
+    """Runs :class:`PlaybestScheduler` in a daemon thread, auto-advancing to the
+    next favorite when the current song's process exits. Stoppable and
+    non-restarting once stopped."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._active = False
+        self._thread: threading.Thread | None = None
+        self._current_pid: int | None = None
+
+    def is_active(self) -> bool:
+        with self._lock:
+            return self._active
+
+    def start(self, entries_provider, state_path: str, on_play=None) -> None:
+        self.stop()
+        with self._lock:
+            self._active = True
+            thread = threading.Thread(
+                target=self._loop,
+                args=(entries_provider, state_path, on_play),
+                daemon=True,
+                name="music-playbest",
+            )
+            self._thread = thread
+        thread.start()
+
+    def stop(self) -> bool:
+        with self._lock:
+            was_active = self._active
+            self._active = False
+            pid = self._current_pid
+            self._current_pid = None
+            thread = self._thread
+            self._thread = None
+        if pid is not None:
+            try:
+                _terminate(pid)
+            except Exception:  # noqa: BLE001
+                logger.exception("playbest: terminate on stop failed")
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+        return was_active
+
+    def _loop(self, entries_provider, state_path: str, on_play) -> None:
+        scheduler = PlaybestScheduler(entries_provider)
+        while self.is_active():
+            entry = scheduler.next()
+            if entry is None:  # favorites empty / all missing → stop cleanly
+                break
+            try:
+                pid = _start_song(entry, state_path)
+            except Exception:  # noqa: BLE001
+                logger.exception("playbest: spawn failed path=%s", entry.get("path"))
+                continue
+            with self._lock:
+                self._current_pid = pid
+            if not self.is_active():  # stopped during spawn → don't leave it playing
+                _terminate(pid)
+                break
+            if on_play is not None:
+                try:
+                    on_play(entry)
+                except Exception:  # noqa: BLE001
+                    logger.exception("playbest: on_play failed")
+            while self.is_active() and _pid_alive(pid):
+                time.sleep(_PLAYBEST_POLL_SECONDS)
+            if not self.is_active():
+                break
+        with self._lock:
+            self._active = False
+
+
+_PLAYBEST = PlaybestController()
+
+
+def _play_best(store: FavoritesStore, state_path: str) -> str:
+    favorites = store.list()
+    if not favorites:
+        return "最愛清單是空的，無法開始連續播放。"
+    playable = [e for e in favorites if os.path.exists(e.get("path", ""))]
+    if not playable:
+        return "最愛清單中的歌曲檔案都不存在，無法播放。"
+    _PLAYBEST.start(
+        entries_provider=store.list,
+        state_path=state_path,
+        on_play=lambda e: store.mark_played(e.get("id", "")),
+    )
+    return "開始連續隨機播放最愛歌曲。用 /music stop 可停止。"
+
+
+# --- shared play entry points (used by handler + Telegram callbacks) -------
+def play_random(settings: AssistantSettings) -> str:
+    """Play one random indexed song. Returns a user-facing message."""
+    music_dir = settings.openclaw_music_dir
+    err = _music_dir_problem(music_dir)
+    if err:
+        return err
+    try:
+        index = load_or_build_index(music_dir, settings.openclaw_music_index_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("music: index build failed dir=%s", music_dir)
+        return f"音樂索引建立失敗：{exc}"
+    if not index.entries:
+        return f"音樂資料夾找不到可播放的音檔（.flac）：{music_dir}"
+    return _play(random.choice(index.entries), settings.openclaw_music_player_state_path)
+
+
+def play_path(settings: AssistantSettings, path: str, name: str | None = None) -> str:
+    """Validate and play a specific song path (for callback buttons). Rejects
+    anything that is not a real ``.flac`` under the music root."""
+    if not validate_song_path(path, settings.openclaw_music_dir):
+        return "這個檔案無法播放（不存在、不是 .flac、或不在音樂資料夾內）。"
+    entry = {"path": os.path.abspath(path), "name": name or Path(path).stem}
+    return _play(entry, settings.openclaw_music_player_state_path)
+
+
+def stop_playback(settings: AssistantSettings) -> str:
+    return _stop(settings.openclaw_music_player_state_path)
+
+
+def start_playbest(settings: AssistantSettings, store: FavoritesStore) -> str:
+    return _play_best(store, settings.openclaw_music_player_state_path)
+
+
+def add_current_to_favorites(settings: AssistantSettings, store: FavoritesStore) -> str:
+    """`/musicnowbest`: add the currently playing OpenClaw song to favorites."""
+    running = _current_running(settings.openclaw_music_player_state_path)
+    if running is None:
+        return "目前沒有播放中的音樂，無法加入最愛。"
+    path = running.get("path")
+    name = running.get("name") or (Path(path).stem if path else "")
+    if not path:
+        return "目前播放狀態缺少檔案路徑，無法加入最愛。"
+    added, entry = store.add(path, name)
+    if added:
+        return f"已加入最愛：\n{entry['name']}"
+    return f"這首已經在最愛清單中：\n{entry['name']}"
+
+
+def _music_dir_problem(music_dir: str) -> str | None:
+    root = Path(music_dir)
+    if not root.exists():
+        return f"找不到音樂資料夾：{music_dir}"
+    if not root.is_dir():
+        return f"音樂路徑不是資料夾：{music_dir}"
+    return None
+
+
 # --- command handler -------------------------------------------------------
-def build_music_handler(settings: AssistantSettings) -> Callable[[str, str], str]:
+def build_music_handler(
+    settings: AssistantSettings,
+) -> Callable[[str, str], "str | tuple[str, dict]"]:
     music_dir = settings.openclaw_music_dir
     index_path = settings.openclaw_music_index_path
     state_path = settings.openclaw_music_player_state_path
+    store = FavoritesStore(settings.openclaw_music_best_path)
 
-    def handler(raw: str, chat_id: str) -> str:
+    def handler(raw: str, chat_id: str) -> "str | tuple[str, dict]":
         arg = (raw or "").strip()
         if not arg:
-            return _usage_text()
-        if arg.lower() == "stop":
+            return _menu_text(), _menu_markup()
+        low = arg.lower()
+        if low == "stop":
             return _stop(state_path)
+        if low == "playbest":
+            return _play_best(store, state_path)
 
-        root = Path(music_dir)
-        if not root.exists():
-            return f"找不到音樂資料夾：{music_dir}"
-        if not root.is_dir():
-            return f"音樂路徑不是資料夾：{music_dir}"
+        problem = _music_dir_problem(music_dir)
+        if problem:
+            return problem
         try:
             index = load_or_build_index(music_dir, index_path)
         except Exception as exc:  # noqa: BLE001
@@ -361,7 +590,7 @@ def build_music_handler(settings: AssistantSettings) -> Callable[[str, str], str
         if not index.entries:
             return f"音樂資料夾找不到可播放的音檔（.flac）：{music_dir}"
 
-        if arg.lower() == "random":
+        if low == "random":
             return _play(random.choice(index.entries), state_path)
         result = _search(index.entries, arg)
         if result.kind in ("exact", "single"):
@@ -373,16 +602,40 @@ def build_music_handler(settings: AssistantSettings) -> Callable[[str, str], str
     return handler
 
 
+def build_musicnowbest_handler(settings: AssistantSettings) -> Callable[[str, str], str]:
+    store = FavoritesStore(settings.openclaw_music_best_path)
+
+    def handler(raw: str, chat_id: str) -> str:
+        return add_current_to_favorites(settings, store)
+
+    return handler
+
+
 def _candidates_text(query: str, candidates: tuple[dict, ...]) -> str:
     lines = [f"找到多首符合「{query}」的歌曲，請輸入更精確的名稱："]
     lines.extend(f"{i}. {e['name']}" for i, e in enumerate(candidates, 1))
     return "\n".join(lines)
 
 
-def _usage_text() -> str:
+def _menu_text() -> str:
     return (
-        "用法：\n"
-        "/music random — 隨機播放一首\n"
-        "/music <歌曲名> — 搜尋並播放最相符的歌曲\n"
-        "/music stop — 停止目前由龍蝦播放的音樂"
+        "🎵 音樂控制\n"
+        "也可直接輸入：/music random、/music <歌曲名>、/music stop、/music playbest"
     )
+
+
+def _menu_markup() -> dict:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "🔀 隨機播放", "callback_data": "music:rnd"},
+                {"text": "⏹ 停止", "callback_data": "music:stop"},
+            ],
+            [{"text": "📂 瀏覽全部歌曲", "callback_data": "music:ls:root:0"}],
+            [
+                {"text": "🎶 最愛清單", "callback_data": "pg:mb:0:r"},
+                {"text": "▶️ 播放最愛", "callback_data": "music:pb"},
+            ],
+            [{"text": "⭐ 收藏目前歌曲", "callback_data": "music:now"}],
+        ]
+    }

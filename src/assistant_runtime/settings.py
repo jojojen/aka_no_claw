@@ -133,6 +133,11 @@ class AssistantSettings:
     # cache/state is ever written into a git-tracked path.
     openclaw_music_index_path: str = ".openclaw_tmp/music_index.json"
     openclaw_music_player_state_path: str = ".openclaw_tmp/music_player_state.json"
+    # Favorite-song list (issue #34) + the callback token→path cache that lets
+    # Telegram buttons reference songs without exceeding the 64-byte callback
+    # limit. Both are gitignored runtime data and must never be committed.
+    openclaw_music_best_path: str = ".openclaw_tmp/music_best.json"
+    openclaw_music_token_cache_path: str = ".openclaw_tmp/music_tokens.json"
 
 
 def _resolve_runtime_path(value: str) -> str:
@@ -379,6 +384,12 @@ def get_settings() -> AssistantSettings:
         ),
         openclaw_music_player_state_path=_resolve_runtime_path(
             os.getenv("OPENCLAW_MUSIC_PLAYER_STATE_PATH", ".openclaw_tmp/music_player_state.json")
+        ),
+        openclaw_music_best_path=_resolve_runtime_path(
+            os.getenv("OPENCLAW_MUSIC_BEST_PATH", ".openclaw_tmp/music_best.json")
+        ),
+        openclaw_music_token_cache_path=_resolve_runtime_path(
+            os.getenv("OPENCLAW_MUSIC_TOKEN_CACHE_PATH", ".openclaw_tmp/music_tokens.json")
         ),
     )
 
