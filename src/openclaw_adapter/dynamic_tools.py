@@ -369,6 +369,24 @@ class OpenCodeTextClient:
         # not use num_ctx and maps num_predict to max_tokens when present.
         self.num_ctx: int | None = None
         self.num_predict: int | None = max_tokens
+        # Cancellation: a caller on another thread (e.g. the command bridge when
+        # the phone disconnects mid-stream) can call abort() to stop a runaway
+        # generation instead of letting it burn the full timeout.
+        self._cancel = threading.Event()
+        self._abort_lock = threading.Lock()
+        self._response: object | None = None
+
+    def abort(self) -> None:
+        """Signal an in-flight :meth:`generate` to stop ASAP: skip remaining
+        retries and close the open HTTP response so a blocked read aborts."""
+        self._cancel.set()
+        with self._abort_lock:
+            resp = self._response
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:  # noqa: BLE001 — best-effort interrupt
+                pass
 
     def _url(self) -> str:
         if self.base_url.endswith("/completions"):
@@ -396,9 +414,18 @@ class OpenCodeTextClient:
         last_exc: RuntimeError | None = None
         body = ""
         for attempt in range(1, _OPENCODE_MAX_RETRIES + 1):
+            if self._cancel.is_set():
+                raise CloudBackendUnavailable("OpenCode request aborted by caller")
             try:
-                with urlopen(request, timeout=self.timeout_seconds) as response:
+                response = urlopen(request, timeout=self.timeout_seconds)
+                with self._abort_lock:
+                    self._response = response
+                try:
                     body = response.read().decode("utf-8", errors="replace")
+                finally:
+                    with self._abort_lock:
+                        self._response = None
+                    response.close()
                 last_exc = None
                 break
             except HTTPError as exc:
@@ -411,7 +438,12 @@ class OpenCodeTextClient:
                     raise RuntimeError(f"OpenCode HTTP {exc.code}: {detail}") from exc
                 last_exc = RuntimeError(f"OpenCode HTTP {exc.code}")
             except URLError as exc:
+                if self._cancel.is_set():
+                    raise CloudBackendUnavailable(
+                        "OpenCode request aborted by caller") from exc
                 last_exc = RuntimeError(f"OpenCode request failed: {exc.reason}")
+            if self._cancel.is_set():
+                raise CloudBackendUnavailable("OpenCode request aborted by caller")
             if attempt < _OPENCODE_MAX_RETRIES:
                 delay = _OPENCODE_RETRY_BASE_SEC * (2.0 ** (attempt - 1))
                 logger.warning(
@@ -454,6 +486,21 @@ class OpenCodeCliTextClient:
         self.home_dir = str(Path(self.cwd) / ".opencode-home")
         self.num_ctx: int | None = None
         self.num_predict: int | None = None
+        # Cancellation: abort() kills the opencode subprocess so a runaway cloud
+        # generation stops immediately (fully effective for the CLI transport).
+        self._cancel = threading.Event()
+        self._abort_lock = threading.Lock()
+        self._proc: subprocess.Popen | None = None
+
+    def abort(self) -> None:
+        self._cancel.set()
+        with self._abort_lock:
+            proc = self._proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001 — best-effort interrupt
+                pass
 
     def generate(self, prompt: str, *, temperature: float = 0.0, think: bool = False) -> str:
         Path(self.home_dir).mkdir(parents=True, exist_ok=True)
@@ -470,23 +517,35 @@ class OpenCodeCliTextClient:
             "opencode", "run", "--pure", "-m", self.model,
             "--dir", self.cwd, prompt,
         ]
+        if self._cancel.is_set():
+            raise CloudBackendUnavailable("OpenCode CLI aborted by caller")
+        proc = subprocess.Popen(
+            cmd,
+            shell=False,
+            cwd=self.cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        with self._abort_lock:
+            self._proc = proc
         try:
-            proc = subprocess.run(
-                cmd,
-                shell=False,
-                cwd=self.cwd,
-                timeout=self.timeout_seconds,
-                capture_output=True,
-                text=True,
-                env=env,
-            )
+            stdout, stderr = proc.communicate(timeout=self.timeout_seconds)
         except subprocess.TimeoutExpired as exc:
+            proc.kill()
+            proc.communicate()
             raise CloudBackendUnavailable(
                 f"OpenCode CLI timeout >{self.timeout_seconds}s") from exc
+        finally:
+            with self._abort_lock:
+                self._proc = None
+        if self._cancel.is_set():
+            raise CloudBackendUnavailable("OpenCode CLI aborted by caller")
         if proc.returncode != 0:
-            detail = _tail((proc.stderr or proc.stdout or "").strip(), 800)
+            detail = _tail((stderr or stdout or "").strip(), 800)
             raise CloudBackendUnavailable(f"OpenCode CLI failed: {detail}")
-        text = _ANSI_RE.sub("", proc.stdout or "")
+        text = _ANSI_RE.sub("", stdout or "")
         lines: list[str] = []
         for line in text.splitlines():
             stripped = line.strip()

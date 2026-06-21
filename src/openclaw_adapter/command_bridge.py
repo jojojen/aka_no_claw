@@ -412,8 +412,18 @@ class CommandBridge:
 
         worker = threading.Thread(target=_worker, daemon=True)
         worker.start()
-        while not done.wait(timeout=_HEARTBEAT_SECONDS):
-            yield stream_heartbeat()
+        try:
+            while not done.wait(timeout=_HEARTBEAT_SECONDS):
+                yield stream_heartbeat()
+        except GeneratorExit:
+            # Client disconnected (phone screen-lock / AbortController). Stop the
+            # cloud model worker instead of letting it burn the full timeout —
+            # the review flagged a runaway worker as the #30 gap.
+            abort = getattr(client, "abort", None)
+            if callable(abort):
+                logger.info("command bridge: aborting cloud chat worker on disconnect")
+                abort()
+            raise
         if "error" in result:
             yield stream_error(f"cloud pickle 後端失敗：{result['error']}")
             return

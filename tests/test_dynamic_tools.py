@@ -1155,6 +1155,9 @@ def test_opencode_generate_posts_openai_completion_payload() -> None:
         def read(self):
             return b'{"choices": [{"text": "  hello\\n"}]}'
 
+        def close(self):
+            pass
+
         def __enter__(self):
             return self
 
@@ -1192,29 +1195,84 @@ def test_opencode_generate_posts_openai_completion_payload() -> None:
 
 
 def test_opencode_cli_generate_strips_banner_and_ansi(tmp_path) -> None:
-    import subprocess
     import unittest.mock as mock
 
-    def _fake_run(cmd, **kwargs):
+    class _FakeProc:
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            return ("\x1b[0m\n> build · big-pickle\n\x1b[0m\nhello\n", "")
+
+        def poll(self):
+            return 0
+
+        def kill(self):
+            pass
+
+    def _fake_popen(cmd, **kwargs):
         assert cmd[:5] == ["opencode", "run", "--pure", "-m", "opencode/big-pickle"]
         env = kwargs["env"]
         assert env["HOME"] == str(tmp_path / ".opencode-home")
         assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path / ".opencode-home" / ".claude")
         assert env["XDG_DATA_HOME"] == str(tmp_path / ".opencode-home" / ".local" / "share")
         assert env["XDG_CACHE_HOME"] == str(tmp_path / ".opencode-home" / ".cache")
-        return subprocess.CompletedProcess(
-            cmd, 0, stdout="\x1b[0m\n> build · big-pickle\n\x1b[0m\nhello\n", stderr=""
-        )
+        return _FakeProc()
 
     client = OpenCodeCliTextClient(
         model="opencode/big-pickle",
         timeout_seconds=123,
         cwd=tmp_path,
     )
-    with mock.patch("openclaw_adapter.dynamic_tools.subprocess.run", _fake_run):
+    with mock.patch("openclaw_adapter.dynamic_tools.subprocess.Popen", _fake_popen):
         out = client.generate("say hello")
 
     assert out == "hello"
+
+
+def test_opencode_cli_abort_kills_running_subprocess(tmp_path) -> None:
+    """A disconnect mid-generation must kill the opencode subprocess (the real
+    cloud transport when no API key is set), not let it run to timeout (#30)."""
+    import threading
+    import unittest.mock as mock
+
+    killed = threading.Event()
+    started = threading.Event()
+
+    class _FakeProc:
+        returncode = -9
+
+        def communicate(self, timeout=None):
+            started.set()
+            killed.wait(timeout=5.0)  # block until abort() kills us
+            return ("", "killed")
+
+        def poll(self):
+            return None if not killed.is_set() else -9
+
+        def kill(self):
+            killed.set()
+
+    client = OpenCodeCliTextClient(
+        model="opencode/big-pickle", timeout_seconds=123, cwd=tmp_path
+    )
+    with mock.patch("openclaw_adapter.dynamic_tools.subprocess.Popen",
+                    lambda *a, **k: _FakeProc()):
+        result: dict[str, object] = {}
+
+        def _run():
+            try:
+                client.generate("say hello")
+            except CloudBackendUnavailable as exc:
+                result["err"] = str(exc)
+
+        t = threading.Thread(target=_run)
+        t.start()
+        assert started.wait(1.0)
+        client.abort()
+        t.join(2.0)
+
+    assert killed.is_set()
+    assert "aborted" in result.get("err", "")
 
 
 def test_builder_uses_opencode_cli_when_codegen_backend_enabled(tmp_path) -> None:
