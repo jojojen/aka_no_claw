@@ -1879,6 +1879,53 @@ def test_shop_reference_from_band_raises_after_subprocess_writes_cooldown(monkey
         rc._shop_reference_from_band("query", 5000, None)
 
 
+def test_shop_reference_from_band_raises_on_pre_network_budget_skip(monkeypatch) -> None:
+    """A HostBudget pre-network refusal (cooldown / concurrency) must surface as a
+    distinct RuntimeError, never collapse into a generic empty result (#24/#25)."""
+    from openclaw_adapter import research_command as rc
+
+    monkeypatch.setattr(rc, "_yuyutei_cooldown_remaining", lambda: 0.0)
+    monkeypatch.setattr(
+        rc, "run_in_subprocess",
+        lambda *a, **kw: {
+            "__budget_skip__": True,
+            "decision": "skipped_concurrency_limit",
+            "reason": "manual slot busy",
+            "remaining_seconds": 0.0,
+        },
+    )
+
+    import pytest
+    with pytest.raises(RuntimeError, match="skipped before network"):
+        rc._shop_reference_from_band("query", 5000, None)
+
+
+def test_shop_reference_scrape_impl_returns_budget_skip_sentinel(monkeypatch) -> None:
+    """When the Yuyutei client records a pre-network budget skip and yields no
+    band, the impl returns the sentinel dict instead of a bare None."""
+    from openclaw_adapter import research_command as rc
+    from market_monitor.host_budget import DECISION_SKIPPED_CONCURRENCY_LIMIT
+    from market_monitor.http import HostRateLimitedError
+
+    class _FakeClient:
+        def __init__(self, *a, **kw) -> None:
+            self.last_budget_skip = HostRateLimitedError(
+                "yuyu-tei.jp", 0.0,
+                decision=DECISION_SKIPPED_CONCURRENCY_LIMIT, reason="busy",
+            )
+
+        def reference_band(self, *a, **kw):
+            return None
+
+    import market_monitor.yuyutei_search as ys
+    monkeypatch.setattr(ys, "YuyuteiMarketplaceSearchClient", _FakeClient)
+
+    out = rc._shop_reference_scrape_impl("query", 5000, None)
+    assert isinstance(out, dict)
+    assert out.get("__budget_skip__") is True
+    assert out["decision"] == DECISION_SKIPPED_CONCURRENCY_LIMIT
+
+
 def test_build_price_section_result_shows_yuyu_note_when_shop_failed() -> None:
     """When shop_reference is None and backend_warnings contains the shop failure
     string, the summary must include the "遊々亭参考：暫無法取得" note."""

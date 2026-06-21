@@ -69,7 +69,11 @@ def _dispatch(target: str, payload: dict) -> object:
         ref = rc._shop_reference_scrape_impl(
             payload["query"], int(payload["price_cap"]), payload.get("source_options")
         )
-        return None if ref is None else rc._shop_reference_to_dict(ref)
+        if ref is None:
+            return None
+        if isinstance(ref, dict):  # pre-network budget-skip sentinel — pass through
+            return ref
+        return rc._shop_reference_to_dict(ref)
     raise ValueError(f"unknown scrape target {target!r}")
 
 

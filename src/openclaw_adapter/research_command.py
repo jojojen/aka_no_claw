@@ -2970,19 +2970,48 @@ def _shop_reference_from_dict(data: dict[str, object]) -> ShopReference:
 
 def _shop_reference_scrape_impl(
     query: str, price_cap: int, source_options: dict[str, object] | None
-) -> ShopReference | None:
-    """Raw Yuyu亭 reference-band scrape (runs inside the scrape worker)."""
-    from market_monitor.host_budget import PRIORITY_MANUAL_RESEARCH, REQUESTER_RESEARCH
+) -> "ShopReference | dict[str, object] | None":
+    """Raw Yuyu亭 reference-band scrape (runs inside the scrape worker).
+
+    Returns a ``ShopReference`` on success, ``None`` when there is simply no
+    Yuyutei data, or a ``{"__budget_skip__": True, ...}`` sentinel dict when the
+    fetch was refused *before any network request* by the shared HostBudget
+    (cooldown / concurrency). The sentinel lets the parent surface a clear
+    "skipped before network" warning instead of collapsing it into an empty
+    result (#24/#25 review)."""
+    from market_monitor.host_budget import (
+        DECISION_SKIPPED_COOLING_DOWN,
+        PRIORITY_MANUAL_RESEARCH,
+        REQUESTER_RESEARCH,
+    )
     from market_monitor.yuyutei_search import YuyuteiMarketplaceSearchClient
 
     # /research is user-driven: claim Yuyutei's single concurrency slot at manual
     # priority so a background enrichment fetch can't make the user wait.
-    band = YuyuteiMarketplaceSearchClient(
+    client = YuyuteiMarketplaceSearchClient(
         requester=REQUESTER_RESEARCH, priority=PRIORITY_MANUAL_RESEARCH,
-    ).reference_band(
+    )
+    band = client.reference_band(
         query, price_max=price_cap, source_options=source_options
     )
     if band is None or not band.has_data:
+        skip = client.last_budget_skip
+        if skip is not None:
+            # A pre-network HostBudget refusal — distinct from "no data". When it's
+            # a cooldown (a 429 backoff), persist the cross-process marker so the
+            # parent's next /research skips Yuyutei until it clears. Concurrency
+            # skips are transient (a slot was busy) and must NOT trip a cooldown.
+            if skip.decision == DECISION_SKIPPED_COOLING_DOWN:
+                try:
+                    _yuyutei_trip_cross_process_cooldown()
+                except Exception:  # noqa: BLE001
+                    pass
+            return {
+                "__budget_skip__": True,
+                "decision": skip.decision,
+                "reason": skip.reason,
+                "remaining_seconds": skip.remaining_seconds,
+            }
         # Persist a cross-process hint when the in-process circuit was tripped by a
         # 429, so the parent's next call skips yuyu-tei until the cooldown clears
         # instead of naively spawning another subprocess that will also get rate-limited.
@@ -3022,6 +3051,12 @@ def _shop_reference_from_band(
         {"query": query, "price_cap": price_cap, "source_options": source_options},
         timeout=_SHOP_REF_SCRAPE_TIMEOUT,
     )
+    if isinstance(result, dict) and result.get("__budget_skip__"):
+        # The fetch was refused before any network request (HostBudget cooldown /
+        # concurrency). Surface it distinctly so it is never collapsed into a
+        # generic "no Yuyutei data" empty result (#24/#25 review finding 2).
+        reason = result.get("reason") or result.get("decision") or "host budget"
+        raise RuntimeError(f"yuyu-tei.jp skipped before network: {reason}")
     if not isinstance(result, dict):
         # The subprocess may have just written the cooldown file on a fresh 429;
         # surface it as an exception so the caller adds a user-visible warning.
