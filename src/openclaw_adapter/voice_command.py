@@ -21,11 +21,14 @@ Callback payloads (prefix ``voice`` stripped):
 from __future__ import annotations
 
 import logging
+import shutil
+import subprocess
 from typing import Callable
 
 from assistant_runtime import AssistantSettings, build_ssl_context
 from price_monitor_bot.bot import TelegramBotClient
 
+from .music_command import stop_playback
 from .quiz_vocab_audio import (
     QuizVocabAudioError,
     VoiceParams,
@@ -34,6 +37,34 @@ from .quiz_vocab_audio import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Local playback for /saynow: play the synthesized WAV out the Mac mini's
+# speakers via afplay (same player the music feature uses). Bounded timeout so a
+# stuck audio device can never hang the bot / a scheduled run.
+_PLAYER_BINARY = "afplay"
+_PLAY_TIMEOUT_SECONDS = 120
+
+
+def play_audio_file(path: str) -> "tuple[bool, str]":
+    """Play *path* through the Mac speakers (blocking). Returns ``(ok, error)``;
+    blocking so a schedule's later steps (e.g. resume music) run after the
+    announcement finishes, and so failures surface instead of being lost."""
+    if shutil.which(_PLAYER_BINARY) is None:
+        return False, "找不到 afplay（此功能僅支援 macOS）。"
+    try:
+        proc = subprocess.run(
+            [_PLAYER_BINARY, path],
+            capture_output=True,
+            text=True,
+            timeout=_PLAY_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "播放逾時。"
+    except OSError as exc:
+        return False, f"播放失敗：{exc}"
+    if proc.returncode != 0:
+        return False, (proc.stderr or proc.stdout or "未知錯誤").strip()
+    return True, ""
 
 # Display order + Chinese labels for the five tunable scales.
 _PARAM_LABELS: list[tuple[str, str]] = [
@@ -191,5 +222,45 @@ def build_say_handler(
             caption=caption[:1024],
         )
         return None
+
+    return handler
+
+
+def build_saynow_handler(
+    settings: AssistantSettings,
+) -> Callable[[str, str], object]:
+    """``/saynow <日文>``: synthesize with the chat's voice params (same path as
+    ``/say``) and play it OUT THE MAC MINI'S SPEAKERS instead of sending a
+    Telegram voice file. This is the form home schedules use for spoken
+    announcements — it needs no chat to deliver to, so it works unattended."""
+    db = _open_db(settings)
+
+    def handler(raw: str, chat_id: str | None = None) -> object:
+        cid = str(chat_id or "")
+        text = (raw or "").strip()
+        if not text:
+            return "用法：/saynow <日文文字>（用目前語音參數在 Mac mini 播放）。"
+        # Voice params are per-chat; with no chat (scheduled run) use defaults.
+        params = db.get_voice_params(cid) if cid else VoiceParams()
+        synth = build_vocab_synthesizer(settings, params)
+        cache_dir = build_vocab_audio_cache_dir(settings=settings)
+        try:
+            audio = synth.synthesize_text(text=text, cache_dir=cache_dir)
+        except QuizVocabAudioError as exc:
+            return f"合成失敗：{exc}"
+        except Exception as exc:
+            logger.exception("/saynow synthesis failed text=%s", text[:40])
+            return f"合成失敗：{exc}"
+        # Free the audio device first: the Mac mini's Bluetooth output can't mix
+        # two streams, so OpenClaw music playing concurrently makes afplay fail
+        # with "AudioQueueStart failed". Stop any OpenClaw music before playing.
+        try:
+            stop_playback(settings)
+        except Exception:
+            logger.exception("/saynow failed to stop music before playback")
+        ok, err = play_audio_file(str(audio.output_path))
+        if not ok:
+            return f"已合成但播放失敗：{err}"
+        return f"已在 Mac mini 播放語音（{audio.engine_label}）：{text}"
 
     return handler

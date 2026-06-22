@@ -417,6 +417,78 @@ def test_playbest_auto_advances_when_song_ends(settings, music_dir, proc_table, 
     handler("stop", "chat-1")
 
 
+def test_playbest_stop_leaves_nothing_playing(settings, music_dir, proc_table, monkeypatch):
+    # Regression: an auto-advanced track started in the gap between "song ended"
+    # and "next song spawned" must NOT escape /music stop. Drive several natural
+    # endings, then stop, and assert nothing is left alive and state is cleared.
+    monkeypatch.setattr(mc, "_PLAYBEST_POLL_SECONDS", 0.01)
+    _write_favorites(settings, music_dir)
+    handler = mc.build_music_handler(settings)
+    handler("playbest", "chat-1")
+    import time as _t
+    for _ in range(200):
+        if proc_table["spawned"]:
+            break
+        _t.sleep(0.01)
+    for _ in range(3):  # simulate songs finishing → loop keeps auto-advancing
+        if proc_table["spawned"]:
+            proc_table["alive"].discard(proc_table["spawned"][-1][0])
+        _t.sleep(0.03)
+    handler("stop", "chat-1")
+    _t.sleep(0.05)
+    assert not mc._PLAYBEST.is_active()
+    assert proc_table["alive"] == set(), "no track may remain playing after stop"
+    assert not Path(settings.openclaw_music_player_state_path).exists()
+
+
+def test_playbest_cross_process_stop_via_session(settings, music_dir, proc_table, monkeypatch):
+    # The Telegram poller and the LAN command-bridge are SEPARATE processes, each
+    # with its own controller. A /music stop in one must halt the other's loop —
+    # which it does by deleting the shared session token. Here a stand-in
+    # controller plays; clearing the session (as the other process's stop would)
+    # must stop it auto-advancing even though we never touched the controller.
+    monkeypatch.setattr(mc, "_PLAYBEST_POLL_SECONDS", 0.01)
+    store, _ = _write_favorites(settings, music_dir)
+    state_path = settings.openclaw_music_player_state_path
+    other = mc.PlaybestController()  # stands in for the bridge process's loop
+    other.start(
+        entries_provider=store.list,
+        state_path=state_path,
+        is_playable=lambda p: True,
+    )
+    import time as _t
+    for _ in range(200):
+        if proc_table["spawned"]:
+            break
+        _t.sleep(0.01)
+    assert proc_table["spawned"]
+    n = len(proc_table["spawned"])
+    # Simulate the other process's /music stop: clear the shared session token
+    # and kill the current track. We never call other.stop() (can't, cross-proc).
+    mc._clear_session(state_path)
+    proc_table["alive"].clear()
+    _t.sleep(0.1)
+    assert len(proc_table["spawned"]) == n, "loop must not auto-advance after session cleared"
+    assert not other.is_active()
+    other.stop()
+
+
+def test_stop_clears_shared_session(settings, music_dir, proc_table, monkeypatch):
+    monkeypatch.setattr(mc, "_PLAYBEST_POLL_SECONDS", 0.01)
+    _write_favorites(settings, music_dir)
+    handler = mc.build_music_handler(settings)
+    handler("playbest", "chat-1")
+    state_path = settings.openclaw_music_player_state_path
+    import time as _t
+    for _ in range(200):
+        if mc._read_session_token(state_path) is not None:
+            break
+        _t.sleep(0.01)
+    assert mc._read_session_token(state_path) is not None  # session claimed
+    handler("stop", "chat-1")
+    assert mc._read_session_token(state_path) is None  # /music stop cleared it
+
+
 def test_playbest_empty_favorites_message(settings, proc_table):
     reply = mc.build_music_handler(settings)("playbest", "chat-1")
     assert "最愛清單是空的" in reply

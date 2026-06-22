@@ -45,6 +45,7 @@ import subprocess
 import threading
 import time
 import unicodedata
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -319,6 +320,40 @@ def _clear_state(state_path: str) -> None:
         logger.warning("music: could not clear player state %s", state_path)
 
 
+# --- continuous-mode session (cross-process) -------------------------------
+# Continuous playback (playbest / random) runs as an in-memory loop in WHICHEVER
+# process started it — but the Telegram poller and the LAN command-bridge are
+# SEPARATE processes, each with their own _PLAYBEST. So a /music stop issued in
+# one process cannot reach the other's loop, and the music "resumes" right after
+# a stop (the other loop auto-advances). The fix: persist a tiny session token
+# next to the player state. start() claims it; every loop checks it each tick and
+# halts the instant the token is gone or replaced; /music stop and single-play
+# delete it, signalling EVERY process's loop to stop.
+def _session_path(state_path: str) -> str:
+    return str(Path(state_path).with_name("music_playbest_session.json"))
+
+
+def _write_session(state_path: str, token: str) -> None:
+    _write_json(_session_path(state_path), {"token": token})
+
+
+def _read_session_token(state_path: str) -> str | None:
+    data = _read_json(_session_path(state_path))
+    if not isinstance(data, dict):
+        return None
+    token = data.get("token")
+    return token if isinstance(token, str) else None
+
+
+def _clear_session(state_path: str) -> None:
+    try:
+        Path(_session_path(state_path)).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.warning("music: could not clear playbest session for %s", state_path)
+
+
 def _terminate_running(state_path: str) -> None:
     """Stop and clear the currently recorded OpenClaw track, if any."""
     running = _current_running(state_path)
@@ -351,7 +386,12 @@ def _start_song(entry: dict, state_path: str) -> int:
 
 def _stop(state_path: str) -> str:
     # /music stop ends both the current song AND any continuous mode (random or
-    # playbest, which share the controller), and it must not auto-restart after.
+    # playbest), and it must not auto-restart after. Clearing the shared session
+    # token FIRST halts the continuous loop in EVERY process (incl. the LAN
+    # command-bridge), not just this one — otherwise that loop auto-advances to
+    # the next song the moment we kill the current track.
+    had_session = _read_session_token(state_path) is not None
+    _clear_session(state_path)
     was_continuous = _PLAYBEST.stop()
     running = _current_running(state_path)
     if running is not None:
@@ -362,14 +402,16 @@ def _stop(state_path: str) -> str:
             return f"停止播放失敗：{exc}"
         _clear_state(state_path)
         return "已停止目前由龍蝦播放的音樂。"
-    if was_continuous:
+    if was_continuous or had_session:
         return "已停止連續播放。"
     return "目前沒有由龍蝦播放中的音樂。"
 
 
 def _play(entry: dict, state_path: str) -> str:
     # A user-initiated single play cancels playbest so the loop never fights it
-    # for the player (and never leaves two OpenClaw songs playing at once).
+    # for the player (and never leaves two OpenClaw songs playing at once). Clear
+    # the shared session too, so a continuous loop in another process also stops.
+    _clear_session(state_path)
     _PLAYBEST.stop()
     try:
         _start_song(entry, state_path)
@@ -427,11 +469,16 @@ class PlaybestController:
 
     def start(self, entries_provider, state_path: str, on_play=None, is_playable=None) -> None:
         self.stop()
+        # Claim the shared session: this token is what the loop checks each tick.
+        # A later start() (even in another process) overwrites it, and a stop()
+        # deletes it — either way every running loop sees the change and halts.
+        token = uuid.uuid4().hex
+        _write_session(state_path, token)
         with self._lock:
             self._active = True
             thread = threading.Thread(
                 target=self._loop,
-                args=(entries_provider, state_path, on_play, is_playable),
+                args=(entries_provider, state_path, on_play, is_playable, token),
                 daemon=True,
                 name="music-playbest",
             )
@@ -455,9 +502,16 @@ class PlaybestController:
             thread.join(timeout=2.0)
         return was_active
 
-    def _loop(self, entries_provider, state_path: str, on_play, is_playable=None) -> None:
+    def _loop(self, entries_provider, state_path: str, on_play, is_playable=None, token=None) -> None:
         scheduler = PlaybestScheduler(entries_provider, exists_fn=is_playable)
-        while self.is_active():
+
+        def _live() -> bool:
+            # Run only while locally active AND we still own the shared session.
+            # A stop() (any process) deletes the token; a newer start() replaces
+            # it — both make this False so the loop halts and stops auto-advancing.
+            return self.is_active() and (token is None or _read_session_token(state_path) == token)
+
+        while _live():
             entry = scheduler.next()
             if entry is None:  # favorites empty / all missing → stop cleanly
                 break
@@ -467,24 +521,31 @@ class PlaybestController:
             if is_playable is not None and not is_playable(entry.get("path", "")):
                 logger.warning("playbest: skipping unplayable favorite path=%s", entry.get("path"))
                 continue
+            # Spawn + record the pid while holding the lock so a concurrent
+            # stop() can never slip between "song ended → auto-advance spawns
+            # next" and "pid recorded": stop() blocks on the same lock, then
+            # sees the just-recorded pid and kills it. Without this, an
+            # auto-advanced track started in that gap escapes /music stop and
+            # the music "resumes" right after a stop.
             try:
-                pid = _start_song(entry, state_path)
+                with self._lock:
+                    if not self._active:  # stopped before we could spawn
+                        break
+                    pid = _start_song(entry, state_path)
+                    self._current_pid = pid
             except Exception:  # noqa: BLE001
                 logger.exception("playbest: spawn failed path=%s", entry.get("path"))
                 continue
-            with self._lock:
-                self._current_pid = pid
-            if not self.is_active():  # stopped during spawn → don't leave it playing
-                _terminate(pid)
-                break
             if on_play is not None:
                 try:
                     on_play(entry)
                 except Exception:  # noqa: BLE001
                     logger.exception("playbest: on_play failed")
-            while self.is_active() and _pid_alive(pid):
+            while _live() and _pid_alive(pid):
                 time.sleep(_PLAYBEST_POLL_SECONDS)
-            if not self.is_active():
+            if not _live():  # stopped (here or cross-process) → leave nothing playing
+                _terminate(pid)
+                _clear_state(state_path)
                 break
         with self._lock:
             self._active = False
@@ -699,5 +760,6 @@ def _menu_markup() -> dict:
                 {"text": "🔉 音量降低", "callback_data": "music:lower"},
                 {"text": "🔊 音量提高", "callback_data": "music:louder"},
             ],
+            [{"text": "🔈 切換音源", "callback_data": "music:dev"}],
         ]
     }
