@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BroadLink 區網排錯指南</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f7f2e8;
+      --ink: #241f18;
+      --muted: #6b6258;
+      --card: #fffaf0;
+      --line: #d9ccb8;
+      --accent: #b64b25;
+      --code: #1f2933;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #171411;
+        --ink: #f3eadc;
+        --muted: #c3b7a5;
+        --card: #241f1a;
+        --line: #4a3f34;
+        --accent: #f08a55;
+        --code: #0f1720;
+      }
+    }
+    body {
+      margin: 0;
+      background: radial-gradient(circle at top left, rgba(182, 75, 37, 0.16), transparent 30rem), var(--bg);
+      color: var(--ink);
+      font-family: "Hiragino Sans", "Noto Sans TC", "PingFang TC", sans-serif;
+      line-height: 1.75;
+    }
+    main {
+      max-width: 920px;
+      margin: 0 auto;
+      padding: 48px 22px 80px;
+    }
+    h1, h2 {
+      line-height: 1.25;
+    }
+    h1 {
+      font-size: clamp(2rem, 6vw, 4rem);
+      margin: 0 0 12px;
+      letter-spacing: -0.04em;
+    }
+    h2 {
+      margin-top: 42px;
+      border-top: 1px solid var(--line);
+      padding-top: 28px;
+      color: var(--accent);
+    }
+    p, li {
+      font-size: 1.03rem;
+    }
+    .lead {
+      color: var(--muted);
+      font-size: 1.14rem;
+      margin-bottom: 28px;
+    }
+    .card {
+      background: color-mix(in srgb, var(--card) 88%, transparent);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 20px 22px;
+      margin: 18px 0;
+      box-shadow: 0 12px 36px rgba(0, 0, 0, 0.08);
+    }
+    code, pre {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    code {
+      background: rgba(127, 127, 127, 0.14);
+      border-radius: 6px;
+      padding: 0.1em 0.35em;
+    }
+    pre {
+      overflow-x: auto;
+      background: var(--code);
+      color: #f5f7fa;
+      border-radius: 14px;
+      padding: 16px;
+      line-height: 1.55;
+    }
+    .ok {
+      border-left: 5px solid #238636;
+    }
+    .bad {
+      border-left: 5px solid #b64b25;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
+    }
+    .stamp {
+      display: inline-block;
+      margin: 8px 0 4px;
+      color: var(--muted);
+      font-size: 0.92rem;
+      letter-spacing: 0.02em;
+    }
+  </style>
+</head>
+<body>
+<main>
+  <h1>BroadLink 區網排錯指南</h1>
+  <p class="lead">這份公開文件只保留可泛化的排錯知識：當同一台電腦上「互動操作可連線、背景服務不可連線」時，應從區網路由、macOS 本機網路權限、啟動上下文與 UDP 行為差異開始判斷。文件刻意不記錄個人路徑、內網位址、服務埠號、API payload、裝置暱稱或實際啟動命令。</p>
+
+  <section class="card bad">
+    <span class="stamp">公開版重點</span>
+    <h2>要解決的問題類型</h2>
+    <p>BroadLink 類設備通常使用 UDP discovery 與後續裝置通訊。排錯時最容易誤判的是：discovery 能看到裝置，不代表後續 unicast auth/send 一定穩定；互動 shell 能成功，也不代表背景服務、daemon、排程器或遠端控制入口會繼承同一組網路權限與路由狀態。</p>
+  </section>
+
+  <h2>安全描述症狀</h2>
+  <div class="grid">
+    <div class="card bad">
+      <strong>互動程序成功，背景程序失敗。</strong>
+      <p>同一個控制流程在使用者主動啟動時可用，但在長駐服務或排程啟動時失敗。</p>
+    </div>
+    <div class="card bad">
+      <strong>可 discovery，不可 auth/send。</strong>
+      <p>能收到區網廣播回應，但連到裝置 IP 的後續單播流程失敗。</p>
+    </div>
+    <div class="card bad">
+      <strong>錯誤像網路不可達。</strong>
+      <p>常見表徵包含 route 不可達、host 不可達、timeout 或 UDP auth 失敗。公開文件只需記錄錯誤類型，不應貼真實 IP、payload 或完整 log。</p>
+    </div>
+  </div>
+
+  <h2>需要理解的基礎知識</h2>
+  <ul>
+    <li><strong>Broadcast 與 unicast 不同。</strong> discovery 可能靠廣播或掃描找到裝置；真正控制時通常要對裝置 IP 做單播通訊。前者成功不保證後者成功。</li>
+    <li><strong>同網段很重要。</strong> 控制端與設備通常應在同一個 LAN/VLAN，且路由應走實體 LAN/Wi-Fi 介面，而不是 VPN、隧道或錯誤的虛擬介面。</li>
+    <li><strong>ARP / neighbor cache 會影響第一包。</strong> 區網裝置剛醒、路由變動或網路介面切換後，控制端可能需要重新建立 neighbor 狀態。</li>
+    <li><strong>macOS 本機網路權限會分上下文。</strong> 互動 App、終端機、背景 daemon、排程器、遠端 shell 或服務管理器可能不共享同一組 Local Network 權限與網路行為。</li>
+    <li><strong>防火牆、VPN 與安全軟體會改變路由。</strong> 問題不一定是開或關，而是某個程序的流量是否被送到錯誤介面或被過濾。</li>
+  </ul>
+
+  <h2>進階判讀</h2>
+  <div class="grid">
+    <div class="card ok">
+      <strong>設備本身是否正常</strong>
+      <p>先用同一台控制端做最小化測試：只驗證 discovery、auth 與一個無害操作。若最小化測試穩定成功，先不要重學 IR code 或重設設備。</p>
+    </div>
+    <div class="card ok">
+      <strong>路由是否一致</strong>
+      <p>比較互動程序與背景程序看到的預設路由、目標路由、DNS、代理與 VPN 狀態。差異通常比 timeout 設定更重要。</p>
+    </div>
+    <div class="card ok">
+      <strong>啟動上下文是否一致</strong>
+      <p>確認長駐服務是否由預期的使用者 session 啟動，並確認它不是繼承了舊 shell、舊終端 App、舊服務管理器或舊網路權限狀態。</p>
+    </div>
+    <div class="card ok">
+      <strong>長駐程序是否污染狀態</strong>
+      <p>長駐程序可能保留過期 socket、環境變數或路由假設。必要時用短生命 worker 做裝置操作，讓每次操作重新取得乾淨網路狀態。</p>
+    </div>
+  </div>
+
+  <h2>建議排錯順序</h2>
+  <ol>
+    <li>確認控制端與設備在同一個 LAN/VLAN，且目標路由走實體 LAN/Wi-Fi 介面。</li>
+    <li>確認互動程序可以完成 discovery、auth 與無害測試操作。</li>
+    <li>用同一組設定從背景服務重跑同樣測試，只記錄成功/失敗類型，不公開完整命令與 payload。</li>
+    <li>比較互動程序與背景服務的使用者 session、Local Network 權限、VPN/防火牆狀態、環境變數與工作目錄。</li>
+    <li>若只有長駐服務失敗，改用短生命 worker 或重建服務啟動上下文，避免沿用舊 session 狀態。</li>
+    <li>確認修正後，記錄抽象化結果：哪一類啟動上下文成功、哪一類失敗，以及對應的網路判讀。</li>
+  </ol>
+
+  <h2>安全的檢查項目</h2>
+  <ul>
+    <li>目標 IP 是否屬於預期私有網段；公開文件請使用 <code>&lt;device-ip&gt;</code> 佔位。</li>
+    <li>到 <code>&lt;device-ip&gt;</code> 的 route 是否走 LAN/Wi-Fi，而不是 VPN 或 tunnel 介面。</li>
+    <li>ARP / neighbor table 是否能看到設備，且 MAC 廠商或設備類型合理。</li>
+    <li>背景服務是否擁有 macOS Local Network 權限，或是否由有權限的使用者 session 啟動。</li>
+    <li>防火牆、安全軟體、VPN、代理是否只影響某一個程序上下文。</li>
+    <li>長駐程序是否需要重建，而不是只重載程式碼或增加 timeout。</li>
+  </ul>
+
+  <h2>不建議公開的內容</h2>
+  <ul>
+    <li>家用或公司內網 IP、MAC 位址、設備序號、裝置暱稱、房間名稱。</li>
+    <li>使用者名稱、本機絕對路徑、repo 路徑、虛擬環境路徑。</li>
+    <li>對外或本機服務 port、API endpoint、完整 JSON payload、可直接複製的控制命令。</li>
+    <li>完整 process list、session/socket 名稱、排程器 label、daemon label。</li>
+    <li>可直接觸發實體設備動作的命令或遙控碼名稱。</li>
+  </ul>
+
+  <h2>公開文件寫法</h2>
+  <div class="card ok">
+    <p>適合公開：問題類型、網路層概念、判讀順序、需要比較的上下文、已知風險類別。</p>
+    <p>不適合公開：能定位個人環境或能直接操作設備的細節。若團隊內部需要完整 runbook，應放在私有文件或本機筆記，並用佔位符、遮罩與最小權限原則整理。</p>
+  </div>
+</main>
+</body>
+</html>
