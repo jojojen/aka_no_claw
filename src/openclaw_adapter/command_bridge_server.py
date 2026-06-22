@@ -84,6 +84,8 @@ def _build_handler(bridge: CommandBridge, *, lan_enabled: bool) -> type[BaseHTTP
                 self._handle_music()
             elif path == "/api/command/session":
                 self._handle_session_save()
+            elif path == "/api/command/restartall":
+                self._write_json(bridge.restart_all())
             else:
                 self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 

@@ -76,6 +76,7 @@ from .source_command import build_source_handler
 from .music_command import build_music_handler, build_musicnowbest_handler
 from .music_browser import build_musiclistall_handler, build_music_callback_handler
 from .music_volume import mute_music, louder_music, lower_music
+from .service_restart import build_restart_all_handler
 from .music_favorites import (
     FavoritesStore,
     MUSIC_BEST_LIST_KIND,
@@ -1152,6 +1153,7 @@ def _build_registries(
             ack="收到，正在從備份還原龍蝦的資料庫…",
             background=True,
         ),
+        "/restartall": RegisteredCommand(build_restart_all_handler(settings)),
         "/stats": RegisteredCommand(lambda r, c: scorecard_handler(r)),
         "/scorecard": RegisteredCommand(lambda r, c: scorecard_handler(r)),
         "/knowledge": RegisteredCommand(
