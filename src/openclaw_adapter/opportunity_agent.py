@@ -20,6 +20,7 @@ from typing import Any, Sequence
 from assistant_runtime import AssistantSettings, build_ssl_context, get_settings
 from market_monitor.mercari_search import DEFAULT_CONDITION_IDS, search_mercari
 from market_monitor.storage import MarketplaceWatch, MonitorDatabase
+from market_monitor.log_utils import log_network_failure
 from price_monitor_bot.bot import TelegramBotClient
 from price_monitor_bot.commands import lookup_card
 from tcg_tracker.catalog import normalize_game_key, supported_game_hint
@@ -215,8 +216,8 @@ class WebResearchCandidateProvider:
         for candidate in candidates:
             try:
                 enriched.append(self._researcher.enrich(candidate))
-            except Exception:
-                logger.exception("Opportunity web research enrichment failed candidate_id=%s", candidate.candidate_id)
+            except Exception as exc:
+                log_network_failure(logger, exc, "Opportunity web research enrichment failed candidate_id=%s", candidate.candidate_id)
                 enriched.append(candidate)
         return tuple(enriched)
 
@@ -359,8 +360,8 @@ class ScheduledWebSearchCandidateProvider:
     def _discover_one(self, query: str, *, limit: int) -> tuple[OpportunityCandidate, ...]:
         try:
             results = self._search_fn(query, max_results=self._results_per_query)
-        except Exception:
-            logger.exception("ScheduledWebSearchCandidateProvider search failed query=%s", query)
+        except Exception as exc:
+            log_network_failure(logger, exc, "ScheduledWebSearchCandidateProvider search failed query=%s", query)
             return ()
         if not results:
             return ()
@@ -532,8 +533,8 @@ class WebOpportunityResearcher:
         for query in queries:
             try:
                 per_query.append(list(self._search_fn(query, limit)))
-            except Exception:
-                logger.exception("Opportunity search failed query=%s", query)
+            except Exception as exc:
+                log_network_failure(logger, exc, "Opportunity search failed query=%s", query)
                 per_query.append([])
         merged: list[WebSearchResult] = []
         seen: set[str] = set()
@@ -831,8 +832,8 @@ class MercariOpportunityListingFinder:
                 results = list(search_mercari(
                     q, price_max=price_max_jpy, max_results=limit, condition_ids=DEFAULT_CONDITION_IDS,
                 ))
-            except Exception:
-                logger.exception("Mercari search failed query=%r", q)
+            except Exception as exc:
+                log_network_failure(logger, exc, "Mercari search failed query=%r", q)
                 return []
             # Harvest the raw listing titles (the broadest, pre-filter set) into
             # the historical title corpus for PR2 IDF. This is a free byproduct of

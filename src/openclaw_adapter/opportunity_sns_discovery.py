@@ -19,6 +19,7 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from market_monitor.log_utils import log_network_failure
 from sns_monitor.models import (
     RECOMMENDED_DOMAINS,
     TCG_DOMAINS,
@@ -115,8 +116,8 @@ def discover_tcg_sns_accounts(
     for query in queries:
         try:
             results = search_fn(query, max_results=results_per_query)
-        except Exception:
-            logger.exception("SnsAccountAutoDiscovery search failed query=%s", query)
+        except Exception as exc:
+            log_network_failure(logger, exc, "SnsAccountAutoDiscovery search failed query=%s", query)
             continue
         for result in results:
             for handle in _HANDLE_RE.findall(result.url or ""):

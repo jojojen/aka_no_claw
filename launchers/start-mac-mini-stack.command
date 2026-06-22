@@ -50,6 +50,22 @@ CHAT_WEB_PORT="${CHAT_WEB_PORT:-8780}"
 
 mkdir -p "${RUN_DIR}" "${LOG_DIR}"
 
+# Per-service stdout/stderr is piped through scripts/log_rotator.py so each
+# redirected service log is size-capped + rotated. Without this the launchctl
+# `-o/-e` and nohup `>>` redirects grow without bound — issue #42, where the
+# opportunity-agent DEBUG console stream reached 1.3G in six weeks.
+ROTATOR_PY="${AKA_DIR}/scripts/log_rotator.py"
+ROTATE_BYTES="${ROTATE_BYTES:-52428800}"   # 50 MiB per file
+ROTATE_KEEP="${ROTATE_KEEP:-5}"            # keep 5 rotated backups
+
+# Echo a shell-safe pipe target that sinks stdin into a rotating ${1} log file.
+# Values are embedded inline because `launchctl submit` does not inherit this
+# shell's environment.
+rotator_cmd() {
+  printf 'ROTATE_BYTES=%q ROTATE_KEEP=%q %q %q %q' \
+    "${ROTATE_BYTES}" "${ROTATE_KEEP}" "${AKA_VENV}/bin/python" "${ROTATOR_PY}" "$1"
+}
+
 log() {
   printf '[mac-mini-stack] %s\n' "$*"
 }
@@ -666,14 +682,12 @@ start_ollama_if_available() {
       launchctl remove "${LAUNCHCTL_OLLAMA_LABEL}" >/dev/null 2>&1 || true
     fi
     launchctl submit -l "${LAUNCHCTL_OLLAMA_LABEL}" \
-      -o "${LOG_DIR}/ollama.log" \
-      -e "${LOG_DIR}/ollama.log" \
-      -- /bin/bash -lc 'exec ollama serve'
+      -- /bin/bash -lc "ollama serve 2>&1 | $(rotator_cmd "${LOG_DIR}/ollama.log")"
     local pid
     pid="$(launchctl_job_pid "${LAUNCHCTL_OLLAMA_LABEL}")"
     [[ -n "${pid}" ]] && echo "${pid}" >> "${PID_FILE}"
   else
-    nohup ollama serve >> "${LOG_DIR}/ollama.log" 2>&1 &
+    nohup bash -c "ollama serve 2>&1 | $(rotator_cmd "${LOG_DIR}/ollama.log")" >/dev/null 2>&1 &
     echo $! >> "${PID_FILE}"
   fi
   for _ in $(seq 1 20); do
@@ -713,15 +727,12 @@ start_aivis_engine() {
       launchctl remove "${LAUNCHCTL_AIVIS_LABEL}" >/dev/null 2>&1 || true
     fi
     launchctl submit -l "${LAUNCHCTL_AIVIS_LABEL}" \
-      -o "${LOG_DIR}/aivis_speech.log" \
-      -e "${LOG_DIR}/aivis_speech.log" \
-      -- "${AIVIS_ENGINE_RUN}" --host "${AIVIS_HOST}" --port "${AIVIS_PORT}" --output_log_utf8
+      -- /bin/bash -lc "'${AIVIS_ENGINE_RUN}' --host '${AIVIS_HOST}' --port '${AIVIS_PORT}' --output_log_utf8 2>&1 | $(rotator_cmd "${LOG_DIR}/aivis_speech.log")"
     local pid
     pid="$(launchctl_job_pid "${LAUNCHCTL_AIVIS_LABEL}")"
     [[ -n "${pid}" ]] && echo "${pid}" >> "${PID_FILE}"
   else
-    nohup "${AIVIS_ENGINE_RUN}" --host "${AIVIS_HOST}" --port "${AIVIS_PORT}" --output_log_utf8 \
-      >> "${LOG_DIR}/aivis_speech.log" 2>&1 &
+    nohup bash -c "'${AIVIS_ENGINE_RUN}' --host '${AIVIS_HOST}' --port '${AIVIS_PORT}' --output_log_utf8 2>&1 | $(rotator_cmd "${LOG_DIR}/aivis_speech.log")" >/dev/null 2>&1 &
     echo $! >> "${PID_FILE}"
   fi
 
@@ -1074,9 +1085,7 @@ start_reputation_server() {
       append_runtime_export "PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH" "${chromium_path}"
     fi
     launchctl submit -l "${LAUNCHCTL_REPUTATION_LABEL}" \
-      -o "${LOG_DIR}/reputation_snapshot.log" \
-      -e "${LOG_DIR}/reputation_snapshot.log" \
-      -- /bin/bash -lc "source '${RUNTIME_ENV_FILE}'; cd '${REPUTATION_DIR}'; exec '${REPUTATION_VENV}/bin/python' app.py"
+      -- /bin/bash -lc "source '${RUNTIME_ENV_FILE}'; cd '${REPUTATION_DIR}'; '${REPUTATION_VENV}/bin/python' app.py 2>&1 | $(rotator_cmd "${LOG_DIR}/reputation_snapshot.log")"
     local pid
     pid="$(launchctl_job_pid "${LAUNCHCTL_REPUTATION_LABEL}")"
     [[ -n "${pid}" ]] && echo "${pid}" >> "${PID_FILE}"
@@ -1091,7 +1100,7 @@ start_reputation_server() {
     if [[ -n "${chromium_path}" ]]; then
       export PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH="${chromium_path}"
     fi
-    nohup "${REPUTATION_VENV}/bin/python" app.py >> "${LOG_DIR}/reputation_snapshot.log" 2>&1 &
+    nohup bash -c "'${REPUTATION_VENV}/bin/python' app.py 2>&1 | $(rotator_cmd "${LOG_DIR}/reputation_snapshot.log")" >/dev/null 2>&1 &
     echo $! >> "${PID_FILE}"
   )
 }
@@ -1142,7 +1151,7 @@ start_openclaw_telegram() {
     if [[ -n "${chromium_path}" ]]; then
       export PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH="${chromium_path}"
     fi
-    nohup "${AKA_VENV}/bin/python" -m openclaw_adapter "${args[@]}" </dev/null >> "${LOG_DIR}/openclaw_telegram.log" 2>&1 &
+    nohup bash -c "'${AKA_VENV}/bin/python' -m openclaw_adapter ${args[*]} </dev/null 2>&1 | $(rotator_cmd "${LOG_DIR}/openclaw_telegram.log")" >/dev/null 2>&1 &
     echo $! >> "${PID_FILE}"
   )
 }
@@ -1158,9 +1167,7 @@ start_sns_monitor_service() {
   log "Starting OpenClaw SNS monitor service..."
   if use_launchctl_services; then
     launchctl submit -l "${LAUNCHCTL_SNS_MONITOR_LABEL}" \
-      -o "${LOG_DIR}/openclaw_sns_monitor.log" \
-      -e "${LOG_DIR}/openclaw_sns_monitor.log" \
-      -- /bin/bash -lc "source '${RUNTIME_ENV_FILE}'; cd '${AKA_DIR}'; export PYTHONPATH='.:src'; exec '${AKA_VENV}/bin/python' -m openclaw_adapter sns-monitor-service"
+      -- /bin/bash -lc "source '${RUNTIME_ENV_FILE}'; cd '${AKA_DIR}'; export PYTHONPATH='.:src'; '${AKA_VENV}/bin/python' -m openclaw_adapter sns-monitor-service 2>&1 | $(rotator_cmd "${LOG_DIR}/openclaw_sns_monitor.log")"
     local pid
     pid="$(launchctl_job_pid "${LAUNCHCTL_SNS_MONITOR_LABEL}")"
     [[ -n "${pid}" ]] && echo "${pid}" >> "${PID_FILE}"
@@ -1169,7 +1176,7 @@ start_sns_monitor_service() {
 
   (
     cd "${AKA_DIR}"
-    nohup "${AKA_VENV}/bin/python" -m openclaw_adapter sns-monitor-service >> "${LOG_DIR}/openclaw_sns_monitor.log" 2>&1 &
+    nohup bash -c "'${AKA_VENV}/bin/python' -m openclaw_adapter sns-monitor-service 2>&1 | $(rotator_cmd "${LOG_DIR}/openclaw_sns_monitor.log")" >/dev/null 2>&1 &
     echo $! >> "${PID_FILE}"
   )
 }
@@ -1178,9 +1185,7 @@ start_price_monitor_service() {
   log "Starting OpenClaw price monitor service..."
   if use_launchctl_services; then
     launchctl submit -l "${LAUNCHCTL_PRICE_MONITOR_LABEL}" \
-      -o "${LOG_DIR}/openclaw_price_monitor.log" \
-      -e "${LOG_DIR}/openclaw_price_monitor.log" \
-      -- /bin/bash -lc "source '${RUNTIME_ENV_FILE}'; cd '${AKA_DIR}'; export PYTHONPATH='.:src'; exec '${AKA_VENV}/bin/python' -m openclaw_adapter price-monitor-service"
+      -- /bin/bash -lc "source '${RUNTIME_ENV_FILE}'; cd '${AKA_DIR}'; export PYTHONPATH='.:src'; '${AKA_VENV}/bin/python' -m openclaw_adapter price-monitor-service 2>&1 | $(rotator_cmd "${LOG_DIR}/openclaw_price_monitor.log")"
     local pid
     pid="$(launchctl_job_pid "${LAUNCHCTL_PRICE_MONITOR_LABEL}")"
     [[ -n "${pid}" ]] && echo "${pid}" >> "${PID_FILE}"
@@ -1189,7 +1194,7 @@ start_price_monitor_service() {
 
   (
     cd "${AKA_DIR}"
-    nohup "${AKA_VENV}/bin/python" -m openclaw_adapter price-monitor-service >> "${LOG_DIR}/openclaw_price_monitor.log" 2>&1 &
+    nohup bash -c "'${AKA_VENV}/bin/python' -m openclaw_adapter price-monitor-service 2>&1 | $(rotator_cmd "${LOG_DIR}/openclaw_price_monitor.log")" >/dev/null 2>&1 &
     echo $! >> "${PID_FILE}"
   )
 }
@@ -1198,9 +1203,7 @@ start_chat_web_service() {
   log "Starting OpenClaw local web chat (http://${CHAT_WEB_HOST}:${CHAT_WEB_PORT}/chat)..."
   if use_launchctl_services; then
     launchctl submit -l "${LAUNCHCTL_CHAT_WEB_LABEL}" \
-      -o "${LOG_DIR}/openclaw_chat_web.log" \
-      -e "${LOG_DIR}/openclaw_chat_web.log" \
-      -- /bin/bash -lc "source '${RUNTIME_ENV_FILE}'; cd '${AKA_DIR}'; export PYTHONPATH='.:src'; exec '${AKA_VENV}/bin/python' -m openclaw_adapter chat-web --host '${CHAT_WEB_HOST}' --port '${CHAT_WEB_PORT}'"
+      -- /bin/bash -lc "source '${RUNTIME_ENV_FILE}'; cd '${AKA_DIR}'; export PYTHONPATH='.:src'; '${AKA_VENV}/bin/python' -m openclaw_adapter chat-web --host '${CHAT_WEB_HOST}' --port '${CHAT_WEB_PORT}' 2>&1 | $(rotator_cmd "${LOG_DIR}/openclaw_chat_web.log")"
     local pid
     pid="$(launchctl_job_pid "${LAUNCHCTL_CHAT_WEB_LABEL}")"
     [[ -n "${pid}" ]] && echo "${pid}" >> "${PID_FILE}"
@@ -1209,7 +1212,7 @@ start_chat_web_service() {
 
   (
     cd "${AKA_DIR}"
-    nohup "${AKA_VENV}/bin/python" -m openclaw_adapter chat-web --host "${CHAT_WEB_HOST}" --port "${CHAT_WEB_PORT}" >> "${LOG_DIR}/openclaw_chat_web.log" 2>&1 &
+    nohup bash -c "'${AKA_VENV}/bin/python' -m openclaw_adapter chat-web --host '${CHAT_WEB_HOST}' --port '${CHAT_WEB_PORT}' 2>&1 | $(rotator_cmd "${LOG_DIR}/openclaw_chat_web.log")" >/dev/null 2>&1 &
     echo $! >> "${PID_FILE}"
   )
 }
@@ -1223,9 +1226,7 @@ start_opportunity_agent() {
   log "Starting OpenClaw opportunity agent..."
   if use_launchctl_services; then
     launchctl submit -l "${LAUNCHCTL_OPPORTUNITY_LABEL}" \
-      -o "${LOG_DIR}/opportunity_agent.log" \
-      -e "${LOG_DIR}/opportunity_agent.log" \
-      -- /bin/bash -lc "source '${RUNTIME_ENV_FILE}'; cd '${AKA_DIR}'; export PYTHONPATH='.:src'; exec '${AKA_VENV}/bin/python' -m openclaw_adapter opportunity-agent"
+      -- /bin/bash -lc "source '${RUNTIME_ENV_FILE}'; cd '${AKA_DIR}'; export PYTHONPATH='.:src'; '${AKA_VENV}/bin/python' -m openclaw_adapter opportunity-agent 2>&1 | $(rotator_cmd "${LOG_DIR}/opportunity_agent.log")"
     local pid
     pid="$(launchctl_job_pid "${LAUNCHCTL_OPPORTUNITY_LABEL}")"
     [[ -n "${pid}" ]] && echo "${pid}" >> "${PID_FILE}"
@@ -1234,7 +1235,7 @@ start_opportunity_agent() {
 
   (
     cd "${AKA_DIR}"
-    nohup "${AKA_VENV}/bin/python" -m openclaw_adapter opportunity-agent >> "${LOG_DIR}/opportunity_agent.log" 2>&1 &
+    nohup bash -c "'${AKA_VENV}/bin/python' -m openclaw_adapter opportunity-agent 2>&1 | $(rotator_cmd "${LOG_DIR}/opportunity_agent.log")" >/dev/null 2>&1 &
     echo $! >> "${PID_FILE}"
   )
 }
