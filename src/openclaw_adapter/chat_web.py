@@ -92,8 +92,9 @@ _CHAT_PAGE_HTML = """<!doctype html>
   .bot { color: #1d1d1f; }
   .err { color: #cc0000; }
   form { display: flex; gap: 0.5rem; }
-  input { flex: 1; padding: 0.5rem; border: 1px solid #d2d2d7; border-radius: 6px; }
-  button { padding: 0.5rem 1rem; border: 0; border-radius: 6px;
+  input { flex: 1; padding: 0.5rem; border: 1px solid #d2d2d7; border-radius: 6px;
+          font-size: 16px; }
+  button { padding: 0.5rem 1rem; border: 0; border-radius: 6px; font-size: 16px;
            background: #0066cc; color: #fff; cursor: pointer; }
   button:disabled { background: #999; cursor: default; }
   .hint { color: #6e6e73; font-size: 0.85rem; }
