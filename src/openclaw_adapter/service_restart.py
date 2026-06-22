@@ -80,6 +80,8 @@ echo "[$(date '+%Y-%m-%d %H:%M:%S')] restartall requested source=$SOURCE pid=$$"
 # Let the caller send its response before this script stops the caller process.
 sleep 2
 
+snapshot "before"
+
 # launchd KeepAlive services are restarted with `kickstart -k` (kill + relaunch
 # under supervision = exactly ONE instance). We must NOT kill+nohup these: a
 # manual nohup copy runs ALONGSIDE the instance launchd respawns, yielding two
@@ -168,6 +170,59 @@ start_service() {{
   )
 }}
 
+# Kill ORPHAN copies of a launchd-managed worker (aka_no_claw#40). `kickstart -k`
+# only ever touches launchd's own instance; a duplicate started by hand / left
+# over from an earlier kill+nohup keeps running the same command line and burns
+# ~100% CPU alongside the supervised one. We find launchd's current PID for the
+# label and kill every OTHER process matching the command pattern. If launchd's
+# PID can't be read we skip (never risk killing the live supervised instance).
+reap_orphans() {{
+  local label="$1"
+  local pattern="$2"
+  local keep pids killed
+  keep="$(launchctl list 2>/dev/null | awk -v l="local.openclaw.$label" '$3==l && $1 ~ /^[0-9]+$/ {{print $1}}')"
+  pids="$(pgrep -f "$pattern" 2>/dev/null | tr '\\n' ' ' || true)"
+  if [ -z "$pids" ]; then
+    echo "[$(date '+%H:%M:%S')] reap $label: none"
+    return 0
+  fi
+  if [ -z "$keep" ]; then
+    echo "[$(date '+%H:%M:%S')] reap $label: launchd PID unknown — skipping (pids=$pids)"
+    return 0
+  fi
+  killed=""
+  for pid in $pids; do
+    [ "$pid" = "$$" ] && continue
+    [ "$pid" = "$keep" ] && continue
+    killed="$killed $pid"
+    kill "$pid" 2>/dev/null || true
+  done
+  if [ -z "$killed" ]; then
+    echo "[$(date '+%H:%M:%S')] reap $label: only launchd PID $keep — clean"
+    return 0
+  fi
+  echo "[$(date '+%H:%M:%S')] reap $label: launchd keeps $keep; killed orphans$killed"
+  sleep 1
+  for pid in $killed; do
+    kill -9 "$pid" 2>/dev/null || true
+  done
+}}
+
+count_service() {{
+  local label="$1"
+  local pattern="$2"
+  local n
+  n="$(pgrep -f "$pattern" 2>/dev/null | wc -l | tr -d ' ')"
+  echo "[$(date '+%H:%M:%S')] final count $label: $n"
+}}
+
+snapshot() {{
+  echo "[$(date '+%H:%M:%S')] $1 snapshot:"
+  ps -Ao pid,%cpu,command 2>/dev/null \\
+    | grep -E "openclaw_adapter (price-monitor-service|opportunity-agent|sns-monitor-service|telegram-poll|chat-web|command-bridge)" \\
+    | grep -v grep | sed 's/^/    /' || true
+}}
+
 # Non-launchd processes (and the nohup chat-web "squatter" that holds :8780 and
 # blocks launchd's own chat_web from binding) — stop these by command pattern.
 # The launchd-managed services are intentionally absent here: `kickstart -k`
@@ -199,6 +254,17 @@ kickstart_service "opportunity"
 kickstart_service "telegram"
 kickstart_service "chat_web"
 
+# Give launchd a moment to relaunch + register the new PIDs, then kill any
+# ORPHAN duplicates of the managed workers (aka_no_claw#40): kickstart only
+# replaces launchd's own instance, so a hand-started copy keeps running and
+# pegs the CPU. reap_orphans keeps just the launchd PID per service.
+sleep 2
+reap_orphans "price_monitor" "openclaw_adapter price-monitor-service"
+reap_orphans "sns_monitor" "openclaw_adapter sns-monitor-service"
+reap_orphans "opportunity" "openclaw_adapter opportunity-agent"
+reap_orphans "telegram" "openclaw_adapter telegram-poll"
+reap_orphans "chat_web" "openclaw_adapter chat-web"
+
 # Reclaim the bridge port before relaunch: the pattern stop above can miss the
 # running bridge, and a still-bound :8781 makes the fresh bridge die on
 # EADDRINUSE (so the web 生活 mode keeps serving the OLD code).
@@ -210,6 +276,13 @@ start_service "command bridge" "$CLAW" "$LOG_DIR/command_bridge.log" "$CLAW/.ven
 start_service "web frontend" "$WEB" "$LOG_DIR/openclaw_web_vite.log" npm run dev -- --host 0.0.0.0
 
 sleep 2
+snapshot "after"
+count_service "price_monitor" "openclaw_adapter price-monitor-service"
+count_service "sns_monitor" "openclaw_adapter sns-monitor-service"
+count_service "opportunity" "openclaw_adapter opportunity-agent"
+count_service "telegram" "openclaw_adapter telegram-poll"
+count_service "chat_web" "openclaw_adapter chat-web"
+count_service "command bridge" "openclaw_adapter command-bridge --lan --port 8781"
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] restartall finished"
 """
 

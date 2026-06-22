@@ -66,6 +66,39 @@ def test_bridge_port_reclaimed_before_relaunch() -> None:
     )
 
 
+def test_orphan_launchd_workers_are_reaped() -> None:
+    # aka_no_claw#40: kickstart -k only replaces launchd's OWN instance, so a
+    # hand-started duplicate of a managed worker (e.g. price-monitor-service,
+    # opportunity-agent) survives and pegs the CPU. The restart must reap orphans
+    # — keeping only launchd's PID per service — for every managed worker.
+    script = _build_restart_script(
+        workspace_dir=Path("/tmp/workspace"),
+        claw_dir=Path("/tmp/workspace/aka_no_claw"),
+        source="test",
+    )
+
+    reaped = {
+        "price_monitor": "openclaw_adapter price-monitor-service",
+        "sns_monitor": "openclaw_adapter sns-monitor-service",
+        "opportunity": "openclaw_adapter opportunity-agent",
+        "telegram": "openclaw_adapter telegram-poll",
+        "chat_web": "openclaw_adapter chat-web",
+    }
+    for label, pattern in reaped.items():
+        assert f'reap_orphans "{label}" "{pattern}"' in script
+
+    # reap_orphans keeps launchd's PID and kills the rest; it must run AFTER the
+    # kickstart that (re)establishes that PID.
+    assert "launchctl list" in script
+    assert script.index('kickstart_service "price_monitor"') < script.index(
+        'reap_orphans "price_monitor"'
+    )
+    # Before/after snapshots + per-service final counts land in the restart log.
+    assert 'snapshot "before"' in script
+    assert 'snapshot "after"' in script
+    assert 'count_service "opportunity"' in script
+
+
 def test_restart_all_handler_schedules_detached_restart(monkeypatch) -> None:
     calls: list[str] = []
 
