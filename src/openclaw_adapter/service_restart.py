@@ -164,7 +164,7 @@ start_service() {{
   echo "[$(date '+%H:%M:%S')] start $label"
   (
     cd "$cwd" || exit 1
-    nohup "$@" >> "$logfile" 2>&1 &
+    nohup "$@" </dev/null >> "$logfile" 2>&1 &
   )
 }}
 

@@ -1142,7 +1142,7 @@ start_openclaw_telegram() {
     if [[ -n "${chromium_path}" ]]; then
       export PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH="${chromium_path}"
     fi
-    nohup "${AKA_VENV}/bin/python" -m openclaw_adapter "${args[@]}" >> "${LOG_DIR}/openclaw_telegram.log" 2>&1 &
+    nohup "${AKA_VENV}/bin/python" -m openclaw_adapter "${args[@]}" </dev/null >> "${LOG_DIR}/openclaw_telegram.log" 2>&1 &
     echo $! >> "${PID_FILE}"
   )
 }
