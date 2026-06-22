@@ -537,6 +537,22 @@ def test_music_action_unknown_prefix_is_error(bridge):
     assert res["status"] == STATUS_ERROR
 
 
+def test_ir_command_normalizes_full_slash_command(monkeypatch):
+    b = CommandBridge(settings=object())
+    seen: dict[str, str] = {}
+
+    def _run(command, remainder):
+        seen["command"] = command
+        seen["remainder"] = remainder
+        return ("IR sent", {"inline_keyboard": []})
+
+    monkeypatch.setattr(b, "_run_command_raw", _run)
+    res = b.run_ir_command("/ir send ceiling_light power")
+    assert seen == {"command": "/ir", "remainder": "send ceiling_light power"}
+    assert res["status"] == STATUS_OK
+    assert res["message"] == "IR sent"
+
+
 def test_server_music_route_dispatches_callback(monkeypatch):
     """POST /api/command/music with callback_data → run_music_action; with
     input → run_music_command; empty body → music menu."""
@@ -583,6 +599,48 @@ def test_server_music_route_dispatches_callback(monkeypatch):
     seen.clear()
     out = _invoke(b"{}")
     assert seen["command"] == ""
+
+
+def test_server_ir_route_dispatches_command_and_callback(monkeypatch):
+    from http.server import BaseHTTPRequestHandler
+
+    from openclaw_adapter import command_bridge_server as srv
+
+    seen: dict[str, object] = {}
+
+    class _FakeBridge:
+        def run_ir_action(self, cb):
+            seen["action"] = cb
+            return {"status": STATUS_OK, "message": "act", "actions": []}
+
+        def run_ir_command(self, text):
+            seen["command"] = text
+            return {"status": STATUS_OK, "message": "cmd", "actions": []}
+
+    def _invoke(body: bytes) -> dict:
+        handler_cls = srv._build_handler(_FakeBridge(), lan_enabled=False)
+        h = handler_cls.__new__(handler_cls)
+        h.headers = {"Content-Length": str(len(body))}
+        h.rfile = io.BytesIO(body)
+        h.wfile = io.BytesIO()
+        h.request_version = "HTTP/1.1"
+        h.protocol_version = "HTTP/1.0"
+        h.requestline = "POST /api/command/ir HTTP/1.1"
+        h.responses = BaseHTTPRequestHandler.responses
+        h.client_address = ("127.0.0.1", 1)
+        h._handle_ir()
+        raw = h.wfile.getvalue().split(b"\r\n\r\n", 1)[1]
+        import json as _json
+        return _json.loads(raw.decode("utf-8"))
+
+    out = _invoke(b'{"callback_data":"ir:send:ceiling_light:power"}')
+    assert seen["action"] == "ir:send:ceiling_light:power"
+    assert out["message"] == "act"
+
+    seen.clear()
+    out = _invoke(b'{"input":"/ir send ceiling_light power"}')
+    assert seen["command"] == "/ir send ceiling_light power"
+    assert out["message"] == "cmd"
 
 
 # --- client allowlist -----------------------------------------------------
