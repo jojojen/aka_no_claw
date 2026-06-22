@@ -93,6 +93,21 @@ def test_discover_retries_transient_auth_no_route(tmp_path, monkeypatch):
     assert "192.0.2.38" in msg
 
 
+def test_route_warmup_uses_available_ping_candidate(tmp_path, monkeypatch):
+    fake_ping = tmp_path / "ping"
+    fake_ping.write_text("", encoding="utf-8")
+    calls = []
+
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(ir, "_PING_CANDIDATES", (str(fake_ping), "ping"))
+    monkeypatch.setattr(ir.subprocess, "run", run)
+    ir._warm_host_route(FakeRm())
+    assert calls == [[str(fake_ping), "-c", "1", "-W", "1000", "192.0.2.38"]]
+
+
 def test_learn_code_persists_base64_payload(tmp_path, monkeypatch):
     fake = FakeRm(payload=b"learned")
     monkeypatch.setattr(ir, "discover_rm", lambda settings: (fake, "fake rm"))
