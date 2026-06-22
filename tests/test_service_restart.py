@@ -40,7 +40,7 @@ def test_launchd_services_use_kickstart_not_nohup_except_telegram() -> None:
         source="test",
     )
 
-    for label in ("price_monitor", "sns_monitor", "opportunity", "chat_web"):
+    for label in ("price_monitor", "sns_monitor", "opportunity"):
         assert f'kickstart_service "{label}"' in script
 
     # Telegram needs local-network access for BroadLink RM4 Mini. On macOS,
@@ -56,10 +56,7 @@ def test_launchd_services_use_kickstart_not_nohup_except_telegram() -> None:
     assert "-m openclaw_adapter price-monitor-service" not in script
     assert "-m openclaw_adapter sns-monitor-service" not in script
     assert "-m openclaw_adapter opportunity-agent" not in script
-    assert "-m openclaw_adapter chat-web" not in script
 
-    # The nohup chat-web "squatter" on :8780 is still stopped so launchd can bind.
-    assert 'stop_pattern "chat web (nohup squatter)"' in script
     # kickstart uses launchctl in the user gui domain.
     assert "launchctl kickstart -k" in script
 
@@ -98,7 +95,6 @@ def test_bridge_port_reclaimed_before_relaunch() -> None:
     )
 
     assert 'free_port "command bridge" 8781' in script
-    assert 'free_port "chat web" 8780' in script
     assert "lsof -nP -iTCP:" in script
     # The bridge port must be reclaimed BEFORE the bridge is (re)started.
     assert script.index('free_port "command bridge" 8781') < script.index(
@@ -121,7 +117,6 @@ def test_orphan_launchd_workers_are_reaped() -> None:
         "price_monitor": "openclaw_adapter price-monitor-service",
         "sns_monitor": "openclaw_adapter sns-monitor-service",
         "opportunity": "openclaw_adapter opportunity-agent",
-        "chat_web": "openclaw_adapter chat-web",
     }
     for label, pattern in reaped.items():
         assert f'reap_orphans "{label}" "{pattern}"' in script
