@@ -73,14 +73,14 @@ REPUTATION={_sh(reputation_dir)}
 SOURCE={_sh(source)}
 LOG_DIR="$CLAW/logs"
 UID_NUM="$(id -u)"
+TMUX_SOCKET="openclaw_codex"
+TMUX_BIN="$(command -v tmux || true)"
 
 mkdir -p "$LOG_DIR"
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] restartall requested source=$SOURCE pid=$$"
 
 # Let the caller send its response before this script stops the caller process.
 sleep 2
-
-snapshot "before"
 
     # Most launchd KeepAlive services are restarted with `kickstart -k` (kill +
     # relaunch under supervision = exactly ONE instance). Telegram is intentionally
@@ -168,6 +168,24 @@ start_service() {{
   )
 }}
 
+start_tmux_service() {{
+  local session="$1"
+  local label="$2"
+  local cwd="$3"
+  shift 3
+  if [ ! -d "$cwd" ]; then
+    echo "[$(date '+%H:%M:%S')] tmux start $label skipped: missing $cwd"
+    return 0
+  fi
+  if [ -z "$TMUX_BIN" ]; then
+    echo "[$(date '+%H:%M:%S')] tmux start $label failed: tmux not found"
+    return 1
+  fi
+  echo "[$(date '+%H:%M:%S')] tmux start $label socket=$TMUX_SOCKET session=$session"
+  "$TMUX_BIN" -L "$TMUX_SOCKET" new-session -d -s "$session" \\
+    "cd '$cwd' && $*"
+}}
+
 # Kill ORPHAN copies of a launchd-managed worker (aka_no_claw#40). `kickstart -k`
 # only ever touches launchd's own instance; a duplicate started by hand / left
 # over from an earlier kill+nohup keeps running the same command line and burns
@@ -221,6 +239,10 @@ snapshot() {{
     | grep -v grep | sed 's/^/    /' || true
 }}
 
+# Capture the pre-restart process table now that snapshot() is defined (it must
+# be called AFTER its definition, or bash errors "snapshot: command not found").
+snapshot "before"
+
 # Non-launchd processes (and the nohup chat-web "squatter" that holds :8780 and
 # blocks launchd's own chat_web from binding) — stop these by command pattern.
 # The launchd-managed services are intentionally absent here: `kickstart -k`
@@ -269,10 +291,19 @@ reap_orphans "chat_web" "openclaw_adapter chat-web"
 # EADDRINUSE (so the web 生活 mode keeps serving the OLD code).
 free_port "command bridge" 8781
 
+# BroadLink RM4 Mini UDP auth is sensitive to the macOS app/launch context.
+# The verified-good path is a fresh, Codex-launched tmux server on a dedicated
+# socket. Kill any stale dedicated server before recreating bridge/telegram so
+# /restartall never falls back to the old Terminal/default-tmux identity.
+if [ -n "$TMUX_BIN" ]; then
+  echo "[$(date '+%H:%M:%S')] reset dedicated tmux socket=$TMUX_SOCKET"
+  "$TMUX_BIN" -L "$TMUX_SOCKET" kill-server 2>/dev/null || true
+fi
+
 # Genuinely non-launchd services: (re)start detached with nohup.
 start_service "reputation_snapshot" "$REPUTATION" "$LOG_DIR/reputation_snapshot.log" "$REPUTATION/.venv/bin/python" app.py
-start_service "telegram" "$CLAW" "$LOG_DIR/openclaw_telegram.log" /bin/bash -lc "source '$CLAW/run/mac-mini-stack.env' 2>/dev/null || true; export PYTHONPATH='.:src'; exec '$CLAW/.venv/bin/python' -m openclaw_adapter telegram-poll --with-reputation-agent --no-dashboard"
-start_service "command bridge" "$CLAW" "$LOG_DIR/command_bridge.log" "$CLAW/.venv/bin/python" -m openclaw_adapter command-bridge --lan --port 8781
+start_tmux_service "telegram" "telegram" "$CLAW" "source '$CLAW/run/mac-mini-stack.env' 2>/dev/null || true; export PYTHONPATH='.:src'; exec '$CLAW/.venv/bin/python' -m openclaw_adapter telegram-poll --with-reputation-agent --no-dashboard"
+start_tmux_service "bridge" "command bridge" "$CLAW" "exec '$CLAW/.venv/bin/python' -m openclaw_adapter command-bridge --lan --port 8781"
 start_service "web frontend" "$WEB" "$LOG_DIR/openclaw_web_vite.log" npm run dev -- --host 0.0.0.0
 
 sleep 2
@@ -280,9 +311,9 @@ snapshot "after"
 count_service "price_monitor" "openclaw_adapter price-monitor-service"
 count_service "sns_monitor" "openclaw_adapter sns-monitor-service"
 count_service "opportunity" "openclaw_adapter opportunity-agent"
-count_service "telegram" "openclaw_adapter telegram-poll"
+count_service "telegram" "python.*openclaw_adapter telegram-poll"
 count_service "chat_web" "openclaw_adapter chat-web"
-count_service "command bridge" "openclaw_adapter command-bridge --lan --port 8781"
+count_service "command bridge" "python.*openclaw_adapter command-bridge --lan --port 8781"
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] restartall finished"
 """
 

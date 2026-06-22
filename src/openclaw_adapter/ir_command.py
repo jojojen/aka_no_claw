@@ -18,8 +18,10 @@ import hashlib
 import ipaddress
 import json
 import logging
+import os
 import socket
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,6 +40,8 @@ _PING_CANDIDATES = ("/sbin/ping", "/bin/ping", "ping")
 _ROUTE_WARMUP_PING_ARGS = ("-o", "-c", "3", "-W", "3000")
 _ROUTE_WARMUP_TIMEOUT_SECONDS = 10
 _RM_CLASS_NAMES = {"rm", "rm4", "rm4mini"}
+_WORKER_ENV = "OPENCLAW_IR_INLINE"
+_WORKER_TIMEOUT_SECONDS = 45
 
 
 @dataclass(frozen=True)
@@ -254,7 +258,61 @@ def _connectivity_help(exc: Exception) -> str:
     return "請確認 BroadLink App 內沒有啟用 Lock device / 本地控制鎖定。"
 
 
+def _use_worker(settings: AssistantSettings) -> bool:
+    # Unit tests pass SimpleNamespace settings and should keep exercising the
+    # inline logic. Real app settings use a short-lived worker so BroadLink UDP
+    # sockets do not get stuck inside long-running Telegram/HTTP processes.
+    return (
+        os.getenv(_WORKER_ENV) != "1"
+        and settings.__class__.__name__ == "AssistantSettings"
+    )
+
+
+def _run_worker(action: str, *args: str) -> str:
+    env = dict(os.environ)
+    env[_WORKER_ENV] = "1"
+    cmd = [sys.executable, "-m", "openclaw_adapter.ir_worker", action, *args]
+    started = time.monotonic()
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=_WORKER_TIMEOUT_SECONDS,
+            check=False,
+            env=env,
+            cwd=str(Path(__file__).resolve().parents[2]),
+            close_fds=True,
+            start_new_session=True,
+        )
+    except subprocess.TimeoutExpired:
+        return "IR worker 逾時，請稍後重試。"
+    except OSError as exc:
+        logger.exception("ir: worker launch failed")
+        return f"IR worker 啟動失敗：{exc}"
+    output = (result.stdout or "").strip()
+    logger.debug(
+        "ir: worker finished action=%s rc=%s elapsed=%.3fs stdout=%r stderr=%r",
+        action,
+        result.returncode,
+        time.monotonic() - started,
+        output[-500:],
+        (result.stderr or "").strip()[-500:],
+    )
+    if result.returncode == 0:
+        return output
+    detail = output or (result.stderr or "").strip()
+    return detail or f"IR worker 失敗：exit={result.returncode}"
+
+
 def discover_message(settings: AssistantSettings) -> str:
+    if _use_worker(settings):
+        return _run_worker("discover")
+    return _discover_message_inline(settings)
+
+
+def _discover_message_inline(settings: AssistantSettings) -> str:
     device, info = discover_rm(settings)
     if device is None:
         return info
@@ -266,6 +324,12 @@ def _valid_name(value: str) -> bool:
 
 
 def learn_code(settings: AssistantSettings, device_name: str, button_name: str) -> str:
+    if _use_worker(settings):
+        return _run_worker("learn", device_name, button_name)
+    return _learn_code_inline(settings, device_name, button_name)
+
+
+def _learn_code_inline(settings: AssistantSettings, device_name: str, button_name: str) -> str:
     if not _valid_name(device_name) or not _valid_name(button_name):
         return "名稱格式無效。請用：/ir learn ceiling_light night"
     rm_device, info = discover_rm(settings)
@@ -298,6 +362,12 @@ def learn_code(settings: AssistantSettings, device_name: str, button_name: str) 
 
 
 def send_code(settings: AssistantSettings, device_name: str, button_name: str) -> str:
+    if _use_worker(settings):
+        return _run_worker("send", device_name, button_name)
+    return _send_code_inline(settings, device_name, button_name)
+
+
+def _send_code_inline(settings: AssistantSettings, device_name: str, button_name: str) -> str:
     payload_b64 = IrStore(settings.openclaw_ir_devices_path).get(device_name, button_name)
     if not payload_b64:
         return f"找不到 IR：{device_name} / {button_name}。先用 /ir learn 學習。"

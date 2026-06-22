@@ -35,11 +35,11 @@ def test_launchd_services_use_kickstart_not_nohup_except_telegram() -> None:
 
     # Telegram needs local-network access for BroadLink RM4 Mini. On macOS,
     # launchctl-submitted daemon jobs fail ARP/route warm-up even when the same
-    # command works from a user shell, so Telegram is intentionally nohup-started.
+    # command works from a user shell, so Telegram is intentionally not launchd.
     assert 'kickstart_service "telegram"' not in script
     assert 'launchctl remove "local.openclaw.telegram"' in script
     assert 'stop_pattern "telegram" "openclaw_adapter telegram-poll"' in script
-    assert 'start_service "telegram"' in script
+    assert 'start_tmux_service "telegram"' in script
     assert "-m openclaw_adapter telegram-poll" in script
 
     # These must NOT be nohup-started (that was the duplicate source).
@@ -52,6 +52,29 @@ def test_launchd_services_use_kickstart_not_nohup_except_telegram() -> None:
     assert 'stop_pattern "chat web (nohup squatter)"' in script
     # kickstart uses launchctl in the user gui domain.
     assert "launchctl kickstart -k" in script
+
+
+def test_broadlink_sensitive_services_start_in_dedicated_tmux_socket() -> None:
+    # BroadLink RM4 Mini UDP auth failed from the old Terminal/default-tmux
+    # identity but worked from a fresh Codex-launched tmux server. /restartall
+    # must recreate bridge + telegram on that dedicated socket every time.
+    script = _build_restart_script(
+        workspace_dir=Path("/tmp/workspace"),
+        claw_dir=Path("/tmp/workspace/aka_no_claw"),
+        source="test",
+    )
+
+    assert 'TMUX_SOCKET="openclaw_codex"' in script
+    assert "TMUX_BIN=\"$(command -v tmux || true)\"" in script
+    assert 'tmux start $label socket=$TMUX_SOCKET' in script
+    assert '"$TMUX_BIN" -L "$TMUX_SOCKET" kill-server' in script
+    assert 'start_tmux_service "telegram" "telegram"' in script
+    assert 'start_tmux_service "bridge" "command bridge"' in script
+    assert 'start_service "telegram"' not in script
+    assert 'start_service "command bridge"' not in script
+    assert script.index('free_port "command bridge" 8781') < script.index(
+        'start_tmux_service "bridge"'
+    )
 
 
 def test_bridge_port_reclaimed_before_relaunch() -> None:
@@ -69,7 +92,7 @@ def test_bridge_port_reclaimed_before_relaunch() -> None:
     assert "lsof -nP -iTCP:" in script
     # The bridge port must be reclaimed BEFORE the bridge is (re)started.
     assert script.index('free_port "command bridge" 8781') < script.index(
-        'start_service "command bridge"'
+        'start_tmux_service "bridge"'
     )
 
 
@@ -103,6 +126,11 @@ def test_orphan_launchd_workers_are_reaped() -> None:
     assert 'snapshot "before"' in script
     assert 'snapshot "after"' in script
     assert 'count_service "opportunity"' in script
+
+    # bash needs snapshot() defined BEFORE it is called, or the "before" snapshot
+    # dies with "snapshot: command not found" and never reaches the log.
+    assert script.index("snapshot() {") < script.index('snapshot "before"')
+    assert script.index('snapshot "before"') < script.index('snapshot "after"')
 
 
 def test_restart_all_handler_schedules_detached_restart(monkeypatch) -> None:

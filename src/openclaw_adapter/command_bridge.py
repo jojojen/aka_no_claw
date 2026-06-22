@@ -559,6 +559,43 @@ class CommandBridge:
             "actions": self._markup_to_actions(markup),
         }
 
+    # --- 生活 mode: IR / home-appliance control surface --------------------
+    def run_ir_command(self, text: str) -> dict:
+        """Run the Telegram ``/ir`` handler from the web 生活 mode. The web UI may
+        send either the full slash command (``/ir send ...``) or just the
+        remainder (``send ...``); the bridge normalizes both forms."""
+        remainder = (text or "").strip()
+        if remainder.startswith("/ir"):
+            remainder = remainder[3:].strip()
+        message, markup = self._run_command_raw("/ir", remainder)
+        return {
+            "status": STATUS_OK,
+            "message": message,
+            "actions": self._markup_to_actions(markup),
+        }
+
+    def run_ir_action(self, callback_data: str) -> dict:
+        """Re-invoke an ``ir:`` callback button for the web 生活 mode."""
+        prefix, _, payload = (callback_data or "").partition(":")
+        if prefix != "ir":
+            return {"status": STATUS_ERROR, "message": f"未知的 IR 動作：{callback_data}", "actions": []}
+        handler = self._callbacks().get("ir")
+        if handler is None:
+            return {"status": STATUS_ERROR, "message": "IR 功能尚未啟用。", "actions": []}
+        try:
+            result = handler(payload, "", _BRIDGE_CHAT_ID)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("ir action failed cb=%s", callback_data)
+            return {"status": STATUS_ERROR, "message": f"動作執行失敗：{exc}", "actions": []}
+        toast, new_text, markup = (list(result) + [None, None, None])[:3] \
+            if isinstance(result, tuple) else (result, None, None)
+        message = new_text if new_text else toast
+        return {
+            "status": STATUS_OK,
+            "message": str(message) if message is not None else "",
+            "actions": self._markup_to_actions(markup),
+        }
+
     def _run_list_action(self, prefix: str, payload: str) -> dict:
         """Generic paginated-list callbacks (favorites use list kind ``mb``):
         ``pg`` repaginate/toggle mode, ``del`` remove a row then re-render in
