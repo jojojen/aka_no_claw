@@ -1124,44 +1124,16 @@ start_openclaw_telegram() {
   log "Starting OpenClaw Telegram bot without dashboards..."
   local admin_token
   local chromium_path
-  local notify_arg=""
   admin_token="$(get_env_value "${AKA_DIR}/.env" "REPUTATION_AGENT_ADMIN_TOKEN")"
   chromium_path="$(find_system_chromium || true)"
   local args=(telegram-poll --with-reputation-agent --no-dashboard)
   if [[ "${START_NOTIFY}" == "1" ]]; then
     args+=(--notify-startup)
-    notify_arg=" --notify-startup"
   fi
 
-  if use_launchctl_services; then
-    (
-      cd "${AKA_DIR}"
-      export REPUTATION_AGENT_SERVER_URL="http://${HOST}:${PORT}"
-      export REPUTATION_AGENT_ADMIN_TOKEN="${admin_token}"
-      prepare_openclaw_runtime_env
-      if [[ -n "${chromium_path}" ]]; then
-        export PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH="${chromium_path}"
-      fi
-      append_runtime_export "REPUTATION_AGENT_SERVER_URL" "${REPUTATION_AGENT_SERVER_URL}"
-      append_runtime_export "REPUTATION_AGENT_ADMIN_TOKEN" "${REPUTATION_AGENT_ADMIN_TOKEN}"
-      append_runtime_export "OPENCLAW_TESSERACT_PATH" "${OPENCLAW_TESSERACT_PATH:-}"
-      append_runtime_export "OPENCLAW_TESSDATA_DIR" "${OPENCLAW_TESSDATA_DIR:-}"
-      append_runtime_export "OPENCLAW_LOCAL_VISION_BACKEND" "${OPENCLAW_LOCAL_VISION_BACKEND:-}"
-      append_runtime_export "OPENCLAW_LOCAL_VISION_MODEL" "${OPENCLAW_LOCAL_VISION_MODEL:-}"
-      append_runtime_export "OPENCLAW_LOCAL_TEXT_BACKEND" "${OPENCLAW_LOCAL_TEXT_BACKEND:-}"
-      append_runtime_export "OPENCLAW_LOCAL_TEXT_MODEL" "${OPENCLAW_LOCAL_TEXT_MODEL:-}"
-      append_runtime_export "PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH" "${PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH:-}"
-    )
-    launchctl submit -l "${LAUNCHCTL_TELEGRAM_LABEL}" \
-      -o "${LOG_DIR}/openclaw_telegram.log" \
-      -e "${LOG_DIR}/openclaw_telegram.log" \
-      -- /bin/bash -lc "source '${RUNTIME_ENV_FILE}'; cd '${AKA_DIR}'; export PYTHONPATH='.:src'; exec '${AKA_VENV}/bin/python' -m openclaw_adapter telegram-poll --with-reputation-agent --no-dashboard${notify_arg}"
-    local pid
-    pid="$(launchctl_job_pid "${LAUNCHCTL_TELEGRAM_LABEL}")"
-    [[ -n "${pid}" ]] && echo "${pid}" >> "${PID_FILE}"
-    return
-  fi
-
+  # Keep Telegram as a shell-started process on macOS. `launchctl submit` runs it
+  # as a background daemon and cannot reliably access local-network devices such
+  # as BroadLink RM4 Mini, while the same process launched from the user shell can.
   (
     cd "${AKA_DIR}"
     export REPUTATION_AGENT_SERVER_URL="http://${HOST}:${PORT}"

@@ -20,7 +20,7 @@ def test_restart_script_covers_core_services() -> None:
     assert "openclaw_adapter.scrape_worker" in script
 
 
-def test_launchd_services_use_kickstart_not_nohup() -> None:
+def test_launchd_services_use_kickstart_not_nohup_except_telegram() -> None:
     # The duplicate-poller bug: kill+nohup of a launchd KeepAlive service runs a
     # copy alongside the one launchd respawns. launchd-managed services must be
     # restarted via `kickstart -k` (single instance), never nohup-started.
@@ -30,12 +30,19 @@ def test_launchd_services_use_kickstart_not_nohup() -> None:
         source="test",
     )
 
-    for label in ("telegram", "price_monitor", "sns_monitor", "opportunity", "chat_web"):
+    for label in ("price_monitor", "sns_monitor", "opportunity", "chat_web"):
         assert f'kickstart_service "{label}"' in script
 
+    # Telegram needs local-network access for BroadLink RM4 Mini. On macOS,
+    # launchctl-submitted daemon jobs fail ARP/route warm-up even when the same
+    # command works from a user shell, so Telegram is intentionally nohup-started.
+    assert 'kickstart_service "telegram"' not in script
+    assert 'launchctl remove "local.openclaw.telegram"' in script
+    assert 'stop_pattern "telegram" "openclaw_adapter telegram-poll"' in script
+    assert 'start_service "telegram"' in script
+    assert "-m openclaw_adapter telegram-poll" in script
+
     # These must NOT be nohup-started (that was the duplicate source).
-    assert "start_service \"telegram poll\"" not in script
-    assert "-m openclaw_adapter telegram-poll" not in script
     assert "-m openclaw_adapter price-monitor-service" not in script
     assert "-m openclaw_adapter sns-monitor-service" not in script
     assert "-m openclaw_adapter opportunity-agent" not in script
@@ -81,7 +88,6 @@ def test_orphan_launchd_workers_are_reaped() -> None:
         "price_monitor": "openclaw_adapter price-monitor-service",
         "sns_monitor": "openclaw_adapter sns-monitor-service",
         "opportunity": "openclaw_adapter opportunity-agent",
-        "telegram": "openclaw_adapter telegram-poll",
         "chat_web": "openclaw_adapter chat-web",
     }
     for label, pattern in reaped.items():

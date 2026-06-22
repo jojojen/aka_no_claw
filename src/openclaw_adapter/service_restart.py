@@ -82,13 +82,11 @@ sleep 2
 
 snapshot "before"
 
-# launchd KeepAlive services are restarted with `kickstart -k` (kill + relaunch
-# under supervision = exactly ONE instance). We must NOT kill+nohup these: a
-# manual nohup copy runs ALONGSIDE the instance launchd respawns, yielding two
-# pollers fighting over Telegram getUpdates (409 storm) and two in-memory music
-# loops (so /music stop only halts one). Only genuinely non-launchd processes
-# (command bridge, vite frontend, reputation_snapshot, on-demand workers) get
-# the kill+nohup treatment below.
+    # Most launchd KeepAlive services are restarted with `kickstart -k` (kill +
+    # relaunch under supervision = exactly ONE instance). Telegram is intentionally
+    # excluded: launchctl-submitted daemon jobs cannot reliably access macOS local
+    # network devices such as BroadLink RM4 Mini, so Telegram is restarted with the
+    # same shell/nohup path as the user-launched process.
 kickstart_service() {{
   local label="$1"
   echo "[$(date '+%H:%M:%S')] kickstart $label"
@@ -228,6 +226,8 @@ snapshot() {{
 # The launchd-managed services are intentionally absent here: `kickstart -k`
 # below does their kill+relaunch, so pattern-killing them would only race
 # launchd's KeepAlive respawn.
+launchctl remove "local.openclaw.telegram" 2>/dev/null || true
+stop_pattern "telegram" "openclaw_adapter telegram-poll"
 stop_pattern "vite web" "aka_no_claw_web/frontend/node_modules/.bin/vite --host 0.0.0.0"
 stop_pattern "command bridge" "openclaw_adapter command-bridge --lan --port 8781"
 stop_pattern "chat web (nohup squatter)" "openclaw_adapter chat-web --host 0.0.0.0 --port 8780"
@@ -237,6 +237,7 @@ stop_pattern "playwright drivers" "related_to_claw/.*/playwright/driver/package/
 
 sleep 3
 
+force_pattern "telegram" "openclaw_adapter telegram-poll"
 force_pattern "vite web" "aka_no_claw_web/frontend/node_modules/.bin/vite --host 0.0.0.0"
 force_pattern "command bridge" "openclaw_adapter command-bridge --lan --port 8781"
 force_pattern "chat web (nohup squatter)" "openclaw_adapter chat-web --host 0.0.0.0 --port 8780"
@@ -251,7 +252,6 @@ free_port "chat web" 8780
 kickstart_service "price_monitor"
 kickstart_service "sns_monitor"
 kickstart_service "opportunity"
-kickstart_service "telegram"
 kickstart_service "chat_web"
 
 # Give launchd a moment to relaunch + register the new PIDs, then kill any
@@ -262,7 +262,6 @@ sleep 2
 reap_orphans "price_monitor" "openclaw_adapter price-monitor-service"
 reap_orphans "sns_monitor" "openclaw_adapter sns-monitor-service"
 reap_orphans "opportunity" "openclaw_adapter opportunity-agent"
-reap_orphans "telegram" "openclaw_adapter telegram-poll"
 reap_orphans "chat_web" "openclaw_adapter chat-web"
 
 # Reclaim the bridge port before relaunch: the pattern stop above can miss the
@@ -272,6 +271,7 @@ free_port "command bridge" 8781
 
 # Genuinely non-launchd services: (re)start detached with nohup.
 start_service "reputation_snapshot" "$REPUTATION" "$LOG_DIR/reputation_snapshot.log" "$REPUTATION/.venv/bin/python" app.py
+start_service "telegram" "$CLAW" "$LOG_DIR/openclaw_telegram.log" /bin/bash -lc "source '$CLAW/run/mac-mini-stack.env' 2>/dev/null || true; export PYTHONPATH='.:src'; exec '$CLAW/.venv/bin/python' -m openclaw_adapter telegram-poll --with-reputation-agent --no-dashboard"
 start_service "command bridge" "$CLAW" "$LOG_DIR/command_bridge.log" "$CLAW/.venv/bin/python" -m openclaw_adapter command-bridge --lan --port 8781
 start_service "web frontend" "$WEB" "$LOG_DIR/openclaw_web_vite.log" npm run dev -- --host 0.0.0.0
 
