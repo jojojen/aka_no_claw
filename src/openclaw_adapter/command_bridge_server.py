@@ -82,6 +82,8 @@ def _build_handler(bridge: CommandBridge, *, lan_enabled: bool) -> type[BaseHTTP
                 self._handle_action()
             elif path == "/api/command/music":
                 self._handle_music()
+            elif path == "/api/command/bluetooth":
+                self._handle_bluetooth()
             elif path == "/api/command/session":
                 self._handle_session_save()
             elif path == "/api/command/restartall":
@@ -165,6 +167,28 @@ def _build_handler(bridge: CommandBridge, *, lan_enabled: bool) -> type[BaseHTTP
                 self._write_json(bridge.run_music_action(callback_data))
                 return
             self._write_json(bridge.run_music_command(str(data.get("input") or "")))
+
+        def _handle_bluetooth(self) -> None:
+            """生活 mode Bluetooth surface (aka_no_claw#38 / web#7). A button press
+            carries ``callback_data`` (re-scan or connect a device); an empty body
+            returns the scanned device list + connect buttons."""
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            try:
+                raw = self.rfile.read(length) if length else b""
+                data = json.loads(raw.decode("utf-8")) if raw else {}
+            except (ValueError, UnicodeDecodeError) as exc:
+                self._write_json({"status": "error", "message": f"無效的請求：{exc}"},
+                                 status=HTTPStatus.BAD_REQUEST)
+                return
+            if not isinstance(data, dict):
+                self._write_json({"status": "error", "message": "請求必須是 JSON 物件。"},
+                                 status=HTTPStatus.BAD_REQUEST)
+                return
+            callback_data = str(data.get("callback_data") or "")
+            if callback_data:
+                self._write_json(bridge.run_bluetooth_action(callback_data))
+                return
+            self._write_json(bridge.run_bluetooth_command())
 
         def _handle_session_save(self) -> None:
             """POST /api/command/session — replace the saved console snapshot.

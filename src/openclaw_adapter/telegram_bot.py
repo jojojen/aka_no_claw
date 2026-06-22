@@ -75,6 +75,10 @@ from .knowledge_command import (
 from .source_command import build_source_handler
 from .music_command import build_music_handler, build_musicnowbest_handler
 from .music_browser import build_musiclistall_handler, build_music_callback_handler
+from .bluetooth_command import (
+    build_bluetooth_handler,
+    build_bluetooth_callback_handler,
+)
 from .music_volume import mute_music, louder_music, lower_music
 from .service_restart import build_restart_all_handler
 from .music_favorites import (
@@ -1170,6 +1174,7 @@ def _build_registries(
         "/musicmute": RegisteredCommand(lambda r, c: mute_music(settings)),
         "/musiclouder": RegisteredCommand(lambda r, c: louder_music(settings)),
         "/musiclower": RegisteredCommand(lambda r, c: lower_music(settings)),
+        "/bluetooth": RegisteredCommand(build_bluetooth_handler(settings)),
         "/research": RegisteredCommand(
             research_handler,
             ack="收到，正在進行深度商品研究（會分階段回報進度）…",
@@ -1235,6 +1240,7 @@ def _build_registries(
         "rs": _build_research_callback_handler(research_cache),
         "imgtr": _build_image_translate_callback_handler(_IMAGE_TRANSLATE_ORIGINAL_CACHE),
         "music": build_music_callback_handler(settings),
+        "bt": build_bluetooth_callback_handler(settings),
     }
 
     view_handlers = {

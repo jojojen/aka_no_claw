@@ -510,6 +510,41 @@ class CommandBridge:
             return self._run_list_action(prefix, payload)
         return {"status": STATUS_ERROR, "message": f"未知的音樂動作：{callback_data}", "actions": []}
 
+    # --- 生活 mode: bluetooth control surface (aka_no_claw#38 / web#7) ------
+    def run_bluetooth_command(self) -> dict:
+        """Scan Bluetooth devices for the web 生活 mode — returns the device list
+        (text + connect buttons). Same handler the Telegram ``/bluetooth`` uses."""
+        message, markup = self._run_command_raw("/bluetooth", "")
+        return {
+            "status": STATUS_OK,
+            "message": message,
+            "actions": self._markup_to_actions(markup),
+        }
+
+    def run_bluetooth_action(self, callback_data: str) -> dict:
+        """Re-invoke a ``bt:`` callback button for the web 生活 mode (re-scan or
+        connect a selected device) — the same handler the Telegram bot dispatches,
+        so address-token resolution and MAC validation are enforced identically."""
+        prefix, _, payload = (callback_data or "").partition(":")
+        if prefix != "bt":
+            return {"status": STATUS_ERROR, "message": f"未知的藍牙動作：{callback_data}", "actions": []}
+        handler = self._callbacks().get("bt")
+        if handler is None:
+            return {"status": STATUS_ERROR, "message": "藍牙功能尚未啟用。", "actions": []}
+        try:
+            result = handler(payload, "", _BRIDGE_CHAT_ID)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("bluetooth action failed cb=%s", callback_data)
+            return {"status": STATUS_ERROR, "message": f"動作執行失敗：{exc}", "actions": []}
+        toast, new_text, markup = (list(result) + [None, None, None])[:3] \
+            if isinstance(result, tuple) else (result, None, None)
+        message = new_text if new_text else toast
+        return {
+            "status": STATUS_OK,
+            "message": str(message) if message is not None else "",
+            "actions": self._markup_to_actions(markup),
+        }
+
     def _run_list_action(self, prefix: str, payload: str) -> dict:
         """Generic paginated-list callbacks (favorites use list kind ``mb``):
         ``pg`` repaginate/toggle mode, ``del`` remove a row then re-render in
