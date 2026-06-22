@@ -79,6 +79,7 @@ from .bluetooth_command import (
     build_bluetooth_handler,
     build_bluetooth_callback_handler,
 )
+from .ir_command import build_ir_callback_handler, build_ir_handler
 from .music_volume import mute_music, louder_music, lower_music
 from .service_restart import build_restart_all_handler
 from .home_schedule import (
@@ -1231,6 +1232,7 @@ def _build_registries(
         "/musiclouder": RegisteredCommand(lambda r, c: louder_music(settings)),
         "/musiclower": RegisteredCommand(lambda r, c: lower_music(settings)),
         "/bluetooth": RegisteredCommand(build_bluetooth_handler(settings)),
+        "/ir": RegisteredCommand(build_ir_handler(settings)),
         "/research": RegisteredCommand(
             research_handler,
             ack="收到，正在進行深度商品研究（會分階段回報進度）…",
@@ -1306,6 +1308,7 @@ def _build_registries(
         "imgtr": _build_image_translate_callback_handler(_IMAGE_TRANSLATE_ORIGINAL_CACHE),
         "music": build_music_callback_handler(settings),
         "bt": build_bluetooth_callback_handler(settings),
+        "ir": build_ir_callback_handler(settings),
         "sh": build_schedulehome_callback_handler(_home_schedule_store, _run_slash_command),
     }
 

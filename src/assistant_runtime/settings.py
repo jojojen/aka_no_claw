@@ -145,6 +145,13 @@ class AssistantSettings:
     # Opaque token→MAC-address cache for /bluetooth device buttons, so MAC
     # addresses never ride in user-facing callback_data. Gitignored runtime data.
     openclaw_bluetooth_token_cache_path: str = ".openclaw_tmp/bluetooth_tokens.json"
+    # ── local BroadLink IR control -------------------------------------------
+    # Learned IR payloads + callback token cache for /ir. Gitignored runtime
+    # data, never committed. Broadcast is optional because some macOS/VPN routing
+    # setups reject 255.255.255.255; when unset we derive the Wi-Fi /24 broadcast.
+    openclaw_ir_devices_path: str = ".openclaw_tmp/ir_devices.json"
+    openclaw_ir_token_cache_path: str = ".openclaw_tmp/ir_tokens.json"
+    openclaw_broadlink_discover_broadcast: str | None = None
     # ── web console session memory (issue #32) ─────────────────────────────
     # Server-side short-term memory for aka_no_claw_web: the latest console
     # snapshot (conversation + selected mode/backend) so a phone that reloads or
@@ -414,6 +421,15 @@ def get_settings() -> AssistantSettings:
         ),
         openclaw_bluetooth_token_cache_path=_resolve_runtime_path(
             os.getenv("OPENCLAW_BLUETOOTH_TOKEN_CACHE_PATH", ".openclaw_tmp/bluetooth_tokens.json")
+        ),
+        openclaw_ir_devices_path=_resolve_runtime_path(
+            os.getenv("OPENCLAW_IR_DEVICES_PATH", ".openclaw_tmp/ir_devices.json")
+        ),
+        openclaw_ir_token_cache_path=_resolve_runtime_path(
+            os.getenv("OPENCLAW_IR_TOKEN_CACHE_PATH", ".openclaw_tmp/ir_tokens.json")
+        ),
+        openclaw_broadlink_discover_broadcast=_none_if_empty(
+            os.getenv("OPENCLAW_BROADLINK_DISCOVER_BROADCAST")
         ),
         openclaw_web_memory_dir=_resolve_runtime_path(
             os.getenv("OPENCLAW_WEB_MEMORY_DIR", ".openclaw_tmp/web_console_memory")
