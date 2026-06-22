@@ -510,6 +510,20 @@ class CommandBridge:
             return self._run_list_action(prefix, payload)
         return {"status": STATUS_ERROR, "message": f"未知的音樂動作：{callback_data}", "actions": []}
 
+    def now_playing(self) -> dict:
+        """Name of the song OpenClaw is currently playing (``null`` when idle),
+        so the web 生活 mode can show a small now-playing strip and hide it when
+        nothing is playing. Reads the live-verified player state via the same
+        music module the handlers use."""
+        from . import music_command
+
+        try:
+            name = music_command.now_playing(self.settings)
+        except Exception:  # noqa: BLE001
+            logger.exception("now_playing lookup failed")
+            name = None
+        return {"status": STATUS_OK, "name": name}
+
     # --- 生活 mode: bluetooth control surface (aka_no_claw#38 / web#7) ------
     def run_bluetooth_command(self) -> dict:
         """Scan Bluetooth devices for the web 生活 mode — returns the device list

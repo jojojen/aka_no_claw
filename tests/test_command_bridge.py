@@ -464,6 +464,22 @@ def test_music_command_runs_music_handler(bridge, monkeypatch):
     assert res["actions"][0]["callback_data"] == "music:mute"
 
 
+def test_now_playing_returns_song_name(bridge, monkeypatch):
+    from openclaw_adapter import music_command
+    monkeypatch.setattr(music_command, "now_playing", lambda settings: "蒼のワルツ")
+    res = bridge.now_playing()
+    assert res["status"] == STATUS_OK
+    assert res["name"] == "蒼のワルツ"
+
+
+def test_now_playing_null_when_idle(bridge, monkeypatch):
+    from openclaw_adapter import music_command
+    monkeypatch.setattr(music_command, "now_playing", lambda settings: None)
+    res = bridge.now_playing()
+    assert res["status"] == STATUS_OK
+    assert res["name"] is None
+
+
 def test_music_action_volume_routes_to_music_callback(bridge, monkeypatch):
     def _music_cb(payload, original_text, chat_id):
         assert payload == "louder"

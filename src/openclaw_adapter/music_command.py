@@ -350,9 +350,9 @@ def _start_song(entry: dict, state_path: str) -> int:
 
 
 def _stop(state_path: str) -> str:
-    # /music stop ends both the current song AND the playbest continuous mode,
-    # and playbest must not auto-restart afterward.
-    was_playbest = _PLAYBEST.stop()
+    # /music stop ends both the current song AND any continuous mode (random or
+    # playbest, which share the controller), and it must not auto-restart after.
+    was_continuous = _PLAYBEST.stop()
     running = _current_running(state_path)
     if running is not None:
         try:
@@ -362,8 +362,8 @@ def _stop(state_path: str) -> str:
             return f"停止播放失敗：{exc}"
         _clear_state(state_path)
         return "已停止目前由龍蝦播放的音樂。"
-    if was_playbest:
-        return "已停止連續播放最愛。"
+    if was_continuous:
+        return "已停止連續播放。"
     return "目前沒有由龍蝦播放中的音樂。"
 
 
@@ -493,6 +493,33 @@ class PlaybestController:
 _PLAYBEST = PlaybestController()
 
 
+def _play_random_continuous(music_dir: str, index_path: str, state_path: str) -> str:
+    """Continuous shuffled playback over the WHOLE library — the same controller
+    that drives playbest, just sourcing every indexed song instead of favorites.
+    Auto-advances to the next random track when the current one ends; /music stop
+    halts it. The provider re-reads the index each round (cache hit when nothing
+    changed) so songs added mid-session are picked up."""
+    def provider() -> list[dict]:
+        try:
+            return load_or_build_index(music_dir, index_path).entries
+        except Exception:  # noqa: BLE001
+            logger.exception("music: random index build failed dir=%s", music_dir)
+            return []
+
+    if not provider():
+        return f"音樂資料夾找不到可播放的音檔（.flac）：{music_dir}"
+
+    def is_playable(path: str) -> bool:
+        return validate_song_path(path, music_dir)
+
+    _PLAYBEST.start(
+        entries_provider=provider,
+        state_path=state_path,
+        is_playable=is_playable,
+    )
+    return "開始隨機播放（自動接續下一首）。用 ⏹ 停止 可停止。"
+
+
 def _play_best(store: FavoritesStore, state_path: str, music_dir: str) -> str:
     favorites = store.list()
     if not favorites:
@@ -519,19 +546,17 @@ def _play_best(store: FavoritesStore, state_path: str, music_dir: str) -> str:
 
 # --- shared play entry points (used by handler + Telegram callbacks) -------
 def play_random(settings: AssistantSettings) -> str:
-    """Play one random indexed song. Returns a user-facing message."""
+    """Start continuous shuffled playback over the whole library (auto-advances
+    to the next random song, like playbest). Returns a user-facing message."""
     music_dir = settings.openclaw_music_dir
     err = _music_dir_problem(music_dir)
     if err:
         return err
-    try:
-        index = load_or_build_index(music_dir, settings.openclaw_music_index_path)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("music: index build failed dir=%s", music_dir)
-        return f"音樂索引建立失敗：{exc}"
-    if not index.entries:
-        return f"音樂資料夾找不到可播放的音檔（.flac）：{music_dir}"
-    return _play(random.choice(index.entries), settings.openclaw_music_player_state_path)
+    return _play_random_continuous(
+        music_dir,
+        settings.openclaw_music_index_path,
+        settings.openclaw_music_player_state_path,
+    )
 
 
 def play_path(settings: AssistantSettings, path: str, name: str | None = None) -> str:
@@ -566,6 +591,20 @@ def add_current_to_favorites(settings: AssistantSettings, store: FavoritesStore)
     if added:
         return f"已加入最愛：\n{entry['name']}"
     return f"這首已經在最愛清單中：\n{entry['name']}"
+
+
+def now_playing(settings: AssistantSettings) -> str | None:
+    """Name of the song OpenClaw is currently playing, or None when nothing is
+    playing. Reads the persisted player state (verified live) so it reflects both
+    single plays and continuous random/playbest."""
+    running = _current_running(settings.openclaw_music_player_state_path)
+    if running is None:
+        return None
+    name = running.get("name")
+    if name:
+        return name
+    path = running.get("path")
+    return Path(path).stem if path else None
 
 
 def _music_dir_problem(music_dir: str) -> str | None:
@@ -608,7 +647,7 @@ def build_music_handler(
             return f"音樂資料夾找不到可播放的音檔（.flac）：{music_dir}"
 
         if low == "random":
-            return _play(random.choice(index.entries), state_path)
+            return _play_random_continuous(music_dir, index_path, state_path)
         result = _search(index.entries, arg)
         if result.kind in ("exact", "single"):
             return _play(result.entry, state_path)

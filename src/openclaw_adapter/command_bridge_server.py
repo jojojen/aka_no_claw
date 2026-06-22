@@ -105,6 +105,8 @@ def _build_handler(bridge: CommandBridge, *, lan_enabled: bool) -> type[BaseHTTP
                 self._write_json(bridge.poll_job(job_ids[0]))
             elif split.path == "/api/command/session":
                 self._write_json(bridge.load_session())
+            elif split.path == "/api/command/music/now":
+                self._write_json(bridge.now_playing())
             else:
                 self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
