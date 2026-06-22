@@ -141,6 +141,10 @@ class AssistantSettings:
     # Persisted {volume, muted} for /musicmute /musiclouder /musiclower (issue
     # #35). Gitignored runtime data — never committed.
     openclaw_music_volume_state_path: str = ".openclaw_tmp/music_volume.json"
+    # ── local Bluetooth control (issue #38) ────────────────────────────────
+    # Opaque token→MAC-address cache for /bluetooth device buttons, so MAC
+    # addresses never ride in user-facing callback_data. Gitignored runtime data.
+    openclaw_bluetooth_token_cache_path: str = ".openclaw_tmp/bluetooth_tokens.json"
     # ── web console session memory (issue #32) ─────────────────────────────
     # Server-side short-term memory for aka_no_claw_web: the latest console
     # snapshot (conversation + selected mode/backend) so a phone that reloads or
@@ -402,6 +406,9 @@ def get_settings() -> AssistantSettings:
         ),
         openclaw_music_volume_state_path=_resolve_runtime_path(
             os.getenv("OPENCLAW_MUSIC_VOLUME_STATE_PATH", ".openclaw_tmp/music_volume.json")
+        ),
+        openclaw_bluetooth_token_cache_path=_resolve_runtime_path(
+            os.getenv("OPENCLAW_BLUETOOTH_TOKEN_CACHE_PATH", ".openclaw_tmp/bluetooth_tokens.json")
         ),
         openclaw_web_memory_dir=_resolve_runtime_path(
             os.getenv("OPENCLAW_WEB_MEMORY_DIR", ".openclaw_tmp/web_console_memory")
