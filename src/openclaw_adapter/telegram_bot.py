@@ -1117,6 +1117,9 @@ def _build_registries(
         seller_snapshot_followup_fn=_build_research_seller_snapshot_followup(settings),
         game_code_resolver_fn=_yuyutei_resolver.resolve if _yuyutei_resolver else None,
         cache_enricher_fn=_yuyutei_resolver.enrich_cache if _yuyutei_resolver else None,
+        query_normalizer_fn=(
+            _yuyutei_resolver.normalize_raw_card_query if _yuyutei_resolver else None
+        ),
         ip_heat_lookup_fn=_build_research_ip_heat_lookup(settings),
         entity_recognizer_fn=build_ollama_entity_recognizer(
             endpoint=settings.openclaw_local_text_endpoint,

@@ -76,6 +76,8 @@ SoldMarketSearchFn = Callable[[str, int], list[dict[str, object]]]
 SoldAverageLookupFn = Callable[[str], float | None]
 ShopReferenceFn = Callable[[str, int], "ShopReference | None"]
 GameCodeResolverFn = Callable[[str], "str | None"]
+# (noisy price query) -> clean 遊々亭 raw-card search term, or None when unsure.
+QueryNormalizerFn = Callable[[str], "str | None"]
 # (query, matched_listing_titles) -> None. Records the item's real identity onto
 # the yuyutei code cache from titles already fetched — no extra request.
 CacheEnricherFn = Callable[[str, tuple[str, ...]], None]
@@ -231,6 +233,13 @@ class ShopReference:
     # box name), threaded through so the yuyutei code cache can record the item's
     # real identity from data already fetched — no extra request.
     sample_titles: tuple[str, ...] = ()
+    # 在庫× 販売 prices: cards the shop lists but is out of stock right now. Not
+    # purchasable, so a weak upper bound — surfaced labeled「在庫なし」rather than
+    # dropped, so a raw card that is sold out still yields a reference (#41).
+    oos_sell_reference: int | None = None
+    oos_sell_min: int | None = None
+    oos_sell_max: int | None = None
+    oos_sell_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -998,6 +1007,7 @@ class ResearchCommandService:
         shop_reference_fn: ShopReferenceFn | None = None,
         game_code_resolver_fn: GameCodeResolverFn | None = None,
         cache_enricher_fn: "CacheEnricherFn | None" = None,
+        query_normalizer_fn: "QueryNormalizerFn | None" = None,
         ip_heat_lookup_fn: IpHeatLookupFn | None = None,
         entity_recognizer_fn: EntityRecognizerFn | None = None,
         appreciation_enricher_fn: AppreciationEnricherFn | None = None,
@@ -1016,7 +1026,7 @@ class ResearchCommandService:
         self._sold_market_search_fn = sold_market_search_fn or _default_sold_market_search
         self._sold_average_lookup_fn = sold_average_lookup_fn or _default_sold_average_lookup
         self._shop_reference_fn = shop_reference_fn or build_shop_reference_fn(
-            game_code_resolver_fn, cache_enricher_fn
+            game_code_resolver_fn, cache_enricher_fn, query_normalizer_fn
         )
         self._ip_heat_lookup_fn = ip_heat_lookup_fn or (lambda canonicals: {})
         self._entity_recognizer_fn = entity_recognizer_fn
@@ -1455,11 +1465,21 @@ class ResearchCommandService:
         )
         active_evidence = tuple(_price_evidence_from_market_item(item, sold_status="active") for item in active_raw)
         active_evidence, active_outliers = _drop_price_outliers(active_evidence)
+        shop_reference_reason: str | None = None
         try:
             shop_reference = self._shop_reference_fn(query, price_cap)
+        except ShopReferenceUnavailable as exc:
+            logger.warning(
+                "Research shop reference unavailable query=%s reason=%s: %s",
+                query, exc.reason, exc,
+            )
+            shop_reference = None
+            shop_reference_reason = exc.reason
+            backend_warnings.append(f"店舗參考價抓取失敗：{exc}")
         except Exception as exc:
             logger.exception("Research shop reference lookup failed query=%s", query)
             shop_reference = None
+            shop_reference_reason = "error"
             backend_warnings.append(f"店舗參考價抓取失敗：{exc}")
         ctx.active_price_evidence = active_evidence
         ctx.sold_price_evidence = sold_evidence
@@ -1478,6 +1498,7 @@ class ResearchCommandService:
             sold_average_jpy=sold_avg,
             listed_condition_label=listed_condition_label,
             shop_reference=shop_reference,
+            shop_reference_reason=shop_reference_reason,
             active_dropped=active_dropped,
             sold_dropped=sold_dropped,
             active_outliers=active_outliers,
@@ -1618,6 +1639,7 @@ def build_research_handler(
     shop_reference_fn: ShopReferenceFn | None = None,
     game_code_resolver_fn: GameCodeResolverFn | None = None,
     cache_enricher_fn: "CacheEnricherFn | None" = None,
+    query_normalizer_fn: "QueryNormalizerFn | None" = None,
     ip_heat_lookup_fn: IpHeatLookupFn | None = None,
     entity_recognizer_fn: EntityRecognizerFn | None = None,
     appreciation_enricher_fn: AppreciationEnricherFn | None = None,
@@ -1640,6 +1662,7 @@ def build_research_handler(
         shop_reference_fn=shop_reference_fn,
         game_code_resolver_fn=game_code_resolver_fn,
         cache_enricher_fn=cache_enricher_fn,
+        query_normalizer_fn=query_normalizer_fn,
         ip_heat_lookup_fn=ip_heat_lookup_fn,
         entity_recognizer_fn=entity_recognizer_fn,
         appreciation_enricher_fn=appreciation_enricher_fn,
@@ -2586,28 +2609,55 @@ def _format_price_band(low: int | None, high: int | None) -> str:
     return f"¥{lo:,}〜¥{hi:,}"
 
 
-def _format_shop_reference(ref: ShopReference) -> str:
+def _format_shop_reference(ref: ShopReference, *, graded_context: bool = False) -> str:
     """One-line shop band for the price summary. 買取 = lower (liquidation),
-    in-stock 販売 = upper (acquisition). Both sides are shown as a min–max
-    range so the band conveys an actual upper/lower spread, not a single point.
-    販売 only appears when stock-backed, so a 庫存0 card never poses as an upper
-    bound."""
+    in-stock 販売 = upper (acquisition), each shown as a min–max range so the band
+    conveys a real spread. When no card is in stock, the 在庫× 販売 price is still
+    shown as a weak「在庫なし」upper bound rather than dropped — for a sold-out raw
+    card it is the only supply signal available (#41).
+
+    遊々亭 stocks raw (ungraded) cards, so in a graded (PSA10 等) context the band
+    is labeled「raw参考」to make explicit it is NOT a graded fair-market comp, only
+    a raw-card supply reference."""
+    base = f"{ref.label} raw参考" if graded_context else f"{ref.label}参考"
     has_buy = ref.buy_reference is not None
     has_sell = ref.sell_reference is not None
+    has_oos = ref.oos_sell_reference is not None
     buy_band = _format_price_band(ref.buy_min, ref.buy_max) or (
         f"¥{ref.buy_reference:,}" if has_buy else ""
     )
     sell_band = _format_price_band(ref.sell_min, ref.sell_max) or (
         f"¥{ref.sell_reference:,}" if has_sell else ""
     )
+    oos_band = _format_price_band(ref.oos_sell_min, ref.oos_sell_max) or (
+        f"¥{ref.oos_sell_reference:,}" if has_oos else ""
+    )
     stock_note = f"（在庫{ref.stock_total}点）" if ref.stock_total else ""
+
     if has_buy and has_sell:
-        return f"{ref.label}参考帯 買取{buy_band}／販売{sell_band}{stock_note}"
+        return f"{base}帯 買取{buy_band}／販売{sell_band}{stock_note}"
     if has_sell:
-        return f"{ref.label}参考 販売{sell_band}{stock_note}"
+        return f"{base} 販売{sell_band}{stock_note}"
+    # No purchasable 販売 — fall back to the 在庫× 販売 weak upper bound when present.
+    if has_buy and has_oos:
+        return f"{base}帯 買取{buy_band}／販売{oos_band}（在庫なし・上限參考弱）"
+    if has_oos:
+        return f"{base} 販売{oos_band}（在庫なし・上限參考弱）"
     if has_buy:
-        return f"{ref.label}参考 買取{buy_band}（販売在庫なし、上限參考弱）"
+        return f"{base} 買取{buy_band}（販売在庫なし、上限參考弱）"
     return ""
+
+
+# Distinct user-facing notes for why the 遊々亭 band is absent — replaces the old
+# blanket "暫無法取得（rate-limited）" that mislabeled a 200-with-zero-hits miss as
+# a rate limit (#41). Keyed by ShopReferenceUnavailable.reason.
+_SHOP_REF_REASON_MESSAGE: dict[str, str] = {
+    "cooldown": "遊々亭参考：暫時跳過（rate-limit 冷卻中）",
+    "concurrency": "遊々亭参考：暫時跳過（並發上限，稍後重試）",
+    "no_match": "遊々亭参考：查無對應卡（正規化檢索仍 0 筆）",
+    "http_block": "遊々亭参考：抓取失敗（HTTP 阻擋）",
+    "error": "遊々亭参考：抓取失敗",
+}
 
 
 def _build_price_section_result(
@@ -2619,6 +2669,7 @@ def _build_price_section_result(
     sold_average_jpy: float | None,
     listed_condition_label: str | None = None,
     shop_reference: ShopReference | None = None,
+    shop_reference_reason: str | None = None,
     active_dropped: int = 0,
     sold_dropped: int = 0,
     active_outliers: int = 0,
@@ -2662,7 +2713,13 @@ def _build_price_section_result(
         warnings.append("active 比價樣本不足（Mercari / Rakuma 均未取得）。")
 
     if shop_reference is not None:
-        shop_band_text = _format_shop_reference(shop_reference)
+        shop_band_text = _format_shop_reference(
+            shop_reference, graded_context=_looks_graded_title(query)
+        )
+    elif shop_reference_reason:
+        shop_band_text = _SHOP_REF_REASON_MESSAGE.get(
+            shop_reference_reason, _SHOP_REF_REASON_MESSAGE["error"]
+        )
     elif any("店舗參考價" in w for w in backend_warnings):
         shop_band_text = "遊々亭参考：暫無法取得（rate-limited）"
     else:
@@ -2948,6 +3005,10 @@ def _shop_reference_to_dict(ref: ShopReference) -> dict[str, object]:
         "sell_min": ref.sell_min,
         "sell_max": ref.sell_max,
         "sample_titles": list(ref.sample_titles),
+        "oos_sell_reference": ref.oos_sell_reference,
+        "oos_sell_min": ref.oos_sell_min,
+        "oos_sell_max": ref.oos_sell_max,
+        "oos_sell_count": ref.oos_sell_count,
     }
 
 
@@ -2965,7 +3026,24 @@ def _shop_reference_from_dict(data: dict[str, object]) -> ShopReference:
         sell_min=data.get("sell_min"),
         sell_max=data.get("sell_max"),
         sample_titles=tuple(data.get("sample_titles") or ()),
+        oos_sell_reference=data.get("oos_sell_reference"),
+        oos_sell_min=data.get("oos_sell_min"),
+        oos_sell_max=data.get("oos_sell_max"),
+        oos_sell_count=int(data.get("oos_sell_count") or 0),
     )
+
+
+class ShopReferenceUnavailable(RuntimeError):
+    """A 遊々亭 band fetch failed or was skipped with a known, user-legible cause.
+
+    ``reason`` is one of ``_SHOP_REF_REASON_MESSAGE``'s keys (cooldown /
+    concurrency / no_match / http_block / error), so the price section can show
+    an accurate note instead of a blanket "rate-limited" (#41). Subclasses
+    ``RuntimeError`` so existing ``except Exception`` handlers still catch it."""
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 def _shop_reference_scrape_impl(
@@ -3015,13 +3093,26 @@ def _shop_reference_scrape_impl(
         # Persist a cross-process hint when the in-process circuit was tripped by a
         # 429, so the parent's next call skips yuyu-tei until the cooldown clears
         # instead of naively spawning another subprocess that will also get rate-limited.
+        diag = client.last_reference_diag or {}
         try:
             from market_monitor.http import _circuit_remaining
             if _circuit_remaining("yuyu-tei.jp") > 0:
                 _yuyutei_trip_cross_process_cooldown()
+                return {"__no_data__": True, "reason": "cooldown", "diag": diag}
         except Exception:  # noqa: BLE001
             pass
-        return None
+        # No budget skip, no live circuit: the fetch ran but yielded nothing. Tell
+        # the parent WHY — an HTTP block vs a 200-with-zero-hits miss — so the user
+        # message is accurate instead of a blanket "rate-limited" (#41).
+        statuses = {diag.get("sell_status"), diag.get("buy_status")}
+        statuses.discard(None)
+        if statuses and statuses <= {"http_block"}:
+            reason = "http_block"
+        elif "zero" in statuses:
+            reason = "no_match"
+        else:
+            reason = "error"
+        return {"__no_data__": True, "reason": reason, "diag": diag}
     return ShopReference(
         label="遊々亭",
         buy_reference=band.buy_reference,
@@ -3035,6 +3126,10 @@ def _shop_reference_scrape_impl(
         sell_min=band.sell_min,
         sell_max=band.sell_max,
         sample_titles=getattr(band, "sample_titles", ()),
+        oos_sell_reference=band.oos_sell_reference,
+        oos_sell_min=band.oos_sell_min,
+        oos_sell_max=band.oos_sell_max,
+        oos_sell_count=len(band.oos_sell_prices),
     )
 
 
@@ -3045,7 +3140,10 @@ def _shop_reference_from_band(
     # saving one wasted Playwright spawn that would just 429 again immediately.
     remaining = _yuyutei_cooldown_remaining()
     if remaining > 0:
-        raise RuntimeError(f"yuyu-tei.jp rate-limited ({remaining:.0f}s cross-process cooldown)")
+        raise ShopReferenceUnavailable(
+            f"yuyu-tei.jp rate-limited ({remaining:.0f}s cross-process cooldown)",
+            reason="cooldown",
+        )
     result = run_in_subprocess(
         "shop_reference",
         {"query": query, "price_cap": price_cap, "source_options": source_options},
@@ -3056,26 +3154,68 @@ def _shop_reference_from_band(
         # concurrency). Surface it distinctly so it is never collapsed into a
         # generic "no Yuyutei data" empty result (#24/#25 review finding 2).
         reason = result.get("reason") or result.get("decision") or "host budget"
-        raise RuntimeError(f"yuyu-tei.jp skipped before network: {reason}")
+        decision = str(result.get("decision") or "")
+        kind = "cooldown" if "cool" in decision.lower() else "concurrency"
+        raise ShopReferenceUnavailable(
+            f"yuyu-tei.jp skipped before network: {reason}", reason=kind,
+        )
+    if isinstance(result, dict) and result.get("__no_data__"):
+        # The fetch ran but yielded no band — carry the scrape worker's diagnosis
+        # (no_match / http_block / cooldown / error) so the note is accurate (#41).
+        kind = str(result.get("reason") or "error")
+        raise ShopReferenceUnavailable(
+            f"yuyu-tei.jp no band data: {kind}", reason=kind,
+        )
     if not isinstance(result, dict):
         # The subprocess may have just written the cooldown file on a fresh 429;
         # surface it as an exception so the caller adds a user-visible warning.
         remaining = _yuyutei_cooldown_remaining()
         if remaining > 0:
-            raise RuntimeError(f"yuyu-tei.jp rate-limited ({remaining:.0f}s cross-process cooldown)")
+            raise ShopReferenceUnavailable(
+                f"yuyu-tei.jp rate-limited ({remaining:.0f}s cross-process cooldown)",
+                reason="cooldown",
+            )
         return None
     return _shop_reference_from_dict(result)
+
+
+def _yuyu_raw_card_search_term(
+    query: str, normalizer_fn: "QueryNormalizerFn | None"
+) -> str:
+    """Derive 遊々亭's search term from the noisy /research price query.
+
+    遊々亭 stocks raw (ungraded) singles, so a query carrying grading + platform +
+    condition noise (e.g.「… ssp PSA10 プロセカ」) returns HTTP 200 with zero parsed
+    hits — the #41 root cause. Grading tokens (a closed enum, Rule G-OK) are
+    stripped first; then an optional LLM normalizer derives the clean raw-card
+    identity (open-world → LLM, not a keyword list). Falls back to the
+    grading-stripped query, then the original, whenever a step yields nothing."""
+    degraded = " ".join(_GRADED_TITLE_RE.sub(" ", query or "").split())
+    base = degraded or (query or "")
+    if normalizer_fn is None:
+        return base
+    try:
+        normalized = normalizer_fn(base)
+    except Exception:
+        logger.exception("Yuyutei raw-card query normalize failed query=%s", query)
+        normalized = None
+    return (normalized or base).strip() or (query or "")
 
 
 def build_shop_reference_fn(
     game_code_resolver_fn: GameCodeResolverFn | None = None,
     cache_enricher_fn: "CacheEnricherFn | None" = None,
+    query_normalizer_fn: "QueryNormalizerFn | None" = None,
 ) -> ShopReferenceFn:
     """Build the Yuyu亭 shop-band fetcher. When a ``game_code_resolver_fn`` is
     supplied, it resolves a query's yuyutei game code (e.g. プロセカ card →
     ``ws``) so the band appears even for bare card names with no game keyword.
     The resolver returns ``None`` when it can't identify a TCG game, in which
     case Yuyutei is skipped (no fan-out, no wasted request).
+
+    When a ``query_normalizer_fn`` is supplied, the (richer) original query still
+    drives game-code resolution, but the band is *fetched* with the normalized
+    raw-card term so a graded/noisy query no longer 0-hits the search (#41).
 
     When a ``cache_enricher_fn`` is supplied, the verbatim matched-listing titles
     on a successful band are handed back to it so the yuyutei code cache can record
@@ -3085,6 +3225,9 @@ def build_shop_reference_fn(
         source_options: dict[str, object] | None = None
         if game_code_resolver_fn is not None:
             try:
+                # Resolve the code from the ORIGINAL query — its platform/game words
+                # are the strongest routing signal — even though we search with the
+                # stripped raw-card term below.
                 code = game_code_resolver_fn(query)
             except Exception:
                 logger.exception("Yuyutei game-code resolver failed query=%s", query)
@@ -3092,7 +3235,11 @@ def build_shop_reference_fn(
             if not code:
                 return None
             source_options = {"game_code": code}
-        ref = _shop_reference_from_band(query, price_cap, source_options)
+        search_term = _yuyu_raw_card_search_term(query, query_normalizer_fn)
+        ref = _shop_reference_from_band(search_term, price_cap, source_options)
+        # Enrich the cache under the ORIGINAL query so the key matches the entry the
+        # game-code resolver stored (it cached under the original query, not the
+        # normalized term).
         if ref is not None and cache_enricher_fn is not None and ref.sample_titles:
             try:
                 cache_enricher_fn(query, ref.sample_titles)

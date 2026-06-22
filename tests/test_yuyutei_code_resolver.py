@@ -37,6 +37,25 @@ def _make_resolver(db_path, llm, *, search_fn=None) -> YuyuteiGameCodeResolver:
     )
 
 
+def test_normalize_raw_card_query_returns_llm_term(tmp_path) -> None:
+    """#41: the LLM normalizer derives the clean raw-card search term from a noisy
+    query so 遊々亭 stops 0-hitting."""
+    db = tmp_path / "k.sqlite3"
+    llm = _RecordingLLM(['{"query": "風に舞う花びらの中で 初音ミク SSP"}'])
+    resolver = _make_resolver(db, llm)
+    out = resolver.normalize_raw_card_query("風に舞う花びらの中で 初音ミク ssp プロセカ")
+    assert out == "風に舞う花びらの中で 初音ミク SSP"
+    assert llm.calls == 1
+
+
+def test_normalize_raw_card_query_returns_none_when_unsure(tmp_path) -> None:
+    """A null verdict (model unsure) yields None so the caller keeps its own term."""
+    db = tmp_path / "k.sqlite3"
+    llm = _RecordingLLM(['{"query": null}'])
+    resolver = _make_resolver(db, llm)
+    assert resolver.normalize_raw_card_query("謎のカード") is None
+
+
 def test_direct_classify_resolves_without_search(tmp_path) -> None:
     db = tmp_path / "k.sqlite3"
     llm = _RecordingLLM(['{"code": "ws"}'])
