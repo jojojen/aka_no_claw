@@ -19,6 +19,7 @@ import ipaddress
 import json
 import logging
 import socket
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +33,7 @@ logger = logging.getLogger(__name__)
 _DISCOVER_TIMEOUT_SECONDS = 8
 _LEARN_TIMEOUT_SECONDS = 25
 _LEARN_POLL_SECONDS = 1.0
+_AUTH_ATTEMPTS = 3
 _RM_CLASS_NAMES = {"rm", "rm4", "rm4mini"}
 
 
@@ -171,11 +173,25 @@ def discover_rm(settings: AssistantSettings) -> tuple[Any | None, str]:
     if not rm_devices:
         return None, f"找不到 RM4 Mini（local_ip={local_ip or 'unknown'}, broadcast={broadcast}）。"
     device = rm_devices[0]
-    try:
-        device.auth()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("ir: BroadLink auth failed host=%s error=%s", getattr(device, "host", None), exc)
-        return None, f"找到 RM4 Mini 但無法連線：{exc}\n{_connectivity_help(exc)}"
+    auth_error: Exception | None = None
+    for attempt in range(1, _AUTH_ATTEMPTS + 1):
+        _warm_host_route(device)
+        try:
+            device.auth()
+            break
+        except Exception as exc:  # noqa: BLE001
+            auth_error = exc
+            logger.warning(
+                "ir: BroadLink auth failed host=%s attempt=%s/%s error=%s",
+                getattr(device, "host", None),
+                attempt,
+                _AUTH_ATTEMPTS,
+                exc,
+            )
+            time.sleep(1)
+    else:
+        assert auth_error is not None
+        return None, f"找到 RM4 Mini 但無法連線：{auth_error}\n{_connectivity_help(auth_error)}"
     return device, _format_rm_device(device)
 
 
@@ -184,6 +200,35 @@ def _format_rm_device(device: Any) -> str:
     ip = host[0] if isinstance(host, tuple) and host else "unknown"
     devtype = getattr(device, "devtype", None)
     return f"{type(device).__name__} {ip} type={hex(devtype) if isinstance(devtype, int) else devtype}"
+
+
+def _host_ip(device: Any) -> str | None:
+    host = getattr(device, "host", None)
+    if isinstance(host, tuple) and host:
+        return str(host[0])
+    return None
+
+
+def _warm_host_route(device: Any) -> None:
+    """Prime ARP/route state for RM4 before UDP auth.
+
+    On this Mac, discovery broadcast can succeed while the first unicast UDP send
+    to the just-discovered RM4 returns ``Errno 65 No route to host``. A short ping
+    often refreshes the host route; failures are harmless because many devices
+    drop ICMP.
+    """
+    ip = _host_ip(device)
+    if not ip:
+        return
+    try:
+        subprocess.run(
+            ["ping", "-c", "1", "-W", "1000", ip],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return
 
 
 def _connectivity_help(exc: Exception) -> str:

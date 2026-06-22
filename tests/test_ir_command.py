@@ -13,8 +13,13 @@ class FakeRm:
         self.learning = False
         self.sent: list[bytes] = []
         self._payload = payload
+        self.auth_errors: list[Exception] = []
+        self.auth_calls = 0
 
     def auth(self) -> None:
+        self.auth_calls += 1
+        if self.auth_errors:
+            raise self.auth_errors.pop(0)
         self.authed = True
 
     def enter_learning(self) -> None:
@@ -68,6 +73,24 @@ def test_discover_respects_configured_broadcast(tmp_path, monkeypatch):
     monkeypatch.setattr(ir.broadlink, "discover", discover)
     ir.discover_rm(settings)
     assert seen["discover_ip_address"] == "10.0.0.255"
+
+
+def test_discover_retries_transient_auth_no_route(tmp_path, monkeypatch):
+    fake = FakeRm()
+    fake.auth_errors.append(OSError(65, "No route to host"))
+    warms = []
+
+    monkeypatch.setattr(ir, "_local_ip", lambda: "192.168.11.34")
+    monkeypatch.setattr(ir, "_RM_CLASS_NAMES", {"fakerm"})
+    monkeypatch.setattr(ir.broadlink, "discover", lambda **kwargs: [fake])
+    monkeypatch.setattr(ir, "_warm_host_route", lambda device: warms.append(device))
+    monkeypatch.setattr(ir.time, "sleep", lambda seconds: None)
+    device, msg = ir.discover_rm(_settings(tmp_path))
+    assert device is fake
+    assert fake.authed is True
+    assert fake.auth_calls == 2
+    assert warms == [fake, fake]
+    assert "192.0.2.38" in msg
 
 
 def test_learn_code_persists_base64_payload(tmp_path, monkeypatch):
