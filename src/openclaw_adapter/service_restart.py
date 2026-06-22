@@ -72,12 +72,27 @@ WEB={_sh(web_dir)}
 REPUTATION={_sh(reputation_dir)}
 SOURCE={_sh(source)}
 LOG_DIR="$CLAW/logs"
+UID_NUM="$(id -u)"
 
 mkdir -p "$LOG_DIR"
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] restartall requested source=$SOURCE pid=$$"
 
 # Let the caller send its response before this script stops the caller process.
 sleep 2
+
+# launchd KeepAlive services are restarted with `kickstart -k` (kill + relaunch
+# under supervision = exactly ONE instance). We must NOT kill+nohup these: a
+# manual nohup copy runs ALONGSIDE the instance launchd respawns, yielding two
+# pollers fighting over Telegram getUpdates (409 storm) and two in-memory music
+# loops (so /music stop only halts one). Only genuinely non-launchd processes
+# (command bridge, vite frontend, reputation_snapshot, on-demand workers) get
+# the kill+nohup treatment below.
+kickstart_service() {{
+  local label="$1"
+  echo "[$(date '+%H:%M:%S')] kickstart $label"
+  launchctl kickstart -k "gui/$UID_NUM/local.openclaw.$label" 2>/dev/null \\
+    || echo "[$(date '+%H:%M:%S')] kickstart $label failed (not loaded?)"
+}}
 
 stop_pattern() {{
   local label="$1"
@@ -110,6 +125,33 @@ force_pattern() {{
   done
 }}
 
+# Reclaim a TCP port by killing whatever LISTENs on it. This is the robust
+# backstop for the command bridge / chat-web squatter: a `pgrep -f` pattern stop
+# can miss (a process whose argv differs from the expected pattern), but a port
+# that stays bound means the freshly-launched service can't bind and silently
+# dies with EADDRINUSE — so we reclaim by port, independent of the cmdline.
+free_port() {{
+  local label="$1"
+  local port="$2"
+  local pids
+  pids="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | tr '\\n' ' ' || true)"
+  if [ -z "$pids" ]; then
+    echo "[$(date '+%H:%M:%S')] free $label :$port: none"
+    return 0
+  fi
+  echo "[$(date '+%H:%M:%S')] free $label :$port: $pids"
+  for pid in $pids; do
+    [ "$pid" = "$$" ] && continue
+    kill "$pid" 2>/dev/null || true
+  done
+  sleep 1
+  pids="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | tr '\\n' ' ' || true)"
+  for pid in $pids; do
+    [ "$pid" = "$$" ] && continue
+    kill -9 "$pid" 2>/dev/null || true
+  done
+}}
+
 start_service() {{
   local label="$1"
   local cwd="$2"
@@ -126,13 +168,14 @@ start_service() {{
   )
 }}
 
+# Non-launchd processes (and the nohup chat-web "squatter" that holds :8780 and
+# blocks launchd's own chat_web from binding) — stop these by command pattern.
+# The launchd-managed services are intentionally absent here: `kickstart -k`
+# below does their kill+relaunch, so pattern-killing them would only race
+# launchd's KeepAlive respawn.
 stop_pattern "vite web" "aka_no_claw_web/frontend/node_modules/.bin/vite --host 0.0.0.0"
 stop_pattern "command bridge" "openclaw_adapter command-bridge --lan --port 8781"
-stop_pattern "chat web" "openclaw_adapter chat-web --host 0.0.0.0 --port 8780"
-stop_pattern "telegram poll" "openclaw_adapter telegram-poll --with-reputation-agent --no-dashboard"
-stop_pattern "opportunity agent" "openclaw_adapter opportunity-agent"
-stop_pattern "sns monitor" "openclaw_adapter sns-monitor-service"
-stop_pattern "price monitor" "openclaw_adapter price-monitor-service"
+stop_pattern "chat web (nohup squatter)" "openclaw_adapter chat-web --host 0.0.0.0 --port 8780"
 stop_pattern "reputation snapshot" "reputation_snapshot/.venv/bin/python app.py"
 stop_pattern "scrape workers" "openclaw_adapter.scrape_worker"
 stop_pattern "playwright drivers" "related_to_claw/.*/playwright/driver/package/cli.js run-driver"
@@ -141,21 +184,28 @@ sleep 3
 
 force_pattern "vite web" "aka_no_claw_web/frontend/node_modules/.bin/vite --host 0.0.0.0"
 force_pattern "command bridge" "openclaw_adapter command-bridge --lan --port 8781"
-force_pattern "chat web" "openclaw_adapter chat-web --host 0.0.0.0 --port 8780"
-force_pattern "telegram poll" "openclaw_adapter telegram-poll --with-reputation-agent --no-dashboard"
-force_pattern "opportunity agent" "openclaw_adapter opportunity-agent"
-force_pattern "sns monitor" "openclaw_adapter sns-monitor-service"
-force_pattern "price monitor" "openclaw_adapter price-monitor-service"
+force_pattern "chat web (nohup squatter)" "openclaw_adapter chat-web --host 0.0.0.0 --port 8780"
 force_pattern "reputation snapshot" "reputation_snapshot/.venv/bin/python app.py"
 force_pattern "scrape workers" "openclaw_adapter.scrape_worker"
 force_pattern "playwright drivers" "related_to_claw/.*/playwright/driver/package/cli.js run-driver"
 
+# Reclaim the launchd chat_web port before kickstart so launchd's instance binds.
+free_port "chat web" 8780
+
+# launchd-managed services: one clean instance each via kickstart (NOT nohup).
+kickstart_service "price_monitor"
+kickstart_service "sns_monitor"
+kickstart_service "opportunity"
+kickstart_service "telegram"
+kickstart_service "chat_web"
+
+# Reclaim the bridge port before relaunch: the pattern stop above can miss the
+# running bridge, and a still-bound :8781 makes the fresh bridge die on
+# EADDRINUSE (so the web 生活 mode keeps serving the OLD code).
+free_port "command bridge" 8781
+
+# Genuinely non-launchd services: (re)start detached with nohup.
 start_service "reputation_snapshot" "$REPUTATION" "$LOG_DIR/reputation_snapshot.log" "$REPUTATION/.venv/bin/python" app.py
-start_service "price monitor" "$CLAW" "$LOG_DIR/openclaw_price_monitor.log" "$CLAW/.venv/bin/python" -m openclaw_adapter price-monitor-service
-start_service "sns monitor" "$CLAW" "$LOG_DIR/openclaw_sns_monitor.log" "$CLAW/.venv/bin/python" -m openclaw_adapter sns-monitor-service
-start_service "opportunity agent" "$CLAW" "$LOG_DIR/opportunity_agent.log" "$CLAW/.venv/bin/python" -m openclaw_adapter opportunity-agent
-start_service "telegram poll" "$CLAW" "$LOG_DIR/telegram-poll.log" "$CLAW/.venv/bin/python" -m openclaw_adapter telegram-poll --with-reputation-agent --no-dashboard
-start_service "chat web" "$CLAW" "$LOG_DIR/openclaw_chat_web.log" "$CLAW/.venv/bin/python" -m openclaw_adapter chat-web --host 0.0.0.0 --port 8780
 start_service "command bridge" "$CLAW" "$LOG_DIR/command_bridge.log" "$CLAW/.venv/bin/python" -m openclaw_adapter command-bridge --lan --port 8781
 start_service "web frontend" "$WEB" "$LOG_DIR/openclaw_web_vite.log" npm run dev -- --host 0.0.0.0
 

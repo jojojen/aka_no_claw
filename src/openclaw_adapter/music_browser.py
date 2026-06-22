@@ -26,6 +26,7 @@ from pathlib import Path
 
 from assistant_runtime import AssistantSettings
 
+from . import music_audio_device as mad
 from . import music_command as mc
 from . import music_volume as mv
 from .music_favorites import FavoritesStore, stable_id
@@ -243,6 +244,20 @@ def build_music_callback_handler(settings: AssistantSettings):
             return mv.louder_music(settings), None, None
         if action == "lower":
             return mv.lower_music(settings), None, None
+
+        if action == "menu":
+            return None, mc._menu_text(), mc._menu_markup()
+
+        if action == "dev":
+            text, markup = mad.audio_devices_view(settings)
+            return None, text, markup
+
+        if action == "setdev":
+            try:
+                index = int(rest)
+            except ValueError:
+                return "音源動作格式錯誤。", None, None
+            return mad.set_output_device_by_index(settings, index)
 
         if action == "ls":
             token, _, page_str = rest.partition(":")

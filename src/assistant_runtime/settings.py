@@ -151,6 +151,11 @@ class AssistantSettings:
     # reconnects restores its session from the Mac mini. Gitignored runtime data
     # under .openclaw_tmp/, never committed and never written to knowledge.sqlite3.
     openclaw_web_memory_dir: str = ".openclaw_tmp/web_console_memory"
+    # ── local timed home scheduler (issue #39) ─────────────────────────────
+    # Persisted home schedules (/schedulehome): timed runs of existing slash
+    # commands (/music, /say, /bluetooth) that survive bot restarts. Gitignored
+    # runtime data; never committed.
+    openclaw_home_schedules_path: str = ".openclaw_tmp/home_schedules.json"
 
 
 def _resolve_runtime_path(value: str) -> str:
@@ -412,6 +417,9 @@ def get_settings() -> AssistantSettings:
         ),
         openclaw_web_memory_dir=_resolve_runtime_path(
             os.getenv("OPENCLAW_WEB_MEMORY_DIR", ".openclaw_tmp/web_console_memory")
+        ),
+        openclaw_home_schedules_path=_resolve_runtime_path(
+            os.getenv("OPENCLAW_HOME_SCHEDULES_PATH", ".openclaw_tmp/home_schedules.json")
         ),
     )
 

@@ -81,6 +81,16 @@ from .bluetooth_command import (
 )
 from .music_volume import mute_music, louder_music, lower_music
 from .service_restart import build_restart_all_handler
+from .home_schedule import (
+    HomeScheduleScheduler,
+    get_home_schedule_store,
+    make_run_slash_command,
+)
+from .home_schedule_command import (
+    build_schedulehome_callback_handler,
+    build_schedulehome_handler,
+    render_list as render_home_schedule_list,
+)
 from .music_favorites import (
     FavoritesStore,
     MUSIC_BEST_LIST_KIND,
@@ -108,6 +118,7 @@ from .quiz_command import (
 )
 from .voice_command import (
     build_say_handler,
+    build_saynow_handler,
     build_voice_callback_handler,
     build_voice_handler,
 )
@@ -391,7 +402,47 @@ class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
             run_in_background=True,
         )
 
+    def _build_home_capture_plan(
+        self, *, chat_id: str | int, text: str | None
+    ) -> TelegramTextReplyPlan | None:
+        """Capture-mode for /schedulehome (issue #39): after a schedule is created
+        the user sends the slash commands to run, one per message, ending with
+        「完成」. While a capture session is active for this chat, plain ``/``
+        messages are appended to that schedule instead of being executed."""
+        if text is None or not self.is_allowed_chat(chat_id):
+            return None
+        store = get_home_schedule_store(self._settings.openclaw_home_schedules_path)
+        sid = store.capture_target(chat_id)
+        if sid is None:
+            return None
+        content = text.strip()
+        if content in {"完成", "done", "結束"}:
+            store.end_capture(chat_id)
+            entry = store.get(sid)
+            n = len(entry.get("commands") or []) if entry else 0
+            list_text, markup = render_home_schedule_list(store)
+            return TelegramTextReplyPlan(
+                ack=None,
+                reply=f"✅ 排程設定完成，已加入 {n} 個指令。\n\n{list_text}",
+                reply_markup=markup,
+            )
+        # Let the user still manage schedules mid-capture without it being eaten.
+        if content.startswith("/schedulehome"):
+            return None
+        if content.startswith("/"):
+            store.add_command(sid, content)
+            entry = store.get(sid)
+            n = len(entry.get("commands") or []) if entry else 0
+            return TelegramTextReplyPlan(
+                ack=None,
+                reply=f"已加入第 {n} 個指令：{content}\n繼續傳下一個指令，或輸入「完成」結束。",
+            )
+        return None
+
     def build_reply_plan(self, *, chat_id: str | int, text: str | None) -> TelegramTextReplyPlan:
+        home_capture_plan = self._build_home_capture_plan(chat_id=chat_id, text=text)
+        if home_capture_plan is not None:
+            return home_capture_plan
         youtube_plan = self._build_youtube_like_song_plan(chat_id=chat_id, text=text)
         if youtube_plan is not None:
             return youtube_plan
@@ -1107,6 +1158,11 @@ def _build_registries(
         "/say": RegisteredCommand(
             build_say_handler(settings), ack="收到，正在合成語音…", background=True
         ),
+        "/saynow": RegisteredCommand(
+            build_saynow_handler(settings),
+            ack="收到，正在合成並於 Mac mini 播放語音…",
+            background=True,
+        ),
         "/translateja": RegisteredCommand(
             build_translate_handler(settings, target="ja"),
             ack="收到，正在翻譯成日文…",
@@ -1218,6 +1274,15 @@ def _build_registries(
         ),
     }
 
+    # /schedulehome (issue #39): scheduled runs re-dispatch existing slash
+    # commands through this same registry, so the runner must close over the
+    # finished command_handlers dict (defined just above).
+    _home_schedule_store = get_home_schedule_store(settings.openclaw_home_schedules_path)
+    _run_slash_command = make_run_slash_command(command_handlers)
+    command_handlers["/schedulehome"] = RegisteredCommand(
+        build_schedulehome_handler(_home_schedule_store, _run_slash_command)
+    )
+
     _rag_cb = _build_rag_callback_handler(settings, knowledge_inbox=knowledge_inbox)
 
     def _rag_keep_adapter(payload: str, original_text: str, chat_id: str):
@@ -1241,6 +1306,7 @@ def _build_registries(
         "imgtr": _build_image_translate_callback_handler(_IMAGE_TRANSLATE_ORIGINAL_CACHE),
         "music": build_music_callback_handler(settings),
         "bt": build_bluetooth_callback_handler(settings),
+        "sh": build_schedulehome_callback_handler(_home_schedule_store, _run_slash_command),
     }
 
     view_handlers = {
@@ -1616,6 +1682,7 @@ def run_telegram_polling(
                           opportunity_inbox=opportunity_inbox,
                           research_notifier_factory=_build_research_notifier_factory(settings))
     )
+    home_schedule_scheduler = _start_home_schedule_scheduler(settings, command_handlers)
 
     _price_bot_module.TelegramCommandProcessor = (
         lambda **kwargs: TelegramCommandProcessor(settings=settings, **kwargs)
@@ -1691,6 +1758,41 @@ def _start_rag_daily_digest(settings) -> RagDailyDigestScheduler | None:
         return scheduler
     except Exception:
         logger.exception("_start_rag_daily_digest: failed to start")
+        return None
+
+
+def _start_home_schedule_scheduler(settings, command_handlers) -> HomeScheduleScheduler | None:
+    """Start the /schedulehome daemon (issue #39): fires due home schedules at
+    minute resolution, re-dispatching their stored slash commands through the
+    same command registry the bot uses. Results are reported back to Telegram."""
+    from price_monitor_bot.bot import TelegramBotClient
+
+    chat_ids = tuple(cid for cid in settings.openclaw_telegram_chat_ids if cid)
+    try:
+        store = get_home_schedule_store(settings.openclaw_home_schedules_path)
+        run_command = make_run_slash_command(command_handlers)
+        notify = None
+        if chat_ids:
+            token = require_telegram_token(settings)
+            client = TelegramBotClient(token, ssl_context=build_ssl_context(settings))
+
+            def notify(text: str) -> None:  # noqa: F811 - intentional conditional def
+                for cid in chat_ids:
+                    client.send_message(chat_id=cid, text=text, reply_markup=None)
+
+        # Single-user/local: scheduled commands deliver to the first configured
+        # chat (e.g. /say sends its synthesized audio there).
+        scheduler_chat_id = chat_ids[0] if chat_ids else ""
+        scheduler = HomeScheduleScheduler(
+            store=store,
+            run_command=run_command,
+            chat_id=scheduler_chat_id,
+            notify=notify,
+        )
+        scheduler.start()
+        return scheduler
+    except Exception:
+        logger.exception("_start_home_schedule_scheduler: failed to start")
         return None
 
 
