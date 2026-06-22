@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -24,17 +25,30 @@ logger = logging.getLogger(__name__)
 
 MAX_AGE_SECONDS = 7200  # 2 hours
 
+# Only accept UUID-hex job ids (32 lowercase hex chars) so an attacker cannot
+# inject path components like "../escape" and write/read outside web_jobs/.
+_SAFE_JOB_ID_RE = re.compile(r"^[a-f0-9]{32}$")
+
+
+def _is_safe_job_id(job_id: str) -> bool:
+    return bool(_SAFE_JOB_ID_RE.match(job_id))
+
 
 class JobStore:
     def __init__(self, dir_path: str) -> None:
         self._dir = Path(dir_path)
 
     def save(self, snapshot: dict) -> None:
-        """Atomically write a job snapshot. Silently skips on OSError."""
+        """Atomically write a job snapshot. Silently skips on OSError or
+        an unsafe job_id (path traversal guard)."""
+        job_id = snapshot.get("job_id", "")
+        if not _is_safe_job_id(job_id):
+            logger.warning("job_store: rejected unsafe job_id %r", job_id)
+            return
         try:
             self._dir.mkdir(parents=True, exist_ok=True)
             body = json.dumps(snapshot, ensure_ascii=False).encode("utf-8")
-            path = self._dir / f"{snapshot['job_id']}.json"
+            path = self._dir / f"{job_id}.json"
             with tempfile.NamedTemporaryFile(
                 "wb", dir=self._dir, delete=False, suffix=".tmp"
             ) as tmp:
@@ -42,10 +56,14 @@ class JobStore:
                 tmp_path = Path(tmp.name)
             os.replace(tmp_path, path)
         except OSError:
-            logger.warning("job_store: save failed for job=%s", snapshot.get("job_id"), exc_info=True)
+            logger.warning("job_store: save failed for job=%s", job_id, exc_info=True)
 
     def load(self, job_id: str) -> dict | None:
-        """Return persisted snapshot for job_id, or None if missing/corrupt."""
+        """Return persisted snapshot for job_id, or None if missing, corrupt,
+        or an unsafe job_id (path traversal guard)."""
+        if not _is_safe_job_id(job_id):
+            logger.warning("job_store: rejected unsafe job_id %r on load", job_id)
+            return None
         path = self._dir / f"{job_id}.json"
         try:
             data = json.loads(path.read_text(encoding="utf-8"))

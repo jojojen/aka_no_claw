@@ -82,7 +82,8 @@ class _Job:
         self.message: str = ""
         self.actions: list[dict] = []
         self.error: str | None = None
-        self.created_at = time.monotonic()
+        self.created_at = time.monotonic()   # monotonic for GC comparisons
+        self.wall_created_at = time.time()   # wall clock for persisted snapshots
         self.lock = threading.Lock()
 
 
@@ -120,14 +121,33 @@ class _JobManager:
 
 class _JobNotifier:
     """ResearchNotifier that appends staged progress to a job, keyed by job id
-    (passed as the research ``chat_id``)."""
+    (passed as the research ``chat_id``), and persists each progress update so
+    a bridge restart can still show intermediate results on reconnect."""
 
-    def __init__(self, jobs: _JobManager, job_id: str) -> None:
+    def __init__(self, jobs: _JobManager, job_id: str, store: "JobStore") -> None:
         self._jobs = jobs
         self._job_id = job_id
+        self._store = store
 
     def send(self, text: str) -> None:
         self._jobs.append_progress(self._job_id, text)
+        # Snapshot current progress outside the lock to avoid disk I/O under it.
+        job = self._jobs.get(self._job_id)
+        if job is None:
+            return
+        with job.lock:
+            progress_snapshot = list(job.progress)
+            wall_created_at = job.wall_created_at
+        self._store.save({
+            "job_id": self._job_id,
+            "status": JOB_RUNNING,
+            "progress": progress_snapshot,
+            "message": "",
+            "actions": [],
+            "error": None,
+            "created_at": wall_created_at,
+            "updated_at": time.time(),
+        })
 
 
 class CommandBridge:
@@ -162,7 +182,7 @@ class CommandBridge:
                         self.settings,
                         None,
                         research_notifier_factory=lambda chat_id: _JobNotifier(
-                            self._jobs, str(chat_id)
+                            self._jobs, str(chat_id), self._get_job_store()
                         ),
                     )
                     self._callback_handlers = callback_handlers
@@ -324,7 +344,6 @@ class CommandBridge:
             return {"status": STATUS_ERROR, "message": "請貼上商品 URL 或輸入商品名稱。"}
         job = self._jobs.create()
         store = self._get_job_store()
-        job_created_at = time.time()
         store.save({
             "job_id": job.id,
             "status": JOB_RUNNING,
@@ -332,8 +351,8 @@ class CommandBridge:
             "message": "",
             "actions": [],
             "error": None,
-            "created_at": job_created_at,
-            "updated_at": job_created_at,
+            "created_at": job.wall_created_at,
+            "updated_at": job.wall_created_at,
         })
         store.purge_expired()
 
@@ -353,7 +372,7 @@ class CommandBridge:
                     "message": message,
                     "actions": list(job.actions),
                     "error": None,
-                    "created_at": job_created_at,
+                    "created_at": job.wall_created_at,
                     "updated_at": time.time(),
                 })
             except Exception as exc:  # noqa: BLE001
@@ -368,7 +387,7 @@ class CommandBridge:
                     "message": "",
                     "actions": [],
                     "error": str(exc),
-                    "created_at": job_created_at,
+                    "created_at": job.wall_created_at,
                     "updated_at": time.time(),
                 })
 
