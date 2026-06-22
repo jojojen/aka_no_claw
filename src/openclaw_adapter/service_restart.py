@@ -224,11 +224,20 @@ reap_orphans() {{
   done
 }}
 
+# Count REAL worker processes for a service. The dedicated tmux launcher
+# (telegram/bridge) keeps the worker's `python -m openclaw_adapter …` command in
+# its OWN argv, so a bare `pgrep -f` would match the tmux server too and report 2
+# for a single worker (aka_no_claw#40). Drop any PID whose command line is the
+# tmux launcher so only the spawned Python worker is counted.
 count_service() {{
   local label="$1"
   local pattern="$2"
   local n
-  n="$(pgrep -f "$pattern" 2>/dev/null | wc -l | tr -d ' ')"
+  n="$(ps -Ao pid,command 2>/dev/null \\
+    | grep -E "$pattern" \\
+    | grep -v "tmux -L $TMUX_SOCKET" \\
+    | grep -v grep \\
+    | wc -l | tr -d ' ')"
   echo "[$(date '+%H:%M:%S')] final count $label: $n"
 }}
 
@@ -236,7 +245,9 @@ snapshot() {{
   echo "[$(date '+%H:%M:%S')] $1 snapshot:"
   ps -Ao pid,%cpu,command 2>/dev/null \\
     | grep -E "openclaw_adapter (price-monitor-service|opportunity-agent|sns-monitor-service|telegram-poll|chat-web|command-bridge)" \\
-    | grep -v grep | sed 's/^/    /' || true
+    | grep -v grep \\
+    | grep -v "tmux -L $TMUX_SOCKET" \\
+    | sed 's/^/    /' || true
 }}
 
 # Capture the pre-restart process table now that snapshot() is defined (it must

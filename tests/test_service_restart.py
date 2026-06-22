@@ -1,9 +1,19 @@
 from __future__ import annotations
 
+import os
+import stat
+import subprocess
 from pathlib import Path
 
 from assistant_runtime import AssistantSettings
 from openclaw_adapter.service_restart import RESTART_MESSAGE, _build_restart_script, build_restart_all_handler
+
+
+def _extract_func(script: str, name: str) -> str:
+    start = script.index(f"{name}() {{")
+    rest = script[start:]
+    end = rest.index("\n}\n") + len("\n}\n")
+    return rest[:end]
 
 
 def test_restart_script_covers_core_services() -> None:
@@ -131,6 +141,45 @@ def test_orphan_launchd_workers_are_reaped() -> None:
     # dies with "snapshot: command not found" and never reaches the log.
     assert script.index("snapshot() {") < script.index('snapshot "before"')
     assert script.index('snapshot "before"') < script.index('snapshot "after"')
+
+
+def test_count_service_excludes_tmux_launcher(tmp_path) -> None:
+    # aka_no_claw#40: telegram/bridge launch via `tmux -L openclaw_codex
+    # new-session … python -m openclaw_adapter telegram-poll …`, so the tmux
+    # server's OWN argv contains the worker pattern. A bare pgrep then matches
+    # both the tmux launcher and the real worker → final count 2 for one worker.
+    # count_service must drop the tmux launcher and report exactly 1.
+    script = _build_restart_script(
+        workspace_dir=Path("/tmp/workspace"),
+        claw_dir=Path("/tmp/workspace/aka_no_claw"),
+        source="test",
+    )
+    count_func = _extract_func(script, "count_service")
+
+    # Fake `ps -Ao pid,command`: row 111 is the tmux launcher (its argv embeds
+    # the worker command), row 222 is the real python worker. Only 222 counts.
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    (fakebin / "ps").write_text(
+        "#!/bin/bash\n"
+        'echo "  111 tmux -L openclaw_codex new-session -d -s telegram '
+        'cd /x && exec /x/.venv/bin/python -m openclaw_adapter telegram-poll"\n'
+        'echo "  222 /x/.venv/bin/python -m openclaw_adapter telegram-poll '
+        '--with-reputation-agent --no-dashboard"\n'
+    )
+    p = fakebin / "ps"
+    p.chmod(p.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+    harness = (
+        'TMUX_SOCKET="openclaw_codex"\n'
+        + count_func
+        + '\ncount_service "telegram" "python.*openclaw_adapter telegram-poll"\n'
+    )
+    env = dict(os.environ, PATH=f"{fakebin}:{os.environ['PATH']}")
+    out = subprocess.run(
+        ["/bin/bash", "-c", harness], capture_output=True, text=True, env=env
+    ).stdout
+    assert "final count telegram: 1" in out
 
 
 def test_restart_all_handler_schedules_detached_restart(monkeypatch) -> None:
