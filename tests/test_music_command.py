@@ -159,13 +159,21 @@ def test_search_ambiguous_returns_candidates(settings):
 
 
 # --- playback --------------------------------------------------------------
-def test_music_random_starts_playback(settings, proc_table):
+def test_music_random_starts_continuous_playback(settings, proc_table, monkeypatch):
+    monkeypatch.setattr(mc, "_PLAYBEST_POLL_SECONDS", 0.01)
     handler = mc.build_music_handler(settings)
     reply = handler("random", "chat-1")
-    assert reply.startswith("正在播放：")
-    assert len(proc_table["spawned"]) == 1
-    state = json.loads(Path(settings.openclaw_music_player_state_path).read_text("utf-8"))
-    assert state["pid"] == proc_table["spawned"][0][0]
+    assert "隨機" in reply and "自動接續" in reply
+    # the continuous controller spawns the first song on its loop thread
+    import time as _t
+    for _ in range(200):
+        if proc_table["spawned"]:
+            break
+        _t.sleep(0.01)
+    assert proc_table["spawned"], "random should have started a song"
+    assert mc._PLAYBEST.is_active()
+    handler("stop", "chat-1")
+    assert not mc._PLAYBEST.is_active()
 
 
 def test_music_by_name_starts_matching_song(settings, proc_table):
@@ -195,7 +203,7 @@ def test_music_ambiguous_query_returns_list_without_playing(settings, proc_table
 
 def test_stop_terminates_current(settings, proc_table):
     handler = mc.build_music_handler(settings)
-    handler("random", "chat-1")
+    handler("間人間", "chat-1")
     pid = proc_table["spawned"][0][0]
     reply = handler("stop", "chat-1")
     assert reply == "已停止目前由龍蝦播放的音樂。"
@@ -212,14 +220,14 @@ def test_stop_is_safe_when_nothing_playing(settings, proc_table):
 
 def test_stop_idempotent(settings, proc_table):
     handler = mc.build_music_handler(settings)
-    handler("random", "chat-1")
+    handler("間人間", "chat-1")
     assert handler("stop", "chat-1") == "已停止目前由龍蝦播放的音樂。"
     assert handler("stop", "chat-1") == "目前沒有由龍蝦播放中的音樂。"
 
 
 def test_stale_pid_is_cleaned_and_reported_not_playing(settings, proc_table):
     handler = mc.build_music_handler(settings)
-    handler("random", "chat-1")
+    handler("間人間", "chat-1")
     pid = proc_table["spawned"][0][0]
     proc_table["alive"].discard(pid)  # process died on its own (song ended)
     reply = handler("stop", "chat-1")
@@ -230,7 +238,7 @@ def test_stale_pid_is_cleaned_and_reported_not_playing(settings, proc_table):
 
 def test_stop_does_not_kill_unrelated_reused_pid(settings, proc_table, monkeypatch):
     handler = mc.build_music_handler(settings)
-    handler("random", "chat-1")
+    handler("間人間", "chat-1")
     pid = proc_table["spawned"][0][0]
     # pid is alive but now belongs to an unrelated, non-afplay process.
     monkeypatch.setattr(mc, "_pid_is_player", lambda p: False)
@@ -244,7 +252,7 @@ def test_stop_does_not_kill_reused_pid_that_is_a_different_afplay(settings, proc
     # the OS handed our pid to (e.g. user's own playback). The start-time mismatch
     # must protect it from /music stop.
     handler = mc.build_music_handler(settings)
-    handler("random", "chat-1")
+    handler("間人間", "chat-1")
     pid = proc_table["spawned"][0][0]
     proc_table["start"][pid] = "start-DIFFERENT-PROCESS"  # pid reused, new identity
     reply = handler("stop", "chat-1")
@@ -305,7 +313,7 @@ def test_playback_failure_message(settings, monkeypatch, proc_table):
         raise OSError("afplay missing")
 
     monkeypatch.setattr(mc, "_spawn_player", _boom)
-    reply = mc.build_music_handler(settings)("random", "chat-1")
+    reply = mc.build_music_handler(settings)("間人間", "chat-1")
     assert "播放失敗" in reply
 
 
@@ -497,7 +505,7 @@ def test_play_best_never_spawns_out_of_root_when_mixed(settings, music_dir, tmp_
 # --- musicnowbest ----------------------------------------------------------
 def test_musicnowbest_adds_current_song(settings, proc_table):
     play = mc.build_music_handler(settings)
-    play("random", "chat-1")
+    play("間人間", "chat-1")
     reply = mc.build_musicnowbest_handler(settings)("", "chat-1")
     assert reply.startswith("已加入最愛")
     from openclaw_adapter.music_favorites import FavoritesStore
@@ -505,7 +513,7 @@ def test_musicnowbest_adds_current_song(settings, proc_table):
 
 
 def test_musicnowbest_no_duplicate(settings, proc_table):
-    mc.build_music_handler(settings)("random", "chat-1")
+    mc.build_music_handler(settings)("間人間", "chat-1")
     now = mc.build_musicnowbest_handler(settings)
     assert now("", "chat-1").startswith("已加入最愛")
     assert "已經在最愛" in now("", "chat-1")  # second add is a no-op
@@ -514,6 +522,23 @@ def test_musicnowbest_no_duplicate(settings, proc_table):
 def test_musicnowbest_nothing_playing(settings, proc_table):
     reply = mc.build_musicnowbest_handler(settings)("", "chat-1")
     assert "目前沒有播放中" in reply
+
+
+# --- now_playing (web#3 生活 mode now-playing strip) ------------------------
+def test_now_playing_returns_song_name_while_playing(settings, proc_table):
+    mc.build_music_handler(settings)("間人間", "chat-1")
+    assert mc.now_playing(settings) == "02 ずっと真夜中でいいのに。 - 間人間"
+
+
+def test_now_playing_is_none_when_idle(settings, proc_table):
+    assert mc.now_playing(settings) is None
+
+
+def test_now_playing_is_none_after_song_ends(settings, proc_table):
+    mc.build_music_handler(settings)("間人間", "chat-1")
+    pid = proc_table["spawned"][0][0]
+    proc_table["alive"].discard(pid)  # song finished on its own
+    assert mc.now_playing(settings) is None
 
 
 # --- callback path safety --------------------------------------------------
