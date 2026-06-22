@@ -361,6 +361,13 @@ def test_openclaw_registries_include_research_commands() -> None:
     assert "rs" in callback_handlers
 
 
+def test_openclaw_registries_include_ir_command() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    command_handlers, callback_handlers, _, _ = _build_registries(settings, dynamic_tool_runner=None)
+    assert "/ir" in command_handlers
+    assert "ir" in callback_handlers
+
+
 def test_build_registries_passes_knowledge_db_path_to_research_handler(monkeypatch, tmp_path: Path) -> None:
     settings = AssistantSettings(
         openclaw_telegram_chat_id="123",
