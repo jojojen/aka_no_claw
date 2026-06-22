@@ -112,37 +112,37 @@ def test_learn_code_persists_base64_payload(tmp_path, monkeypatch):
     fake = FakeRm(payload=b"learned")
     monkeypatch.setattr(ir, "discover_rm", lambda settings: (fake, "fake rm"))
     monkeypatch.setattr(ir.time, "sleep", lambda seconds: None)
-    msg = ir.learn_code(_settings(tmp_path), "ceiling_light", "night")
+    msg = ir.learn_code(_settings(tmp_path), "demo_light", "night")
     assert "已儲存" in msg
     assert fake.learning is True
-    stored = ir.IrStore(str(tmp_path / "ir_devices.json")).get("ceiling_light", "night")
+    stored = ir.IrStore(str(tmp_path / "ir_devices.json")).get("demo_light", "night")
     assert stored == "bGVhcm5lZA=="
 
 
 def test_send_code_replays_persisted_payload(tmp_path, monkeypatch):
     settings = _settings(tmp_path)
     fake = FakeRm()
-    ir.IrStore(settings.openclaw_ir_devices_path).put("ceiling_light", "night", "cGxheQ==")
+    ir.IrStore(settings.openclaw_ir_devices_path).put("demo_light", "night", "cGxheQ==")
     monkeypatch.setattr(ir, "discover_rm", lambda settings: (fake, "fake rm"))
-    msg = ir.send_code(settings, "ceiling_light", "night")
+    msg = ir.send_code(settings, "demo_light", "night")
     assert "已送出" in msg
     assert fake.sent == [b"play"]
 
 
 def test_render_devices_uses_opaque_tokens(tmp_path):
     settings = _settings(tmp_path)
-    ir.IrStore(settings.openclaw_ir_devices_path).put("ceiling_light", "night", "abc")
+    ir.IrStore(settings.openclaw_ir_devices_path).put("demo_light", "night", "abc")
     text, markup = ir.render_devices(settings)
-    assert "ceiling_light" in text
+    assert "demo_light" in text
     cb = markup["inline_keyboard"][0][0]["callback_data"]
     assert cb.startswith("ir:s:")
-    assert "ceiling_light" not in cb
+    assert "demo_light" not in cb
     assert "night" not in cb
 
 
 def test_callback_sends_tokenized_button(tmp_path, monkeypatch):
     settings = _settings(tmp_path)
-    token = ir.IrTokenCache(settings.openclaw_ir_token_cache_path).put("ceiling_light", "night")
+    token = ir.IrTokenCache(settings.openclaw_ir_token_cache_path).put("demo_light", "night")
     calls = []
     monkeypatch.setattr(ir, "send_code", lambda s, d, b: calls.append((d, b)) or "sent")
     cb = ir.build_ir_callback_handler(settings)
@@ -150,4 +150,4 @@ def test_callback_sends_tokenized_button(tmp_path, monkeypatch):
     assert toast == "sent"
     assert new_text is None
     assert markup is None
-    assert calls == [("ceiling_light", "night")]
+    assert calls == [("demo_light", "night")]
