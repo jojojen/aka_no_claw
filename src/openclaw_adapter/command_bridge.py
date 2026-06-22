@@ -31,6 +31,7 @@ from assistant_runtime import AssistantSettings, build_ssl_context
 
 from .job_store import JobStore
 from .session_memory import SessionMemoryStore, SessionWriteError, empty_session
+from .service_restart import RESTART_MESSAGE, trigger_restart_all
 from .command_bridge_models import (
     CHAT_BACKEND_CLOUD_PICKLE,
     CHAT_BACKEND_LOCAL,
@@ -585,6 +586,17 @@ class CommandBridge:
             logger.exception("session memory: clear failed")
             return {"status": STATUS_ERROR, "message": f"清除 session 失敗：{exc}"}
         return {"status": STATUS_OK}
+
+    def restart_all(self) -> dict:
+        """Schedule a detached full local restart. The current HTTP request must
+        return before the command bridge process is stopped by the script."""
+        try:
+            script_path = trigger_restart_all(settings=self.settings, source="web")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("restartall: scheduling failed")
+            return {"status": STATUS_ERROR, "message": f"排程重啟失敗：{exc}"}
+        logger.info("restartall: scheduled script=%s", script_path)
+        return {"status": STATUS_OK, "message": RESTART_MESSAGE}
 
     def _stream_ollama_chat(self, prompt: str) -> Iterator[dict]:
         endpoint = self.settings.openclaw_local_text_endpoint.rstrip("/")

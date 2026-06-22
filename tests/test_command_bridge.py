@@ -184,6 +184,21 @@ def test_handler_exception_becomes_structured_error(bridge, monkeypatch):
     assert "kaboom" in resp.message
 
 
+def test_restart_all_schedules_detached_script(bridge, monkeypatch):
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        "openclaw_adapter.command_bridge.trigger_restart_all",
+        lambda *, settings, source: calls.append(source) or "/tmp/restart.sh",
+    )
+
+    resp = bridge.restart_all()
+
+    assert resp["status"] == STATUS_OK
+    assert "重啟龍蝦" in resp["message"]
+    assert calls == ["web"]
+
+
 # --- streaming ------------------------------------------------------------
 def test_stream_chat_local_emits_start_delta_done(bridge, monkeypatch):
     def _fake_stream(prompt):
