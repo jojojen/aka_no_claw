@@ -105,7 +105,7 @@ def test_route_warmup_uses_available_ping_candidate(tmp_path, monkeypatch):
     monkeypatch.setattr(ir, "_PING_CANDIDATES", (str(fake_ping), "ping"))
     monkeypatch.setattr(ir.subprocess, "run", run)
     ir._warm_host_route(FakeRm())
-    assert calls == [[str(fake_ping), "-c", "1", "-W", "1000", "192.0.2.38"]]
+    assert calls == [[str(fake_ping), "-o", "-c", "3", "-W", "3000", "192.0.2.38"]]
 
 
 def test_learn_code_persists_base64_payload(tmp_path, monkeypatch):

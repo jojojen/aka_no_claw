@@ -35,6 +35,8 @@ _LEARN_TIMEOUT_SECONDS = 25
 _LEARN_POLL_SECONDS = 1.0
 _AUTH_ATTEMPTS = 3
 _PING_CANDIDATES = ("/sbin/ping", "/bin/ping", "ping")
+_ROUTE_WARMUP_PING_ARGS = ("-o", "-c", "3", "-W", "3000")
+_ROUTE_WARMUP_TIMEOUT_SECONDS = 10
 _RM_CLASS_NAMES = {"rm", "rm4", "rm4mini"}
 
 
@@ -224,16 +226,17 @@ def _warm_host_route(device: Any) -> None:
     ping_cmd = next((cmd for cmd in _PING_CANDIDATES if Path(cmd).exists()), _PING_CANDIDATES[-1])
     try:
         result = subprocess.run(
-            [ping_cmd, "-c", "1", "-W", "1000", ip],
+            [ping_cmd, *_ROUTE_WARMUP_PING_ARGS, ip],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=2,
+            timeout=_ROUTE_WARMUP_TIMEOUT_SECONDS,
             check=False,
         )
         logger.debug(
-            "ir: BroadLink route warmup host=%s cmd=%s exit=%s",
+            "ir: BroadLink route warmup host=%s cmd=%s args=%s exit=%s",
             ip,
             ping_cmd,
+            _ROUTE_WARMUP_PING_ARGS,
             result.returncode,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
