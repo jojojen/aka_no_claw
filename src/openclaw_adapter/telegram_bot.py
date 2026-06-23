@@ -73,7 +73,11 @@ from .knowledge_command import (
     build_knowledge_item_deleters,
 )
 from .source_command import build_source_handler
-from .music_command import build_music_handler, build_musicnowbest_handler
+from .music_command import (
+    build_music_handler,
+    build_musicdiag_handler,
+    build_musicnowbest_handler,
+)
 from .music_browser import build_musiclistall_handler, build_music_callback_handler
 from .bluetooth_command import (
     build_bluetooth_handler,
@@ -1239,6 +1243,7 @@ def _build_registries(
         "/musiclistall": RegisteredCommand(build_musiclistall_handler(settings)),
         "/musiclistbest": RegisteredCommand(_musiclistbest_handler),
         "/musicnowbest": RegisteredCommand(build_musicnowbest_handler(settings)),
+        "/musicdiag": RegisteredCommand(build_musicdiag_handler(settings)),
         "/musicmute": RegisteredCommand(lambda r, c: mute_music(settings)),
         "/musiclouder": RegisteredCommand(lambda r, c: louder_music(settings)),
         "/musiclower": RegisteredCommand(lambda r, c: lower_music(settings)),

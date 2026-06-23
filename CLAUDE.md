@@ -20,34 +20,42 @@ Two repos: `aka_no_claw` (bot logic) + `price_monitor_bot` (Telegram dispatcher)
 
 ## Operations — restarting the bot (龍蝦)
 
-The bot is **launchd-managed with KeepAlive**, NOT a plain background process.
-After editing code you MUST restart it for changes to take effect.
+After editing code you MUST restart for changes to take effect.
 
-**Correct restart (the ONLY supported way):**
+**Correct restart (the ONLY supported way): the `/restartall` command** — this is
+exactly what the user's「重啟龍蝦」button triggers. It runs the orchestrator in
+`src/openclaw_adapter/service_restart.py` (`trigger_restart_all`), which writes a
+detached script and brings the WHOLE Mac-mini stack back on the new code in one
+clean pass. Claude cannot send a Telegram command, so when a restart is needed:
+**ask the user to press「重啟龍蝦」(`/restartall`)**, then verify (below). Do NOT
+hand-restart the poller — see the 409 warning.
 
-```
-launchctl kickstart -k gui/$(id -u)/local.openclaw.telegram
-```
+The telegram bot is **no longer launchd-managed**; the old
+`launchctl kickstart -k gui/$(id -u)/local.openclaw.telegram` label does not
+exist anymore and will fail. Current topology:
 
-`-k` = kill the running instance and relaunch it under supervision → exactly one
-instance. Sibling services: `local.openclaw.{reputation,opportunity,ollama}`.
-Logs (stdout+stderr): `logs/openclaw_telegram.log`.
+- **tmux socket `openclaw_codex`** holds the two manually-launched workers:
+  session `telegram` → `openclaw_adapter telegram-poll …`, and session `bridge`
+  → `openclaw_adapter command-bridge --lan --port 8781`. `/restartall` does
+  `tmux -L openclaw_codex kill-server` then recreates BOTH sessions, so it (and
+  only it) is the safe way to restart the bridge too.
+- **launchd-managed siblings** (restarted via `kickstart -k` inside the script):
+  `local.openclaw.{price_monitor,sns_monitor,opportunity}` (+ `aivis`, `ollama`).
 
-**NEVER restart with manual `kill` + `nohup`.** KeepAlive instantly respawns the
-killed instance, so your manual launch and the respawn both call Telegram
-`getUpdates` → **HTTP 409 (Conflict) storm**. The startup drain in
-`price_monitor_bot/bot.py` `run_telegram_polling` (~line 3370,
-`get_updates(timeout=0)`) is NOT try-wrapped: a 409 there propagates to
-`SystemExit(main())` and the poll loop never starts — yet non-daemon monitor
-threads keep the process *alive*, so it looks healthy while `/new` is dead.
-Also: a 409 fires if you restart within ~20s of killing a poller (Telegram holds
-the old long-poll slot for the poll_timeout) — `kickstart -k` handles this, but
-don't race it with manual launches.
+**NEVER restart the poller with manual `kill` + `nohup` / tmux respawn.** Two
+processes both calling Telegram `getUpdates` → **HTTP 409 (Conflict) storm**; and
+a 409 also fires if you relaunch within ~20s of killing a poller (Telegram holds
+the old long-poll slot). `/restartall` sequences stop → force-kill → wait →
+relaunch to avoid this; ad-hoc restarts race it. The startup drain in
+`price_monitor_bot/bot.py` `run_telegram_polling` (`get_updates(timeout=0)`) is
+NOT try-wrapped: a 409 there kills the poll loop while non-daemon threads keep
+the process *alive*, so it looks healthy while `/new` is dead.
 
 **Verify polling is live (don't trust process-alive alone):**
 
 ```
-lsof -nP -p <pid> | grep ESTABLISHED   # expect a conn to a Telegram IP 149.154.x.x:443
+tmux -L openclaw_codex list-panes -a -F "#{session_name} pid=#{pane_pid}"  # telegram + bridge sessions present
+lsof -nP -p <telegram-pid> | grep ESTABLISHED   # expect a conn to a Telegram IP 149.154.x.x:443
 ```
 
 The stdout marker `OpenClaw Telegram bot polling as @Aka_No_Claw_bot` is a

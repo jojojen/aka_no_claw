@@ -79,6 +79,19 @@ def proc_table(monkeypatch):
     monkeypatch.setattr(mc, "_terminate", _terminate)
     # Skip the real spawn-survival wait; a spawned pid is "playing" iff alive.
     monkeypatch.setattr(mc, "_verify_playing", _alive)
+    # Keep spawn-failure diagnostics hermetic: never shell out to afplay /
+    # SwitchAudioSource just to build a failure message.
+    monkeypatch.setattr(mc, "_safe_output_device", lambda: ("MockSpeaker", None))
+    monkeypatch.setattr(mc, "_probe_spawn_failure", lambda path: "stub-reason")
+    # Never restart the real coreaudiod during a spawn recovery; record calls and
+    # report "could not recover" by default so failure tests still raise.
+    state["recoveries"] = 0
+
+    def _recover():
+        state["recoveries"] += 1
+        return False
+
+    monkeypatch.setattr(mc, "_recover_wedged_output", _recover)
     yield state
     mc._PLAYBEST.stop()  # never leak a playbest thread across tests
 
@@ -317,6 +330,33 @@ def test_playback_failure_message(settings, monkeypatch, proc_table):
     monkeypatch.setattr(mc, "_spawn_player", _boom)
     reply = mc.build_music_handler(settings)("間人間", "chat-1")
     assert "播放失敗" in reply
+
+
+def test_spawn_retry_restarts_coreaudiod_once_on_wedge(settings, monkeypatch, proc_table):
+    # afplay can't start (CoreAudio -66681 wedge) → all quick attempts fail; we
+    # restart coreaudiod exactly once and try one more full pass before giving up.
+    monkeypatch.setattr(mc, "_verify_playing", lambda pid: False)
+    with pytest.raises(mc.PlaybackSpawnError):
+        mc._spawn_with_retry("/music/x.flac")
+    assert proc_table["recoveries"] == 1  # recovery attempted once, then gave up
+
+
+def test_spawn_retry_succeeds_after_coreaudiod_restart(settings, monkeypatch, proc_table):
+    # Quick attempts fail (wedge); after a coreaudiod restart the retry pass
+    # succeeds — proves the one-shot self-heal path returns a live pid.
+    attempts = {"n": 0}
+
+    def _verify(pid):
+        # Fail the first bounded pass; succeed once recovery has run.
+        attempts["n"] += 1
+        return proc_table["recoveries"] >= 1
+
+    monkeypatch.setattr(mc, "_verify_playing", _verify)
+    monkeypatch.setattr(mc, "_recover_wedged_output", lambda: (proc_table.__setitem__(
+        "recoveries", proc_table["recoveries"] + 1) or True))
+    pid = mc._spawn_with_retry("/music/x.flac")
+    assert pid in proc_table["alive"]
+    assert proc_table["recoveries"] == 1  # restarted exactly once
 
 
 def test_play_reports_failure_when_afplay_dies_on_spawn(settings, monkeypatch, proc_table):
@@ -645,3 +685,166 @@ def test_validate_song_path_rejects_appledouble_and_non_flac(settings, music_dir
 def test_validate_song_path_accepts_real_song(settings, music_dir):
     song = music_dir / "misc" / "Daft Punk - Get Lucky.flac"
     assert mc.validate_song_path(str(song), settings.openclaw_music_dir) is True
+
+
+# --- issue #47: health probe / continuous recovery / diagnostics -----------
+def test_music_now_reports_playing(settings, proc_table):
+    handler = mc.build_music_handler(settings)
+    handler("間人間", "chat-1")
+    reply = handler("now", "chat-1")
+    assert "正在播放" in reply
+
+
+def test_music_now_reports_no_playback_when_idle(settings, proc_table):
+    reply = mc.build_music_handler(settings)("now", "chat-1")
+    assert "沒有由龍蝦播放中" in reply
+
+
+def test_health_playing_when_song_alive(settings, proc_table):
+    mc.build_music_handler(settings)("間人間", "chat-1")
+    h = mc.playback_health(settings)
+    assert h.status == mc.HEALTH_PLAYING
+    assert h.track_exists is True
+
+
+def test_health_stale_dead_when_pid_died(settings, proc_table):
+    mc.build_music_handler(settings)("間人間", "chat-1")
+    pid = proc_table["spawned"][0][0]
+    proc_table["alive"].discard(pid)  # process ended on its own
+    h = mc.playback_health(settings)
+    assert h.status == mc.HEALTH_STALE_DEAD
+    assert h.pid_alive is False
+
+
+def test_health_pid_reuse_on_identity_mismatch(settings, proc_table):
+    mc.build_music_handler(settings)("間人間", "chat-1")
+    pid = proc_table["spawned"][0][0]
+    proc_table["start"][pid] = "start-SOMEONE-ELSE"  # pid reused, new identity
+    h = mc.playback_health(settings)
+    assert h.status == mc.HEALTH_PID_REUSE
+    assert h.identity_ok is False
+
+
+def test_health_missing_file_when_track_vanishes(settings, proc_table, music_dir):
+    mc.build_music_handler(settings)("間人間", "chat-1")
+    # delete the currently-recorded track on disk while the pid is still "alive"
+    state = json.loads(Path(settings.openclaw_music_player_state_path).read_text())
+    Path(state["path"]).unlink()
+    h = mc.playback_health(settings)
+    assert h.status == mc.HEALTH_MISSING_FILE
+    assert h.track_exists is False
+
+
+def test_health_flags_missing_music_root(settings, proc_table, monkeypatch):
+    monkeypatch.setattr(settings, "openclaw_music_dir", "/no/such/music/root")
+    h = mc.playback_health(settings)
+    assert h.music_root_ok is False
+    text = mc._format_health_text(h)
+    assert "音樂資料夾不可用" in text
+
+
+def test_continuous_loop_stops_after_repeated_spawn_failures(
+    settings, music_dir, proc_table, monkeypatch
+):
+    # Output device gone / drive asleep: every spawn dies. The loop must skip a
+    # bounded number then STOP (not spin forever), clear the session, and record
+    # the reason so /music now & /musicdiag can explain why music stopped.
+    monkeypatch.setattr(mc, "_PLAYBEST_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(mc, "_PLAYBACK_RETRY_SECONDS", 0.0)
+    monkeypatch.setattr(mc, "_verify_playing", lambda pid: False)  # nothing survives
+    _write_favorites(settings, music_dir)
+    handler = mc.build_music_handler(settings)
+    handler("playbest", "chat-1")
+    import time as _t
+    state_path = settings.openclaw_music_player_state_path
+    for _ in range(300):
+        if mc._read_failure(state_path) is not None:
+            break
+        _t.sleep(0.01)
+    assert not mc._PLAYBEST.is_active(), "loop must stop after repeated failures"
+    failure = mc._read_failure(state_path)
+    assert failure is not None
+    assert failure["count"] >= mc._MAX_CONSECUTIVE_SPAWN_FAILURES
+
+
+def test_acquire_audio_session_stops_music(settings, proc_table):
+    handler = mc.build_music_handler(settings)
+    handler("間人間", "chat-1")
+    pid = proc_table["spawned"][0][0]
+    mc.acquire_audio_session(settings, reason="saynow")
+    assert pid in proc_table["killed"]
+    assert not Path(settings.openclaw_music_player_state_path).exists()
+
+
+def test_single_play_records_mode_single(settings, proc_table):
+    mc.build_music_handler(settings)("間人間", "chat-1")
+    state = json.loads(Path(settings.openclaw_music_player_state_path).read_text())
+    assert state["mode"] == "single"
+
+
+def test_acquire_captures_single_and_resume_replays_track(settings, proc_table):
+    handler = mc.build_music_handler(settings)
+    handler("間人間", "chat-1")
+    first_pid = proc_table["spawned"][0][0]
+    token = mc.acquire_audio_session(settings, reason="saynow")
+    assert token is not None and token.mode == "single"
+    assert first_pid in proc_table["killed"]  # music stopped for the voice
+    assert not Path(settings.openclaw_music_player_state_path).exists()
+    resumed = mc.resume_after_voice(settings, token)
+    assert resumed is True
+    assert len(proc_table["spawned"]) == 2  # the same track was replayed
+    assert Path(settings.openclaw_music_player_state_path).exists()
+
+
+def test_resume_skipped_when_user_stopped_during_interruption(settings, proc_table):
+    handler = mc.build_music_handler(settings)
+    handler("間人間", "chat-1")
+    token = mc.acquire_audio_session(settings, reason="saynow")
+    handler("stop", "chat-1")  # user manually stops while the voice is talking
+    spawned_before = len(proc_table["spawned"])
+    resumed = mc.resume_after_voice(settings, token)
+    assert resumed is False  # deliberate stop must NOT be undone
+    assert len(proc_table["spawned"]) == spawned_before
+
+
+def test_resume_noop_when_nothing_was_playing(settings, proc_table):
+    token = mc.acquire_audio_session(settings, reason="saynow")
+    assert token is None  # nothing healthy to capture
+    assert mc.resume_after_voice(settings, token) is False
+
+
+def test_continuous_modes_record_their_mode(settings, music_dir, proc_table, monkeypatch):
+    monkeypatch.setattr(mc, "_PLAYBEST_POLL_SECONDS", 0.01)
+    import time as _t
+    state_path = settings.openclaw_music_player_state_path
+    handler = mc.build_music_handler(settings)
+    handler("random", "chat-1")
+    for _ in range(300):
+        if Path(state_path).exists():
+            break
+        _t.sleep(0.01)
+    assert json.loads(Path(state_path).read_text())["mode"] == "random"
+    handler("stop", "chat-1")
+    _write_favorites(settings, music_dir)
+    handler("playbest", "chat-1")
+    for _ in range(300):
+        if Path(state_path).exists():
+            break
+        _t.sleep(0.01)
+    assert json.loads(Path(state_path).read_text())["mode"] == "playbest"
+    handler("stop", "chat-1")
+
+
+def test_musicdiag_reports_tools_and_health(settings, proc_table):
+    reply = mc.build_musicdiag_handler(settings)("", "chat-1")
+    assert "音樂診斷" in reply
+    assert "afplay" in reply
+    assert "目前輸出裝置：MockSpeaker" in reply  # from stubbed _safe_output_device
+
+
+def test_musicdiag_flags_missing_tools(settings, proc_table, monkeypatch):
+    monkeypatch.setattr(mc.shutil, "which", lambda name: None)  # afplay gone
+    monkeypatch.setattr(mc, "_safe_output_device", lambda: (None, "SwitchAudioSource 未安裝"))
+    reply = mc.build_musicdiag_handler(settings)("", "chat-1")
+    assert "找不到" in reply  # afplay unavailable
+    assert "不可用" in reply  # output device unavailable

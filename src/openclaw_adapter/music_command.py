@@ -40,6 +40,7 @@ import json
 import logging
 import os
 import random
+import shutil
 import signal
 import subprocess
 import threading
@@ -156,13 +157,105 @@ def _verify_playing(pid: int) -> bool:
 # that transient instead of leaving the user with silence.
 _PLAYBACK_SPAWN_ATTEMPTS = 3
 _PLAYBACK_RETRY_SECONDS = 0.25
+# afplay dies within ~0.1s on an unreadable file / unusable output device, so a
+# short blocking probe is enough to recover the real reason the detached
+# (DEVNULL) spawn discards.
+_PROBE_TIMEOUT_SECONDS = 3
 
 
-def _spawn_with_retry(path: str) -> int:
+def _safe_output_device() -> "tuple[str | None, str | None]":
+    """``(device_name, error)`` for the current macOS output device, best-effort.
+    Never raises — health/diagnostic callers degrade gracefully when
+    SwitchAudioSource is missing instead of crashing the command."""
+    try:
+        from .music_audio_device import current_output_device
+
+        return current_output_device(), None
+    except Exception as exc:  # noqa: BLE001 — missing binary / failure → unknown
+        return None, str(exc)
+
+
+def _recover_wedged_output() -> bool:
+    """Best-effort clear of a wedged CoreAudio output (the ``-66681`` /
+    "AudioQueueStart failed" HAL state) by restarting coreaudiod, so the next
+    spawn attempt can actually start. Never raises."""
+    try:
+        from .audio_recovery import restart_coreaudiod
+
+        return restart_coreaudiod()
+    except Exception:  # noqa: BLE001 — recovery is best-effort, never fatal
+        return False
+
+
+def _probe_spawn_failure(path: str) -> str | None:
+    """Run ONE bounded blocking afplay to capture the real failure reason
+    (stderr / return code) after every detached attempt died. Returns a short
+    diagnostic string, or ``None`` when no clear reason is available."""
+    try:
+        proc = subprocess.run(
+            [_PLAYER_BINARY, path],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=_PROBE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return None  # it actually kept playing this time — no failure to report
+    except OSError as exc:
+        return f"afplay 無法執行：{exc}"
+    if proc.returncode == 0:
+        return None
+    detail = (proc.stderr or proc.stdout or "").strip()
+    return detail or f"afplay 回傳碼 {proc.returncode}"
+
+
+class PlaybackSpawnError(RuntimeError):
+    """Every spawn attempt for a track died on startup. Carries structured
+    diagnostics (attempt count, current output device, captured reason) so the
+    failure says WHY — an unreadable file vs. an unusable/busy audio device —
+    instead of a generic line, and so logs can record the same fields."""
+
+    def __init__(
+        self,
+        *,
+        path: str,
+        attempts: int,
+        output_device: str | None,
+        device_error: str | None,
+        reason: str | None,
+    ) -> None:
+        self.path = path
+        self.attempts = attempts
+        self.output_device = output_device
+        self.device_error = device_error
+        self.reason = reason
+        super().__init__(self._build_message())
+
+    def _build_message(self) -> str:
+        parts = [f"afplay 連續 {self.attempts} 次啟動失敗"]
+        if self.reason:
+            parts.append(f"原因：{self.reason}")
+        if self.output_device:
+            parts.append(f"目前輸出裝置：{self.output_device}")
+        elif self.device_error:
+            parts.append(f"輸出裝置未知：{self.device_error}")
+        parts.append(
+            "（檔案可能無法讀取，或音訊輸出裝置忙碌／不可用——"
+            "可用 /music 的音源選單切換到可用裝置）"
+        )
+        return "；".join(parts)
+
+
+def _spawn_with_retry(path: str, *, allow_recovery: bool = True) -> int:
     """Spawn afplay and confirm it actually started, retrying a couple of times
     to absorb the transient audio-device-busy race. Returns the live pid, or
-    raises if every attempt died on startup (genuinely unreadable file / no
-    usable audio device)."""
+    raises :class:`PlaybackSpawnError` (with diagnostics) if every attempt died
+    on startup (genuinely unreadable file / no usable audio device).
+
+    If all quick attempts fail (the ``-66681`` CoreAudio wedge — quick retries
+    can't clear it), restart coreaudiod once and try one more full pass before
+    giving up. ``allow_recovery=False`` on the recursive pass bounds it to a
+    single daemon restart per play."""
     for attempt in range(_PLAYBACK_SPAWN_ATTEMPTS):
         pid = _spawn_player(path)
         if _verify_playing(pid):
@@ -170,9 +263,15 @@ def _spawn_with_retry(path: str) -> int:
         _terminate(pid)  # dead/zombie afplay — never leave it around
         if attempt + 1 < _PLAYBACK_SPAWN_ATTEMPTS:
             time.sleep(_PLAYBACK_RETRY_SECONDS)
-    raise RuntimeError(
-        "afplay 連續啟動失敗（檔案無法讀取，或音訊輸出裝置忙碌／不可用——"
-        "可用 /music 的音源選單切換到可用裝置）"
+    if allow_recovery and _recover_wedged_output():
+        return _spawn_with_retry(path, allow_recovery=False)
+    device, device_error = _safe_output_device()
+    raise PlaybackSpawnError(
+        path=path,
+        attempts=_PLAYBACK_SPAWN_ATTEMPTS,
+        output_device=device,
+        device_error=device_error,
+        reason=_probe_spawn_failure(path),
     )
 
 
@@ -366,6 +465,170 @@ def _clear_state(state_path: str) -> None:
         logger.warning("music: could not clear player state %s", state_path)
 
 
+# --- continuous-mode failure record ---------------------------------------
+# When continuous playback stops because every spawn keeps failing (output
+# device gone, external drive asleep…), the loop runs with no chat to report to.
+# It records the reason next to the player state so /music now and /musicdiag can
+# show WHY the music stopped instead of leaving the user guessing.
+def _failure_state_path(state_path: str) -> str:
+    return str(Path(state_path).with_name("music_playback_failure.json"))
+
+
+def _write_failure(state_path: str, reason: str, count: int) -> None:
+    _write_json(
+        _failure_state_path(state_path),
+        {
+            "reason": reason,
+            "count": count,
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        },
+    )
+
+
+def _read_failure(state_path: str) -> dict | None:
+    data = _read_json(_failure_state_path(state_path))
+    return data if isinstance(data, dict) and data.get("reason") else None
+
+
+def _clear_failure(state_path: str) -> None:
+    try:
+        Path(_failure_state_path(state_path)).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.warning("music: could not clear playback failure record %s", state_path)
+
+
+# --- voice-interruption resume marker (issue #47) --------------------------
+# When /saynow needs the speakers, it stops the current music and writes this
+# marker (mode + track + a one-shot epoch). After the announcement it resumes
+# the SAME playback — UNLESS the marker is gone (the user ran /music stop during
+# the interruption) or a newer epoch superseded it. Lives next to the player
+# state so the decision survives across the bot and the LAN command-bridge.
+def _interrupt_path(state_path: str) -> str:
+    return str(Path(state_path).with_name("music_interrupt.json"))
+
+
+def _write_interrupt(state_path: str, data: dict) -> None:
+    _write_json(_interrupt_path(state_path), data)
+
+
+def _read_interrupt(state_path: str) -> dict | None:
+    data = _read_json(_interrupt_path(state_path))
+    return data if isinstance(data, dict) and data.get("epoch") else None
+
+
+def _clear_interrupt(state_path: str) -> None:
+    try:
+        Path(_interrupt_path(state_path)).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.warning("music: could not clear interrupt marker %s", state_path)
+
+
+# --- playback health probe -------------------------------------------------
+HEALTH_NO_PLAYBACK = "no_playback"
+HEALTH_PLAYING = "playing"
+HEALTH_STALE_DEAD = "stale_dead"  # recorded process no longer alive
+HEALTH_PID_REUSE = "pid_reuse"  # pid alive but not our afplay (reused identity)
+HEALTH_MISSING_FILE = "missing_file"  # recorded as playing but the file vanished
+
+
+@dataclass(frozen=True)
+class PlaybackHealth:
+    """A read-only snapshot of whether OpenClaw playback is actually healthy,
+    crossing the boundaries that make Mac mini playback fragile: process
+    liveness/identity, the track file, the music root, and the output device."""
+
+    status: str
+    has_state: bool
+    pid: int | None
+    pid_alive: bool
+    is_player: bool
+    identity_ok: bool
+    track_name: str | None
+    track_path: str | None
+    track_exists: bool
+    music_root: str
+    music_root_ok: bool
+    output_device: str | None
+    output_device_error: str | None
+    last_failure: dict | None
+
+
+def playback_health(settings: AssistantSettings) -> PlaybackHealth:
+    """Probe current playback health without mutating state (so it is safe to
+    call from diagnostics). Distinguishes healthy playing, stale/dead process,
+    pid reuse, a vanished current file, a missing music root, and no playback."""
+    state_path = settings.openclaw_music_player_state_path
+    music_root = settings.openclaw_music_dir
+    root_ok = Path(music_root).is_dir()
+    device, device_err = _safe_output_device()
+    last_failure = _read_failure(state_path)
+    state = _read_json(state_path)
+    pid = state.get("pid") if isinstance(state, dict) else None
+    if not isinstance(pid, int) or pid <= 0:
+        return PlaybackHealth(
+            status=HEALTH_NO_PLAYBACK, has_state=bool(state), pid=None,
+            pid_alive=False, is_player=False, identity_ok=False,
+            track_name=None, track_path=None, track_exists=False,
+            music_root=music_root, music_root_ok=root_ok,
+            output_device=device, output_device_error=device_err,
+            last_failure=last_failure,
+        )
+    name = state.get("name")
+    path = state.get("path")
+    track_exists = bool(path) and Path(path).is_file()
+    alive = _pid_alive(pid)
+    is_player = alive and _pid_is_player(pid)
+    identity_ok = (
+        is_player and bool(state.get("start")) and state.get("start") == _pid_start_time(pid)
+    )
+    if not alive:
+        status = HEALTH_STALE_DEAD
+    elif not is_player or not identity_ok:
+        status = HEALTH_PID_REUSE
+    elif not track_exists:
+        status = HEALTH_MISSING_FILE
+    else:
+        status = HEALTH_PLAYING
+    return PlaybackHealth(
+        status=status, has_state=True, pid=pid, pid_alive=alive,
+        is_player=is_player, identity_ok=identity_ok, track_name=name,
+        track_path=path, track_exists=track_exists, music_root=music_root,
+        music_root_ok=root_ok, output_device=device,
+        output_device_error=device_err, last_failure=last_failure,
+    )
+
+
+def _format_health_text(h: PlaybackHealth) -> str:
+    lines: list[str] = []
+    if h.status == HEALTH_PLAYING:
+        name = h.track_name or (Path(h.track_path).stem if h.track_path else "?")
+        lines.append(f"▶️ 正在播放：{name}")
+    elif h.status == HEALTH_NO_PLAYBACK:
+        lines.append("⏹ 目前沒有由龍蝦播放中的音樂。")
+    elif h.status == HEALTH_STALE_DEAD:
+        lines.append("⚠️ 播放狀態殘留：紀錄的程序已結束（視為未播放，下次操作會自動清除）。")
+    elif h.status == HEALTH_PID_REUSE:
+        lines.append("⚠️ 播放狀態殘留：pid 已被系統重用為其他程序（不會誤殺，視為未播放）。")
+    elif h.status == HEALTH_MISSING_FILE:
+        lines.append(f"⚠️ 仍記為播放中，但檔案已不存在：{h.track_path}")
+    if h.output_device:
+        lines.append(f"輸出裝置：{h.output_device}")
+    elif h.output_device_error:
+        lines.append(f"輸出裝置未知：{h.output_device_error}")
+    if not h.music_root_ok:
+        lines.append(f"⚠️ 音樂資料夾不可用（外接碟可能未掛載／休眠）：{h.music_root}")
+    if h.last_failure and h.status != HEALTH_PLAYING:
+        lines.append(
+            f"上次連續播放停止原因（連續 {h.last_failure.get('count')} 次失敗）："
+            f"{h.last_failure.get('reason')}"
+        )
+    return "\n".join(lines)
+
+
 # --- continuous-mode session (cross-process) -------------------------------
 # Continuous playback (playbest / random) runs as an in-memory loop in WHICHEVER
 # process started it — but the Telegram poller and the LAN command-bridge are
@@ -412,10 +675,13 @@ def _terminate_running(state_path: str) -> None:
     _clear_state(state_path)
 
 
-def _start_song(entry: dict, state_path: str) -> int:
+def _start_song(entry: dict, state_path: str, mode: str = "single") -> int:
     """Stop the previous track, spawn ``entry``, persist its identity, return
     the pid. Shared by user-initiated plays and the playbest loop; callers that
-    are *not* the playbest loop must stop playbest first (see :func:`_play`)."""
+    are *not* the playbest loop must stop playbest first (see :func:`_play`).
+
+    ``mode`` (single / random / playbest) is recorded next to the pid so a voice
+    interruption can later resume the SAME kind of playback (issue #47)."""
     _terminate_running(state_path)
     pid = _spawn_with_retry(entry["path"])
     _write_json(
@@ -425,8 +691,10 @@ def _start_song(entry: dict, state_path: str) -> int:
             "name": entry["name"],
             "path": entry["path"],
             "start": _pid_start_time(pid),
+            "mode": mode,
         },
     )
+    _clear_failure(state_path)  # a healthy spawn clears any stale failure record
     return pid
 
 
@@ -438,6 +706,10 @@ def _stop(state_path: str) -> str:
     # the next song the moment we kill the current track.
     had_session = _read_session_token(state_path) is not None
     _clear_session(state_path)
+    _clear_failure(state_path)  # a manual stop resets any continuous-failure record
+    # A manual stop also cancels any pending voice-interruption resume: if the
+    # user deliberately stopped during/after a /saynow, music must NOT come back.
+    _clear_interrupt(state_path)
     was_continuous = _PLAYBEST.stop()
     running = _current_running(state_path)
     if running is not None:
@@ -469,6 +741,12 @@ def _play(entry: dict, state_path: str) -> str:
 
 # --- playbest: continuous shuffled favorite playback -----------------------
 _PLAYBEST_POLL_SECONDS = 1.0
+# Continuous mode skips a single bad track, but after this many *consecutive*
+# spawn failures it stops instead of spinning forever on a broken environment
+# (output device unavailable, external drive asleep/unmounted). Matches the
+# per-track _PLAYBACK_SPAWN_ATTEMPTS so a transient device-busy race never trips
+# it, only a sustained failure does.
+_MAX_CONSECUTIVE_SPAWN_FAILURES = 3
 
 
 class PlaybestScheduler:
@@ -513,7 +791,10 @@ class PlaybestController:
         with self._lock:
             return self._active
 
-    def start(self, entries_provider, state_path: str, on_play=None, is_playable=None) -> None:
+    def start(
+        self, entries_provider, state_path: str, on_play=None, is_playable=None,
+        mode: str = "playbest",
+    ) -> None:
         self.stop()
         # Claim the shared session: this token is what the loop checks each tick.
         # A later start() (even in another process) overwrites it, and a stop()
@@ -524,7 +805,7 @@ class PlaybestController:
             self._active = True
             thread = threading.Thread(
                 target=self._loop,
-                args=(entries_provider, state_path, on_play, is_playable, token),
+                args=(entries_provider, state_path, on_play, is_playable, token, mode),
                 daemon=True,
                 name="music-playbest",
             )
@@ -548,8 +829,9 @@ class PlaybestController:
             thread.join(timeout=2.0)
         return was_active
 
-    def _loop(self, entries_provider, state_path: str, on_play, is_playable=None, token=None) -> None:
+    def _loop(self, entries_provider, state_path: str, on_play, is_playable=None, token=None, mode: str = "playbest") -> None:
         scheduler = PlaybestScheduler(entries_provider, exists_fn=is_playable)
+        consecutive_failures = 0
 
         def _live() -> bool:
             # Run only while locally active AND we still own the shared session.
@@ -577,11 +859,30 @@ class PlaybestController:
                 with self._lock:
                     if not self._active:  # stopped before we could spawn
                         break
-                    pid = _start_song(entry, state_path)
+                    pid = _start_song(entry, state_path, mode=mode)
                     self._current_pid = pid
-            except Exception:  # noqa: BLE001
-                logger.exception("playbest: spawn failed path=%s", entry.get("path"))
+            except Exception as exc:  # noqa: BLE001
+                consecutive_failures += 1
+                logger.exception(
+                    "playbest: spawn failed (%d/%d) path=%s",
+                    consecutive_failures, _MAX_CONSECUTIVE_SPAWN_FAILURES,
+                    entry.get("path"),
+                )
+                # Bounded recovery: skip one bad track, but stop spinning forever
+                # when the environment is broken (output device gone, drive
+                # asleep). Record the reason so /music now & /musicdiag explain it.
+                if consecutive_failures >= _MAX_CONSECUTIVE_SPAWN_FAILURES:
+                    reason = str(exc)
+                    _write_failure(state_path, reason, consecutive_failures)
+                    _clear_session(state_path)
+                    logger.error(
+                        "playbest: stopping continuous mode after %d consecutive "
+                        "spawn failures; last reason: %s",
+                        consecutive_failures, reason,
+                    )
+                    break
                 continue
+            consecutive_failures = 0
             if on_play is not None:
                 try:
                     on_play(entry)
@@ -623,6 +924,7 @@ def _play_random_continuous(music_dir: str, index_path: str, state_path: str) ->
         entries_provider=provider,
         state_path=state_path,
         is_playable=is_playable,
+        mode="random",
     )
     return "開始隨機播放（自動接續下一首）。用 ⏹ 停止 可停止。"
 
@@ -647,6 +949,7 @@ def _play_best(store: FavoritesStore, state_path: str, music_dir: str) -> str:
         state_path=state_path,
         on_play=lambda e: store.mark_played(e.get("id", "")),
         is_playable=is_playable,
+        mode="playbest",
     )
     return "開始連續隨機播放最愛歌曲。用 /music stop 可停止。"
 
@@ -677,6 +980,102 @@ def play_path(settings: AssistantSettings, path: str, name: str | None = None) -
 
 def stop_playback(settings: AssistantSettings) -> str:
     return _stop(settings.openclaw_music_player_state_path)
+
+
+@dataclass(frozen=True)
+class ResumeToken:
+    """A narrow snapshot of what was playing when a voice interruption took the
+    speakers, so ``/saynow`` can resume the SAME playback afterwards without
+    knowing any music internals (issue #47). ``epoch`` is a one-shot id matched
+    against the on-disk interrupt marker: a manual ``/music stop`` deletes the
+    marker, so resume becomes a no-op."""
+
+    mode: str  # single / random / playbest
+    track_path: str | None
+    track_name: str | None
+    epoch: str
+
+
+def acquire_audio_session(
+    settings: AssistantSettings, *, reason: str = ""
+) -> "ResumeToken | None":
+    """The one shared primitive for taking exclusive use of the Mac mini's audio
+    output. The Bluetooth/AirPlay sink can't mix two ``afplay`` streams, so any
+    consumer about to play (e.g. ``/saynow`` voice) must free the device through
+    THIS call rather than each caller separately remembering to stop music.
+
+    Snapshots healthy playback into a :class:`ResumeToken` (and records an
+    interrupt marker) BEFORE stopping it, so the caller can later
+    :func:`resume_after_voice`. Returns ``None`` when nothing healthy was
+    playing (nothing to resume). Stopping is best-effort and never raises."""
+    state_path = settings.openclaw_music_player_state_path
+    logger.info(
+        "audio-session: acquiring exclusive output%s",
+        f" for {reason}" if reason else "",
+    )
+    token = _snapshot_resume_token(settings)
+    try:
+        _stop(state_path)  # frees the device + clears any stale interrupt marker
+    except Exception:  # noqa: BLE001 — never let freeing the device crash the caller
+        logger.exception("audio-session: failed to stop music before exclusive audio")
+    if token is not None:
+        _write_interrupt(
+            state_path,
+            {
+                "epoch": token.epoch,
+                "reason": reason,
+                "mode": token.mode,
+                "path": token.track_path,
+                "name": token.track_name,
+                "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            },
+        )
+    return token
+
+
+def _snapshot_resume_token(settings: AssistantSettings) -> "ResumeToken | None":
+    """Capture the current playback as a resume token, or ``None`` when nothing
+    is healthily playing (a stale/dead/reused pid is not worth resuming)."""
+    health = playback_health(settings)
+    if health.status != HEALTH_PLAYING:
+        return None
+    state = _read_json(settings.openclaw_music_player_state_path)
+    mode = state.get("mode") if isinstance(state, dict) else None
+    return ResumeToken(
+        mode=mode or "single",
+        track_path=health.track_path,
+        track_name=health.track_name,
+        epoch=uuid.uuid4().hex,
+    )
+
+
+def resume_after_voice(
+    settings: AssistantSettings, token: "ResumeToken | None"
+) -> bool:
+    """Resume the playback captured by :func:`acquire_audio_session` after a voice
+    announcement finishes. No-ops (returns ``False``) when there is no token, the
+    interrupt marker is gone (user ran ``/music stop`` meanwhile), or a newer
+    epoch superseded it. Returns ``True`` only when it actually restarted music."""
+    if token is None:
+        return False
+    state_path = settings.openclaw_music_player_state_path
+    marker = _read_interrupt(state_path)
+    if marker is None or marker.get("epoch") != token.epoch:
+        return False  # user stopped during the interruption, or it was superseded
+    _clear_interrupt(state_path)
+    try:
+        if token.mode == "random":
+            play_random(settings)
+        elif token.mode == "playbest":
+            start_playbest(settings, FavoritesStore(settings.openclaw_music_best_path))
+        elif token.track_path:
+            play_path(settings, token.track_path, token.track_name)
+        else:
+            return False
+    except Exception:  # noqa: BLE001 — a failed resume must not crash the caller
+        logger.exception("audio-session: failed to resume music after voice")
+        return False
+    return True
 
 
 def start_playbest(settings: AssistantSettings, store: FavoritesStore) -> str:
@@ -739,6 +1138,8 @@ def build_music_handler(
         low = arg.lower()
         if low == "stop":
             return _stop(state_path)
+        if low == "now":
+            return _format_health_text(playback_health(settings))
         if low == "playbest":
             return _play_best(store, state_path, music_dir)
 
@@ -770,6 +1171,53 @@ def build_musicnowbest_handler(settings: AssistantSettings) -> Callable[[str, st
 
     def handler(raw: str, chat_id: str) -> str:
         return add_current_to_favorites(settings, store)
+
+    return handler
+
+
+def _musicdiag_text(settings: AssistantSettings) -> str:
+    """One-shot Mac mini music diagnostic (issue #47): tool availability, current
+    output device, music-root status, and live playback health. Read-only — it
+    never mutates system power settings or playback state."""
+    lines = ["🩺 音樂診斷（Mac mini）"]
+    afplay = shutil.which(_PLAYER_BINARY)
+    lines.append(f"afplay：{('可用 ' + afplay) if afplay else '找不到（此功能僅支援 macOS）'}")
+
+    device, device_err = _safe_output_device()
+    if device is not None:
+        lines.append("SwitchAudioSource：可用")
+        lines.append(f"目前輸出裝置：{device}")
+    else:
+        lines.append(f"SwitchAudioSource／輸出裝置：不可用（{device_err}）")
+
+    root = settings.openclaw_music_dir
+    rp = Path(root)
+    if rp.is_dir():
+        lines.append(f"音樂資料夾：可用 {root}")
+    elif rp.exists():
+        lines.append(f"音樂資料夾：路徑不是資料夾 {root}")
+    else:
+        lines.append(f"音樂資料夾：找不到 {root}（外接碟可能未掛載／休眠）")
+
+    lines.append("——")
+    lines.append(_format_health_text(playback_health(settings)))
+
+    # launchd's PATH omits /opt/homebrew/bin; flag it only when a tool is missing
+    # from PATH yet may well be installed via Homebrew.
+    if device is None and shutil.which(_BINARY_HINT) is None:
+        lines.append(
+            "提示：服務在 launchd 下 PATH 不含 /opt/homebrew/bin；"
+            "若工具其實已安裝卻找不到，請確認 Homebrew 路徑。"
+        )
+    return "\n".join(lines)
+
+
+_BINARY_HINT = "SwitchAudioSource"
+
+
+def build_musicdiag_handler(settings: AssistantSettings) -> Callable[[str, str], str]:
+    def handler(raw: str, chat_id: str) -> str:
+        return _musicdiag_text(settings)
 
     return handler
 

@@ -28,7 +28,8 @@ from typing import Callable
 from assistant_runtime import AssistantSettings, build_ssl_context
 from price_monitor_bot.bot import TelegramBotClient
 
-from .music_command import stop_playback
+from .audio_recovery import restart_coreaudiod
+from .music_command import acquire_audio_session, resume_after_voice
 from .quiz_vocab_audio import (
     QuizVocabAudioError,
     VoiceParams,
@@ -45,12 +46,7 @@ _PLAYER_BINARY = "afplay"
 _PLAY_TIMEOUT_SECONDS = 120
 
 
-def play_audio_file(path: str) -> "tuple[bool, str]":
-    """Play *path* through the Mac speakers (blocking). Returns ``(ok, error)``;
-    blocking so a schedule's later steps (e.g. resume music) run after the
-    announcement finishes, and so failures surface instead of being lost."""
-    if shutil.which(_PLAYER_BINARY) is None:
-        return False, "找不到 afplay（此功能僅支援 macOS）。"
+def _run_afplay(path: str) -> "tuple[bool, str]":
     try:
         proc = subprocess.run(
             [_PLAYER_BINARY, path],
@@ -65,6 +61,28 @@ def play_audio_file(path: str) -> "tuple[bool, str]":
     if proc.returncode != 0:
         return False, (proc.stderr or proc.stdout or "未知錯誤").strip()
     return True, ""
+
+
+def play_audio_file(path: str) -> "tuple[bool, str]":
+    """Play *path* through the Mac speakers (blocking). Returns ``(ok, error)``;
+    blocking so a schedule's later steps (e.g. resume music) run after the
+    announcement finishes, and so failures surface instead of being lost.
+
+    afplay intermittently dies on startup with "AudioQueueStart failed"
+    (``-66681``) — a known macOS CoreAudio wedge where the output queue can't
+    start even though the device is fine. Restarting coreaudiod clears it, so on
+    failure we restart the daemon once (passwordless sudo) and retry."""
+    if shutil.which(_PLAYER_BINARY) is None:
+        return False, "找不到 afplay（此功能僅支援 macOS）。"
+    ok, err = _run_afplay(path)
+    if ok:
+        return True, ""
+    if restart_coreaudiod():
+        logger.warning("afplay failed (%s); restarted coreaudiod and retrying", err[:120])
+        ok, err = _run_afplay(path)
+        if ok:
+            return True, ""
+    return False, err
 
 # Display order + Chinese labels for the five tunable scales.
 _PARAM_LABELS: list[tuple[str, str]] = [
@@ -251,16 +269,24 @@ def build_saynow_handler(
         except Exception as exc:
             logger.exception("/saynow synthesis failed text=%s", text[:40])
             return f"合成失敗：{exc}"
-        # Free the audio device first: the Mac mini's Bluetooth output can't mix
-        # two streams, so OpenClaw music playing concurrently makes afplay fail
-        # with "AudioQueueStart failed". Stop any OpenClaw music before playing.
+        # Free the audio device first through the shared audio-session primitive
+        # (issue #47): the Mac mini's Bluetooth output can't mix two streams, so
+        # OpenClaw music playing concurrently makes afplay fail with
+        # "AudioQueueStart failed". The primitive also snapshots any music it
+        # interrupts so we can resume it once the announcement finishes.
+        token = acquire_audio_session(settings, reason="saynow")
+        resumed = False
         try:
-            stop_playback(settings)
-        except Exception:
-            logger.exception("/saynow failed to stop music before playback")
-        ok, err = play_audio_file(str(audio.output_path))
+            ok, err = play_audio_file(str(audio.output_path))
+        finally:
+            # Resume regardless of playback outcome — restore the prior state —
+            # but only if the user did not /music stop during the announcement.
+            resumed = resume_after_voice(settings, token)
         if not ok:
             return f"已合成但播放失敗：{err}"
-        return f"已在 Mac mini 播放語音（{audio.engine_label}）：{text}"
+        msg = f"已在 Mac mini 播放語音（{audio.engine_label}）：{text}"
+        if resumed:
+            msg += "\n（已恢復先前中斷的音樂播放）"
+        return msg
 
     return handler
