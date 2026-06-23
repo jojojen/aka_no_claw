@@ -21,11 +21,15 @@ from openclaw_adapter.command_bridge import CommandBridge, build_chat_prompt
 from openclaw_adapter.command_bridge_models import (
     CHAT_BACKEND_CLOUD_PICKLE,
     CHAT_BACKEND_LOCAL,
+    CHAT_TOOL_SEARCH,
     MAX_HISTORY_TURNS,
     ChatTurn,
     MODE_CHAT,
     MODE_INVESTMENT,
     MODE_TRANSLATION,
+    ROUTER_DECISION_DIRECT,
+    ROUTER_DECISION_TOOL,
+    RouterDecision,
     STATUS_ERROR,
     STATUS_OK,
     STATUS_UNSUPPORTED,
@@ -35,6 +39,7 @@ from openclaw_adapter.command_bridge_models import (
     SUBMODE_TEXT_TRANSLATION,
     RequestValidationError,
     parse_request,
+    parse_router_decision,
 )
 
 
@@ -411,6 +416,313 @@ def test_chat_stream_uses_history(bridge, monkeypatch):
     list(bridge.stream(req, "rid-h"))
     assert "千本櫻" in captured["prompt"]
     assert "再講一首" in captured["prompt"]
+
+
+# --- #45 router decision parsing (trust boundary) -------------------------
+def test_parse_router_decision_direct():
+    d = parse_router_decision('{"decision":"direct","reason_summary":"閒聊"}')
+    assert d == RouterDecision(decision=ROUTER_DECISION_DIRECT, reason_summary="閒聊")
+
+
+def test_parse_router_decision_tool():
+    d = parse_router_decision(
+        '{"decision":"tool","tool":"/search","query":"初音 新歌","reason_summary":"需即時"}'
+    )
+    assert d.decision == ROUTER_DECISION_TOOL
+    assert d.tool == CHAT_TOOL_SEARCH
+    assert d.query == "初音 新歌"
+
+
+def test_parse_router_decision_extracts_json_from_noise():
+    raw = '<think>嗯</think> 好的：\n```json\n{"decision":"tool","tool":"/search","query":"q"}\n```'
+    d = parse_router_decision(raw)
+    assert d is not None and d.tool == CHAT_TOOL_SEARCH and d.query == "q"
+
+
+@pytest.mark.parametrize("raw", [
+    None,
+    42,
+    "not json at all",
+    '{"decision":"tool","tool":"/rm-rf","query":"x"}',   # tool not whitelisted
+    '{"decision":"tool","tool":"/search","query":"   "}',  # empty query
+    '{"decision":"tool","tool":"/search"}',                # missing query
+    '{"decision":"teleport"}',                             # unknown decision
+])
+def test_parse_router_decision_rejects_untrusted(raw):
+    assert parse_router_decision(raw) is None
+
+
+# --- #45 chat contextual tool routing -------------------------------------
+def _tool_settings(debug: bool = False):
+    return SimpleNamespace(
+        openclaw_web_chat_tool_debug=debug,
+        openclaw_local_text_model="qwen3:14b",
+        openclaw_local_text_endpoint="http://local",
+        openclaw_local_text_timeout_seconds=60,
+        openclaw_opencode_model="big-pickle",
+    )
+
+
+def _result(title, url, snippet):
+    return SimpleNamespace(title=title, url=url, snippet=snippet)
+
+
+def test_chat_direct_decision_does_not_call_tool(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(b, "_generate_router_json", lambda prompt: '{"decision":"direct"}')
+    monkeypatch.setattr(b, "_ollama_generate_blocking", lambda prompt: f"direct:{prompt}")
+
+    def _no_search(*a, **k):
+        raise AssertionError("web_search must not run on a direct decision")
+
+    monkeypatch.setattr("openclaw_adapter.web_search.web_search", _no_search)
+    resp = b.handle(parse_request({"mode": "chat", "input": "嗨", "chat_backend": "local"}))
+    assert resp.status == STATUS_OK
+    assert resp.message.startswith("direct:")
+
+
+def test_chat_tool_search_triggers_grounded_answer(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        b, "_generate_router_json",
+        lambda prompt: '{"decision":"tool","tool":"/search","query":"初音 最新單曲"}',
+    )
+    seen = {}
+
+    def _search(q, *, max_results, reuse_browser):
+        seen["query"] = q
+        seen["reuse_browser"] = reuse_browser
+        return (_result("初音官網", "https://miku.example/news", "2026 新單曲發售"),)
+
+    monkeypatch.setattr("openclaw_adapter.web_search.web_search", _search)
+    monkeypatch.setattr(b, "_ollama_generate_blocking", lambda prompt: "她推出了新單曲。")
+
+    resp = b.handle(parse_request({"mode": "chat", "input": "她有新歌嗎", "chat_backend": "local"}))
+    assert resp.status == STATUS_OK
+    assert seen["query"] == "初音 最新單曲"
+    # Retrieval off-thread must use a one-shot browser.
+    assert seen["reuse_browser"] is False
+    assert "她推出了新單曲。" in resp.message
+    # The tool-usage marker is ALWAYS shown (not gated by the debug flag).
+    assert "已使用工具" in resp.message
+    assert CHAT_TOOL_SEARCH in resp.message
+    # Sources are always appended so the answer is traceable.
+    assert "https://miku.example/news" in resp.message
+
+
+def test_router_prompt_includes_history_for_rewrite(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    seen = {}
+
+    def _router(prompt):
+        seen["prompt"] = prompt
+        return '{"decision":"direct"}'
+
+    monkeypatch.setattr(b, "_generate_router_json", _router)
+    monkeypatch.setattr(b, "_ollama_generate_blocking", lambda prompt: "ok")
+    b.handle(parse_request({
+        "mode": "chat", "input": "她有新歌嗎", "chat_backend": "local",
+        "history": [{"role": "user", "content": "初音未來是誰"}],
+    }))
+    # The prior subject must reach the router so it can rewrite the pronoun query.
+    assert "初音未來" in seen["prompt"]
+    assert "她有新歌嗎" in seen["prompt"]
+
+
+def test_synthesis_prompt_includes_source_fields(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        b, "_generate_router_json",
+        lambda prompt: '{"decision":"tool","tool":"/search","query":"q"}',
+    )
+    monkeypatch.setattr(
+        "openclaw_adapter.web_search.web_search",
+        lambda q, *, max_results, reuse_browser: (
+            _result("標題A", "https://a.example", "摘要片段A"),
+        ),
+    )
+    seen = {}
+
+    def _synth(prompt):
+        seen["prompt"] = prompt
+        return "答案"
+
+    monkeypatch.setattr(b, "_ollama_generate_blocking", _synth)
+    b.handle(parse_request({"mode": "chat", "input": "問題", "chat_backend": "local"}))
+    assert "標題A" in seen["prompt"]
+    assert "https://a.example" in seen["prompt"]
+    assert "摘要片段A" in seen["prompt"]
+
+
+def test_chat_tool_uses_chosen_cloud_backend_for_synthesis(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        b, "_generate_router_json",
+        lambda prompt: '{"decision":"tool","tool":"/search","query":"q"}',
+    )
+    monkeypatch.setattr(
+        "openclaw_adapter.web_search.web_search",
+        lambda q, *, max_results, reuse_browser: (_result("T", "https://u.example", "S"),),
+    )
+
+    class _Client:
+        def generate(self, prompt, *, temperature=0.0):
+            return "雲端合成答案"
+
+    monkeypatch.setattr(b, "_build_cloud_chat_client", lambda: _Client())
+    # local synthesis must NOT be used when the user picked cloud.
+    monkeypatch.setattr(
+        b, "_ollama_generate_blocking",
+        lambda prompt: (_ for _ in ()).throw(AssertionError("should use cloud")),
+    )
+    resp = b.handle(parse_request({"mode": "chat", "input": "問", "chat_backend": "cloud_pickle"}))
+    assert "雲端合成答案" in resp.message
+
+
+def test_debug_flag_appends_model_label(monkeypatch):
+    b = CommandBridge(settings=_tool_settings(debug=True))
+    monkeypatch.setattr(
+        b, "_generate_router_json",
+        lambda prompt: '{"decision":"tool","tool":"/search","query":"q"}',
+    )
+    monkeypatch.setattr(
+        "openclaw_adapter.web_search.web_search",
+        lambda q, *, max_results, reuse_browser: (_result("T", "https://u.example", "S"),),
+    )
+    monkeypatch.setattr(b, "_ollama_generate_blocking", lambda prompt: "答案")
+    resp = b.handle(parse_request({"mode": "chat", "input": "問", "chat_backend": "local"}))
+    assert "合成模型" in resp.message and "qwen3:14b" in resp.message
+
+
+def test_debug_flag_off_hides_model_label(monkeypatch):
+    b = CommandBridge(settings=_tool_settings(debug=False))
+    monkeypatch.setattr(
+        b, "_generate_router_json",
+        lambda prompt: '{"decision":"tool","tool":"/search","query":"q"}',
+    )
+    monkeypatch.setattr(
+        "openclaw_adapter.web_search.web_search",
+        lambda q, *, max_results, reuse_browser: (_result("T", "https://u.example", "S"),),
+    )
+    monkeypatch.setattr(b, "_ollama_generate_blocking", lambda prompt: "答案")
+    resp = b.handle(parse_request({"mode": "chat", "input": "問", "chat_backend": "local"}))
+    assert "合成模型" not in resp.message
+    # ...but the tool-usage marker is still shown even with debug off.
+    assert "已使用工具" in resp.message
+
+
+def test_router_unavailable_falls_back_to_direct(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+
+    def _boom(prompt):
+        raise RuntimeError("ollama down")
+
+    monkeypatch.setattr(b, "_generate_router_json", _boom)
+    monkeypatch.setattr(b, "_ollama_generate_blocking", lambda prompt: "direct-answer")
+    monkeypatch.setattr(
+        "openclaw_adapter.web_search.web_search",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no tool on router failure")),
+    )
+    resp = b.handle(parse_request({"mode": "chat", "input": "嗨", "chat_backend": "local"}))
+    assert resp.status == STATUS_OK
+    assert resp.message == "direct-answer"
+
+
+def test_invalid_router_json_falls_back_to_direct(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(b, "_generate_router_json", lambda prompt: "totally not json")
+    monkeypatch.setattr(b, "_ollama_generate_blocking", lambda prompt: "direct-answer")
+    monkeypatch.setattr(
+        "openclaw_adapter.web_search.web_search",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no tool on bad JSON")),
+    )
+    resp = b.handle(parse_request({"mode": "chat", "input": "嗨", "chat_backend": "local"}))
+    assert resp.message == "direct-answer"
+
+
+def test_non_whitelisted_tool_falls_back_to_direct(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        b, "_generate_router_json",
+        lambda prompt: '{"decision":"tool","tool":"/shell","query":"rm -rf /"}',
+    )
+    monkeypatch.setattr(b, "_ollama_generate_blocking", lambda prompt: "direct-answer")
+    monkeypatch.setattr(
+        "openclaw_adapter.web_search.web_search",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("never dispatch unknown tool")),
+    )
+    resp = b.handle(parse_request({"mode": "chat", "input": "嗨", "chat_backend": "local"}))
+    assert resp.message == "direct-answer"
+
+
+def test_search_no_results_returns_readable_message(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        b, "_generate_router_json",
+        lambda prompt: '{"decision":"tool","tool":"/search","query":"obscure"}',
+    )
+    monkeypatch.setattr(
+        "openclaw_adapter.web_search.web_search",
+        lambda q, *, max_results, reuse_browser: (),
+    )
+    monkeypatch.setattr(
+        b, "_ollama_generate_blocking",
+        lambda prompt: (_ for _ in ()).throw(AssertionError("no synthesis without sources")),
+    )
+    resp = b.handle(parse_request({"mode": "chat", "input": "嗨", "chat_backend": "local"}))
+    assert resp.status == STATUS_OK
+    assert "找不到" in resp.message
+
+
+def test_non_chat_modes_do_not_route(bridge, monkeypatch):
+    def _no_route(req):
+        raise AssertionError("non-chat modes must not invoke the chat router")
+
+    monkeypatch.setattr(bridge, "_route_chat_decision", _no_route)
+    resp = bridge.handle(parse_request({
+        "mode": "translation", "submode": "text_translation", "input": "abc",
+    }))
+    assert resp.message == "[zh]abc"
+
+
+def test_stream_tool_emits_live_calling_notice_then_done(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        b, "_route_chat_decision",
+        lambda req: RouterDecision(decision=ROUTER_DECISION_TOOL, tool=CHAT_TOOL_SEARCH, query="q"),
+    )
+    monkeypatch.setattr("openclaw_adapter.command_bridge._HEARTBEAT_SECONDS", 0.01)
+
+    def _slow_tool(req, decision):
+        time.sleep(0.05)
+        return "grounded answer"
+
+    monkeypatch.setattr(b, "_run_chat_tool", _slow_tool)
+    events = list(b.stream(parse_request({"mode": "chat", "input": "q", "chat_backend": "local"}), "rid-t"))
+    assert events[0]["type"] == "start"
+    # A live "正在調用…工具中" notice must reach the user before the answer.
+    deltas = [e for e in events if e["type"] == "delta"]
+    assert deltas and "正在調用" in deltas[0]["text"] and CHAT_TOOL_SEARCH in deltas[0]["text"]
+    # Heartbeats keep the connection alive while the tool runs.
+    assert any(e["type"] == "heartbeat" for e in events)
+    # The grounded answer arrives via done (no progress text mixed into it).
+    assert events[-1] == {"type": "done", "message": "grounded answer"}
+
+
+def test_stream_tool_failure_emits_readable_error(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        b, "_route_chat_decision",
+        lambda req: RouterDecision(decision=ROUTER_DECISION_TOOL, tool=CHAT_TOOL_SEARCH, query="q"),
+    )
+
+    def _boom(req, decision):
+        raise RuntimeError("synthesis exploded")
+
+    monkeypatch.setattr(b, "_run_chat_tool", _boom)
+    events = list(b.stream(parse_request({"mode": "chat", "input": "q", "chat_backend": "local"}), "rid-e"))
+    assert events[-1]["type"] == "error"
+    assert "synthesis exploded" in events[-1]["message"]
 
 
 def test_non_chat_ignores_history(bridge):

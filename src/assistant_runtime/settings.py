@@ -158,6 +158,11 @@ class AssistantSettings:
     # reconnects restores its session from the Mac mini. Gitignored runtime data
     # under .openclaw_tmp/, never committed and never written to knowledge.sqlite3.
     openclaw_web_memory_dir: str = ".openclaw_tmp/web_console_memory"
+    # ── web chat contextual tool routing (issue #45) ───────────────────────
+    # When on, the grounded /search tool answer appends a one-line note saying
+    # which model synthesized it (本地 qwen3:14b / 雲端 big-pickle) for debugging.
+    # Default off so end users never see the internal label.
+    openclaw_web_chat_tool_debug: bool = False
     # ── local timed home scheduler (issue #39) ─────────────────────────────
     # Persisted home schedules (/schedulehome): timed runs of existing slash
     # commands (/music, /say, /bluetooth) that survive bot restarts. Gitignored
@@ -433,6 +438,9 @@ def get_settings() -> AssistantSettings:
         ),
         openclaw_web_memory_dir=_resolve_runtime_path(
             os.getenv("OPENCLAW_WEB_MEMORY_DIR", ".openclaw_tmp/web_console_memory")
+        ),
+        openclaw_web_chat_tool_debug=_as_bool(
+            os.getenv("OPENCLAW_WEB_CHAT_TOOL_DEBUG")
         ),
         openclaw_home_schedules_path=_resolve_runtime_path(
             os.getenv("OPENCLAW_HOME_SCHEDULES_PATH", ".openclaw_tmp/home_schedules.json")

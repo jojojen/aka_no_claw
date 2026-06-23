@@ -13,6 +13,7 @@ Contract source: aka_no_claw_web/docs/LOCAL_MOBILE_CONSOLE_MVP.md.
 from __future__ import annotations
 
 import base64
+import json
 from dataclasses import dataclass, field
 
 # --- Modes ----------------------------------------------------------------
@@ -276,6 +277,83 @@ def _sanitize_history(raw: object) -> tuple[ChatTurn, ...]:
         kept.append(turn)
     kept.reverse()
     return tuple(kept)
+
+
+# --- Web Chat contextual tool routing (issue #45) ------------------------
+# Phase 2: before answering a chat message the bridge asks a local router LLM
+# whether the question needs a tool. Only one bounded tool is whitelisted for
+# now (``/search`` → grounded web search). The router speaks strict JSON; this
+# module owns the *trust boundary* around that output: a malformed payload, an
+# unknown decision/tool, or an empty tool query is rejected so the caller falls
+# back to a plain (direct) chat answer instead of executing anything unsafe.
+ROUTER_DECISION_DIRECT = "direct"
+ROUTER_DECISION_TOOL = "tool"
+CHAT_TOOL_SEARCH = "/search"
+# Hardcoding the tool whitelist is deliberate (a closed protocol allowlist, not
+# open-ended recognition): only these exact tools may ever be dispatched.
+CHAT_TOOLS = {CHAT_TOOL_SEARCH}
+
+
+@dataclass(frozen=True, slots=True)
+class RouterDecision:
+    decision: str  # ROUTER_DECISION_DIRECT | ROUTER_DECISION_TOOL
+    tool: str | None = None
+    query: str = ""
+    reason_summary: str = ""
+
+
+def _loads_first_json_object(text: str) -> object:
+    """Best-effort decode of the first JSON object in router output.
+
+    A small local model may wrap the JSON in prose, ``<think>`` noise, or a
+    ```` ```json ```` fence. Try a clean parse first, then fall back to the
+    substring between the first ``{`` and the last ``}``. Returns ``None`` when
+    nothing parses (the caller treats that as an untrusted decision)."""
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        return json.loads(text[start : end + 1])
+    except ValueError:
+        return None
+
+
+def parse_router_decision(raw: object) -> RouterDecision | None:
+    """Coerce raw router LLM output into a trusted RouterDecision, or ``None``.
+
+    Returns ``None`` (→ caller falls back to direct chat) on anything that can't
+    be trusted: non-string input, unparseable JSON, an unknown ``decision``, a
+    tool not on the whitelist, or a tool decision with an empty ``query``. Extra
+    fields are ignored. A valid ``direct`` decision returns a RouterDecision so
+    the caller can log the router's reasoning even when no tool runs."""
+    if not isinstance(raw, str):
+        return None
+    data = _loads_first_json_object(raw.strip())
+    if not isinstance(data, dict):
+        return None
+    decision = data.get("decision")
+    reason = _opt_str(data.get("reason_summary")) or ""
+    if decision == ROUTER_DECISION_DIRECT:
+        return RouterDecision(decision=ROUTER_DECISION_DIRECT, reason_summary=reason)
+    if decision == ROUTER_DECISION_TOOL:
+        tool = data.get("tool")
+        if tool not in CHAT_TOOLS:
+            return None
+        query = data.get("query")
+        if not isinstance(query, str) or not query.strip():
+            return None
+        return RouterDecision(
+            decision=ROUTER_DECISION_TOOL,
+            tool=tool,
+            query=query.strip(),
+            reason_summary=reason,
+        )
+    return None
 
 
 # --- Streaming event constructors ----------------------------------------

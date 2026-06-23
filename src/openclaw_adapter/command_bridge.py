@@ -35,10 +35,13 @@ from .service_restart import RESTART_MESSAGE, trigger_restart_all
 from .command_bridge_models import (
     CHAT_BACKEND_CLOUD_PICKLE,
     CHAT_BACKEND_LOCAL,
+    CHAT_TOOL_SEARCH,
     ChatTurn,
     MODE_CHAT,
     MODE_INVESTMENT,
     MODE_TRANSLATION,
+    ROUTER_DECISION_TOOL,
+    RouterDecision,
     STATUS_ERROR,
     STATUS_OK,
     STATUS_UNSUPPORTED,
@@ -48,6 +51,7 @@ from .command_bridge_models import (
     SUBMODE_TEXT_TRANSLATION,
     WebCommandRequest,
     WebCommandResponse,
+    parse_router_decision,
     stream_delta,
     stream_done,
     stream_error,
@@ -75,6 +79,45 @@ _CHAT_SYSTEM_PROMPT = (
     "並以繁體中文自然作答。"
 )
 _CHAT_ROLE_LABELS = {"user": "使用者", "assistant": "助理", "system": "系統"}
+
+# Web Chat contextual tool routing (#45). A local router LLM decides, per chat
+# turn, whether to answer directly or call the one whitelisted tool (/search).
+# The router gets the recent history so it can resolve pronouns into a
+# self-contained search query (e.g. 「她的歌」→「初音未來 歌曲」). It must emit a
+# single strict-JSON object; anything else is treated as "direct" (fail soft).
+_ROUTER_TIMEOUT_CAP_SECONDS = 30
+_ROUTER_SYSTEM_PROMPT = (
+    "你是 aka_no_claw 聊天助理的路由器。根據對話判斷要不要使用工具來回答使用者的『最新訊息』。\n"
+    "可用工具：\n"
+    "- /search：當回答需要『即時、最新或你不確定的事實資訊』（新聞、價格、商品規格、人物近況、"
+    "賽事結果等）時使用。\n"
+    "其他情況（閒聊、改寫、翻譯、一般常識、可由上文直接回答）一律 direct，不要用工具。\n"
+    "只輸出一個 JSON 物件，不要加任何多餘文字或說明：\n"
+    '{"decision":"direct|tool","tool":"/search","query":"...","reason_summary":"..."}\n'
+    "當 decision=tool 時，query 必須是適合丟給搜尋引擎、語意完整的查詢；"
+    "若使用者用代名詞（她／它／這個），請用對話紀錄把主詞補回 query。"
+)
+_SEARCH_SYNTHESIS_PROMPT = (
+    "你是 aka_no_claw 聊天助理。請根據下面的網路搜尋結果，用繁體中文回答使用者的問題。\n"
+    "規則：\n"
+    "1. 只根據提供的來源作答，不要編造來源裡沒有的事實。\n"
+    "2. 若來源不足以回答，請誠實說明，不要硬掰。\n"
+    "3. 引用具體資訊時可標註對應的來源編號 [n]。\n"
+    "4. 回答精簡自然，不要整段照抄摘要。"
+)
+# Tool-usage indicators the user sees directly in the chat (#45). Two layers:
+#  - a LIVE "正在調用…工具中" notice streamed before the tool runs, so the user
+#    can see a tool is being invoked while they wait; and
+#  - a persistent "已使用工具" banner on the finished answer, so the call is
+#    still evident after streaming completes. Both are always on (never gated by
+#    the debug flag) — only the synthesis-model label stays behind that flag.
+_TOOL_USED_PREFIX = "🔧 已使用工具："
+_TOOL_FRIENDLY_NAMES = {CHAT_TOOL_SEARCH: "網路搜尋"}
+
+
+def _tool_calling_notice(tool: str) -> str:
+    name = _TOOL_FRIENDLY_NAMES.get(tool, tool)
+    return f"🔧 正在調用「{name}（{tool}）」工具中…"
 
 
 def build_chat_prompt(user_input: str, history: tuple[ChatTurn, ...] = ()) -> str:
@@ -362,6 +405,21 @@ class CommandBridge:
             return WebCommandResponse(
                 status=STATUS_ERROR, message="請輸入訊息。", mode=MODE_CHAT
             )
+        decision = self._route_chat_decision(req)
+        if decision is not None and decision.decision == ROUTER_DECISION_TOOL:
+            try:
+                message = self._run_chat_tool(req, decision)
+                return WebCommandResponse(
+                    status=STATUS_OK, message=message, mode=MODE_CHAT
+                )
+            except Exception as exc:  # noqa: BLE001 — surface, don't crash the turn
+                logger.exception("chat tool failed tool=%s", decision.tool)
+                return WebCommandResponse(
+                    status=STATUS_ERROR,
+                    message=f"工具執行失敗：{exc}",
+                    mode=MODE_CHAT,
+                )
+        # Direct chat (router said direct, or its output was untrusted/unavailable).
         prompt = build_chat_prompt(req.input, req.history)
         if req.chat_backend == CHAT_BACKEND_CLOUD_PICKLE:
             client = self._build_cloud_chat_client()
@@ -380,11 +438,179 @@ class CommandBridge:
         if not (req.input or "").strip():
             yield stream_error("請輸入訊息。")
             return
+        decision = self._route_chat_decision(req)
+        if decision is not None and decision.decision == ROUTER_DECISION_TOOL:
+            yield from self._stream_chat_tool(req, decision)
+            return
         prompt = build_chat_prompt(req.input, req.history)
         if req.chat_backend == CHAT_BACKEND_CLOUD_PICKLE:
             yield from self._stream_cloud_chat(prompt)
         else:
             yield from self._stream_ollama_chat(prompt)
+
+    # --- chat tool routing (#45) -----------------------------------------
+    def _route_chat_decision(self, req: WebCommandRequest) -> RouterDecision | None:
+        """Ask the local router LLM whether this chat turn needs a tool.
+
+        Returns ``None`` (→ direct chat) when the router is unavailable, times
+        out, or emits anything untrusted — routing must never block a plain
+        answer. A trusted ``direct`` or ``tool`` decision is logged for
+        debugging and returned."""
+        try:
+            raw = self._generate_router_json(self._build_router_prompt(req))
+        except Exception:  # noqa: BLE001 — router is best-effort; fall back to direct
+            logger.warning(
+                "[chat-route] router LLM unavailable; direct fallback", exc_info=True
+            )
+            return None
+        decision = parse_router_decision(raw)
+        if decision is None:
+            logger.info(
+                "[chat-route] untrusted router output; direct fallback raw=%r",
+                (raw or "")[:200],
+            )
+            return None
+        logger.info(
+            "[chat-route] decision=%s tool=%s query=%r reason=%s",
+            decision.decision, decision.tool, decision.query, decision.reason_summary,
+        )
+        return decision
+
+    def _build_router_prompt(self, req: WebCommandRequest) -> str:
+        lines = [_ROUTER_SYSTEM_PROMPT, "", "對話紀錄："]
+        for turn in req.history:
+            label = _CHAT_ROLE_LABELS.get(turn.role, turn.role)
+            lines.append(f"{label}：{turn.content}")
+        lines += ["", f"使用者最新訊息：{(req.input or '').strip()}", "", "JSON："]
+        return "\n".join(lines)
+
+    def _generate_router_json(self, prompt: str) -> str:
+        from .dynamic_tools import OllamaTextClient
+
+        # Routing is mechanical classification → always local Ollama, low temp
+        # for stable JSON, and a capped timeout so a slow router can't hold the
+        # whole chat turn hostage (it just falls back to direct).
+        client = OllamaTextClient(
+            endpoint=self.settings.openclaw_local_text_endpoint,
+            model=self._local_model(),
+            timeout_seconds=min(
+                self.settings.openclaw_local_text_timeout_seconds,
+                _ROUTER_TIMEOUT_CAP_SECONDS,
+            ),
+        )
+        return client.generate(prompt, temperature=0.0)
+
+    def _run_chat_tool(self, req: WebCommandRequest, decision: RouterDecision) -> str:
+        if decision.tool == CHAT_TOOL_SEARCH:
+            return self._run_grounded_search(req, decision.query)
+        raise ValueError(f"unknown chat tool: {decision.tool}")
+
+    def _stream_chat_tool(
+        self, req: WebCommandRequest, decision: RouterDecision
+    ) -> Iterator[dict]:
+        """Run the tool off-thread, surfacing a live "正在調用…工具中" notice up
+        front (so the user can see a tool is being invoked) and heartbeats while
+        it works (so the connection stays alive), then deliver the grounded
+        answer as the ``done`` event. The finished answer still carries its own
+        persistent "已使用工具" banner from :meth:`_run_grounded_search`."""
+        yield stream_delta(_tool_calling_notice(decision.tool))
+        result: dict[str, object] = {}
+        done = threading.Event()
+
+        def _worker() -> None:
+            try:
+                result["text"] = self._run_chat_tool(req, decision)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("chat tool failed tool=%s", decision.tool)
+                result["error"] = str(exc)
+            finally:
+                done.set()
+
+        threading.Thread(target=_worker, daemon=True).start()
+        while not done.wait(timeout=_HEARTBEAT_SECONDS):
+            yield stream_heartbeat()
+        if "error" in result:
+            yield stream_error(f"工具執行失敗：{result['error']}")
+            return
+        yield stream_done(str(result.get("text") or "").strip())
+
+    def _run_grounded_search(self, req: WebCommandRequest, query: str) -> str:
+        """Grounded web search: retrieve sources, then synthesize an answer with
+        the user's chosen chat backend (so cloud-pickle users get cloud
+        synthesis). Retrieval is logged with the exact backing function so a tool
+        call is always traceable to code for debugging."""
+        from .web_search import DEFAULT_WEB_SEARCH_LIMIT, web_search
+
+        query = (query or "").strip()
+        logger.info(
+            "[chat-tool] tool=%s fn=openclaw_adapter.web_search.web_search query=%r",
+            CHAT_TOOL_SEARCH, query,
+        )
+        # The tool-usage marker is ALWAYS shown (never gated by the debug flag):
+        # the user must be able to tell a tool ran, and on which query, straight
+        # from the answer — not only from the server log.
+        banner = f"{_TOOL_USED_PREFIX}網路搜尋（{CHAT_TOOL_SEARCH}）｜查詢：{query}"
+        # Off the main thread (streaming worker / async): force a one-shot browser.
+        results = web_search(
+            query, max_results=DEFAULT_WEB_SEARCH_LIMIT, reuse_browser=False
+        )
+        if not results:
+            return (
+                f"{banner}\n\n"
+                f"我搜尋了「{query}」，但目前找不到可用的網路來源，"
+                "請稍後再試或換個說法。"
+            )
+        source_pack = self._format_search_source_pack(results)
+        prompt = "\n".join([
+            _SEARCH_SYNTHESIS_PROMPT, "",
+            f"使用者問題：{(req.input or '').strip()}",
+            f"搜尋查詢：{query}", "",
+            "搜尋結果：", source_pack, "", "回答：",
+        ])
+        answer, model_label = self._synthesize_with_chat_backend(
+            req.chat_backend, prompt
+        )
+        message = (
+            f"{banner}\n\n{answer.strip()}\n\n"
+            f"{self._format_search_sources_block(results)}"
+        )
+        if self.settings.openclaw_web_chat_tool_debug:
+            message += f"\n\n（合成模型：{model_label}）"
+        return message
+
+    @staticmethod
+    def _format_search_source_pack(results) -> str:
+        lines: list[str] = []
+        for i, r in enumerate(results, 1):
+            snippet = (r.snippet or "").strip()
+            lines.append(
+                f"[{i}] 標題：{r.title}\n    網址：{r.url}\n    摘要：{snippet}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_search_sources_block(results) -> str:
+        lines = ["資料來源："]
+        for i, r in enumerate(results, 1):
+            lines.append(f"[{i}] {r.title} — {r.url}")
+        return "\n".join(lines)
+
+    def _synthesize_with_chat_backend(
+        self, chat_backend: str, prompt: str
+    ) -> tuple[str, str]:
+        """Compose the final grounded answer with the user's chat backend.
+        Returns (text, model_label). If cloud is requested but unavailable, fall
+        back to local synthesis so the search result is still usable."""
+        if chat_backend == CHAT_BACKEND_CLOUD_PICKLE:
+            client = self._build_cloud_chat_client()
+            if client is None:
+                text = self._ollama_generate_blocking(prompt)
+                return text, f"本地 {self._local_model()}（雲端不可用，已改用本地）"
+            text = client.generate(prompt, temperature=0.3)
+            model = (self.settings.openclaw_opencode_model or "big-pickle").strip()
+            return text, f"雲端 {model}"
+        text = self._ollama_generate_blocking(prompt)
+        return text, f"本地 {self._local_model()}"
 
     # --- async job + poll (long research, decoupled from the connection) --
     def _get_job_store(self) -> JobStore:
