@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from dataclasses import dataclass, field
 
 # --- Modes ----------------------------------------------------------------
@@ -293,6 +294,20 @@ CHAT_TOOL_SEARCH = "/search"
 # open-ended recognition): only these exact tools may ever be dispatched.
 CHAT_TOOLS = {CHAT_TOOL_SEARCH}
 
+# The router ``query`` is untrusted LLM output that flows into logs, the visible
+# tool banner, and ``web_search()`` — so it is normalized and budgeted before it
+# is trusted: control characters stripped, all whitespace (incl. newlines)
+# collapsed to single spaces, and the result capped. Whitelisting the *tool*
+# guards against arbitrary command execution; this guards the tool's *argument*.
+MAX_ROUTER_QUERY_LEN = 256
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _normalize_router_query(query: str) -> str:
+    cleaned = _CONTROL_CHARS_RE.sub(" ", query)
+    cleaned = " ".join(cleaned.split())
+    return cleaned[:MAX_ROUTER_QUERY_LEN].strip()
+
 
 @dataclass(frozen=True, slots=True)
 class RouterDecision:
@@ -345,12 +360,15 @@ def parse_router_decision(raw: object) -> RouterDecision | None:
         if tool not in CHAT_TOOLS:
             return None
         query = data.get("query")
-        if not isinstance(query, str) or not query.strip():
+        if not isinstance(query, str):
+            return None
+        query = _normalize_router_query(query)
+        if not query:
             return None
         return RouterDecision(
             decision=ROUTER_DECISION_TOOL,
             tool=tool,
-            query=query.strip(),
+            query=query,
             reason_summary=reason,
         )
     return None

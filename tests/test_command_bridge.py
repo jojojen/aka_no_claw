@@ -23,6 +23,7 @@ from openclaw_adapter.command_bridge_models import (
     CHAT_BACKEND_LOCAL,
     CHAT_TOOL_SEARCH,
     MAX_HISTORY_TURNS,
+    MAX_ROUTER_QUERY_LEN,
     ChatTurn,
     MODE_CHAT,
     MODE_INVESTMENT,
@@ -452,6 +453,30 @@ def test_parse_router_decision_rejects_untrusted(raw):
     assert parse_router_decision(raw) is None
 
 
+def test_parse_router_decision_caps_overlong_query():
+    long_q = "あ" * 1000
+    d = parse_router_decision(
+        '{"decision":"tool","tool":"/search","query":"' + long_q + '"}'
+    )
+    assert d is not None and d.decision == ROUTER_DECISION_TOOL
+    assert len(d.query) == MAX_ROUTER_QUERY_LEN
+    assert d.query == "あ" * MAX_ROUTER_QUERY_LEN
+
+
+def test_parse_router_decision_collapses_noisy_query():
+    # Newlines, tabs, control chars and runs of spaces collapse to single spaces.
+    raw = '{"decision":"tool","tool":"/search","query":"初音\\n\\t  未來\\u0007 新歌  "}'
+    d = parse_router_decision(raw)
+    assert d is not None and d.query == "初音 未來 新歌"
+
+
+def test_parse_router_decision_rejects_control_only_query():
+    # A query that normalizes to empty (only whitespace/control chars) is unsafe.
+    assert parse_router_decision(
+        '{"decision":"tool","tool":"/search","query":"\\n\\t \\u0000"}'
+    ) is None
+
+
 # --- #45 chat contextual tool routing -------------------------------------
 def _tool_settings(debug: bool = False):
     return SimpleNamespace(
@@ -552,6 +577,82 @@ def test_synthesis_prompt_includes_source_fields(monkeypatch):
     assert "標題A" in seen["prompt"]
     assert "https://a.example" in seen["prompt"]
     assert "摘要片段A" in seen["prompt"]
+
+
+def test_synthesis_source_pack_truncates_long_fields_but_keeps_url(monkeypatch):
+    from openclaw_adapter.command_bridge import (
+        _SOURCE_PACK_SNIPPET_CAP,
+        _SOURCE_PACK_TITLE_CAP,
+    )
+
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        b, "_generate_router_json",
+        lambda prompt: '{"decision":"tool","tool":"/search","query":"q"}',
+    )
+    long_title = "標" * 1000
+    long_snippet = "摘" * 5000
+    url = "https://src.example/article"
+    monkeypatch.setattr(
+        "openclaw_adapter.web_search.web_search",
+        lambda q, *, max_results, reuse_browser: (
+            _result(long_title, url, long_snippet),
+        ),
+    )
+    seen = {}
+    monkeypatch.setattr(
+        b, "_ollama_generate_blocking",
+        lambda prompt: seen.setdefault("prompt", prompt) and "答案",
+    )
+    resp = b.handle(parse_request({"mode": "chat", "input": "問題", "chat_backend": "local"}))
+
+    # External snippet/title text is budgeted before it reaches the synthesis LLM.
+    assert "標" * (_SOURCE_PACK_TITLE_CAP + 1) not in seen["prompt"]
+    assert "摘" * (_SOURCE_PACK_SNIPPET_CAP + 1) not in seen["prompt"]
+    assert "…" in seen["prompt"]
+    # The full source URL is never truncated — neither in the prompt nor in the
+    # visible sources block of the final answer.
+    assert url in seen["prompt"]
+    assert url in resp.message
+
+
+def test_synthesis_source_pack_total_budget_drops_overflow(monkeypatch):
+    from openclaw_adapter.command_bridge import (
+        _SOURCE_PACK_SNIPPET_CAP,
+        _SOURCE_PACK_TOTAL_CAP,
+    )
+
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        b, "_generate_router_json",
+        lambda prompt: '{"decision":"tool","tool":"/search","query":"q"}',
+    )
+    # Many max-snippet sources: their cumulative pack size exceeds the total cap,
+    # so the later sources are dropped from the synthesis prompt. Sized so the
+    # first source survives and the last one is dropped.
+    snippet = "x" * _SOURCE_PACK_SNIPPET_CAP
+    n = (_SOURCE_PACK_TOTAL_CAP // _SOURCE_PACK_SNIPPET_CAP) + 3
+    results = tuple(
+        _result(f"來源{i}", f"https://src{i}.example", snippet) for i in range(n)
+    )
+    monkeypatch.setattr(
+        "openclaw_adapter.web_search.web_search",
+        lambda q, *, max_results, reuse_browser: results,
+    )
+    seen = {}
+    monkeypatch.setattr(
+        b, "_ollama_generate_blocking",
+        lambda prompt: seen.setdefault("prompt", prompt) and "答案",
+    )
+    resp = b.handle(parse_request({"mode": "chat", "input": "問題", "chat_backend": "local"}))
+
+    # First source survives in the prompt; an overflowing later source is dropped.
+    assert "https://src0.example" in seen["prompt"]
+    assert f"https://src{n - 1}.example" not in seen["prompt"]
+    assert len(seen["prompt"]) < _SOURCE_PACK_TOTAL_CAP + 2000
+    # But the visible sources block still lists every retrieved source.
+    assert "https://src0.example" in resp.message
+    assert f"https://src{n - 1}.example" in resp.message
 
 
 def test_chat_tool_uses_chosen_cloud_backend_for_synthesis(monkeypatch):

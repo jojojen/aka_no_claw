@@ -114,6 +114,23 @@ _SEARCH_SYNTHESIS_PROMPT = (
 _TOOL_USED_PREFIX = "🔧 已使用工具："
 _TOOL_FRIENDLY_NAMES = {CHAT_TOOL_SEARCH: "網路搜尋"}
 
+# Search snippets are external (search-engine) text fed into the final synthesis
+# LLM, so they are budgeted before entering the prompt: per-field caps bound any
+# single title/snippet, and a total cap bounds the whole pack. This protects
+# prompt size and shrinks the prompt-injection surface from upstream snippets.
+# URLs are NOT truncated (a clipped URL is useless) — the visible sources block
+# always carries the full URL.
+_SOURCE_PACK_TITLE_CAP = 200
+_SOURCE_PACK_SNIPPET_CAP = 500
+_SOURCE_PACK_TOTAL_CAP = 4000
+
+
+def _clip(text: str, cap: int) -> str:
+    text = (text or "").strip()
+    if len(text) <= cap:
+        return text
+    return text[:cap].rstrip() + "…"
+
 
 def _tool_calling_notice(tool: str) -> str:
     name = _TOOL_FRIENDLY_NAMES.get(tool, tool)
@@ -581,11 +598,17 @@ class CommandBridge:
     @staticmethod
     def _format_search_source_pack(results) -> str:
         lines: list[str] = []
+        total = 0
         for i, r in enumerate(results, 1):
-            snippet = (r.snippet or "").strip()
-            lines.append(
-                f"[{i}] 標題：{r.title}\n    網址：{r.url}\n    摘要：{snippet}"
-            )
+            title = _clip(r.title, _SOURCE_PACK_TITLE_CAP)
+            url = (r.url or "").strip()
+            snippet = _clip(r.snippet, _SOURCE_PACK_SNIPPET_CAP)
+            entry = f"[{i}] 標題：{title}\n    網址：{url}\n    摘要：{snippet}"
+            # Keep at least the first source even if it alone busts the budget.
+            if lines and total + len(entry) > _SOURCE_PACK_TOTAL_CAP:
+                break
+            lines.append(entry)
+            total += len(entry)
         return "\n".join(lines)
 
     @staticmethod
