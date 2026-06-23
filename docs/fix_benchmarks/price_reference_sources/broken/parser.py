@@ -2,7 +2,8 @@
 
 This file intentionally mirrors attempts/attempt_02_json_dom.py. It represents
 a real mid-repair state: KNSR direct DOM and JSON-island fixtures pass, but
-official-release definition lists and catalog tables are still unsupported.
+shuffled product tiles, official-release definition lists, and catalog tables
+are still unsupported.
 """
 from __future__ import annotations
 

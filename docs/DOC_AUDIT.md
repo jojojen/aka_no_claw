@@ -42,6 +42,9 @@ for which question each one answers.
 | `fix_benchmarks/README.md` | Current | agent-maintenance | Keep; `/fix` benchmark index and synthetic-fixture safety rules. |
 | `fix_benchmarks/price_reference_sources/README.md` | Current | agent-maintenance | Keep; benchmark spec for synthetic multi-source price parsers. |
 | `fix_benchmarks/price_reference_sources/FAILURE_TRACE.md` | Current | agent-maintenance | Keep; reproducible parser failure history for `/fix` evaluation. |
+| `fix_benchmarks/seller_snapshot_sources/README.md` | Current | agent-maintenance | Keep; benchmark spec for synthetic seller snapshot parser and lifecycle repair. |
+| `fix_benchmarks/seller_snapshot_sources/FAILURE_TRACE.md` | Current | agent-maintenance | Keep; reproducible seller snapshot parser and cooldown failure history. |
+| `fix_benchmarks/seller_snapshot_sources/lifecycle/README.md` | Current | agent-maintenance | Keep; rate-limit and bot-interstitial classifier benchmark. |
 | `NEW_DYNAMIC_TOOLS_PROGRESS.md` | Current | dynamic-tools | Keep; canonical `/new` doc. |
 | `NEW_E2E_DISCRIMINATING_TESTS.md` | Current | dynamic-tools | Keep; cross-link from dynamic-tools canonical. |
 | `OPPORTUNITY_AGENT_SPEC.md` | Needs review | opportunity | Verify thresholds vs code; canonical Opportunity doc. |

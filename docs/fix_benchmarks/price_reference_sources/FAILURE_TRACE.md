@@ -31,16 +31,18 @@ Observed result:
 FAIL aucl_auction_v1
 PASS knsr_listing_v1
 FAIL knsr_listing_v2
+FAIL knsr_listing_v3
 FAIL pubr_release_v1
 FAIL tcgw_catalog_v1
 
-Pass rate: 1/5 = 20%
+Pass rate: 1/6 = 17%
 ```
 
 Reason:
 
 - It only understands direct `data-testid` fields.
 - It cannot read JSON islands.
+- It cannot extract primary product tiles when attributes are shuffled.
 - It cannot read publisher-release definition lists.
 - It cannot read auction current-bid layouts.
 - It cannot choose the primary table row in catalog pages.
@@ -66,16 +68,20 @@ Observed result:
 FAIL aucl_auction_v1
 PASS knsr_listing_v1
 PASS knsr_listing_v2
+FAIL knsr_listing_v3
 FAIL pubr_release_v1
 FAIL tcgw_catalog_v1
 
-Pass rate: 2/5 = 40%
+Pass rate: 2/6 = 33%
 ```
 
 Remaining failures:
 
 - `aucl_auction_v1`: current bid, auction status, seller, and condition are
   stored in auction-specific text/metadata.
+- `knsr_listing_v3`: the primary product tile uses shuffled attributes,
+  accessible-label price text, nested visible price spans, and nearby stale tile
+  decoys.
 - `pubr_release_v1`: MSRP, release status, publisher channel, and condition are
   stored in a definition list.
 - `tcgw_catalog_v1`: the relevant product is a primary table row among decoys.
@@ -103,10 +109,11 @@ Observed result:
 PASS aucl_auction_v1
 PASS knsr_listing_v1
 PASS knsr_listing_v2
+PASS knsr_listing_v3
 PASS pubr_release_v1
 PASS tcgw_catalog_v1
 
-Pass rate: 5/5 = 100%
+Pass rate: 6/6 = 100%
 Verifier PASSED.
 ```
 
@@ -117,8 +124,10 @@ The repair task is:
 ```text
 Starting from broken/parser.py, add generalized extraction support for:
 1. auction current-bid pages,
-2. publisher-release definition-list pages,
-3. card-shop catalog tables with decoy rows.
+2. shuffled-attribute product tiles with accessible-label and nested-span price
+   fallbacks,
+3. publisher-release definition-list pages,
+4. card-shop catalog tables with decoy rows.
 ```
 
 The repair must keep KNSR fixtures passing and must not hardcode complete

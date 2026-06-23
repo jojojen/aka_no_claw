@@ -1,7 +1,8 @@
 """Attempt 02: DOM + JSON island parser.
 
 This is the intentionally broken parser used by the benchmark. It handles the
-KNSR listing layouts but still fails official release and table catalog pages.
+first KNSR listing layouts but still fails shuffled result tiles, official
+release pages, and table catalog pages.
 """
 from __future__ import annotations
 

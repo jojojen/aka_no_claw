@@ -1,0 +1,7 @@
+{
+  "case_id": "interstitial-block",
+  "http_status": 200,
+  "headers": {},
+  "body_text": "SYNTHETIC TEST PAGE - NOT A REAL WEBSITE\nPlease verify that you are not automated before continuing.\nNo seller profile metrics are present.",
+  "elapsed_seconds": 7
+}

@@ -46,6 +46,7 @@ Expected output schema:
 |---|---|---|
 | [fixtures/knsr_listing_v1.html](fixtures/knsr_listing_v1.html) | Secondary-market listing | Direct semantic attributes. |
 | [fixtures/knsr_listing_v2.html](fixtures/knsr_listing_v2.html) | Secondary-market listing | Data moved into a JSON island with stale selector decoys. |
+| [fixtures/knsr_listing_v3.html](fixtures/knsr_listing_v3.html) | Secondary-market result grid | Product tile attributes are shuffled; price appears in both an accessible label and nested spans, with stale tile decoys nearby. |
 | [fixtures/aucl_auction_v1.html](fixtures/aucl_auction_v1.html) | Auction listing | Current bid, auction status, and seller are in mixed visible text and metadata. |
 | [fixtures/pubr_release_v1.html](fixtures/pubr_release_v1.html) | Publisher product/release | MSRP and release status appear in a definition list. |
 | [fixtures/tcgw_catalog_v1.html](fixtures/tcgw_catalog_v1.html) | Card-shop catalog | Price and stock data appear in a table row. |
@@ -54,6 +55,7 @@ The fixtures intentionally include real-world parser annoyances:
 
 - noisy layout wrappers and unrelated sidebar modules,
 - stale selector decoys,
+- attribute-order changes that break regex-only product-tile parsers,
 - data split across attributes, visible text, metadata, tables, and JSON islands,
 - mixed Japanese and English labels,
 - sponsored/decoy rows,

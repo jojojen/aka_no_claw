@@ -48,6 +48,7 @@ KNSR  secondary-market style listing source
 AUCL  auction-style listing source
 PUBR  publisher-release style source
 TCGW  card-shop catalog style source
+SLSH  seller-profile / review snapshot style source
 ```
 
 These codes are not brands. They only label fixture families. Real sources may
@@ -59,6 +60,7 @@ merchant names or real source URLs.
 | Benchmark | Purpose |
 |---|---|
 | [price_reference_sources](price_reference_sources/README.md) | Multi-source card/product price-reference parser benchmark. |
+| [seller_snapshot_sources](seller_snapshot_sources/README.md) | Seller profile, review, and cooldown lifecycle benchmark. |
 
 ## Running A Benchmark
 

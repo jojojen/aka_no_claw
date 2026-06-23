@@ -1,0 +1,8 @@
+{
+  "case_id": "rate-limit-429",
+  "action": "cooldown_wait",
+  "retry_after_seconds": 600,
+  "should_parse": false,
+  "should_requeue": true,
+  "reason": "rate_limited"
+}
