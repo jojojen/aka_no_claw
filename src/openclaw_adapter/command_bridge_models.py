@@ -57,9 +57,17 @@ DEFAULT_SOURCE = "aka_no_claw_web"
 # follow-ups in context. History is best-effort context, not authoritative
 # data: it is sanitized and trimmed here, and a malformed entry is skipped
 # rather than failing the whole request.
-CHAT_ROLES = {"user", "assistant", "system"}
+#
+# Only the user's own visible turns count: a tampered/buggy frontend must not be
+# able to inject a `system` instruction into the prompt, so system turns are
+# rejected (a trusted backend summary would be added server-side, not here).
+CHAT_ROLES = {"user", "assistant"}
 MAX_HISTORY_TURNS = 12
 MAX_HISTORY_CONTENT_LEN = 4000
+# Cumulative character budget across the kept turns (not just per-turn): the
+# window is "recent", so keep the newest turns until either the turn count or
+# this total budget is hit — otherwise 12 * 4000 chars could bloat the prompt.
+MAX_HISTORY_TOTAL_CHARS = 4000
 
 
 class RequestValidationError(ValueError):
@@ -237,12 +245,14 @@ def _sanitize_history(raw: object) -> tuple[ChatTurn, ...]:
 
     History is best-effort context, so this never raises: a non-list, or any
     malformed entry, is silently skipped rather than failing the whole chat
-    request. Entries are kept only when role is known and content is a non-empty
-    string; content is length-capped and the list is trimmed to the most recent
-    MAX_HISTORY_TURNS turns."""
+    request. Entries are kept only when role is user/assistant and content is a
+    non-empty string; content is per-turn length-capped, then the list is kept to
+    the most recent turns within both MAX_HISTORY_TURNS and a cumulative
+    MAX_HISTORY_TOTAL_CHARS budget (walked newest->oldest, restored to
+    chronological order)."""
     if not isinstance(raw, list):
         return ()
-    turns: list[ChatTurn] = []
+    valid: list[ChatTurn] = []
     for item in raw:
         if not isinstance(item, dict):
             continue
@@ -253,8 +263,19 @@ def _sanitize_history(raw: object) -> tuple[ChatTurn, ...]:
         content = content.strip()
         if not content:
             continue
-        turns.append(ChatTurn(role=role, content=content[:MAX_HISTORY_CONTENT_LEN]))
-    return tuple(turns[-MAX_HISTORY_TURNS:])
+        valid.append(ChatTurn(role=role, content=content[:MAX_HISTORY_CONTENT_LEN]))
+    kept: list[ChatTurn] = []
+    total = 0
+    for turn in reversed(valid):
+        if len(kept) >= MAX_HISTORY_TURNS:
+            break
+        total += len(turn.content)
+        # Always keep at least the newest turn even if it alone exceeds budget.
+        if total > MAX_HISTORY_TOTAL_CHARS and kept:
+            break
+        kept.append(turn)
+    kept.reverse()
+    return tuple(kept)
 
 
 # --- Streaming event constructors ----------------------------------------
