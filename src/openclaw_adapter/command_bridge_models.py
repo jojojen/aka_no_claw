@@ -52,6 +52,15 @@ EVENT_ERROR = "error"
 
 DEFAULT_SOURCE = "aka_no_claw_web"
 
+# --- Chat history (Web Chat continuity, issue #44) ------------------------
+# Recent visible chat turns the frontend sends so the bridge can answer
+# follow-ups in context. History is best-effort context, not authoritative
+# data: it is sanitized and trimmed here, and a malformed entry is skipped
+# rather than failing the whole request.
+CHAT_ROLES = {"user", "assistant", "system"}
+MAX_HISTORY_TURNS = 12
+MAX_HISTORY_CONTENT_LEN = 4000
+
 
 class RequestValidationError(ValueError):
     """Raised when an incoming request body violates the contract."""
@@ -94,6 +103,12 @@ class Attachment:
 
 
 @dataclass(frozen=True, slots=True)
+class ChatTurn:
+    role: str
+    content: str
+
+
+@dataclass(frozen=True, slots=True)
 class WebCommandRequest:
     mode: str
     input: str = ""
@@ -101,6 +116,11 @@ class WebCommandRequest:
     chat_backend: str = CHAT_BACKEND_LOCAL
     attachments: tuple[Attachment, ...] = ()
     source: str = DEFAULT_SOURCE
+    # Web Chat continuity (#44): recent visible turns + stable ids. Only used
+    # when mode == chat; other modes ignore history even if it is present.
+    history: tuple[ChatTurn, ...] = ()
+    session_id: str | None = None
+    conversation_id: str | None = None
 
     @property
     def has_image_attachment(self) -> bool:
@@ -197,6 +217,8 @@ def parse_request(data: object) -> WebCommandRequest:
 
     source = str(data.get("source") or DEFAULT_SOURCE).strip() or DEFAULT_SOURCE
 
+    history = _sanitize_history(data.get("history"))
+
     return WebCommandRequest(
         mode=mode,
         input=text,
@@ -204,7 +226,35 @@ def parse_request(data: object) -> WebCommandRequest:
         chat_backend=chat_backend,
         attachments=attachments,
         source=source,
+        history=history,
+        session_id=_opt_str(data.get("session_id")),
+        conversation_id=_opt_str(data.get("conversation_id")),
     )
+
+
+def _sanitize_history(raw: object) -> tuple[ChatTurn, ...]:
+    """Coerce frontend-provided chat history into clean ChatTurns.
+
+    History is best-effort context, so this never raises: a non-list, or any
+    malformed entry, is silently skipped rather than failing the whole chat
+    request. Entries are kept only when role is known and content is a non-empty
+    string; content is length-capped and the list is trimmed to the most recent
+    MAX_HISTORY_TURNS turns."""
+    if not isinstance(raw, list):
+        return ()
+    turns: list[ChatTurn] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        content = item.get("content")
+        if role not in CHAT_ROLES or not isinstance(content, str):
+            continue
+        content = content.strip()
+        if not content:
+            continue
+        turns.append(ChatTurn(role=role, content=content[:MAX_HISTORY_CONTENT_LEN]))
+    return tuple(turns[-MAX_HISTORY_TURNS:])
 
 
 # --- Streaming event constructors ----------------------------------------

@@ -17,10 +17,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from openclaw_adapter.command_bridge import CommandBridge
+from openclaw_adapter.command_bridge import CommandBridge, build_chat_prompt
 from openclaw_adapter.command_bridge_models import (
     CHAT_BACKEND_CLOUD_PICKLE,
     CHAT_BACKEND_LOCAL,
+    MAX_HISTORY_TURNS,
+    ChatTurn,
     MODE_CHAT,
     MODE_INVESTMENT,
     MODE_TRANSLATION,
@@ -108,6 +110,65 @@ def test_parse_request_rejects_bad_base64():
             "mode": "translation", "submode": "image_translation", "input": "",
             "attachments": [{"type": "image", "data_base64": "not!!base64!!"}],
         })
+
+
+# --- chat history + ids (#44) ---------------------------------------------
+def test_parse_request_parses_history_and_ids():
+    req = parse_request({
+        "mode": "chat", "input": "follow up",
+        "session_id": "sess-1", "conversation_id": "default",
+        "history": [
+            {"role": "user", "content": "誰是初音"},
+            {"role": "assistant", "content": "她是虛擬歌手"},
+        ],
+    })
+    assert req.session_id == "sess-1"
+    assert req.conversation_id == "default"
+    assert req.history == (
+        ChatTurn(role="user", content="誰是初音"),
+        ChatTurn(role="assistant", content="她是虛擬歌手"),
+    )
+
+
+def test_parse_request_skips_malformed_history_non_fatally():
+    req = parse_request({
+        "mode": "chat", "input": "x",
+        "history": [
+            {"role": "user", "content": "keep me"},
+            "not-a-dict",
+            {"role": "bogus", "content": "bad role"},
+            {"role": "assistant", "content": "   "},
+            {"role": "system", "content": "also kept"},
+        ],
+    })
+    # Bad-role / non-dict / empty-content entries are dropped; the request still parses.
+    assert req.history == (
+        ChatTurn(role="user", content="keep me"),
+        ChatTurn(role="system", content="also kept"),
+    )
+
+
+def test_parse_request_trims_history_to_recent_turns():
+    raw = [{"role": "user", "content": f"m{i}"} for i in range(MAX_HISTORY_TURNS + 5)]
+    req = parse_request({"mode": "chat", "input": "x", "history": raw})
+    assert len(req.history) == MAX_HISTORY_TURNS
+    assert req.history[-1].content == f"m{MAX_HISTORY_TURNS + 4}"
+
+
+def test_build_chat_prompt_without_history_is_bare_input():
+    assert build_chat_prompt("  hello  ", ()) == "hello"
+
+
+def test_build_chat_prompt_with_history_includes_turns():
+    prompt = build_chat_prompt(
+        "她還有哪些經典歌曲",
+        (ChatTurn(role="user", content="初音是誰"),
+         ChatTurn(role="assistant", content="虛擬歌手")),
+    )
+    assert "初音是誰" in prompt
+    assert "虛擬歌手" in prompt
+    assert prompt.rstrip().endswith("助理：")
+    assert "她還有哪些經典歌曲" in prompt
 
 
 # --- translation routing --------------------------------------------------
@@ -283,6 +344,57 @@ def test_chat_cloud_unavailable_is_error(bridge, monkeypatch):
     req = parse_request({"mode": "chat", "input": "hello", "chat_backend": "cloud_pickle"})
     resp = bridge.handle(req)
     assert resp.status == STATUS_ERROR
+
+
+def test_chat_local_blocking_uses_history(bridge, monkeypatch):
+    captured: dict[str, str] = {}
+
+    def _gen(prompt):
+        captured["prompt"] = prompt
+        return "answer"
+
+    monkeypatch.setattr(bridge, "_ollama_generate_blocking", _gen)
+    req = parse_request({
+        "mode": "chat", "input": "她還有哪些經典歌曲", "chat_backend": "local",
+        "history": [
+            {"role": "user", "content": "初音是誰"},
+            {"role": "assistant", "content": "虛擬歌手"},
+        ],
+    })
+    resp = bridge.handle(req)
+    assert resp.status == STATUS_OK
+    assert "初音是誰" in captured["prompt"]
+    assert "她還有哪些經典歌曲" in captured["prompt"]
+
+
+def test_chat_stream_uses_history(bridge, monkeypatch):
+    captured: dict[str, str] = {}
+
+    def _fake_stream(prompt):
+        from openclaw_adapter.command_bridge_models import stream_delta, stream_done
+        captured["prompt"] = prompt
+        yield stream_delta("ok")
+        yield stream_done("ok")
+
+    monkeypatch.setattr(bridge, "_stream_ollama_chat", _fake_stream)
+    req = parse_request({
+        "mode": "chat", "input": "再講一首", "chat_backend": "local",
+        "history": [{"role": "assistant", "content": "千本櫻"}],
+    })
+    list(bridge.stream(req, "rid-h"))
+    assert "千本櫻" in captured["prompt"]
+    assert "再講一首" in captured["prompt"]
+
+
+def test_non_chat_ignores_history(bridge):
+    # Translation must not leak chat history into the /zh remainder.
+    req = parse_request({
+        "mode": "translation", "submode": "text_translation", "input": "abc",
+        "history": [{"role": "user", "content": "should be ignored"}],
+    })
+    resp = bridge.handle(req)
+    assert resp.message == "[zh]abc"
+    assert bridge._calls["/zh"] == [("abc", "web-bridge")]
 
 
 def test_handler_exception_becomes_structured_error(bridge, monkeypatch):

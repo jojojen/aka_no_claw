@@ -35,6 +35,7 @@ from .service_restart import RESTART_MESSAGE, trigger_restart_all
 from .command_bridge_models import (
     CHAT_BACKEND_CLOUD_PICKLE,
     CHAT_BACKEND_LOCAL,
+    ChatTurn,
     MODE_CHAT,
     MODE_INVESTMENT,
     MODE_TRANSLATION,
@@ -63,6 +64,36 @@ _HEARTBEAT_SECONDS = 10.0
 _JOB_TTL_SECONDS = 1800.0
 
 _SELLER_UNSUPPORTED_MSG = "賣家信譽快照目前尚未由本地 command bridge 支援。"
+
+# Web Chat continuity (#44). Prepended so the model continues the conversation
+# (e.g. resolves 「她/它/這個」 against earlier turns) instead of treating each
+# message as a one-shot. Blocking and streaming chat share build_chat_prompt so
+# the two paths can't drift.
+_CHAT_SYSTEM_PROMPT = (
+    "你是 aka_no_claw 的本機聊天助理。下面是這段對話最近的內容，"
+    "請延續上下文回答使用者最新的訊息（例如代名詞「她／它／這個」指的是先前提到的主題），"
+    "並以繁體中文自然作答。"
+)
+_CHAT_ROLE_LABELS = {"user": "使用者", "assistant": "助理", "system": "系統"}
+
+
+def build_chat_prompt(user_input: str, history: tuple[ChatTurn, ...] = ()) -> str:
+    """Assemble the chat prompt from recent history + the current input.
+
+    With no history this is just the bare input (back-compat with the old
+    stateless behaviour). With history it becomes ``system + recent turns +
+    current input`` as a single string, which works for both the local Ollama
+    and cloud-pickle backends. Server-side trimming/sanitization already happened
+    in parse_request; this only formats."""
+    user_input = (user_input or "").strip()
+    if not history:
+        return user_input
+    lines = [_CHAT_SYSTEM_PROMPT, "", "對話紀錄："]
+    for turn in history:
+        label = _CHAT_ROLE_LABELS.get(turn.role, turn.role)
+        lines.append(f"{label}：{turn.content}")
+    lines += ["", f"使用者：{user_input}", "助理："]
+    return "\n".join(lines)
 
 _NO_IMAGE_MSG = "請附上要翻譯的圖片。"
 _BAD_IMAGE_TYPE_MSG = "不支援的檔案類型，請改用 JPG / PNG / WEBP / GIF 等圖片格式。"
@@ -327,11 +358,11 @@ class CommandBridge:
 
     # --- chat ------------------------------------------------------------
     def _handle_chat_blocking(self, req: WebCommandRequest) -> WebCommandResponse:
-        prompt = (req.input or "").strip()
-        if not prompt:
+        if not (req.input or "").strip():
             return WebCommandResponse(
                 status=STATUS_ERROR, message="請輸入訊息。", mode=MODE_CHAT
             )
+        prompt = build_chat_prompt(req.input, req.history)
         if req.chat_backend == CHAT_BACKEND_CLOUD_PICKLE:
             client = self._build_cloud_chat_client()
             if client is None:
@@ -346,10 +377,10 @@ class CommandBridge:
         return WebCommandResponse(status=STATUS_OK, message=message, mode=MODE_CHAT)
 
     def _stream_chat(self, req: WebCommandRequest) -> Iterator[dict]:
-        prompt = (req.input or "").strip()
-        if not prompt:
+        if not (req.input or "").strip():
             yield stream_error("請輸入訊息。")
             return
+        prompt = build_chat_prompt(req.input, req.history)
         if req.chat_backend == CHAT_BACKEND_CLOUD_PICKLE:
             yield from self._stream_cloud_chat(prompt)
         else:
