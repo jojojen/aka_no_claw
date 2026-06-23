@@ -62,8 +62,23 @@ _HEARTBEAT_SECONDS = 10.0
 # can still fetch the final report, then they are garbage-collected.
 _JOB_TTL_SECONDS = 1800.0
 
-_IMAGE_UNSUPPORTED_MSG = "圖片翻譯目前尚未由本地 command bridge 支援。"
 _SELLER_UNSUPPORTED_MSG = "賣家信譽快照目前尚未由本地 command bridge 支援。"
+
+_NO_IMAGE_MSG = "請附上要翻譯的圖片。"
+_BAD_IMAGE_TYPE_MSG = "不支援的檔案類型，請改用 JPG / PNG / WEBP / GIF 等圖片格式。"
+_SUPPORTED_IMAGE_EXTENSIONS = (
+    ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".heic", ".heif",
+)
+_IMAGE_SUFFIX_BY_CONTENT_TYPE = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "image/bmp": ".bmp",
+    "image/heic": ".heic",
+    "image/heif": ".heif",
+}
 
 JOB_RUNNING = "running"
 JOB_DONE = "done"
@@ -151,6 +166,26 @@ class _JobNotifier:
         })
 
 
+def _is_supported_image(att) -> bool:
+    """Whether an image attachment is a format the OCR pipeline can open. Trust an
+    explicit content_type when present (must be image/*); otherwise fall back to
+    the filename extension."""
+    ct = (att.content_type or "").strip().lower()
+    if ct:
+        return ct.startswith("image/")
+    name = (att.filename or "").lower()
+    return any(name.endswith(ext) for ext in _SUPPORTED_IMAGE_EXTENSIONS)
+
+
+def _image_temp_suffix(att) -> str:
+    name = (att.filename or "").lower()
+    for ext in _SUPPORTED_IMAGE_EXTENSIONS:
+        if name.endswith(ext):
+            return ext
+    ct = (att.content_type or "").strip().lower()
+    return _IMAGE_SUFFIX_BY_CONTENT_TYPE.get(ct, ".img")
+
+
 class CommandBridge:
     """Stateless-per-request router over the existing OpenClaw handlers."""
 
@@ -166,6 +201,9 @@ class CommandBridge:
         self._job_store_lock = threading.Lock()
         self._session_store: SessionMemoryStore | None = None
         self._session_lock = threading.Lock()
+        self._image_renderer = None
+        self._image_renderer_built = False
+        self._image_renderer_lock = threading.Lock()
 
     # --- handler registry (lazy, shared with the Telegram bot) ------------
     def _ensure_registries(self) -> None:
@@ -805,14 +843,27 @@ class CommandBridge:
         return (self.settings.openclaw_local_text_model or "qwen3:14b").split(",")[0].strip()
 
     # --- translation -----------------------------------------------------
+    def _image_translate_renderer(self):
+        """Lazily build (and cache) the shared OCR+繁中翻譯 renderer from settings.
+        Returns None when the local vision/text models are not configured — the
+        same gate the Telegram photo path uses."""
+        if self._image_renderer_built:
+            return self._image_renderer
+        with self._image_renderer_lock:
+            if not self._image_renderer_built:
+                from .image_translate import (
+                    build_image_ocr_translate_renderer_from_settings,
+                )
+
+                self._image_renderer = build_image_ocr_translate_renderer_from_settings(
+                    self.settings
+                )
+                self._image_renderer_built = True
+        return self._image_renderer
+
     def _handle_translation(self, req: WebCommandRequest) -> WebCommandResponse:
         if req.submode == SUBMODE_IMAGE_TRANSLATION or req.has_image_attachment:
-            return WebCommandResponse(
-                status=STATUS_UNSUPPORTED,
-                message=_IMAGE_UNSUPPORTED_MSG,
-                mode=MODE_TRANSLATION,
-                submode=SUBMODE_IMAGE_TRANSLATION,
-            )
+            return self._handle_image_translation(req)
         text = (req.input or "").strip()
         if not text:
             return WebCommandResponse(
@@ -827,6 +878,63 @@ class CommandBridge:
             message=message,
             mode=MODE_TRANSLATION,
             submode=SUBMODE_TEXT_TRANSLATION,
+        )
+
+    def _handle_image_translation(self, req: WebCommandRequest) -> WebCommandResponse:
+        """Run the uploaded image through the same OCR + 繁體中文 translation
+        pipeline the Telegram photo path uses (#43). Image bytes are written to a
+        throwaway temp file (the renderer takes a path), then unlinked."""
+        def _err(message: str, status: str = STATUS_ERROR) -> WebCommandResponse:
+            return WebCommandResponse(
+                status=status,
+                message=message,
+                mode=MODE_TRANSLATION,
+                submode=SUBMODE_IMAGE_TRANSLATION,
+            )
+
+        image = next((a for a in req.attachments if a.type == "image"), None)
+        if image is None or not image.data:
+            return _err(_NO_IMAGE_MSG)
+        if not _is_supported_image(image):
+            return _err(_BAD_IMAGE_TYPE_MSG)
+
+        renderer = self._image_translate_renderer()
+        if renderer is None:
+            from .image_translate import NOT_CONFIGURED_MESSAGE
+
+            return _err(NOT_CONFIGURED_MESSAGE, status=STATUS_UNSUPPORTED)
+
+        import os
+        import tempfile
+        from pathlib import Path
+
+        tmp_path: Path | None = None
+        try:
+            fd, tmp_name = tempfile.mkstemp(
+                prefix="akaweb_imgtr_", suffix=_image_temp_suffix(image)
+            )
+            tmp_path = Path(tmp_name)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(image.data)
+            result = renderer(tmp_path, (req.input or "").strip() or None)
+        finally:
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    logger.warning("image translation temp cleanup failed path=%s", tmp_path)
+
+        if not result.ok:
+            return _err(result.message)
+        message = (
+            f"🌐→🇹🇼 圖片文字翻譯（偵測語言：{result.source_language}）\n\n"
+            f"{result.translation}\n\n【原文】\n{result.ocr_text}"
+        )
+        return WebCommandResponse(
+            status=STATUS_OK,
+            message=message,
+            mode=MODE_TRANSLATION,
+            submode=SUBMODE_IMAGE_TRANSLATION,
         )
 
     # --- investment ------------------------------------------------------

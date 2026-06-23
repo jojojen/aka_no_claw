@@ -12,6 +12,7 @@ Contract source: aka_no_claw_web/docs/LOCAL_MOBILE_CONSOLE_MVP.md.
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass, field
 
 # --- Modes ----------------------------------------------------------------
@@ -61,6 +62,10 @@ class Attachment:
     type: str
     filename: str | None = None
     content_type: str | None = None
+    # Raw attachment bytes (e.g. an uploaded image). Carried in-process only —
+    # never serialized back out. The frontend sends them base64-encoded in the
+    # ``data_base64`` JSON field (see ``from_dict``).
+    data: bytes | None = None
 
     @classmethod
     def from_dict(cls, data: object) -> "Attachment":
@@ -69,10 +74,22 @@ class Attachment:
         atype = str(data.get("type") or "").strip()
         if not atype:
             raise RequestValidationError("attachment.type is required")
+        raw_b64 = data.get("data_base64")
+        decoded: bytes | None = None
+        if raw_b64 is not None:
+            if not isinstance(raw_b64, str):
+                raise RequestValidationError("attachment.data_base64 must be a base64 string")
+            try:
+                decoded = base64.b64decode(raw_b64, validate=True)
+            except ValueError as exc:  # binascii.Error subclasses ValueError
+                raise RequestValidationError(
+                    f"attachment.data_base64 is not valid base64: {exc}"
+                )
         return cls(
             type=atype,
             filename=_opt_str(data.get("filename")),
             content_type=_opt_str(data.get("content_type")),
+            data=decoded,
         )
 
 

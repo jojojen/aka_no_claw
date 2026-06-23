@@ -2,10 +2,11 @@
 
 These tests assert the bridge's routing contract: chat goes to the selected
 backend (local Ollama vs cloud big-pickle), Translation reuses the existing
-``/zh`` handler, deep product research reuses ``/research``, while image
-translation and seller snapshot return structured ``unsupported`` (allowed for
-MVP). Streaming emits the documented event sequence. The real handlers/models
-are stubbed so the routing — not the network — is what's under test.
+``/zh`` handler (text) and the shared OCR+繁中翻譯 pipeline (image, #43), deep
+product research reuses ``/research``, while seller snapshot returns structured
+``unsupported`` (allowed for MVP). Streaming emits the documented event
+sequence. The real handlers/models are stubbed so the routing — not the
+network — is what's under test.
 """
 from __future__ import annotations
 
@@ -88,6 +89,27 @@ def test_parse_request_image_attachment():
     assert req.has_image_attachment
 
 
+def test_parse_request_decodes_image_base64():
+    import base64
+    raw = b"\x89PNG\r\n hello bytes"
+    req = parse_request({
+        "mode": "translation", "submode": "image_translation", "input": "",
+        "attachments": [{
+            "type": "image", "filename": "a.png", "content_type": "image/png",
+            "data_base64": base64.b64encode(raw).decode("ascii"),
+        }],
+    })
+    assert req.attachments[0].data == raw
+
+
+def test_parse_request_rejects_bad_base64():
+    with pytest.raises(RequestValidationError):
+        parse_request({
+            "mode": "translation", "submode": "image_translation", "input": "",
+            "attachments": [{"type": "image", "data_base64": "not!!base64!!"}],
+        })
+
+
 # --- translation routing --------------------------------------------------
 def test_translation_text_routes_to_zh(bridge):
     req = parse_request({"mode": "translation", "submode": "text_translation",
@@ -99,15 +121,107 @@ def test_translation_text_routes_to_zh(bridge):
     assert bridge._calls["/zh"] == [("これはペンです", "web-bridge")]
 
 
-def test_translation_image_is_unsupported(bridge):
+def test_translation_image_without_bytes_is_error(bridge):
+    """Image submode but no actual image bytes → readable structured error."""
     req = parse_request({
         "mode": "translation", "submode": "image_translation", "input": "",
         "attachments": [{"type": "image", "filename": "a.jpg", "content_type": "image/jpeg"}],
     })
     resp = bridge.handle(req)
+    assert resp.status == STATUS_ERROR
+    assert resp.submode == SUBMODE_IMAGE_TRANSLATION
+    assert "圖片" in resp.message
+    assert bridge._calls["/zh"] == []  # never touched the text translator
+
+
+def _png_base64() -> str:
+    import base64
+    # 1x1 transparent PNG.
+    png = (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+        b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01"
+        b"\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+    return base64.b64encode(png).decode("ascii")
+
+
+def test_translation_image_success_routes_to_pipeline(bridge, monkeypatch):
+    from openclaw_adapter.image_translate import ImageTranslateResult
+
+    seen: dict[str, object] = {}
+
+    def _fake_renderer(image_path, caption=None):
+        from pathlib import Path
+        p = Path(image_path)
+        seen["existed_during_render"] = p.exists()
+        seen["bytes"] = p.read_bytes()
+        seen["caption"] = caption
+        seen["path"] = p
+        return ImageTranslateResult(
+            ok=True, source_language="日文", ocr_text="ペン", translation="筆", message="",
+        )
+
+    monkeypatch.setattr(bridge, "_image_translate_renderer", lambda: _fake_renderer)
+    req = parse_request({
+        "mode": "translation", "submode": "image_translation", "input": "",
+        "attachments": [{"type": "image", "filename": "a.png",
+                         "content_type": "image/png", "data_base64": _png_base64()}],
+    })
+    resp = bridge.handle(req)
+    assert resp.status == STATUS_OK
+    assert resp.submode == SUBMODE_IMAGE_TRANSLATION
+    assert "筆" in resp.message
+    assert "日文" in resp.message
+    assert "ペン" in resp.message  # OCR原文 included
+    # The pipeline saw the real uploaded bytes on disk...
+    assert seen["existed_during_render"] is True
+    assert seen["bytes"]
+    # ...and the temp file is cleaned up afterwards.
+    assert not seen["path"].exists()
+
+
+def test_translation_image_failure_surfaces_message(bridge, monkeypatch):
+    from openclaw_adapter.image_translate import ImageTranslateResult
+
+    def _fake_renderer(image_path, caption=None):
+        return ImageTranslateResult(
+            ok=False, source_language="", ocr_text="", translation="",
+            message="這張圖片裡沒有辨識到任何文字。",
+        )
+
+    monkeypatch.setattr(bridge, "_image_translate_renderer", lambda: _fake_renderer)
+    req = parse_request({
+        "mode": "translation", "submode": "image_translation", "input": "",
+        "attachments": [{"type": "image", "filename": "a.png",
+                         "content_type": "image/png", "data_base64": _png_base64()}],
+    })
+    resp = bridge.handle(req)
+    assert resp.status == STATUS_ERROR
+    assert "沒有辨識到" in resp.message
+
+
+def test_translation_image_bad_type_is_error(bridge, monkeypatch):
+    monkeypatch.setattr(bridge, "_image_translate_renderer", lambda: (_ for _ in ()).throw(AssertionError))
+    req = parse_request({
+        "mode": "translation", "submode": "image_translation", "input": "",
+        "attachments": [{"type": "image", "filename": "a.txt",
+                         "content_type": "text/plain", "data_base64": _png_base64()}],
+    })
+    resp = bridge.handle(req)
+    assert resp.status == STATUS_ERROR
+    assert "不支援的檔案類型" in resp.message
+
+
+def test_translation_image_pipeline_unavailable_is_unsupported(bridge, monkeypatch):
+    monkeypatch.setattr(bridge, "_image_translate_renderer", lambda: None)
+    req = parse_request({
+        "mode": "translation", "submode": "image_translation", "input": "",
+        "attachments": [{"type": "image", "filename": "a.png",
+                         "content_type": "image/png", "data_base64": _png_base64()}],
+    })
+    resp = bridge.handle(req)
     assert resp.status == STATUS_UNSUPPORTED
     assert resp.submode == SUBMODE_IMAGE_TRANSLATION
-    assert bridge._calls["/zh"] == []  # never touched the translator
 
 
 def test_translation_empty_text_is_error(bridge):
@@ -225,9 +339,9 @@ def test_stream_non_chat_runs_blocking_then_done(bridge):
 def test_stream_non_chat_error_emits_error_event(bridge):
     req = parse_request({"mode": "translation", "submode": "image_translation", "input": "",
                          "attachments": [{"type": "image"}]})
-    # image translation -> unsupported (not error), so done carries the message
+    # image submode with no bytes -> structured error, surfaced as an error event.
     events = list(bridge.stream(req, "rid-3"))
-    assert events[-1]["type"] == "done"
+    assert events[-1]["type"] == "error"
 
 
 # --- async job + poll (long research) -------------------------------------
