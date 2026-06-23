@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="robots" content="noindex">
+  <title>TCGW fixture catalog v1</title>
+</head>
+<body class="catalog-shell catalog-shell--search-results js-table-sort" data-benchmark="price-reference-sources" data-source-code="TCGW">
+  <header>
+    <h1>SYNTHETIC TEST PAGE - NOT A REAL WEBSITE</h1>
+    <strong>TCGW synthetic card catalog</strong>
+    <p>Benchmark fixture only. This is not a real commerce website.</p>
+  </header>
+
+  <main data-page-kind="card-shop-catalog">
+    <form class="filters filters--compact" action="/fixtures/tcgw/search">
+      <input type="search" name="q" value="fixture keyword">
+      <select name="sort"><option>price</option></select>
+    </form>
+    <table class="catalog-table result-table v3 sortable" data-source-type="shop_catalog">
+      <thead>
+        <tr>
+          <th data-key="id">Item ID</th>
+          <th data-key="title">Title</th>
+          <th data-key="price">Price</th>
+          <th data-key="kind">Kind</th>
+          <th data-key="availability">Availability</th>
+          <th data-key="store">Store</th>
+          <th data-key="condition">Condition</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr class="sponsored-row" aria-hidden="true">
+          <td>TCGW-2026-0000</td>
+          <td>Sponsored decoy item</td>
+          <td>1円</td>
+          <td>Sell</td>
+          <td>In stock</td>
+          <td>tcgw-sponsored-decoy</td>
+          <td>Poor</td>
+        </tr>
+        <tr class="result-row result-row--primary" data-primary-result="true" data-row-id="fixture-row-0201">
+          <td><span class="mono">TCGW-2026-0201</span></td>
+          <td><a href="/fixtures/tcgw/items/0201">夜明けの剣士 プレイマット</a></td>
+          <td><span class="price"><span class="currency">JPY</span> 19,500円</span></td>
+          <td><span class="kind">Sell</span></td>
+          <td><span class="stock stock--ok">In stock</span></td>
+          <td><span class="store">tcgw-main-fixture</span></td>
+          <td><span class="grade">Excellent</span></td>
+        </tr>
+        <tr class="result-row">
+          <td>TCGW-2026-0999</td>
+          <td>Unrelated decoy item</td>
+          <td>100円</td>
+          <td>Sell</td>
+          <td>In stock</td>
+          <td>tcgw-decoy</td>
+          <td>Poor</td>
+        </tr>
+      </tbody>
+    </table>
+  </main>
+</body>
+</html>

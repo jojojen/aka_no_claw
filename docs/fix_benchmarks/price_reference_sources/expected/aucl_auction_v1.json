@@ -1,0 +1,11 @@
+{
+  "source_code": "AUCL",
+  "source_type": "auction",
+  "item_id": "AUCL-2026-0301",
+  "title": "白銀アーカイブ SP サンプルカード",
+  "price_jpy": 8400,
+  "price_kind": "current_bid",
+  "availability": "open",
+  "seller_or_store": "archive-bid-fixture",
+  "condition": "very_good"
+}

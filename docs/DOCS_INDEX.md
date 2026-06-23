@@ -32,6 +32,9 @@ Full inventory with recommended actions is in [DOC_AUDIT.md](DOC_AUDIT.md).
 |---|---|---|---|
 | [LIQUIDITY_METHODOLOGY.md](LIQUIDITY_METHODOLOGY.md) | Current | price/liquidity | Scoring approach for liquidity and market support. |
 | [RESEARCH_COMMAND_PLAN.md](RESEARCH_COMMAND_PLAN.md) | Current | research | `/research` implementation status, offload, and stage parallelization. |
+| [fix_benchmarks/README.md](fix_benchmarks/README.md) | Current | agent-maintenance | Deterministic `/fix` benchmark directory and safety rules for synthetic fixtures. |
+| [fix_benchmarks/price_reference_sources/README.md](fix_benchmarks/price_reference_sources/README.md) | Current | agent-maintenance | Multi-source synthetic price reference parser repair benchmark. |
+| [fix_benchmarks/price_reference_sources/FAILURE_TRACE.md](fix_benchmarks/price_reference_sources/FAILURE_TRACE.md) | Current | agent-maintenance | Reproducible broken-parser attempts and verifier outcomes for the benchmark. |
 | [NEW_DYNAMIC_TOOLS_PROGRESS.md](NEW_DYNAMIC_TOOLS_PROGRESS.md) | Current (canonical: dynamic-tools) | dynamic-tools | `/new` implementation notes and benchmark history. |
 | [NEW_E2E_DISCRIMINATING_TESTS.md](NEW_E2E_DISCRIMINATING_TESTS.md) | Current | dynamic-tools | Companion: discriminating tests for generated tools. |
 | [KB_EMBEDDING_PLAN.md](KB_EMBEDDING_PLAN.md) | Needs review | knowledge | Embedding/RAG plan and status may need fresh verification. |

@@ -39,6 +39,9 @@ for which question each one answers.
 |---|---|---|---|
 | `LIQUIDITY_METHODOLOGY.md` | Current | price/liquidity | Keep; update with scoring changes. |
 | `RESEARCH_COMMAND_PLAN.md` | Current | research | Keep; living `/research` status. |
+| `fix_benchmarks/README.md` | Current | agent-maintenance | Keep; `/fix` benchmark index and synthetic-fixture safety rules. |
+| `fix_benchmarks/price_reference_sources/README.md` | Current | agent-maintenance | Keep; benchmark spec for synthetic multi-source price parsers. |
+| `fix_benchmarks/price_reference_sources/FAILURE_TRACE.md` | Current | agent-maintenance | Keep; reproducible parser failure history for `/fix` evaluation. |
 | `NEW_DYNAMIC_TOOLS_PROGRESS.md` | Current | dynamic-tools | Keep; canonical `/new` doc. |
 | `NEW_E2E_DISCRIMINATING_TESTS.md` | Current | dynamic-tools | Keep; cross-link from dynamic-tools canonical. |
 | `OPPORTUNITY_AGENT_SPEC.md` | Needs review | opportunity | Verify thresholds vs code; canonical Opportunity doc. |
