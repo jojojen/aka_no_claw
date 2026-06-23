@@ -1323,6 +1323,43 @@ def test_yuyu_raw_card_search_term_falls_back_when_normalizer_unsure() -> None:
     assert term == "初音ミク SSP"
 
 
+@pytest.mark.parametrize(
+    "noisy",
+    [
+        "初音ミク SSP PSA10鑑定済み",
+        "初音ミク SSP psa10プロセカ",
+        "初音ミク SSP ARS10鑑定",
+        "初音ミク SSP BGS 9.5",
+        "初音ミク SSP プロセカPSA10",
+    ],
+)
+def test_yuyu_raw_card_search_term_strips_compact_grading_tokens(noisy: str) -> None:
+    """#41 code-review follow-up: grading tokens written tight against Japanese
+    text (PSA10鑑定済み / psa10プロセカ) or with a decimal grade (BGS 9.5) must be
+    stripped from the fallback query so it can't reintroduce the 200+0-hit bug."""
+    from openclaw_adapter import research_command as rc
+
+    term = rc._yuyu_raw_card_search_term(noisy, lambda text: None)
+    lowered = term.lower()
+    assert "psa" not in lowered
+    assert "bgs" not in lowered
+    assert "ars" not in lowered
+    assert ".5" not in term
+    assert "10" not in term
+
+
+@pytest.mark.parametrize(
+    "title",
+    ["PSA10鑑定済み", "psa10プロセカ", "ARS10鑑定", "BGS 9.5", "プロセカPSA10"],
+)
+def test_looks_graded_title_detects_compact_forms(title: str) -> None:
+    """The same regex gates graded-context labeling; compact forms must register
+    as graded so 遊々亭 is labeled 「raw参考」rather than mistaken for a PSA comp."""
+    from openclaw_adapter import research_command as rc
+
+    assert rc._looks_graded_title(title) is True
+
+
 def test_shop_reference_from_band_reports_zero_hits_as_no_match(monkeypatch) -> None:
     """#41: a 200-with-zero-parsed-hits result must surface as reason='no_match',
     NOT collapse into the generic 'rate-limited' message."""

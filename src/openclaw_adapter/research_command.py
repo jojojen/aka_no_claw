@@ -107,7 +107,10 @@ _META_PRICE_RE = re.compile(
     r'<meta[^>]+name=["\']product:price:amount["\'][^>]+content=["\'](\d+)["\']',
     re.IGNORECASE,
 )
-_GRADED_TITLE_RE = re.compile(r"\b(?:psa|bgs|ars)(?:\s*\d{1,2})?\b|鑑定", re.IGNORECASE)
+_GRADED_TITLE_RE = re.compile(
+    r"(?<![a-z0-9])(?:psa|bgs|ars)\s*\d{0,2}(?:\.\d)?|鑑定",
+    re.IGNORECASE,
+)
 _GENERIC_PROMO_TOKEN_RE = re.compile(r"\d+|周年|限定|フェス|記念|特典|入場者", re.IGNORECASE)
 _REVIEW_WHITESPACE_RE = re.compile(r"\s+")
 _MERCARI_ITEM_CONDITIONS = frozenset(
