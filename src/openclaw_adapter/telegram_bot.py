@@ -88,6 +88,7 @@ from .home_schedule import (
     make_run_slash_command,
 )
 from .home_schedule_command import (
+    begin_label_then_capture,
     build_schedulehome_callback_handler,
     build_schedulehome_handler,
     render_list as render_home_schedule_list,
@@ -413,10 +414,17 @@ class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
         if text is None or not self.is_allowed_chat(chat_id):
             return None
         store = get_home_schedule_store(self._settings.openclaw_home_schedules_path)
+        content = text.strip()
+        # Naming mode (between recurrence selection and command capture): the next
+        # plain message names the schedule, then we drop into command capture.
+        if store.naming_target(chat_id) is not None:
+            if content.startswith("/schedulehome"):
+                return None  # let the user still manage schedules mid-naming
+            reply, markup = begin_label_then_capture(store, chat_id, content)
+            return TelegramTextReplyPlan(ack=None, reply=reply, reply_markup=markup)
         sid = store.capture_target(chat_id)
         if sid is None:
             return None
-        content = text.strip()
         if content in {"完成", "done", "結束"}:
             store.end_capture(chat_id)
             entry = store.get(sid)

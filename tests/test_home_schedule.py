@@ -290,17 +290,19 @@ def test_callback_time_picker_adjust_and_next(store):
     assert "重複日" in text
 
 
-def test_callback_recurrence_ok_creates_and_captures(store):
+def test_callback_recurrence_ok_creates_and_prompts_for_name(store):
     cb = hc.build_schedulehome_callback_handler(store, lambda c, cid: "ok")
     # Choose weekday preset, then confirm.
     toast, text, markup = cb("r:07:30:0000000:wk", "", "chat1")
     assert "平日" in text
     toast, text, markup = cb("r:07:30:1111100:ok", "", "chat1")
     assert toast == "已建立排程"
+    assert "名稱" in text  # prompts the user to name the schedule
     entry = store.get("sch_001")
     assert entry["schedule"] == {"time": "07:30", "days": hs.WEEKDAY_KEYS}
-    # Capture mode now active for this chat.
-    assert store.capture_target("chat1") == "sch_001"
+    # Naming mode is active first; command capture has NOT started yet.
+    assert store.naming_target("chat1") == "sch_001"
+    assert store.capture_target("chat1") is None
 
 
 def test_callback_recurrence_ok_requires_a_day(store):
@@ -335,6 +337,69 @@ def test_callback_cancel_ends_capture(store):
     toast, text, markup = cb("cancel", "", "chat1")
     assert toast == "已取消"
     assert store.capture_target("chat1") is None
+
+
+# --- naming flow (user-configurable labels, issue #39 review) --------------
+def test_naming_session_lifecycle(store):
+    store.add(time="07:00", days=["mon"])
+    assert store.naming_target("chat1") is None
+    store.begin_naming("chat1", "sch_001")
+    assert store.naming_target("chat1") == "sch_001"
+    assert store.end_naming("chat1") == "sch_001"
+    assert store.naming_target("chat1") is None
+
+
+def test_delete_clears_naming(store):
+    store.add(time="07:00", days=["mon"])
+    store.begin_naming("chat1", "sch_001")
+    store.delete("sch_001")
+    assert store.naming_target("chat1") is None
+
+
+def test_callback_cancel_ends_naming(store):
+    store.add(time="07:00", days=["mon"])
+    store.begin_naming("chat1", "sch_001")
+    cb = hc.build_schedulehome_callback_handler(store, lambda c, cid: "ok")
+    toast, text, markup = cb("cancel", "", "chat1")
+    assert toast == "已取消"
+    assert store.naming_target("chat1") is None
+
+
+def test_begin_label_then_capture_sets_label_and_captures(store):
+    entry = store.add(time="07:30", days=["mon"])
+    store.begin_naming("chat1", entry["id"])
+    reply, markup = hc.begin_label_then_capture(store, "chat1", "平日早安")
+    assert store.get("sch_001")["label"] == "平日早安"
+    assert "平日早安" in reply  # capture hint shows the chosen name
+    assert store.naming_target("chat1") is None
+    assert store.capture_target("chat1") == "sch_001"  # now collecting commands
+
+
+def test_begin_label_then_capture_skip_keeps_default(store):
+    entry = store.add(time="07:30", days=["mon"])
+    store.begin_naming("chat1", entry["id"])
+    reply, markup = hc.begin_label_then_capture(store, "chat1", "略過")
+    assert store.get("sch_001")["label"] == ""  # default (falls back to id in UI)
+    assert store.capture_target("chat1") == "sch_001"
+
+
+def test_handler_label_renames_existing(store):
+    store.add(time="07:00", days=["mon"])
+    handler = hc.build_schedulehome_handler(store, lambda c, cid: "ok")
+    reply = handler("label sch_001 平日 早安", "chat1")
+    assert "平日 早安" in reply  # multi-word labels preserved
+    assert store.get("sch_001")["label"] == "平日 早安"
+
+
+def test_handler_label_not_found(store):
+    handler = hc.build_schedulehome_handler(store, lambda c, cid: "ok")
+    assert "找不到排程" in handler("label sch_999 名稱", "chat1")
+
+
+def test_handler_label_requires_id_and_name(store):
+    handler = hc.build_schedulehome_handler(store, lambda c, cid: "ok")
+    assert "請指定排程 id 與名稱" in handler("label", "chat1")
+    assert "請指定排程 id 與名稱" in handler("label sch_001", "chat1")
 
 
 # --- edit flow (re-set time / recurrence, keep commands) -------------------

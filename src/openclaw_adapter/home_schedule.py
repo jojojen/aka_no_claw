@@ -147,6 +147,10 @@ class HomeScheduleStore:
         self._lock = threading.Lock()
         # chat_id -> schedule id currently being built (command capture mode).
         self._capture: dict[str, str] = {}
+        # chat_id -> schedule id awaiting a user-typed label (naming mode). This
+        # sits between recurrence selection and command capture so a freshly
+        # created schedule gets a human name instead of a bare sch_NNN id.
+        self._naming: dict[str, str] = {}
         # chat_id -> schedule id whose time/recurrence is being re-edited via the
         # time/recurrence pickers (no command capture; commands are left as-is).
         self._editing: dict[str, str] = {}
@@ -254,8 +258,9 @@ class HomeScheduleStore:
             if len(kept) == len(entries):
                 return False
             self._save(kept)
-            # Drop any capture/edit session pointing at the deleted schedule.
+            # Drop any capture/naming/edit session pointing at the deleted schedule.
             self._capture = {c: s for c, s in self._capture.items() if s != sid}
+            self._naming = {c: s for c, s in self._naming.items() if s != sid}
             self._editing = {c: s for c, s in self._editing.items() if s != sid}
             return True
 
@@ -271,6 +276,19 @@ class HomeScheduleStore:
     def end_capture(self, chat_id: str) -> str | None:
         with self._lock:
             return self._capture.pop(str(chat_id), None)
+
+    # --- transient naming state ------------------------------------------
+    def begin_naming(self, chat_id: str, sid: str) -> None:
+        with self._lock:
+            self._naming[str(chat_id)] = sid
+
+    def naming_target(self, chat_id: str) -> str | None:
+        with self._lock:
+            return self._naming.get(str(chat_id))
+
+    def end_naming(self, chat_id: str) -> str | None:
+        with self._lock:
+            return self._naming.pop(str(chat_id), None)
 
     # --- transient edit state --------------------------------------------
     def begin_edit(self, chat_id: str, sid: str) -> None:
