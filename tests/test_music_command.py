@@ -77,6 +77,8 @@ def proc_table(monkeypatch):
     monkeypatch.setattr(mc, "_pid_is_player", _is_player)
     monkeypatch.setattr(mc, "_pid_start_time", _start_time)
     monkeypatch.setattr(mc, "_terminate", _terminate)
+    # Skip the real spawn-survival wait; a spawned pid is "playing" iff alive.
+    monkeypatch.setattr(mc, "_verify_playing", _alive)
     yield state
     mc._PLAYBEST.stop()  # never leak a playbest thread across tests
 
@@ -315,6 +317,19 @@ def test_playback_failure_message(settings, monkeypatch, proc_table):
     monkeypatch.setattr(mc, "_spawn_player", _boom)
     reply = mc.build_music_handler(settings)("間人間", "chat-1")
     assert "播放失敗" in reply
+
+
+def test_play_reports_failure_when_afplay_dies_on_spawn(settings, monkeypatch, proc_table):
+    # afplay launches but exits instantly (unreadable file / asleep external
+    # drive): we must NOT claim 正在播放, must surface a failure, kill the dead
+    # pid, and leave no stale player state behind.
+    monkeypatch.setattr(mc, "_verify_playing", lambda pid: False)
+    reply = mc.build_music_handler(settings)("間人間", "chat-1")
+    assert "正在播放" not in reply
+    assert "播放失敗" in reply
+    pid = proc_table["spawned"][0][0]
+    assert pid in proc_table["killed"]
+    assert not Path(settings.openclaw_music_player_state_path).exists()
 
 
 def test_empty_arg_returns_button_menu(settings, proc_table):

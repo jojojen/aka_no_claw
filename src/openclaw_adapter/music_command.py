@@ -130,6 +130,52 @@ def _terminate(pid: int) -> None:
         pass
 
 
+# A freshly-spawned afplay that cannot read its file — vanished file, or an
+# external drive that is asleep/unmounted/spinning up — exits within ~0.1s.
+# _spawn_player still returns its (already-dead) pid, so without this check we
+# would record the song as "playing" and report 正在播放 while no sound plays.
+_PLAYBACK_VERIFY_SECONDS = 0.3
+_PLAYBACK_VERIFY_POLL = 0.05
+
+
+def _verify_playing(pid: int) -> bool:
+    """True iff the just-spawned afplay is still our live player after a brief
+    moment — i.e. it actually started decoding rather than dying instantly on an
+    unreadable file. Returns early as soon as the pid is seen dead."""
+    deadline = time.monotonic() + _PLAYBACK_VERIFY_SECONDS
+    while time.monotonic() < deadline:
+        if not _pid_alive(pid):
+            return False
+        time.sleep(_PLAYBACK_VERIFY_POLL)
+    return _pid_alive(pid) and _pid_is_player(pid)
+
+
+# Switching tracks kills the previous afplay then immediately spawns the next;
+# CoreAudio may not have released the output device yet, so the new afplay can
+# die on startup with "AudioQueueStart failed". A short bounded retry rides out
+# that transient instead of leaving the user with silence.
+_PLAYBACK_SPAWN_ATTEMPTS = 3
+_PLAYBACK_RETRY_SECONDS = 0.25
+
+
+def _spawn_with_retry(path: str) -> int:
+    """Spawn afplay and confirm it actually started, retrying a couple of times
+    to absorb the transient audio-device-busy race. Returns the live pid, or
+    raises if every attempt died on startup (genuinely unreadable file / no
+    usable audio device)."""
+    for attempt in range(_PLAYBACK_SPAWN_ATTEMPTS):
+        pid = _spawn_player(path)
+        if _verify_playing(pid):
+            return pid
+        _terminate(pid)  # dead/zombie afplay — never leave it around
+        if attempt + 1 < _PLAYBACK_SPAWN_ATTEMPTS:
+            time.sleep(_PLAYBACK_RETRY_SECONDS)
+    raise RuntimeError(
+        "afplay 連續啟動失敗（檔案無法讀取，或音訊輸出裝置忙碌／不可用——"
+        "可用 /music 的音源選單切換到可用裝置）"
+    )
+
+
 # --- index build / cache / invalidation -----------------------------------
 def _iter_audio_files(root: Path):
     for dirpath, _dirnames, filenames in os.walk(root):
@@ -371,7 +417,7 @@ def _start_song(entry: dict, state_path: str) -> int:
     the pid. Shared by user-initiated plays and the playbest loop; callers that
     are *not* the playbest loop must stop playbest first (see :func:`_play`)."""
     _terminate_running(state_path)
-    pid = _spawn_player(entry["path"])
+    pid = _spawn_with_retry(entry["path"])
     _write_json(
         state_path,
         {
