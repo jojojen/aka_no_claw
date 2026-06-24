@@ -35,10 +35,21 @@ For a faster smoke test:
 python3 docs/local_tool_calling_benchmark/run_benchmark.py --models qwen3:4b qwen2.5-coder:7b
 ```
 
+To test whether OpenClaw can force unfinished multi-step tasks to continue:
+
+```bash
+python3 docs/local_tool_calling_benchmark/run_benchmark.py \
+  --models qwen3:14b \
+  --timeout 120 \
+  --max-rounds 6 \
+  --subgoal-gate
+```
+
 Outputs:
 
 - `latest_results.json`
 - `latest_results.md`
+- timestamped `results_*.json` / `results_*.md`
 
 ## Acceptance Bar Before Filing An Architecture Issue
 
@@ -50,6 +61,8 @@ chat backend change:
 - Multi-step case must call tools in the expected order.
 - Mean latency should be tolerable for web chat on the Mac mini target.
 - Failure mode must be structured and diagnosable, not empty content or raw JSON.
+- Multi-step tasks should pass both with correct tool order and no fabricated
+  detail after a subgoal gate intervention.
 
 ## Reference Notes
 

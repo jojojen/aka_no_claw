@@ -129,7 +129,27 @@ def normalize_tool_calls(message: dict[str, Any]) -> list[dict[str, Any]]:
     return normalized
 
 
-def run_case(endpoint: str, model: str, case: dict[str, Any], timeout: int, max_rounds: int) -> dict[str, Any]:
+def missing_expected_tools(expected: list[str], observed: list[str]) -> list[str]:
+    missing: list[str] = []
+    cursor = 0
+    for name in expected:
+        try:
+            found_at = observed.index(name, cursor)
+        except ValueError:
+            missing.append(name)
+        else:
+            cursor = found_at + 1
+    return missing
+
+
+def run_case(
+    endpoint: str,
+    model: str,
+    case: dict[str, Any],
+    timeout: int,
+    max_rounds: int,
+    subgoal_gate: bool,
+) -> dict[str, Any]:
     started = time.time()
     messages: list[dict[str, Any]] = [
         {
@@ -147,6 +167,8 @@ def run_case(endpoint: str, model: str, case: dict[str, Any], timeout: int, max_
     raw_rounds: list[dict[str, Any]] = []
     final_content = ""
     error = None
+    gate_interventions: list[dict[str, Any]] = []
+    expected = case.get("expected_tools") or []
 
     for round_index in range(max_rounds):
         payload = {
@@ -178,6 +200,24 @@ def run_case(endpoint: str, model: str, case: dict[str, Any], timeout: int, max_
         messages.append(message)
         if not calls:
             final_content = str(message.get("content") or "").strip()
+            missing = missing_expected_tools(expected, [item["name"] for item in observed_tools])
+            if subgoal_gate and missing and round_index < max_rounds - 1:
+                next_tool = missing[0]
+                correction = (
+                    f"你尚未完成必要工具 `{next_tool}`。"
+                    "不要編造缺少的資料，請先呼叫下一個必要工具；"
+                    "工具結果回來後再給最終答案。"
+                )
+                gate_interventions.append(
+                    {
+                        "after_round": round_index + 1,
+                        "missing_tools": missing,
+                        "message": correction,
+                    }
+                )
+                messages.append({"role": "user", "content": correction})
+                final_content = ""
+                continue
             break
         for call in calls:
             name = call["name"]
@@ -199,7 +239,6 @@ def run_case(endpoint: str, model: str, case: dict[str, Any], timeout: int, max_
                 }
             )
 
-    expected = case.get("expected_tools") or []
     observed_names = [item["name"] for item in observed_tools]
     stripped_final = final_content.strip()
     leaked_thinking = "</think>" in stripped_final or "<think>" in stripped_final
@@ -229,6 +268,7 @@ def run_case(endpoint: str, model: str, case: dict[str, Any], timeout: int, max_
         "observed_tools": observed_tools,
         "final_content": final_content,
         "quality_flags": quality_flags,
+        "gate_interventions": gate_interventions,
         "rounds": raw_rounds,
         "duration_seconds": round(time.time() - started, 3),
         "error": error,
@@ -263,6 +303,8 @@ def write_markdown(summary_path: Path, payload: dict[str, Any]) -> None:
         active_flags = [name for name, active in result.get("quality_flags", {}).items() if active]
         if active_flags:
             lines.append(f"- Quality flags: `{active_flags}`")
+        if result.get("gate_interventions"):
+            lines.append(f"- Gate interventions: `{len(result['gate_interventions'])}`")
         if result["final_content"]:
             lines.append("- Final content:")
             lines.append("")
@@ -280,6 +322,11 @@ def main() -> int:
     parser.add_argument("--cases", default=str(ROOT / "cases.json"))
     parser.add_argument("--timeout", type=int, default=90)
     parser.add_argument("--max-rounds", type=int, default=4)
+    parser.add_argument(
+        "--subgoal-gate",
+        action="store_true",
+        help="Prompt the model to continue when expected tools are still missing.",
+    )
     args = parser.parse_args()
 
     cases = json.loads(Path(args.cases).read_text(encoding="utf-8"))
@@ -287,7 +334,16 @@ def main() -> int:
     for model in args.models:
         for case in cases:
             print(f"running {model} / {case['id']}...", flush=True)
-            results.append(run_case(args.endpoint, model, case, args.timeout, args.max_rounds))
+            results.append(
+                run_case(
+                    args.endpoint,
+                    model,
+                    case,
+                    args.timeout,
+                    args.max_rounds,
+                    args.subgoal_gate,
+                )
+            )
 
     summary: dict[str, dict[str, Any]] = {}
     for model in args.models:
@@ -306,6 +362,7 @@ def main() -> int:
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "endpoint": args.endpoint,
         "models": args.models,
+        "subgoal_gate": args.subgoal_gate,
         "summary": summary,
         "results": results,
     }

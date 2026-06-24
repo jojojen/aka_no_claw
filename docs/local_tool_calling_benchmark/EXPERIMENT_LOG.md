@@ -21,7 +21,8 @@ the OpenAI-compatible route.
 - Harness: [run_benchmark.py](run_benchmark.py)
 - Cases: [cases.json](cases.json)
 - Latest result: [latest_results.md](latest_results.md)
-- Archived run: [results_20260624T030509Z.md](results_20260624T030509Z.md)
+- Baseline run: [results_20260624T030509Z.md](results_20260624T030509Z.md)
+- Subgoal-gate run: [results_20260624T031051Z.md](results_20260624T031051Z.md)
 
 Models tested:
 
@@ -50,11 +51,28 @@ Quality failures are counted even when the task partially succeeds:
 
 ## Results
 
+### Baseline: no subgoal gate
+
 | Model | Passed | Total | Pass rate | Mean seconds | Main failure |
 | --- | ---: | ---: | ---: | ---: | --- |
 | `qwen3:4b` | 0 | 4 | 0% | 16.1 | thinking leaked; multi-tool calls not emitted |
 | `qwen2.5-coder:7b` | 1 | 4 | 25% | 2.6 | prints raw tool JSON as text |
 | `qwen3:14b` | 3 | 4 | 75% | 7.2 | stops after first tool in a two-step task |
+
+### With unfinished-subgoal gate
+
+| Model | Passed | Total | Pass rate | Mean seconds | Main observation |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `qwen3:14b` | 4 | 4 | 100% | 12.2 | one corrective intervention fixed the two-step case |
+
+The gate detected that `get_song_detail` was still missing after the model tried
+to finalize the two-step music answer. It sent this corrective message:
+
+```text
+你尚未完成必要工具 `get_song_detail`。不要編造缺少的資料，請先呼叫下一個必要工具；工具結果回來後再給最終答案。
+```
+
+The model then called `get_song_detail` and produced a grounded final answer.
 
 ### qwen3:14b
 
@@ -73,6 +91,10 @@ Failure:
   answer without calling `get_song_detail`. It also fabricated a release date
   instead of using the fixture detail tool. This is the exact production risk:
   the model can start a tool workflow but stop too early.
+
+The subgoal gate mitigated this failure in the second run, raising `qwen3:14b`
+from 3/4 to 4/4. The tradeoff is latency: mean runtime increased from 7.2s to
+12.2s, and the two-step case took 18.7s.
 
 ### qwen2.5-coder:7b
 
@@ -108,24 +130,25 @@ web chat request
 
 The important addition is the `unfinished subgoals` gate. The two-step failure
 shows that relying on the model alone to continue after the first tool is not
-stable enough.
+stable enough; the second run shows that a simple corrective gate can recover
+the workflow.
 
 ## Recommended Next Experiment
 
-Before filing an architecture issue, run one more local benchmark revision:
+Before filing an architecture issue, run one more targeted experiment against
+the real OpenClaw web-search/music tools instead of deterministic fixtures:
 
-1. Add an explicit subgoal checklist to each test case.
-2. After each tool result, have OpenClaw check whether required tools/subgoals
-   remain unfinished.
-3. If the model tries to finalize early, feed back a corrective message:
-   `你尚未完成 get_song_detail，請先呼叫下一個工具，不要編造。`
-4. Re-run `qwen3:14b`.
+1. Map the fixture tools to real OpenClaw commands or functions.
+2. Keep the same subgoal gate and expected-tool checklist.
+3. Add timeout handling and a user-visible "still working" progress event.
+4. Re-run `qwen3:14b` with realistic search latency.
 5. Optionally install and test `qwen3:8b` if memory allows; Docker's benchmark
    suggests Qwen3 8B can be a better speed/accuracy compromise.
 
 Acceptance before proposing a production issue:
 
-- `qwen3:14b` or another installed local model passes at least 4/4 current cases.
+- `qwen3:14b` or another installed local model passes at least 4/4 current cases
+  with subgoal gate enabled.
 - The two-step case must call `search_music` then `get_song_detail`.
 - No final answer may contain leaked thinking or raw tool JSON.
 - Mean latency should stay under roughly 10 seconds for this small benchmark.
