@@ -1,5 +1,9 @@
 # Local Tool Calling Benchmark
 
+Last reviewed: 2026-06-24
+Status: Current
+Owner area: agent-maintenance
+
 Purpose: test whether local Ollama models can reliably act as OpenClaw's tool
 selector before changing the production chat architecture.
 
@@ -21,6 +25,9 @@ The fixture tools are deterministic and offline:
 - `get_weather(city)`
 - `search_music(artist, limit)`
 - `get_song_detail(title)`
+
+There is also a semi-real music probe that uses the real OpenClaw music index
+and can optionally use the real web-search backend. It never plays audio.
 
 ## Run
 
@@ -45,11 +52,33 @@ python3 docs/local_tool_calling_benchmark/run_benchmark.py \
   --subgoal-gate
 ```
 
+To test the realistic music-selection flow without audio playback:
+
+```bash
+.venv/bin/python docs/local_tool_calling_benchmark/run_realistic_probe.py \
+  --model qwen3:14b \
+  --timeout 180 \
+  --max-rounds 8
+```
+
+To include the real web-search backend:
+
+```bash
+.venv/bin/python docs/local_tool_calling_benchmark/run_realistic_probe.py \
+  --model qwen3:14b \
+  --timeout 180 \
+  --max-rounds 8 \
+  --live-web
+```
+
 Outputs:
 
 - `latest_results.json`
 - `latest_results.md`
 - timestamped `results_*.json` / `results_*.md`
+- `latest_realistic_probe.json`
+- `latest_realistic_probe.md`
+- timestamped `realistic_probe_*.json` / `realistic_probe_*.md`
 
 ## Acceptance Bar Before Filing An Architecture Issue
 
@@ -63,6 +92,9 @@ chat backend change:
 - Failure mode must be structured and diagnosable, not empty content or raw JSON.
 - Multi-step tasks should pass both with correct tool order and no fabricated
   detail after a subgoal gate intervention.
+- The realistic music probe must not call any playback command. It should only
+  list/search/select and return a proposed song.
+- Realistic probe outputs must not contain absolute local filesystem paths.
 
 ## Reference Notes
 

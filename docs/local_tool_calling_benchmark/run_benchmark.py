@@ -279,6 +279,10 @@ def write_markdown(summary_path: Path, payload: dict[str, Any]) -> None:
     lines = [
         "# Local Tool Calling Benchmark Results",
         "",
+        "Last reviewed: 2026-06-24",
+        "Status: Generated",
+        "Owner area: agent-maintenance",
+        "",
         f"- Timestamp: `{payload['timestamp']}`",
         f"- Endpoint: `{payload['endpoint']}`",
         f"- Models: `{', '.join(payload['models'])}`",

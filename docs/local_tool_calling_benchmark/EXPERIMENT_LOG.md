@@ -23,6 +23,10 @@ the OpenAI-compatible route.
 - Latest result: [latest_results.md](latest_results.md)
 - Baseline run: [results_20260624T030509Z.md](results_20260624T030509Z.md)
 - Subgoal-gate run: [results_20260624T031051Z.md](results_20260624T031051Z.md)
+- Realistic music probe harness: [run_realistic_probe.py](run_realistic_probe.py)
+- Latest realistic probe: [latest_realistic_probe.md](latest_realistic_probe.md)
+- Realistic fixture-web run: [realistic_probe_20260624T032155Z.md](realistic_probe_20260624T032155Z.md)
+- Realistic live-web run: [realistic_probe_20260624T032222Z.md](realistic_probe_20260624T032222Z.md)
 
 Models tested:
 
@@ -73,6 +77,44 @@ to finalize the two-step music answer. It sent this corrective message:
 ```
 
 The model then called `get_song_detail` and produced a grounded final answer.
+
+### Realistic music-selection probe
+
+This probe replaced deterministic fixture music tools with the real OpenClaw
+music index while explicitly preventing audio playback. It also ran once with a
+fixture web-search result and once with the real web-search backend.
+
+Tool chain under test:
+
+1. `list_local_music(query)` reads the real music index and returns sanitized
+   candidate paths.
+2. `web_search_top_songs(artist)` returns either a fixture result or live search
+   results.
+3. `select_local_song(title)` uses the real music search function and returns a
+   selected local track, but never starts `afplay` or `/music`.
+
+| Run | Live web | Passed | Duration | Music entries | Observed tools | Selected song |
+| --- | --- | ---: | ---: | ---: | --- | --- |
+| `realistic_probe_20260624T032155Z` | No | Yes | 13.6s | 672 | `list_local_music -> web_search_top_songs -> select_local_song` | `Lemon` |
+| `realistic_probe_20260624T032222Z` | Yes | Yes | 26.9s | 672 | `list_local_music -> web_search_top_songs -> select_local_song` | `IRIS OUT` |
+
+Important observations:
+
+- `qwen3:14b` successfully executed the required three-tool plan in order.
+- No playback command was available to the model, so this test is safe for
+  repeated CI/manual runs.
+- Result files sanitize local paths as `<music_root>/...`; they do not record
+  absolute local filesystem paths.
+- The real music index currently contains filename/path data, not reliable
+  normalized artist/album/title metadata. In this local library, searching the
+  artist name found only files whose folder happened to include that artist
+  string. A popular title such as `Lemon` was still selectable, but this relied
+  on the second step producing the title.
+- Live web-search quality varied across runs. In the retained live run, the
+  first result snippet ranked `IRIS OUT` first and `Lemon` second, so the model
+  selected a locally available first-ranked song. This is acceptable for "choose
+  one available popular song" but still not enough for "top 3 by current
+  popularity" without a deterministic extraction/ranking step.
 
 ### qwen3:14b
 
@@ -135,23 +177,33 @@ the workflow.
 
 ## Recommended Next Experiment
 
-Before filing an architecture issue, run one more targeted experiment against
-the real OpenClaw web-search/music tools instead of deterministic fixtures:
+The realistic probe is enough to justify a focused architecture issue, but not
+enough to implement production chat blindly. The next production design should
+include these constraints:
 
-1. Map the fixture tools to real OpenClaw commands or functions.
-2. Keep the same subgoal gate and expected-tool checklist.
+1. Use Ollama native tool calls, not OpenCode, for local tool routing.
+2. Keep the expected-tool/subgoal gate.
 3. Add timeout handling and a user-visible "still working" progress event.
-4. Re-run `qwen3:14b` with realistic search latency.
-5. Optionally install and test `qwen3:8b` if memory allows; Docker's benchmark
+4. Add a tool-result validator that rejects final answers when required tool
+   facts are missing.
+5. Improve the music index with normalized metadata so artist queries do not
+   depend on folder names.
+6. For "recent top songs", add a deterministic extraction/ranking layer over
+   web-search results instead of expecting the model to infer rankings from
+   arbitrary snippets.
+7. Optionally install and test `qwen3:8b` if memory allows; Docker's benchmark
    suggests Qwen3 8B can be a better speed/accuracy compromise.
 
-Acceptance before proposing a production issue:
+Acceptance before implementing the production chat path:
 
 - `qwen3:14b` or another installed local model passes at least 4/4 current cases
   with subgoal gate enabled.
 - The two-step case must call `search_music` then `get_song_detail`.
 - No final answer may contain leaked thinking or raw tool JSON.
-- Mean latency should stay under roughly 10 seconds for this small benchmark.
+- Mean latency should stay tolerable for the web chat surface, or the UI must
+  emit explicit progress events for longer live-search runs.
+- Realistic probes must pass without exposing absolute local paths or invoking
+  playback.
 
 ## External References
 
