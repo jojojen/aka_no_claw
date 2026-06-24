@@ -1,0 +1,32 @@
+[
+  {
+    "id": "zero_tool_greeting",
+    "prompt": "請用繁體中文一句話打招呼，不要使用工具。",
+    "expected_tools": []
+  },
+  {
+    "id": "single_weather_lookup",
+    "prompt": "請查東京現在天氣，然後用繁體中文一句話回答。",
+    "expected_tools": ["get_weather"]
+  },
+  {
+    "id": "two_step_music_search_then_detail",
+    "prompt": "請找米津玄師最近熱門前三首歌，然後查第一首歌的詳細資料，最後用 1. 2. 3. 格式回答三首歌名，並補一句第一首歌的發行資訊。",
+    "expected_tools": ["search_music", "get_song_detail"]
+  },
+  {
+    "id": "tool_after_context_pronoun",
+    "history": [
+      {
+        "role": "user",
+        "content": "米津玄師是誰？"
+      },
+      {
+        "role": "assistant",
+        "content": "米津玄師是日本創作歌手。"
+      }
+    ],
+    "prompt": "請查他最近熱門前三首歌，只回傳 1. 2. 3. 三行。",
+    "expected_tools": ["search_music"]
+  }
+]

@@ -46,6 +46,8 @@ for which question each one answers.
 | `fix_benchmarks/seller_snapshot_sources/README.md` | Current | agent-maintenance | Keep; benchmark spec for synthetic seller snapshot parser and lifecycle repair. |
 | `fix_benchmarks/seller_snapshot_sources/FAILURE_TRACE.md` | Current | agent-maintenance | Keep; reproducible seller snapshot parser and cooldown failure history. |
 | `fix_benchmarks/seller_snapshot_sources/lifecycle/README.md` | Current | agent-maintenance | Keep; rate-limit and bot-interstitial classifier benchmark. |
+| `local_tool_calling_benchmark/README.md` | Current | agent-maintenance | Keep; local Ollama tool-calling benchmark harness and acceptance bar. |
+| `local_tool_calling_benchmark/EXPERIMENT_LOG.md` | Current | agent-maintenance | Keep; feasibility results for local model tool calling before filing architecture issue. |
 | `NEW_DYNAMIC_TOOLS_PROGRESS.md` | Current | dynamic-tools | Keep; canonical `/new` doc. |
 | `NEW_E2E_DISCRIMINATING_TESTS.md` | Current | dynamic-tools | Keep; cross-link from dynamic-tools canonical. |
 | `OPPORTUNITY_AGENT_SPEC.md` | Needs review | opportunity | Verify thresholds vs code; canonical Opportunity doc. |

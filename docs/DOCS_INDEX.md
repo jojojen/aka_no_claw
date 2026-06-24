@@ -39,6 +39,8 @@ Full inventory with recommended actions is in [DOC_AUDIT.md](DOC_AUDIT.md).
 | [fix_benchmarks/seller_snapshot_sources/README.md](fix_benchmarks/seller_snapshot_sources/README.md) | Current | agent-maintenance | Synthetic seller snapshot parser and cooldown lifecycle repair benchmark. |
 | [fix_benchmarks/seller_snapshot_sources/FAILURE_TRACE.md](fix_benchmarks/seller_snapshot_sources/FAILURE_TRACE.md) | Current | agent-maintenance | Reproducible seller snapshot parser and lifecycle failure history. |
 | [fix_benchmarks/seller_snapshot_sources/lifecycle/README.md](fix_benchmarks/seller_snapshot_sources/lifecycle/README.md) | Current | agent-maintenance | Rate-limit and bot-interstitial lifecycle classifier benchmark. |
+| [local_tool_calling_benchmark/README.md](local_tool_calling_benchmark/README.md) | Current | agent-maintenance | Reproducible local Ollama tool-calling benchmark harness. |
+| [local_tool_calling_benchmark/EXPERIMENT_LOG.md](local_tool_calling_benchmark/EXPERIMENT_LOG.md) | Current | agent-maintenance | Local model tool-calling feasibility results and next experiment criteria. |
 | [NEW_DYNAMIC_TOOLS_PROGRESS.md](NEW_DYNAMIC_TOOLS_PROGRESS.md) | Current (canonical: dynamic-tools) | dynamic-tools | `/new` implementation notes and benchmark history. |
 | [NEW_E2E_DISCRIMINATING_TESTS.md](NEW_E2E_DISCRIMINATING_TESTS.md) | Current | dynamic-tools | Companion: discriminating tests for generated tools. |
 | [KB_EMBEDDING_PLAN.md](KB_EMBEDDING_PLAN.md) | Needs review | knowledge | Embedding/RAG plan and status may need fresh verification. |

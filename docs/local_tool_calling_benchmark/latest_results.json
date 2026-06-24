@@ -1,0 +1,448 @@
+{
+  "timestamp": "2026-06-24T03:05:09.139745+00:00",
+  "endpoint": "http://127.0.0.1:11434",
+  "models": [
+    "qwen3:4b",
+    "qwen2.5-coder:7b",
+    "qwen3:14b"
+  ],
+  "summary": {
+    "qwen3:4b": {
+      "passed": 0,
+      "total": 4,
+      "pass_rate": 0.0,
+      "mean_seconds": 16.14725
+    },
+    "qwen2.5-coder:7b": {
+      "passed": 1,
+      "total": 4,
+      "pass_rate": 0.25,
+      "mean_seconds": 2.5832499999999996
+    },
+    "qwen3:14b": {
+      "passed": 3,
+      "total": 4,
+      "pass_rate": 0.75,
+      "mean_seconds": 7.188
+    }
+  },
+  "results": [
+    {
+      "case_id": "zero_tool_greeting",
+      "model": "qwen3:4b",
+      "passed": false,
+      "expected_tools": [],
+      "observed_tools": [],
+      "final_content": "好的，用户让我用繁体中文一句话打招呼，而且不要使用工具。首先，我需要确认是否需要调用工具。用户明确说“不要使用工具”，所以我要直接回答，不需要调用任何函数。\n\n先看看提供的工具列表，有三个函数：get_weather、search_music、get_song_detail。但用户不需要天气、音乐搜索或歌曲详情，所以都不需要调用。用户要求的是打招呼，用繁体中文，所以直接生成一句合适的问候语。\n\n繁体中文的打招呼常用语比如“你好！”、“您好！”、“早上好！”之类的。这里用户要一句，所以选最简单的。比如“你好！”在繁体中是“你好！”或者“您好！”可能更正式一点。不过通常“你好”在繁体中文里也用“你好”，可能不需要加“您”。不过用户可能希望比较自然的表达。\n\n比如“你好！”或者“您好！”都可以。但用户要一句，所以直接选一个。可能“你好！”比较常用，但需要确认是否要更礼貌的。不过用户没有指定场合，所以简单一点的就好。\n\n所以直接回答：“你好！” 用繁体中文的话，就是“你好！”因为“你好”在繁体中和简体一样，但可能用户希望用更正式的，比如“您好！”不过可能用户接受“你好！”。\n\n或者可能用“您好，今天天气如何？”不过用户说不要用工具，而且这里不需要天气，所以不能提天气。所以直接一句简单的问候。\n\n确定不需要调用工具，所以直接输出一句繁体中文的问候语。比如“你好！”或者“您好！”\n\n可能用户希望更自然的，比如“你好呀！” 但可能太随意。这里选“你好！”作为答案。\n\n所以最终答案是“你好！”\n</think>\n\n你好！",
+      "quality_flags": {
+        "leaked_thinking": true,
+        "raw_json_tool_text": false
+      },
+      "rounds": [
+        {
+          "round": 1,
+          "content": "好的，用户让我用繁体中文一句话打招呼，而且不要使用工具。首先，我需要确认是否需要调用工具。用户明确说“不要使用工具”，所以我要直接回答，不需要调用任何函数。\n\n先看看提供的工具列表，有三个函数：get_weather、search_music、get_song_detail。但用户不需要天气、音乐搜索或歌曲详情，所以都不需要调用。用户要求的是打招呼，用繁体中文，所以直接生成一句合适的问候语。\n\n繁体中文的打招呼常用语比如“你好！”、“您好！”、“早上好！”之类的。这里用户要一句，所以选最简单的。比如“你好！”在繁体中是“你好！”或者“您好！”可能更正式一点。不过通常“你好”在繁体中文里也用“你好”，可能不需要加“您”。不过用户可能希望比较自然的表达。\n\n比如“你好！”或者“您好！”都可以。但用户要一句，所以直接选一个。可能“你好！”比较常用，但需要确认是否要更礼貌的。不过用户没有指定场合，所以简单一点的就好。\n\n所以直接回答：“你好！” 用繁体中文的话，就是“你好！”因为“你好”在繁体中和简体一样，但可能用户希望用更正式的，比如“您好！”不过可能用户接受“你好！”。\n\n或者可能用“您好，今天天气如何？”不过用户说不要用工具，而且这里不需要天气，所以不能提天气。所以直接一句简单的问候。\n\n确定不需要调用工具，所以直接输出一句繁体中文的问候语。比如“你好！”或者“您好！”\n\n可能用户希望更自然的，比如“你好呀！” 但可能太随意。这里选“你好！”作为答案。\n\n所以最终答案是“你好！”\n</think>\n\n你好！",
+          "thinking_present": false,
+          "tool_calls": []
+        }
+      ],
+      "duration_seconds": 14.192,
+      "error": null
+    },
+    {
+      "case_id": "single_weather_lookup",
+      "model": "qwen3:4b",
+      "passed": false,
+      "expected_tools": [
+        "get_weather"
+      ],
+      "observed_tools": [
+        {
+          "name": "get_weather",
+          "arguments": {
+            "city": "東京"
+          },
+          "result": {
+            "city": "東京",
+            "condition": "晴れ",
+            "temperature_c": "28",
+            "source": "fixture"
+          }
+        }
+      ],
+      "final_content": "好的，用户让我查东京现在的天气，然后用繁体中文一句话回答。首先，我需要确认已经调用了正确的工具。之前调用了get_weather，参数是東京，工具返回了晴天，温度28度。\n\n现在工具返回了结果，我需要根据这个结果生成一句繁体中文的回答。用户要求的是“一句話”，所以要简洁明了。天气情况是晴，温度28度，所以可以写成“東京現在天氣晴朗，溫度28度。”。\n\n检查一下是否符合繁体中文，这里“晴朗”和“溫度”都是正确的繁体用词。温度单位用摄氏度，用户可能希望用中文的表达方式，所以“28度”没问题。不需要其他工具，因为已经获取了天气数据，所以直接回答即可。\n\n确认没有其他需要调用的工具，所以最终答案就是这句。\n</think>\n\n東京現在天氣晴朗，溫度28度。",
+      "quality_flags": {
+        "leaked_thinking": true,
+        "raw_json_tool_text": false
+      },
+      "rounds": [
+        {
+          "round": 1,
+          "content": "好的，用户让我查东京现在的天气，然后用繁体中文一句话回答。首先，我需要确定要调用哪个工具。看提供的工具列表，第一个工具是get_weather，参数是城市名。用户要东京的天气，所以应该调用这个函数，参数是\"東京\"。\n\n接下来，我需要检查是否需要其他工具。用户只要求天气，所以不需要调用其他工具比如search_music或get_song_detail。所以只需要调用get_weather一次。\n\n然后，工具调用的参数是城市名，这里用户用的是“東京”，所以参数应该是{\"city\": \"東京\"}。注意中文的正确写法，可能需要确认是否用繁体字。用户的问题是用繁体中文的，所以城市名应该用繁体的“東京”。\n\n调用之后，工具会返回天气数据，然后我需要用繁体中文一句话回答。比如“東京現在天氣為...”。但用户要求的是工具调用测试循环，所以现在只需要生成工具调用的JSON，不需要处理结果。不过根据问题描述，用户说“需要外部資料時請呼叫工具；工具結果回來後再用繁體中文給最終答案。”，所以这里先调用工具，然后等结果再回答。但当前步骤是生成工具调和，所以这里应该只输出工具调用的JSON。\n\n确认工具名称是get_weather，参数是city: \"東京\"。所以正确的tool_call应该是：\n\n{\n  \"name\": \"get_weather\",\n  \"arguments\": {\n    \"city\": \"東京\"\n  }\n}\n\n然后等工具返回结果后，再用繁体中文写一句话。但现在只需要生成这个工具调用。\n</think>\n\n",
+          "thinking_present": false,
+          "tool_calls": [
+            {
+              "name": "get_weather",
+              "arguments": {
+                "city": "東京"
+              }
+            }
+          ]
+        },
+        {
+          "round": 2,
+          "content": "好的，用户让我查东京现在的天气，然后用繁体中文一句话回答。首先，我需要确认已经调用了正确的工具。之前调用了get_weather，参数是東京，工具返回了晴天，温度28度。\n\n现在工具返回了结果，我需要根据这个结果生成一句繁体中文的回答。用户要求的是“一句話”，所以要简洁明了。天气情况是晴，温度28度，所以可以写成“東京現在天氣晴朗，溫度28度。”。\n\n检查一下是否符合繁体中文，这里“晴朗”和“溫度”都是正确的繁体用词。温度单位用摄氏度，用户可能希望用中文的表达方式，所以“28度”没问题。不需要其他工具，因为已经获取了天气数据，所以直接回答即可。\n\n确认没有其他需要调用的工具，所以最终答案就是这句。\n</think>\n\n東京現在天氣晴朗，溫度28度。",
+          "thinking_present": false,
+          "tool_calls": []
+        }
+      ],
+      "duration_seconds": 18.897,
+      "error": null
+    },
+    {
+      "case_id": "two_step_music_search_then_detail",
+      "model": "qwen3:4b",
+      "passed": false,
+      "expected_tools": [
+        "search_music",
+        "get_song_detail"
+      ],
+      "observed_tools": [],
+      "final_content": "好的，我现在需要帮用户解决这个问题。用户要求找米津玄師最近熱門前三首歌，然后查第一首歌的詳細資料，最后用1. 2. 3.格式回答三首歌名，并补充第一首歌的發行資訊。\n\n首先，我得确定用户需要调用哪些工具。根据提供的工具列表，有三个函数：get_weather、search_music、get_song_detail。这里用户的问题是关于音乐的，所以应该用search_music和get_song_detail。\n\n首先，用户要的是米津玄師最近熱門前三首歌。所以第一步应该调用search_music函数，参数是artist为“米津玄師”，limit设为3，这样就能得到最近的前三首歌。然后，用第一首歌的标题调用get_song_detail来获取详细资料。\n\n不过，我需要确认工具的参数是否正确。search_music的参数是artist和limit，其中limit是整数。用户要前三，所以limit=3。然后，假设返回的歌曲列表中第一首的标题是title，再用get_song_detail传入这个title。\n\n现在，我需要先调用search_music。所以第一个tool_call应该是search_music，参数artist是“米津玄師”，limit是3。\n\n然后，假设search_music返回的结果中，第一首歌的标题是“歌名1”，那么接下来调用get_song_detail，参数title是“歌名1”。\n\n不过，用户要求最后用1. 2. 3.格式回答三首歌名，并补充第一首的發行資訊。所以需要先得到前三首歌的标题，然后第一首的详细信息。\n\n现在，我需要生成第一个tool_call，即search_music。然后根据返回结果，再调用get_song_detail。但根据问题描述，工具调用测试迴圈中，可能需要分步骤调用。不过用户可能希望先调用search_music，然后根据结果调用get_song_detail。\n\n但根据题目要求，需要外部資料時請呼叫工具；工具結果回來後再用繁體中文給最終答案。所以这里可能需要先调用search_music，然后根据返回结果调和get_song_detail。\n\n不过，作为工具调用测试，可能需要先生成第一个tool_call，然后等待结果，再生成第二个。但在这个问题中，用户可能希望我先生成第一个tool_call，然后假设结果返回后，再生成第二个。\n\n不过，根据问题描述，",
+      "quality_flags": {
+        "leaked_thinking": false,
+        "raw_json_tool_text": false
+      },
+      "rounds": [
+        {
+          "round": 1,
+          "content": "好的，我现在需要帮用户解决这个问题。用户要求找米津玄師最近熱門前三首歌，然后查第一首歌的詳細資料，最后用1. 2. 3.格式回答三首歌名，并补充第一首歌的發行資訊。\n\n首先，我得确定用户需要调用哪些工具。根据提供的工具列表，有三个函数：get_weather、search_music、get_song_detail。这里用户的问题是关于音乐的，所以应该用search_music和get_song_detail。\n\n首先，用户要的是米津玄師最近熱門前三首歌。所以第一步应该调用search_music函数，参数是artist为“米津玄師”，limit设为3，这样就能得到最近的前三首歌。然后，用第一首歌的标题调用get_song_detail来获取详细资料。\n\n不过，我需要确认工具的参数是否正确。search_music的参数是artist和limit，其中limit是整数。用户要前三，所以limit=3。然后，假设返回的歌曲列表中第一首的标题是title，再用get_song_detail传入这个title。\n\n现在，我需要先调用search_music。所以第一个tool_call应该是search_music，参数artist是“米津玄師”，limit是3。\n\n然后，假设search_music返回的结果中，第一首歌的标题是“歌名1”，那么接下来调用get_song_detail，参数title是“歌名1”。\n\n不过，用户要求最后用1. 2. 3.格式回答三首歌名，并补充第一首的發行資訊。所以需要先得到前三首歌的标题，然后第一首的详细信息。\n\n现在，我需要生成第一个tool_call，即search_music。然后根据返回结果，再调用get_song_detail。但根据问题描述，工具调用测试迴圈中，可能需要分步骤调用。不过用户可能希望先调用search_music，然后根据结果调用get_song_detail。\n\n但根据题目要求，需要外部資料時請呼叫工具；工具結果回來後再用繁體中文給最終答案。所以这里可能需要先调用search_music，然后根据返回结果调和get_song_detail。\n\n不过，作为工具调用测试，可能需要先生成第一个tool_call，然后等待结果，再生成第二个。但在这个问题中，用户可能希望我先生成第一个tool_call，然后假设结果返回后，再生成第二个。\n\n不过，根据问题描述，",
+          "thinking_present": false,
+          "tool_calls": []
+        }
+      ],
+      "duration_seconds": 15.868,
+      "error": null
+    },
+    {
+      "case_id": "tool_after_context_pronoun",
+      "model": "qwen3:4b",
+      "passed": false,
+      "expected_tools": [
+        "search_music"
+      ],
+      "observed_tools": [],
+      "final_content": "好的，用户让我查米津玄師最近熱門前三首歌，只回傳1. 2. 3.三行。首先，我需要确定应该调用哪个工具。用户提到的工具里有search_music这个函数，可以搜索最近的热门歌曲，参数是artist和limit。用户需要前三，所以limit设为3。\n\n先确认工具的参数：search_music需要artist和limit。这里artist是“米津玄師”，但可能需要中文名，不过工具的描述里说artist是字符串，比如例子可能用英文，但用户用的是中文名，可能工具能处理。不过可能需要检查，但根据问题，用户用的是中文，所以应该用“米津玄師”作为artist参数。\n\n然后调用search_music，参数artist: \"米津玄師\", limit: 3。这样就能得到最近的前三首歌。然后返回结果，用户要求只回傳1. 2. 3.三行，所以可能需要把结果整理成每行一个，用数字标号。\n\n不过需要先调用工具，所以先生成tool_call。工具的名称是search_music，参数是artist和limit。所以tool_call的JSON应该是{\"name\": \"search_music\", \"arguments\": {\"artist\": \"米津玄師\", \"limit\": 3}}。\n\n然后假设工具返回了结果，比如三首歌的标题，比如“Lemon”、“Bloom”、“Rising”，那么需要以1. 2. 3.的格式返回。但用户要求只回傳三行，每行一个，所以可能需要这样：\n\n1. Lemon\n2. Bloom\n3. Rising\n\n不过具体要看工具返回的数据。但这里作为工具调用，先生成正确的tool_call，然后假设返回结果后，再用繁体中文回答。不过用户要求的是最终答案用繁體中文，但这里需要先调用工具。\n\n所以现在需要生成tool_call的JSON。确认参数是否正确：artist是“米津玄師”，limit是3。工具的参数描述里，artist是字符串，所以没问题。\n\n所以tool_call应该是：\n\n{\n  \"name\": \"search_music\",\n  \"arguments\": {\n    \"artist\": \"米津玄師\",\n    \"limit\": 3\n  }\n}\n\n然后等待工具返回结果，再处理。但用户现在需要的是先调用工具，所以这里应该输出tool_call的XML。\n</think>",
+      "quality_flags": {
+        "leaked_thinking": true,
+        "raw_json_tool_text": false
+      },
+      "rounds": [
+        {
+          "round": 1,
+          "content": "好的，用户让我查米津玄師最近熱門前三首歌，只回傳1. 2. 3.三行。首先，我需要确定应该调用哪个工具。用户提到的工具里有search_music这个函数，可以搜索最近的热门歌曲，参数是artist和limit。用户需要前三，所以limit设为3。\n\n先确认工具的参数：search_music需要artist和limit。这里artist是“米津玄師”，但可能需要中文名，不过工具的描述里说artist是字符串，比如例子可能用英文，但用户用的是中文名，可能工具能处理。不过可能需要检查，但根据问题，用户用的是中文，所以应该用“米津玄師”作为artist参数。\n\n然后调用search_music，参数artist: \"米津玄師\", limit: 3。这样就能得到最近的前三首歌。然后返回结果，用户要求只回傳1. 2. 3.三行，所以可能需要把结果整理成每行一个，用数字标号。\n\n不过需要先调用工具，所以先生成tool_call。工具的名称是search_music，参数是artist和limit。所以tool_call的JSON应该是{\"name\": \"search_music\", \"arguments\": {\"artist\": \"米津玄師\", \"limit\": 3}}。\n\n然后假设工具返回了结果，比如三首歌的标题，比如“Lemon”、“Bloom”、“Rising”，那么需要以1. 2. 3.的格式返回。但用户要求只回傳三行，每行一个，所以可能需要这样：\n\n1. Lemon\n2. Bloom\n3. Rising\n\n不过具体要看工具返回的数据。但这里作为工具调用，先生成正确的tool_call，然后假设返回结果后，再用繁体中文回答。不过用户要求的是最终答案用繁體中文，但这里需要先调用工具。\n\n所以现在需要生成tool_call的JSON。确认参数是否正确：artist是“米津玄師”，limit是3。工具的参数描述里，artist是字符串，所以没问题。\n\n所以tool_call应该是：\n\n{\n  \"name\": \"search_music\",\n  \"arguments\": {\n    \"artist\": \"米津玄師\",\n    \"limit\": 3\n  }\n}\n\n然后等待工具返回结果，再处理。但用户现在需要的是先调用工具，所以这里应该输出tool_call的XML。\n</think>",
+          "thinking_present": false,
+          "tool_calls": []
+        }
+      ],
+      "duration_seconds": 15.632,
+      "error": null
+    },
+    {
+      "case_id": "zero_tool_greeting",
+      "model": "qwen2.5-coder:7b",
+      "passed": true,
+      "expected_tools": [],
+      "observed_tools": [],
+      "final_content": "你好！",
+      "quality_flags": {
+        "leaked_thinking": false,
+        "raw_json_tool_text": false
+      },
+      "rounds": [
+        {
+          "round": 1,
+          "content": "你好！",
+          "thinking_present": false,
+          "tool_calls": []
+        }
+      ],
+      "duration_seconds": 5.04,
+      "error": null
+    },
+    {
+      "case_id": "single_weather_lookup",
+      "model": "qwen2.5-coder:7b",
+      "passed": false,
+      "expected_tools": [
+        "get_weather"
+      ],
+      "observed_tools": [],
+      "final_content": "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"東京\"}}",
+      "quality_flags": {
+        "leaked_thinking": false,
+        "raw_json_tool_text": true
+      },
+      "rounds": [
+        {
+          "round": 1,
+          "content": "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"東京\"}}",
+          "thinking_present": false,
+          "tool_calls": []
+        }
+      ],
+      "duration_seconds": 1.027,
+      "error": null
+    },
+    {
+      "case_id": "two_step_music_search_then_detail",
+      "model": "qwen2.5-coder:7b",
+      "passed": false,
+      "expected_tools": [
+        "search_music",
+        "get_song_detail"
+      ],
+      "observed_tools": [],
+      "final_content": "{\"name\": \"search_music\", \"arguments\": {\"artist\": \"米津玄師\", \"limit\": 3}}\n{\"name\": \"get_song_detail\", \"arguments\": {\"title\": \"<第一首歌的標題>\"}}",
+      "quality_flags": {
+        "leaked_thinking": false,
+        "raw_json_tool_text": true
+      },
+      "rounds": [
+        {
+          "round": 1,
+          "content": "{\"name\": \"search_music\", \"arguments\": {\"artist\": \"米津玄師\", \"limit\": 3}}\n{\"name\": \"get_song_detail\", \"arguments\": {\"title\": \"<第一首歌的標題>\"}}",
+          "thinking_present": false,
+          "tool_calls": []
+        }
+      ],
+      "duration_seconds": 2.691,
+      "error": null
+    },
+    {
+      "case_id": "tool_after_context_pronoun",
+      "model": "qwen2.5-coder:7b",
+      "passed": false,
+      "expected_tools": [
+        "search_music"
+      ],
+      "observed_tools": [],
+      "final_content": "{\"name\": \"search_music\", \"arguments\": {\"artist\": \"米津玄師\", \"limit\": 3}}",
+      "quality_flags": {
+        "leaked_thinking": false,
+        "raw_json_tool_text": true
+      },
+      "rounds": [
+        {
+          "round": 1,
+          "content": "{\"name\": \"search_music\", \"arguments\": {\"artist\": \"米津玄師\", \"limit\": 3}}",
+          "thinking_present": false,
+          "tool_calls": []
+        }
+      ],
+      "duration_seconds": 1.575,
+      "error": null
+    },
+    {
+      "case_id": "zero_tool_greeting",
+      "model": "qwen3:14b",
+      "passed": true,
+      "expected_tools": [],
+      "observed_tools": [],
+      "final_content": "您好，很高興為您服務！",
+      "quality_flags": {
+        "leaked_thinking": false,
+        "raw_json_tool_text": false
+      },
+      "rounds": [
+        {
+          "round": 1,
+          "content": "您好，很高興為您服務！",
+          "thinking_present": false,
+          "tool_calls": []
+        }
+      ],
+      "duration_seconds": 8.575,
+      "error": null
+    },
+    {
+      "case_id": "single_weather_lookup",
+      "model": "qwen3:14b",
+      "passed": true,
+      "expected_tools": [
+        "get_weather"
+      ],
+      "observed_tools": [
+        {
+          "name": "get_weather",
+          "arguments": {
+            "city": "東京"
+          },
+          "result": {
+            "city": "東京",
+            "condition": "晴れ",
+            "temperature_c": "28",
+            "source": "fixture"
+          }
+        }
+      ],
+      "final_content": "東京現在天氣晴朗，氣溫28攝氏度。",
+      "quality_flags": {
+        "leaked_thinking": false,
+        "raw_json_tool_text": false
+      },
+      "rounds": [
+        {
+          "round": 1,
+          "content": "",
+          "thinking_present": false,
+          "tool_calls": [
+            {
+              "name": "get_weather",
+              "arguments": {
+                "city": "東京"
+              }
+            }
+          ]
+        },
+        {
+          "round": 2,
+          "content": "東京現在天氣晴朗，氣溫28攝氏度。",
+          "thinking_present": false,
+          "tool_calls": []
+        }
+      ],
+      "duration_seconds": 4.501,
+      "error": null
+    },
+    {
+      "case_id": "two_step_music_search_then_detail",
+      "model": "qwen3:14b",
+      "passed": false,
+      "expected_tools": [
+        "search_music",
+        "get_song_detail"
+      ],
+      "observed_tools": [
+        {
+          "name": "search_music",
+          "arguments": {
+            "limit": 3,
+            "artist": "米津玄師"
+          },
+          "result": {
+            "artist": "米津玄師",
+            "songs": [
+              {
+                "title": "Lemon",
+                "rank": 1
+              },
+              {
+                "title": "KICK BACK",
+                "rank": 2
+              },
+              {
+                "title": "感電",
+                "rank": 3
+              }
+            ],
+            "source": "fixture"
+          }
+        }
+      ],
+      "final_content": "1. Lemon  \n2. KICK BACK  \n3. 感電  \n\nLemon 於 2017 年 12 月 6 日發行。",
+      "quality_flags": {
+        "leaked_thinking": false,
+        "raw_json_tool_text": false
+      },
+      "rounds": [
+        {
+          "round": 1,
+          "content": "",
+          "thinking_present": false,
+          "tool_calls": [
+            {
+              "name": "search_music",
+              "arguments": {
+                "limit": 3,
+                "artist": "米津玄師"
+              }
+            }
+          ]
+        },
+        {
+          "round": 2,
+          "content": "1. Lemon  \n2. KICK BACK  \n3. 感電  \n\nLemon 於 2017 年 12 月 6 日發行。",
+          "thinking_present": false,
+          "tool_calls": []
+        }
+      ],
+      "duration_seconds": 9.095,
+      "error": null
+    },
+    {
+      "case_id": "tool_after_context_pronoun",
+      "model": "qwen3:14b",
+      "passed": true,
+      "expected_tools": [
+        "search_music"
+      ],
+      "observed_tools": [
+        {
+          "name": "search_music",
+          "arguments": {
+            "artist": "米津玄師",
+            "limit": 3
+          },
+          "result": {
+            "artist": "米津玄師",
+            "songs": [
+              {
+                "title": "Lemon",
+                "rank": 1
+              },
+              {
+                "title": "KICK BACK",
+                "rank": 2
+              },
+              {
+                "title": "感電",
+                "rank": 3
+              }
+            ],
+            "source": "fixture"
+          }
+        }
+      ],
+      "final_content": "1. Lemon  \n2. KICK BACK  \n3. 感電",
+      "quality_flags": {
+        "leaked_thinking": false,
+        "raw_json_tool_text": false
+      },
+      "rounds": [
+        {
+          "round": 1,
+          "content": "",
+          "thinking_present": false,
+          "tool_calls": [
+            {
+              "name": "search_music",
+              "arguments": {
+                "artist": "米津玄師",
+                "limit": 3
+              }
+            }
+          ]
+        },
+        {
+          "round": 2,
+          "content": "1. Lemon  \n2. KICK BACK  \n3. 感電",
+          "thinking_present": false,
+          "tool_calls": []
+        }
+      ],
+      "duration_seconds": 6.581,
+      "error": null
+    }
+  ]
+}
