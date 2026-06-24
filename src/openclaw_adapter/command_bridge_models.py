@@ -61,6 +61,7 @@ class Attachment:
     type: str
     filename: str | None = None
     content_type: str | None = None
+    data_base64: str | None = None
 
     @classmethod
     def from_dict(cls, data: object) -> "Attachment":
@@ -73,6 +74,7 @@ class Attachment:
             type=atype,
             filename=_opt_str(data.get("filename")),
             content_type=_opt_str(data.get("content_type")),
+            data_base64=_opt_str(data.get("data_base64")),
         )
 
 

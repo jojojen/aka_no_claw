@@ -6,9 +6,9 @@ reimplements command logic and never drifts from the Telegram bot:
 
 * Chat       → local Ollama model or cloud big-pickle, pure chat (Phase 1, no
                tool calls), with a streaming path for long output.
-* Translation→ the existing ``/zh`` handler (text). Image translation is
-               reported as a structured ``unsupported`` until the bridge grows a
-               multipart file route (doc-allowed for MVP).
+* Translation→ the existing ``/zh`` handler (text), or the shared image OCR +
+               translation renderer when the web console sends a base64 image
+               attachment.
 * Investment → ``商品深入研究`` reuses the existing ``/research`` handler. Seller
                reputation snapshot is ``unsupported`` for MVP.
 
@@ -18,8 +18,13 @@ registry the bot uses) so there is one source of truth.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
+import os
+from pathlib import Path
+import tempfile
 import threading
 import time
 from collections.abc import Iterator
@@ -30,6 +35,10 @@ from uuid import uuid4
 from assistant_runtime import AssistantSettings, build_ssl_context
 
 from .job_store import JobStore
+from .image_translate import (
+    NOT_CONFIGURED_MESSAGE as IMAGE_TRANSLATE_NOT_CONFIGURED_MESSAGE,
+    build_image_ocr_translate_renderer_from_settings,
+)
 from .session_memory import SessionMemoryStore, SessionWriteError, empty_session
 from .service_restart import RESTART_MESSAGE, trigger_restart_all
 from .command_bridge_models import (
@@ -62,13 +71,39 @@ _HEARTBEAT_SECONDS = 10.0
 # can still fetch the final report, then they are garbage-collected.
 _JOB_TTL_SECONDS = 1800.0
 
-_IMAGE_UNSUPPORTED_MSG = "圖片翻譯目前尚未由本地 command bridge 支援。"
+_IMAGE_MISSING_MSG = "請上傳要翻譯的圖片。"
+_IMAGE_MISSING_BYTES_MSG = "圖片附件缺少 data_base64，請更新前端後重試。"
+_IMAGE_INVALID_BYTES_MSG = "圖片附件不是有效的 base64 圖片資料。"
+_MAX_IMAGE_TRANSLATION_BYTES = 12 * 1024 * 1024
 _SELLER_UNSUPPORTED_MSG = "賣家信譽快照目前尚未由本地 command bridge 支援。"
 
 JOB_RUNNING = "running"
 JOB_DONE = "done"
 JOB_ERROR = "error"
 JOB_INTERRUPTED = "interrupted"  # persisted running job whose in-memory worker is gone
+
+
+def _decode_attachment_base64(data_base64: str) -> bytes:
+    raw = data_base64.strip()
+    if raw.lower().startswith("data:") and "," in raw:
+        raw = raw.split(",", 1)[1].strip()
+    try:
+        return base64.b64decode(raw, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("invalid base64 image data") from exc
+
+
+def _image_file_suffix(filename: str | None, content_type: str | None) -> str:
+    suffix = Path(filename or "").suffix.lower()
+    if suffix in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}:
+        return suffix
+    return {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+        "image/bmp": ".bmp",
+    }.get((content_type or "").strip().lower(), ".img")
 
 
 class _Job:
@@ -807,12 +842,7 @@ class CommandBridge:
     # --- translation -----------------------------------------------------
     def _handle_translation(self, req: WebCommandRequest) -> WebCommandResponse:
         if req.submode == SUBMODE_IMAGE_TRANSLATION or req.has_image_attachment:
-            return WebCommandResponse(
-                status=STATUS_UNSUPPORTED,
-                message=_IMAGE_UNSUPPORTED_MSG,
-                mode=MODE_TRANSLATION,
-                submode=SUBMODE_IMAGE_TRANSLATION,
-            )
+            return self._handle_image_translation(req)
         text = (req.input or "").strip()
         if not text:
             return WebCommandResponse(
@@ -827,6 +857,91 @@ class CommandBridge:
             message=message,
             mode=MODE_TRANSLATION,
             submode=SUBMODE_TEXT_TRANSLATION,
+        )
+
+    def _handle_image_translation(self, req: WebCommandRequest) -> WebCommandResponse:
+        attachment = next((a for a in req.attachments if a.type == "image"), None)
+        if attachment is None:
+            return WebCommandResponse(
+                status=STATUS_ERROR,
+                message=_IMAGE_MISSING_MSG,
+                mode=MODE_TRANSLATION,
+                submode=SUBMODE_IMAGE_TRANSLATION,
+            )
+        if not attachment.data_base64:
+            return WebCommandResponse(
+                status=STATUS_ERROR,
+                message=_IMAGE_MISSING_BYTES_MSG,
+                mode=MODE_TRANSLATION,
+                submode=SUBMODE_IMAGE_TRANSLATION,
+            )
+
+        renderer = build_image_ocr_translate_renderer_from_settings(self.settings)
+        if renderer is None:
+            return WebCommandResponse(
+                status=STATUS_UNSUPPORTED,
+                message=IMAGE_TRANSLATE_NOT_CONFIGURED_MESSAGE,
+                mode=MODE_TRANSLATION,
+                submode=SUBMODE_IMAGE_TRANSLATION,
+            )
+
+        try:
+            image_bytes = _decode_attachment_base64(attachment.data_base64)
+        except ValueError:
+            return WebCommandResponse(
+                status=STATUS_ERROR,
+                message=_IMAGE_INVALID_BYTES_MSG,
+                mode=MODE_TRANSLATION,
+                submode=SUBMODE_IMAGE_TRANSLATION,
+            )
+        if not image_bytes:
+            return WebCommandResponse(
+                status=STATUS_ERROR,
+                message=_IMAGE_INVALID_BYTES_MSG,
+                mode=MODE_TRANSLATION,
+                submode=SUBMODE_IMAGE_TRANSLATION,
+            )
+        if len(image_bytes) > _MAX_IMAGE_TRANSLATION_BYTES:
+            return WebCommandResponse(
+                status=STATUS_ERROR,
+                message="圖片太大，請改用 12MB 以下的圖片。",
+                mode=MODE_TRANSLATION,
+                submode=SUBMODE_IMAGE_TRANSLATION,
+            )
+
+        tmp_path: Path | None = None
+        try:
+            fd, raw_path = tempfile.mkstemp(
+                prefix="openclaw_imgtr_",
+                suffix=_image_file_suffix(attachment.filename, attachment.content_type),
+            )
+            tmp_path = Path(raw_path)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(image_bytes)
+            result = renderer(tmp_path, (req.input or "").strip() or None)
+        finally:
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("failed to remove temporary image %s", tmp_path)
+
+        if not result.ok:
+            return WebCommandResponse(
+                status=STATUS_ERROR,
+                message=result.message,
+                mode=MODE_TRANSLATION,
+                submode=SUBMODE_IMAGE_TRANSLATION,
+            )
+        message = (
+            f"🌐→🇹🇼 圖片文字翻譯（偵測語言：{result.source_language}）\n\n"
+            f"{result.translation}"
+        )
+        return WebCommandResponse(
+            status=STATUS_OK,
+            message=message,
+            mode=MODE_TRANSLATION,
+            submode=SUBMODE_IMAGE_TRANSLATION,
         )
 
     # --- investment ------------------------------------------------------
