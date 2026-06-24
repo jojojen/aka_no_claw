@@ -23,6 +23,8 @@ the OpenAI-compatible route.
 - Latest result: [latest_results.md](latest_results.md)
 - Baseline run: [results_20260624T030509Z.md](results_20260624T030509Z.md)
 - Subgoal-gate run: [results_20260624T031051Z.md](results_20260624T031051Z.md)
+- Gemma tool-support check: [results_20260624T032416Z.md](results_20260624T032416Z.md)
+- Strict dependency-validation run: [results_20260624T142241Z.md](results_20260624T142241Z.md)
 - Realistic music probe harness: [run_realistic_probe.py](run_realistic_probe.py)
 - Latest realistic probe: [latest_realistic_probe.md](latest_realistic_probe.md)
 - Realistic fixture-web run: [realistic_probe_20260624T032155Z.md](realistic_probe_20260624T032155Z.md)
@@ -31,8 +33,10 @@ the OpenAI-compatible route.
 Models tested:
 
 - `qwen3:4b`
+- `qwen2.5:0.5b`
 - `qwen2.5-coder:7b`
 - `qwen3:14b`
+- `gemma3:12b`
 
 The harness sends deterministic fixture tools to Ollama:
 
@@ -52,6 +56,9 @@ Quality failures are counted even when the task partially succeeds:
 - `leaked_thinking`: the final answer exposes `<think>` / `</think>`.
 - `raw_json_tool_text`: the model prints a tool call JSON as normal text instead
   of returning structured `message.tool_calls`.
+- `invalid_tool_dependency`: a later tool did not use required data from an
+  earlier tool result, for example calling `get_song_detail("第一首歌")` instead
+  of `get_song_detail("Lemon")` after `search_music` returned `Lemon` as rank 1.
 
 ## Results
 
@@ -77,6 +84,47 @@ to finalize the two-step music answer. It sent this corrective message:
 ```
 
 The model then called `get_song_detail` and produced a grounded final answer.
+
+### Tool-support check
+
+| Model | Passed | Total | Pass rate | Mean seconds | Main observation |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `gemma3:12b` | 0 | 4 | 0% | 0.1 | Ollama rejects `tools`: model does not support tools |
+
+`gemma3:12b` is installed locally, but Ollama returns this error for every
+request that includes tool schemas:
+
+```text
+HTTPError 400: {"error":"registry.ollama.ai/library/gemma3:12b does not support tools"}
+```
+
+This rules it out as a direct local tool router even before quality or latency
+can be measured.
+
+### Strict dependency validation
+
+| Model | Passed | Total | Pass rate | Mean seconds | Main observation |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `qwen2.5:0.5b` | 3 | 4 | 75% | 1.1 | fast but failed cross-tool dependency |
+| `qwen3:14b` | 4 | 4 | 100% | 10.3 | passed with one subgoal-gate intervention |
+
+This run added `invalid_tool_dependency` to catch a subtle false positive. The
+small `qwen2.5:0.5b` model called the right tool names in the right order, but
+called:
+
+```text
+get_song_detail(title="第一首歌")
+```
+
+instead of using the first title returned by `search_music`:
+
+```text
+get_song_detail(title="Lemon")
+```
+
+So it produced a superficially plausible answer but could not ground the
+release detail. This is a strong signal that production validation must inspect
+tool arguments and tool results, not just count tool calls.
 
 ### Realistic music-selection probe
 

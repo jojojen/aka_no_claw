@@ -142,6 +142,27 @@ def missing_expected_tools(expected: list[str], observed: list[str]) -> list[str
     return missing
 
 
+def invalid_tool_dependency(case_id: str, observed_tools: list[dict[str, Any]]) -> bool:
+    """True when a later tool ignores required data from an earlier tool.
+
+    The strict case is intentionally narrow for now: the two-step music case
+    requires `get_song_detail.title` to equal the first title returned by
+    `search_music`, not a vague phrase like "第一首歌".
+    """
+    if case_id != "two_step_music_search_then_detail":
+        return False
+    search = next((item for item in observed_tools if item["name"] == "search_music"), None)
+    detail = next((item for item in observed_tools if item["name"] == "get_song_detail"), None)
+    if not search or not detail:
+        return False
+    songs = (search.get("result") or {}).get("songs") or []
+    if not songs or not isinstance(songs[0], dict):
+        return True
+    expected_title = str(songs[0].get("title") or "").strip().casefold()
+    actual_title = str((detail.get("arguments") or {}).get("title") or "").strip().casefold()
+    return not expected_title or expected_title != actual_title
+
+
 def run_case(
     endpoint: str,
     model: str,
@@ -181,7 +202,11 @@ def run_case(
         }
         try:
             response = post_json(f"{endpoint.rstrip('/')}/api/chat", payload, timeout)
-        except (HTTPError, URLError, TimeoutError) as exc:
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            error = f"HTTPError {exc.code}: {body or exc.reason}"
+            break
+        except (URLError, TimeoutError) as exc:
             error = f"{type(exc).__name__}: {exc}"
             break
         message = response.get("message") or {}
@@ -246,6 +271,7 @@ def run_case(
     quality_flags = {
         "leaked_thinking": leaked_thinking,
         "raw_json_tool_text": raw_json_tool_text,
+        "invalid_tool_dependency": invalid_tool_dependency(case["id"], observed_tools),
     }
     passed = (
         error is None
