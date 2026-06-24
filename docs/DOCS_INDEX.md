@@ -1,6 +1,8 @@
 # Docs Index
 
 Last reviewed: 2026-06-20
+Status: Current
+Owner area: agent-maintenance
 
 Governance for this index lives in [DOCUMENTATION_GOVERNANCE.md](DOCUMENTATION_GOVERNANCE.md).
 Full inventory with recommended actions is in [DOC_AUDIT.md](DOC_AUDIT.md).
