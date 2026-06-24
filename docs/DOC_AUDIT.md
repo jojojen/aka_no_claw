@@ -42,6 +42,7 @@ for which question each one answers.
 | `fix_benchmarks/README.md` | Current | agent-maintenance | Keep; `/fix` benchmark index and synthetic-fixture safety rules. |
 | `fix_benchmarks/price_reference_sources/README.md` | Current | agent-maintenance | Keep; benchmark spec for synthetic multi-source price parsers. |
 | `fix_benchmarks/price_reference_sources/FAILURE_TRACE.md` | Current | agent-maintenance | Keep; reproducible parser failure history for `/fix` evaluation. |
+| `fix_benchmarks/image_translation_policy/README.md` | Current | agent-maintenance | Keep; public-media benchmark for adaptive OCR/image translation policies. |
 | `fix_benchmarks/seller_snapshot_sources/README.md` | Current | agent-maintenance | Keep; benchmark spec for synthetic seller snapshot parser and lifecycle repair. |
 | `fix_benchmarks/seller_snapshot_sources/FAILURE_TRACE.md` | Current | agent-maintenance | Keep; reproducible seller snapshot parser and cooldown failure history. |
 | `fix_benchmarks/seller_snapshot_sources/lifecycle/README.md` | Current | agent-maintenance | Keep; rate-limit and bot-interstitial classifier benchmark. |

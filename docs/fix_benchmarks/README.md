@@ -4,8 +4,8 @@ Last reviewed: 2026-06-24
 Status: Current
 Owner area: agent-maintenance
 
-This directory contains deterministic parser/extractor repair benchmarks for
-the future `/fix` workflow.
+This directory contains deterministic parser/extractor repair benchmarks and
+quality benchmarks for future repair workflows.
 
 Each benchmark should provide:
 
@@ -27,10 +27,10 @@ reproduce failure
 
 ## Safety Rules
 
-Fixtures must be useful for parser repair without becoming realistic clones of
-live commerce sites.
+Commerce/parser fixtures must be useful for parser repair without becoming
+realistic clones of live commerce sites.
 
-Required:
+Required for synthetic commerce fixtures:
 
 - Use fictional source names, sellers, item IDs, URLs, CSS classes, and copy.
 - Do not mention real merchant names inside benchmark files.
@@ -55,12 +55,21 @@ These codes are not brands. They only label fixture families. Real sources may
 inspire the generic source type, but benchmark files must not contain real
 merchant names or real source URLs.
 
+Required for public-media quality fixtures:
+
+- Use publicly available media with a recorded source URL, author, and license.
+- Re-save local image copies without EXIF/GPS metadata.
+- Avoid private personal data. Public venue artifacts are acceptable only when
+  the benchmark objective is OCR/translation quality and not contact extraction.
+- Keep source attribution in metadata files, not hidden in binary metadata.
+
 ## Current Benchmarks
 
 | Benchmark | Purpose |
 |---|---|
 | [price_reference_sources](price_reference_sources/README.md) | Multi-source card/product price-reference parser benchmark. |
 | [seller_snapshot_sources](seller_snapshot_sources/README.md) | Seller profile, review, and cooldown lifecycle benchmark. |
+| [image_translation_policy](image_translation_policy/README.md) | Public-media image translation policy benchmark. |
 
 ## Running A Benchmark
 

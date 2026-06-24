@@ -1,0 +1,111 @@
+{
+  "benchmark_id": "image_translation_policy",
+  "created_at": "2026-06-24",
+  "target_language": "zh-TW",
+  "fixture_policy": {
+    "source_kind": "publicly available Wikimedia Commons media",
+    "local_transform": "Images are resized to fit within 1200x1200 and re-saved without EXIF/GPS metadata. No visible content was intentionally altered.",
+    "privacy_review": "No private personal data was observed. Some real public venue artifacts may contain public contact or location context; benchmark tasks must not extract or act on contact information.",
+    "use_scope": "Use these images only as OCR/translation-policy fixtures, not as crawler targets or merchant/person datasets."
+  },
+  "cases": [
+    {
+      "id": "menu_yakitori",
+      "fixture": "fixtures/menu_yakitori.jpg",
+      "content_type": "menu_photo",
+      "source_languages": ["ja", "en"],
+      "source_url": "https://commons.wikimedia.org/wiki/File:Yakitori_Menu_-_Tokyo_Japan.jpg",
+      "source_title": "Yakitori Menu - Tokyo Japan.jpg",
+      "author": "Donatingpictures",
+      "license": "CC BY-SA 4.0",
+      "license_url": "https://creativecommons.org/licenses/by-sa/4.0/",
+      "expected_policy": "Menu translation: preserve item rows, prices, units, and parallel Japanese/English wording. Prefer concise food/menu terms over literary prose.",
+      "must_preserve": ["yen prices", "item boundaries", "food/body-part terms", "visible English labels"],
+      "must_not": ["rewrite as dialogue", "drop prices", "invent unavailable items", "extract or act on public contact/location details"]
+    },
+    {
+      "id": "sign_airport_osaka",
+      "fixture": "fixtures/sign_airport_osaka.jpg",
+      "content_type": "wayfinding_sign",
+      "source_languages": ["ja", "en", "ko", "zh"],
+      "source_url": "https://commons.wikimedia.org/wiki/File:Arrival_Signs_in_Osaka_Airport.JPG",
+      "source_title": "Arrival Signs in Osaka Airport.JPG",
+      "author": "Ominae",
+      "license": "CC BY-SA 3.0",
+      "license_url": "https://creativecommons.org/licenses/by-sa/3.0/",
+      "expected_policy": "Wayfinding translation: output short signage-equivalent phrases, preserve arrow/direction semantics and existing multilingual labels.",
+      "must_preserve": ["arrivals direction", "international transfer direction", "short label style"],
+      "must_not": ["turn into paragraphs", "lose directionality", "over-translate proper-place context"]
+    },
+    {
+      "id": "nutrition_fda_2014",
+      "fixture": "fixtures/nutrition_fda_2014.jpg",
+      "content_type": "nutrition_label",
+      "source_languages": ["en"],
+      "source_url": "https://commons.wikimedia.org/wiki/File:FDA_Nutrition_Facts_Label_2014.jpg",
+      "source_title": "FDA Nutrition Facts Label 2014.jpg",
+      "author": "U.S. Food and Drug Administration",
+      "license": "Public domain",
+      "license_url": "https://www.fda.gov/about-fda/about-website/fdagov-archive",
+      "expected_policy": "Label/table translation: preserve numeric values, units, percent daily values, hierarchy, and row structure.",
+      "must_preserve": ["serving size", "calories", "grams/milligrams/micrograms", "percent daily values", "table hierarchy"],
+      "must_not": ["summarize away values", "convert units without being asked", "change health claims"]
+    },
+    {
+      "id": "document_commonsense",
+      "fixture": "fixtures/document_commonsense.jpg",
+      "content_type": "historical_document_scan",
+      "source_languages": ["en"],
+      "source_url": "https://commons.wikimedia.org/wiki/File:Commonsense.jpg",
+      "source_title": "Commonsense.jpg",
+      "author": "Thomas Paine; scan uploaded by Niki K",
+      "license": "Public domain",
+      "license_url": "https://creativecommons.org/publicdomain/mark/1.0/",
+      "expected_policy": "Document translation: preserve title, headings, roman numerals, list structure, and historical/archaic wording where meaningful.",
+      "must_preserve": ["title hierarchy", "roman numerals", "publication line", "uncertain handwritten marks as uncertain"],
+      "must_not": ["modernize into casual speech", "ignore document layout", "treat as menu or UI"]
+    },
+    {
+      "id": "ui_libreoffice_writer",
+      "fixture": "fixtures/ui_libreoffice_writer.png",
+      "content_type": "software_ui_screenshot",
+      "source_languages": ["en"],
+      "source_url": "https://commons.wikimedia.org/wiki/File:LibreOffice_7.2.4.1_Writer_screenshot.png",
+      "source_title": "LibreOffice 7.2.4.1 Writer screenshot.png",
+      "author": "The Document Foundation contributors; screenshot by VulcanSphere",
+      "license": "MPL 2.0 / LGPL software screenshot terms noted on source page",
+      "license_url": "https://www.mozilla.org/en-US/MPL/2.0/",
+      "expected_policy": "UI translation: translate visible UI labels and document text concisely; preserve version numbers, build IDs, locale strings, shortcuts, and menu hierarchy.",
+      "must_preserve": ["version/build values", "menu labels", "toolbar label brevity", "UI hierarchy"],
+      "must_not": ["produce a prose summary only", "invent actions not visible", "translate version strings"]
+    },
+    {
+      "id": "comic_dwig_private_secretary",
+      "fixture": "fixtures/comic_dwig_private_secretary.jpg",
+      "content_type": "comic_dialogue",
+      "source_languages": ["en"],
+      "source_url": "https://commons.wikimedia.org/wiki/File:Dwig%27s_School_Days_cartoon_-_%22The_Private_Secretary%22.jpg",
+      "source_title": "Dwig's School Days cartoon - \"The Private Secretary\".jpg",
+      "author": "Clare Victor Dwiggins",
+      "license": "Public domain in the United States",
+      "license_url": "https://commons.wikimedia.org/wiki/Template:PD-US-expired",
+      "expected_policy": "Comic/dialogue translation: group by visible balloon or caption, preserve humor and speaker boundaries, and naturalize dialogue without copying OCR line breaks.",
+      "must_preserve": ["speech balloon boundaries", "caption/title", "intentional misspelling or joke as a note if needed"],
+      "must_not": ["output OCR line fragments as separate Chinese lines", "flatten all speakers into one paragraph", "over-polish away the joke"]
+    },
+    {
+      "id": "handwritten_japanese_notice",
+      "fixture": "fixtures/handwritten_japanese_notice.png",
+      "content_type": "handwritten_public_notice",
+      "source_languages": ["ja"],
+      "source_url": "https://commons.wikimedia.org/wiki/File:Handwritten_notice_in_Japanese-komejirushi_at_the_bottom_of_each_page.png",
+      "source_title": "Handwritten notice in Japanese-komejirushi at the bottom of each page.png",
+      "author": "Tmtm; color-adjusted revision by Karl432",
+      "license": "CC BY-SA 3.0",
+      "license_url": "https://creativecommons.org/licenses/by-sa/3.0/",
+      "expected_policy": "Handwritten notice translation: preserve grouped headings and bullet-like lists, mark ambiguous handwriting as uncertain, and keep casual shop-note tone.",
+      "must_preserve": ["free topping headings", "lists under ramen/maze-soba/tsukemen", "uncertain handwriting markers"],
+      "must_not": ["pretend uncertain handwriting is certain", "merge all columns into one unordered paragraph", "rewrite as formal document prose"]
+    }
+  ]
+}

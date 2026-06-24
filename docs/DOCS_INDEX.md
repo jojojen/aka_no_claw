@@ -35,6 +35,7 @@ Full inventory with recommended actions is in [DOC_AUDIT.md](DOC_AUDIT.md).
 | [fix_benchmarks/README.md](fix_benchmarks/README.md) | Current | agent-maintenance | Deterministic `/fix` benchmark directory and safety rules for synthetic fixtures. |
 | [fix_benchmarks/price_reference_sources/README.md](fix_benchmarks/price_reference_sources/README.md) | Current | agent-maintenance | Multi-source synthetic price reference parser repair benchmark. |
 | [fix_benchmarks/price_reference_sources/FAILURE_TRACE.md](fix_benchmarks/price_reference_sources/FAILURE_TRACE.md) | Current | agent-maintenance | Reproducible broken-parser attempts and verifier outcomes for the benchmark. |
+| [fix_benchmarks/image_translation_policy/README.md](fix_benchmarks/image_translation_policy/README.md) | Current | agent-maintenance | Public-media benchmark for adaptive OCR/image translation policies. |
 | [fix_benchmarks/seller_snapshot_sources/README.md](fix_benchmarks/seller_snapshot_sources/README.md) | Current | agent-maintenance | Synthetic seller snapshot parser and cooldown lifecycle repair benchmark. |
 | [fix_benchmarks/seller_snapshot_sources/FAILURE_TRACE.md](fix_benchmarks/seller_snapshot_sources/FAILURE_TRACE.md) | Current | agent-maintenance | Reproducible seller snapshot parser and lifecycle failure history. |
 | [fix_benchmarks/seller_snapshot_sources/lifecycle/README.md](fix_benchmarks/seller_snapshot_sources/lifecycle/README.md) | Current | agent-maintenance | Rate-limit and bot-interstitial lifecycle classifier benchmark. |
