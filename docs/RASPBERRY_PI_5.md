@@ -1,6 +1,6 @@
 # Raspberry Pi 5 Quick Run
 
-Last reviewed: 2026-06-20
+Last reviewed: 2026-06-25
 Status: Needs review
 Owner area: operations
 
@@ -29,15 +29,15 @@ REPUTATION_AGENT_ADMIN_TOKEN=...
 For non-interactive setup, prefill the Telegram values from the shell:
 
 ```bash
-OPENCLAW_TELEGRAM_BOT_TOKEN='...' OPENCLAW_TELEGRAM_CHAT_ID='...' ./start-rpi5-stack.sh
+OPENCLAW_TELEGRAM_BOT_TOKEN='...' OPENCLAW_TELEGRAM_CHAT_ID='...' ./launchers/start-rpi5-stack.sh
 ```
 
 ## First Run
 
 ```bash
 cd ~/ai_work_space/aka_no_claw
-chmod +x start-rpi5-stack.sh stop-rpi5-stack.sh
-./start-rpi5-stack.sh
+chmod +x launchers/start-rpi5-stack.sh
+./launchers/start-rpi5-stack.sh
 ```
 
 The script will:
@@ -64,13 +64,13 @@ If `reputation_snapshot/.env` already exists, the script keeps a one-time backup
 If you already prepared system packages yourself and do not want the script to use `sudo apt-get`:
 
 ```bash
-AUTO_INSTALL_SYSTEM_DEPS=0 ./start-rpi5-stack.sh
+AUTO_INSTALL_SYSTEM_DEPS=0 ./launchers/start-rpi5-stack.sh
 ```
 
 To require a real Raspberry Pi 5 board instead of allowing Docker or another Linux host:
 
 ```bash
-RPI5_REQUIRE_PI=1 ./start-rpi5-stack.sh
+RPI5_REQUIRE_PI=1 ./launchers/start-rpi5-stack.sh
 ```
 
 If Python must be built locally, the default source version is `3.12.10`; override it with `PYTHON_VERSION=3.12.x` if needed.
@@ -78,7 +78,7 @@ If Python must be built locally, the default source version is `3.12.10`; overri
 To skip copied-runtime cleanup:
 
 ```bash
-CLEAN_COPIED_RUNTIME=0 ./start-rpi5-stack.sh
+CLEAN_COPIED_RUNTIME=0 ./launchers/start-rpi5-stack.sh
 ```
 
 ## Local Natural Language / Ollama
@@ -96,7 +96,7 @@ The Pi startup script does not edit `aka_no_claw/.env`, but at runtime it replac
 To install and use Ollama on an 8GB Pi for natural-language routing:
 
 ```bash
-SETUP_OLLAMA=1 ./start-rpi5-stack.sh
+SETUP_OLLAMA=1 ./launchers/start-rpi5-stack.sh
 ```
 
 The script defaults to `gemma3:1b` for text routing because it is much safer on 8GB RAM than larger vision models.
@@ -110,7 +110,7 @@ OPENCLAW_LOCAL_TEXT_MODEL=gemma3:1b
 By default, `SETUP_OLLAMA=1` only ensures the text model. It will not pull vision models on an 8GB Pi. If you still want image fallback through Ollama, set `OPENCLAW_LOCAL_VISION_MODEL` and explicitly opt in:
 
 ```bash
-SETUP_OLLAMA=1 SETUP_OLLAMA_VISION=1 ./start-rpi5-stack.sh
+SETUP_OLLAMA=1 SETUP_OLLAMA_VISION=1 ./launchers/start-rpi5-stack.sh
 ```
 
 Expect larger vision models such as `qwen2.5vl:7b` to be much heavier than text routing on 8GB RAM.
@@ -118,7 +118,7 @@ Expect larger vision models such as `qwen2.5vl:7b` to be much heavier than text 
 To send a Telegram startup notification:
 
 ```bash
-START_NOTIFY=1 ./start-rpi5-stack.sh
+START_NOTIFY=1 ./launchers/start-rpi5-stack.sh
 ```
 
 ## Docker Verification Before Pi
@@ -138,10 +138,10 @@ cd ~/ai_work_space/aka_no_claw
 ```
 
 The Docker test uses a Debian Python 3.12 container and a mocked Pi workspace. It runs the real
-`start-rpi5-stack.sh` and `stop-rpi5-stack.sh` end to end while stubbing `apt-get`, `pip`,
+`launchers/start-rpi5-stack.sh` setup path while stubbing `apt-get`, `pip`,
 Playwright, Chromium, Ollama, and long-running services. This verifies:
 
-- shell syntax for the start and stop scripts
+- shell syntax for the setup script
 - environment detection output
 - copied Windows virtualenv cleanup
 - system dependency installation path
@@ -150,7 +150,6 @@ Playwright, Chromium, Ollama, and long-running services. This verifies:
 - default pull of the Pi-friendly `gemma3:1b` text model
 - vision model pull is skipped unless `SETUP_OLLAMA_VISION=1`
 - reputation server and Telegram process orchestration
-- stop script cleanup, including the Ollama process started by the stack
 
 To ask Docker to run the smoke test as an ARM64 container when your Docker installation supports emulation:
 
@@ -189,7 +188,7 @@ DOCKER_PLATFORM=linux/arm64/v8 ./scripts/run-rpi5-realistic-docker-test.sh
 
 The realistic test copies `aka_no_claw`, `price_monitor_bot`, and `reputation_snapshot` into a
 temporary container workspace, deliberately excluding your real `.env`. It writes a sanitized test
-`.env` with a fake Telegram token and then runs the real `start-rpi5-stack.sh`.
+`.env` with a fake Telegram token and then runs the real `launchers/start-rpi5-stack.sh`.
 
 This test performs real operations for:
 
@@ -201,7 +200,6 @@ This test performs real operations for:
 - Ed25519 key generation
 - `reputation_snapshot` server startup and `/admin` readiness
 - OpenClaw CLI import and tool registry loading
-- stack stop and PID cleanup
 
 It still avoids using your Telegram bot token and does not install or pull Ollama models by default.
 Use the real Raspberry Pi for the final Telegram/Ollama check.
@@ -218,15 +216,7 @@ or:
 
 ```bash
 REALISTIC_SETUP_OLLAMA=1 DOCKER_PLATFORM=linux/arm64/v8 ./scripts/run-rpi5-realistic-docker-test.sh
-```
-
 This is much slower and still may not represent Pi thermal, memory, or accelerator behavior.
-
-## Stop
-
-```bash
-./stop-rpi5-stack.sh
-```
 
 ## Logs
 
@@ -246,16 +236,12 @@ Address already in use
 Port 5000 is in use by another program.
 ```
 
-an older `reputation_snapshot` process is still holding the local API port. Update `aka_no_claw`,
-then run the stop script once before starting again:
+an older `reputation_snapshot` process is still holding the local API port. Use
+`/restartall` or the web console restart button so the full runtime is restarted
+through one path.
 
-```bash
-./stop-rpi5-stack.sh
-./start-rpi5-stack.sh
-```
-
-The updated stop/start scripts also look for orphaned OpenClaw and `reputation_snapshot` processes
-from the same copied workspace when the PID file is missing or stale.
+If the stack is not running at all, use `./launchers/start-rpi5-stack.sh` as the
+cold-start/setup path.
 
 If `logs/openclaw_telegram.log` or `logs/openclaw.log` shows:
 
@@ -264,14 +250,9 @@ BrowserType.launch: Executable doesn't exist
 Looks like Playwright was just installed or updated.
 ```
 
-update both `aka_no_claw` and `price_monitor_bot`, then restart. The Mercari watcher now uses the
-system Chromium path prepared by `start-rpi5-stack.sh` instead of requiring Playwright to download a
+update both `aka_no_claw` and `price_monitor_bot`, then use `/restartall`. The Mercari watcher now uses the
+system Chromium path prepared by `launchers/start-rpi5-stack.sh` instead of requiring Playwright to download a
 separate bundled browser:
-
-```bash
-./stop-rpi5-stack.sh
-./start-rpi5-stack.sh
-```
 
 As a temporary workaround on an older copy, this also works but is slower and uses more disk:
 
@@ -287,12 +268,7 @@ AttributeError: 'NoneType' object has no attribute 'strip'
 
 near `build_local_vision_clients`, the Telegram process crashed while local Ollama vision fallback
 was disabled but an old `OPENCLAW_LOCAL_VISION_MODEL` value was still present. Update both
-`aka_no_claw` and `price_monitor_bot`, then restart:
-
-```bash
-./stop-rpi5-stack.sh
-./start-rpi5-stack.sh
-```
+`aka_no_claw` and `price_monitor_bot`, then use `/restartall`.
 
 The `node ... write EPIPE` message that may appear after this is usually a follow-on Playwright
 pipe error after the Python process has already crashed, not the root cause.

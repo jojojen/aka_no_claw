@@ -183,10 +183,9 @@ stage_workspace() {
     "${WORKSPACE_DIR}/reputation_snapshot/scripts" \
     "${LOG_DIR}"
 
-  cp "${SOURCE_AKA}/start-rpi5-stack.sh" "${WORKSPACE_DIR}/aka_no_claw/start-rpi5-stack.sh"
-  cp "${SOURCE_AKA}/stop-rpi5-stack.sh" "${WORKSPACE_DIR}/aka_no_claw/stop-rpi5-stack.sh"
+  cp "${SOURCE_AKA}/launchers/start-rpi5-stack.sh" "${WORKSPACE_DIR}/aka_no_claw/start-rpi5-stack.sh"
   cp "${SOURCE_AKA}/.env.example" "${WORKSPACE_DIR}/aka_no_claw/.env.example"
-  chmod +x "${WORKSPACE_DIR}/aka_no_claw/start-rpi5-stack.sh" "${WORKSPACE_DIR}/aka_no_claw/stop-rpi5-stack.sh"
+  chmod +x "${WORKSPACE_DIR}/aka_no_claw/start-rpi5-stack.sh"
 
   cat > "${WORKSPACE_DIR}/aka_no_claw/.env" <<'EOF'
 OPENCLAW_TELEGRAM_BOT_TOKEN=fake-token
@@ -230,7 +229,6 @@ run_smoke() {
 
   log "Running shell syntax checks."
   bash -n "${WORKSPACE_DIR}/aka_no_claw/start-rpi5-stack.sh"
-  bash -n "${WORKSPACE_DIR}/aka_no_claw/stop-rpi5-stack.sh"
 
   log "Running mocked Raspberry Pi 5 stack start with Ollama setup enabled."
   (
@@ -261,18 +259,11 @@ run_smoke() {
   assert_file_contains "${LOG_DIR}/ollama.log" "ollama pull gemma3:1b"
   assert_file_not_contains "${LOG_DIR}/ollama.log" "qwen2.5vl:7b"
 
-  log "Running mocked stack stop."
-  (
-    cd "${WORKSPACE_DIR}/aka_no_claw"
-    ./stop-rpi5-stack.sh
-  ) | tee "${LOG_DIR}/stop.log"
-
-  [[ ! -f "${WORKSPACE_DIR}/aka_no_claw/run/rpi5-stack.pid" ]] || fail "PID file was not removed by stop script."
-  assert_file_contains "${LOG_DIR}/stop.log" "Stopped."
+  log "Setup script smoke complete. Live restarts are covered by /restartall tests, not a stop shell."
 }
 
 main() {
-  [[ -f "${SOURCE_AKA}/start-rpi5-stack.sh" ]] || fail "Source aka_no_claw not mounted at ${SOURCE_AKA}"
+  [[ -f "${SOURCE_AKA}/launchers/start-rpi5-stack.sh" ]] || fail "Source aka_no_claw not mounted at ${SOURCE_AKA}"
   write_fake_commands
   stage_workspace
   run_smoke

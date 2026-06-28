@@ -244,7 +244,16 @@ launchers\start-telegram-bot.bat --notify-startup
 OPENCLAW_TELEGRAM_BOT_TOKEN=你的新token
 ```
 
-更新後重啟 bot：
+更新後重啟龍蝦。若本機 stack 已經在跑，請使用支援的 live restart
+路徑，不要手動 stop/start stack shell：
+
+```text
+Telegram: /restartall
+Web console: restart button
+HTTP bridge: POST http://127.0.0.1:8781/api/command/restartall
+```
+
+Windows cold-start launcher（只用於尚未啟動 bot 時）：
 
 ```powershell
 launchers\start-telegram-bot.bat --notify-startup

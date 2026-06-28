@@ -44,7 +44,7 @@ stage_workspace() {
   copy_repo "price_monitor_bot"
   copy_repo "reputation_snapshot"
 
-  chmod +x "${AKA_DIR}/start-mac-mini-stack.command" "${AKA_DIR}/stop-mac-mini-stack.command"
+  chmod +x "${AKA_DIR}/launchers/start-mac-mini-stack.command"
 
   cat > "${AKA_DIR}/.env" <<'EOF'
 MONITOR_ENV=development
@@ -89,7 +89,7 @@ run_realistic_stack() {
       CLEAN_COPIED_RUNTIME=1 \
       SETUP_OLLAMA=0 \
       START_NOTIFY=0 \
-      ./start-mac-mini-stack.command
+      ./launchers/start-mac-mini-stack.command
   ) | tee "${LOG_DIR}/start.log"
 
   [[ -x "${AKA_DIR}/.venv/bin/python" ]] || fail "aka_no_claw virtualenv was not created."
@@ -127,13 +127,7 @@ PY
 
   wait_for_openclaw_log || log "OpenClaw Telegram log did not appear before stop; fake token may have exited early."
 
-  log "Stopping realistic stack."
-  (
-    cd "${AKA_DIR}"
-    ./stop-mac-mini-stack.command
-  ) | tee "${LOG_DIR}/stop.log"
-
-  [[ ! -f "${AKA_DIR}/run/mac-mini-stack.pid" ]] || fail "PID file was not removed."
+  log "Realistic setup smoke complete. Live restarts are covered by /restartall tests."
 }
 
 main() {

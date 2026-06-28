@@ -3,7 +3,7 @@
 Status: Current
 Owner area: agent-maintenance
 
-Last reviewed: 2026-06-20
+Last reviewed: 2026-06-25
 
 ## Read This First
 
@@ -42,6 +42,9 @@ Sibling repos provide major reusable capabilities:
 - Do not document planned behavior as shipped behavior.
 - Do not treat sibling repo boundaries as incidental; they are part of the architecture.
 - Do not push runtime databases, generated tools, logs, caches, cookies, or `.env`.
+- Runtime entry points are intentionally limited: use
+  `launchers/start-mac-mini-stack.command` only for first setup / cold start,
+  and use `/restartall` or `POST /api/command/restartall` for live restart.
 
 ## Before Editing
 
@@ -61,6 +64,20 @@ python -m openclaw_adapter sns-monitor-service
 python -m openclaw_adapter opportunity-agent
 python -m openclaw_adapter reputation-agent
 ```
+
+## Restarting 龍蝦
+
+Supported live restart paths:
+
+```text
+Telegram: /restartall
+Web console: restart button
+HTTP bridge: POST http://127.0.0.1:8781/api/command/restartall
+```
+
+Do not introduce another manual restart shell. If the running system needs to
+reload code or configuration, go through `/restartall` so Telegram, command
+bridge, web frontend, and background services stay in one runtime identity.
 
 ## When Unsure
 

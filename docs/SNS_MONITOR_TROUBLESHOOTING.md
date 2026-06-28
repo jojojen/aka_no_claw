@@ -106,7 +106,9 @@ python -m openclaw_adapter sns.list-rules
 
 ### 短期（本週）
 1. 檢查 twikit 是否發布新版本
-2. 如果有新版本: `pip install --upgrade twikit && restart telegram-poll`
+2. 如果有新版本: `pip install --upgrade twikit` 後使用 `/restartall`
+   或 web console restart，讓 Telegram、command bridge、web frontend 與背景服務
+   一起用同一套 runtime 重啟。
 3. 如果沒有新版本: 啟動申請 X 開發者 API
 
 ### 長期（本月）

@@ -1,6 +1,6 @@
 # Mac mini M4 Quick Run
 
-Last reviewed: 2026-06-20
+Last reviewed: 2026-06-25
 Status: Current
 Owner area: operations
 
@@ -15,18 +15,36 @@ ai_work_space/
   reputation_snapshot/
 ```
 
-## One-Button Start
+## Supported Restart Path
+
+For an already running OpenClaw stack, use only the in-app restart path:
+
+```text
+Telegram: /restartall
+Web console: restart button
+HTTP bridge: POST http://127.0.0.1:8781/api/command/restartall
+```
+
+The supported restart path is implemented by
+`src/openclaw_adapter/service_restart.py`. It restarts Telegram, command bridge,
+web frontend, launchd-managed services, and cleanup targets from one consistent
+runtime script.
+
+## Cold Start / Bootstrap
+
+Use this only when the stack is not running, after a reboot, or while preparing
+the machine.
 
 On the Mac, double-click:
 
 ```text
-aka_no_claw/start-mac-mini-stack.command
+aka_no_claw/launchers/start-mac-mini-stack.command
 ```
 
 The first run may ask macOS Terminal for permission to run the script. If Finder says the file is not executable, run this once from Terminal:
 
 ```bash
-chmod +x start-mac-mini-stack.command stop-mac-mini-stack.command
+chmod +x launchers/start-mac-mini-stack.command
 ```
 
 The startup script will:
@@ -44,12 +62,6 @@ The startup script will:
 - start `reputation_snapshot`
 - start OpenClaw Telegram polling with the reputation agent enabled and dashboard disabled
 
-To stop everything, double-click:
-
-```text
-aka_no_claw/stop-mac-mini-stack.command
-```
-
 Logs are written to:
 
 ```text
@@ -62,19 +74,19 @@ aka_no_claw/logs/openclaw_telegram.log
 You can prefill required Telegram values from Terminal:
 
 ```bash
-OPENCLAW_TELEGRAM_BOT_TOKEN='...' OPENCLAW_TELEGRAM_CHAT_ID='...' ./start-mac-mini-stack.command
+OPENCLAW_TELEGRAM_BOT_TOKEN='...' OPENCLAW_TELEGRAM_CHAT_ID='...' ./launchers/start-mac-mini-stack.command
 ```
 
 To send a Telegram startup notification:
 
 ```bash
-START_NOTIFY=1 ./start-mac-mini-stack.command
+START_NOTIFY=1 ./launchers/start-mac-mini-stack.command
 ```
 
 To skip Homebrew package setup after you have prepared dependencies yourself:
 
 ```bash
-AUTO_INSTALL_SYSTEM_DEPS=0 ./start-mac-mini-stack.command
+AUTO_INSTALL_SYSTEM_DEPS=0 ./launchers/start-mac-mini-stack.command
 ```
 
 The reputation snapshot service defaults to port `5000`. If that port is already
@@ -82,13 +94,13 @@ in use on macOS, the launcher automatically falls back to a nearby local port
 such as `5055`. To force a specific port:
 
 ```bash
-REPUTATION_PORT=5055 ./start-mac-mini-stack.command
+REPUTATION_PORT=5055 ./launchers/start-mac-mini-stack.command
 ```
 
 To require Apple Silicon:
 
 ```bash
-MAC_REQUIRE_APPLE_SILICON=1 ./start-mac-mini-stack.command
+MAC_REQUIRE_APPLE_SILICON=1 ./launchers/start-mac-mini-stack.command
 ```
 
 ## Optional Ollama
@@ -105,13 +117,13 @@ OPENCLAW_LOCAL_TEXT_TIMEOUT_SECONDS=75
 To install/start Ollama and pull the text model:
 
 ```bash
-SETUP_OLLAMA=1 ./start-mac-mini-stack.command
+SETUP_OLLAMA=1 ./launchers/start-mac-mini-stack.command
 ```
 
 Vision models are still opt-in:
 
 ```bash
-SETUP_OLLAMA=1 SETUP_OLLAMA_VISION=1 ./start-mac-mini-stack.command
+SETUP_OLLAMA=1 SETUP_OLLAMA_VISION=1 ./launchers/start-mac-mini-stack.command
 ```
 
 The 16GB vision preset is:

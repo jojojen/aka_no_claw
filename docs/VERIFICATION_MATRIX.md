@@ -3,7 +3,7 @@
 Status: Current
 Owner area: verification
 
-Last reviewed: 2026-06-20
+Last reviewed: 2026-06-25
 
 ## Verification By Change Type
 
@@ -22,8 +22,8 @@ Last reviewed: 2026-06-20
 | Reputation snapshot adapter | Reputation adapter tests | Local `reputation-agent` plus `/snapshot` smoke with non-sensitive URL |
 | Opportunity agent | Opportunity pipeline/store/scoring tests | Local agent tick with test DB or controlled candidate |
 | Dashboard | Dashboard unit tests if available | `serve-dashboard` local browser smoke |
-| DB schema or runtime path | Init/migration tests for all readers/writers | Service restart smoke and log check |
-| Launchd/service wiring | Targeted service tests and path-resolution tests | `launchctl kickstart` plus log inspection on this machine |
+| DB schema or runtime path | Init/migration tests for all readers/writers | `/restartall` or `POST /api/command/restartall` smoke and log check |
+| Launchd/service wiring | Targeted service tests and path-resolution tests | `/restartall` smoke plus log inspection on this machine; run the device setup script only for first-setup/cold-start verification |
 
 ## Reporting Verification
 

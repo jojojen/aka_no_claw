@@ -3,7 +3,7 @@
 Status: Current
 Owner area: agent-maintenance
 
-Last reviewed: 2026-06-20
+Last reviewed: 2026-06-25
 
 ## Status Legend
 
@@ -33,7 +33,7 @@ Last reviewed: 2026-06-20
 | Dashboard | `beta` | `python -m openclaw_adapter serve-dashboard --open-browser` | Read-only current state from local stores | Local UI for boards and status. |
 | Knowledge / RAG | `beta` | `/know`, daily digest, research writes | `knowledge.sqlite3`, `knowledge_inbox.sqlite3` | Must store grounded facts, not formulas or transient product pages as “knowledge” without meaningful normalization. |
 | Quiz / teaching loop | `partial` | `/quiz`, docs under quiz files | `quiz.sqlite3` | Active but not the core OpenClaw market pipeline. |
-| Backup / launchd services | `beta` | launchd labels, backup commands | runtime DBs and configured backup target | Path handling was hardened for launchd cwd differences. |
+| Backup / launchd services | `beta` | `/restartall`, `POST /api/command/restartall`, launchd labels, backup commands | runtime DBs and configured backup target | Running stack restarts go through `/restartall`. `launchers/start-mac-mini-stack.command` is only first setup / cold start. |
 
 ## Known Drift / Mismatch
 

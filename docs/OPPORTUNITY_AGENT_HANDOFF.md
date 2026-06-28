@@ -49,7 +49,8 @@ Completed on 2026-05-13:
 - Full `aka_no_claw` tests: `191 passed, 7 skipped`
 - Price monitor focused tests after natural-language fallback fix: `28 passed`
 - CLI smoke: `opportunity-agent --once` exits cleanly with an empty SNS database.
-- Shell syntax: `start-mac-mini-stack.command` and `stop-mac-mini-stack.command` pass `bash -n`.
+- Shell syntax: `launchers/start-mac-mini-stack.command` passes `bash -n`;
+  live restart is covered by `tests/test_service_restart.py`.
 - Live launchctl smoke: `local.openclaw.opportunity` starts and remains running.
 - First live tick: read SNS data, extracted 4 candidates, rejected all before notification because no reliable fair value was found.
 - Visibility check: `opportunity-status --limit 4` shows the current 4 monitored candidates.

@@ -46,7 +46,7 @@ stage_workspace() {
   copy_repo "price_monitor_bot"
   copy_repo "reputation_snapshot"
 
-  chmod +x "${AKA_DIR}/start-rpi5-stack.sh" "${AKA_DIR}/stop-rpi5-stack.sh"
+  chmod +x "${AKA_DIR}/launchers/start-rpi5-stack.sh"
 
   cat > "${AKA_DIR}/.env" <<'EOF'
 MONITOR_ENV=development
@@ -92,7 +92,7 @@ run_realistic_stack() {
       SETUP_OLLAMA_VISION="${REALISTIC_SETUP_OLLAMA_VISION}" \
       START_NOTIFY=0 \
       RPI5_REQUIRE_PI=0 \
-      ./start-rpi5-stack.sh
+      ./launchers/start-rpi5-stack.sh
   ) | tee "${LOG_DIR}/start.log"
 
   [[ -x "${AKA_DIR}/.venv/bin/python" ]] || fail "aka_no_claw virtualenv was not created."
@@ -130,13 +130,7 @@ PY
 
   wait_for_openclaw_log || log "OpenClaw Telegram log did not appear before stop; fake token may have exited early."
 
-  log "Stopping realistic stack."
-  (
-    cd "${AKA_DIR}"
-    ./stop-rpi5-stack.sh
-  ) | tee "${LOG_DIR}/stop.log"
-
-  [[ ! -f "${AKA_DIR}/run/rpi5-stack.pid" ]] || fail "PID file was not removed."
+  log "Realistic setup smoke complete. Live restarts are covered by /restartall tests."
 }
 
 main() {

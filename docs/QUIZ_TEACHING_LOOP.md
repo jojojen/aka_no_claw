@@ -217,6 +217,7 @@ db.delete_question("<question_id>")
 
 1. 累積 ≥20 題合格單語題後，回報 user 做最終確認。
 2. 兩個 repo 跑 `.venv/bin/python -m pytest -q` 全綠。
-3. 重啟龍蝦：`launchctl kickstart -k gui/$(id -u)/local.openclaw.telegram`，
-   並用 `lsof -nP -p <pid> | grep ESTABLISHED` 確認連到 149.154.x.x:443。
+3. 重啟龍蝦：使用 Telegram `/restartall` 或 web console 的 restart 按鈕。
+   避免直接 `launchctl kickstart` 單獨重啟 Telegram，因為那不會同步重啟
+   command bridge / web frontend 等同一組 runtime。
 4. 推送前先依 SKILL.md §A 摘要、等 user 說「推」。
