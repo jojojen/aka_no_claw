@@ -52,6 +52,13 @@ _OLLAMA_MAX_RETRIES = 3       # transient-error retries in generate()
 _OLLAMA_RETRY_BASE_SEC = 1.0  # first backoff; doubles each attempt (1, 2, 4 s)
 _OPENCODE_MAX_RETRIES = 3
 _OPENCODE_RETRY_BASE_SEC = 1.0
+# zen blocks the default Python-urllib UA with Cloudflare 1010
+# (browser_signature_banned). A browser UA passes. See
+# docs/NEW_OPENCODE_DECOUPLING_PLAN.md §Phase 0.
+_OPENCODE_BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
 
 class CloudBackendUnavailable(RuntimeError):
@@ -389,20 +396,30 @@ class OpenCodeTextClient:
                 pass
 
     def _url(self) -> str:
-        if self.base_url.endswith("/completions"):
+        # zen only serves /chat/completions (chat format); the legacy text
+        # /completions endpoint 404s. See NEW_OPENCODE_DECOUPLING_PLAN.md §Phase 0.
+        if self.base_url.endswith("/chat/completions"):
             return self.base_url
-        return f"{self.base_url}/completions"
+        if self.base_url.endswith("/completions"):
+            return self.base_url[: -len("/completions")] + "/chat/completions"
+        return f"{self.base_url}/chat/completions"
 
     def generate(self, prompt: str, *, temperature: float = 0.0, think: bool = False) -> str:
         payload: dict[str, object] = {
             "model": self.model,
-            "prompt": prompt,
+            "messages": [{"role": "user", "content": prompt}],
             "temperature": temperature,
             "stream": False,
         }
         if self.num_predict is not None:
-            payload["max_tokens"] = self.num_predict
-        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+            # Big Pickle (DeepSeek V4) is a CoT model: reasoning_content eats the
+            # budget first, so <4096 starves `content` to empty. Keep a floor.
+            payload["max_tokens"] = max(4096, int(self.num_predict))
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": _OPENCODE_BROWSER_UA,
+        }
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         request = Request(
@@ -555,6 +572,94 @@ class OpenCodeCliTextClient:
                 continue
             lines.append(line)
         return _THINK_RE.sub("", "\n".join(lines)).strip()
+
+
+_MISTRAL_API_BASE = "https://api.mistral.ai/v1"
+_MISTRAL_DEFAULT_MODEL = "mistral-large-latest"
+
+
+class MistralTextClient:
+    """Mistral cloud chat client (api.mistral.ai/v1/chat/completions)."""
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str = _MISTRAL_DEFAULT_MODEL,
+        timeout_seconds: int = 120,
+    ) -> None:
+        self.api_key = api_key
+        self.model = model
+        self.timeout_seconds = max(1, timeout_seconds)
+        self.num_ctx: int | None = None
+        self.num_predict: int | None = None
+        self._cancel = threading.Event()
+        self._abort_lock = threading.Lock()
+        self._response: object | None = None
+
+    def abort(self) -> None:
+        self._cancel.set()
+        with self._abort_lock:
+            resp = self._response
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def generate(self, prompt: str, *, temperature: float = 0.7, think: bool = False) -> str:
+        payload: dict[str, object] = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": temperature,
+            "stream": False,
+        }
+        if self.num_predict is not None:
+            payload["max_tokens"] = int(self.num_predict)
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+        url = f"{_MISTRAL_API_BASE}/chat/completions"
+        request = Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        if self._cancel.is_set():
+            raise RuntimeError("Mistral request aborted by caller")
+        try:
+            response = urlopen(request, timeout=self.timeout_seconds)
+            with self._abort_lock:
+                self._response = response
+            try:
+                body = response.read().decode("utf-8", errors="replace")
+            finally:
+                with self._abort_lock:
+                    self._response = None
+                response.close()
+        except HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")[:400]
+            except Exception:
+                detail = ""
+            raise RuntimeError(f"Mistral HTTP {exc.code}: {detail}") from exc
+        except URLError as exc:
+            raise RuntimeError(f"Mistral request failed: {exc.reason}") from exc
+        if self._cancel.is_set():
+            raise RuntimeError("Mistral request aborted by caller")
+        parsed = json.loads(body)
+        choices = parsed.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise RuntimeError("Mistral response missing choices")
+        first = choices[0]
+        text = (first.get("message") or {}).get("content") or ""
+        if not isinstance(text, str):
+            raise RuntimeError(f"Mistral response text type was {type(text).__name__}")
+        return _THINK_RE.sub("", text).strip()
 
 
 class DynamicToolRunner:
@@ -2315,17 +2420,31 @@ def build_dynamic_tool_runner_from_settings(settings) -> DynamicToolRunner | Non
     if codegen_backend == "opencode":
         model = (getattr(settings, "openclaw_opencode_model", "big-pickle") or "big-pickle").strip()
         timeout = max(60, int(getattr(settings, "openclaw_opencode_timeout_seconds", 900)))
+        base_url = (getattr(settings, "openclaw_opencode_base_url", None)
+                    or "https://opencode.ai/zen/v1").strip()
+        # zen wants the bare model name (e.g. "big-pickle"); the CLI wants "opencode/big-pickle".
+        http_model = model.split("/")[-1]
+        # Cloud generates; idle local model independently cross-validates.
+        validator_client, validator_model = _build_local_validator(settings)
+        # Prefer direct HTTP: no `opencode run` subprocess means no AGENTS.md/CLAUDE.md
+        # context pollution (issue #59) and full control over the request. The CLI is
+        # kept only as a fallback for when the HTTP endpoint is unreachable.
+        if probe_opencode(base_url, model=http_model, timeout=10.0):
+            client = OpenCodeTextClient(base_url=base_url, model=http_model, timeout_seconds=timeout)
+            logger.info("dynamic_tools: using OpenCode direct-HTTP codegen backend model=%s", http_model)
+            return _build_runner_with_client(
+                settings, client, fast_model=http_model, strong_model=http_model,
+                validator_client=validator_client, validator_model=validator_model,
+                cloud_failover_restart=True)
         cli_model = _opencode_cli_model(model)
         if probe_opencode_cli(model=cli_model, timeout=min(timeout, 30)):
             client = OpenCodeCliTextClient(model=cli_model, timeout_seconds=timeout)
-            logger.info("dynamic_tools: using OpenCode CLI codegen backend model=%s", cli_model)
-            # Cloud generates; idle local model independently cross-validates.
-            validator_client, validator_model = _build_local_validator(settings)
+            logger.info("dynamic_tools: OpenCode HTTP unavailable; using CLI fallback model=%s", cli_model)
             return _build_runner_with_client(
                 settings, client, fast_model=cli_model, strong_model=cli_model,
                 validator_client=validator_client, validator_model=validator_model,
                 cloud_failover_restart=True)
-        logger.warning("dynamic_tools: OpenCode CLI unavailable; falling back to Ollama if configured")
+        logger.warning("dynamic_tools: OpenCode HTTP+CLI both unavailable; falling back to Ollama if configured")
     elif codegen_backend and codegen_backend != "ollama":
         logger.warning("dynamic_tools: unsupported codegen backend=%s; falling back to Ollama", codegen_backend)
 

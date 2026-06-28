@@ -37,7 +37,8 @@ SUBMODE_SELLER_REPUTATION_SNAPSHOT = "seller_reputation_snapshot"
 # --- Chat backends --------------------------------------------------------
 CHAT_BACKEND_LOCAL = "local"
 CHAT_BACKEND_CLOUD_PICKLE = "cloud_pickle"
-_CHAT_BACKENDS = {CHAT_BACKEND_LOCAL, CHAT_BACKEND_CLOUD_PICKLE}
+CHAT_BACKEND_CLOUD_MISTRAL = "cloud_mistral"
+_CHAT_BACKENDS = {CHAT_BACKEND_LOCAL, CHAT_BACKEND_CLOUD_PICKLE, CHAT_BACKEND_CLOUD_MISTRAL}
 
 # --- Response statuses ----------------------------------------------------
 STATUS_OK = "ok"

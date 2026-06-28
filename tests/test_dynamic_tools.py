@@ -1146,14 +1146,14 @@ def test_ollama_generate_does_not_retry_on_4xx() -> None:
     assert call_count[0] == 1  # no retry on 4xx
 
 
-def test_opencode_generate_posts_openai_completion_payload() -> None:
+def test_opencode_generate_posts_openai_chat_payload() -> None:
     import unittest.mock as mock
 
     captured = {}
 
     class _FakeResp:
         def read(self):
-            return b'{"choices": [{"text": "  hello\\n"}]}'
+            return b'{"choices": [{"message": {"content": "  hello\\n"}}]}'
 
         def close(self):
             pass
@@ -1182,16 +1182,22 @@ def test_opencode_generate_posts_openai_completion_payload() -> None:
         out = client.generate("write code", temperature=0.2)
 
     assert out == "hello"
-    assert captured["url"] == "https://opencode.ai/zen/v1/completions"
+    # zen only serves /chat/completions; the client targets it regardless of base_url suffix.
+    assert captured["url"] == "https://opencode.ai/zen/v1/chat/completions"
     assert captured["timeout"] == 123
     assert captured["payload"] == {
         "model": "big-pickle",
-        "prompt": "write code",
+        "messages": [{"role": "user", "content": "write code"}],
         "temperature": 0.2,
         "stream": False,
-        "max_tokens": 99,
+        # CoT models need a >=4096 floor or `content` starves; 99 is raised to 4096.
+        "max_tokens": 4096,
     }
     assert captured["headers"]["Authorization"] == "Bearer secret"
+    # Browser UA is mandatory: zen blocks the default Python-urllib UA with CF 1010.
+    # Header keys are capitalized by urllib (User-agent).
+    ua = captured["headers"].get("User-agent") or captured["headers"].get("User-Agent")
+    assert ua and "Mozilla/5.0" in ua
 
 
 def test_opencode_cli_generate_strips_banner_and_ansi(tmp_path) -> None:
@@ -1275,7 +1281,7 @@ def test_opencode_cli_abort_kills_running_subprocess(tmp_path) -> None:
     assert "aborted" in result.get("err", "")
 
 
-def test_builder_uses_opencode_cli_when_codegen_backend_enabled(tmp_path) -> None:
+def test_builder_prefers_opencode_http_when_codegen_backend_enabled(tmp_path) -> None:
     import unittest.mock as mock
 
     settings = SimpleNamespace(
@@ -1291,37 +1297,43 @@ def test_builder_uses_opencode_cli_when_codegen_backend_enabled(tmp_path) -> Non
         openclaw_codegen_fast_model=None,
         knowledge_db_path=str(tmp_path / "knowledge.sqlite3"),
     )
-    with mock.patch("openclaw_adapter.dynamic_tools.probe_opencode_cli", return_value=True):
+    # HTTP probe succeeds → direct-HTTP client; CLI must not even be probed.
+    with mock.patch("openclaw_adapter.dynamic_tools.probe_opencode", return_value=True), \
+         mock.patch("openclaw_adapter.dynamic_tools.probe_opencode_cli") as cli_probe:
+        runner = build_dynamic_tool_runner_from_settings(settings)
+
+    assert isinstance(runner.client, OpenCodeTextClient)
+    cli_probe.assert_not_called()
+    assert runner.fast_model == "big-pickle"
+    assert runner.strong_model == "big-pickle"
+    assert runner.client.timeout_seconds == 321
+
+
+def test_builder_falls_back_to_opencode_cli_when_http_blocked(tmp_path) -> None:
+    import unittest.mock as mock
+
+    settings = SimpleNamespace(
+        openclaw_codegen_backend="opencode",
+        openclaw_opencode_base_url="https://opencode.ai/zen/v1",
+        openclaw_opencode_model="big-pickle",
+        openclaw_opencode_api_key=None,
+        openclaw_opencode_timeout_seconds=321,
+        openclaw_local_text_backend=None,
+        openclaw_local_text_model=None,
+        openclaw_local_text_endpoint="http://127.0.0.1:11434",
+        openclaw_local_text_timeout_seconds=45,
+        openclaw_codegen_fast_model=None,
+        knowledge_db_path=str(tmp_path / "knowledge.sqlite3"),
+    )
+    # HTTP probe fails (e.g. CF block) → CLI fallback.
+    with mock.patch("openclaw_adapter.dynamic_tools.probe_opencode", return_value=False), \
+         mock.patch("openclaw_adapter.dynamic_tools.probe_opencode_cli", return_value=True):
         runner = build_dynamic_tool_runner_from_settings(settings)
 
     assert isinstance(runner.client, OpenCodeCliTextClient)
     assert runner.fast_model == "opencode/big-pickle"
     assert runner.strong_model == "opencode/big-pickle"
     assert runner.client.timeout_seconds == 321
-
-
-def test_builder_does_not_probe_opencode_http_when_codegen_backend_enabled(tmp_path) -> None:
-    import unittest.mock as mock
-
-    settings = SimpleNamespace(
-        openclaw_codegen_backend="opencode",
-        openclaw_opencode_base_url="https://opencode.ai/zen/v1",
-        openclaw_opencode_model="big-pickle",
-        openclaw_opencode_api_key=None,
-        openclaw_opencode_timeout_seconds=321,
-        openclaw_local_text_backend=None,
-        openclaw_local_text_model=None,
-        openclaw_local_text_endpoint="http://127.0.0.1:11434",
-        openclaw_local_text_timeout_seconds=45,
-        openclaw_codegen_fast_model=None,
-        knowledge_db_path=str(tmp_path / "knowledge.sqlite3"),
-    )
-    with mock.patch("openclaw_adapter.dynamic_tools.probe_opencode") as http_probe, \
-         mock.patch("openclaw_adapter.dynamic_tools.probe_opencode_cli", return_value=True):
-        runner = build_dynamic_tool_runner_from_settings(settings)
-
-    http_probe.assert_not_called()
-    assert isinstance(runner.client, OpenCodeCliTextClient)
 
 
 def test_builder_falls_back_to_ollama_when_opencode_probe_fails(tmp_path) -> None:
@@ -1340,7 +1352,9 @@ def test_builder_falls_back_to_ollama_when_opencode_probe_fails(tmp_path) -> Non
         openclaw_codegen_fast_model="qwen2.5-coder:7b",
         knowledge_db_path=str(tmp_path / "knowledge.sqlite3"),
     )
-    with mock.patch("openclaw_adapter.dynamic_tools.probe_opencode_cli", return_value=False), \
+    # Both HTTP and CLI unavailable → Ollama.
+    with mock.patch("openclaw_adapter.dynamic_tools.probe_opencode", return_value=False), \
+         mock.patch("openclaw_adapter.dynamic_tools.probe_opencode_cli", return_value=False), \
          mock.patch("openclaw_adapter.dynamic_tools.probe_ollama", return_value=True):
         runner = build_dynamic_tool_runner_from_settings(settings)
 
@@ -1490,11 +1504,11 @@ def test_builder_enables_cross_validation_for_opencode(tmp_path):
         openclaw_codegen_fast_model=None,
         knowledge_db_path=str(tmp_path / "knowledge.sqlite3"),
     )
-    with mock.patch("openclaw_adapter.dynamic_tools.probe_opencode_cli", return_value=True), \
+    with mock.patch("openclaw_adapter.dynamic_tools.probe_opencode", return_value=True), \
          mock.patch("openclaw_adapter.dynamic_tools.probe_ollama", return_value=True):
         runner = build_dynamic_tool_runner_from_settings(settings)
 
-    assert isinstance(runner.client, OpenCodeCliTextClient)
+    assert isinstance(runner.client, OpenCodeTextClient)
     assert isinstance(runner.validator_client, OllamaTextClient)
     assert runner.validator_model == "qwen3:14b"
     assert "驗證" in runner.backend_label

@@ -39,6 +39,8 @@ class AssistantSettings:
     openclaw_opencode_model: str = "big-pickle"
     openclaw_opencode_api_key: str | None = None
     openclaw_opencode_timeout_seconds: int = 900
+    openclaw_mistral_api_key: str | None = None
+    openclaw_mistral_model: str = "mistral-large-latest"
     # /research appreciation enrichment backend, decoupled from /new's codegen
     # backend above. "opencode" routes the appreciation summariser to cloud
     # big-pickle (with single in-process local fallback); empty keeps it local.
@@ -246,6 +248,10 @@ def get_settings() -> AssistantSettings:
             os.getenv("OPENCLAW_OPENCODE_TIMEOUT_SECONDS"),
             default=900,
         ),
+        openclaw_mistral_api_key=_none_if_empty(
+            _getenv_any("MISTRAL_API_KEY", "MISTRAL_KEY")
+        ),
+        openclaw_mistral_model=os.getenv("OPENCLAW_MISTRAL_MODEL", "mistral-large-latest"),
         openclaw_research_cloud_enricher=_none_if_empty(
             os.getenv("OPENCLAW_RESEARCH_CLOUD_ENRICHER")
         ),

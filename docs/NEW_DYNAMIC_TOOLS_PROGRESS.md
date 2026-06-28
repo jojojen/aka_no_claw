@@ -8,6 +8,8 @@ Owner area: dynamic-tools
 > 目標：Telegram `/new <需求>` → 本地 qwen3:14b 自己寫 Python 工具 → 護欄下執行 →
 > 回答案，並把工具存進 gitignored `generated_tools/`（含 manifest）供重用。全程地端、零 API 費用。
 > 完整設計見 plan：`/Users/jen/.claude/plans/3-ollama-modular-trinket.md`。
+> 進行中遷移計畫（Planned）：把 `/new` + Chat 雲端模型脫離 OpenCode CLI、改走直接 HTTP，
+> 並加 Mistral 切換 → 見 companion [NEW_OPENCODE_DECOUPLING_PLAN.md](NEW_OPENCODE_DECOUPLING_PLAN.md)。
 >
 > 2026-06 update：預設仍維持全地端 Ollama。若需要更穩定 codegen，可設定
 > `OPENCLAW_CODEGEN_BACKEND=opencode` 讓 `/new` 的文字生成/修復/驗證走 OpenCode Big Pickle

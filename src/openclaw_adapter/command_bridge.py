@@ -33,6 +33,7 @@ from .job_store import JobStore
 from .session_memory import SessionMemoryStore, SessionWriteError, empty_session
 from .service_restart import RESTART_MESSAGE, trigger_restart_all
 from .command_bridge_models import (
+    CHAT_BACKEND_CLOUD_MISTRAL,
     CHAT_BACKEND_CLOUD_PICKLE,
     CHAT_BACKEND_LOCAL,
     CHAT_TOOL_SEARCH,
@@ -490,6 +491,15 @@ class CommandBridge:
                     mode=MODE_CHAT,
                 )
             message = client.generate(prompt, temperature=0.7)
+        elif req.chat_backend == CHAT_BACKEND_CLOUD_MISTRAL:
+            client = self._build_mistral_chat_client()
+            if client is None:
+                return WebCommandResponse(
+                    status=STATUS_ERROR,
+                    message="Mistral 後端目前無法使用（未設定 MISTRAL_API_KEY）。",
+                    mode=MODE_CHAT,
+                )
+            message = client.generate(prompt, temperature=0.7)
         else:
             message = self._ollama_generate_blocking(prompt)
         return WebCommandResponse(status=STATUS_OK, message=message, mode=MODE_CHAT)
@@ -520,6 +530,8 @@ class CommandBridge:
         prompt = build_chat_prompt(req.input, req.history)
         if req.chat_backend == CHAT_BACKEND_CLOUD_PICKLE:
             yield from self._stream_cloud_chat(prompt)
+        elif req.chat_backend == CHAT_BACKEND_CLOUD_MISTRAL:
+            yield from self._stream_mistral_chat(prompt)
         else:
             yield from self._stream_ollama_chat(prompt)
 
@@ -900,6 +912,14 @@ class CommandBridge:
             text = client.generate(prompt, temperature=0.3)
             model = (self.settings.openclaw_opencode_model or "big-pickle").strip()
             return text, f"雲端 {model}"
+        if chat_backend == CHAT_BACKEND_CLOUD_MISTRAL:
+            client = self._build_mistral_chat_client()
+            if client is None:
+                text = self._ollama_generate_blocking(prompt)
+                return text, f"本地 {self._local_model()}（Mistral 不可用，已改用本地）"
+            text = client.generate(prompt, temperature=0.3)
+            model = getattr(self.settings, "openclaw_mistral_model", "mistral-nemo-latest")
+            return text, f"Mistral {model}"
         text = self._ollama_generate_blocking(prompt)
         return text, f"本地 {self._local_model()}"
 
@@ -1365,19 +1385,20 @@ class CommandBridge:
         return client.generate(prompt, temperature=0.7)
 
     def _build_cloud_chat_client(self):
-        """Big-pickle chat client: direct HTTP when an API key is configured,
-        else the opencode CLI, else None when neither is usable."""
+        """Big-pickle chat client via direct HTTP (zen/v1). CLI is fallback only."""
         from .dynamic_tools import (
             OpenCodeCliTextClient,
             OpenCodeTextClient,
+            probe_opencode,
             probe_opencode_cli,
         )
 
+        base_url = self.settings.openclaw_opencode_base_url
         raw_model = (self.settings.openclaw_opencode_model or "big-pickle").strip()
-        if self.settings.openclaw_opencode_api_key:
-            model = raw_model.split("/")[-1] if "/" in raw_model else raw_model
+        model = raw_model.split("/")[-1] if "/" in raw_model else raw_model
+        if probe_opencode(base_url, model=model, timeout=10.0):
             return OpenCodeTextClient(
-                base_url=self.settings.openclaw_opencode_base_url,
+                base_url=base_url,
                 model=model,
                 api_key=self.settings.openclaw_opencode_api_key,
                 timeout_seconds=180,
@@ -1386,6 +1407,50 @@ class CommandBridge:
         if probe_opencode_cli(model=cli_model, timeout=20.0):
             return OpenCodeCliTextClient(model=cli_model, timeout_seconds=180)
         return None
+
+    def _build_mistral_chat_client(self):
+        """Mistral cloud chat client; returns None when MISTRAL_API_KEY not set."""
+        from .dynamic_tools import MistralTextClient
+
+        key = getattr(self.settings, "openclaw_mistral_api_key", None)
+        if not key:
+            return None
+        model = getattr(self.settings, "openclaw_mistral_model", "mistral-nemo-latest")
+        return MistralTextClient(api_key=key, model=model, timeout_seconds=180)
+
+    def _stream_mistral_chat(self, prompt: str) -> "Iterator[dict]":
+        client = self._build_mistral_chat_client()
+        if client is None:
+            yield stream_error("Mistral 後端目前無法使用（未設定 MISTRAL_API_KEY）。")
+            return
+        result: dict[str, object] = {}
+        done = threading.Event()
+
+        def _worker() -> None:
+            try:
+                result["text"] = client.generate(prompt, temperature=0.7)
+            except Exception as exc:  # noqa: BLE001
+                result["error"] = str(exc)
+            finally:
+                done.set()
+
+        worker = threading.Thread(target=_worker, daemon=True)
+        worker.start()
+        try:
+            while not done.wait(timeout=_HEARTBEAT_SECONDS):
+                yield stream_heartbeat()
+        except GeneratorExit:
+            abort = getattr(client, "abort", None)
+            if callable(abort):
+                abort()
+            raise
+        if "error" in result:
+            yield stream_error(f"Mistral 後端失敗：{result['error']}")
+            return
+        text = str(result.get("text") or "").strip()
+        if text:
+            yield stream_delta(text)
+        yield stream_done(text)
 
     def _local_model(self) -> str:
         return (self.settings.openclaw_local_text_model or "qwen3:14b").split(",")[0].strip()

@@ -41,6 +41,7 @@ for which question each one answers.
 | `RESEARCH_COMMAND_PLAN.md` | Current | research | Keep; living `/research` status. |
 | `NEW_DYNAMIC_TOOLS_PROGRESS.md` | Current | dynamic-tools | Keep; canonical `/new` doc. |
 | `NEW_E2E_DISCRIMINATING_TESTS.md` | Current | dynamic-tools | Keep; cross-link from dynamic-tools canonical. |
+| `NEW_OPENCODE_DECOUPLING_PLAN.md` | Planned | dynamic-tools | Keep until shipped; then fold into canonical and archive. Cross-linked from canonical. |
 | `OPPORTUNITY_AGENT_SPEC.md` | Needs review | opportunity | Verify thresholds vs code; canonical Opportunity doc. |
 | `OPPORTUNITY_AGENT_HANDOFF.md` | Needs review | opportunity | Keep as operational companion; cross-link to spec. |
 | `KB_EMBEDDING_PLAN.md` | Needs review | knowledge | Re-verify embedding/RAG status. |

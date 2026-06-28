@@ -34,6 +34,7 @@ Full inventory with recommended actions is in [DOC_AUDIT.md](DOC_AUDIT.md).
 | [RESEARCH_COMMAND_PLAN.md](RESEARCH_COMMAND_PLAN.md) | Current | research | `/research` implementation status, offload, and stage parallelization. |
 | [NEW_DYNAMIC_TOOLS_PROGRESS.md](NEW_DYNAMIC_TOOLS_PROGRESS.md) | Current (canonical: dynamic-tools) | dynamic-tools | `/new` implementation notes and benchmark history. |
 | [NEW_E2E_DISCRIMINATING_TESTS.md](NEW_E2E_DISCRIMINATING_TESTS.md) | Current | dynamic-tools | Companion: discriminating tests for generated tools. |
+| [NEW_OPENCODE_DECOUPLING_PLAN.md](NEW_OPENCODE_DECOUPLING_PLAN.md) | Planned | dynamic-tools | Companion: plan to move `/new` + Chat off OpenCode CLI to direct HTTP; add Mistral switch (issues #51/#59). |
 | [KB_EMBEDDING_PLAN.md](KB_EMBEDDING_PLAN.md) | Needs review | knowledge | Embedding/RAG plan and status may need fresh verification. |
 | [OPENCLAW_TCG_MONITOR_PLAN.md](OPENCLAW_TCG_MONITOR_PLAN.md) | Needs review | price/tcg | Original monitor plan; verify against current code before relying on it. |
 | [OPPORTUNITY_AGENT_SPEC.md](OPPORTUNITY_AGENT_SPEC.md) | Needs review (canonical: opportunity) | opportunity | Spec for recommendation pipeline; verify thresholds against code. |
