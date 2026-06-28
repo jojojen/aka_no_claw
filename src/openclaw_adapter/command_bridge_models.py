@@ -400,3 +400,72 @@ def _opt_str(value: object) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+# --- Chat tool typed envelope (issue #46) --------------------------------
+# A small typed layer between CommandBridge and individual tool executors so
+# each tool does not reimplment its own validation, budget enforcement, banner
+# formatting, trace logging, or error semantics.
+
+@dataclass(frozen=True, slots=True)
+class ChatToolPolicy:
+    """Static per-tool limits and display metadata.
+
+    All char limits apply *after* whitespace normalisation.  Enforcement
+    happens in ChatToolRequest construction so the executor never receives an
+    oversized input.
+    """
+    display_name: str
+    max_query_chars: int = 256
+    max_source_field_chars: int = 500
+    max_source_pack_chars: int = 4000
+
+
+@dataclass(frozen=True, slots=True)
+class ChatToolRequest:
+    """Validated, budget-enforced input for a single chat tool call.
+
+    Built by :func:`make_chat_tool_request` which applies the policy before
+    handing control to the executor.
+    """
+    tool: str
+    query: str          # sanitized, length-capped by policy.max_query_chars
+    user_question: str  # original user text (for synthesis prompts)
+    policy: ChatToolPolicy
+
+
+@dataclass(frozen=True, slots=True)
+class ChatToolResult:
+    """Typed return value from a chat tool executor.
+
+    The ``answer`` field is the user-visible text (may include a source block).
+    ``source_count`` and ``result_summary`` are used for trace logging only —
+    they never contain private chain-of-thought or raw external content.
+    """
+    answer: str
+    source_count: int = 0
+    result_summary: str = ""
+
+
+def make_chat_tool_request(
+    tool: str,
+    raw_query: str,
+    user_question: str,
+    policy: ChatToolPolicy,
+) -> ChatToolRequest:
+    """Validate and budget-enforce a raw router query into a ChatToolRequest.
+
+    Applies the same control-char stripping and whitespace collapsing as
+    :func:`_normalize_router_query`, then enforces ``policy.max_query_chars``.
+    Raises ``ValueError`` when the cleaned query is empty after normalisation.
+    """
+    cleaned = _CONTROL_CHARS_RE.sub(" ", raw_query or "")
+    cleaned = " ".join(cleaned.split())[: policy.max_query_chars].strip()
+    if not cleaned:
+        raise ValueError(f"chat tool {tool!r}: query is empty after normalisation")
+    return ChatToolRequest(
+        tool=tool,
+        query=cleaned,
+        user_question=(user_question or "").strip(),
+        policy=policy,
+    )

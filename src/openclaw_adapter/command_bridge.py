@@ -36,6 +36,9 @@ from .command_bridge_models import (
     CHAT_BACKEND_CLOUD_PICKLE,
     CHAT_BACKEND_LOCAL,
     CHAT_TOOL_SEARCH,
+    ChatToolPolicy,
+    ChatToolRequest,
+    ChatToolResult,
     ChatTurn,
     MODE_CHAT,
     MODE_INVESTMENT,
@@ -51,6 +54,7 @@ from .command_bridge_models import (
     SUBMODE_TEXT_TRANSLATION,
     WebCommandRequest,
     WebCommandResponse,
+    make_chat_tool_request,
     parse_router_decision,
     stream_delta,
     stream_done,
@@ -123,6 +127,17 @@ _TOOL_FRIENDLY_NAMES = {CHAT_TOOL_SEARCH: "網路搜尋"}
 _SOURCE_PACK_TITLE_CAP = 200
 _SOURCE_PACK_SNIPPET_CAP = 500
 _SOURCE_PACK_TOTAL_CAP = 4000
+
+# Central chat tool registry (#46): maps tool name → (policy, executor).
+# The executor signature is (bridge, ChatToolRequest) → ChatToolResult.
+# Adding a new tool means: (a) whitelist it in command_bridge_models.CHAT_TOOLS,
+# (b) add an entry here. No other file needs to change.
+_SEARCH_TOOL_POLICY = ChatToolPolicy(
+    display_name="網路搜尋",
+    max_query_chars=256,
+    max_source_field_chars=_SOURCE_PACK_SNIPPET_CAP,
+    max_source_pack_chars=_SOURCE_PACK_TOTAL_CAP,
+)
 
 
 def _clip(text: str, cap: int) -> str:
@@ -425,9 +440,13 @@ class CommandBridge:
         decision = self._route_chat_decision(req)
         if decision is not None and decision.decision == ROUTER_DECISION_TOOL:
             try:
-                message = self._run_chat_tool(req, decision)
+                tool_result = self._run_chat_tool(req, decision)
+                logger.info(
+                    "[chat-tool] tool=%s sources=%d summary=%r",
+                    decision.tool, tool_result.source_count, tool_result.result_summary,
+                )
                 return WebCommandResponse(
-                    status=STATUS_OK, message=message, mode=MODE_CHAT
+                    status=STATUS_OK, message=tool_result.answer, mode=MODE_CHAT
                 )
             except Exception as exc:  # noqa: BLE001 — surface, don't crash the turn
                 logger.exception("chat tool failed tool=%s", decision.tool)
@@ -517,10 +536,25 @@ class CommandBridge:
         )
         return client.generate(prompt, temperature=0.0)
 
-    def _run_chat_tool(self, req: WebCommandRequest, decision: RouterDecision) -> str:
-        if decision.tool == CHAT_TOOL_SEARCH:
-            return self._run_grounded_search(req, decision.query)
-        raise ValueError(f"unknown chat tool: {decision.tool}")
+    def _run_chat_tool(self, req: WebCommandRequest, decision: RouterDecision) -> ChatToolResult:
+        """Dispatch a router decision to the appropriate tool executor via the registry.
+
+        Raises ``ValueError`` for any tool not in the registry (should not
+        happen — parse_router_decision already guards the whitelist)."""
+        policy_map: dict[str, tuple[ChatToolPolicy, object]] = {
+            CHAT_TOOL_SEARCH: (_SEARCH_TOOL_POLICY, self._exec_grounded_search),
+        }
+        entry = policy_map.get(decision.tool)
+        if entry is None:
+            raise ValueError(f"unknown chat tool: {decision.tool!r}")
+        policy, executor = entry
+        tool_req = make_chat_tool_request(
+            tool=decision.tool,
+            raw_query=decision.query,
+            user_question=req.input or "",
+            policy=policy,
+        )
+        return executor(req, tool_req)  # type: ignore[operator]
 
     def _stream_chat_tool(
         self, req: WebCommandRequest, decision: RouterDecision
@@ -529,14 +563,19 @@ class CommandBridge:
         front (so the user can see a tool is being invoked) and heartbeats while
         it works (so the connection stays alive), then deliver the grounded
         answer as the ``done`` event. The finished answer still carries its own
-        persistent "已使用工具" banner from :meth:`_run_grounded_search`."""
+        persistent "已使用工具" banner from the executor."""
         yield stream_delta(_tool_calling_notice(decision.tool))
         result: dict[str, object] = {}
         done = threading.Event()
 
         def _worker() -> None:
             try:
-                result["text"] = self._run_chat_tool(req, decision)
+                tool_result: ChatToolResult = self._run_chat_tool(req, decision)
+                result["text"] = tool_result.answer
+                logger.info(
+                    "[chat-tool] tool=%s sources=%d summary=%r",
+                    decision.tool, tool_result.source_count, tool_result.result_summary,
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.exception("chat tool failed tool=%s", decision.tool)
                 result["error"] = str(exc)
@@ -551,36 +590,39 @@ class CommandBridge:
             return
         yield stream_done(str(result.get("text") or "").strip())
 
-    def _run_grounded_search(self, req: WebCommandRequest, query: str) -> str:
-        """Grounded web search: retrieve sources, then synthesize an answer with
-        the user's chosen chat backend (so cloud-pickle users get cloud
-        synthesis). Retrieval is logged with the exact backing function so a tool
-        call is always traceable to code for debugging."""
+    def _exec_grounded_search(
+        self, req: WebCommandRequest, tool_req: ChatToolRequest
+    ) -> ChatToolResult:
+        """Grounded web search executor: retrieve sources, then synthesize an
+        answer with the user's chosen chat backend. Returns a typed
+        ``ChatToolResult``; the ``answer`` field carries the user-visible text
+        (banner + synthesis + source block). Logs the backing function so every
+        tool call is traceable to code."""
         from .web_search import DEFAULT_WEB_SEARCH_LIMIT, web_search
 
-        query = (query or "").strip()
+        query = tool_req.query  # already sanitized + budget-enforced by make_chat_tool_request
         logger.info(
             "[chat-tool] tool=%s fn=openclaw_adapter.web_search.web_search query=%r",
-            CHAT_TOOL_SEARCH, query,
+            tool_req.tool, query,
         )
-        # The tool-usage marker is ALWAYS shown (never gated by the debug flag):
-        # the user must be able to tell a tool ran, and on which query, straight
-        # from the answer — not only from the server log.
-        banner = f"{_TOOL_USED_PREFIX}網路搜尋（{CHAT_TOOL_SEARCH}）｜查詢：{query}"
-        # Off the main thread (streaming worker / async): force a one-shot browser.
+        banner = f"{_TOOL_USED_PREFIX}網路搜尋（{tool_req.tool}）｜查詢：{query}"
         results = web_search(
             query, max_results=DEFAULT_WEB_SEARCH_LIMIT, reuse_browser=False
         )
         if not results:
-            return (
-                f"{banner}\n\n"
-                f"我搜尋了「{query}」，但目前找不到可用的網路來源，"
-                "請稍後再試或換個說法。"
+            return ChatToolResult(
+                answer=(
+                    f"{banner}\n\n"
+                    f"我搜尋了「{query}」，但目前找不到可用的網路來源，"
+                    "請稍後再試或換個說法。"
+                ),
+                source_count=0,
+                result_summary="no results",
             )
-        source_pack = self._format_search_source_pack(results)
+        source_pack = self._format_search_source_pack(results, tool_req.policy)
         prompt = "\n".join([
             _SEARCH_SYNTHESIS_PROMPT, "",
-            f"使用者問題：{(req.input or '').strip()}",
+            f"使用者問題：{tool_req.user_question}",
             f"搜尋查詢：{query}", "",
             "搜尋結果：", source_pack, "", "回答：",
         ])
@@ -593,19 +635,23 @@ class CommandBridge:
         )
         if self.settings.openclaw_web_chat_tool_debug:
             message += f"\n\n（合成模型：{model_label}）"
-        return message
+        return ChatToolResult(
+            answer=message,
+            source_count=len(results),
+            result_summary=f"query={query!r} sources={len(results)} model={model_label}",
+        )
 
     @staticmethod
-    def _format_search_source_pack(results) -> str:
+    def _format_search_source_pack(results, policy: ChatToolPolicy) -> str:
         lines: list[str] = []
         total = 0
         for i, r in enumerate(results, 1):
             title = _clip(r.title, _SOURCE_PACK_TITLE_CAP)
             url = (r.url or "").strip()
-            snippet = _clip(r.snippet, _SOURCE_PACK_SNIPPET_CAP)
+            snippet = _clip(r.snippet, policy.max_source_field_chars)
             entry = f"[{i}] 標題：{title}\n    網址：{url}\n    摘要：{snippet}"
             # Keep at least the first source even if it alone busts the budget.
-            if lines and total + len(entry) > _SOURCE_PACK_TOTAL_CAP:
+            if lines and total + len(entry) > policy.max_source_pack_chars:
                 break
             lines.append(entry)
             total += len(entry)

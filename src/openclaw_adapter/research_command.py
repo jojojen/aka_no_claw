@@ -9,7 +9,7 @@ import statistics
 import threading
 import time
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Iterable, Protocol, Sequence
@@ -36,6 +36,15 @@ _SOLD_SCRAPE_TIMEOUT = 90.0
 _SOLD_AVG_SCRAPE_TIMEOUT = 75.0
 _SHOP_REF_SCRAPE_TIMEOUT = 75.0
 _ITEM_HTML_SCRAPE_TIMEOUT = 90.0
+
+# Overall cap on how long we wait for the parallel marketplace stages (3/4/6)
+# to ALL complete.  Each stage has its own per-scrape timeout (above), but on a
+# slow query those can stack to > 5 min total.  After this budget the futures
+# we've already collected are used for the report; stages still running are
+# abandoned to their own timeouts in the background.
+_MARKETPLACE_TOTAL_BUDGET_SECONDS = 210.0
+# How often the background heartbeat fires while marketplace stages are blocked.
+_MARKETPLACE_HEARTBEAT_INTERVAL_SECONDS = 25.0
 
 # Cross-process yuyu-tei rate-limit state. The per-host circuit breaker in
 # market_monitor.http persists a wall-clock cooldown to a tempdir marker file on
@@ -291,6 +300,10 @@ class ResearchJobContext:
     heartbeat_interval_seconds: float = 15.0
     stage_started_monotonic: float = 0.0
     last_heartbeat_monotonic: float = 0.0
+    # Set to True when the overall marketplace budget is exhausted before all
+    # parallel stages (3/4/6) return.  build_research_report appends a note so
+    # the user knows the answer is based on partial market data.
+    marketplace_timed_out: bool = False
     # Serialises section_results/warnings appends across stages 3/4/6 when they
     # run on parallel threads (Phase 2 parallelisation).
     _section_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
@@ -322,6 +335,7 @@ class ResearchReport:
     seller_snapshot: SellerReputationSnapshot | None
     section_results: tuple[ResearchSectionResult, ...]
     warnings: tuple[str, ...]
+    marketplace_timed_out: bool = False
 
 
 class _NullResearchNotifier:
@@ -1080,18 +1094,64 @@ class ResearchCommandService:
             # independent — each reads only stage 0-2 outputs and writes disjoint
             # ctx fields. Run them concurrently so a cloud-offloaded appreciation
             # enricher overlaps the local price gate instead of queueing behind it.
+            notifier.send("🔍 [3-6/6] 市場搜尋中…（可能需要 1-3 分鐘）")
+            marketplace_start = time.monotonic()
+
+            # Background heartbeat: stage threads can block on I/O for 90s+ each
+            # so we can't rely on in-stage heartbeat() calls.  A daemon thread
+            # fires progress notes independently of the scrapers.
+            _heartbeat_stop = threading.Event()
+
+            def _marketplace_heartbeat() -> None:
+                _heartbeat_stop.wait(timeout=_MARKETPLACE_HEARTBEAT_INTERVAL_SECONDS)
+                while not _heartbeat_stop.is_set():
+                    elapsed = time.monotonic() - marketplace_start
+                    notifier.send(
+                        f"⏳ 市場搜尋仍在執行（已過 {elapsed:.0f}s）；請稍候…"
+                    )
+                    _heartbeat_stop.wait(timeout=_MARKETPLACE_HEARTBEAT_INTERVAL_SECONDS)
+
+            threading.Thread(
+                target=_marketplace_heartbeat, daemon=True, name="research-hb"
+            ).start()
+
             parallel_notes: dict[int, str] = {}
-            with ThreadPoolExecutor(
-                max_workers=3, thread_name_prefix="research-stage"
-            ) as pool:
-                futures = {
-                    pool.submit(stage_by_no[stage_no][1], ctx): stage_no
-                    for stage_no in (3, 4, 6)
-                }
-                for future in as_completed(futures):
-                    parallel_notes[futures[future]] = future.result()
+            try:
+                with ThreadPoolExecutor(
+                    max_workers=3, thread_name_prefix="research-stage"
+                ) as pool:
+                    futures = {
+                        pool.submit(stage_by_no[stage_no][1], ctx): stage_no
+                        for stage_no in (3, 4, 6)
+                    }
+                    try:
+                        for future in as_completed(
+                            futures, timeout=_MARKETPLACE_TOTAL_BUDGET_SECONDS
+                        ):
+                            parallel_notes[futures[future]] = future.result()
+                    except FuturesTimeoutError:
+                        ctx.marketplace_timed_out = True
+                        elapsed = time.monotonic() - marketplace_start
+                        logger.warning(
+                            "research marketplace budget exhausted elapsed=%.1fs budget=%.1fs",
+                            elapsed,
+                            _MARKETPLACE_TOTAL_BUDGET_SECONDS,
+                        )
+                        notifier.send(
+                            "⚠️ 市場搜尋逾時，已用目前取得的資料回答；"
+                            "價格／成交資料可能不完整。"
+                        )
+            finally:
+                _heartbeat_stop.set()
+
+            elapsed_marketplace = time.monotonic() - marketplace_start
+            logger.info(
+                "research marketplace stages elapsed=%.1fs timed_out=%s",
+                elapsed_marketplace,
+                ctx.marketplace_timed_out,
+            )
             milestone = self._MILESTONE_STAGES.get(4)
-            if milestone:
+            if milestone and not ctx.marketplace_timed_out:
                 notifier.send(f"✅ {milestone}：{parallel_notes.get(4, '')}")
 
             # Stage 5 (流動性) consumes stage 4's price evidence, so it must run
@@ -1671,6 +1731,12 @@ def build_research_report(ctx: ResearchJobContext) -> ResearchReport:
         ctx.section_results,
         key=lambda result: _SECTION_ORDER.get(result.section_name, len(_SECTION_ORDER) + 1),
     )
+    warnings = list(dict.fromkeys(ctx.warnings))
+    if ctx.marketplace_timed_out:
+        warnings.insert(
+            0,
+            "市場搜尋逾時，已用目前取得的資料回答；價格／成交資料可能不完整。",
+        )
     return ResearchReport(
         chat_id=ctx.chat_id,
         mode_label=mode_label,
@@ -1680,7 +1746,8 @@ def build_research_report(ctx: ResearchJobContext) -> ResearchReport:
         item_data=ctx.item_data,
         seller_snapshot=ctx.seller_snapshot,
         section_results=tuple(ordered_sections),
-        warnings=tuple(dict.fromkeys(ctx.warnings)),
+        warnings=tuple(warnings),
+        marketplace_timed_out=ctx.marketplace_timed_out,
     )
 
 

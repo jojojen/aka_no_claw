@@ -24,6 +24,9 @@ from openclaw_adapter.command_bridge_models import (
     CHAT_TOOL_SEARCH,
     MAX_HISTORY_TURNS,
     MAX_ROUTER_QUERY_LEN,
+    ChatToolPolicy,
+    ChatToolRequest,
+    ChatToolResult,
     ChatTurn,
     MODE_CHAT,
     MODE_INVESTMENT,
@@ -39,6 +42,7 @@ from openclaw_adapter.command_bridge_models import (
     SUBMODE_SELLER_REPUTATION_SNAPSHOT,
     SUBMODE_TEXT_TRANSLATION,
     RequestValidationError,
+    make_chat_tool_request,
     parse_request,
     parse_router_decision,
 )
@@ -796,7 +800,7 @@ def test_stream_tool_emits_live_calling_notice_then_done(monkeypatch):
 
     def _slow_tool(req, decision):
         time.sleep(0.05)
-        return "grounded answer"
+        return ChatToolResult(answer="grounded answer", source_count=1)
 
     monkeypatch.setattr(b, "_run_chat_tool", _slow_tool)
     events = list(b.stream(parse_request({"mode": "chat", "input": "q", "chat_backend": "local"}), "rid-t"))
@@ -1318,3 +1322,140 @@ def test_loopback_allowed_lan_blocked_by_default():
     assert not _is_allowed_client("192.168.1.50", lan_enabled=False)
     assert _is_allowed_client("192.168.1.50", lan_enabled=True)
     assert not _is_allowed_client("8.8.8.8", lan_enabled=True)
+
+
+# --- Issue #46: typed chat tool envelope ----------------------------------
+
+def _make_policy(**kw) -> ChatToolPolicy:
+    defaults = dict(
+        display_name="Test",
+        max_query_chars=256,
+        max_source_field_chars=500,
+        max_source_pack_chars=4000,
+    )
+    defaults.update(kw)
+    return ChatToolPolicy(**defaults)
+
+
+def test_make_chat_tool_request_normalizes_and_caps_query():
+    policy = _make_policy(max_query_chars=10)
+    req = make_chat_tool_request("/search", "  hello  world  ", "user q", policy)
+    assert req.query == "hello worl"  # collapsed whitespace, then capped at 10
+
+
+def test_make_chat_tool_request_strips_control_chars():
+    policy = _make_policy(max_query_chars=256)
+    req = make_chat_tool_request("/search", "abc\x00def\x1fghi", "q", policy)
+    assert "\x00" not in req.query
+    assert "\x1f" not in req.query
+    assert "abc def ghi" == req.query
+
+
+def test_make_chat_tool_request_raises_on_empty_after_normalise():
+    policy = _make_policy(max_query_chars=256)
+    with pytest.raises(ValueError, match="empty after normalisation"):
+        make_chat_tool_request("/search", "   \x00\x1f  ", "q", policy)
+
+
+def test_make_chat_tool_request_fields_populated():
+    policy = _make_policy()
+    req = make_chat_tool_request("/search", "初音", "她有新歌嗎", policy)
+    assert req.tool == "/search"
+    assert req.query == "初音"
+    assert req.user_question == "她有新歌嗎"
+    assert req.policy is policy
+
+
+def test_chat_tool_result_fields():
+    result = ChatToolResult(answer="ok", source_count=3, result_summary="s")
+    assert result.answer == "ok"
+    assert result.source_count == 3
+    assert result.result_summary == "s"
+
+
+def test_chat_tool_result_defaults():
+    result = ChatToolResult(answer="x")
+    assert result.source_count == 0
+    assert result.result_summary == ""
+
+
+def test_run_chat_tool_returns_chat_tool_result(monkeypatch):
+    """_run_chat_tool must return a ChatToolResult, not a bare str."""
+    b = CommandBridge(settings=_tool_settings())
+
+    monkeypatch.setattr(
+        "openclaw_adapter.web_search.web_search",
+        lambda q, *, max_results, reuse_browser: (
+            _result("T", "https://x.example", "snippet"),
+        ),
+    )
+    monkeypatch.setattr(b, "_ollama_generate_blocking", lambda p: "answer text")
+
+    decision = RouterDecision(
+        decision=ROUTER_DECISION_TOOL,
+        tool=CHAT_TOOL_SEARCH,
+        query="初音 新曲",
+    )
+    req = parse_request({"mode": "chat", "input": "她有新歌嗎", "chat_backend": "local"})
+    result = b._run_chat_tool(req, decision)
+    assert isinstance(result, ChatToolResult)
+    assert "answer text" in result.answer
+    assert result.source_count == 1
+
+
+def test_run_chat_tool_unknown_raises():
+    b = CommandBridge(settings=_tool_settings())
+    decision = RouterDecision(
+        decision=ROUTER_DECISION_TOOL,
+        tool="/unknown",
+        query="q",
+    )
+    req = parse_request({"mode": "chat", "input": "x"})
+    with pytest.raises(ValueError, match="unknown chat tool"):
+        b._run_chat_tool(req, decision)
+
+
+def test_source_pack_respects_policy_budget():
+    """_format_search_source_pack must truncate snippets at policy.max_source_field_chars
+    and stop adding entries when policy.max_source_pack_chars is reached."""
+    b = CommandBridge(settings=_tool_settings())
+    policy = _make_policy(max_source_field_chars=10, max_source_pack_chars=60)
+    long_snippet = "S" * 100  # exceeds max_source_field_chars=10
+
+    results = [
+        _result(f"T{i}", f"https://e{i}.example", long_snippet)
+        for i in range(10)
+    ]
+    pack = b._format_search_source_pack(results, policy)
+
+    # Every snippet in the pack must be capped at 10 chars (+ possible "…" clip).
+    assert long_snippet not in pack  # no uncapped snippet allowed
+    for line in pack.splitlines():
+        if "摘要：" in line:
+            snippet_text = line.split("摘要：", 1)[1]
+            assert len(snippet_text) <= 10 + 1  # 10 + possible trailing "…"
+
+    # Total pack must be at most max_source_pack_chars + per-entry fixed overhead
+    # (we keep at least the first entry regardless).
+    assert len(pack) <= 60 + 200  # small budget + per-entry label overhead
+
+
+def test_exec_grounded_search_source_count(monkeypatch):
+    """_exec_grounded_search must return a ChatToolResult with accurate source_count."""
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        "openclaw_adapter.web_search.web_search",
+        lambda q, *, max_results, reuse_browser: (
+            _result("T", "https://x.example", "s"),
+            _result("T2", "https://y.example", "s2"),
+        ),
+    )
+    monkeypatch.setattr(b, "_ollama_generate_blocking", lambda p: "answer")
+
+    policy = _make_policy()
+    tool_req = make_chat_tool_request("/search", "初音", "她有新歌嗎", policy)
+    req = parse_request({"mode": "chat", "input": "她有新歌嗎"})
+    result = b._exec_grounded_search(req, tool_req)
+    assert isinstance(result, ChatToolResult)
+    assert result.source_count == 2
+    assert "sources=2" in result.result_summary

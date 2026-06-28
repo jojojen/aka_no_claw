@@ -16,6 +16,8 @@ from openclaw_adapter.research_command import (
     ResearchSectionResult,
     SellerReputationSnapshot,
     ShopReference,
+    _MARKETPLACE_HEARTBEAT_INTERVAL_SECONDS,
+    _MARKETPLACE_TOTAL_BUDGET_SECONDS,
     build_budgeted_search_fn,
     build_research_handler,
     format_research_compact_report,
@@ -2295,3 +2297,91 @@ def test_research_handler_no_followup_fn_degrades_gracefully_on_still_pending(tm
     reply = handler("https://jp.mercari.com/item/m18542743389", "chat-1")
     assert "賣家風險分析 [partial]" in reply
     assert "處理中" in reply
+
+
+# ── #48: bounded progress UX for slow marketplace scrapes ────────────────────
+
+
+def test_marketplace_upfront_notice_is_sent() -> None:
+    # Before stages 3/4/6 start, a "市場搜尋中" notice must be visible so the
+    # user knows Dragon is working even before the first heartbeat fires.
+    notifier = FakeNotifier()
+    handler = build_research_handler(
+        notifier_factory=lambda _: notifier,
+        stage_runners=(
+            _parse_stage,
+            _placeholder("item"),
+            _placeholder("entity"),
+            _placeholder("appreciation"),
+            _placeholder("price"),
+            _placeholder("liquidity"),
+            _placeholder("seller"),
+        ),
+        active_market_search_fn=_fake_active_search,
+        sold_market_search_fn=_fake_sold_search,
+        sold_average_lookup_fn=_fake_sold_average,
+        final_formatter=lambda report: report,
+    )
+    handler("https://jp.mercari.com/item/m65806654179", "chat-1")
+    assert any("市場搜尋中" in m for m in notifier.messages)
+
+
+def test_marketplace_budget_exhaustion_marks_partial_and_warns() -> None:
+    # When parallel stages exceed _MARKETPLACE_TOTAL_BUDGET_SECONDS the report
+    # must carry the timeout warning and marketplace_timed_out must be set.
+    # We patch the budget to near-zero to force a timeout without real sleeping.
+    import openclaw_adapter.research_command as rc
+
+    original_budget = rc._MARKETPLACE_TOTAL_BUDGET_SECONDS
+    rc._MARKETPLACE_TOTAL_BUDGET_SECONDS = 0.05  # 50 ms — stages sleep longer
+
+    notifier = FakeNotifier()
+    try:
+        handler = build_research_handler(
+            notifier_factory=lambda _: notifier,
+            stage_runners=(
+                _parse_stage,
+                _placeholder("item"),
+                _placeholder("entity"),
+                _section_stage("增值潛力分析", delay=0.3),
+                _section_stage("合理市價分析", delay=0.3),
+                _placeholder("liquidity"),
+                _section_stage("賣家風險分析", delay=0.3),
+            ),
+            active_market_search_fn=_fake_active_search,
+            sold_market_search_fn=_fake_sold_search,
+            sold_average_lookup_fn=_fake_sold_average,
+            final_formatter=lambda report: report,
+        )
+        report = handler("https://jp.mercari.com/item/m65806654179", "chat-1")
+    finally:
+        rc._MARKETPLACE_TOTAL_BUDGET_SECONDS = original_budget
+
+    assert report.marketplace_timed_out
+    timeout_warnings = [w for w in report.warnings if "逾時" in w]
+    assert timeout_warnings, "timeout warning should appear in report.warnings"
+    assert any("逾時" in m for m in notifier.messages)
+
+
+def test_marketplace_full_completion_does_not_set_timed_out() -> None:
+    # Fast stages must NOT set marketplace_timed_out — partial flag is only for
+    # genuine budget exhaustion, not for every research call.
+    handler = build_research_handler(
+        notifier_factory=lambda _: FakeNotifier(),
+        stage_runners=(
+            _parse_stage,
+            _placeholder("item"),
+            _placeholder("entity"),
+            _section_stage("增值潛力分析", delay=0.0),
+            _section_stage("合理市價分析", delay=0.0),
+            _placeholder("liquidity"),
+            _section_stage("賣家風險分析", delay=0.0),
+        ),
+        active_market_search_fn=_fake_active_search,
+        sold_market_search_fn=_fake_sold_search,
+        sold_average_lookup_fn=_fake_sold_average,
+        final_formatter=lambda report: report,
+    )
+    report = handler("https://jp.mercari.com/item/m65806654179", "chat-1")
+    assert not report.marketplace_timed_out
+    assert not any("逾時" in w for w in report.warnings)
