@@ -1418,13 +1418,8 @@ class CommandBridge:
         return client.generate(prompt, temperature=0.7)
 
     def _build_cloud_chat_client(self):
-        """Big-pickle chat client via direct HTTP (zen/v1). CLI is fallback only."""
-        from .dynamic_tools import (
-            OpenCodeCliTextClient,
-            OpenCodeTextClient,
-            probe_opencode,
-            probe_opencode_cli,
-        )
+        """Big-pickle chat client via direct HTTP (zen/v1). No CLI fallback (#59)."""
+        from .dynamic_tools import OpenCodeTextClient, probe_opencode
 
         base_url = self.settings.openclaw_opencode_base_url
         raw_model = (self.settings.openclaw_opencode_model or "big-pickle").strip()
@@ -1436,9 +1431,6 @@ class CommandBridge:
                 api_key=self.settings.openclaw_opencode_api_key,
                 timeout_seconds=180,
             )
-        cli_model = raw_model if "/" in raw_model else f"opencode/{raw_model}"
-        if probe_opencode_cli(model=cli_model, timeout=20.0):
-            return OpenCodeCliTextClient(model=cli_model, timeout_seconds=180)
         return None
 
     def _build_mistral_chat_client(self):

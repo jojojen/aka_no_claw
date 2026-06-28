@@ -262,21 +262,27 @@ def probe_opencode_cli(
 
 def build_research_cloud_text_client(
     settings: "object", *, timeout_seconds: int = 180
-) -> "OpenCodeCliTextClient | None":
-    """Cloud (OpenCode big-pickle) text client for /research appreciation
-    enrichment, probed once at build time. Returns None when
-    ``OPENCLAW_RESEARCH_CLOUD_ENRICHER`` isn't "opencode" or the CLI can't be
-    used. Deliberately carries NONE of the /new runner's cloud-failover restart
-    behavior — /research degrades in-process, it must never restart the bot."""
+) -> "OpenCodeTextClient | None":
+    """Cloud (big-pickle) text client for /research appreciation enrichment via
+    direct HTTP. Returns None when ``OPENCLAW_RESEARCH_CLOUD_ENRICHER`` isn't
+    "opencode" or the HTTP endpoint is unreachable. Deliberately carries NONE of
+    the /new runner's cloud-failover restart behavior — /research degrades
+    in-process, it must never restart the bot. CLI is not used here (#59)."""
     backend = (getattr(settings, "openclaw_research_cloud_enricher", None) or "").strip().lower()
     if backend != "opencode":
         return None
+    base_url = (getattr(settings, "openclaw_opencode_base_url", None) or "https://opencode.ai/zen/v1").strip()
     raw_model = (getattr(settings, "openclaw_opencode_model", None) or "big-pickle").strip()
-    model = raw_model if "/" in raw_model else f"opencode/{raw_model}"
-    if not probe_opencode_cli(model=model, timeout=20.0):
-        logger.warning("dynamic_tools: /research cloud enricher requested but CLI probe failed")
+    model = raw_model.split("/")[-1] if "/" in raw_model else raw_model
+    if not probe_opencode(base_url, model=model, timeout=10.0):
+        logger.warning("dynamic_tools: /research cloud enricher requested but HTTP probe failed")
         return None
-    return OpenCodeCliTextClient(model=model, timeout_seconds=max(1, int(timeout_seconds)))
+    return OpenCodeTextClient(
+        base_url=base_url,
+        model=model,
+        api_key=getattr(settings, "openclaw_opencode_api_key", None),
+        timeout_seconds=max(1, int(timeout_seconds)),
+    )
 
 
 class OllamaTextClient:
@@ -522,11 +528,11 @@ class OpenCodeCliTextClient:
     def generate(self, prompt: str, *, temperature: float = 0.0, think: bool = False) -> str:
         Path(self.home_dir).mkdir(parents=True, exist_ok=True)
         env = dict(os.environ)
-        # Keep opencode's config from the real XDG config dir, but isolate HOME
-        # so Claude/Codex global memories like ~/.claude/CLAUDE.md cannot leak
-        # into generated tool answers.
-        env.setdefault("XDG_CONFIG_HOME", str(Path.home() / ".config"))
+        # Fully isolate the subprocess from host HOME, XDG dirs, and Claude/Codex
+        # global config so AGENTS.md / CLAUDE.md cannot leak into responses (#59).
+        env["OPENCODE_DISABLE_CLAUDE_CODE"] = "1"
         env["HOME"] = self.home_dir
+        env["XDG_CONFIG_HOME"] = str(Path(self.home_dir) / ".config")
         env["XDG_DATA_HOME"] = str(Path(self.home_dir) / ".local" / "share")
         env["XDG_CACHE_HOME"] = str(Path(self.home_dir) / ".cache")
         env["CLAUDE_CONFIG_DIR"] = str(Path(self.home_dir) / ".claude")
@@ -2436,15 +2442,9 @@ def build_dynamic_tool_runner_from_settings(settings) -> DynamicToolRunner | Non
                 settings, client, fast_model=http_model, strong_model=http_model,
                 validator_client=validator_client, validator_model=validator_model,
                 cloud_failover_restart=True)
-        cli_model = _opencode_cli_model(model)
-        if probe_opencode_cli(model=cli_model, timeout=min(timeout, 30)):
-            client = OpenCodeCliTextClient(model=cli_model, timeout_seconds=timeout)
-            logger.info("dynamic_tools: OpenCode HTTP unavailable; using CLI fallback model=%s", cli_model)
-            return _build_runner_with_client(
-                settings, client, fast_model=cli_model, strong_model=cli_model,
-                validator_client=validator_client, validator_model=validator_model,
-                cloud_failover_restart=True)
-        logger.warning("dynamic_tools: OpenCode HTTP+CLI both unavailable; falling back to Ollama if configured")
+        # CLI fallback intentionally removed: auto-invoking `opencode run` risks
+        # loading AGENTS.md / CLAUDE.md and violates the #59 isolation contract.
+        logger.warning("dynamic_tools: OpenCode HTTP unavailable; falling back to Ollama if configured")
     elif codegen_backend and codegen_backend != "ollama":
         logger.warning("dynamic_tools: unsupported codegen backend=%s; falling back to Ollama", codegen_backend)
 

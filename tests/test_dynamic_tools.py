@@ -1309,7 +1309,9 @@ def test_builder_prefers_opencode_http_when_codegen_backend_enabled(tmp_path) ->
     assert runner.client.timeout_seconds == 321
 
 
-def test_builder_falls_back_to_opencode_cli_when_http_blocked(tmp_path) -> None:
+def test_builder_returns_none_when_opencode_http_unavailable(tmp_path) -> None:
+    # HTTP probe fails and CLI fallback is intentionally not used (#59).
+    # With no Ollama backend configured the builder returns None.
     import unittest.mock as mock
 
     settings = SimpleNamespace(
@@ -1325,15 +1327,10 @@ def test_builder_falls_back_to_opencode_cli_when_http_blocked(tmp_path) -> None:
         openclaw_codegen_fast_model=None,
         knowledge_db_path=str(tmp_path / "knowledge.sqlite3"),
     )
-    # HTTP probe fails (e.g. CF block) → CLI fallback.
-    with mock.patch("openclaw_adapter.dynamic_tools.probe_opencode", return_value=False), \
-         mock.patch("openclaw_adapter.dynamic_tools.probe_opencode_cli", return_value=True):
+    with mock.patch("openclaw_adapter.dynamic_tools.probe_opencode", return_value=False):
         runner = build_dynamic_tool_runner_from_settings(settings)
 
-    assert isinstance(runner.client, OpenCodeCliTextClient)
-    assert runner.fast_model == "opencode/big-pickle"
-    assert runner.strong_model == "opencode/big-pickle"
-    assert runner.client.timeout_seconds == 321
+    assert runner is None
 
 
 def test_builder_falls_back_to_ollama_when_opencode_probe_fails(tmp_path) -> None:
