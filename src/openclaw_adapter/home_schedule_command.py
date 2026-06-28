@@ -7,12 +7,10 @@ weekdays. The flow is:
    buttons plus 「➕ 新增排程」.
 2. ➕ → a ➖HH➕ / ➖MM➕ / ✅下一步 time picker.
 3. ✅下一步 → a weekday picker (個別星期多選 + 每天 / 平日 / 週末) and ✅完成.
-4. ✅完成 creates the schedule and enters *naming mode*: the next plain message
-   becomes the schedule's label (or 「略過」 keeps the default). The chat then
-   moves into *capture mode*: the user sends the slash commands to run (e.g.
-   ``/music playbest``, ``/say 早安``) one per message, finishing with 「完成」.
-   Naming and capture are wired in telegram_bot.py's build_reply_plan. Existing
-   schedules can be renamed with ``/schedulehome label <id> <名稱>``.
+4. ✅完成 creates the schedule and enters *capture mode*: the user then sends the
+   slash commands to run (e.g. ``/music playbest``, ``/say 早安``) one per
+   message, finishing with 「完成」. Capture is wired in telegram_bot.py's
+   build_reply_plan so plain ``/`` messages append to the schedule.
 
 All callback_data stays well under Telegram's 64-byte cap: the weekday set rides
 as a 7-char on/off mask (index 0=Mon … 6=Sun), e.g. ``sh:r:07:30:1111100:ok``.
@@ -168,33 +166,6 @@ def _format_run(entry: dict, results: list[str]) -> str:
     return f"已執行「{label}」：\n{body}"
 
 
-_SKIP_LABEL_WORDS = {"略過", "跳過", "skip"}
-
-
-def _naming_hint(entry: dict) -> str:
-    sched = entry.get("schedule") or {}
-    return (
-        f"✅ 已建立排程（{sched.get('time')} {days_label(sched.get('days') or [])}）。\n"
-        "請輸入這個排程的名稱（直接傳一則文字），方便日後辨識，例如「平日早安」。\n"
-        "想用預設名稱就輸入「略過」。"
-    )
-
-
-def begin_label_then_capture(store: HomeScheduleStore, chat_id: str, text: str):
-    """Naming-mode text handler: set the freshly created schedule's label from the
-    user's message (unless they typed 略過/skip), then switch the chat into
-    command-capture mode. Returns ``(reply_text, reply_markup)`` for the Telegram
-    layer. The caller guarantees a naming session is active for this chat."""
-    sid = store.naming_target(chat_id)
-    label = (text or "").strip()
-    if label and label not in _SKIP_LABEL_WORDS:
-        store.set_label(sid, label)
-    store.end_naming(chat_id)
-    store.begin_capture(chat_id, sid)
-    entry = store.get(sid)
-    return _capture_hint(entry), None
-
-
 def _capture_hint(entry: dict) -> str:
     sched = entry.get("schedule") or {}
     return (
@@ -221,14 +192,6 @@ def build_schedulehome_handler(
 
         if sub == "add":
             return render_time_picker(7, 0)
-        if sub == "label":
-            new_label = " ".join(parts[2:]).strip()
-            if not arg or not new_label:
-                return "請指定排程 id 與名稱，例如 /schedulehome label sch_001 平日早安"
-            entry = store.set_label(arg, new_label)
-            return (
-                f"已將排程 {arg} 命名為「{new_label}」" if entry else f"找不到排程：{arg}"
-            )
         if sub in {"run", "on", "off", "delete", "del"} and not arg:
             return f"請指定排程 id，例如 /schedulehome {sub} sch_001"
 
@@ -249,7 +212,7 @@ def build_schedulehome_handler(
 
         return (
             "用法：/schedulehome（列出）、/schedulehome add（新增）、"
-            "/schedulehome label <id> <名稱>、/schedulehome run|on|off|delete <id>"
+            "/schedulehome run|on|off|delete <id>"
         )
 
     return handler
@@ -271,7 +234,6 @@ def build_schedulehome_callback_handler(
 
         if action == "cancel":
             store.end_capture(chat_id)
-            store.end_naming(chat_id)
             store.end_edit(chat_id)
             text, markup = render_list(store)
             return "已取消", text, markup
@@ -374,10 +336,8 @@ def build_schedulehome_callback_handler(
                 text, markup = render_list(store)
                 return "已更新排程", text, markup
             entry = store.add(time=f"{hh:02d}:{mm:02d}", days=days)
-            # Ask for a human label first (naming mode); the Telegram layer turns
-            # the next plain message into the label, then begins command capture.
-            store.begin_naming(chat_id, entry["id"])
-            return "已建立排程", _naming_hint(entry), None
+            store.begin_capture(chat_id, entry["id"])
+            return "已建立排程", _capture_hint(entry), None
         text, markup = render_recurrence_picker(hh, mm, mask)
         return None, text, markup
 

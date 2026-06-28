@@ -8,7 +8,7 @@ from openclaw_adapter import ir_command as ir
 class FakeRm:
     def __init__(self, payload: bytes = b"ir-payload") -> None:
         self.host = ("192.0.2.38", 80)
-        self.devtype = 0x0000
+        self.devtype = 0x5216
         self.authed = False
         self.learning = False
         self.sent: list[bytes] = []
@@ -48,14 +48,14 @@ def test_discover_uses_lan_broadcast_from_local_ip(tmp_path, monkeypatch):
         seen.update(kwargs)
         return [fake]
 
-    monkeypatch.setattr(ir, "_local_ip", lambda: "192.0.2.34")
+    monkeypatch.setattr(ir, "_local_ip", lambda: "192.168.11.34")
     monkeypatch.setattr(ir, "_RM_CLASS_NAMES", {"fakerm"})
     monkeypatch.setattr(ir.broadlink, "discover", discover)
     device, msg = ir.discover_rm(_settings(tmp_path))
     assert device is fake
     assert fake.authed is True
-    assert seen["local_ip_address"] == "192.0.2.34"
-    assert seen["discover_ip_address"] == "192.0.2.255"
+    assert seen["local_ip_address"] == "192.168.11.34"
+    assert seen["discover_ip_address"] == "192.168.11.255"
     assert "192.0.2.38" in msg
 
 
@@ -68,7 +68,7 @@ def test_discover_respects_configured_broadcast(tmp_path, monkeypatch):
 
     settings = _settings(tmp_path)
     settings.openclaw_broadlink_discover_broadcast = "10.0.0.255"
-    monkeypatch.setattr(ir, "_local_ip", lambda: "192.0.2.34")
+    monkeypatch.setattr(ir, "_local_ip", lambda: "192.168.11.34")
     monkeypatch.setattr(ir, "_RM_CLASS_NAMES", {"fakerm"})
     monkeypatch.setattr(ir.broadlink, "discover", discover)
     ir.discover_rm(settings)
@@ -80,7 +80,7 @@ def test_discover_retries_transient_auth_no_route(tmp_path, monkeypatch):
     fake.auth_errors.append(OSError(65, "No route to host"))
     warms = []
 
-    monkeypatch.setattr(ir, "_local_ip", lambda: "192.0.2.34")
+    monkeypatch.setattr(ir, "_local_ip", lambda: "192.168.11.34")
     monkeypatch.setattr(ir, "_RM_CLASS_NAMES", {"fakerm"})
     monkeypatch.setattr(ir.broadlink, "discover", lambda **kwargs: [fake])
     monkeypatch.setattr(ir, "_warm_host_route", lambda device: warms.append(device))

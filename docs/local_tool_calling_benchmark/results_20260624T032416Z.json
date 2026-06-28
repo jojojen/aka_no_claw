@@ -1,0 +1,89 @@
+{
+  "timestamp": "2026-06-24T03:24:16.719866+00:00",
+  "endpoint": "http://127.0.0.1:11434",
+  "models": [
+    "gemma3:12b"
+  ],
+  "subgoal_gate": true,
+  "summary": {
+    "gemma3:12b": {
+      "passed": 0,
+      "total": 4,
+      "pass_rate": 0.0,
+      "mean_seconds": 0.10124999999999999
+    }
+  },
+  "results": [
+    {
+      "case_id": "zero_tool_greeting",
+      "model": "gemma3:12b",
+      "passed": false,
+      "expected_tools": [],
+      "observed_tools": [],
+      "final_content": "",
+      "quality_flags": {
+        "leaked_thinking": false,
+        "raw_json_tool_text": false
+      },
+      "gate_interventions": [],
+      "rounds": [],
+      "duration_seconds": 0.181,
+      "error": "HTTPError 400: {\"error\":\"registry.ollama.ai/library/gemma3:12b does not support tools\"}"
+    },
+    {
+      "case_id": "single_weather_lookup",
+      "model": "gemma3:12b",
+      "passed": false,
+      "expected_tools": [
+        "get_weather"
+      ],
+      "observed_tools": [],
+      "final_content": "",
+      "quality_flags": {
+        "leaked_thinking": false,
+        "raw_json_tool_text": false
+      },
+      "gate_interventions": [],
+      "rounds": [],
+      "duration_seconds": 0.079,
+      "error": "HTTPError 400: {\"error\":\"registry.ollama.ai/library/gemma3:12b does not support tools\"}"
+    },
+    {
+      "case_id": "two_step_music_search_then_detail",
+      "model": "gemma3:12b",
+      "passed": false,
+      "expected_tools": [
+        "search_music",
+        "get_song_detail"
+      ],
+      "observed_tools": [],
+      "final_content": "",
+      "quality_flags": {
+        "leaked_thinking": false,
+        "raw_json_tool_text": false
+      },
+      "gate_interventions": [],
+      "rounds": [],
+      "duration_seconds": 0.072,
+      "error": "HTTPError 400: {\"error\":\"registry.ollama.ai/library/gemma3:12b does not support tools\"}"
+    },
+    {
+      "case_id": "tool_after_context_pronoun",
+      "model": "gemma3:12b",
+      "passed": false,
+      "expected_tools": [
+        "search_music"
+      ],
+      "observed_tools": [],
+      "final_content": "",
+      "quality_flags": {
+        "leaked_thinking": false,
+        "raw_json_tool_text": false
+      },
+      "gate_interventions": [],
+      "rounds": [],
+      "duration_seconds": 0.073,
+      "error": "HTTPError 400: {\"error\":\"registry.ollama.ai/library/gemma3:12b does not support tools\"}"
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "case_id": "normal-profile-ready",
+  "action": "parse_now",
+  "retry_after_seconds": 0,
+  "should_parse": true,
+  "should_requeue": false,
+  "reason": "ready"
+}

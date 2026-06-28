@@ -174,52 +174,6 @@ class YuyuteiGameCodeResolver:
         except Exception:
             logger.exception("Yuyutei code cache store failed query=%s code=%s", query, code)
 
-    def normalize_raw_card_query(self, query: str) -> str | None:
-        """Derive 遊々亭's raw-card search term from a noisy /research price query.
-
-        遊々亭 stocks raw (ungraded) singles, so a query that carries grading +
-        platform + condition noise (e.g.「風に舞う花びらの中で 初音ミク ssp PSA10
-        プロセカ」) makes the search_word miss — HTTP 200 with zero parsed hits
-        (#41). The clean raw-card identity (character / card title / rarity) is an
-        open-world judgement, so the local LLM derives it (Rule G — no keyword
-        list); grading tokens are expected to be stripped by the caller first.
-        Returns the normalized term, or ``None`` when the model is unsure or
-        unavailable so the caller falls back to its own query. Never raises."""
-        try:
-            cleaned = " ".join((query or "").split()).strip()
-            if not cleaned:
-                return None
-            prompt = (
-                "あなたはトレカ検索語の正規化器です。\n"
-                "遊々亭(yuyu-tei.jp)は『生(未鑑定)カード』を在庫します。次の検索語から、"
-                "遊々亭で1枚のカードがヒットするような最小の検索語を作る。\n"
-                "規則:\n"
-                "- キャラ名・カード名・レアリティ(SSP/SR等)は残す。\n"
-                "- 鑑定/状態の語(PSA10・BGS・美品・新品等)とプラットフォーム名"
-                "(プロセカ・ホロライブ等)は除く(版権名は検索を狭めるため)。\n"
-                "- 変更不要ならそのまま返す。判断できなければ null。\n"
-                f"検索語: {cleaned}\n"
-                'JSONのみで答える: {"query": "<正規化した検索語>" または null}'
-            )
-            raw = self._call_raw(prompt)
-            if not raw:
-                return None
-            try:
-                payload = json.loads(raw)
-            except (json.JSONDecodeError, TypeError):
-                match = re.search(r'"query"\s*:\s*"([^"]+)"', raw)
-                payload = {"query": match.group(1)} if match else None
-            if not isinstance(payload, dict):
-                return None
-            value = payload.get("query")
-            if not isinstance(value, str):
-                return None
-            normalized = " ".join(value.split()).strip()
-            return normalized or None
-        except Exception:
-            logger.exception("Yuyutei raw-card query normalize failed query=%s", query)
-            return None
-
     def enrich_cache(self, query: str, titles: Sequence[str]) -> None:
         """Best-effort: from yuyutei listing titles already fetched for *query*
         (which carry the real card number / rarity / set / box name), have the

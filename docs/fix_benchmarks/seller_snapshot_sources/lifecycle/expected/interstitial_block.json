@@ -1,0 +1,8 @@
+{
+  "case_id": "interstitial-block",
+  "action": "cooldown_wait",
+  "retry_after_seconds": 300,
+  "should_parse": false,
+  "should_requeue": true,
+  "reason": "bot_interstitial"
+}

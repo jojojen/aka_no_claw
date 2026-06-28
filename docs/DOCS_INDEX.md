@@ -38,6 +38,15 @@ Full inventory with recommended actions is in [DOC_AUDIT.md](DOC_AUDIT.md).
 | [OPENCLAW_TCG_MONITOR_PLAN.md](OPENCLAW_TCG_MONITOR_PLAN.md) | Needs review | price/tcg | Original monitor plan; verify against current code before relying on it. |
 | [OPPORTUNITY_AGENT_SPEC.md](OPPORTUNITY_AGENT_SPEC.md) | Needs review (canonical: opportunity) | opportunity | Spec for recommendation pipeline; verify thresholds against code. |
 | [OPPORTUNITY_AGENT_HANDOFF.md](OPPORTUNITY_AGENT_HANDOFF.md) | Needs review | opportunity | Companion: operational handoff notes. |
+| [fix_benchmarks/README.md](fix_benchmarks/README.md) | Current | agent-maintenance | Deterministic `/fix` benchmark directory and safety rules for synthetic fixtures. |
+| [fix_benchmarks/price_reference_sources/README.md](fix_benchmarks/price_reference_sources/README.md) | Current | agent-maintenance | Multi-source synthetic price reference parser repair benchmark. |
+| [fix_benchmarks/price_reference_sources/FAILURE_TRACE.md](fix_benchmarks/price_reference_sources/FAILURE_TRACE.md) | Current | agent-maintenance | Reproducible broken-parser attempts and verifier outcomes for the benchmark. |
+| [fix_benchmarks/image_translation_policy/README.md](fix_benchmarks/image_translation_policy/README.md) | Current | agent-maintenance | Public-media benchmark for adaptive OCR/image translation policies. |
+| [fix_benchmarks/seller_snapshot_sources/README.md](fix_benchmarks/seller_snapshot_sources/README.md) | Current | agent-maintenance | Synthetic seller snapshot parser and cooldown lifecycle repair benchmark. |
+| [fix_benchmarks/seller_snapshot_sources/FAILURE_TRACE.md](fix_benchmarks/seller_snapshot_sources/FAILURE_TRACE.md) | Current | agent-maintenance | Reproducible seller snapshot parser and lifecycle failure history. |
+| [fix_benchmarks/seller_snapshot_sources/lifecycle/README.md](fix_benchmarks/seller_snapshot_sources/lifecycle/README.md) | Current | agent-maintenance | Rate-limit and bot-interstitial lifecycle classifier benchmark. |
+| [local_tool_calling_benchmark/README.md](local_tool_calling_benchmark/README.md) | Current | agent-maintenance | Reproducible local Ollama tool-calling benchmark harness. |
+| [local_tool_calling_benchmark/EXPERIMENT_LOG.md](local_tool_calling_benchmark/EXPERIMENT_LOG.md) | Current | agent-maintenance | Local model tool-calling feasibility results and next experiment criteria. |
 
 ## SNS / Reputation / Operations
 

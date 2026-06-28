@@ -1,0 +1,107 @@
+{
+  "timestamp": "2026-06-24T03:21:55.260109+00:00",
+  "model": "qwen3:14b",
+  "live_web": false,
+  "expected_tools": [
+    "list_local_music",
+    "web_search_top_songs",
+    "select_local_song"
+  ],
+  "observed_tools": [
+    {
+      "name": "list_local_music",
+      "arguments": {
+        "query": "米津玄師"
+      },
+      "result": {
+        "count": 2,
+        "matches": [
+          {
+            "name": "01 IRIS OUT",
+            "path": "<music_root>/米津玄師 - IRIS OUT JANE DOE/01 IRIS OUT.flac"
+          },
+          {
+            "name": "02 JANE DOE",
+            "path": "<music_root>/米津玄師 - IRIS OUT JANE DOE/02 JANE DOE.flac"
+          }
+        ]
+      }
+    },
+    {
+      "name": "web_search_top_songs",
+      "arguments": {
+        "artist": "米津玄師"
+      },
+      "result": {
+        "query": "米津玄師 人気曲 ランキング 最新",
+        "results": [
+          {
+            "title": "米津玄師 人気曲 ランキング",
+            "snippet": "Lemon, KICK BACK, LOSER, ピースサインなど。"
+          }
+        ],
+        "live": false
+      }
+    },
+    {
+      "name": "select_local_song",
+      "arguments": {
+        "title": "Lemon"
+      },
+      "result": {
+        "kind": "single",
+        "selected": {
+          "name": "08 Lemon",
+          "path": "<music_root>/STRAY SHEEP/08 Lemon.flac"
+        }
+      }
+    }
+  ],
+  "passed": true,
+  "final_content": "選擇的歌曲是《Lemon》，理由是這首歌是米津玄師的熱門單曲之一，且在本地音樂庫中存在。",
+  "rounds": [
+    {
+      "round": 1,
+      "content": "",
+      "tool_calls": [
+        {
+          "name": "list_local_music",
+          "arguments": {
+            "query": "米津玄師"
+          }
+        }
+      ]
+    },
+    {
+      "round": 2,
+      "content": "",
+      "tool_calls": [
+        {
+          "name": "web_search_top_songs",
+          "arguments": {
+            "artist": "米津玄師"
+          }
+        }
+      ]
+    },
+    {
+      "round": 3,
+      "content": "",
+      "tool_calls": [
+        {
+          "name": "select_local_song",
+          "arguments": {
+            "title": "Lemon"
+          }
+        }
+      ]
+    },
+    {
+      "round": 4,
+      "content": "選擇的歌曲是《Lemon》，理由是這首歌是米津玄師的熱門單曲之一，且在本地音樂庫中存在。",
+      "tool_calls": []
+    }
+  ],
+  "duration_seconds": 13.608,
+  "music_entries": 672
+}

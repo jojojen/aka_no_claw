@@ -34,6 +34,14 @@ TRUTH_DOCS = [
 
 REQUIRED_METADATA = ["Last reviewed:", "Owner area:"]
 
+# Generated benchmark reports are covered by their parent README / experiment
+# log. Requiring every timestamped result to be indexed would make each local
+# benchmark run create doc-governance churn unrelated to system truth.
+GENERATED_REPORT_RE = re.compile(
+    r"^local_tool_calling_benchmark/"
+    r"(latest_results|latest_realistic_probe|results_\d{8}T\d{6}Z|realistic_probe_\d{8}T\d{6}Z)\.md$"
+)
+
 # Docs that index themselves / are pure listings — exempt from "must be indexed".
 INDEX_SELF_EXEMPT = {"DOCS_INDEX.md"}
 
@@ -60,6 +68,8 @@ def check_indexing(errors: list[str]) -> None:
         rel = path.relative_to(DOCS).as_posix()
         if rel in INDEX_SELF_EXEMPT:
             continue
+        if GENERATED_REPORT_RE.match(rel):
+            continue
         if rel not in targets:
             errors.append(f"[A indexing] {rel} is not listed in DOCS_INDEX.md")
 
@@ -69,6 +79,8 @@ def check_metadata(errors: list[str]) -> None:
         rel = path.relative_to(DOCS).as_posix()
         if rel.startswith("archive/"):
             continue  # archive docs are frozen historical snapshots
+        if GENERATED_REPORT_RE.match(rel):
+            continue
         text = path.read_text(encoding="utf-8")
         for field in REQUIRED_METADATA:
             if field not in text:

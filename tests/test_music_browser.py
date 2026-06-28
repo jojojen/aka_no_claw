@@ -64,7 +64,6 @@ def proc_table(monkeypatch):
     monkeypatch.setattr(mc, "_pid_is_player", lambda p: p in state["alive"])
     monkeypatch.setattr(mc, "_pid_start_time", lambda p: state["start"].get(p) if p in state["alive"] else None)
     monkeypatch.setattr(mc, "_terminate", lambda p: (state["killed"].append(p), state["alive"].discard(p)))
-    monkeypatch.setattr(mc, "_verify_playing", lambda p: p in state["alive"])
     yield state
     mc._PLAYBEST.stop()
 

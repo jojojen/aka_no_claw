@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="robots" content="noindex">
+  <title>KNSR fixture listing v3</title>
+  <style>
+    .lab-shell-77 { display: grid; grid-template-columns: 180px 1fr 220px; gap: 14px; }
+    .noise-card__shadow { border: 1px dashed #777; padding: 6px; }
+    .tileDeck__card--primary { border: 2px solid #235; background: #f8fbff; }
+    .fx-priceRow > span { margin-right: 2px; }
+  </style>
+</head>
+<body class="lab-shell-77 env-synthetic hash-b2c92" data-benchmark="price-reference-sources" data-source-code="KNSR" data-source-type="secondary_market">
+  <header>
+    <h1>SYNTHETIC TEST PAGE - NOT A REAL WEBSITE</h1>
+    <strong>KNSR synthetic source</strong>
+    <p>Benchmark fixture only. This page is not affiliated with any real marketplace.</p>
+  </header>
+
+  <main data-page-kind="secondary-market-grid">
+    <aside class="noise-card__shadow">
+      <h2>Related synthetic cards</h2>
+      <a class="tileDeck__card" href="/fixtures/knsr/item/DECOY-0000" aria-label="古い候補 - 999,999円">
+        <span class="tileDeck__title">古い候補を使わない</span>
+        <span class="fx-priceRow"><span>¥</span><span class="fx-productPrice">999,999</span></span>
+        <span class="fx-seller">stale-grid-room</span>
+      </a>
+    </aside>
+
+    <section class="tileDeck tileDeck--search-results" aria-label="synthetic product grid">
+      <a aria-label="星灯りの剣姫 SP [RDX 013/777] - 24,600円"
+         class="tileDeck__card--primary x5_productTile qa-shuffle"
+         data-card-noise="rank:2 previous_price:31000"
+         data-primary-result="true"
+         href="/fixtures/knsr/item/KNSR-2026-0003"
+         data-item-id="KNSR-2026-0003">
+        <div class="tileDeck__media">
+          <img alt="星灯りの剣姫 SP [RDX 013/777]" src="/fixtures/assets/synthetic-card-placeholder.webp" loading="lazy">
+          <span class="badge">SAMPLE</span>
+        </div>
+        <div class="tileDeck__body">
+          <span class="fx-productName">星灯りの剣姫 SP [RDX 013/777]</span>
+          <span class="fx-priceRow">
+            <span class="fx-priceYen">¥</span>
+            <span class="fx-productPrice">24,600</span>
+          </span>
+          <span class="fx-priceKind">Ask</span>
+          <span class="fx-availability">Available</span>
+          <span class="fx-seller">grid-lab-07</span>
+          <span class="fx-condition">Near Mint</span>
+        </div>
+      </a>
+
+      <template id="hydration-decoy">
+        {"source_code":"KNSR","record":{"item_id":"KNSR-OLD","title":"Do not parse template data","price":{"amount":1}}}
+      </template>
+    </section>
+
+    <aside class="noise-card__shadow">
+      <h2>Debug sidebar</h2>
+      <p>Parser should prefer the primary result tile and ignore template data.</p>
+    </aside>
+  </main>
+</body>
+</html>

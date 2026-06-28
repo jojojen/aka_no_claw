@@ -1,0 +1,498 @@
+{
+  "timestamp": "2026-06-24T14:22:41.293961+00:00",
+  "endpoint": "http://127.0.0.1:11434",
+  "models": [
+    "qwen2.5:0.5b",
+    "qwen3:14b"
+  ],
+  "subgoal_gate": true,
+  "summary": {
+    "qwen2.5:0.5b": {
+      "passed": 3,
+      "total": 4,
+      "pass_rate": 0.75,
+      "mean_seconds": 1.141
+    },
+    "qwen3:14b": {
+      "passed": 4,
+      "total": 4,
+      "pass_rate": 1.0,
+      "mean_seconds": 10.32625
+    }
+  },
+  "results": [
+    {
+      "case_id": "zero_tool_greeting",
+      "model": "qwen2.5:0.5b",
+      "passed": true,
+      "expected_tools": [],
+      "observed_tools": [],
+      "final_content": "你好！",
+      "quality_flags": {
+        "leaked_thinking": false,
+        "raw_json_tool_text": false,
+        "invalid_tool_dependency": false
+      },
+      "gate_interventions": [],
+      "rounds": [
+        {
+          "round": 1,
+          "content": "你好！",
+          "thinking_present": false,
+          "tool_calls": []
+        }
+      ],
+      "duration_seconds": 2.831,
+      "error": null
+    },
+    {
+      "case_id": "single_weather_lookup",
+      "model": "qwen2.5:0.5b",
+      "passed": true,
+      "expected_tools": [
+        "get_weather"
+      ],
+      "observed_tools": [
+        {
+          "name": "get_weather",
+          "arguments": {
+            "city": "東京"
+          },
+          "result": {
+            "city": "東京",
+            "condition": "晴れ",
+            "temperature_c": "28",
+            "source": "fixture"
+          }
+        }
+      ],
+      "final_content": "東京現在是晴天，气温為28度。",
+      "quality_flags": {
+        "leaked_thinking": false,
+        "raw_json_tool_text": false,
+        "invalid_tool_dependency": false
+      },
+      "gate_interventions": [],
+      "rounds": [
+        {
+          "round": 1,
+          "content": "",
+          "thinking_present": false,
+          "tool_calls": [
+            {
+              "name": "get_weather",
+              "arguments": {
+                "city": "東京"
+              }
+            }
+          ]
+        },
+        {
+          "round": 2,
+          "content": "東京現在是晴天，气温為28度。",
+          "thinking_present": false,
+          "tool_calls": []
+        }
+      ],
+      "duration_seconds": 0.402,
+      "error": null
+    },
+    {
+      "case_id": "two_step_music_search_then_detail",
+      "model": "qwen2.5:0.5b",
+      "passed": false,
+      "expected_tools": [
+        "search_music",
+        "get_song_detail"
+      ],
+      "observed_tools": [
+        {
+          "name": "search_music",
+          "arguments": {
+            "artist": "米津玄師",
+            "limit": 3
+          },
+          "result": {
+            "artist": "米津玄師",
+            "songs": [
+              {
+                "title": "Lemon",
+                "rank": 1
+              },
+              {
+                "title": "KICK BACK",
+                "rank": 2
+              },
+              {
+                "title": "感電",
+                "rank": 3
+              }
+            ],
+            "source": "fixture"
+          }
+        },
+        {
+          "name": "get_song_detail",
+          "arguments": {
+            "title": "第一首歌"
+          },
+          "result": {
+            "title": "第一首歌",
+            "released": "unknown",
+            "tie_in": "unknown"
+          }
+        }
+      ],
+      "final_content": "米津玄師的最近熱門前三首歌分別是「Lemon」、「KICK BACK」和「感電」。第一名是「Lemon」，排名1；第二名是「KICK BACK」，排名2；第三名是「感電」，排名3。第一首歌的發行資訊尚未確定。",
+      "quality_flags": {
+        "leaked_thinking": false,
+        "raw_json_tool_text": false,
+        "invalid_tool_dependency": true
+      },
+      "gate_interventions": [],
+      "rounds": [
+        {
+          "round": 1,
+          "content": "",
+          "thinking_present": false,
+          "tool_calls": [
+            {
+              "name": "search_music",
+              "arguments": {
+                "artist": "米津玄師",
+                "limit": 3
+              }
+            },
+            {
+              "name": "get_song_detail",
+              "arguments": {
+                "title": "第一首歌"
+              }
+            }
+          ]
+        },
+        {
+          "round": 2,
+          "content": "米津玄師的最近熱門前三首歌分別是「Lemon」、「KICK BACK」和「感電」。第一名是「Lemon」，排名1；第二名是「KICK BACK」，排名2；第三名是「感電」，排名3。第一首歌的發行資訊尚未確定。",
+          "thinking_present": false,
+          "tool_calls": []
+        }
+      ],
+      "duration_seconds": 0.931,
+      "error": null
+    },
+    {
+      "case_id": "tool_after_context_pronoun",
+      "model": "qwen2.5:0.5b",
+      "passed": true,
+      "expected_tools": [
+        "search_music"
+      ],
+      "observed_tools": [
+        {
+          "name": "search_music",
+          "arguments": {
+            "artist": "米津玄師",
+            "limit": 3
+          },
+          "result": {
+            "artist": "米津玄師",
+            "songs": [
+              {
+                "title": "Lemon",
+                "rank": 1
+              },
+              {
+                "title": "KICK BACK",
+                "rank": 2
+              },
+              {
+                "title": "感電",
+                "rank": 3
+              }
+            ],
+            "source": "fixture"
+          }
+        }
+      ],
+      "final_content": "1. Lemon\n2. Kick Back\n3.感電",
+      "quality_flags": {
+        "leaked_thinking": false,
+        "raw_json_tool_text": false,
+        "invalid_tool_dependency": false
+      },
+      "gate_interventions": [],
+      "rounds": [
+        {
+          "round": 1,
+          "content": "",
+          "thinking_present": false,
+          "tool_calls": [
+            {
+              "name": "search_music",
+              "arguments": {
+                "artist": "米津玄師",
+                "limit": 3
+              }
+            }
+          ]
+        },
+        {
+          "round": 2,
+          "content": "1. Lemon\n2. Kick Back\n3.感電",
+          "thinking_present": false,
+          "tool_calls": []
+        }
+      ],
+      "duration_seconds": 0.4,
+      "error": null
+    },
+    {
+      "case_id": "zero_tool_greeting",
+      "model": "qwen3:14b",
+      "passed": true,
+      "expected_tools": [],
+      "observed_tools": [],
+      "final_content": "您好，很高興為您服務！",
+      "quality_flags": {
+        "leaked_thinking": false,
+        "raw_json_tool_text": false,
+        "invalid_tool_dependency": false
+      },
+      "gate_interventions": [],
+      "rounds": [
+        {
+          "round": 1,
+          "content": "您好，很高興為您服務！",
+          "thinking_present": false,
+          "tool_calls": []
+        }
+      ],
+      "duration_seconds": 11.073,
+      "error": null
+    },
+    {
+      "case_id": "single_weather_lookup",
+      "model": "qwen3:14b",
+      "passed": true,
+      "expected_tools": [
+        "get_weather"
+      ],
+      "observed_tools": [
+        {
+          "name": "get_weather",
+          "arguments": {
+            "city": "東京"
+          },
+          "result": {
+            "city": "東京",
+            "condition": "晴れ",
+            "temperature_c": "28",
+            "source": "fixture"
+          }
+        }
+      ],
+      "final_content": "東京現在天氣晴朗，氣溫28攝氏度。",
+      "quality_flags": {
+        "leaked_thinking": false,
+        "raw_json_tool_text": false,
+        "invalid_tool_dependency": false
+      },
+      "gate_interventions": [],
+      "rounds": [
+        {
+          "round": 1,
+          "content": "",
+          "thinking_present": false,
+          "tool_calls": [
+            {
+              "name": "get_weather",
+              "arguments": {
+                "city": "東京"
+              }
+            }
+          ]
+        },
+        {
+          "round": 2,
+          "content": "東京現在天氣晴朗，氣溫28攝氏度。",
+          "thinking_present": false,
+          "tool_calls": []
+        }
+      ],
+      "duration_seconds": 4.532,
+      "error": null
+    },
+    {
+      "case_id": "two_step_music_search_then_detail",
+      "model": "qwen3:14b",
+      "passed": true,
+      "expected_tools": [
+        "search_music",
+        "get_song_detail"
+      ],
+      "observed_tools": [
+        {
+          "name": "search_music",
+          "arguments": {
+            "artist": "米津玄師",
+            "limit": 3
+          },
+          "result": {
+            "artist": "米津玄師",
+            "songs": [
+              {
+                "title": "Lemon",
+                "rank": 1
+              },
+              {
+                "title": "KICK BACK",
+                "rank": 2
+              },
+              {
+                "title": "感電",
+                "rank": 3
+              }
+            ],
+            "source": "fixture"
+          }
+        },
+        {
+          "name": "get_song_detail",
+          "arguments": {
+            "title": "Lemon"
+          },
+          "result": {
+            "title": "Lemon",
+            "released": "2018-03-14",
+            "tie_in": "Unnatural theme song"
+          }
+        }
+      ],
+      "final_content": "1. Lemon  \n2. KICK BACK  \n3. 感電  \n\nLemon 於 2018 年 3 月 14 日發行，並作為電視劇《Unnatural》的主題曲。",
+      "quality_flags": {
+        "leaked_thinking": false,
+        "raw_json_tool_text": false,
+        "invalid_tool_dependency": false
+      },
+      "gate_interventions": [
+        {
+          "after_round": 2,
+          "missing_tools": [
+            "get_song_detail"
+          ],
+          "message": "你尚未完成必要工具 `get_song_detail`。不要編造缺少的資料，請先呼叫下一個必要工具；工具結果回來後再給最終答案。"
+        }
+      ],
+      "rounds": [
+        {
+          "round": 1,
+          "content": "",
+          "thinking_present": false,
+          "tool_calls": [
+            {
+              "name": "search_music",
+              "arguments": {
+                "artist": "米津玄師",
+                "limit": 3
+              }
+            }
+          ]
+        },
+        {
+          "round": 2,
+          "content": "1. Lemon  \n2. KICK BACK  \n3. 感電  \n\nLemon 於 2017 年 12 月 6 日發行。",
+          "thinking_present": false,
+          "tool_calls": []
+        },
+        {
+          "round": 3,
+          "content": "",
+          "thinking_present": false,
+          "tool_calls": [
+            {
+              "name": "get_song_detail",
+              "arguments": {
+                "title": "Lemon"
+              }
+            }
+          ]
+        },
+        {
+          "round": 4,
+          "content": "1. Lemon  \n2. KICK BACK  \n3. 感電  \n\nLemon 於 2018 年 3 月 14 日發行，並作為電視劇《Unnatural》的主題曲。",
+          "thinking_present": false,
+          "tool_calls": []
+        }
+      ],
+      "duration_seconds": 18.74,
+      "error": null
+    },
+    {
+      "case_id": "tool_after_context_pronoun",
+      "model": "qwen3:14b",
+      "passed": true,
+      "expected_tools": [
+        "search_music"
+      ],
+      "observed_tools": [
+        {
+          "name": "search_music",
+          "arguments": {
+            "artist": "米津玄師",
+            "limit": 3
+          },
+          "result": {
+            "artist": "米津玄師",
+            "songs": [
+              {
+                "title": "Lemon",
+                "rank": 1
+              },
+              {
+                "title": "KICK BACK",
+                "rank": 2
+              },
+              {
+                "title": "感電",
+                "rank": 3
+              }
+            ],
+            "source": "fixture"
+          }
+        }
+      ],
+      "final_content": "1. Lemon  \n2. KICK BACK  \n3. 感電",
+      "quality_flags": {
+        "leaked_thinking": false,
+        "raw_json_tool_text": false,
+        "invalid_tool_dependency": false
+      },
+      "gate_interventions": [],
+      "rounds": [
+        {
+          "round": 1,
+          "content": "",
+          "thinking_present": false,
+          "tool_calls": [
+            {
+              "name": "search_music",
+              "arguments": {
+                "artist": "米津玄師",
+                "limit": 3
+              }
+            }
+          ]
+        },
+        {
+          "round": 2,
+          "content": "1. Lemon  \n2. KICK BACK  \n3. 感電",
+          "thinking_present": false,
+          "tool_calls": []
+        }
+      ],
+      "duration_seconds": 6.96,
+      "error": null
+    }
+  ]
+}

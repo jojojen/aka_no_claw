@@ -1,0 +1,9 @@
+{
+  "case_id": "rate-limit-429",
+  "http_status": 429,
+  "headers": {
+    "Retry-After": "600"
+  },
+  "body_text": "SYNTHETIC TEST PAGE - NOT A REAL WEBSITE\nRequest limit reached. Please wait before retrying.",
+  "elapsed_seconds": 4
+}

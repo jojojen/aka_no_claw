@@ -73,11 +73,7 @@ from .knowledge_command import (
     build_knowledge_item_deleters,
 )
 from .source_command import build_source_handler
-from .music_command import (
-    build_music_handler,
-    build_musicdiag_handler,
-    build_musicnowbest_handler,
-)
+from .music_command import build_music_handler, build_musicnowbest_handler
 from .music_browser import build_musiclistall_handler, build_music_callback_handler
 from .bluetooth_command import (
     build_bluetooth_handler,
@@ -92,7 +88,6 @@ from .home_schedule import (
     make_run_slash_command,
 )
 from .home_schedule_command import (
-    begin_label_then_capture,
     build_schedulehome_callback_handler,
     build_schedulehome_handler,
     render_list as render_home_schedule_list,
@@ -418,17 +413,10 @@ class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
         if text is None or not self.is_allowed_chat(chat_id):
             return None
         store = get_home_schedule_store(self._settings.openclaw_home_schedules_path)
-        content = text.strip()
-        # Naming mode (between recurrence selection and command capture): the next
-        # plain message names the schedule, then we drop into command capture.
-        if store.naming_target(chat_id) is not None:
-            if content.startswith("/schedulehome"):
-                return None  # let the user still manage schedules mid-naming
-            reply, markup = begin_label_then_capture(store, chat_id, content)
-            return TelegramTextReplyPlan(ack=None, reply=reply, reply_markup=markup)
         sid = store.capture_target(chat_id)
         if sid is None:
             return None
+        content = text.strip()
         if content in {"完成", "done", "結束"}:
             store.end_capture(chat_id)
             entry = store.get(sid)
@@ -1129,9 +1117,6 @@ def _build_registries(
         seller_snapshot_followup_fn=_build_research_seller_snapshot_followup(settings),
         game_code_resolver_fn=_yuyutei_resolver.resolve if _yuyutei_resolver else None,
         cache_enricher_fn=_yuyutei_resolver.enrich_cache if _yuyutei_resolver else None,
-        query_normalizer_fn=(
-            _yuyutei_resolver.normalize_raw_card_query if _yuyutei_resolver else None
-        ),
         ip_heat_lookup_fn=_build_research_ip_heat_lookup(settings),
         entity_recognizer_fn=build_ollama_entity_recognizer(
             endpoint=settings.openclaw_local_text_endpoint,
@@ -1243,7 +1228,6 @@ def _build_registries(
         "/musiclistall": RegisteredCommand(build_musiclistall_handler(settings)),
         "/musiclistbest": RegisteredCommand(_musiclistbest_handler),
         "/musicnowbest": RegisteredCommand(build_musicnowbest_handler(settings)),
-        "/musicdiag": RegisteredCommand(build_musicdiag_handler(settings)),
         "/musicmute": RegisteredCommand(lambda r, c: mute_music(settings)),
         "/musiclouder": RegisteredCommand(lambda r, c: louder_music(settings)),
         "/musiclower": RegisteredCommand(lambda r, c: lower_music(settings)),

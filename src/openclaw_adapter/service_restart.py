@@ -126,7 +126,7 @@ force_pattern() {{
 }}
 
 # Reclaim a TCP port by killing whatever LISTENs on it. This is the robust
-# backstop for the command bridge: a `pgrep -f` pattern stop
+# backstop for the command bridge / chat-web squatter: a `pgrep -f` pattern stop
 # can miss (a process whose argv differs from the expected pattern), but a port
 # that stays bound means the freshly-launched service can't bind and silently
 # dies with EADDRINUSE — so we reclaim by port, independent of the cmdline.
@@ -244,7 +244,7 @@ count_service() {{
 snapshot() {{
   echo "[$(date '+%H:%M:%S')] $1 snapshot:"
   ps -Ao pid,%cpu,command 2>/dev/null \\
-    | grep -E "openclaw_adapter (price-monitor-service|opportunity-agent|sns-monitor-service|telegram-poll|command-bridge)" \\
+    | grep -E "openclaw_adapter (price-monitor-service|opportunity-agent|sns-monitor-service|telegram-poll|chat-web|command-bridge)" \\
     | grep -v grep \\
     | grep -v "tmux -L $TMUX_SOCKET" \\
     | sed 's/^/    /' || true
@@ -254,7 +254,8 @@ snapshot() {{
 # be called AFTER its definition, or bash errors "snapshot: command not found").
 snapshot "before"
 
-# Non-launchd processes — stop these by command pattern.
+# Non-launchd processes (and the nohup chat-web "squatter" that holds :8780 and
+# blocks launchd's own chat_web from binding) — stop these by command pattern.
 # The launchd-managed services are intentionally absent here: `kickstart -k`
 # below does their kill+relaunch, so pattern-killing them would only race
 # launchd's KeepAlive respawn.
@@ -262,6 +263,7 @@ launchctl remove "local.openclaw.telegram" 2>/dev/null || true
 stop_pattern "telegram" "openclaw_adapter telegram-poll"
 stop_pattern "vite web" "aka_no_claw_web/frontend/node_modules/.bin/vite --host 0.0.0.0"
 stop_pattern "command bridge" "openclaw_adapter command-bridge --lan --port 8781"
+stop_pattern "chat web (nohup squatter)" "openclaw_adapter chat-web --host 0.0.0.0 --port 8780"
 stop_pattern "reputation snapshot" "reputation_snapshot/.venv/bin/python app.py"
 stop_pattern "scrape workers" "openclaw_adapter.scrape_worker"
 stop_pattern "playwright drivers" "related_to_claw/.*/playwright/driver/package/cli.js run-driver"
@@ -271,14 +273,19 @@ sleep 3
 force_pattern "telegram" "openclaw_adapter telegram-poll"
 force_pattern "vite web" "aka_no_claw_web/frontend/node_modules/.bin/vite --host 0.0.0.0"
 force_pattern "command bridge" "openclaw_adapter command-bridge --lan --port 8781"
+force_pattern "chat web (nohup squatter)" "openclaw_adapter chat-web --host 0.0.0.0 --port 8780"
 force_pattern "reputation snapshot" "reputation_snapshot/.venv/bin/python app.py"
 force_pattern "scrape workers" "openclaw_adapter.scrape_worker"
 force_pattern "playwright drivers" "related_to_claw/.*/playwright/driver/package/cli.js run-driver"
+
+# Reclaim the launchd chat_web port before kickstart so launchd's instance binds.
+free_port "chat web" 8780
 
 # launchd-managed services: one clean instance each via kickstart (NOT nohup).
 kickstart_service "price_monitor"
 kickstart_service "sns_monitor"
 kickstart_service "opportunity"
+kickstart_service "chat_web"
 
 # Give launchd a moment to relaunch + register the new PIDs, then kill any
 # ORPHAN duplicates of the managed workers (aka_no_claw#40): kickstart only
@@ -288,6 +295,7 @@ sleep 2
 reap_orphans "price_monitor" "openclaw_adapter price-monitor-service"
 reap_orphans "sns_monitor" "openclaw_adapter sns-monitor-service"
 reap_orphans "opportunity" "openclaw_adapter opportunity-agent"
+reap_orphans "chat_web" "openclaw_adapter chat-web"
 
 # Reclaim the bridge port before relaunch: the pattern stop above can miss the
 # running bridge, and a still-bound :8781 makes the fresh bridge die on
@@ -315,6 +323,7 @@ count_service "price_monitor" "openclaw_adapter price-monitor-service"
 count_service "sns_monitor" "openclaw_adapter sns-monitor-service"
 count_service "opportunity" "openclaw_adapter opportunity-agent"
 count_service "telegram" "python.*openclaw_adapter telegram-poll"
+count_service "chat_web" "openclaw_adapter chat-web"
 count_service "command bridge" "python.*openclaw_adapter command-bridge --lan --port 8781"
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] restartall finished"
 """
