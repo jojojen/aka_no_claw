@@ -402,6 +402,110 @@ def _opt_str(value: object) -> str | None:
     return text or None
 
 
+# --- Music intent fast-path (issue #49) ----------------------------------
+# A deterministic keyword layer that fires BEFORE the LLM router for obvious
+# natural-language music requests.  It maps only to a closed set of allowlisted
+# actions and never executes arbitrary slash commands.
+#
+# Issue #50 extends this with a bounded multi-step plan action (MUSIC_ACTION_PLAN)
+# for requests that contain an external-context qualifier such as 熱門/最新.
+MUSIC_ACTION_RANDOM = "play_random"
+MUSIC_ACTION_PLAY_QUERY = "play_query"
+MUSIC_ACTION_STOP = "stop"
+MUSIC_ACTION_NOW = "now"
+MUSIC_ACTION_LIST_ALL = "list_all"
+MUSIC_ACTION_LIST_FAVORITES = "list_favorites"
+MUSIC_ACTION_PLAN = "plan"         # bounded multi-tool plan (#50)
+_MUSIC_ACTIONS = frozenset({
+    MUSIC_ACTION_RANDOM, MUSIC_ACTION_PLAY_QUERY, MUSIC_ACTION_STOP,
+    MUSIC_ACTION_NOW, MUSIC_ACTION_LIST_ALL, MUSIC_ACTION_LIST_FAVORITES,
+    MUSIC_ACTION_PLAN,
+})
+
+# Qualifiers that signal the user wants external-context information (e.g.
+# popularity / latest release) before selecting a local song.  Presence of any
+# of these in a play-style request triggers the multi-step plan path (#50).
+_MUSIC_PLAN_QUALIFIER_RE = re.compile(
+    r"(熱門|最新|代表曲|推薦|人氣|知名|好聽|有名|名曲|popular|最近|新出|新曲)",
+    re.IGNORECASE,
+)
+# Detect "播/播放/放 <artist> <qualifier>" without requiring spaces (Chinese text
+# normally omits them).  The non-greedy (.+?) stops at the first qualifier so
+# the captured group is just the artist / keyword portion.
+_MUSIC_PLAN_RE = re.compile(
+    r"^(?:播放?|播|放)\s*(.+?)\s*(?:熱門|最新|代表曲|推薦|人氣|知名|好聽|有名|名曲|popular|最近|新出|新曲)"
+    r"(?:單曲|歌曲|歌)?$",
+    re.IGNORECASE,
+)
+
+# Simple one-intent patterns ordered most-specific first; PLAY_QUERY last.
+_MUSIC_FAST_PATH_RE: list[tuple[re.Pattern[str], str, int]] = [
+    # play_random — generic "play a song" without a specific title
+    (re.compile(
+        r"^(?:播放?|放|來)(?:一首|隨機|個)(?:歌|音樂|曲子)?$"
+        r"|^隨機(?:播放|選歌|播歌)?$|^播歌$"
+    ), MUSIC_ACTION_RANDOM, 0),
+    # stop
+    (re.compile(
+        r"^(?:停止(?:音樂|播放|播歌)?|停播|音樂停|停掉(?:音樂|播放)?|暫停(?:音樂|播放)?)$"
+    ), MUSIC_ACTION_STOP, 0),
+    # now playing
+    (re.compile(
+        r"(?:現在|正在|目前)(?:播|放)(?:的|什麼|啥)?|播什麼|在播啥"
+    ), MUSIC_ACTION_NOW, 0),
+    # list all songs
+    (re.compile(
+        r"列出?(?:所有|全部)?歌曲|有(?:什麼|哪些)歌|打開音樂清單|音樂清單|歌曲列表|可以播(?:放)?的歌"
+    ), MUSIC_ACTION_LIST_ALL, 0),
+    # list favorites
+    (re.compile(
+        r"列出?最愛|我的歌單|最愛歌曲|收藏(?:歌曲|清單)|最愛清單"
+    ), MUSIC_ACTION_LIST_FAVORITES, 0),
+    # play_query — specific title/artist (last so generic patterns win first)
+    (re.compile(r"^(?:播放|播|放)\s*(.+)$"), MUSIC_ACTION_PLAY_QUERY, 1),
+]
+
+
+@dataclass(frozen=True, slots=True)
+class MusicIntent:
+    """A resolved music action from the fast-path detector.
+
+    ``action`` is always one of the ``MUSIC_ACTION_*`` constants.
+    ``query`` is the song/artist search text (PLAY_QUERY, PLAN only).
+    ``qualifier`` is the external-context word that triggered the plan path
+    (e.g. ``"熱門"``; PLAN only).
+    """
+    action: str
+    query: str = ""
+    qualifier: str = ""
+
+
+def detect_music_intent(text: str) -> MusicIntent | None:
+    """Deterministic fast-path: parse natural-language music requests into a
+    bounded ``MusicIntent`` before the LLM router runs.
+
+    Checks the multi-tool plan path first (qualifier words like 熱門/最新 override
+    plain play_query so the bridge knows to fetch external context before
+    selecting a song).  Falls back to the simple one-step patterns.  Returns
+    ``None`` when nothing matches so the caller passes through to the LLM router.
+    """
+    t = (text or "").strip()
+    # Plan path first: "播放 <artist> 熱門單曲" style requests
+    m = _MUSIC_PLAN_RE.match(t)
+    if m:
+        artist = m.group(1).strip()
+        qm = _MUSIC_PLAN_QUALIFIER_RE.search(t)
+        qualifier = qm.group(1) if qm else "熱門"
+        return MusicIntent(action=MUSIC_ACTION_PLAN, query=artist, qualifier=qualifier)
+    # Simple one-step fast-path
+    for pattern, action, group in _MUSIC_FAST_PATH_RE:
+        mm = pattern.search(t)
+        if mm:
+            query = mm.group(group).strip() if group else ""
+            return MusicIntent(action=action, query=query)
+    return None
+
+
 # --- Chat tool typed envelope (issue #46) --------------------------------
 # A small typed layer between CommandBridge and individual tool executors so
 # each tool does not reimplment its own validation, budget enforcement, banner

@@ -24,6 +24,13 @@ from openclaw_adapter.command_bridge_models import (
     CHAT_TOOL_SEARCH,
     MAX_HISTORY_TURNS,
     MAX_ROUTER_QUERY_LEN,
+    MUSIC_ACTION_LIST_ALL,
+    MUSIC_ACTION_LIST_FAVORITES,
+    MUSIC_ACTION_NOW,
+    MUSIC_ACTION_PLAN,
+    MUSIC_ACTION_PLAY_QUERY,
+    MUSIC_ACTION_RANDOM,
+    MUSIC_ACTION_STOP,
     ChatToolPolicy,
     ChatToolRequest,
     ChatToolResult,
@@ -31,6 +38,7 @@ from openclaw_adapter.command_bridge_models import (
     MODE_CHAT,
     MODE_INVESTMENT,
     MODE_TRANSLATION,
+    MusicIntent,
     ROUTER_DECISION_DIRECT,
     ROUTER_DECISION_TOOL,
     RouterDecision,
@@ -42,6 +50,7 @@ from openclaw_adapter.command_bridge_models import (
     SUBMODE_SELLER_REPUTATION_SNAPSHOT,
     SUBMODE_TEXT_TRANSLATION,
     RequestValidationError,
+    detect_music_intent,
     make_chat_tool_request,
     parse_request,
     parse_router_decision,
@@ -489,6 +498,8 @@ def _tool_settings(debug: bool = False):
         openclaw_local_text_endpoint="http://local",
         openclaw_local_text_timeout_seconds=60,
         openclaw_opencode_model="big-pickle",
+        openclaw_music_dir="/tmp/test_music",
+        openclaw_music_index_path="/tmp/test_music_index.json",
     )
 
 
@@ -1459,3 +1470,293 @@ def test_exec_grounded_search_source_count(monkeypatch):
     assert isinstance(result, ChatToolResult)
     assert result.source_count == 2
     assert "sources=2" in result.result_summary
+
+
+# --- Issue #49: music fast-path detection ---------------------------------
+
+@pytest.mark.parametrize("text,expected_action,expected_query", [
+    ("播放一首歌", MUSIC_ACTION_RANDOM, ""),
+    ("放一首", MUSIC_ACTION_RANDOM, ""),
+    ("隨機播放", MUSIC_ACTION_RANDOM, ""),
+    ("播歌", MUSIC_ACTION_RANDOM, ""),
+    ("停止音樂", MUSIC_ACTION_STOP, ""),
+    ("停播", MUSIC_ACTION_STOP, ""),
+    ("現在播什麼", MUSIC_ACTION_NOW, ""),
+    ("正在播的是什麼", MUSIC_ACTION_NOW, ""),
+    ("列出歌曲", MUSIC_ACTION_LIST_ALL, ""),
+    ("可以播放的歌", MUSIC_ACTION_LIST_ALL, ""),
+    ("列出最愛", MUSIC_ACTION_LIST_FAVORITES, ""),
+    ("我的歌單", MUSIC_ACTION_LIST_FAVORITES, ""),
+    ("播放 One Last Kiss", MUSIC_ACTION_PLAY_QUERY, "One Last Kiss"),
+    ("播放Lemon", MUSIC_ACTION_PLAY_QUERY, "Lemon"),
+    ("播 KICK BACK", MUSIC_ACTION_PLAY_QUERY, "KICK BACK"),
+])
+def test_detect_music_intent_simple(text, expected_action, expected_query):
+    intent = detect_music_intent(text)
+    assert intent is not None, f"expected intent for {text!r}"
+    assert intent.action == expected_action
+    if expected_query:
+        assert intent.query == expected_query
+
+
+@pytest.mark.parametrize("text", [
+    "幫我查今天天氣",
+    "初音未來是誰",
+    "",
+    "   ",
+])
+def test_detect_music_intent_returns_none_for_non_music(text):
+    assert detect_music_intent(text) is None
+
+
+def test_detect_music_intent_plan_qualifier():
+    intent = detect_music_intent("播放米津玄師熱門單曲")
+    assert intent is not None
+    assert intent.action == MUSIC_ACTION_PLAN
+    assert intent.query == "米津玄師"
+    assert intent.qualifier == "熱門"
+
+
+def test_detect_music_intent_plan_latest():
+    intent = detect_music_intent("播放 YOASOBI 最新歌曲")
+    assert intent is not None
+    assert intent.action == MUSIC_ACTION_PLAN
+    assert intent.query == "YOASOBI"
+    assert intent.qualifier == "最新"
+
+
+def test_detect_music_intent_plan_does_not_match_simple_title():
+    # "One Last Kiss" has no qualifier → simple play_query
+    intent = detect_music_intent("播放 One Last Kiss")
+    assert intent is not None
+    assert intent.action == MUSIC_ACTION_PLAY_QUERY
+    assert intent.query == "One Last Kiss"
+
+
+def test_chat_random_play_dispatches_to_music_command(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    called = {}
+
+    def _mock_run_music_command(text):
+        called["text"] = text
+        return {"status": STATUS_OK, "message": "🎵 Now playing: ランダム曲", "actions": []}
+
+    monkeypatch.setattr(b, "run_music_command", _mock_run_music_command)
+    resp = b.handle(parse_request({"mode": "chat", "input": "播放一首歌"}))
+    assert resp.status == STATUS_OK
+    assert called["text"] == "random"
+    assert "ランダム曲" in resp.message
+
+
+def test_chat_play_query_passes_song_name(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    called = {}
+
+    def _mock_run_music_command(text):
+        called["text"] = text
+        return {"status": STATUS_OK, "message": f"▶️ {text}", "actions": []}
+
+    monkeypatch.setattr(b, "run_music_command", _mock_run_music_command)
+    resp = b.handle(parse_request({"mode": "chat", "input": "播放 One Last Kiss"}))
+    assert resp.status == STATUS_OK
+    assert called["text"] == "One Last Kiss"
+    assert "One Last Kiss" in resp.message
+
+
+def test_chat_stop_music(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(b, "run_music_command",
+                        lambda t: {"status": STATUS_OK, "message": "⏹ 已停止", "actions": []})
+    resp = b.handle(parse_request({"mode": "chat", "input": "停止音樂"}))
+    assert resp.status == STATUS_OK
+    assert "已停止" in resp.message
+
+
+def test_chat_list_all_returns_actions(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    markup_actions = [{"label": "🎵 Song A", "callback_data": "music:sd:tokA"}]
+    monkeypatch.setattr(b, "run_music_action",
+                        lambda cb: {"status": STATUS_OK, "message": "📁 全部歌曲", "actions": markup_actions})
+    resp = b.handle(parse_request({"mode": "chat", "input": "列出歌曲"}))
+    assert resp.status == STATUS_OK
+    assert "全部歌曲" in resp.message
+    assert len(resp.actions) == 1
+    assert resp.actions[0].label == "🎵 Song A"
+    assert resp.actions[0].command == "music:sd:tokA"
+
+
+def test_chat_music_bypasses_llm_router(monkeypatch):
+    """Music fast-path must not invoke the LLM router at all."""
+    b = CommandBridge(settings=_tool_settings())
+    router_called = []
+    monkeypatch.setattr(b, "_route_chat_decision", lambda req: router_called.append(1) or None)
+    monkeypatch.setattr(b, "run_music_command",
+                        lambda t: {"status": STATUS_OK, "message": "ok", "actions": []})
+    b.handle(parse_request({"mode": "chat", "input": "停播"}))
+    assert not router_called, "LLM router must not be called for music intents"
+
+
+def test_stream_chat_music_emits_done(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(b, "run_music_command",
+                        lambda t: {"status": STATUS_OK, "message": "🎵 Playing", "actions": []})
+    events = list(b.stream(parse_request({"mode": "chat", "input": "播歌"}), "rid-m"))
+    assert events[0]["type"] == "start"
+    assert events[-1] == {"type": "done", "message": "🎵 Playing"}
+
+
+# --- Issue #50: bounded multi-tool music plan ----------------------------
+
+def _make_music_index_entry(name: str) -> dict:
+    return {"name": name, "path": f"/music/{name}.flac", "folder": "root"}
+
+
+def _make_index(names: list[str]):
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        entries=[_make_music_index_entry(n) for n in names],
+        signature="sig",
+        rebuilt=False,
+    )
+
+
+def _make_web_result(title: str, snippet: str = ""):
+    return SimpleNamespace(title=title, snippet=snippet, url=f"https://example.com/{title}")
+
+
+def test_music_plan_plays_single_web_matched_song(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+
+    monkeypatch.setattr(
+        "openclaw_adapter.music_command.load_or_build_index",
+        lambda music_dir, index_path: _make_index(["JANE DOE", "Lemon", "One Last Kiss"]),
+    )
+    monkeypatch.setattr(
+        "openclaw_adapter.web_search.web_search",
+        lambda q, *, max_results, reuse_browser: [
+            _make_web_result("JANE DOE - 米津玄師", "Popular single"),
+        ],
+    )
+    played = {}
+    monkeypatch.setattr(b, "run_music_command",
+                        lambda t: played.update({"title": t}) or
+                        {"status": STATUS_OK, "message": f"▶️ {t}", "actions": []})
+
+    intent = MusicIntent(action=MUSIC_ACTION_PLAN, query="米津玄師", qualifier="熱門")
+    resp = b._exec_music_intent(parse_request({"mode": "chat", "input": "x"}), intent)
+    assert resp.status == STATUS_OK
+    assert played.get("title") == "JANE DOE"
+    assert "JANE DOE" in resp.message
+    assert "Goal:" in resp.message   # plan trace present
+
+
+def test_music_plan_asks_when_multiple_matched(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+
+    monkeypatch.setattr(
+        "openclaw_adapter.music_command.load_or_build_index",
+        lambda music_dir, index_path: _make_index(["JANE DOE", "Lemon", "One Last Kiss"]),
+    )
+    # Both JANE DOE and Lemon appear in the web results
+    monkeypatch.setattr(
+        "openclaw_adapter.web_search.web_search",
+        lambda q, *, max_results, reuse_browser: [
+            _make_web_result("JANE DOE + Lemon 米津玄師 比較", "both popular"),
+        ],
+    )
+    monkeypatch.setattr(b, "run_music_command",
+                        lambda t: {"status": STATUS_OK, "message": f"▶️ {t}", "actions": []})
+
+    intent = MusicIntent(action=MUSIC_ACTION_PLAN, query="米津玄師", qualifier="熱門")
+    resp = b._exec_music_intent(parse_request({"mode": "chat", "input": "x"}), intent)
+    assert resp.status == STATUS_OK
+    assert "請問您想播哪一首" in resp.message
+    # Both candidates should be mentioned
+    assert "JANE DOE" in resp.message
+    assert "Lemon" in resp.message
+
+
+def test_music_plan_empty_library_returns_message(monkeypatch):
+    """Empty local library → no candidates → early return with artist name."""
+    b = CommandBridge(settings=_tool_settings())
+
+    monkeypatch.setattr(
+        "openclaw_adapter.music_command.load_or_build_index",
+        lambda music_dir, index_path: _make_index([]),
+    )
+    monkeypatch.setattr(
+        "openclaw_adapter.web_search.web_search",
+        lambda q, *, max_results, reuse_browser: [],
+    )
+
+    intent = MusicIntent(action=MUSIC_ACTION_PLAN, query="存在しない", qualifier="最新")
+    resp = b._exec_music_intent(parse_request({"mode": "chat", "input": "x"}), intent)
+    assert resp.status == STATUS_OK
+    assert "存在しない" in resp.message
+
+
+def test_music_plan_no_web_confirmed_match_presents_local_candidates(monkeypatch):
+    """If local songs exist but none appear in web results, show local candidates."""
+    b = CommandBridge(settings=_tool_settings())
+
+    monkeypatch.setattr(
+        "openclaw_adapter.music_command.load_or_build_index",
+        lambda music_dir, index_path: _make_index(["KICK BACK", "Chainsaw Man OST"]),
+    )
+    # Web results mention an unrelated artist
+    monkeypatch.setattr(
+        "openclaw_adapter.web_search.web_search",
+        lambda q, *, max_results, reuse_browser: [
+            _make_web_result("米津玄師 KICK BACK", "Chainsaw Man OP"),
+        ],
+    )
+    monkeypatch.setattr(b, "run_music_command",
+                        lambda t: {"status": STATUS_OK, "message": f"▶️ {t}", "actions": []})
+
+    intent = MusicIntent(action=MUSIC_ACTION_PLAN, query="米津玄師", qualifier="代表曲")
+    resp = b._exec_music_intent(parse_request({"mode": "chat", "input": "x"}), intent)
+    assert resp.status == STATUS_OK
+    # KICK BACK appears in web text → single match → played
+    assert "KICK BACK" in resp.message
+
+
+def test_music_plan_guardrails_no_arbitrary_commands(monkeypatch):
+    """Arbitrary slash commands must not be reachable through the plan path."""
+    b = CommandBridge(settings=_tool_settings())
+
+    monkeypatch.setattr(
+        "openclaw_adapter.music_command.load_or_build_index",
+        lambda music_dir, index_path: _make_index([]),
+    )
+    monkeypatch.setattr(
+        "openclaw_adapter.web_search.web_search",
+        lambda q, *, max_results, reuse_browser: [],
+    )
+
+    # Even if an attacker crafts a qualifier like /exec or arbitrary text, the
+    # plan only dispatches through run_music_command with the matched song title —
+    # it never runs arbitrary slash commands.
+    intent = MusicIntent(action=MUSIC_ACTION_PLAN, query="/exec rm -rf /", qualifier="熱門")
+    resp = b._exec_music_intent(parse_request({"mode": "chat", "input": "x"}), intent)
+    # Response should be safe — either "not found" message or asks to choose.
+    assert resp.status == STATUS_OK
+    # Must NOT contain any sign of command execution success
+    assert "rm" not in resp.message or "找不到" in resp.message
+
+
+def test_rank_local_by_web_mentions():
+    from types import SimpleNamespace
+
+    local = [
+        {"name": "JANE DOE", "path": "/a.flac"},
+        {"name": "Lemon", "path": "/b.flac"},
+        {"name": "Pale Blue", "path": "/c.flac"},
+    ]
+    web = [
+        SimpleNamespace(title="JANE DOE 米津玄師 MV", snippet="大ヒット曲"),
+        SimpleNamespace(title="Lemon 歌詞", snippet="JANE DOE も人気"),
+    ]
+    result = CommandBridge._rank_local_by_web_mentions(local, web)
+    assert [c["name"] for c in result] == ["JANE DOE", "Lemon"]
+    # Pale Blue has no web mention → excluded
+    assert all(c["name"] != "Pale Blue" for c in result)

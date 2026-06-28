@@ -36,6 +36,14 @@ from .command_bridge_models import (
     CHAT_BACKEND_CLOUD_PICKLE,
     CHAT_BACKEND_LOCAL,
     CHAT_TOOL_SEARCH,
+    MUSIC_ACTION_LIST_ALL,
+    MUSIC_ACTION_LIST_FAVORITES,
+    MUSIC_ACTION_NOW,
+    MUSIC_ACTION_PLAN,
+    MUSIC_ACTION_PLAY_QUERY,
+    MUSIC_ACTION_RANDOM,
+    MUSIC_ACTION_STOP,
+    Action,
     ChatToolPolicy,
     ChatToolRequest,
     ChatToolResult,
@@ -43,6 +51,7 @@ from .command_bridge_models import (
     MODE_CHAT,
     MODE_INVESTMENT,
     MODE_TRANSLATION,
+    MusicIntent,
     ROUTER_DECISION_TOOL,
     RouterDecision,
     STATUS_ERROR,
@@ -54,6 +63,7 @@ from .command_bridge_models import (
     SUBMODE_TEXT_TRANSLATION,
     WebCommandRequest,
     WebCommandResponse,
+    detect_music_intent,
     make_chat_tool_request,
     parse_router_decision,
     stream_delta,
@@ -433,10 +443,24 @@ class CommandBridge:
 
     # --- chat ------------------------------------------------------------
     def _handle_chat_blocking(self, req: WebCommandRequest) -> WebCommandResponse:
-        if not (req.input or "").strip():
+        text = (req.input or "").strip()
+        if not text:
             return WebCommandResponse(
                 status=STATUS_ERROR, message="請輸入訊息。", mode=MODE_CHAT
             )
+        # Music fast-path (#49/#50): fires before the LLM router for obvious music
+        # intents so there is no LLM round-trip for "播放一首歌" / "停止音樂" etc.
+        music_intent = detect_music_intent(text)
+        if music_intent is not None:
+            try:
+                return self._exec_music_intent(req, music_intent)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("music intent failed action=%s", music_intent.action)
+                return WebCommandResponse(
+                    status=STATUS_ERROR,
+                    message=f"音樂操作失敗：{exc}",
+                    mode=MODE_CHAT,
+                )
         decision = self._route_chat_decision(req)
         if decision is not None and decision.decision == ROUTER_DECISION_TOOL:
             try:
@@ -471,8 +495,23 @@ class CommandBridge:
         return WebCommandResponse(status=STATUS_OK, message=message, mode=MODE_CHAT)
 
     def _stream_chat(self, req: WebCommandRequest) -> Iterator[dict]:
-        if not (req.input or "").strip():
+        text = (req.input or "").strip()
+        if not text:
             yield stream_error("請輸入訊息。")
+            return
+        # Music fast-path (#49/#50)
+        music_intent = detect_music_intent(text)
+        if music_intent is not None:
+            try:
+                resp = self._exec_music_intent(req, music_intent)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("music intent failed action=%s", music_intent.action)
+                yield stream_error(f"音樂操作失敗：{exc}")
+                return
+            if resp.status == STATUS_ERROR:
+                yield stream_error(resp.message)
+            else:
+                yield stream_done(resp.message)
             return
         decision = self._route_chat_decision(req)
         if decision is not None and decision.decision == ROUTER_DECISION_TOOL:
@@ -483,6 +522,189 @@ class CommandBridge:
             yield from self._stream_cloud_chat(prompt)
         else:
             yield from self._stream_ollama_chat(prompt)
+
+    # --- music intent fast-path (#49 / #50) ---------------------------------
+    def _exec_music_intent(
+        self, req: WebCommandRequest, intent: MusicIntent
+    ) -> WebCommandResponse:
+        """Dispatch a music intent to the appropriate bridge method.
+
+        Simple intents (#49) call run_music_command / run_music_action directly.
+        The PLAN action (#50) runs a bounded multi-step flow that inspects the
+        local library and searches for external popularity context before playing.
+        Never executes arbitrary slash commands — only the closed MUSIC_ACTION_*
+        set is reachable here."""
+        logger.info(
+            "[music-intent] action=%s query=%r qualifier=%r",
+            intent.action, intent.query, intent.qualifier,
+        )
+        if intent.action == MUSIC_ACTION_PLAN:
+            return self._exec_music_plan(req, intent)
+        if intent.action == MUSIC_ACTION_RANDOM:
+            result = self.run_music_command("random")
+        elif intent.action == MUSIC_ACTION_PLAY_QUERY:
+            result = self.run_music_command(intent.query)
+        elif intent.action == MUSIC_ACTION_STOP:
+            result = self.run_music_command("stop")
+        elif intent.action == MUSIC_ACTION_NOW:
+            result = self.run_music_command("now")
+        elif intent.action == MUSIC_ACTION_LIST_ALL:
+            result = self.run_music_action("music:ls:root:0")
+        elif intent.action == MUSIC_ACTION_LIST_FAVORITES:
+            result = self.run_music_action("pg:mb:0:r")
+        else:
+            raise ValueError(f"unknown music action: {intent.action!r}")
+        actions = tuple(
+            Action(label=str(a.get("label", "")), command=str(a.get("callback_data", "")))
+            for a in result.get("actions", [])
+            if a.get("label") and a.get("callback_data")
+        )
+        return WebCommandResponse(
+            status=result.get("status", STATUS_OK),
+            message=result.get("message", ""),
+            mode=MODE_CHAT,
+            actions=actions,
+        )
+
+    def _exec_music_plan(
+        self, req: WebCommandRequest, intent: MusicIntent
+    ) -> WebCommandResponse:
+        """Bounded multi-tool plan (#50): local library inspection → web search →
+        match → play or ask for confirmation.
+
+        The plan trace is embedded in the response message so it is visible to
+        the user and testable without a separate log sink.  Only local songs that
+        appear in the web search results are eligible for playback; the bridge
+        never plays a song that is absent from the local library."""
+        from .music_command import _search, load_or_build_index
+        from .web_search import DEFAULT_WEB_SEARCH_LIMIT, web_search
+
+        artist = intent.query
+        qualifier = intent.qualifier
+        plan_trace: list[str] = [
+            f"Goal: play a {qualifier} song by {artist!r} available locally",
+        ]
+
+        # Task 1 — local candidate lookup
+        # First try matching the artist name directly against song titles (covers
+        # libraries where files are named "Artist - Song" or "Artist Song"). When
+        # that yields nothing (titles are song-only, like "JANE DOE.flac"), fall
+        # back to all entries: the web-ranking step in Task 3 will filter to only
+        # songs that web results associate with this artist.
+        plan_trace.append(f"Task 1: inspect local music candidates for {artist!r}")
+        try:
+            index = load_or_build_index(
+                self.settings.openclaw_music_dir,
+                self.settings.openclaw_music_index_path,
+            )
+            local_sr = _search(index.entries, artist)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[music-plan] index load failed: %s", exc)
+            index = None
+            local_sr = None
+        if index is None or not index.entries:
+            plan_trace.append("Task 1 result: local music library is empty or unavailable")
+            msg = (
+                f"本地音樂庫中找不到「{artist}」的歌曲。\n\n"
+                + "\n".join(plan_trace)
+            )
+            return WebCommandResponse(status=STATUS_OK, message=msg, mode=MODE_CHAT)
+        if local_sr is not None and local_sr.kind != "none":
+            local_candidates: list[dict] = (
+                [local_sr.entry]
+                if local_sr.kind in ("exact", "single") and local_sr.entry
+                else list(local_sr.candidates)
+            )
+        else:
+            # Artist name not in song titles — rank ALL local entries against web
+            # results so songs by this artist (confirmed by web mentions) bubble up.
+            local_candidates = list(index.entries)
+        plan_trace.append(
+            f"Task 1 result: {len(local_candidates)} local candidate(s): "
+            + "、".join(c.get("name", "?") for c in local_candidates[:5])
+        )
+
+        # Task 2 — external web search for popularity context
+        search_query = f"{artist} {qualifier} シングル"
+        plan_trace.append(f"Task 2: search for {search_query!r}")
+        try:
+            web_results = web_search(
+                search_query, max_results=DEFAULT_WEB_SEARCH_LIMIT, reuse_browser=False
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[music-plan] web search failed: %s", exc)
+            web_results = []
+        plan_trace.append(f"Task 2 result: {len(web_results)} web result(s)")
+
+        # Task 3 — match web results against local candidates
+        plan_trace.append("Task 3: match search results against local candidates")
+        matched = self._rank_local_by_web_mentions(local_candidates, web_results)
+        plan_trace.append(
+            f"Task 3 result: {len(matched)} matched: "
+            + "、".join(c.get("name", "?") for c in matched[:5])
+        )
+
+        # Task 4 — play or ask for confirmation
+        if not matched:
+            # No web-confirmed match — list local candidates for the user to pick
+            candidates_text = "、".join(c.get("name", "?") for c in local_candidates[:5])
+            plan_trace.append(
+                "Task 4: no web-confirmed match; presenting local candidates"
+            )
+            msg = (
+                f"找到以下「{artist}」歌曲，但無法從搜尋結果確認哪首最{qualifier}：\n"
+                f"{candidates_text}\n\n"
+                "請問您想播哪一首？\n\n"
+                + "\n".join(plan_trace)
+            )
+            return WebCommandResponse(status=STATUS_OK, message=msg, mode=MODE_CHAT)
+        if len(matched) == 1:
+            selected = matched[0]["name"]
+            plan_trace.append(f"Task 4: play selected local match: {selected!r}")
+            play_result = self.run_music_command(selected)
+            msg = (
+                f"🎵 {play_result.get('message', '')}\n\n"
+                + "\n".join(plan_trace)
+            )
+            return WebCommandResponse(
+                status=play_result.get("status", STATUS_OK),
+                message=msg,
+                mode=MODE_CHAT,
+            )
+        # Multiple plausible matches — ask the user
+        candidates_text = "、".join(c.get("name", "?") for c in matched[:5])
+        plan_trace.append(
+            f"Task 4: multiple matches ({len(matched)}); asking user to choose"
+        )
+        msg = (
+            f"找到多首「{artist}」{qualifier}候選歌曲：\n{candidates_text}\n\n"
+            "請問您想播哪一首？\n\n"
+            + "\n".join(plan_trace)
+        )
+        return WebCommandResponse(status=STATUS_OK, message=msg, mode=MODE_CHAT)
+
+    @staticmethod
+    def _rank_local_by_web_mentions(
+        local_candidates: list[dict], web_results: list
+    ) -> list[dict]:
+        """Rank local songs by mentions in web search result titles/snippets.
+
+        Only songs that appear at least once in the web text are returned, ordered
+        by mention count descending (most-mentioned = most-popular proxy)."""
+        from .music_command import _normalize
+
+        web_text = " ".join(
+            (_normalize(r.title or "") + " " + _normalize(r.snippet or ""))
+            for r in web_results
+        )
+        scored: list[tuple[int, dict]] = []
+        for c in local_candidates:
+            norm_name = _normalize(c.get("name", ""))
+            if norm_name and norm_name in web_text:
+                count = web_text.count(norm_name)
+                scored.append((count, c))
+        scored.sort(key=lambda x: -x[0])
+        return [c for _, c in scored]
 
     # --- chat tool routing (#45) -----------------------------------------
     def _route_chat_decision(self, req: WebCommandRequest) -> RouterDecision | None:
