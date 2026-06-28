@@ -797,10 +797,15 @@ class CommandBridge:
         front (so the user can see a tool is being invoked) and heartbeats while
         it works (so the connection stays alive), then deliver the grounded
         answer as the ``done`` event. The finished answer still carries its own
-        persistent "已使用工具" banner from the executor."""
+        persistent "已使用工具" banner from the executor.
+
+        If the client disconnects (GeneratorExit) before the worker finishes,
+        the completed result is pushed into server-side session memory so it
+        appears automatically when the user reconnects."""
         yield stream_delta(_tool_calling_notice(decision.tool))
         result: dict[str, object] = {}
         done = threading.Event()
+        abandoned = threading.Event()
 
         def _worker() -> None:
             try:
@@ -815,14 +820,42 @@ class CommandBridge:
                 result["error"] = str(exc)
             finally:
                 done.set()
+                if abandoned.is_set() and "text" in result:
+                    try:
+                        self._push_orphaned_result(str(result["text"]))
+                    except Exception:  # noqa: BLE001
+                        logger.exception("command bridge: failed to push orphaned tool result")
 
         threading.Thread(target=_worker, daemon=True).start()
-        while not done.wait(timeout=_HEARTBEAT_SECONDS):
-            yield stream_heartbeat()
+        try:
+            while not done.wait(timeout=_HEARTBEAT_SECONDS):
+                yield stream_heartbeat()
+        except GeneratorExit:
+            abandoned.set()
+            raise
         if "error" in result:
             yield stream_error(f"工具執行失敗：{result['error']}")
             return
         yield stream_done(str(result.get("text") or "").strip())
+
+    def _push_orphaned_result(self, text: str) -> None:
+        """Push a completed assistant message into session memory when the
+        streaming client disconnected before delivery. The user sees it on
+        the next reconnect/session load."""
+        from uuid import uuid4
+        snapshot = self._sessions().load()
+        messages = list(snapshot.get("messages") or [])
+        messages.append({
+            "id": uuid4().hex,
+            "role": "assistant",
+            "text": text,
+            "status": "ok",
+        })
+        snapshot["messages"] = messages
+        self._sessions().save(snapshot)
+        logger.info(
+            "command bridge: pushed orphaned tool result to session memory (%d chars)", len(text)
+        )
 
     def _exec_grounded_search(
         self, req: WebCommandRequest, tool_req: ChatToolRequest
