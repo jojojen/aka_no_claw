@@ -1,22 +1,26 @@
-"""Typed task workspace for variable-bound tool pipelines (#53, Phase 1).
+"""Typed task workspace for variable-bound tool pipelines (#53).
 
 A WorkflowRunner executes a Workflow step-by-step, binding each step's output
 to a named Variable in a VariableStore. Later steps resolve their inputs from
-the store rather than receiving raw strings. The runner is pure logic: no
-Telegram, no persistence, no LLM calls in this phase.
+the store rather than receiving raw strings. WorkflowStore persists workflow
+definitions and execution traces as JSON files.
 
-Step kinds supported in Phase 1:
+Step kinds:
   tool_call     — calls a generated catalog tool with explicit params via the
                   ToolCallExecutor protocol (DynamicToolRunner.run_tool_step).
   command_sink  — calls a whitelisted slash command with a resolved variable value
                   via an injected CommandDispatcher.
-  llm_transform — not yet implemented (Phase 4); immediately returns failed.
+  llm_transform — calls an LLM with a no-invention-constrained prompt; input
+                  variable values are the sole grounding source.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Literal, Protocol
 
 logger = logging.getLogger(__name__)
@@ -222,13 +226,19 @@ class WorkflowTrace:
     variables: dict[str, Variable] = field(default_factory=dict)
     steps: list[StepTrace] = field(default_factory=list)
     final_result: str | None = None
+    # Set when the workflow fails structural validation before any step runs.
+    # An empty step list alone does not mean failure; this field makes it explicit.
+    validation_error: str | None = None
 
     @property
     def ok(self) -> bool:
-        return all(st.status != "failed" for st in self.steps)
+        return (
+            self.validation_error is None
+            and all(st.status != "failed" for st in self.steps)
+        )
 
     def to_dict(self) -> dict:
-        return {
+        d: dict = {
             "workflow_id": self.workflow_id,
             "goal": self.goal,
             "variables": {
@@ -244,9 +254,38 @@ class WorkflowTrace:
             "steps": [s.to_dict() for s in self.steps],
             "final_result": self.final_result,
         }
+        if self.validation_error is not None:
+            d["validation_error"] = self.validation_error
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "WorkflowTrace":
+        variables = {
+            k: Variable(
+                name=v["name"], type=v["type"], value=v["value"],
+                source_step=v["source_step"], provenance=v["provenance"],
+            )
+            for k, v in d.get("variables", {}).items()
+        }
+        steps = [
+            StepTrace(
+                step_id=s["step_id"], kind=s["kind"], status=s["status"],
+                output_var=s.get("output_var"), error=s.get("error"),
+                provenance=s.get("provenance"),
+            )
+            for s in d.get("steps", [])
+        ]
+        return cls(
+            workflow_id=d["workflow_id"],
+            goal=d["goal"],
+            variables=variables,
+            steps=steps,
+            final_result=d.get("final_result"),
+            validation_error=d.get("validation_error"),
+        )
 
 
-# ── Executor protocol ─────────────────────────────────────────────────────────
+# ── Executor / LLM protocols ──────────────────────────────────────────────────
 
 class ToolCallExecutor(Protocol):
     """Narrow interface the WorkflowRunner needs from DynamicToolRunner."""
@@ -258,6 +297,12 @@ class ToolCallExecutor(Protocol):
         ...
 
 
+class LLMClient(Protocol):
+    """Minimal LLM interface needed for llm_transform steps."""
+
+    def generate(self, prompt: str, *, temperature: float = 0.0) -> str: ...
+
+
 # ── Runner ────────────────────────────────────────────────────────────────────
 
 class WorkflowRunner:
@@ -267,17 +312,23 @@ class WorkflowRunner:
         self,
         executor: ToolCallExecutor,
         command_dispatcher: CommandDispatcher | None = None,
+        llm_client: LLMClient | None = None,
     ) -> None:
         self.executor = executor
         self.command_dispatcher: CommandDispatcher = command_dispatcher or {}
+        self.llm_client = llm_client
 
     def run(self, workflow: Workflow) -> WorkflowTrace:
         """Execute all steps and return the full trace."""
         errors = workflow.validate_references()
         if errors:
-            trace = WorkflowTrace(workflow_id=workflow.id, goal=workflow.goal)
-            trace.final_result = "工作流定義有誤：\n" + "\n".join(errors)
-            return trace
+            joined = "\n".join(errors)
+            return WorkflowTrace(
+                workflow_id=workflow.id,
+                goal=workflow.goal,
+                validation_error=joined,
+                final_result=f"工作流定義有誤：\n{joined}",
+            )
 
         store = VariableStore()
         trace = WorkflowTrace(workflow_id=workflow.id, goal=workflow.goal)
@@ -435,13 +486,138 @@ class WorkflowRunner:
         )
 
     def _run_llm_transform(
-        self, step: WorkflowStep, store: VariableStore  # noqa: ARG002
+        self, step: WorkflowStep, store: VariableStore
     ) -> tuple[StepTrace, str | None]:
-        # Phase 4 — not yet implemented.
+        if self.llm_client is None:
+            return (
+                StepTrace(
+                    step_id=step.id, kind=step.kind, status="failed",
+                    error="WorkflowRunner has no llm_client; cannot run llm_transform",
+                ),
+                None,
+            )
+
+        # Resolve and embed each input variable — these are the sole grounding source.
+        input_blocks: list[str] = []
+        for var_name in step.inputs:
+            try:
+                value = store.resolve(var_name)
+            except KeyError as exc:
+                return (
+                    StepTrace(
+                        step_id=step.id, kind=step.kind, status="failed",
+                        error=str(exc),
+                    ),
+                    None,
+                )
+            input_blocks.append(f"[{var_name}]\n{value}")
+
+        inputs_text = "\n\n".join(input_blocks)
+        prompt = (
+            f"以下は入力データです：\n\n{inputs_text}\n\n"
+            f"タスク指示：{step.instructions or '内容を変換してください。'}\n\n"
+            "厳守ルール（絶対に破らないこと）：\n"
+            "- 上の「入力データ」にある内容だけを使うこと。\n"
+            "- 入力データにない事実（温度、天気、地名、数値、出来事など）を"
+            "捏造・推測・補完してはならない。\n"
+            "- 結果だけを出力すること。説明・見出し・前置きは不要。"
+        )
+
+        try:
+            result = self.llm_client.generate(prompt, temperature=0.7)
+        except Exception as exc:
+            logger.exception("task_workspace: llm_transform failed step=%s", step.id)
+            return (
+                StepTrace(
+                    step_id=step.id, kind=step.kind, status="failed",
+                    error=f"LLM transform 失敗: {exc}",
+                ),
+                None,
+            )
+
+        provenance = f"llm_transform(inputs={step.inputs})"
+        var = store.bind(
+            step.output, result,
+            source_step=step.id,
+            provenance=provenance,
+        )
         return (
             StepTrace(
-                step_id=step.id, kind=step.kind, status="failed",
-                error="llm_transform は Phase 4 で実装予定です",
+                step_id=step.id, kind=step.kind, status="ok",
+                output_var=step.output, provenance=var.provenance,
             ),
-            None,
+            step.output,
         )
+
+
+# ── Persistence ───────────────────────────────────────────────────────────────
+
+class WorkflowStore:
+    """Persists workflow definitions and execution traces as JSON files.
+
+    Layout under ``base_dir``:
+      <id>.json               — workflow definition
+      traces/<id>/<ts_ms>.json — execution trace per run
+    """
+
+    def __init__(self, base_dir: Path) -> None:
+        self._dir = Path(base_dir)
+        self._dir.mkdir(parents=True, exist_ok=True)
+        (self._dir / "traces").mkdir(exist_ok=True)
+
+    # ── Workflow definitions ──────────────────────────────────────────────────
+
+    def save(self, workflow: Workflow) -> None:
+        (self._dir / f"{workflow.id}.json").write_text(
+            json.dumps(workflow.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def get(self, workflow_id: str) -> Workflow | None:
+        path = self._dir / f"{workflow_id}.json"
+        if not path.exists():
+            return None
+        try:
+            return Workflow.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        except Exception:
+            logger.exception("WorkflowStore: failed to load workflow %s", workflow_id)
+            return None
+
+    def list(self) -> list[Workflow]:
+        workflows: list[Workflow] = []
+        for p in sorted(self._dir.glob("*.json")):
+            try:
+                workflows.append(Workflow.from_dict(json.loads(p.read_text(encoding="utf-8"))))
+            except Exception:
+                logger.debug("WorkflowStore: skipping malformed file %s", p)
+        return workflows
+
+    def delete(self, workflow_id: str) -> bool:
+        path = self._dir / f"{workflow_id}.json"
+        if path.exists():
+            path.unlink()
+            return True
+        return False
+
+    # ── Execution traces ──────────────────────────────────────────────────────
+
+    def save_trace(self, trace: WorkflowTrace) -> None:
+        traces_dir = self._dir / "traces" / trace.workflow_id
+        traces_dir.mkdir(parents=True, exist_ok=True)
+        ts = time.time_ns()
+        (traces_dir / f"{ts}.json").write_text(
+            json.dumps(trace.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def list_traces(self, workflow_id: str) -> list[WorkflowTrace]:
+        traces_dir = self._dir / "traces" / workflow_id
+        if not traces_dir.exists():
+            return []
+        traces: list[WorkflowTrace] = []
+        for p in sorted(traces_dir.glob("*.json")):
+            try:
+                traces.append(WorkflowTrace.from_dict(json.loads(p.read_text(encoding="utf-8"))))
+            except Exception:
+                logger.debug("WorkflowStore: skipping malformed trace %s", p)
+        return traces

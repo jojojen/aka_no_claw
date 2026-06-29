@@ -1,23 +1,28 @@
-"""Tests for task_workspace.py — Phase 1 (#53).
+"""Tests for task_workspace.py (#53, Phase 1 + D + A persistence).
 
 Coverage:
-  Schema:     Workflow/WorkflowStep to_dict / from_dict roundtrip; validate_references.
+  Schema:        Workflow/WorkflowStep to_dict / from_dict roundtrip; validate_references.
   VariableStore: bind / resolve / missing key.
-  WorkflowRunner: tool_call ok/fail, command_sink ok/not-allowlisted/no-handler/
-                  missing-input/$ref-arg, failure halting (skipped), llm_transform stub,
-                  invalid workflow short-circuit, full 2-step pipeline trace.
+  WorkflowRunner — tool_call: ok/fail/explicit-params/$ref-arg.
+  WorkflowRunner — command_sink: ok/not-allowlisted/no-handler/missing-input/exception.
+  WorkflowRunner — llm_transform: no-invention prompt, output bound, no-client/missing-var/exception.
+  WorkflowRunner — control flow: failure halting, invalid workflow short-circuit.
+  WorkflowTrace:  to_dict / from_dict roundtrip.
+  WorkflowStore:  save/get/list/delete, save_trace/list_traces roundtrip.
 """
 
 import pytest
 
 from openclaw_adapter.task_workspace import (
     COMMAND_SINK_ALLOWLIST,
+    LLMClient,
     StepTrace,
     ToolCallExecutor,
     Variable,
     VariableStore,
     Workflow,
     WorkflowRunner,
+    WorkflowStore,
     WorkflowStep,
     WorkflowTrace,
 )
@@ -363,15 +368,15 @@ def test_all_skipped_after_first_fail():
 
 # ── WorkflowRunner — llm_transform stub ──────────────────────────────────────
 
-def test_llm_transform_returns_not_implemented():
-    ex, runner = _make_runner()
+def test_llm_transform_no_client_stub_fails():
+    ex, runner = _make_runner()  # no llm_client
     step = WorkflowStep(id="s1", kind="llm_transform",
                         inputs=["weather"], instructions="transform", output="greeting")
     store = VariableStore()
     store.bind("weather", "晴れ", "s0", "p0")
     step_trace, var = runner._run_llm_transform(step, store)
     assert step_trace.status == "failed"
-    assert "Phase 4" in (step_trace.error or "")
+    assert "llm_client" in (step_trace.error or "")
     assert var is None
 
 
@@ -387,8 +392,9 @@ def test_invalid_workflow_returns_error_trace():
     trace = runner.run(wf)
     # No steps were executed — the validate_references short-circuit fires
     assert trace.steps == []
-    assert trace.final_result is not None
-    assert "工作流定義有誤" in trace.final_result
+    assert not trace.ok                          # must be False despite empty step list
+    assert trace.validation_error is not None
+    assert "工作流定義有誤" in (trace.final_result or "")
 
 
 # ── WorkflowTrace ─────────────────────────────────────────────────────────────
@@ -470,3 +476,271 @@ def test_allowlist_contains_saynow():
 def test_allowlist_does_not_contain_arbitrary_commands():
     for dangerous in ["/new", "/restartall", "/rm", "/exec", "/bash"]:
         assert dangerous not in COMMAND_SINK_ALLOWLIST
+
+
+# ── FakeLLMClient helper ──────────────────────────────────────────────────────
+
+class FakeLLMClient:
+    def __init__(self, response: str = "transformed output") -> None:
+        self._response = response
+        self.prompts: list[str] = []
+        self.temperatures: list[float] = []
+        self.raise_on_call: Exception | None = None
+
+    def generate(self, prompt: str, *, temperature: float = 0.0) -> str:
+        self.prompts.append(prompt)
+        self.temperatures.append(temperature)
+        if self.raise_on_call:
+            raise self.raise_on_call
+        return self._response
+
+
+# ── WorkflowRunner — llm_transform ───────────────────────────────────────────
+
+def test_llm_transform_binds_output_variable():
+    llm = FakeLLMClient("おはようございます！今日は晴れです。")
+    ex, runner = _make_runner()
+    runner.llm_client = llm
+
+    step = WorkflowStep(
+        id="s1", kind="llm_transform",
+        inputs=["weather"], instructions="用女僕口吻說早安",
+        output="greeting",
+    )
+    store = VariableStore()
+    store.bind("weather", "東京：晴れ、28℃", "s0", "p0")
+
+    step_trace, var_name = runner._run_llm_transform(step, store)
+
+    assert step_trace.status == "ok"
+    assert var_name == "greeting"
+    assert store.resolve("greeting") == "おはようございます！今日は晴れです。"
+    assert step_trace.output_var == "greeting"
+    assert "llm_transform" in (step_trace.provenance or "")
+
+
+def test_llm_transform_prompt_contains_no_invention_constraint():
+    llm = FakeLLMClient("ok")
+    ex, runner = _make_runner()
+    runner.llm_client = llm
+
+    step = WorkflowStep(
+        id="s1", kind="llm_transform",
+        inputs=["weather"], instructions="変換してください",
+        output="greeting",
+    )
+    store = VariableStore()
+    store.bind("weather", "東京：晴れ", "s0", "p0")
+    runner._run_llm_transform(step, store)
+
+    prompt = llm.prompts[0]
+    assert "捏造" in prompt or "捏造・推測" in prompt
+    assert "東京：晴れ" in prompt   # input value embedded
+    assert "変換してください" in prompt
+
+
+def test_llm_transform_prompt_embeds_all_input_variables():
+    llm = FakeLLMClient("ok")
+    ex, runner = _make_runner()
+    runner.llm_client = llm
+
+    step = WorkflowStep(
+        id="s1", kind="llm_transform",
+        inputs=["weather", "user_name"], instructions="greet",
+        output="greeting",
+    )
+    store = VariableStore()
+    store.bind("weather", "晴れ", "s0", "p0")
+    store.bind("user_name", "ご主人様", "s0", "p0")
+    runner._run_llm_transform(step, store)
+
+    prompt = llm.prompts[0]
+    assert "晴れ" in prompt
+    assert "ご主人様" in prompt
+    assert "[weather]" in prompt
+    assert "[user_name]" in prompt
+
+
+def test_llm_transform_no_client_fails():
+    ex, runner = _make_runner()  # llm_client=None
+    step = WorkflowStep(
+        id="s1", kind="llm_transform",
+        inputs=["weather"], output="greeting",
+    )
+    store = VariableStore()
+    store.bind("weather", "晴れ", "s0", "p0")
+    step_trace, var = runner._run_llm_transform(step, store)
+    assert step_trace.status == "failed"
+    assert "llm_client" in (step_trace.error or "")
+    assert var is None
+
+
+def test_llm_transform_missing_input_variable_fails():
+    llm = FakeLLMClient("ok")
+    ex, runner = _make_runner()
+    runner.llm_client = llm
+
+    step = WorkflowStep(
+        id="s1", kind="llm_transform",
+        inputs=["missing_var"], output="greeting",
+    )
+    store = VariableStore()  # missing_var never bound
+    step_trace, var = runner._run_llm_transform(step, store)
+    assert step_trace.status == "failed"
+    assert "missing_var" in (step_trace.error or "")
+    assert var is None
+    assert llm.prompts == []  # LLM never called
+
+
+def test_llm_transform_exception_caught():
+    llm = FakeLLMClient()
+    llm.raise_on_call = RuntimeError("timeout")
+    ex, runner = _make_runner()
+    runner.llm_client = llm
+
+    step = WorkflowStep(
+        id="s1", kind="llm_transform",
+        inputs=["weather"], output="greeting",
+    )
+    store = VariableStore()
+    store.bind("weather", "晴れ", "s0", "p0")
+    step_trace, var = runner._run_llm_transform(step, store)
+    assert step_trace.status == "failed"
+    assert "timeout" in (step_trace.error or "")
+    assert var is None
+
+
+def test_full_three_step_pipeline():
+    """tool_call -> llm_transform -> command_sink (wf-morning-greeting)."""
+    spoken: list[str] = []
+
+    def saynow(text: str) -> str:
+        spoken.append(text)
+        return "🔊 完了"
+
+    llm = FakeLLMClient("おはようございます！東京は晴れです。")
+    ex, runner = _make_runner(
+        responses={"city-weather-xyz": (True, "東京：晴れ、28℃")},
+        commands={"/saynow": saynow},
+    )
+    runner.llm_client = llm
+
+    wf = Workflow(
+        id="wf-morning",
+        goal="早安工作流",
+        steps=[
+            WorkflowStep(id="s1", kind="tool_call", tool="city-weather-xyz",
+                         args={"city": "東京"}, output="weather"),
+            WorkflowStep(id="s2", kind="llm_transform",
+                         inputs=["weather"], instructions="用女僕口吻說早安",
+                         output="greeting"),
+            WorkflowStep(id="s3", kind="command_sink", command="/saynow",
+                         input="greeting", output="speech_result"),
+        ],
+    )
+    trace = runner.run(wf)
+
+    assert trace.ok
+    assert [st.status for st in trace.steps] == ["ok", "ok", "ok"]
+    assert spoken == ["おはようございます！東京は晴れです。"]
+    assert trace.final_result == "🔊 完了"
+    assert "weather" in trace.variables
+    assert "greeting" in trace.variables
+    assert "speech_result" in trace.variables
+
+
+# ── WorkflowTrace.from_dict roundtrip ────────────────────────────────────────
+
+def test_workflow_trace_from_dict_roundtrip():
+    ex, runner = _make_runner({"t": (True, "東京：晴れ")})
+    wf = Workflow(id="wf", goal="g", steps=[
+        WorkflowStep(id="s1", kind="tool_call", tool="t",
+                     args={"city": "東京"}, output="weather"),
+    ])
+    trace = runner.run(wf)
+    restored = WorkflowTrace.from_dict(trace.to_dict())
+
+    assert restored.workflow_id == trace.workflow_id
+    assert restored.goal == trace.goal
+    assert restored.final_result == trace.final_result
+    assert restored.ok == trace.ok
+    assert len(restored.steps) == len(trace.steps)
+    assert restored.steps[0].status == trace.steps[0].status
+    assert restored.variables["weather"].value == "東京：晴れ"
+    assert restored.variables["weather"].source_step == "s1"
+
+
+# ── WorkflowStore ─────────────────────────────────────────────────────────────
+
+def test_store_save_and_get(tmp_path):
+    store = WorkflowStore(tmp_path / "workflows")
+    wf = Workflow(id="wf-test", goal="テスト", steps=[
+        WorkflowStep(id="s1", kind="tool_call", tool="t",
+                     args={"city": "東京"}, output="weather"),
+    ])
+    store.save(wf)
+    loaded = store.get("wf-test")
+    assert loaded is not None
+    assert loaded == wf
+
+
+def test_store_get_missing_returns_none(tmp_path):
+    store = WorkflowStore(tmp_path / "workflows")
+    assert store.get("nonexistent") is None
+
+
+def test_store_list(tmp_path):
+    store = WorkflowStore(tmp_path / "workflows")
+    wf1 = Workflow(id="wf-a", goal="A")
+    wf2 = Workflow(id="wf-b", goal="B")
+    store.save(wf1)
+    store.save(wf2)
+    ids = {wf.id for wf in store.list()}
+    assert ids == {"wf-a", "wf-b"}
+
+
+def test_store_delete(tmp_path):
+    store = WorkflowStore(tmp_path / "workflows")
+    wf = Workflow(id="wf-del", goal="delete me")
+    store.save(wf)
+    assert store.delete("wf-del") is True
+    assert store.get("wf-del") is None
+    assert store.delete("wf-del") is False  # already gone
+
+
+def test_store_save_and_list_traces(tmp_path):
+    store = WorkflowStore(tmp_path / "workflows")
+    ex, runner = _make_runner({"t": (True, "晴れ")})
+    wf = Workflow(id="wf-trace", goal="g", steps=[
+        WorkflowStep(id="s1", kind="tool_call", tool="t", output="out"),
+    ])
+    trace1 = runner.run(wf)
+    trace2 = runner.run(wf)
+    store.save_trace(trace1)
+    store.save_trace(trace2)
+
+    traces = store.list_traces("wf-trace")
+    assert len(traces) == 2
+    for t in traces:
+        assert t.workflow_id == "wf-trace"
+        assert t.ok
+
+
+def test_store_list_traces_empty_for_unknown(tmp_path):
+    store = WorkflowStore(tmp_path / "workflows")
+    assert store.list_traces("wf-nonexistent") == []
+
+
+def test_store_trace_roundtrip_preserves_variables(tmp_path):
+    store = WorkflowStore(tmp_path / "workflows")
+    ex, runner = _make_runner({"t": (True, "東京：晴れ、28℃")})
+    wf = Workflow(id="wf-vars", goal="g", steps=[
+        WorkflowStep(id="s1", kind="tool_call", tool="t",
+                     args={"city": "東京"}, output="weather"),
+    ])
+    trace = runner.run(wf)
+    store.save_trace(trace)
+    [loaded] = store.list_traces("wf-vars")
+
+    assert loaded.variables["weather"].value == "東京：晴れ、28℃"
+    assert loaded.variables["weather"].provenance.startswith("t")
