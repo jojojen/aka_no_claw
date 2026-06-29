@@ -161,6 +161,28 @@ def test_make_run_slash_command_unknown_and_non_slash():
     assert "略過" in run("not a command", "chat1")
 
 
+def test_make_run_slash_command_sees_later_additions():
+    """Regression: /workflow is added to command_handlers AFTER make_run_slash_command
+    is called (same pattern as telegram_bot._build_registries). The closed-over dict
+    reference must pick up the late addition at dispatch time."""
+    handlers: dict = {}
+    run = hs.make_run_slash_command(handlers)  # called before /workflow exists
+
+    # Simulate the late registration that happens in _build_registries
+    calls: list[tuple] = []
+
+    def workflow_handler(remainder, chat_id):
+        calls.append((remainder, chat_id))
+        return f"wf:{remainder}"
+
+    handlers["/workflow"] = SimpleNamespace(handler=workflow_handler)
+
+    result = run("/workflow run wf-morning", "chat-42")
+    assert result == "wf:run wf-morning"
+    assert calls == [("run wf-morning", "chat-42")]
+
+
+
 # --- enable/disable + manual run -------------------------------------------
 def test_set_enabled_persists(tmp_path):
     path = str(tmp_path / "s.json")

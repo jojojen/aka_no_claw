@@ -1,0 +1,28 @@
+{
+  "id": "wf-tokyo-weather-maid",
+  "goal": "查東京天氣預報，以女僕說話方式用日語報天氣跟早安問候，然後念出來",
+  "steps": [
+    {
+      "id": "s1",
+      "kind": "tool_call",
+      "output": "weather_data",
+      "tool": "tool_ca00010a"
+    },
+    {
+      "id": "s2",
+      "kind": "llm_transform",
+      "output": "maid_greeting",
+      "inputs": [
+        "weather_data"
+      ],
+      "instructions": "以女僕口吻用日語報告天氣跟早安問候"
+    },
+    {
+      "id": "s3",
+      "kind": "command_sink",
+      "output": "speech_result",
+      "command": "/saynow",
+      "input": "maid_greeting"
+    }
+  ]
+}

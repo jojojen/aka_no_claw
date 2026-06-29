@@ -31,6 +31,13 @@ The Telegram assistant can reach these tools:
   - This is an explicit command (handled before NL routing); a dedicated NL
     intent is not yet wired.
 
+- `/workflow create <一句話>`
+  - Generate an AI workflow draft from one natural-language sentence, then present an editable step card (reorder / delete / save / cancel) with existing tools reused where possible.
+  - Use `create_workflow` when the user wants to BUILD / CREATE / 建立 / 設定 a workflow / 工作流 / 自動化流程 / 例行任務.
+  - Set `workflow_description` to the full task description the user provided.
+  - Examples: "建立一個 workflow：每天早上查東京天氣，用女僕口吻說日文報天氣", "幫我建立自動化流程：查東京天氣後以日文女僕口吻播報".
+  - Disambiguation: if the message is about building/creating a workflow (動詞 = 建立/create/設定), use `create_workflow`. If it's issuing an existing workflow command (e.g. `/workflow list`, `/workflow run`), that's a different subcommand, not `create_workflow`.
+
 - `/price <game> <name>`
 - `/price <game> | <name> | <card_number> | <rarity> | <set_code>`
   - Look up the price/value of one card.
@@ -170,6 +177,7 @@ Routing rules:
 - A bare Mercari item/shops product URL with no reputation-or-research wording is ambiguous between `reputation_snapshot` and `product_research`: set `query_url` and return confidence below 0.5 so the caller asks the user which one.
 - Return `web_research` when the user asks about price direction, market sentiment, recent news, or any why/how/explanatory question that needs web sources and summarization.
 - Return `opportunity_remove` when the user wants to remove/dismiss a target from the opportunity/hunt list.
+- Return `create_workflow` when the user wants to build/create/設定 a new workflow / 工作流 / 自動化流程; set `workflow_description` to the full task description.
 - Return watch intents for tracking requests.
 - Return `unknown` when the request is unrelated or too ambiguous.
 

@@ -1212,6 +1212,112 @@ def test_music_action_list_pg_routes_to_view(bridge, monkeypatch):
     assert res["actions"][0]["callback_data"] == "music:pf:1"
 
 
+# --- workflow surface: NL draft + editable card in web chat (#53) ----------
+class _FakeWfEditor:
+    """Stands in for WorkflowEditor; records the chat_id it is keyed by."""
+
+    def __init__(self):
+        self.calls: list[tuple] = []
+
+    def callback_handlers(self):
+        def _wfe(payload, original_text, chat_id):
+            self.calls.append((payload, chat_id))
+            if payload == "save":
+                return ("✅ 已儲存", "Workflow *wf-x* 已儲存。", None)
+            if payload == "down:0":
+                markup = {"inline_keyboard": [[{"text": "💾 儲存", "callback_data": "wfe:save"}]]}
+                return ("已下移", "卡片", markup)
+            return (None, None, None)
+        return {"wfe": _wfe}
+
+
+def _seed_wf_surface(bridge, handler, editor):
+    # Pre-seed the lazy cache so _workflow_surface returns fakes (no real shim).
+    bridge._workflow_handler = handler
+    bridge._workflow_editor = editor
+
+
+def test_run_workflow_command_strips_prefix_and_keys_web_chat(bridge):
+    seen: dict = {}
+
+    def _handler(remainder, chat_id):
+        seen["remainder"] = remainder
+        seen["chat_id"] = chat_id
+        markup = {"inline_keyboard": [[{"text": "💾 儲存", "callback_data": "wfe:save"}]]}
+        return ("🤖 草稿", markup)
+
+    _seed_wf_surface(bridge, _handler, _FakeWfEditor())
+    res = bridge.run_workflow_command("/workflow create 每天早上查東京天氣")
+    assert res["status"] == STATUS_OK
+    assert seen["remainder"] == "create 每天早上查東京天氣"   # /workflow stripped
+    assert seen["chat_id"] == "web-workflow"                  # fixed web chat id
+    assert res["message"] == "🤖 草稿"
+    assert res["actions"][0]["callback_data"] == "wfe:save"
+
+
+def test_run_workflow_command_accepts_bare_remainder(bridge):
+    def _handler(remainder, chat_id):
+        return (f"R:{remainder}", None)
+
+    _seed_wf_surface(bridge, _handler, _FakeWfEditor())
+    res = bridge.run_workflow_command("list")
+    assert res["message"] == "R:list"
+    assert res["actions"] == []
+
+
+def test_run_workflow_command_string_result(bridge):
+    _seed_wf_surface(bridge, lambda remainder, chat_id: "純文字", _FakeWfEditor())
+    res = bridge.run_workflow_command("show wf-x")
+    assert res["status"] == STATUS_OK
+    assert res["message"] == "純文字"
+    assert res["actions"] == []
+
+
+def test_run_workflow_command_handler_exception_is_structured(bridge):
+    def _boom(remainder, chat_id):
+        raise RuntimeError("kaboom")
+
+    _seed_wf_surface(bridge, _boom, _FakeWfEditor())
+    res = bridge.run_workflow_command("create x")
+    assert res["status"] == STATUS_ERROR
+    assert "kaboom" in res["message"]
+
+
+def test_run_workflow_action_reorder_returns_card_and_buttons(bridge):
+    editor = _FakeWfEditor()
+    _seed_wf_surface(bridge, lambda *a: "", editor)
+    res = bridge.run_workflow_action("wfe:down:0")
+    assert res["status"] == STATUS_OK
+    assert res["message"] == "卡片"                              # new_text wins over toast
+    assert res["actions"][0]["callback_data"] == "wfe:save"
+    assert editor.calls == [("down:0", "web-workflow")]
+
+
+def test_run_workflow_action_save_confirms(bridge):
+    editor = _FakeWfEditor()
+    _seed_wf_surface(bridge, lambda *a: "", editor)
+    res = bridge.run_workflow_action("wfe:save")
+    assert res["status"] == STATUS_OK
+    assert "已儲存" in res["message"]
+
+
+def test_run_workflow_action_toast_only_falls_back_to_toast(bridge):
+    class _ToastEditor(_FakeWfEditor):
+        def callback_handlers(self):
+            return {"wfe": lambda payload, ot, cid: ("僅提示", None, None)}
+
+    _seed_wf_surface(bridge, lambda *a: "", _ToastEditor())
+    res = bridge.run_workflow_action("wfe:noop")
+    assert res["message"] == "僅提示"
+
+
+def test_run_workflow_action_rejects_non_wfe_prefix(bridge):
+    _seed_wf_surface(bridge, lambda *a: "", _FakeWfEditor())
+    res = bridge.run_workflow_action("music:louder")
+    assert res["status"] == STATUS_ERROR
+    assert "未知的工作流動作" in res["message"]
+
+
 def test_music_action_list_del_then_rerenders_edit(bridge, monkeypatch):
     deleted: list[str] = []
     monkeypatch.setattr(bridge, "_deleters",

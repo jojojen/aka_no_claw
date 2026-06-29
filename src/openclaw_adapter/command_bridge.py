@@ -84,6 +84,10 @@ from .task_loop import (
 logger = logging.getLogger(__name__)
 
 _BRIDGE_CHAT_ID = "web-bridge"
+# Fixed chat id for the single-user web workflow editor. The editor keys draft
+# sessions by chat id; the web console is one user, so a constant id lets a
+# draft survive across the separate HTTP requests of a draft → edit → save flow.
+_WF_WEB_CHAT_ID = "web-workflow"
 _HEARTBEAT_SECONDS = 10.0
 # Finished jobs linger this long so a phone that reconnects after a screen-lock
 # can still fetch the final report, then they are garbage-collected.
@@ -310,6 +314,31 @@ def _image_temp_suffix(att) -> str:
     return _IMAGE_SUFFIX_BY_CONTENT_TYPE.get(ct, ".img")
 
 
+class _WorkflowShimRunner:
+    """Minimal runner exposing only what ``build_workflow_handler`` reads:
+    ``tools_dir`` (→ workflow_store path), ``catalog`` (so NL tool_call steps
+    ground on real generated-tool slugs), and ``client`` (the local fallback
+    for NL drafting when cloud big-pickle is unreachable).
+
+    Deliberately NOT a full ``DynamicToolRunner`` — that would carry the
+    cloud-failover restart side effects, which must never fire from the web
+    bridge. Workflow *execution* in web is out of scope (the draft + button
+    version only authors/saves), so ``run_tool_step`` is intentionally absent;
+    ``/workflow run`` from web would surface a normal handler error."""
+
+    def __init__(self, settings: AssistantSettings) -> None:
+        from .dynamic_tools import OllamaTextClient, _resolve_tools_dir
+        from .generated_tool_catalog import GeneratedToolCatalog
+
+        self.tools_dir = _resolve_tools_dir()
+        self.catalog = GeneratedToolCatalog(self.tools_dir)
+        self.client = OllamaTextClient(
+            endpoint=settings.openclaw_local_text_endpoint,
+            model=(settings.openclaw_local_text_model or "qwen3:14b").split(",")[0].strip(),
+            timeout_seconds=settings.openclaw_local_text_timeout_seconds,
+        )
+
+
 class CommandBridge:
     """Stateless-per-request router over the existing OpenClaw handlers."""
 
@@ -333,6 +362,12 @@ class CommandBridge:
         # In-process only: a resume is a follow-up turn within the same bridge run.
         self._music_continuations: dict[str, dict] = {}
         self._music_cont_lock = threading.Lock()
+        # #53: workflow surface for web chat (NL draft + editable card buttons).
+        # Built lazily — the shared editor must persist draft sessions across the
+        # separate HTTP requests that a draft → reorder → save flow spans.
+        self._workflow_handler: object | None = None
+        self._workflow_editor: object | None = None
+        self._workflow_lock = threading.Lock()
 
     # --- handler registry (lazy, shared with the Telegram bot) ------------
     def _ensure_registries(self) -> None:
@@ -1327,6 +1362,79 @@ class CommandBridge:
             logger.exception("now_playing lookup failed")
             name = None
         return {"status": STATUS_OK, "name": name}
+
+    # --- workflow surface: NL draft + editable card (issue #53, web) -------
+    def _workflow_surface(self) -> tuple[object, object]:
+        """Lazily build the shared (handler, editor) pair for web workflows.
+
+        One editor instance is kept for the bridge's lifetime so a draft created
+        by ``run_workflow_command`` survives the later button-press requests
+        (reorder / delete / save) that hit ``run_workflow_action``."""
+        if self._workflow_handler is None:
+            with self._workflow_lock:
+                if self._workflow_handler is None:
+                    from .workflow_command import build_workflow_handler, _workflow_store
+                    from .workflow_editor import WorkflowEditor
+
+                    runner = _WorkflowShimRunner(self.settings)
+                    editor = WorkflowEditor(_workflow_store(runner))
+                    self._workflow_editor = editor
+                    self._workflow_handler = build_workflow_handler(
+                        self.settings, runner, workflow_editor=editor
+                    )
+        return self._workflow_handler, self._workflow_editor  # type: ignore[return-value]
+
+    def run_workflow_command(self, text: str) -> dict:
+        """Run the ``/workflow`` handler for the web console. ``text`` is the
+        remainder after the command (e.g. ``create 每天早上查東京天氣…``); a
+        natural-language ``create`` drafts a workflow via the cloud-preferred LLM
+        and lands it in an editable card (the same flow the Telegram bot uses, so
+        tool_call steps reuse real generated-tool slugs)."""
+        handler, _ = self._workflow_surface()
+        remainder = (text or "").strip()
+        if remainder.startswith("/workflow"):
+            remainder = remainder[len("/workflow"):].strip()
+        try:
+            result = handler(remainder, _WF_WEB_CHAT_ID)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("workflow command failed text=%r", text)
+            return {"status": STATUS_ERROR, "message": f"工作流指令失敗：{exc}", "actions": []}
+        if isinstance(result, tuple):
+            message = result[0]
+            markup = result[1] if len(result) > 1 else None
+        else:
+            message, markup = result, None
+        return {
+            "status": STATUS_OK,
+            "message": str(message) if message is not None else "",
+            "actions": self._markup_to_actions(markup),
+        }
+
+    def run_workflow_action(self, callback_data: str) -> dict:
+        """Re-invoke a ``wfe:`` workflow-editor button for the web console
+        (reorder / delete / save / cancel a draft step). The same editor handler
+        the Telegram bot dispatches, so step validation on save is identical."""
+        _, editor = self._workflow_surface()
+        prefix, _, payload = (callback_data or "").partition(":")
+        if prefix != "wfe":
+            return {"status": STATUS_ERROR,
+                    "message": f"未知的工作流動作：{callback_data}", "actions": []}
+        handler = editor.callback_handlers().get("wfe")
+        if handler is None:
+            return {"status": STATUS_ERROR, "message": "工作流編輯器尚未啟用。", "actions": []}
+        try:
+            result = handler(payload, "", _WF_WEB_CHAT_ID)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("workflow action failed cb=%s", callback_data)
+            return {"status": STATUS_ERROR, "message": f"動作執行失敗：{exc}", "actions": []}
+        toast, new_text, markup = (list(result) + [None, None, None])[:3] \
+            if isinstance(result, tuple) else (result, None, None)
+        message = new_text if new_text else toast
+        return {
+            "status": STATUS_OK,
+            "message": str(message) if message is not None else "",
+            "actions": self._markup_to_actions(markup),
+        }
 
     # --- 生活 mode: bluetooth control surface (aka_no_claw#38 / web#7) ------
     def run_bluetooth_command(self) -> dict:

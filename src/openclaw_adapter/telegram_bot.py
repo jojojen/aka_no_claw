@@ -93,7 +93,8 @@ from .home_schedule_command import (
     build_schedulehome_handler,
     render_list as render_home_schedule_list,
 )
-from .workflow_command import build_workflow_handler
+from .workflow_command import build_workflow_handler, _workflow_store
+from .workflow_editor import WorkflowEditor
 from .music_favorites import (
     FavoritesStore,
     MUSIC_BEST_LIST_KIND,
@@ -321,9 +322,11 @@ class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
         *,
         settings: AssistantSettings | None = None,
         allowed_chat_ids: frozenset[str] | None = None,
+        workflow_editor=None,
         **kwargs,
     ) -> None:
         self._settings = settings
+        self._workflow_editor = workflow_editor
         if allowed_chat_ids is None and settings is not None and settings.openclaw_telegram_chat_id:
             allowed_chat_ids = frozenset({settings.openclaw_telegram_chat_id})
         super().__init__(allowed_chat_ids=allowed_chat_ids, **kwargs)
@@ -442,7 +445,32 @@ class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
             )
         return None
 
+    def _build_workflow_capture_plan(
+        self, *, chat_id: str | int, text: str | None
+    ) -> TelegramTextReplyPlan | None:
+        """Capture-mode for the workflow card editor (#53): while a user has an
+        active editor session and is being asked for a field value, plain-text
+        messages are routed here instead of the main dispatcher."""
+        if text is None or self._workflow_editor is None:
+            return None
+        if not self.is_allowed_chat(chat_id):
+            return None
+        if not self._workflow_editor.is_capturing(str(chat_id)):
+            return None
+        result = self._workflow_editor.handle_text_capture(text, str(chat_id))
+        if result is None:
+            return None
+        reply_text, markup = result
+        return TelegramTextReplyPlan(
+            ack=None,
+            reply=reply_text,
+            reply_markup=markup or None,
+        )
+
     def build_reply_plan(self, *, chat_id: str | int, text: str | None) -> TelegramTextReplyPlan:
+        workflow_capture_plan = self._build_workflow_capture_plan(chat_id=chat_id, text=text)
+        if workflow_capture_plan is not None:
+            return workflow_capture_plan
         home_capture_plan = self._build_home_capture_plan(chat_id=chat_id, text=text)
         if home_capture_plan is not None:
             return home_capture_plan
@@ -1714,8 +1742,23 @@ def run_telegram_polling(
     catalog_planner = CatalogPlanner(dynamic_tool_runner)
     callback_handlers.update(catalog_planner.callback_handlers())
 
+    # Workflow card editor (#53): single shared WorkflowEditor instance handles
+    # wfe: callbacks AND text capture via the processor's build_reply_plan.
+    # Re-register /workflow to include the editor for `new`/`edit` subcommands.
+    _wf_editor: WorkflowEditor | None = None
+    if dynamic_tool_runner is not None:
+        _wf_editor = WorkflowEditor(_workflow_store(dynamic_tool_runner))
+        callback_handlers.update(_wf_editor.callback_handlers())
+        command_handlers["/workflow"] = RegisteredCommand(
+            build_workflow_handler(settings, dynamic_tool_runner, workflow_editor=_wf_editor),
+            ack="⚙️",
+            background=True,
+        )
+
     _price_bot_module.TelegramCommandProcessor = (
-        lambda **kwargs: TelegramCommandProcessor(settings=settings, **kwargs)
+        lambda **kwargs: TelegramCommandProcessor(
+            settings=settings, workflow_editor=_wf_editor, **kwargs
+        )
     )
     return _base_run_telegram_polling(
         token=token,
