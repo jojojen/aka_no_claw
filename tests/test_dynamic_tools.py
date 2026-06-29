@@ -424,6 +424,77 @@ def test_validator_fail_triggers_repair(tmp_path):
     assert "主題不符" in client.repair_prompts[0]
 
 
+def test_trace_records_missing_answer_then_repair(tmp_path):
+    # #51 PR1 fixture: a tool that runs but omits the ===ANSWER=== block fails
+    # the output contract, gets repaired, and the second attempt succeeds. The
+    # structured trace must capture goal, the failed action/observation, a
+    # contract-violation reflection, the repair next_action, the final success,
+    # and the attempt budget — without changing the loop's behavior.
+    no_answer = 'print("hello, but no answer block here")\n'
+    client = FakeClient(code_responses=[no_answer, GOOD_SCRIPT])
+    runner = _make_runner(tmp_path, client)
+    res = runner.run_detailed("做一件先漏輸出契約的事")
+
+    assert res.ok
+    assert res.generations == 2
+    trace = res.trace
+    assert trace is not None
+    assert trace.goal == "做一件先漏輸出契約的事"
+    assert trace.stop_condition == "goal satisfied"
+    # Budget reflects attempts used and the per-tier limit.
+    assert trace.generations_used == 2
+    assert trace.generations_limit == runner.max_repairs
+
+    first, last = trace.attempts[0], trace.attempts[-1]
+    assert first.action == "execute_generated_tool"
+    assert "contract violated" in first.reflection
+    assert first.next_action == "repair_code"
+    assert last.reflection == "goal satisfied"
+    assert last.next_action == "done"
+
+
+def test_trace_validator_rejection_does_not_claim_success(tmp_path):
+    # #51 PR1 fixture: execution succeeds but the validator rejects the answer as
+    # contradicting the request. The loop must NOT claim success on that attempt;
+    # the trace records the semantic-mismatch reflection and the validator reason,
+    # then a repaired attempt passes.
+    client = FakeClient(
+        code_responses=[GOOD_SCRIPT, GOOD_SCRIPT + "\n# retry"],
+        validate_responses=["FAIL: 主題不符", "PASS"],
+    )
+    runner = _make_runner(tmp_path, client)
+    res = runner.run_detailed("查天氣")
+
+    assert res.ok
+    assert res.generations == 2  # did not stop at the rejected first attempt
+    trace = res.trace
+    assert trace is not None
+    rejected = trace.attempts[0]
+    assert rejected.action == "execute_generated_tool"
+    assert "semantic mismatch" in rejected.reflection
+    assert "主題不符" in rejected.observation
+    assert rejected.next_action == "repair_code"
+    assert trace.attempts[-1].next_action == "done"
+
+
+def test_trace_records_infeasible_refusal(tmp_path):
+    # #51 PR1 fixture: an honestly-refused (infeasible) request still produces a
+    # trace with the preflight observation and an "infeasible" stop condition.
+    client = FakeClient(
+        code_responses=[],
+        feasibility_response="INFEASIBLE: 需要付費金鑰",
+    )
+    runner = _make_runner(tmp_path, client)
+    res = runner.run_detailed("查一個需要付費金鑰的資料")
+
+    assert not res.ok
+    trace = res.trace
+    assert trace is not None
+    assert trace.stop_condition == "infeasible"
+    assert trace.attempts[0].action == "preflight"
+    assert trace.attempts[0].next_action == "refuse"
+
+
 def test_reuse_validation_fail_regenerates(tmp_path):
     # First run registers a legacy tool (validator passes by default).
     client1 = FakeClient(code_responses=[GOOD_SCRIPT])

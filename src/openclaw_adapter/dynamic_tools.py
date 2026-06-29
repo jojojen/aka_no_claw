@@ -186,6 +186,66 @@ def _utc_now_iso() -> str:
 
 
 @dataclass
+class AttemptTrace:
+    """One step of the troubleshoot-reflect-continue loop (#51).
+
+    Records what was done (action), what came back (observation), how it was
+    classified (reflection), and what the loop chose to do next (next_action)."""
+    phase: int
+    attempt: int
+    action: str
+    observation: str
+    reflection: str = ""
+    next_action: str = ""
+
+
+@dataclass
+class TaskTrace:
+    """Structured trace of a `/new` run: the goal, every attempt, the budget
+    snapshot, and why the loop stopped. Purely observational — recording it does
+    not change loop behavior. Serializable via ``to_dict`` so PR2 can emit a
+    compact continuation state from the same data."""
+    goal: str
+    attempts: list[AttemptTrace] = field(default_factory=list)
+    generations_used: int = 0
+    generations_limit: int = 0
+    search_used: int = 0
+    search_limit: int = 0
+    tier: int = 1
+    tier_limit: int = 3
+    stop_condition: str = ""
+
+    def record(self, *, phase: int, attempt: int, action: str, observation: str,
+               reflection: str = "", next_action: str = "") -> None:
+        self.attempts.append(AttemptTrace(
+            phase=phase, attempt=attempt, action=action,
+            observation=observation, reflection=reflection, next_action=next_action,
+        ))
+
+    def to_dict(self) -> dict:
+        return {
+            "goal": self.goal,
+            "attempts": [
+                {
+                    "phase": a.phase, "attempt": a.attempt, "action": a.action,
+                    "observation": a.observation, "reflection": a.reflection,
+                    "next_action": a.next_action,
+                }
+                for a in self.attempts
+            ],
+            "budget": {
+                "generations_used": self.generations_used,
+                "generations_limit": self.generations_limit,
+                "search_used": self.search_used,
+                "search_limit": self.search_limit,
+                "tier": self.tier,
+                "tier_limit": self.tier_limit,
+            },
+            "stop_condition": self.stop_condition,
+        }
+
+
+@dataclass
 class DynamicToolResult:
     ok: bool
     answer: str = ""
@@ -194,6 +254,7 @@ class DynamicToolResult:
     generations: int = 0
     error: str = ""
     raw_stdout: str = ""
+    trace: TaskTrace | None = None
 
 
 class TextGenerationClient(Protocol):
@@ -977,13 +1038,31 @@ class DynamicToolRunner:
     # ── generation + self-repair ────────────────────────────────────────────
 
     def _generate_with_repair(self, request: str) -> DynamicToolResult:
+        # #51: structured trace of the troubleshoot-reflect-continue loop. Built
+        # alongside the existing control flow and attached to the result; it never
+        # alters a decision. generations_limit is the per-tier repair budget; the
+        # cascade can climb tier_limit tiers.
+        trace = TaskTrace(
+            goal=request,
+            generations_limit=self.max_repairs,
+            search_limit=self.search_daily_cap,
+            tier_limit=3,
+        )
         always_on, topical = self._load_rules_split()
         feasible, why, selected = self._preflight(request, topical)
         if not feasible:
             logger.info("dynamic_tools: infeasible request, refusing honestly: %s", why)
+            trace.record(
+                phase=0, attempt=0, action="preflight",
+                observation=f"no keyless public data source: {why}",
+                reflection="request is infeasible with generated tools",
+                next_action="refuse",
+            )
+            trace.stop_condition = "infeasible"
             return DynamicToolResult(
                 ok=False, generations=0,
                 error=f"此需求需要的資料沒有免金鑰的公開資料源，無法以生成工具取得：{why}",
+                trace=trace,
             )
         # Pre-warm the independent local validator while the (cloud) generator
         # works: loading qwen3:14b is the slow part, and the local GPU is idle
@@ -1017,8 +1096,10 @@ class DynamicToolRunner:
         references = self._ground_references(request, knowledge_rows)
         if references is None:
             if self._needs_search_grounding(request, ""):
+                trace.search_used += 1
                 references = self._search_ground(request)
         elif self._needs_search_grounding(request, references):
+            trace.search_used += 1
             extra = self._search_ground(request)
             if extra:
                 references = references + "\n" + extra
@@ -1062,6 +1143,7 @@ class DynamicToolRunner:
                 (3, self.strong_model, True,  1),
             ):
                 self.client.model = model
+                trace.tier = phase
                 if phase >= 2:
                     logger.info(
                         "dynamic_tools: escalating to tier %s model=%s think=%s for request=%s",
@@ -1099,6 +1181,16 @@ class DynamicToolRunner:
                             if generations >= 2 and self.distill_enabled:
                                 self._distill_failure(request, code, last_error)
                             self._mark_knowledge_applied(knowledge_rows)
+                            trace.generations_used = generations
+                            trace.stop_condition = "goal satisfied"
+                            trace.record(
+                                phase=phase, attempt=generations,
+                                action="execute_generated_tool",
+                                observation="execution succeeded; answer satisfies the request",
+                                reflection="goal satisfied",
+                                next_action="done",
+                            )
+                            exec_result.trace = trace
                             return exec_result
                         if reason.startswith("[歧見]"):
                             # Primary approved, independent dissented. Remember it
@@ -1108,6 +1200,11 @@ class DynamicToolRunner:
                             exec_result.generations = generations
                             disputed_fallback = exec_result
                             disputed_reason = reason[len("[歧見]"):].strip()
+                            obs = "execution succeeded but independent validator disputed: " + reason
+                            refl = "cross-validator dispute"
+                        else:
+                            obs = "execution succeeded but answer rejected: " + reason
+                            refl = "output contradicts request (semantic mismatch)"
                         last_error = (
                             "答案驗證未通過（程式執行成功但輸出內容不符需求）：" + reason
                             + "\n（修正方向：改程式邏輯，讓輸出的依據取自真實資料點、"
@@ -1120,8 +1217,25 @@ class DynamicToolRunner:
                         )
                     else:
                         last_error = exec_result.error
+                        if ANSWER_START in (last_error or ""):
+                            obs = "script ran but produced no " + ANSWER_START + " block"
+                            refl = "output contract violated (missing answer block)"
+                        else:
+                            obs = "execution failed: " + _tail(last_error, 200)
+                            refl = "runtime/execution error"
                         logger.info("dynamic_tools: exec failed slug=%s err=%s",
                                     slug, _tail(last_error, 200))
+                    will_repair = phase_gen < phase_max
+                    next_action = (
+                        "repair_code" if will_repair
+                        else ("escalate_tier" if phase < 3 else "stop")
+                    )
+                    trace.generations_used = generations
+                    trace.record(
+                        phase=phase, attempt=generations,
+                        action="execute_generated_tool",
+                        observation=obs, reflection=refl, next_action=next_action,
+                    )
                     if phase_gen >= phase_max:
                         break
                     phase_gen += 1
@@ -1139,6 +1253,7 @@ class DynamicToolRunner:
                                                   think=think, api_structure=api_structure,
                                                   references=references)
 
+            trace.generations_used = generations
             if disputed_fallback is not None:
                 # Repairs exhausted but the generator approved this answer; ship it
                 # with a visible caveat instead of failing on the weaker model's word.
@@ -1147,10 +1262,14 @@ class DynamicToolRunner:
                     + f"\n—\n⚠️ 本地交叉驗證有疑慮：{disputed_reason}"
                 )
                 disputed_fallback.generations = generations
+                trace.stop_condition = "budgets exhausted; shipped disputed answer with caveat"
+                disputed_fallback.trace = trace
                 return disputed_fallback
+            trace.stop_condition = "budgets exhausted; no valid answer"
             return DynamicToolResult(
                 ok=False, slug=slug, generations=generations,
                 error=_tail(last_error, 600), raw_stdout=last_stdout,
+                trace=trace,
             )
         finally:
             self.client.num_predict = saved_num_predict
