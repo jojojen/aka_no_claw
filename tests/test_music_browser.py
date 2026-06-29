@@ -236,3 +236,50 @@ def test_pf_callback_plays_favorite(settings, proc_table):
     toast, _, _ = cb(f"pf:{entry['id']}", "", "c")
     assert toast.startswith("正在播放")
     assert len(proc_table["spawned"]) == 1
+
+
+# --- #60 queue-control callbacks (menu buttons) ----------------------------
+def test_menu_markup_has_queue_control_buttons():
+    cbs = _all_cbs(mc._menu_markup())
+    assert "music:prev" in cbs
+    assert "music:playpause" in cbs
+    assert "music:next" in cbs
+
+
+def test_prev_next_callbacks_refuse_without_queue(settings, proc_table):
+    cb = mb.build_music_callback_handler(settings)
+    assert cb("prev", "", "c")[0] == mc._NO_QUEUE_MSG
+    assert cb("next", "", "c")[0] == mc._NO_QUEUE_MSG
+
+
+def test_next_callback_skips_current_track(settings, proc_table):
+    state_path = settings.openclaw_music_player_state_path
+    mc._write_session(state_path, "tok")  # active continuous queue
+    pid = mc._start_song({"name": "Cur", "path": "/m/Cur.flac"}, state_path, mode="random")
+    cb = mb.build_music_callback_handler(settings)
+    toast, new_text, _ = cb("next", "", "c")
+    assert toast == "⏭ 已跳到下一首。"
+    assert new_text is None
+    assert pid in proc_table["killed"]
+
+
+def test_playpause_callback_toggles(settings, proc_table, monkeypatch):
+    signals = []
+    monkeypatch.setattr(mc, "_signal_pid", lambda pid, sig: signals.append((pid, sig)) or True)
+    state_path = settings.openclaw_music_player_state_path
+    pid = mc._start_song({"name": "A", "path": "/m/A.flac"}, state_path, mode="single")
+    cb = mb.build_music_callback_handler(settings)
+
+    import signal as _sig
+    assert cb("playpause", "", "c")[0] == "⏸ 已暫停播放。"  # first press pauses
+    assert (pid, _sig.SIGSTOP) in signals
+    assert mc._read_json(state_path)["paused"] is True
+
+    assert cb("playpause", "", "c")[0] == "▶️ 已繼續播放。"  # second press resumes
+    assert (pid, _sig.SIGCONT) in signals
+    assert mc._read_json(state_path)["paused"] is False
+
+
+def test_playpause_callback_when_nothing_playing(settings, proc_table):
+    cb = mb.build_music_callback_handler(settings)
+    assert cb("playpause", "", "c")[0] == "目前沒有播放中的音樂。"

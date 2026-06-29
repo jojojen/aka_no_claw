@@ -1173,6 +1173,23 @@ def test_music_action_volume_routes_to_music_callback(bridge, monkeypatch):
     assert res["actions"] == []
 
 
+def test_music_action_queue_controls_route_to_music_callback(bridge, monkeypatch):
+    # #60: the 生活-mode ⏮/⏯/⏭ buttons must reach the same music callback the
+    # Telegram bot uses, so web playback control shares one code path.
+    seen: list[str] = []
+
+    def _music_cb(payload, original_text, chat_id):
+        seen.append(payload)
+        return (f"toast:{payload}", None, None)
+
+    monkeypatch.setattr(bridge, "_callbacks", lambda: {"music": _music_cb})
+    for cb in ("music:prev", "music:playpause", "music:next"):
+        res = bridge.run_music_action(cb)
+        assert res["status"] == STATUS_OK
+        assert res["actions"] == []
+    assert seen == ["prev", "playpause", "next"]
+
+
 def test_music_action_browse_returns_rerender_text_and_buttons(bridge, monkeypatch):
     markup = {"inline_keyboard": [[{"text": "🎵 song", "callback_data": "music:sd:tok"}]]}
 

@@ -785,6 +785,14 @@ def _resume(state_path: str) -> str:
     return "▶️ 已繼續播放。"
 
 
+def _toggle_pause(state_path: str) -> str:
+    """One-button ⏯: resume if currently paused, otherwise pause."""
+    running = _current_running(state_path)
+    if running is None:
+        return "目前沒有播放中的音樂。"
+    return _resume(state_path) if running.get("paused") else _pause(state_path)
+
+
 def _next(state_path: str) -> str:
     if not _has_active_queue(state_path):
         return _NO_QUEUE_MSG
@@ -1151,6 +1159,26 @@ def stop_playback(settings: AssistantSettings) -> str:
     return _stop(settings.openclaw_music_player_state_path)
 
 
+def pause_playback(settings: AssistantSettings) -> str:
+    return _pause(settings.openclaw_music_player_state_path)
+
+
+def resume_playback(settings: AssistantSettings) -> str:
+    return _resume(settings.openclaw_music_player_state_path)
+
+
+def toggle_pause(settings: AssistantSettings) -> str:
+    return _toggle_pause(settings.openclaw_music_player_state_path)
+
+
+def next_track(settings: AssistantSettings) -> str:
+    return _next(settings.openclaw_music_player_state_path)
+
+
+def previous_track(settings: AssistantSettings) -> str:
+    return _previous(settings.openclaw_music_player_state_path)
+
+
 @dataclass(frozen=True)
 class ResumeToken:
     """A narrow snapshot of what was playing when a voice interruption took the
@@ -1421,6 +1449,11 @@ def _menu_markup() -> dict:
             [
                 {"text": "🔀 隨機播放", "callback_data": "music:rnd"},
                 {"text": "⏹ 停止", "callback_data": "music:stop"},
+            ],
+            [
+                {"text": "⏮ 上一首", "callback_data": "music:prev"},
+                {"text": "⏯ 暫停／繼續", "callback_data": "music:playpause"},
+                {"text": "⏭ 下一首", "callback_data": "music:next"},
             ],
             [{"text": "📂 瀏覽全部歌曲", "callback_data": "music:ls:root:0"}],
             [

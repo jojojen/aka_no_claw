@@ -236,6 +236,16 @@ def build_music_callback_handler(settings: AssistantSettings):
             return mc.stop_playback(settings), None, None
         if action == "pb":
             return mc.start_playbest(settings, store), None, None
+        if action == "pause":
+            return mc.pause_playback(settings), None, None
+        if action == "resume":
+            return mc.resume_playback(settings), None, None
+        if action == "playpause":
+            return mc.toggle_pause(settings), None, None
+        if action == "next":
+            return mc.next_track(settings), None, None
+        if action == "prev":
+            return mc.previous_track(settings), None, None
         if action == "now":
             return mc.add_current_to_favorites(settings, store), None, None
         if action == "mute":
