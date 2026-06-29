@@ -397,6 +397,94 @@ def test_parameterized_tool_reuse_matches_by_type(tmp_path):
     assert "77" in second.answer
 
 
+# --- #52 Phase 2: catalog wired into /new reuse lifecycle ----------------------
+
+def test_generation_registers_catalog_candidate(tmp_path):
+    # A freshly validated parameterized tool is immediately a reusable candidate.
+    client = FakeClient(code_responses=[PARAM_TOOL], meta_response=PARAM_META)
+    runner = _make_runner(tmp_path, client)
+    res = runner.run_detailed("輸出 x=10")
+    entry = runner.catalog.get(res.slug)
+    assert entry is not None
+    assert entry.status == "candidate"
+
+
+def test_new_generation_text_marks_tool_reusable(tmp_path):
+    client = FakeClient(code_responses=[PARAM_TOOL], meta_response=PARAM_META)
+    runner = _make_runner(tmp_path, client)
+    text = runner.run("輸出 x=10")
+    assert "🛠 新生成工具（已加入可重用工具庫）" in text
+
+
+def test_reuse_records_success_metric_and_promotes(tmp_path):
+    client1 = FakeClient(code_responses=[PARAM_TOOL], meta_response=PARAM_META)
+    runner = _make_runner(tmp_path, client1)
+    slug = runner.run_detailed("輸出 x=10").slug
+
+    client2 = FakeClient(code_responses=[], pick_response="x輸出", params_response='{"x": 77}')
+    runner.client = client2
+    text = runner.run("輸出 x=77")  # user-facing string
+    assert "♻️ 重用既有工具：x輸出" in text
+
+    entry = runner.catalog.get(slug)
+    assert entry.metrics["reuse_success_count"] == 1
+    assert entry.status == "promoted"
+
+
+def test_failed_reuse_records_failure_metric(tmp_path):
+    client1 = FakeClient(code_responses=[PARAM_TOOL], meta_response=PARAM_META)
+    runner = _make_runner(tmp_path, client1)
+    slug = runner.run_detailed("輸出 x=10").slug
+
+    # Reuse matches but its answer fails validation → reuse aborts (failure
+    # recorded for the matched tool), then regeneration succeeds.
+    client2 = FakeClient(
+        code_responses=[PARAM_TOOL], meta_response=PARAM_META,
+        pick_response="x輸出", params_response='{"x": 77}',
+        validate_responses=["FAIL", "PASS"],
+    )
+    runner.client = client2
+    runner.run_detailed("輸出 x=77")
+    assert runner.catalog.get(slug).metrics["failure_count"] >= 1
+
+
+def test_demoted_tool_skipped_and_regenerated(tmp_path):
+    client1 = FakeClient(code_responses=[PARAM_TOOL], meta_response=PARAM_META)
+    runner = _make_runner(tmp_path, client1)
+    slug = runner.run_detailed("輸出 x=10").slug
+    for _ in range(3):
+        runner.catalog.record_failure(slug)
+    assert runner.catalog.get(slug).status == "demoted"
+
+    # A demoted tool must drop out of the reuse fast-path: /new regenerates a
+    # fresh tool instead of reusing the unreliable one (#52 §E).
+    client2 = FakeClient(
+        code_responses=[PARAM_TOOL], meta_response=PARAM_META,
+        pick_response="x輸出", params_response='{"x": 77}',
+    )
+    runner.client = client2
+    second = runner.run_detailed("輸出 x=77")
+    assert second.ok
+    assert not second.reused
+    assert client2.calls["code"] == 1  # regenerated, not reused
+
+
+def test_blocked_tool_skipped_from_reuse(tmp_path):
+    client1 = FakeClient(code_responses=[PARAM_TOOL], meta_response=PARAM_META)
+    runner = _make_runner(tmp_path, client1)
+    slug = runner.run_detailed("輸出 x=10").slug
+    runner.catalog.block(slug, reason="safety")
+
+    client2 = FakeClient(
+        code_responses=[PARAM_TOOL], meta_response=PARAM_META,
+        pick_response="x輸出", params_response='{"x": 77}',
+    )
+    runner.client = client2
+    second = runner.run_detailed("輸出 x=77")
+    assert not second.reused
+    assert client2.calls["code"] == 1
+
+
 def test_validator_pass_unchanged(tmp_path):
     # Default validator (PASS) → behavior identical to pre-gate pipeline,
     # but the validation call itself must have happened.

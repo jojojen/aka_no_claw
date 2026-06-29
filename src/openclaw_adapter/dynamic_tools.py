@@ -46,6 +46,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+from .generated_tool_catalog import GeneratedToolCatalog
+
 logger = logging.getLogger(__name__)
 
 _OLLAMA_MAX_RETRIES = 3       # transient-error retries in generate()
@@ -788,6 +790,11 @@ class DynamicToolRunner:
         self.cloud_failover_restart = cloud_failover_restart
         self._cloud_failover_cooldown_seconds = 300.0
         self.tools_dir = Path(tools_dir)
+        # Lifecycle catalog over the manifest (#52). Generation registers a
+        # candidate; real reuse records success/failure metrics; tools that
+        # demote (repeated failures) or are blocked fall out of the reuse
+        # fast-path. Read-only wrt the manifest itself.
+        self.catalog = GeneratedToolCatalog(self.tools_dir)
         self.knowledge_db = knowledge_db
         self.exec_timeout_seconds = exec_timeout_seconds
         self.max_repairs = max_repairs
@@ -845,8 +852,14 @@ class DynamicToolRunner:
             logger.exception("dynamic_tools: run failed")
             return f"動態工具執行失敗：{exc}"
         if result.ok:
-            prefix = "♻️ 重用既有工具\n" if result.reused else "🛠 新生成工具\n"
-            reuse_note = "（本次重用，未重新生成）" if result.reused else ""
+            tool_type = self._catalog_tool_type(result.slug)
+            if result.reused:
+                label = f"♻️ 重用既有工具：{tool_type}" if tool_type else "♻️ 重用既有工具"
+                prefix = label + "\n"
+                reuse_note = "（本次重用，未重新生成）"
+            else:
+                prefix = "🛠 新生成工具（已加入可重用工具庫）\n"
+                reuse_note = ""
             footer = f"\n—\n🤖 codegen：{self.backend_label}{reuse_note}"
             return prefix + result.answer + footer
         if result.generations == 0:
@@ -938,14 +951,42 @@ class DynamicToolRunner:
                 trace.stop_condition = "goal satisfied via reuse"
                 reused.trace = trace
                 result = reused
+                self._record_catalog_outcome(match.get("slug"), True, None)
             else:
                 logger.info("dynamic_tools: reuse failed, regenerating slug=%s", match.get("slug"))
+                self._record_catalog_outcome(
+                    match.get("slug"), False, "reuse failed validation/execution"
+                )
         if result is None:
             result = self._generate_with_repair(core)
 
         if result.ok and format_spec:
             result.answer = self._apply_presentation(format_spec, result.answer)
         return result
+
+    def _catalog_tool_type(self, slug: str | None) -> str | None:
+        """tool_type of a generated tool, for the user-visible reuse trace.
+        Best effort — never break a /new reply over a missing catalog entry."""
+        if not slug:
+            return None
+        try:
+            entry = self.catalog.get(slug)
+        except Exception:
+            return None
+        return entry.tool_type if entry else None
+
+    def _record_catalog_outcome(self, slug: str | None, ok: bool, reason: str | None) -> None:
+        """Update lifecycle metrics after a real reuse attempt (#52 §5). Best
+        effort: catalog bookkeeping must never break a /new reply."""
+        if not slug:
+            return
+        try:
+            if ok:
+                self.catalog.record_reuse_success(slug)
+            else:
+                self.catalog.record_failure(slug, reason)
+        except Exception:
+            logger.debug("dynamic_tools: catalog metric update failed slug=%s", slug, exc_info=True)
 
     def _split_request_intent(self, request: str) -> tuple[str, str]:
         """Split a request into (core_data_request, format_spec). The format spec
@@ -2063,6 +2104,13 @@ class DynamicToolRunner:
             entry["tool_type"] = str(tool_type)
         entries.append(entry)
         self._save_manifest(entries)
+        # Seed a catalog state row so a freshly validated tool is immediately a
+        # reusable candidate (#52 §A). Best-effort: catalog bookkeeping must
+        # never break code generation.
+        try:
+            self.catalog.register(slug)
+        except Exception:
+            logger.debug("dynamic_tools: catalog.register failed slug=%s", slug, exc_info=True)
 
     def _pick_reusable(self, request: str) -> dict | None:
         """Decide which existing tool (if any) to reuse.
@@ -2079,6 +2127,18 @@ class DynamicToolRunner:
         entries = self._load_manifest()
         if not entries:
             return None
+
+        # Drop tools the catalog has demoted (repeated reuse failures) or blocked
+        # (safety) so they no longer serve the fast-path; /new regenerates a fresh
+        # tool instead (#52 §E).
+        try:
+            suppressed = self.catalog.reuse_suppressed()
+        except Exception:
+            suppressed = set()
+        if suppressed:
+            entries = [e for e in entries if e.get("slug") not in suppressed]
+            if not entries:
+                return None
 
         norm_req = _normalize_request(request)
         for e in entries:
