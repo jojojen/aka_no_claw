@@ -441,14 +441,20 @@ def test_trace_records_missing_answer_then_repair(tmp_path):
     assert trace is not None
     assert trace.goal == "做一件先漏輸出契約的事"
     assert trace.stop_condition == "goal satisfied"
-    # Budget reflects attempts used and the per-tier limit.
+    # Budget: used never exceeds limit. generations_limit is the cascade TOTAL
+    # (2*max_repairs+1); the per-tier ceiling is tier_generations_limit.
     assert trace.generations_used == 2
-    assert trace.generations_limit == runner.max_repairs
+    assert trace.generations_limit == 2 * runner.max_repairs + 1
+    assert trace.tier_generations_limit == runner.max_repairs
+    assert trace.generations_used <= trace.generations_limit
 
-    first, last = trace.attempts[0], trace.attempts[-1]
-    assert first.action == "execute_generated_tool"
-    assert "contract violated" in first.reflection
-    assert first.next_action == "repair_code"
+    actions = [a.action for a in trace.attempts]
+    assert "generate_code" in actions
+    assert "repair_code" in actions
+    executes = [a for a in trace.attempts if a.action == "execute_generated_tool"]
+    assert "contract violated" in executes[0].reflection
+    assert executes[0].next_action == "repair_code"
+    last = trace.attempts[-1]
     assert last.reflection == "goal satisfied"
     assert last.next_action == "done"
 
@@ -469,8 +475,8 @@ def test_trace_validator_rejection_does_not_claim_success(tmp_path):
     assert res.generations == 2  # did not stop at the rejected first attempt
     trace = res.trace
     assert trace is not None
-    rejected = trace.attempts[0]
-    assert rejected.action == "execute_generated_tool"
+    executes = [a for a in trace.attempts if a.action == "execute_generated_tool"]
+    rejected = executes[0]
     assert "semantic mismatch" in rejected.reflection
     assert "主題不符" in rejected.observation
     assert rejected.next_action == "repair_code"
@@ -493,6 +499,78 @@ def test_trace_records_infeasible_refusal(tmp_path):
     assert trace.stop_condition == "infeasible"
     assert trace.attempts[0].action == "preflight"
     assert trace.attempts[0].next_action == "refuse"
+
+
+def test_trace_records_tier_escalation_event(tmp_path):
+    # #51 review fixture: tier A fails 3x, tier B succeeds. The trace must contain
+    # an explicit escalate_tier event, and the multi-tier budget snapshot must be
+    # coherent (used <= total limit, per-tier ceiling separate).
+    client = FakeClient(
+        code_responses=[BAD_SCRIPT + "\n# v1", BAD_SCRIPT + "\n# v2",
+                        BAD_SCRIPT + "\n# v3", GOOD_SCRIPT],
+    )
+    runner = DynamicToolRunner(
+        client=client,
+        tools_dir=tmp_path / "generated_tools",
+        knowledge_db=None,
+        exec_timeout_seconds=30,
+        fast_model="coder:7b",
+        strong_model="big:14b",
+    )
+    runner._ensure_venv = lambda: Path(sys.executable)  # type: ignore[assignment]
+    runner._pip_install = lambda packages: None  # type: ignore[assignment]
+
+    res = runner.run_detailed("先失敗三次再升級")
+    assert res.ok and res.generations == 4
+    trace = res.trace
+    assert trace is not None
+    escalations = [a for a in trace.attempts if a.action == "escalate_tier"]
+    assert len(escalations) == 1
+    assert escalations[0].phase == 2  # climbed from tier 1 to tier 2
+    # Budget stays coherent across tiers: used never exceeds the cascade total.
+    assert trace.generations_used == 4
+    assert trace.generations_limit == 2 * runner.max_repairs + 1
+    assert trace.generations_used <= trace.generations_limit
+    assert trace.tier == 2
+    assert trace.tier_generations_used <= trace.tier_generations_limit
+
+
+def test_trace_records_reuse_path(tmp_path):
+    # #51 review fixture: a reused tool skips _generate_with_repair, but the result
+    # must still carry a trace describing the no-generation reuse success.
+    client1 = FakeClient(code_responses=[GOOD_SCRIPT])
+    runner = _make_runner(tmp_path, client1)
+    runner.run_detailed("查某個固定東西")
+
+    client2 = FakeClient(code_responses=[])  # no codegen allowed: must reuse
+    runner2 = _make_runner(tmp_path, client2)
+    res = runner2.run_detailed("查某個固定東西")
+    assert res.ok and res.reused
+    assert client2.calls["code"] == 0  # proves the reuse path, not regeneration
+    trace = res.trace
+    assert trace is not None
+    assert trace.stop_condition == "goal satisfied via reuse"
+    actions = [a.action for a in trace.attempts]
+    assert actions == ["pick_reusable", "reuse_existing_tool"]
+    assert trace.attempts[-1].next_action == "done"
+
+
+def test_trace_records_distillation_event(tmp_path):
+    # #51 review fixture: when distillation runs (>=2 generations, opted in), the
+    # trace records a distill_failure event alongside the success.
+    db = KnowledgeDatabase(tmp_path / "k.sqlite3")
+    distilled = (
+        '{"category":"validation","title":"通則","technique":"通用規則","keywords":["t"]}'
+    )
+    client = FakeClient(code_responses=[BAD_SCRIPT, GOOD_SCRIPT], distill_response=distilled)
+    runner = _make_runner(tmp_path, client, db=db)
+    runner.distill_enabled = True
+    res = runner.run_detailed("需要修復後蒸餾的任務")
+    assert res.ok and res.generations == 2
+    assert client.calls["distill"] == 1
+    trace = res.trace
+    assert trace is not None
+    assert any(a.action == "distill_failure" for a in trace.attempts)
 
 
 def test_reuse_validation_fail_regenerates(tmp_path):

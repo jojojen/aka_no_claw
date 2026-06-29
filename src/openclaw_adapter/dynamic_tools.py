@@ -207,12 +207,19 @@ class TaskTrace:
     compact continuation state from the same data."""
     goal: str
     attempts: list[AttemptTrace] = field(default_factory=list)
+    # Total generations across the whole tier cascade. The cascade is
+    # tier1(max_repairs) + tier2(max_repairs) + tier3(1), so the total limit is
+    # 2*max_repairs+1 — using max_repairs here let `used` exceed `limit` once the
+    # loop climbed a tier (review #51). `generations_*` are TOTAL; `tier_*`
+    # describe budget within the current tier only.
     generations_used: int = 0
     generations_limit: int = 0
-    search_used: int = 0
-    search_limit: int = 0
     tier: int = 1
     tier_limit: int = 3
+    tier_generations_used: int = 0
+    tier_generations_limit: int = 0
+    search_used: int = 0
+    search_limit: int = 0
     stop_condition: str = ""
 
     def record(self, *, phase: int, attempt: int, action: str, observation: str,
@@ -236,10 +243,12 @@ class TaskTrace:
             "budget": {
                 "generations_used": self.generations_used,
                 "generations_limit": self.generations_limit,
-                "search_used": self.search_used,
-                "search_limit": self.search_limit,
                 "tier": self.tier,
                 "tier_limit": self.tier_limit,
+                "tier_generations_used": self.tier_generations_used,
+                "tier_generations_limit": self.tier_generations_limit,
+                "search_used": self.search_used,
+                "search_limit": self.search_limit,
             },
             "stop_condition": self.stop_condition,
         }
@@ -905,6 +914,29 @@ class DynamicToolRunner:
         if match is not None:
             reused = self._reuse(match, core)
             if reused is not None and reused.ok:
+                # The reuse path skips _generate_with_repair, so it has no trace of
+                # its own (#51 review). Give it a minimal one: matched -> ran ->
+                # validated, so resume/inspection sees the no-generation success.
+                trace = TaskTrace(
+                    goal=core,
+                    generations_limit=2 * self.max_repairs + 1,
+                    search_limit=self.search_daily_cap,
+                    tier=0, tier_limit=3,
+                )
+                trace.record(
+                    phase=0, attempt=0, action="pick_reusable",
+                    observation=f"matched existing tool slug={match.get('slug')}",
+                    reflection="reuse candidate found",
+                    next_action="reuse_existing_tool",
+                )
+                trace.record(
+                    phase=0, attempt=0, action="reuse_existing_tool",
+                    observation="ran existing tool; answer satisfies the request",
+                    reflection="goal satisfied via reuse (no generation needed)",
+                    next_action="done",
+                )
+                trace.stop_condition = "goal satisfied via reuse"
+                reused.trace = trace
                 result = reused
             else:
                 logger.info("dynamic_tools: reuse failed, regenerating slug=%s", match.get("slug"))
@@ -1040,11 +1072,12 @@ class DynamicToolRunner:
     def _generate_with_repair(self, request: str) -> DynamicToolResult:
         # #51: structured trace of the troubleshoot-reflect-continue loop. Built
         # alongside the existing control flow and attached to the result; it never
-        # alters a decision. generations_limit is the per-tier repair budget; the
-        # cascade can climb tier_limit tiers.
+        # alters a decision. generations_limit is the TOTAL across the cascade
+        # tier1(max_repairs)+tier2(max_repairs)+tier3(1); per-tier budget lives in
+        # tier_generations_*.
         trace = TaskTrace(
             goal=request,
-            generations_limit=self.max_repairs,
+            generations_limit=2 * self.max_repairs + 1,
             search_limit=self.search_daily_cap,
             tier_limit=3,
         )
@@ -1097,9 +1130,19 @@ class DynamicToolRunner:
         if references is None:
             if self._needs_search_grounding(request, ""):
                 trace.search_used += 1
+                trace.record(
+                    phase=0, attempt=0, action="search_grounding",
+                    observation="no stored reference; grounding via bounded web search",
+                    next_action="generate_code",
+                )
                 references = self._search_ground(request)
         elif self._needs_search_grounding(request, references):
             trace.search_used += 1
+            trace.record(
+                phase=0, attempt=0, action="search_grounding",
+                observation="stored reference lacks a current value; augmenting via web search",
+                next_action="generate_code",
+            )
             extra = self._search_ground(request)
             if extra:
                 references = references + "\n" + extra
@@ -1144,10 +1187,18 @@ class DynamicToolRunner:
             ):
                 self.client.model = model
                 trace.tier = phase
+                trace.tier_generations_limit = phase_max
                 if phase >= 2:
                     logger.info(
                         "dynamic_tools: escalating to tier %s model=%s think=%s for request=%s",
                         phase, model, think, request[:80],
+                    )
+                    trace.record(
+                        phase=phase, attempt=generations, action="escalate_tier",
+                        observation=f"tier {phase - 1} exhausted; escalating to tier {phase} "
+                                    f"(model={model}, think={think})",
+                        reflection="lower tier could not satisfy the request",
+                        next_action="generate_code",
                     )
                 if phase == 3:
                     # Think mode generates longer output; remove the num_predict cap and
@@ -1160,6 +1211,11 @@ class DynamicToolRunner:
                 code = self._pass_syntax_gate(request, code, knowledge_rows,
                                               think=think, api_structure=api_structure,
                                               references=references)
+                trace.record(
+                    phase=phase, attempt=generations, action="generate_code",
+                    observation=f"generated tool code for tier {phase}",
+                    next_action="execute_generated_tool",
+                )
                 phase_gen = 1
                 while True:
                     generations += 1
@@ -1178,10 +1234,8 @@ class DynamicToolRunner:
                                 tool_type=meta.get("tool_type"),
                                 param_schema=meta.get("param_schema"),
                             )
-                            if generations >= 2 and self.distill_enabled:
-                                self._distill_failure(request, code, last_error)
-                            self._mark_knowledge_applied(knowledge_rows)
                             trace.generations_used = generations
+                            trace.tier_generations_used = phase_gen
                             trace.stop_condition = "goal satisfied"
                             trace.record(
                                 phase=phase, attempt=generations,
@@ -1190,6 +1244,16 @@ class DynamicToolRunner:
                                 reflection="goal satisfied",
                                 next_action="done",
                             )
+                            if generations >= 2 and self.distill_enabled:
+                                self._distill_failure(request, code, last_error)
+                                trace.record(
+                                    phase=phase, attempt=generations,
+                                    action="distill_failure",
+                                    observation="abstracted a reusable rule into codegen knowledge",
+                                    reflection="multi-attempt success worth distilling",
+                                    next_action="done",
+                                )
+                            self._mark_knowledge_applied(knowledge_rows)
                             exec_result.trace = trace
                             return exec_result
                         if reason.startswith("[歧見]"):
@@ -1231,6 +1295,7 @@ class DynamicToolRunner:
                         else ("escalate_tier" if phase < 3 else "stop")
                     )
                     trace.generations_used = generations
+                    trace.tier_generations_used = phase_gen
                     trace.record(
                         phase=phase, attempt=generations,
                         action="execute_generated_tool",
@@ -1248,7 +1313,18 @@ class DynamicToolRunner:
                         # fail identically; skip straight to the next tier.
                         logger.info("dynamic_tools: repair produced identical code, "
                                     "escalating early (phase=%s)", phase)
+                        trace.record(
+                            phase=phase, attempt=generations, action="repair_code",
+                            observation="repair returned identical code",
+                            reflection="repair stuck; escalating tier early",
+                            next_action="escalate_tier" if phase < 3 else "stop",
+                        )
                         break
+                    trace.record(
+                        phase=phase, attempt=generations, action="repair_code",
+                        observation="regenerated code from the observed failure reason",
+                        next_action="execute_generated_tool",
+                    )
                     code = self._pass_syntax_gate(request, code, knowledge_rows,
                                                   think=think, api_structure=api_structure,
                                                   references=references)
