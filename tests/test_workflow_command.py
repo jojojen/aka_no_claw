@@ -10,6 +10,7 @@ from openclaw_adapter.workflow_command import (
     _cmd_list,
     _cmd_run,
     _cmd_show,
+    _cmd_traces,
     _help,
 )
 
@@ -267,8 +268,53 @@ def test_cmd_run_saynow_receives_chat_id(tmp_path):
 
 def test_help_text():
     h = _help()
-    for sub in ["list", "show", "run", "delete", "create"]:
+    for sub in ["list", "show", "run", "delete", "create", "traces"]:
         assert sub in h
+
+
+# ── /workflow traces ──────────────────────────────────────────────────────────
+
+def test_cmd_traces_empty(tmp_path):
+    store = _make_store(tmp_path)
+    store.save(_simple_wf())
+    reply = _cmd_traces("wf-test", store)
+    assert "尚無" in reply
+
+
+def test_cmd_traces_missing_id(tmp_path):
+    reply = _cmd_traces("", _make_store(tmp_path))
+    assert "用法" in reply
+
+
+def test_cmd_traces_shows_ok_entries(tmp_path):
+    store = _make_store(tmp_path)
+    store.save(_simple_wf())
+    executor = FakeExecutor(tmp_path, {"t": (True, "東京：晴れ")})
+    _cmd_run("wf-test", "c", store, executor, _noop_saynow, None)
+    _cmd_run("wf-test", "c", store, executor, _noop_saynow, None)
+    reply = _cmd_traces("wf-test", store)
+    assert "2 回" in reply
+    assert "✅" in reply
+
+
+def test_cmd_traces_shows_failed_entries(tmp_path):
+    store = _make_store(tmp_path)
+    store.save(_simple_wf())
+    executor = FakeExecutor(tmp_path, {"t": (False, "タイムアウト")})
+    _cmd_run("wf-test", "c", store, executor, _noop_saynow, None)
+    reply = _cmd_traces("wf-test", store)
+    assert "❌" in reply
+
+
+def test_cmd_traces_limits_to_five(tmp_path):
+    store = _make_store(tmp_path)
+    store.save(_simple_wf())
+    executor = FakeExecutor(tmp_path, {"t": (True, "ok")})
+    for _ in range(7):
+        _cmd_run("wf-test", "c", store, executor, _noop_saynow, None)
+    reply = _cmd_traces("wf-test", store)
+    assert "7 回" in reply           # total count shown
+    assert reply.count("[") <= 5    # only 5 entries rendered
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

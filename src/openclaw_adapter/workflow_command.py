@@ -61,6 +61,8 @@ def build_workflow_handler(settings, runner) -> Callable[[str, str], object]:
             return _cmd_create(arg, store)
         if subcmd == "run":
             return _cmd_run(arg, chat_id, store, runner, _saynow_raw, settings)
+        if subcmd == "traces":
+            return _cmd_traces(arg, store)
         return _help()
 
     return handler
@@ -176,12 +178,36 @@ def _cmd_run(
     return f"❌ {wf.id} 失敗\n{trace.final_result or '（無詳情）'}"
 
 
+def _cmd_traces(workflow_id: str, store: WorkflowStore, limit: int = 5) -> str:
+    if not workflow_id:
+        return "用法：/workflow traces <id>"
+    traces = store.list_traces(workflow_id)
+    if not traces:
+        return f"workflow '{workflow_id}' 尚無執行記錄。"
+    recent = traces[-limit:][::-1]  # most recent first, up to limit
+    lines = [f"📊 {workflow_id} — {len(traces)} 回執行記錄（顯示最近 {len(recent)} 回）"]
+    for i, trace in enumerate(recent, 1):
+        status = "✅" if trace.ok else "❌"
+        summary = (trace.final_result or "（無輸出）")[:80]
+        if len(trace.final_result or "") > 80:
+            summary += "…"
+        # Summarise failed steps
+        failed = [st for st in trace.steps if st.status == "failed"]
+        if failed:
+            fail_info = f" | 失敗步驟：{failed[0].step_id}（{failed[0].error or ''}）"[:60]
+        else:
+            fail_info = ""
+        lines.append(f"[{i}] {status} {summary}{fail_info}")
+    return "\n".join(lines)
+
+
 def _help() -> str:
     return (
         "用法：\n"
         "  /workflow list              — 列出所有 workflow\n"
         "  /workflow show <id>         — 顯示 workflow 的步驟\n"
         "  /workflow run <id>          — 執行 workflow\n"
+        "  /workflow traces <id>       — 顯示執行記錄\n"
         "  /workflow delete <id>       — 刪除 workflow\n"
         "  /workflow create <JSON>     — 從 JSON 建立 workflow"
     )
