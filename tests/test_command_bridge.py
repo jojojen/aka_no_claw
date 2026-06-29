@@ -1744,6 +1744,80 @@ def test_music_plan_guardrails_no_arbitrary_commands(monkeypatch):
     assert "rm" not in resp.message or "找不到" in resp.message
 
 
+def test_music_plan_pause_persists_continuation_then_resume_plays(monkeypatch):
+    """#51 PR3: an ambiguous plan pauses into a resumable continuation; a follow-up
+    turn naming a track resumes at the play step WITHOUT re-running inspect/search."""
+    b = CommandBridge(settings=_tool_settings())
+    calls = {"index": 0, "web": 0}
+
+    def _index(music_dir, index_path):
+        calls["index"] += 1
+        return _make_index(["JANE DOE", "Lemon", "One Last Kiss"])
+
+    def _web(q, *, max_results, reuse_browser):
+        calls["web"] += 1
+        return [_make_web_result("JANE DOE + Lemon 米津玄師 比較", "both popular")]
+
+    monkeypatch.setattr("openclaw_adapter.music_command.load_or_build_index", _index)
+    monkeypatch.setattr("openclaw_adapter.web_search.web_search", _web)
+    played = {}
+    monkeypatch.setattr(b, "run_music_command",
+                        lambda t: played.update({"title": t}) or
+                        {"status": STATUS_OK, "message": f"▶️ {t}", "actions": []})
+
+    req = parse_request({"mode": "chat", "input": "x", "conversation_id": "c1"})
+    intent = MusicIntent(action=MUSIC_ACTION_PLAN, query="米津玄師", qualifier="熱門")
+
+    # Turn 1: ambiguous → pause, no playback yet, continuation persisted.
+    pause = b._exec_music_intent(req, intent)
+    assert "請問您想播哪一首" in pause.message
+    assert played == {}
+    assert calls == {"index": 1, "web": 1}
+    entry = b._music_continuations["c1"]
+    assert entry["state"]["next_action"] == "play"
+    assert "JANE DOE" in entry["candidates"] and "Lemon" in entry["candidates"]
+
+    # Turn 2: user names a track → resume plays it without re-inspecting/searching.
+    resume_req = parse_request({"mode": "chat", "input": "Lemon", "conversation_id": "c1"})
+    resumed = b._handle_chat_blocking(resume_req)
+    assert played.get("title") == "Lemon"
+    assert "▶️ Lemon" in resumed.message
+    assert calls == {"index": 1, "web": 1}  # inspect/search NOT re-run
+    assert "c1" not in b._music_continuations  # consumed
+
+
+def test_music_plan_resume_rejects_unoffered_track(monkeypatch):
+    """Guardrail: resume only plays a track from the offered candidate set."""
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        "openclaw_adapter.music_command.load_or_build_index",
+        lambda music_dir, index_path: _make_index(["JANE DOE", "Lemon"]),
+    )
+    monkeypatch.setattr(
+        "openclaw_adapter.web_search.web_search",
+        lambda q, *, max_results, reuse_browser: [
+            _make_web_result("JANE DOE + Lemon 米津玄師", "both"),
+        ],
+    )
+    played = {}
+    monkeypatch.setattr(b, "run_music_command",
+                        lambda t: played.update({"title": t}) or
+                        {"status": STATUS_OK, "message": f"▶️ {t}", "actions": []})
+
+    req = parse_request({"mode": "chat", "input": "x", "conversation_id": "c2"})
+    b._exec_music_intent(req, MusicIntent(action=MUSIC_ACTION_PLAN, query="米津玄師", qualifier="熱門"))
+
+    # An un-offered title must not play; the continuation stays put (text didn't match,
+    # so the resume hook ignores it and routing would continue).
+    assert b._maybe_resume_music_plan(req, "rm -rf /") is None
+    assert played == {}
+    assert "c2" in b._music_continuations
+    # Calling the resume entry directly with a bad selection is rejected explicitly.
+    rejected = b._resume_music_plan(req, "rm -rf /")
+    assert rejected.status == "error"
+    assert played == {}
+
+
 def test_rank_local_by_web_mentions():
     from types import SimpleNamespace
 

@@ -73,6 +73,13 @@ from .command_bridge_models import (
     stream_heartbeat,
     stream_start,
 )
+from .task_loop import (
+    BoundedTaskLoop,
+    ContinuationState,
+    LoopContext,
+    StepOutcome,
+    resume_loop,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -321,6 +328,11 @@ class CommandBridge:
         self._image_renderer = None
         self._image_renderer_built = False
         self._image_renderer_lock = threading.Lock()
+        # #51 PR3: per-conversation paused music plans awaiting a track choice.
+        # Maps a conversation key -> {"state": ContinuationState dict, "candidates": [names]}.
+        # In-process only: a resume is a follow-up turn within the same bridge run.
+        self._music_continuations: dict[str, dict] = {}
+        self._music_cont_lock = threading.Lock()
 
     # --- handler registry (lazy, shared with the Telegram bot) ------------
     def _ensure_registries(self) -> None:
@@ -449,6 +461,12 @@ class CommandBridge:
             return WebCommandResponse(
                 status=STATUS_ERROR, message="請輸入訊息。", mode=MODE_CHAT
             )
+        # #51 PR3: if this conversation has a paused music plan and the user's
+        # message names one of the offered tracks, resume the loop (play that
+        # track) instead of routing — the live resume client for the bounded loop.
+        resumed = self._maybe_resume_music_plan(req, text)
+        if resumed is not None:
+            return resumed
         # Music fast-path (#49/#50): fires before the LLM router for obvious music
         # intents so there is no LLM round-trip for "播放一首歌" / "停止音樂" etc.
         music_intent = detect_music_intent(text)
@@ -581,119 +599,266 @@ class CommandBridge:
     def _exec_music_plan(
         self, req: WebCommandRequest, intent: MusicIntent
     ) -> WebCommandResponse:
-        """Bounded multi-tool plan (#50): local library inspection → web search →
-        match → play or ask for confirmation.
+        """Bounded multi-tool plan (#50), now driven through the #51 BoundedTaskLoop.
 
-        The plan trace is embedded in the response message so it is visible to
-        the user and testable without a separate log sink.  Only local songs that
-        appear in the web search results are eligible for playback; the bridge
-        never plays a song that is absent from the local library."""
+        The four allowlisted steps — inspect → search → match → play — run under a
+        hard step budget. When the match is unambiguous the loop plays and ends;
+        when it is ambiguous (zero or several web-confirmed matches) the loop stops
+        without playing and the bridge emits a resumable :class:`ContinuationState`
+        (persisted per-conversation) plus track-choice buttons, so a follow-up turn
+        resumes *at the play step* without re-running inspect/search/match.
+
+        Only local songs confirmed by web results are ever played; arbitrary slash
+        commands are unreachable — the play step calls ``run_music_command`` with a
+        local title only."""
+        artist = intent.query
+        qualifier = intent.qualifier
+        scratch: dict = {
+            "artist": artist,
+            "qualifier": qualifier,
+            "trace": [f"Goal: play a {qualifier} song by {artist!r} available locally"],
+            "selection": None,
+            "matched": [],
+            "local_candidates": [],
+            "abort": None,
+            "play_result": None,
+        }
+        loop = BoundedTaskLoop(
+            f"play a {qualifier} song by {artist!r} available locally",
+            steps=self._music_plan_steps(scratch),
+            decider=self._music_plan_decider(scratch),
+            max_steps=4,
+            constraints="play only web-confirmed local tracks; no arbitrary commands",
+        )
+        result = loop.run()
+        trace = scratch["trace"]
+
+        def with_trace(body: str) -> str:
+            return body + "\n\n" + "\n".join(trace)
+
+        if scratch["abort"]:
+            return WebCommandResponse(
+                status=STATUS_OK, message=with_trace(scratch["abort"]), mode=MODE_CHAT
+            )
+        if result.done:
+            play_result = scratch["play_result"] or {}
+            return WebCommandResponse(
+                status=play_result.get("status", STATUS_OK),
+                message=with_trace(f"🎵 {play_result.get('message', '')}"),
+                mode=MODE_CHAT,
+            )
+        # Loop stopped before playing → disambiguation needed. Persist a resumable
+        # continuation (next action = play) and offer the candidate tracks.
+        matched = scratch["matched"]
+        local_candidates = scratch["local_candidates"]
+        if not matched:
+            candidates = local_candidates[:5]
+            head = (
+                f"找到以下「{artist}」歌曲，但無法從搜尋結果確認哪首最{qualifier}：\n"
+                + "、".join(c.get("name", "?") for c in candidates)
+                + "\n\n請問您想播哪一首？"
+            )
+        else:
+            candidates = matched[:5]
+            head = (
+                f"找到多首「{artist}」{qualifier}候選歌曲：\n"
+                + "、".join(c.get("name", "?") for c in candidates)
+                + "\n\n請問您想播哪一首？"
+            )
+        names = [c.get("name", "?") for c in candidates]
+        state = self._music_continuation_state(scratch, result, names)
+        self._store_music_continuation(req, state, names)
+        # Resume is driven by the user's next message naming a track (see
+        # _maybe_resume_music_plan), so no buttons are attached here.
+        return WebCommandResponse(
+            status=STATUS_OK, message=with_trace(head), mode=MODE_CHAT
+        )
+
+    def _music_plan_steps(self, scratch: dict) -> dict:
+        """Allowlisted steps for the music plan loop, sharing ``scratch`` for the
+        data the linear StepOutcome string cannot carry between steps."""
         from .music_command import _search, load_or_build_index
         from .web_search import DEFAULT_WEB_SEARCH_LIMIT, web_search
 
-        artist = intent.query
-        qualifier = intent.qualifier
-        plan_trace: list[str] = [
-            f"Goal: play a {qualifier} song by {artist!r} available locally",
-        ]
+        artist = scratch["artist"]
+        qualifier = scratch["qualifier"]
+        trace = scratch["trace"]
 
-        # Task 1 — local candidate lookup
-        # First try matching the artist name directly against song titles (covers
-        # libraries where files are named "Artist - Song" or "Artist Song"). When
-        # that yields nothing (titles are song-only, like "JANE DOE.flac"), fall
-        # back to all entries: the web-ranking step in Task 3 will filter to only
-        # songs that web results associate with this artist.
-        plan_trace.append(f"Task 1: inspect local music candidates for {artist!r}")
-        try:
-            index = load_or_build_index(
-                self.settings.openclaw_music_dir,
-                self.settings.openclaw_music_index_path,
+        def inspect(ctx: LoopContext) -> StepOutcome:
+            trace.append(f"Task 1: inspect local music candidates for {artist!r}")
+            try:
+                index = load_or_build_index(
+                    self.settings.openclaw_music_dir,
+                    self.settings.openclaw_music_index_path,
+                )
+                local_sr = _search(index.entries, artist)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[music-plan] index load failed: %s", exc)
+                index = None
+                local_sr = None
+            if index is None or not index.entries:
+                trace.append("Task 1 result: local music library is empty or unavailable")
+                scratch["abort"] = f"本地音樂庫中找不到「{artist}」的歌曲。"
+                return StepOutcome(observation="local library empty", failed=True)
+            if local_sr is not None and local_sr.kind != "none":
+                local_candidates = (
+                    [local_sr.entry]
+                    if local_sr.kind in ("exact", "single") and local_sr.entry
+                    else list(local_sr.candidates)
+                )
+            else:
+                local_candidates = list(index.entries)
+            scratch["local_candidates"] = local_candidates
+            trace.append(
+                f"Task 1 result: {len(local_candidates)} local candidate(s): "
+                + "、".join(c.get("name", "?") for c in local_candidates[:5])
             )
-            local_sr = _search(index.entries, artist)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[music-plan] index load failed: %s", exc)
-            index = None
-            local_sr = None
-        if index is None or not index.entries:
-            plan_trace.append("Task 1 result: local music library is empty or unavailable")
-            msg = (
-                f"本地音樂庫中找不到「{artist}」的歌曲。\n\n"
-                + "\n".join(plan_trace)
+            return StepOutcome(observation=f"{len(local_candidates)} local candidate(s)")
+
+        def search(ctx: LoopContext) -> StepOutcome:
+            query = f"{artist} {qualifier} シングル"
+            trace.append(f"Task 2: search for {query!r}")
+            try:
+                web_results = web_search(
+                    query, max_results=DEFAULT_WEB_SEARCH_LIMIT, reuse_browser=False
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[music-plan] web search failed: %s", exc)
+                web_results = []
+            scratch["web_results"] = web_results
+            trace.append(f"Task 2 result: {len(web_results)} web result(s)")
+            return StepOutcome(observation=f"{len(web_results)} web result(s)")
+
+        def match(ctx: LoopContext) -> StepOutcome:
+            trace.append("Task 3: match search results against local candidates")
+            matched = self._rank_local_by_web_mentions(
+                scratch["local_candidates"], scratch.get("web_results", [])
             )
-            return WebCommandResponse(status=STATUS_OK, message=msg, mode=MODE_CHAT)
-        if local_sr is not None and local_sr.kind != "none":
-            local_candidates: list[dict] = (
-                [local_sr.entry]
-                if local_sr.kind in ("exact", "single") and local_sr.entry
-                else list(local_sr.candidates)
+            scratch["matched"] = matched
+            trace.append(
+                f"Task 3 result: {len(matched)} matched: "
+                + "、".join(c.get("name", "?") for c in matched[:5])
             )
-        else:
-            # Artist name not in song titles — rank ALL local entries against web
-            # results so songs by this artist (confirmed by web mentions) bubble up.
-            local_candidates = list(index.entries)
-        plan_trace.append(
-            f"Task 1 result: {len(local_candidates)} local candidate(s): "
-            + "、".join(c.get("name", "?") for c in local_candidates[:5])
+            return StepOutcome(observation=f"{len(matched)} matched")
+
+        def play(ctx: LoopContext) -> StepOutcome:
+            selection = scratch.get("selection") or scratch["matched"][0]["name"]
+            trace.append(f"Task 4: play selected local match: {selection!r}")
+            play_result = self.run_music_command(selection)
+            scratch["play_result"] = play_result
+            return StepOutcome(observation=f"played {selection}", done=True)
+
+        return {"inspect": inspect, "search": search, "match": match, "play": play}
+
+    @staticmethod
+    def _music_plan_decider(scratch: dict):
+        """Deterministic decider: walk inspect→search→match, then play only when a
+        single track is resolvable (one web-confirmed match, or a user selection on
+        resume). Returns ``""`` to pause for the user when the match is ambiguous."""
+        def decide(ctx: LoopContext) -> str:
+            if scratch.get("abort"):
+                return ""
+            done = {c.split(":", 1)[0] for c in ctx.completed}
+            for action in ("inspect", "search", "match"):
+                if action not in done:
+                    return action
+            if "play" in done:
+                return ""
+            if scratch.get("selection") or len(scratch.get("matched", [])) == 1:
+                return "play"
+            return ""
+        return decide
+
+    @staticmethod
+    def _music_continuation_state(
+        scratch: dict, result, candidate_names: list[str]
+    ) -> ContinuationState:
+        """Build the resumable snapshot for a paused music plan: completed steps so
+        far, next action = play, and the offered tracks as the stop anchor."""
+        completed = list(result.state.completed) if result.state else []
+        return ContinuationState(
+            goal=scratch["trace"][0].removeprefix("Goal: "),
+            constraints="play only an offered local track",
+            completed=completed,
+            current_status=f"{len(scratch.get('matched', []))} web-confirmed match(es); awaiting user choice",
+            attempted_fixes=[],
+            budget={"steps_used": len(completed), "steps_limit": 4},
+            next_action="play",
+            stop_condition="awaiting user track selection from: " + "、".join(candidate_names),
         )
 
-        # Task 2 — external web search for popularity context
-        search_query = f"{artist} {qualifier} シングル"
-        plan_trace.append(f"Task 2: search for {search_query!r}")
-        try:
-            web_results = web_search(
-                search_query, max_results=DEFAULT_WEB_SEARCH_LIMIT, reuse_browser=False
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[music-plan] web search failed: %s", exc)
-            web_results = []
-        plan_trace.append(f"Task 2 result: {len(web_results)} web result(s)")
+    @staticmethod
+    def _conversation_key(req: WebCommandRequest) -> str:
+        return req.conversation_id or req.session_id or "_default"
 
-        # Task 3 — match web results against local candidates
-        plan_trace.append("Task 3: match search results against local candidates")
-        matched = self._rank_local_by_web_mentions(local_candidates, web_results)
-        plan_trace.append(
-            f"Task 3 result: {len(matched)} matched: "
-            + "、".join(c.get("name", "?") for c in matched[:5])
-        )
+    def _store_music_continuation(
+        self, req: WebCommandRequest, state: ContinuationState, candidates: list[str]
+    ) -> None:
+        with self._music_cont_lock:
+            self._music_continuations[self._conversation_key(req)] = {
+                "state": state.to_dict(),
+                "candidates": list(candidates),
+            }
 
-        # Task 4 — play or ask for confirmation
-        if not matched:
-            # No web-confirmed match — list local candidates for the user to pick
-            candidates_text = "、".join(c.get("name", "?") for c in local_candidates[:5])
-            plan_trace.append(
-                "Task 4: no web-confirmed match; presenting local candidates"
-            )
-            msg = (
-                f"找到以下「{artist}」歌曲，但無法從搜尋結果確認哪首最{qualifier}：\n"
-                f"{candidates_text}\n\n"
-                "請問您想播哪一首？\n\n"
-                + "\n".join(plan_trace)
-            )
-            return WebCommandResponse(status=STATUS_OK, message=msg, mode=MODE_CHAT)
-        if len(matched) == 1:
-            selected = matched[0]["name"]
-            plan_trace.append(f"Task 4: play selected local match: {selected!r}")
-            play_result = self.run_music_command(selected)
-            msg = (
-                f"🎵 {play_result.get('message', '')}\n\n"
-                + "\n".join(plan_trace)
-            )
+    def _maybe_resume_music_plan(
+        self, req: WebCommandRequest, text: str
+    ) -> WebCommandResponse | None:
+        """If a paused music plan exists for this conversation and ``text`` names an
+        offered track, resume the loop at the play step. Returns ``None`` otherwise
+        so normal routing proceeds untouched."""
+        key = self._conversation_key(req)
+        with self._music_cont_lock:
+            entry = self._music_continuations.get(key)
+        if not entry or text not in entry["candidates"]:
+            return None
+        return self._resume_music_plan(req, text)
+
+    def _resume_music_plan(
+        self, req: WebCommandRequest, selection: str
+    ) -> WebCommandResponse:
+        """Resume a paused music plan: play the user-chosen track via the bounded
+        loop's resume path, so inspect/search/match are NOT re-run. The selection
+        is validated against the offered candidates (guardrail: only an offered
+        local title is playable)."""
+        key = self._conversation_key(req)
+        with self._music_cont_lock:
+            entry = self._music_continuations.get(key)
+        if not entry:
             return WebCommandResponse(
-                status=play_result.get("status", STATUS_OK),
-                message=msg,
+                status=STATUS_ERROR, message="沒有可續播的音樂計畫。", mode=MODE_CHAT
+            )
+        if selection not in entry["candidates"]:
+            return WebCommandResponse(
+                status=STATUS_ERROR,
+                message=f"「{selection}」不在候選清單中，無法播放。",
                 mode=MODE_CHAT,
             )
-        # Multiple plausible matches — ask the user
-        candidates_text = "、".join(c.get("name", "?") for c in matched[:5])
-        plan_trace.append(
-            f"Task 4: multiple matches ({len(matched)}); asking user to choose"
+        state = ContinuationState.from_dict(entry["state"])
+        scratch: dict = {
+            "artist": "",
+            "qualifier": "",
+            "selection": selection,
+            "matched": [{"name": selection}],
+            "local_candidates": [],
+            "abort": None,
+            "trace": [f"Goal: {state.goal}"],
+            "play_result": None,
+        }
+        loop = BoundedTaskLoop(
+            state.goal,
+            steps=self._music_plan_steps(scratch),
+            decider=self._music_plan_decider(scratch),
+            max_steps=4,
         )
-        msg = (
-            f"找到多首「{artist}」{qualifier}候選歌曲：\n{candidates_text}\n\n"
-            "請問您想播哪一首？\n\n"
-            + "\n".join(plan_trace)
+        resume_loop(loop, state)
+        with self._music_cont_lock:
+            self._music_continuations.pop(key, None)
+        play_result = scratch["play_result"] or {}
+        return WebCommandResponse(
+            status=play_result.get("status", STATUS_OK),
+            message=f"🎵 {play_result.get('message', '')}",
+            mode=MODE_CHAT,
         )
-        return WebCommandResponse(status=STATUS_OK, message=msg, mode=MODE_CHAT)
 
     @staticmethod
     def _rank_local_by_web_mentions(
