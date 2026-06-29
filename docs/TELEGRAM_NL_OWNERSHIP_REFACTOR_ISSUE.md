@@ -4,9 +4,86 @@ Last reviewed: 2026-06-30
 Status: Planned
 Owner area: telegram
 
-Draft GitHub issue for cleaning up the cross-repo ownership problem exposed by
-issue #53. This is a supporting handoff document; paste the issue body below
-into GitHub when ready.
+Draft GitHub issue / planning note for cleaning up the cross-repo ownership
+problem exposed by issue #53.
+
+## Current Discussion State
+
+Local code has already moved the aka-specific natural-language behavior into
+`aka_no_claw`:
+
+- `src/openclaw_adapter/natural_language.py` now injects aka-only router schema,
+  prompt examples, and deterministic fallback for `create_workflow` and
+  `play_music`.
+- `src/openclaw_adapter/telegram_bot.py` now handles aka-only app intents through
+  the `TelegramCommandProcessor` subclass.
+- The base `price_monitor_bot.TelegramCommandProcessor` has an app intent hook,
+  so it no longer needs to hardcode `/workflow` dispatch behavior.
+
+Local verification on 2026-06-30:
+
+```text
+.venv/bin/python -m pytest tests/test_natural_language.py -q
+84 passed
+
+.venv/bin/python -m pytest tests/test_telegram_bot.py -q
+59 passed
+
+.venv/bin/python -m pytest tests/test_task_workspace.py tests/test_workflow_command.py tests/test_command_bridge.py tests/test_workflow_editor.py tests/test_home_schedule.py tests/test_ir_command.py -q
+348 passed
+```
+
+Remaining ownership problem:
+
+`price_monitor_bot` still owns the full `natural_language.py` implementation.
+If the goal is to remove that responsibility entirely, do not move it into
+`aka_no_claw`. That would make `price_monitor_bot` depend on the app repo and
+invert the current dependency direction.
+
+Preferred next step:
+
+Create a neutral sibling package/repo, tentatively:
+
+```text
+related_to_claw/telegram_nl
+```
+
+Dependency direction should become:
+
+```text
+telegram_nl
+  ↑
+price_monitor_bot
+  ↑
+aka_no_claw
+```
+
+`aka_no_claw` may also import `telegram_nl` directly, but
+`price_monitor_bot` must not import `aka_no_claw`.
+
+## What Should Move To `telegram_nl`
+
+- `TelegramNaturalLanguageRouter`
+- `TelegramNaturalLanguageIntent` or a neutral replacement carrier
+- router JSON parsing / normalization helpers
+- router schema extension mechanism
+- prompt construction and `build_telegram_natural_language_router`
+- pure NL tests for normalization, schema extension, and base routing mechanics
+
+## What Should Stay Out Of `telegram_nl`
+
+- `TelegramCommandProcessor`: it mixes command registry dispatch, photo
+  clarification, callbacks, SNS, lookup, reputation, and app hooks. If this is
+  extracted later, it belongs in a broader `telegram_bot_core`, not `telegram_nl`.
+- `TelegramBotClient`, `RegisteredCommand`, `TelegramTextReplyPlan`, and
+  `list_view.py`: reusable Telegram runtime/UI primitives, but not natural
+  language. Treat as a possible later `telegram_bot_core` extraction.
+- `price_monitor_bot.commands`, `formatters`, and `watch_monitor`: price/TCG
+  domain code.
+- aka-only profiles and examples: `create_workflow`, `play_music`,
+  `workflow_description`, `music_query`, `/workflow`, `/music`, `/schedulehome`.
+
+## Suggested Title
 
 ## Suggested Title
 
@@ -62,9 +139,20 @@ aka-only feature can require changing the generic/sibling bot package.
 
 ## Goal
 
-Move aka-specific natural-language workflow routing and dispatch ownership back
-to `aka_no_claw`, while keeping `price_monitor_bot` as a reusable/generic
-Telegram bot foundation.
+Move natural-language routing implementation ownership out of `price_monitor_bot`
+without making `price_monitor_bot` depend on `aka_no_claw`.
+
+Short-term status:
+
+- aka-only intent behavior belongs in `aka_no_claw`.
+- base `price_monitor_bot` should only expose generic app-extension hooks.
+
+Long-term target:
+
+- generic natural-language router mechanics belong in a neutral `telegram_nl`
+  package.
+- price-specific intent profiles stay in `price_monitor_bot`.
+- aka-specific intent profiles stay in `aka_no_claw`.
 
 ## Desired Ownership Boundary
 
@@ -85,6 +173,31 @@ Telegram bot foundation.
 - #53 workflow-specific tests
 
 ## Proposed Refactor Shape
+
+### Recommended shape: new neutral package `telegram_nl`
+
+Create a sibling repo/package:
+
+```text
+related_to_claw/telegram_nl
+  pyproject.toml
+  src/telegram_nl/__init__.py
+  src/telegram_nl/natural_language.py
+  tests/test_natural_language.py
+```
+
+Move the generic router implementation out of `price_monitor_bot` into
+`telegram_nl`. Then:
+
+- `price_monitor_bot` imports router primitives from `telegram_nl`.
+- `aka_no_claw` imports router primitives from `telegram_nl` through
+  `openclaw_adapter.natural_language`.
+- `price_monitor_bot.natural_language` may remain temporarily as a compatibility
+  shim that re-exports `telegram_nl`.
+- new code should not import `price_monitor_bot.natural_language`.
+
+Do not move `natural_language.py` into `aka_no_claw`; that would reverse the
+dependency direction and make the reusable price package depend on the app repo.
 
 ### Option A: downstream NL intent extension hook
 
@@ -138,8 +251,8 @@ create_workflow
 
 ### Recommendation
 
-Prefer Option A if inheritance is already the local pattern. It is the smallest
-change and fits the existing `aka_no_claw` subclass.
+Keep Option A as the short-term app hook, and use the neutral `telegram_nl`
+package as the long-term owner for the generic router code.
 
 ## Implementation Tasks
 
@@ -154,11 +267,12 @@ Files likely involved:
 
 Tasks:
 
-- Remove `create_workflow` handling from the base `TelegramCommandProcessor`.
-- Remove `/workflow` dispatch from `price_monitor_bot`.
-- Prefer removing `workflow_description` from the generic
-  `TelegramNaturalLanguageIntent` if no generic extension mechanism requires it.
-- Add a downstream/app-specific natural-language hook or registry.
+- Replace implementation imports with `telegram_nl`.
+- Keep `price_monitor_bot.natural_language` only as a temporary re-export shim,
+  or remove it after all imports are migrated.
+- Remove aka-only names from base schema/tests if they still exist:
+  `create_workflow`, `play_music`, `workflow_description`, `music_query`.
+- Keep the downstream/app-specific natural-language hook or registry.
 - Keep existing price-monitor natural-language behavior unchanged.
 - Add/adjust tests proving unknown app-specific intents can be delegated through
   the extension hook without hardcoding aka-specific names.
@@ -173,7 +287,22 @@ rg -n "create_workflow|workflow_description|/workflow" src tests
 Should show either no matches, or only generic extension-hook tests/docs that do
 not encode aka workflow behavior.
 
-### 2. In `aka_no_claw`
+### 2. In `telegram_nl`
+
+Files likely involved:
+
+- `src/telegram_nl/natural_language.py`
+- `tests/test_natural_language.py`
+- `pyproject.toml`
+
+Tasks:
+
+- Move generic router code out of `price_monitor_bot`.
+- Keep the extension mechanism generic.
+- Do not encode aka-only or price-only intent names as universal behavior.
+- Add package tests for schema extension and unknown intent normalization.
+
+### 3. In `aka_no_claw`
 
 Files likely involved:
 
@@ -185,9 +314,8 @@ Files likely involved:
 
 Tasks:
 
-- Define the aka-specific `create_workflow` intent behavior in `aka_no_claw`.
-- If needed, add an aka-specific intent dataclass or wrapper field for
-  `workflow_description`.
+- Keep aka-specific `create_workflow` and `play_music` behavior in
+  `aka_no_claw`.
 - Teach the aka natural-language router prompt/tool spec to emit workflow
   creation intent.
 - Dispatch `create_workflow` to registered `/workflow` inside
@@ -202,9 +330,15 @@ Tasks:
 
 ## Acceptance Criteria
 
-- `price_monitor_bot` no longer contains aka-specific workflow intent names or
-  `/workflow` dispatch logic.
+- `price_monitor_bot` no longer owns the generic natural-language router
+  implementation.
+- `price_monitor_bot` no longer contains aka-specific workflow/music intent
+  names or `/workflow` dispatch logic.
+- `price_monitor_bot` remains standalone and does not depend on `aka_no_claw`.
 - `aka_no_claw` still routes workflow creation NL requests to `/workflow create`.
+- `aka_no_claw` still routes direct music NL requests to `/music`.
+- `telegram_nl` contains only generic router mechanics, not app-specific command
+  behavior.
 - #53 workflow UX remains functional:
   - Telegram can draft a workflow from natural language.
   - Web Chat Mode can draft/edit/save a workflow.
