@@ -1075,6 +1075,29 @@ class DynamicToolRunner:
             return f"動態工具執行失敗：{exc}"
         return self._format_result(result)
 
+    def run_tool_step(self, slug: str, explicit_params: dict) -> tuple[bool, str]:
+        """Execute a catalog tool by slug with caller-supplied params (task workspace
+        step). Writes params.json directly — no LLM param extraction. Returns
+        ``(ok, result_text)``; result_text is the answer on success or an error
+        description on failure."""
+        entry = self.catalog.get(slug)
+        if entry is None:
+            return False, f"工具 '{slug}' 不在 catalog 中"
+        tool_path = self.tools_dir / slug / "tool.py"
+        if not tool_path.exists():
+            return False, f"工具 '{slug}' 的 tool.py 不存在"
+        if explicit_params:
+            (self.tools_dir / slug / "params.json").write_text(
+                json.dumps(explicit_params, ensure_ascii=False), encoding="utf-8"
+            )
+        code = tool_path.read_text(encoding="utf-8")
+        result = self._install_and_execute(slug, tool_path, code)
+        if result.ok:
+            self._record_catalog_outcome(slug, True, None)
+            return True, result.answer
+        self._record_catalog_outcome(slug, False, "workspace tool step failed")
+        return False, result.answer or "工具執行失敗"
+
     def _catalog_tool_type(self, slug: str | None) -> str | None:
         """tool_type of a generated tool, for the user-visible reuse trace.
         Best effort — never break a /new reply over a missing catalog entry."""
