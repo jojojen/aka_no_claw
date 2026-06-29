@@ -27,7 +27,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from .task_workspace import COMMAND_SINK_ALLOWLIST, Workflow, WorkflowStep, WorkflowStore
+from .task_workspace import (
+    COMMAND_SINK_DENYLIST,
+    is_command_sink_allowed,
+    Workflow,
+    WorkflowStep,
+    WorkflowStore,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -117,15 +123,27 @@ def _render_kind_picker() -> tuple[str, dict]:
     markup = {"inline_keyboard": [
         [{"text": "🌤 Tool Call（呼叫已生成工具）", "callback_data": "wfe:kind:tool_call"}],
         [{"text": "🤖 LLM Transform（LLM 轉換）", "callback_data": "wfe:kind:llm_transform"}],
-        [{"text": "🔊 Command Sink（/saynow）", "callback_data": "wfe:kind:command_sink"}],
+        [{"text": "🔌 Command Sink（/saynow・/music・/bluetooth…）", "callback_data": "wfe:kind:command_sink"}],
         [{"text": "✖️ 取消新增", "callback_data": "wfe:add_cancel"}],
     ]}
     return "選擇新步驟的類型：", markup
 
 
-def _render_command_picker() -> tuple[str, dict]:
-    rows = [[{"text": cmd, "callback_data": f"wfe:cmd:{cmd}"}]
-            for cmd in sorted(COMMAND_SINK_ALLOWLIST)]
+def _render_command_picker(command_registry=None) -> tuple[str, dict]:
+    if command_registry is not None:
+        cmds = sorted(
+            cmd for cmd in command_registry
+            if is_command_sink_allowed(cmd)
+        )
+    else:
+        # Fallback when no registry is available: show a curated set of
+        # well-known safe commands rather than an empty picker.
+        cmds = sorted(c for c in (
+            "/saynow", "/say", "/music", "/musicmute", "/musiclouder",
+            "/musiclower", "/musicnowbest", "/bluetooth", "/ir",
+            "/translateja", "/translatezh",
+        ) if is_command_sink_allowed(c))
+    rows = [[{"text": cmd, "callback_data": f"wfe:cmd:{cmd}"}] for cmd in cmds]
     rows.append([{"text": "✖️ 取消", "callback_data": "wfe:add_cancel"}])
     return "選擇要呼叫的指令：", {"inline_keyboard": rows}
 
@@ -135,9 +153,10 @@ def _render_command_picker() -> tuple[str, dict]:
 class WorkflowEditor:
     """Per-chat card editor for building and modifying Workflows."""
 
-    def __init__(self, store: WorkflowStore) -> None:
+    def __init__(self, store: WorkflowStore, command_registry=None) -> None:
         self._store = store
         self._sessions: dict[str, _EditorSession] = {}
+        self._command_registry = command_registry
 
     # ── Public entry points ───────────────────────────────────────────────────
 
@@ -370,14 +389,14 @@ class WorkflowEditor:
                 session.adding = _AddingStep(kind="llm_transform", collecting="inputs")
                 return None, "請輸入 inputs（逗號分隔的輸入變數名稱，e.g. `weather`）：", None
             if kind == "command_sink":
-                text, markup = _render_command_picker()
+                text, markup = _render_command_picker(self._command_registry)
                 return None, text, markup
             return "未知步驟類型", None, None
 
         if action == "cmd":
             cmd = arg
-            if cmd not in COMMAND_SINK_ALLOWLIST:
-                return f"指令 '{cmd}' 不在許可清單中", None, None
+            if not is_command_sink_allowed(cmd):
+                return f"指令 '{cmd}' 不被允許（在拒絕清單中）", None, None
             session.adding = _AddingStep(
                 kind="command_sink",
                 fields={"command": cmd},

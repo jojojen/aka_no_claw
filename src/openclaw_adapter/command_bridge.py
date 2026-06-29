@@ -1377,10 +1377,18 @@ class CommandBridge:
                     from .workflow_editor import WorkflowEditor
 
                     runner = _WorkflowShimRunner(self.settings)
-                    editor = WorkflowEditor(_workflow_store(runner))
+                    # Pass the full command registry so the web command picker
+                    # lists every allowed registered command and _cmd_run can
+                    # dispatch any registered handler (not just the fallbacks).
+                    command_registry = self._handlers()
+                    editor = WorkflowEditor(
+                        _workflow_store(runner),
+                        command_registry=command_registry,
+                    )
                     self._workflow_editor = editor
                     self._workflow_handler = build_workflow_handler(
-                        self.settings, runner, workflow_editor=editor
+                        self.settings, runner, workflow_editor=editor,
+                        command_registry=command_registry,
                     )
         return self._workflow_handler, self._workflow_editor  # type: ignore[return-value]
 
@@ -1389,9 +1397,31 @@ class CommandBridge:
         remainder after the command (e.g. ``create 每天早上查東京天氣…``); a
         natural-language ``create`` drafts a workflow via the cloud-preferred LLM
         and lands it in an editable card (the same flow the Telegram bot uses, so
-        tool_call steps reuse real generated-tool slugs)."""
-        handler, _ = self._workflow_surface()
-        remainder = (text or "").strip()
+        tool_call steps reuse real generated-tool slugs).
+
+        When the editor is in capture mode (collecting a field value such as the
+        workflow id/goal or a step tool name), the text is routed to
+        ``handle_text_capture`` instead of being dispatched as a new subcommand.
+        This mirrors the Telegram path in
+        ``TelegramCommandProcessor._build_workflow_capture_plan``."""
+        handler, editor = self._workflow_surface()
+        raw = (text or "").strip()
+
+        if editor.is_capturing(_WF_WEB_CHAT_ID):
+            try:
+                captured = editor.handle_text_capture(raw, _WF_WEB_CHAT_ID)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("workflow capture failed text=%r", raw)
+                return {"status": STATUS_ERROR, "message": f"工作流欄位輸入失敗：{exc}", "actions": []}
+            if captured is not None:
+                message, markup = captured
+                return {
+                    "status": STATUS_OK,
+                    "message": str(message) if message is not None else "",
+                    "actions": self._markup_to_actions(markup),
+                }
+
+        remainder = raw
         if remainder.startswith("/workflow"):
             remainder = remainder[len("/workflow"):].strip()
         try:

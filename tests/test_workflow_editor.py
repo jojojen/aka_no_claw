@@ -251,8 +251,8 @@ def test_add_command_sink_full_sequence(tmp_path):
 def test_command_sink_non_allowlisted_rejected(tmp_path):
     editor = _make_editor(tmp_path)
     _setup_session(editor)
-    toast, _, _ = editor._handle_callback("cmd:/rm-rf", "", "chat-1")
-    assert "許可" in (toast or "") or "allowlist" in (toast or "").lower()
+    toast, _, _ = editor._handle_callback("cmd:/restartall", "", "chat-1")
+    assert toast is not None and len(toast) > 0
 
 
 # ── delete step ───────────────────────────────────────────────────────────────

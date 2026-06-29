@@ -1219,6 +1219,12 @@ class _FakeWfEditor:
     def __init__(self):
         self.calls: list[tuple] = []
 
+    def is_capturing(self, chat_id: str) -> bool:
+        return False
+
+    def handle_text_capture(self, text: str, chat_id: str):
+        return None
+
     def callback_handlers(self):
         def _wfe(payload, original_text, chat_id):
             self.calls.append((payload, chat_id))
@@ -1957,3 +1963,122 @@ def test_rank_local_by_web_mentions():
     assert [c["name"] for c in result] == ["JANE DOE", "Lemon"]
     # Pale Blue has no web mention → excluded
     assert all(c["name"] != "Pale Blue" for c in result)
+
+
+# --- web workflow capture flow (Fix #53 Issue 1 + 5) -------------------------
+
+def _make_web_bridge(tmp_path):
+    """Build a CommandBridge wired to a real WorkflowEditor for capture tests."""
+    from pathlib import Path
+    from openclaw_adapter.task_workspace import WorkflowStore
+    from openclaw_adapter.workflow_editor import WorkflowEditor
+    from openclaw_adapter.workflow_command import build_workflow_handler
+    import openclaw_adapter.voice_command as vc
+
+    store = WorkflowStore(Path(tmp_path) / "workflow_store")
+    editor = WorkflowEditor(store)
+
+    settings = SimpleNamespace(openclaw_voice_enabled=False)
+    orig = vc.build_saynow_handler
+    vc.build_saynow_handler = lambda s: (lambda text, chat_id=None: "saynow-ok")
+    try:
+        handler = build_workflow_handler(settings, _FakeRunner(tmp_path),
+                                         workflow_editor=editor)
+    finally:
+        vc.build_saynow_handler = orig
+
+    b = CommandBridge.__new__(CommandBridge)
+    b.settings = settings
+    b._workflow_handler = handler
+    b._workflow_editor = editor
+    b._workflow_lock = None
+    return b, editor
+
+
+class _FakeRunner:
+    def __init__(self, root):
+        from pathlib import Path
+        self.tools_dir = str(Path(root) / "generated_tools")
+        Path(self.tools_dir).mkdir(parents=True, exist_ok=True)
+        self.catalog = None
+        self.client = None
+
+    def run_tool_step(self, slug, explicit_params):
+        return True, "tool-output"
+
+
+def test_web_capture_new_then_id_goal(tmp_path):
+    b, editor = _make_web_bridge(tmp_path)
+    # step 1: /workflow new → enters capture mode
+    res = b.run_workflow_command("new")
+    assert res["status"] == STATUS_OK
+    assert editor.is_capturing("web-workflow")
+
+    # step 2: user types id / goal → editor consumes it, no longer capturing
+    res = b.run_workflow_command("wf-web / Web goal")
+    assert res["status"] == STATUS_OK
+    assert editor._sessions["web-workflow"].workflow.id == "wf-web"
+    assert editor._sessions["web-workflow"].workflow.goal == "Web goal"
+    assert not editor.is_capturing("web-workflow")
+
+    # editor card renders add/save buttons
+    cb_data = {a["callback_data"] for a in res["actions"]}
+    assert any("wfe:add" in cd for cd in cb_data)
+
+
+def test_web_capture_add_tool_call_step(tmp_path):
+    b, editor = _make_web_bridge(tmp_path)
+    b.run_workflow_command("new")
+    b.run_workflow_command("wf-web / Web goal")
+
+    # add step
+    b.run_workflow_action("wfe:add")
+    b.run_workflow_action("wfe:kind:tool_call")
+
+    assert editor.is_capturing("web-workflow")
+
+    # user types tool slug → stored in adding.fields
+    res = b.run_workflow_command("city_weather")
+    assert res["status"] == STATUS_OK
+    session = editor._sessions["web-workflow"]
+    # editor has either consumed and moved on, or stored the field
+    assert not editor.is_capturing("web-workflow") or \
+           session.adding is not None
+
+
+def test_web_capture_add_llm_transform_step(tmp_path):
+    b, editor = _make_web_bridge(tmp_path)
+    b.run_workflow_command("new")
+    b.run_workflow_command("wf-llm / LLM goal")
+
+    b.run_workflow_action("wfe:add")
+    b.run_workflow_action("wfe:kind:llm_transform")
+
+    # capture prompt: should be in capturing state
+    assert editor.is_capturing("web-workflow")
+    res = b.run_workflow_command("weather")   # input var name
+    assert res["status"] == STATUS_OK
+
+
+def test_web_capture_add_command_sink_step(tmp_path):
+    b, editor = _make_web_bridge(tmp_path)
+    b.run_workflow_command("new")
+    b.run_workflow_command("wf-sink / Sink goal")
+
+    b.run_workflow_action("wfe:add")
+    b.run_workflow_action("wfe:kind:command_sink")
+    # command_sink shows the command picker first; pick /saynow to enter capture mode
+    b.run_workflow_action("wfe:cmd:/saynow")
+
+    assert editor.is_capturing("web-workflow")
+    res = b.run_workflow_command("greeting")   # input variable name
+    assert res["status"] == STATUS_OK
+
+
+def test_web_capture_text_not_swallowed_when_not_capturing(tmp_path):
+    b, editor = _make_web_bridge(tmp_path)
+    # no capture in progress: text should route to the workflow handler, not editor
+    res = b.run_workflow_command("list")
+    assert res["status"] == STATUS_OK
+    # response is from the real /workflow list handler
+    assert not editor.is_capturing("web-workflow")

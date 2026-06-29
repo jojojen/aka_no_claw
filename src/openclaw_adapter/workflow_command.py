@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Callable
 
 from .task_workspace import (
-    COMMAND_SINK_ALLOWLIST,
+    is_command_sink_allowed,
     Workflow,
     WorkflowRunner,
     WorkflowStore,
@@ -34,7 +34,7 @@ def _workflow_store(runner) -> WorkflowStore:
 
 
 def build_workflow_handler(
-    settings, runner, *, workflow_editor=None
+    settings, runner, *, workflow_editor=None, command_registry=None
 ) -> Callable[[str, str], object]:
     """Return a ``handler(remainder, chat_id)`` for the ``/workflow`` command.
 
@@ -43,10 +43,18 @@ def build_workflow_handler(
     ``DynamicToolRunner``. ``settings`` is used to build the ``/saynow``
     dispatcher and, if available, the LLM client for ``llm_transform`` steps.
     Pass ``workflow_editor`` to enable the ``new`` and ``edit`` subcommands.
+    Pass ``command_registry`` (the full RegisteredCommand dict) to wire every
+    allowlisted slash command into workflow execution without needing to build
+    each handler individually.
     """
     from .voice_command import build_saynow_handler as _build_saynow
 
     _saynow_raw = _build_saynow(settings)
+    try:
+        from .music_command import build_music_handler as _build_music
+        _music_raw = _build_music(settings)
+    except Exception:
+        _music_raw = None
     _catalog = getattr(runner, "catalog", None)
 
     def handler(remainder: str, chat_id: str) -> object:
@@ -82,9 +90,11 @@ def build_workflow_handler(
                 catalog=_catalog,
                 editor=workflow_editor,
                 client_warning=_warning,
+                command_registry=command_registry,
             )
         if subcmd == "run":
-            return _cmd_run(arg, chat_id, store, runner, _saynow_raw, settings)
+            return _cmd_run(arg, chat_id, store, runner, _saynow_raw, settings,
+                            music_raw=_music_raw, command_registry=command_registry)
         if subcmd == "traces":
             return _cmd_traces(arg, store)
         return _help()
@@ -142,6 +152,7 @@ def _cmd_create(
     catalog=None,
     editor=None,
     client_warning: str | None = None,
+    command_registry=None,
 ):
     """Create a workflow.
 
@@ -161,7 +172,7 @@ def _cmd_create(
 
     stripped = arg.strip()
     if stripped.startswith("{"):
-        return _cmd_create_json(stripped, store)
+        return _cmd_create_json(stripped, store, command_registry=command_registry)
 
     # Natural-language mode → LLM draft → editable card.
     if editor is None or llm_client is None:
@@ -169,7 +180,8 @@ def _cmd_create(
             "自然語言生成需要卡片編輯器與 LLM（目前未啟用）。\n"
             "請改用 /workflow create <JSON>，或 /workflow new 手動建立。"
         )
-    wf, err = _generate_workflow_from_nl(stripped, llm_client, catalog)
+    wf, err = _generate_workflow_from_nl(stripped, llm_client, catalog,
+                                          command_registry=command_registry)
     if wf is None:
         return f"❌ 無法生成草稿：{err}\n可改用 /workflow new 手動建立。"
     text, markup = editor.start_from_draft(chat_id, wf)
@@ -178,7 +190,7 @@ def _cmd_create(
     return text, markup
 
 
-def _cmd_create_json(arg: str, store: WorkflowStore) -> str:
+def _cmd_create_json(arg: str, store: WorkflowStore, *, command_registry=None) -> str:
     try:
         data = json.loads(arg)
     except json.JSONDecodeError as exc:
@@ -187,7 +199,8 @@ def _cmd_create_json(arg: str, store: WorkflowStore) -> str:
         wf = Workflow.from_dict(data)
     except (KeyError, TypeError) as exc:
         return f"工作流結構錯誤：{exc}"
-    errors = wf.validate_references()
+    known = frozenset(command_registry.keys()) if command_registry else None
+    errors = wf.validate_references(known_commands=known)
     if errors:
         return "工作流定義有誤：\n" + "\n".join(errors)
     store.save(wf)
@@ -239,13 +252,13 @@ def _resolve_draft_client(settings, runner) -> tuple[object, str | None]:
     return local, warning
 
 
-def _generate_workflow_from_nl(description: str, llm_client, catalog):
+def _generate_workflow_from_nl(description: str, llm_client, catalog, *, command_registry=None):
     """Ask the LLM to draft a Workflow from a one-line description.
 
     Returns ``(Workflow, None)`` on success or ``(None, error_message)``.
     Tool steps are grounded on the live generated-tool catalog so the draft
     references real slugs where possible."""
-    prompt = _build_nl_workflow_prompt(description, catalog)
+    prompt = _build_nl_workflow_prompt(description, catalog, command_registry=command_registry)
     try:
         raw = llm_client.generate(prompt, temperature=0.2)
     except Exception as exc:  # noqa: BLE001 — surface any LLM/transport failure
@@ -268,7 +281,7 @@ def _generate_workflow_from_nl(description: str, llm_client, catalog):
     return wf, None
 
 
-def _build_nl_workflow_prompt(description: str, catalog) -> str:
+def _build_nl_workflow_prompt(description: str, catalog, *, command_registry=None) -> str:
     tool_lines = []
     if catalog is not None:
         try:
@@ -278,7 +291,10 @@ def _build_nl_workflow_prompt(description: str, catalog) -> str:
         except Exception:  # noqa: BLE001 — catalog is best-effort grounding
             tool_lines = []
     tool_block = "\n".join(tool_lines) if tool_lines else "（目前沒有已生成的工具可參考）"
-    allow = ", ".join(sorted(COMMAND_SINK_ALLOWLIST))
+    if command_registry is not None:
+        allow = ", ".join(sorted(c for c in command_registry if is_command_sink_allowed(c)))
+    else:
+        allow = "（任何已登記的 slash 指令，如 /saynow, /music, /bluetooth 等）"
 
     return (
         "你是工作流草稿生成器。把使用者的一句話需求轉成結構化的 workflow JSON。\n\n"
@@ -323,9 +339,11 @@ def _cmd_run(
     workflow_id: str,
     chat_id: str,
     store: WorkflowStore,
-    executor,          # ToolCallExecutor (DynamicToolRunner)
-    saynow_raw,        # raw handler(text, chat_id) from build_saynow_handler
+    executor,
+    saynow_raw,        # raw handler(text, chat_id) — used by tests / as fallback
     settings,
+    music_raw=None,    # optional music handler — used when no command_registry
+    command_registry=None,  # full RegisteredCommand dict; primary source in production
 ) -> str:
     if not workflow_id:
         return "用法：/workflow run <id>"
@@ -333,11 +351,35 @@ def _cmd_run(
     if wf is None:
         return f"找不到 workflow '{workflow_id}'"
 
-    # Build a /saynow dispatcher bound to the current chat_id.
-    def _saynow(text: str) -> str:
-        return str(saynow_raw(text, chat_id))
+    # Build command dispatchers bound to the current chat_id.
+    # If a full command registry is available, wire every allowlisted command
+    # that has a registered handler.  Explicit saynow_raw / music_raw are then
+    # used as fallbacks for tests and headless environments.
+    dispatcher: dict = {}
 
-    dispatcher = {"/saynow": _saynow}
+    if command_registry is not None:
+        for cmd, reg in command_registry.items():
+            if not is_command_sink_allowed(cmd):
+                continue
+            raw = reg.handler
+            def _make_wrapper(h):
+                def _wrapper(text: str) -> str:
+                    result = h(text, chat_id)
+                    return str(result[0] if isinstance(result, tuple) else result)
+                return _wrapper
+            dispatcher[cmd] = _make_wrapper(raw)
+
+    # Always honour explicitly supplied handlers (tests, CI, or overrides).
+    if saynow_raw is not None and "/saynow" not in dispatcher:
+        def _saynow(text: str) -> str:
+            return str(saynow_raw(text, chat_id))
+        dispatcher["/saynow"] = _saynow
+
+    if music_raw is not None and "/music" not in dispatcher:
+        def _music(text: str) -> str:
+            result = music_raw(text, chat_id)
+            return str(result[0] if isinstance(result, tuple) else result)
+        dispatcher["/music"] = _music
 
     # Use the runner's main LLM client for llm_transform steps (Big Pickle /
     # Mistral / local, whichever is active).  executor.client may not exist on

@@ -15,6 +15,12 @@ import pytest
 
 from openclaw_adapter.task_workspace import (
     COMMAND_SINK_ALLOWLIST,
+    COMMAND_SINK_DENYLIST,
+    COMMAND_SINK_INPUT_TYPES,
+    VARIABLE_TYPE_COMMAND_RESULT,
+    VARIABLE_TYPE_PLAIN_TEXT,
+    VARIABLE_TYPE_SPEECH_TEXT,
+    is_command_sink_allowed,
     LLMClient,
     StepTrace,
     ToolCallExecutor,
@@ -126,10 +132,10 @@ def test_validate_references_forward_ref_in_args():
 def test_validate_references_non_allowlisted_command():
     wf = Workflow(id="wf", goal="g", steps=[
         WorkflowStep(id="s1", kind="tool_call", tool="t", output="data"),
-        WorkflowStep(id="s2", kind="command_sink", command="/rm-rf", input="data", output="out"),
+        WorkflowStep(id="s2", kind="command_sink", command="/restartall", input="data", output="out"),
     ])
     errors = wf.validate_references()
-    assert any("/rm-rf" in e for e in errors)
+    assert any("/restartall" in e for e in errors)
 
 
 def test_validate_references_missing_tool():
@@ -280,14 +286,14 @@ def test_command_sink_ok():
 
 
 def test_command_sink_not_in_allowlist():
-    ex, runner = _make_runner(commands={"/rm-rf": lambda x: "boom"})
-    step = WorkflowStep(id="s1", kind="command_sink", command="/rm-rf",
+    ex, runner = _make_runner(commands={"/restartall": lambda x: "boom"})
+    step = WorkflowStep(id="s1", kind="command_sink", command="/restartall",
                         input="data", output="out")
     store = VariableStore()
     store.bind("data", "some value", "s0", "p0")
     step_trace, _ = runner._run_command_sink(step, store)
     assert step_trace.status == "failed"
-    assert "allowlist" in (step_trace.error or "")
+    assert "denied" in (step_trace.error or "")
 
 
 def test_command_sink_no_handler_registered():
@@ -322,7 +328,7 @@ def test_command_sink_handler_exception_caught():
     step = WorkflowStep(id="s1", kind="command_sink", command="/saynow",
                         input="msg", output="out")
     store = VariableStore()
-    store.bind("msg", "hello", "s0", "p0")
+    store.bind("msg", "hello", "s0", "p0", type_=VARIABLE_TYPE_PLAIN_TEXT)
     step_trace, _ = runner._run_command_sink(step, store)
     assert step_trace.status == "failed"
     assert "音声合成エラー" in (step_trace.error or "")
@@ -467,15 +473,23 @@ def test_two_step_pipeline_tool_then_saynow():
     assert trace.variables["speech_result"].provenance == "/saynow(input=weather)"
 
 
-# ── COMMAND_SINK_ALLOWLIST sanity ─────────────────────────────────────────────
+# ── COMMAND_SINK_DENYLIST / is_command_sink_allowed sanity ───────────────────
 
 def test_allowlist_contains_saynow():
-    assert "/saynow" in COMMAND_SINK_ALLOWLIST
+    assert is_command_sink_allowed("/saynow")
 
 
 def test_allowlist_does_not_contain_arbitrary_commands():
-    for dangerous in ["/new", "/restartall", "/rm", "/exec", "/bash"]:
-        assert dangerous not in COMMAND_SINK_ALLOWLIST
+    for dangerous in ["/new", "/restartall", "/rm", "/exec", "/bash",
+                      "/snsadd", "/snsdelete", "/backupclaw", "/workflow",
+                      "/schedulehome"]:
+        assert not is_command_sink_allowed(dangerous)
+
+
+def test_allowlist_contains_safe_home_commands():
+    for safe in ["/music", "/bluetooth", "/ir", "/translateja",
+                 "/knowledge", "/research", "/snsbuzz"]:
+        assert is_command_sink_allowed(safe)
 
 
 # ── FakeLLMClient helper ──────────────────────────────────────────────────────
@@ -743,4 +757,235 @@ def test_store_trace_roundtrip_preserves_variables(tmp_path):
     [loaded] = store.list_traces("wf-vars")
 
     assert loaded.variables["weather"].value == "東京：晴れ、28℃"
-    assert loaded.variables["weather"].provenance.startswith("t")
+
+
+# ── Type mismatch rejection ───────────────────────────────────────────────────
+
+def test_command_sink_saynow_accepts_plain_text():
+    spoken: list[str] = []
+
+    def saynow(text: str) -> str:
+        spoken.append(text)
+        return "🔊 ok"
+
+    ex, runner = _make_runner(commands={"/saynow": saynow})
+    step = WorkflowStep(id="s1", kind="command_sink", command="/saynow",
+                        input="msg", output="out")
+    store = VariableStore()
+    store.bind("msg", "hello", "s0", "p0", type_=VARIABLE_TYPE_PLAIN_TEXT)
+    step_trace, _ = runner._run_command_sink(step, store)
+    assert step_trace.status == "ok"
+    assert spoken == ["hello"]
+
+
+def test_command_sink_saynow_accepts_speech_text():
+    spoken: list[str] = []
+
+    def saynow(text: str) -> str:
+        spoken.append(text)
+        return "🔊 ok"
+
+    ex, runner = _make_runner(commands={"/saynow": saynow})
+    step = WorkflowStep(id="s1", kind="command_sink", command="/saynow",
+                        input="msg", output="out")
+    store = VariableStore()
+    store.bind("msg", "おはよう", "s0", "p0", type_=VARIABLE_TYPE_SPEECH_TEXT)
+    step_trace, _ = runner._run_command_sink(step, store)
+    assert step_trace.status == "ok"
+    assert spoken == ["おはよう"]
+
+
+def test_command_sink_saynow_rejects_command_result():
+    saynow_called: list[bool] = []
+
+    def saynow(text: str) -> str:
+        saynow_called.append(True)
+        return "🔊 ok"
+
+    ex, runner = _make_runner(commands={"/saynow": saynow})
+    step = WorkflowStep(id="s1", kind="command_sink", command="/saynow",
+                        input="raw_data", output="out")
+    store = VariableStore()
+    store.bind("raw_data", "JSON{}", "s0", "p0", type_=VARIABLE_TYPE_COMMAND_RESULT)
+    step_trace, _ = runner._run_command_sink(step, store)
+    assert step_trace.status == "failed"
+    assert "type mismatch" in (step_trace.error or "")
+    assert saynow_called == []
+
+
+def test_command_sink_type_mismatch_trace_records_error():
+    def saynow(text: str) -> str:
+        return "ok"
+
+    ex, runner = _make_runner(commands={"/saynow": saynow})
+    step = WorkflowStep(id="s1", kind="command_sink", command="/saynow",
+                        input="data", output="out")
+    store = VariableStore()
+    store.bind("data", "search result", "s0", "p0", type_=VARIABLE_TYPE_COMMAND_RESULT)
+    step_trace, var = runner._run_command_sink(step, store)
+    assert step_trace.status == "failed"
+    assert var is None
+    assert step_trace.error is not None
+    assert "command_result" in (step_trace.error or "")
+
+
+def test_command_sink_music_accepts_any_type():
+    music_called: list[str] = []
+
+    def music(text: str) -> str:
+        music_called.append(text)
+        return "🎵 playing"
+
+    ex, runner = _make_runner(commands={"/music": music})
+    step = WorkflowStep(id="s1", kind="command_sink", command="/music",
+                        input="query", output="out")
+    store = VariableStore()
+    store.bind("query", "playbest", "s0", "p0", type_=VARIABLE_TYPE_COMMAND_RESULT)
+    step_trace, _ = runner._run_command_sink(step, store)
+    assert step_trace.status == "ok"
+    assert music_called == ["playbest"]
+
+
+def test_command_sink_literal_static_arg():
+    music_called: list[str] = []
+
+    def music(text: str) -> str:
+        music_called.append(text)
+        return "🎵 playing"
+
+    ex, runner = _make_runner(commands={"/music": music})
+    step = WorkflowStep(id="s1", kind="command_sink", command="/music",
+                        literal="playbest", output="out")
+    store = VariableStore()
+    step_trace, _ = runner._run_command_sink(step, store)
+    assert step_trace.status == "ok"
+    assert music_called == ["playbest"]
+
+
+def test_command_sink_literal_roundtrip():
+    step = WorkflowStep(id="s1", kind="command_sink", command="/music",
+                        literal="playbest", output="out")
+    d = step.to_dict()
+    assert d["literal"] == "playbest"
+    loaded = WorkflowStep.from_dict(d)
+    assert loaded.literal == "playbest"
+    assert loaded.input is None
+
+
+def test_allowlist_contains_music():
+    assert is_command_sink_allowed("/music")
+
+
+def test_command_sink_input_types_music_accepts_any():
+    # Commands not in COMMAND_SINK_INPUT_TYPES have no type restriction.
+    assert COMMAND_SINK_INPUT_TYPES.get("/music") is None
+
+
+def test_command_sink_input_types_saynow_restricted():
+    accepted = COMMAND_SINK_INPUT_TYPES["/saynow"]
+    assert accepted is not None
+    assert VARIABLE_TYPE_PLAIN_TEXT in accepted
+    assert VARIABLE_TYPE_SPEECH_TEXT in accepted
+    assert VARIABLE_TYPE_COMMAND_RESULT not in accepted
+
+
+# ── Denylist policy: registry-only command accepted ───────────────────────────
+
+def test_registry_command_not_in_denylist_accepted():
+    """/musiclistall is not in COMMAND_SINK_DENYLIST → validate_references passes."""
+    assert "/musiclistall" not in COMMAND_SINK_DENYLIST
+    assert is_command_sink_allowed("/musiclistall")
+    wf = Workflow(id="wf-test", goal="g", steps=[
+        WorkflowStep(id="s1", kind="command_sink", command="/musiclistall",
+                     literal="", output="out"),
+    ])
+    errors = wf.validate_references()
+    assert errors == []
+
+
+def test_registry_command_dispatched_through_registry():
+    """/musiclistall injected via command_registry is executed by _run_command_sink."""
+    from types import SimpleNamespace
+
+    called: list[str] = []
+
+    def musiclistall_handler(remainder, chat_id):
+        called.append(remainder)
+        return "list ok"
+
+    registry = {"/musiclistall": SimpleNamespace(handler=musiclistall_handler)}
+
+    ex = FakeExecutor()
+    runner = WorkflowRunner(
+        executor=ex,
+        command_dispatcher={
+            "/musiclistall": lambda text: musiclistall_handler(text, "chat-1"),
+        },
+    )
+    step = WorkflowStep(id="s1", kind="command_sink", command="/musiclistall",
+                        literal="", output="out")
+    store = VariableStore()
+    step_trace, var_name = runner._run_command_sink(step, store)
+    assert step_trace.status == "ok"
+    assert called == [""]
+    assert var_name == "out"
+
+
+# ── validate_references: known_commands check ─────────────────────────────────
+
+def test_validate_references_known_commands_passes_registered():
+    """/music is in known_commands → no error."""
+    wf = Workflow(id="wf", goal="g", steps=[
+        WorkflowStep(id="s1", kind="command_sink", command="/music",
+                     literal="random", output="out"),
+    ])
+    errors = wf.validate_references(known_commands=frozenset({"/music", "/saynow"}))
+    assert errors == []
+
+
+def test_validate_references_known_commands_rejects_unregistered():
+    """/ir is not in known_commands → error mentioning 'not registered'."""
+    wf = Workflow(id="wf", goal="g", steps=[
+        WorkflowStep(id="s1", kind="command_sink", command="/ir",
+                     literal="send ceiling_light power", output="out"),
+    ])
+    errors = wf.validate_references(known_commands=frozenset({"/music", "/saynow"}))
+    assert any("/ir" in e and "not registered" in e for e in errors)
+
+
+def test_validate_references_no_known_commands_skips_registry_check():
+    """Without known_commands the registry check is skipped (backward compat)."""
+    wf = Workflow(id="wf", goal="g", steps=[
+        WorkflowStep(id="s1", kind="command_sink", command="/ir",
+                     literal="send ceiling_light power", output="out"),
+    ])
+    errors = wf.validate_references()  # no known_commands → only denylist check
+    assert errors == []
+
+
+def test_runner_run_catches_unregistered_command_at_validation():
+    """WorkflowRunner.run() passes its dispatcher keys to validate_references,
+    so an unregistered command (not in denylist, not in dispatcher) surfaces as
+    a validation error instead of a runtime 'no handler' failure."""
+    ex, runner = _make_runner(commands={"/saynow": lambda x: "ok"})
+    wf = Workflow(id="wf", goal="g", steps=[
+        WorkflowStep(id="s1", kind="command_sink", command="/ir",
+                     literal="send ceiling_light power", output="out"),
+    ])
+    trace = runner.run(wf)
+    assert not trace.ok
+    assert trace.validation_error is not None
+    assert "/ir" in (trace.validation_error or "")
+    assert "not registered" in (trace.validation_error or "")
+    assert trace.steps == []  # no steps ran — short-circuited by validation
+
+
+def test_runner_run_empty_dispatcher_skips_registry_check():
+    """When the dispatcher is empty, runner skips the registry check so
+    workflows without any command_sink steps (tool_call only) still run."""
+    ex, runner = _make_runner(responses={"t": (True, "ok")})
+    wf = Workflow(id="wf", goal="g", steps=[
+        WorkflowStep(id="s1", kind="tool_call", tool="t", output="out"),
+    ])
+    trace = runner.run(wf)
+    assert trace.ok

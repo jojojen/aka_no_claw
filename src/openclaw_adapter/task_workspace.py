@@ -26,7 +26,51 @@ from typing import Callable, Literal, Protocol
 logger = logging.getLogger(__name__)
 
 # Only explicitly allowlisted commands may be used as sinks (#53 §E).
-COMMAND_SINK_ALLOWLIST: frozenset[str] = frozenset({"/saynow"})
+# Commands that are NEVER allowed as workflow command sinks, even if registered.
+# Policy: any command present in the runtime command registry is schedulable as a
+# workflow sink UNLESS it appears in this denylist.  This mirrors /schedulehome
+# semantics so the two execution layers stay in sync automatically.
+COMMAND_SINK_DENYLIST: frozenset[str] = frozenset({
+    # service / system destructive
+    "/restartall",
+    # arbitrary code execution
+    "/new",
+    # filesystem / backup operations
+    "/backupclaw", "/backup", "/clawrecover", "/recoverclaw",
+    # meta / recursive scheduling
+    "/schedulehome", "/workflow",
+    # monitoring config mutations (SNS write-side)
+    "/snsadd", "/sns_add", "/snsdelete", "/sns_delete", "/snsclearfilter",
+    # shell-like commands if ever registered
+    "/bash", "/exec", "/rm", "/shell",
+})
+
+# Keep the old name as a read-only alias so any remaining callsite that imports
+# COMMAND_SINK_ALLOWLIST still compiles.  Prefer COMMAND_SINK_DENYLIST for new code.
+# NOTE: this is intentionally empty — use is_command_sink_allowed() for policy checks.
+COMMAND_SINK_ALLOWLIST: frozenset[str] = frozenset()  # deprecated; use COMMAND_SINK_DENYLIST
+
+
+def is_command_sink_allowed(command: str) -> bool:
+    """Return True if ``command`` may be used as a workflow command sink.
+
+    A command is allowed when it is NOT in the explicit denylist.  The caller is
+    responsible for confirming that a handler actually exists at runtime."""
+    return bool(command) and command not in COMMAND_SINK_DENYLIST
+
+# Variable type tags understood by the runtime.
+VARIABLE_TYPE_PLAIN_TEXT = "plain_text"
+VARIABLE_TYPE_SPEECH_TEXT = "speech_text"
+VARIABLE_TYPE_COMMAND_RESULT = "command_result"
+
+# Accepted input variable types per command sink.
+# None means any text type is accepted (generic text-input commands).
+# Commands that are TTS-focused require plain or speech text to avoid passing
+# raw command-result objects (e.g. JSON) to a voice synthesiser.
+COMMAND_SINK_INPUT_TYPES: dict[str, frozenset[str] | None] = {
+    "/saynow": frozenset({VARIABLE_TYPE_PLAIN_TEXT, VARIABLE_TYPE_SPEECH_TEXT}),
+    "/say":    frozenset({VARIABLE_TYPE_PLAIN_TEXT, VARIABLE_TYPE_SPEECH_TEXT}),
+}
 
 # Maps slash-command string to a callable that takes the input text and returns
 # the result string. Callers inject this into WorkflowRunner.
@@ -52,6 +96,7 @@ class WorkflowStep:
     # command_sink
     command: str | None = None       # must be in COMMAND_SINK_ALLOWLIST
     input: str | None = None         # single input variable name
+    literal: str | None = None       # static argument (used when no variable input, e.g. "/music playbest")
 
     def to_dict(self) -> dict:
         d: dict = {"id": self.id, "kind": self.kind, "output": self.output}
@@ -67,6 +112,8 @@ class WorkflowStep:
             d["command"] = self.command
         if self.input is not None:
             d["input"] = self.input
+        if self.literal is not None:
+            d["literal"] = self.literal
         return d
 
     @classmethod
@@ -81,6 +128,7 @@ class WorkflowStep:
             instructions=d.get("instructions"),
             command=d.get("command"),
             input=d.get("input"),
+            literal=d.get("literal"),
         )
 
 
@@ -90,9 +138,17 @@ class Workflow:
     goal: str
     steps: list[WorkflowStep] = field(default_factory=list)
 
-    def validate_references(self) -> list[str]:
+    def validate_references(
+        self,
+        known_commands: frozenset[str] | None = None,
+    ) -> list[str]:
         """Return a list of structural errors (forward refs, unlisted commands).
-        An empty list means the workflow is structurally sound."""
+        An empty list means the workflow is structurally sound.
+
+        Pass ``known_commands`` (the keys of the live command dispatcher) to also
+        flag commands that pass the denylist check but have no registered handler.
+        When ``None`` (default) the registry check is skipped — used at save-time
+        when no dispatcher is available."""
         errors: list[str] = []
         defined: set[str] = set()
         for step in self.steps:
@@ -109,15 +165,25 @@ class Workflow:
             elif step.kind == "command_sink":
                 if not step.command:
                     errors.append(f"Step {step.id}: command_sink is missing 'command'")
-                elif step.command not in COMMAND_SINK_ALLOWLIST:
+                elif not is_command_sink_allowed(step.command):
                     errors.append(
-                        f"Step {step.id}: command '{step.command}' is not in the "
-                        f"allowlist {sorted(COMMAND_SINK_ALLOWLIST)}"
+                        f"Step {step.id}: command '{step.command}' is not allowed "
+                        f"(in denylist {sorted(COMMAND_SINK_DENYLIST)})"
+                    )
+                elif known_commands is not None and step.command not in known_commands:
+                    errors.append(
+                        f"Step {step.id}: command '{step.command}' is not registered "
+                        f"(no handler found; check spelling or register the command)"
                     )
                 if step.input and step.input not in defined:
                     errors.append(
                         f"Step {step.id}: input '{step.input}' is not yet produced "
                         f"by a prior step"
+                    )
+                if step.input is None and step.literal is None:
+                    errors.append(
+                        f"Step {step.id}: command_sink must have 'input' (variable name) "
+                        f"or 'literal' (static argument)"
                     )
             elif step.kind == "llm_transform":
                 for var in step.inputs:
@@ -320,7 +386,8 @@ class WorkflowRunner:
 
     def run(self, workflow: Workflow) -> WorkflowTrace:
         """Execute all steps and return the full trace."""
-        errors = workflow.validate_references()
+        known = frozenset(self.command_dispatcher.keys()) if self.command_dispatcher else None
+        errors = workflow.validate_references(known_commands=known)
         if errors:
             joined = "\n".join(errors)
             return WorkflowTrace(
@@ -409,6 +476,7 @@ class WorkflowRunner:
                 step.output, result_text,
                 source_step=step.id,
                 provenance=provenance,
+                type_=VARIABLE_TYPE_PLAIN_TEXT,
             )
             return (
                 StepTrace(
@@ -429,11 +497,11 @@ class WorkflowRunner:
     def _run_command_sink(
         self, step: WorkflowStep, store: VariableStore
     ) -> tuple[StepTrace, str | None]:
-        if step.command not in COMMAND_SINK_ALLOWLIST:
+        if not is_command_sink_allowed(step.command or ""):
             return (
                 StepTrace(
                     step_id=step.id, kind=step.kind, status="failed",
-                    error=f"command '{step.command}' is not in the allowlist",
+                    error=f"command '{step.command}' is not allowed (denied)",
                 ),
                 None,
             )
@@ -448,16 +516,37 @@ class WorkflowRunner:
                 None,
             )
 
-        try:
-            input_value = store.resolve(step.input or "")
-        except KeyError as exc:
-            return (
-                StepTrace(
-                    step_id=step.id, kind=step.kind, status="failed",
-                    error=str(exc),
-                ),
-                None,
-            )
+        # Resolve input: prefer variable reference, fall back to literal.
+        if step.input:
+            try:
+                input_value = store.resolve(step.input)
+            except KeyError as exc:
+                return (
+                    StepTrace(
+                        step_id=step.id, kind=step.kind, status="failed",
+                        error=str(exc),
+                    ),
+                    None,
+                )
+            # Type check: reject variable types the sink cannot handle.
+            accepted = COMMAND_SINK_INPUT_TYPES.get(step.command)
+            if accepted is not None:
+                var_obj = store.get(step.input)
+                if var_obj is not None and var_obj.type not in accepted:
+                    return (
+                        StepTrace(
+                            step_id=step.id, kind=step.kind, status="failed",
+                            error=(
+                                f"type mismatch: '{step.command}' accepts {sorted(accepted)} "
+                                f"but variable '{step.input}' has type '{var_obj.type}'"
+                            ),
+                        ),
+                        None,
+                    )
+        elif step.literal is not None:
+            input_value = step.literal
+        else:
+            input_value = ""
 
         try:
             result = handler(input_value)
@@ -471,11 +560,12 @@ class WorkflowRunner:
                 None,
             )
 
-        provenance = f"{step.command}(input={step.input})"
+        provenance = f"{step.command}(input={step.input or repr(step.literal)})"
         var = store.bind(
-            step.output, result,
+            step.output, str(result) if result is not None else "",
             source_step=step.id,
             provenance=provenance,
+            type_=VARIABLE_TYPE_COMMAND_RESULT,
         )
         return (
             StepTrace(
@@ -540,6 +630,7 @@ class WorkflowRunner:
             step.output, result,
             source_step=step.id,
             provenance=provenance,
+            type_=VARIABLE_TYPE_SPEECH_TEXT,
         )
         return (
             StepTrace(
