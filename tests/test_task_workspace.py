@@ -534,7 +534,7 @@ def test_llm_transform_prompt_contains_no_invention_constraint():
     runner._run_llm_transform(step, store)
 
     prompt = llm.prompts[0]
-    assert "捏造" in prompt or "捏造・推測" in prompt
+    assert "invent" in prompt.lower() or "NOT" in prompt
     assert "東京：晴れ" in prompt   # input value embedded
     assert "変換してください" in prompt
 

@@ -514,13 +514,13 @@ class WorkflowRunner:
 
         inputs_text = "\n\n".join(input_blocks)
         prompt = (
-            f"以下は入力データです：\n\n{inputs_text}\n\n"
-            f"タスク指示：{step.instructions or '内容を変換してください。'}\n\n"
-            "厳守ルール（絶対に破らないこと）：\n"
-            "- 上の「入力データ」にある内容だけを使うこと。\n"
-            "- 入力データにない事実（温度、天気、地名、数値、出来事など）を"
-            "捏造・推測・補完してはならない。\n"
-            "- 結果だけを出力すること。説明・見出し・前置きは不要。"
+            f"Input data:\n\n{inputs_text}\n\n"
+            f"Task instructions: {step.instructions or 'Transform the input data.'}\n\n"
+            "Strict rules (never break these):\n"
+            "- Use ONLY information present in the input data above.\n"
+            "- Do NOT invent, infer, or supplement facts absent from the input "
+            "(e.g. temperatures, weather, locations, numbers, events).\n"
+            "- Output the result only — no explanations, headings, or preamble."
         )
 
         try:

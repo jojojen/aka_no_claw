@@ -93,6 +93,7 @@ from .home_schedule_command import (
     build_schedulehome_handler,
     render_list as render_home_schedule_list,
 )
+from .workflow_command import build_workflow_handler
 from .music_favorites import (
     FavoritesStore,
     MUSIC_BEST_LIST_KIND,
@@ -1296,6 +1297,13 @@ def _build_registries(
     command_handlers["/schedulehome"] = RegisteredCommand(
         build_schedulehome_handler(_home_schedule_store, _run_slash_command)
     )
+
+    if dynamic_tool_runner is not None:
+        command_handlers["/workflow"] = RegisteredCommand(
+            build_workflow_handler(settings, dynamic_tool_runner),
+            ack="⚙️",
+            background=True,
+        )
 
     _rag_cb = _build_rag_callback_handler(settings, knowledge_inbox=knowledge_inbox)
 
