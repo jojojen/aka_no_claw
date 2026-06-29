@@ -1,6 +1,6 @@
 # Documentation Audit
 
-Last reviewed: 2026-06-20
+Last reviewed: 2026-06-30
 Owner area: agent-maintenance
 
 Full inventory of repository documentation with lifecycle status, owner area, and
@@ -42,6 +42,7 @@ for which question each one answers.
 | `NEW_DYNAMIC_TOOLS_PROGRESS.md` | Current | dynamic-tools | Keep; canonical `/new` doc. |
 | `NEW_E2E_DISCRIMINATING_TESTS.md` | Current | dynamic-tools | Keep; cross-link from dynamic-tools canonical. |
 | `NEW_OPENCODE_DECOUPLING_PLAN.md` | Planned | dynamic-tools | Keep until shipped; then fold into canonical and archive. Cross-linked from canonical. |
+| `TELEGRAM_NL_OWNERSHIP_REFACTOR_ISSUE.md` | Planned | telegram | Draft issue; keep until the cross-repo NL ownership refactor is filed/resolved. |
 | `OPPORTUNITY_AGENT_SPEC.md` | Needs review | opportunity | Verify thresholds vs code; canonical Opportunity doc. |
 | `OPPORTUNITY_AGENT_HANDOFF.md` | Needs review | opportunity | Keep as operational companion; cross-link to spec. |
 | `KB_EMBEDDING_PLAN.md` | Needs review | knowledge | Re-verify embedding/RAG status. |
@@ -78,6 +79,7 @@ Moved under `docs/archive/`; see [archive/README.md](archive/README.md).
 | `archive/TEST_RECORD_2026-04-16.md` | Historical | testing | Dated test snapshot. |
 | `archive/TEST_RECORD_2026-04-17.md` | Historical | testing | Dated test snapshot. |
 | `archive/SNS_INTEGRATION_TEST_REPORT.md` | Historical | sns | One-time integration report. |
+| `archive/ISSUE_53_WORKFLOW_REVIEW_HANDOFF.md` | Historical | telegram | Pre-resolution workflow review handoff; archived after issue #53 shipped. |
 | `archive/comp_filter_bm25_discussion.md` | Historical | price/research | Superseded design discussion. |
 | `archive/search_ddg_block_investigation.md` | Historical | search | One-time investigation. |
 | `archive/COMMISSION_SYSTEM_PLAN.md` | Historical | commissions | Business shelved. |

@@ -1,16 +1,28 @@
 # Issue 53 Workflow Review Handoff
 
 Last reviewed: 2026-06-30
-Status: Planned
+Status: Historical
 Owner area: telegram
 
-Review handoff for GitHub issue #53, based on local review of commit
-`dd27589` (`feat(#53): cloud-first NL router + /workflow create NL intent + web bridge surface`)
-and a second local acceptance pass against unpushed working-tree changes on
-2026-06-30.
+Historical review handoff for GitHub issue #53.
 
-This is a fix-oriented supporting document, not an authoritative system truth
-source. Update or archive it after the listed blockers are resolved.
+The issue is now resolved and this file is archived as a pre-resolution review
+snapshot. The shipped fix landed in commit `bd80e59`
+(`fix(#53): denylist-based command sink policy + web registry wiring`).
+
+Resolution summary:
+
+- workflow command sinks now use a denylist-based policy
+- Telegram and Web workflow surfaces both receive the full command registry
+- `/schedulehome -> /workflow run -> command_sink` was re-verified locally for
+  `/saynow`, `/music`, `/ir`, and `/musiclistall`
+- Web workflow picker and execution were re-verified locally for registry-backed
+  safe commands
+- full local suite passed: `2095 passed, 7 skipped`
+
+The remaining cross-repo ownership cleanup about Telegram natural-language
+workflow routing is tracked separately in
+`docs/TELEGRAM_NL_OWNERSHIP_REFACTOR_ISSUE.md`.
 
 ## Scope
 
@@ -23,16 +35,10 @@ Issue #53 aims to make workflows composable:
 - Telegram and Web Chat Mode should support card-based workflow authoring without
   requiring raw JSON editing on a phone.
 
-## Current Verdict
+## Archived Verdict
 
-Core runtime and schedule replay are mostly working, and the latest local
-working tree now passes the full test suite.
-
-Do not close #53 yet. The latest changes still do not implement the requested
-negative-list policy for workflow command sinks. They expanded a hardcoded
-positive allowlist instead, so workflow sinks can still drift from
-`/schedulehome` and currently reject registered commands that `/schedulehome`
-can replay.
+This section and the detailed findings below are preserved as the review context
+from before the final fix landed. They are no longer the current project state.
 
 ## Latest Local Acceptance Pass
 

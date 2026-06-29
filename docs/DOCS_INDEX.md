@@ -1,6 +1,6 @@
 # Docs Index
 
-Last reviewed: 2026-06-20
+Last reviewed: 2026-06-30
 
 Governance for this index lives in [DOCUMENTATION_GOVERNANCE.md](DOCUMENTATION_GOVERNANCE.md).
 Full inventory with recommended actions is in [DOC_AUDIT.md](DOC_AUDIT.md).
@@ -35,6 +35,7 @@ Full inventory with recommended actions is in [DOC_AUDIT.md](DOC_AUDIT.md).
 | [NEW_DYNAMIC_TOOLS_PROGRESS.md](NEW_DYNAMIC_TOOLS_PROGRESS.md) | Current (canonical: dynamic-tools) | dynamic-tools | `/new` implementation notes and benchmark history. |
 | [NEW_E2E_DISCRIMINATING_TESTS.md](NEW_E2E_DISCRIMINATING_TESTS.md) | Current | dynamic-tools | Companion: discriminating tests for generated tools. |
 | [NEW_OPENCODE_DECOUPLING_PLAN.md](NEW_OPENCODE_DECOUPLING_PLAN.md) | Planned | dynamic-tools | Companion: plan to move `/new` + Chat off OpenCode CLI to direct HTTP; add Mistral switch (issues #51/#59). |
+| [TELEGRAM_NL_OWNERSHIP_REFACTOR_ISSUE.md](TELEGRAM_NL_OWNERSHIP_REFACTOR_ISSUE.md) | Planned | telegram | Draft issue for moving aka-specific Telegram NL workflow routing out of `price_monitor_bot`. |
 | [KB_EMBEDDING_PLAN.md](KB_EMBEDDING_PLAN.md) | Needs review | knowledge | Embedding/RAG plan and status may need fresh verification. |
 | [OPENCLAW_TCG_MONITOR_PLAN.md](OPENCLAW_TCG_MONITOR_PLAN.md) | Needs review | price/tcg | Original monitor plan; verify against current code before relying on it. |
 | [OPPORTUNITY_AGENT_SPEC.md](OPPORTUNITY_AGENT_SPEC.md) | Needs review (canonical: opportunity) | opportunity | Spec for recommendation pipeline; verify thresholds against code. |
@@ -82,6 +83,7 @@ Frozen, superseded context only — do not rely on for current truth. See
 | [archive/TEST_RECORD_2026-04-16.md](archive/TEST_RECORD_2026-04-16.md) | testing | Dated test snapshot. |
 | [archive/TEST_RECORD_2026-04-17.md](archive/TEST_RECORD_2026-04-17.md) | testing | Dated test snapshot. |
 | [archive/SNS_INTEGRATION_TEST_REPORT.md](archive/SNS_INTEGRATION_TEST_REPORT.md) | sns | One-time integration report. |
+| [archive/ISSUE_53_WORKFLOW_REVIEW_HANDOFF.md](archive/ISSUE_53_WORKFLOW_REVIEW_HANDOFF.md) | telegram | Archived pre-resolution review handoff after issue #53 shipped. |
 | [archive/comp_filter_bm25_discussion.md](archive/comp_filter_bm25_discussion.md) | price/research | Superseded design discussion. |
 | [archive/search_ddg_block_investigation.md](archive/search_ddg_block_investigation.md) | search | One-time investigation. |
 | [archive/COMMISSION_SYSTEM_PLAN.md](archive/COMMISSION_SYSTEM_PLAN.md) | commissions | Business shelved. |
