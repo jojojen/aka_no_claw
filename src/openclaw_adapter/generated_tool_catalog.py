@@ -26,6 +26,7 @@ build on the views exposed here.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,6 +46,11 @@ DEMOTE_CONSECUTIVE_FAILURES = 3
 # pay the recovery tax. This guards against a flaky tool oscillating
 # demoted→promoted→demoted on every other call.
 PROMOTE_CLEAN_REUSES_AFTER_FAILURE = 2
+
+# Default number of generated tools surfaced to a planner per request (#52 §G /
+# Phase 4). Gorilla/LlamaIndex lesson: retrieve a *small* relevant set, never
+# dump the whole catalog into the prompt.
+DEFAULT_RETRIEVE_TOP_K = 5
 
 STATUS_CANDIDATE = "candidate"
 STATUS_PROMOTED = "promoted"
@@ -167,6 +173,7 @@ class CatalogEntry:
     promotion_reason: str | None
     metrics: dict
     safety_profile: dict
+    example_request: str = ""
     schema_version: int = SCHEMA_VERSION
 
     @property
@@ -205,6 +212,56 @@ def _path_under_tools(path: str | None) -> bool:
         return False
     p = Path(path)
     return not p.is_absolute() and ".." not in p.parts
+
+
+_ASCII_WORD = re.compile(r"[a-z0-9]+")
+
+
+def _is_cjk(ch: str) -> bool:
+    o = ord(ch)
+    return (
+        0x3040 <= o <= 0x30FF  # hiragana + katakana
+        or 0x3400 <= o <= 0x4DBF  # CJK ext A
+        or 0x4E00 <= o <= 0x9FFF  # CJK unified ideographs
+        or 0xF900 <= o <= 0xFAFF  # CJK compatibility ideographs
+    )
+
+
+def _tokenize(text: str | None) -> set[str]:
+    """Lexical tokens for retrieval (#52 §G, Phase 4). Mixes two schemes so it
+    works on the bot's bilingual traffic without a tokenizer dependency:
+      - ASCII: whitespace/word tokens (``city`` from ``城市 city``),
+      - CJK: char unigrams + adjacent-char bigrams per run, since Chinese and
+        Japanese have no whitespace word boundaries (``東京`` → ``東``, ``京``,
+        ``東京``). Bigrams give ``查東京天氣`` a strong overlap with a tool whose
+        example request was ``查東京天氣`` while still matching ``大阪`` loosely.
+    The issue mandates starting lexical and upgrading to embeddings only if
+    needed, so this stays dependency-free and deterministic."""
+    if not text:
+        return set()
+    low = text.lower()
+    tokens: set[str] = set(_ASCII_WORD.findall(low))
+    run: list[str] = []
+    for ch in low:
+        if _is_cjk(ch):
+            run.append(ch)
+            continue
+        _flush_cjk_run(run, tokens)
+        run = []
+    _flush_cjk_run(run, tokens)
+    return tokens
+
+
+def _flush_cjk_run(run: list[str], tokens: set[str]) -> None:
+    if not run:
+        return
+    tokens.update(run)  # unigrams
+    for i in range(len(run) - 1):
+        tokens.add(run[i] + run[i + 1])  # adjacent bigrams
+
+
+# Tie-break order when two tools score equally: prefer the more trusted tier.
+_STATUS_RANK = {STATUS_PROMOTED: 0, STATUS_RECOVERING: 1, STATUS_CANDIDATE: 2}
 
 
 class GeneratedToolCatalog:
@@ -357,6 +414,7 @@ class GeneratedToolCatalog:
             promotion_reason=reason,
             metrics=st.to_dict(),
             safety_profile=self._safety_profile(entry),
+            example_request=entry.get("request") or "",
         )
 
     # ---- views -------------------------------------------------------------
@@ -406,6 +464,80 @@ class GeneratedToolCatalog:
                 out.add(slug)
         return out
 
+    # ---- retrieval (Phase 4, #52 §G) ---------------------------------------
+
+    def _score(self, query_tokens: set[str], entry: CatalogEntry) -> int:
+        """Weighted lexical overlap between a request and a tool's searchable
+        fields. tool_type and the original example request carry the most signal
+        for matching a new same-kind request; description and param names help on
+        the margin. Pure token-set intersection — deterministic, no embeddings."""
+        if not query_tokens:
+            return 0
+        param_text = " ".join(
+            f"{p.get('name', '')} {p.get('desc', '')}"
+            for p in entry.param_schema
+            if isinstance(p, dict)
+        )
+        fields = (
+            (entry.tool_type, 3),
+            (entry.example_request, 2),
+            (entry.description, 2),
+            (param_text, 1),
+        )
+        return sum(
+            weight * len(query_tokens & _tokenize(text))
+            for text, weight in fields
+        )
+
+    def retrieve(
+        self,
+        query: str,
+        *,
+        k: int = DEFAULT_RETRIEVE_TOP_K,
+        promoted_only: bool = False,
+    ) -> list[CatalogEntry]:
+        """Top-k reusable tools most lexically relevant to ``query`` (#52 §G).
+
+        Only reusable tiers are eligible (candidate/promoted/recovering) — a
+        blocked, demoted, or ineligible tool is never surfaced to the planner.
+        ``promoted_only=True`` restricts to trusted known tools (the privilege
+        split the issue calls for: candidates and promoted tools must not have
+        the same exposure). Ties break toward the more trusted tier, then more
+        proven reuse, then slug for determinism."""
+        q = _tokenize(query)
+        if not q:
+            return []
+        pool = self.reusable()
+        if promoted_only:
+            pool = [e for e in pool if e.status == STATUS_PROMOTED]
+        scored = [(self._score(q, e), e) for e in pool]
+        scored = [(s, e) for s, e in scored if s > 0]
+        scored.sort(
+            key=lambda t: (
+                -t[0],
+                _STATUS_RANK.get(t[1].status, 9),
+                -int(t[1].metrics.get("reuse_success_count", 0)),
+                t[1].slug,
+            )
+        )
+        return [e for _, e in scored[: max(0, k)]]
+
+    def planner_tools(
+        self,
+        query: str,
+        *,
+        k: int = DEFAULT_RETRIEVE_TOP_K,
+        promoted_only: bool = False,
+    ) -> list[dict]:
+        """Planner-facing surface: top-k retrieved tools as compact schemas
+        (no raw metrics, execution pinned to the reuse path). This is what a
+        planning layer (#49/#50) should put in front of the model instead of the
+        whole catalog (#52 §G)."""
+        return [
+            e.planner_view()
+            for e in self.retrieve(query, k=k, promoted_only=promoted_only)
+        ]
+
     # ---- metric mutations --------------------------------------------------
 
     def _mutate(self, slug: str, fn) -> CatalogEntry | None:
@@ -422,6 +554,19 @@ class GeneratedToolCatalog:
     def register(self, slug: str) -> CatalogEntry | None:
         """Ensure a state row exists for a freshly generated tool (idempotent)."""
         return self._mutate(slug, lambda st: None)
+
+    def note_generation(self, slug: str) -> CatalogEntry | None:
+        """Record that ``/new`` produced a validation-passing build for ``slug``.
+
+        First-ever build → just register the row (generation_success_count stays
+        1). A *rebuild* of a slug that already has history is a self-heal
+        (#52 Phase 5): the tool was regenerated and re-validated, so bump the
+        generation counter and clear the consecutive-failure streak. That lets a
+        previously demoted/suppressed tool climb back out via ``recovering``
+        rather than staying dead after a successful repair."""
+        if slug in self._load_states():
+            return self.record_generation_success(slug)
+        return self.register(slug)
 
     def record_generation_success(self, slug: str) -> CatalogEntry | None:
         def fn(st: ToolState) -> None:

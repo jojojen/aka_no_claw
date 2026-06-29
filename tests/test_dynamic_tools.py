@@ -485,6 +485,60 @@ def test_blocked_tool_skipped_from_reuse(tmp_path):
     assert client2.calls["code"] == 1
 
 
+# --- #52 Phase 5: self-healing with version preservation/rollback --------------
+
+def test_failed_self_heal_rolls_back_to_prior_version(tmp_path):
+    # A validated tool exists; regenerating the SAME request (self-heal) fails
+    # every attempt. The repair loop overwrites tool.py in place, so the guard
+    # must restore the prior working version rather than leave failing code on disk.
+    client1 = FakeClient(code_responses=[PARAM_TOOL], meta_response=PARAM_META)
+    runner = _make_runner(tmp_path, client1)
+    slug = runner.run_detailed("輸出 x=10").slug
+    tool_path = runner.tools_dir / slug / "tool.py"
+    prior = tool_path.read_text(encoding="utf-8")
+
+    # Full cascade = 7 generations; all fail (distinct scripts so no early stop).
+    client2 = FakeClient(code_responses=[BAD_SCRIPT + f"\n# v{i}" for i in range(7)])
+    runner.client = client2
+    res = runner._generate_with_repair("輸出 x=10")
+    assert not res.ok
+    assert tool_path.read_text(encoding="utf-8") == prior  # rolled back intact
+
+
+def test_successful_self_heal_replaces_version_and_clears_failures(tmp_path):
+    # A demoted tool regenerated from the SAME request and re-validated must have
+    # its consecutive-failure streak cleared (so it leaves the suppressed set),
+    # while its lifetime failure history is preserved.
+    client1 = FakeClient(code_responses=[PARAM_TOOL], meta_response=PARAM_META)
+    runner = _make_runner(tmp_path, client1)
+    slug = runner.run_detailed("輸出 x=10").slug
+    for _ in range(3):
+        runner.catalog.record_failure(slug)
+    assert runner.catalog.get(slug).status == "demoted"
+    assert slug in runner.catalog.reuse_suppressed()
+
+    client2 = FakeClient(code_responses=[PARAM_TOOL], meta_response=PARAM_META)
+    runner.client = client2
+    res = runner._generate_with_repair("輸出 x=10")
+    assert res.ok
+    m = runner.catalog.get(slug).metrics
+    assert m["consecutive_failures"] == 0          # streak healed
+    assert m["failure_count"] == 3                 # history preserved
+    assert m["generation_success_count"] == 2      # counted as a rebuild
+    assert slug not in runner.catalog.reuse_suppressed()  # reusable again
+
+
+def test_first_generation_leaves_no_prior_to_roll_back(tmp_path):
+    # A brand-new slug that fails every attempt has no prior version; the guard
+    # must be a no-op (not crash, not resurrect anything).
+    client = FakeClient(code_responses=[BAD_SCRIPT + f"\n# v{i}" for i in range(7)])
+    runner = _make_runner(tmp_path, client)
+    res = runner._generate_with_repair("全新且失敗")
+    assert not res.ok
+    # manifest never recorded the failed first build
+    assert runner._load_manifest() == []
+
+
 def test_validator_pass_unchanged(tmp_path):
     # Default validator (PASS) → behavior identical to pre-gate pipeline,
     # but the validation call itself must have happened.

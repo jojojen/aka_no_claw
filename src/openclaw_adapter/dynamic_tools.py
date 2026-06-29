@@ -1199,6 +1199,17 @@ class DynamicToolRunner:
         tool_dir.mkdir(parents=True, exist_ok=True)
         tool_path = tool_dir / "tool.py"
 
+        # Self-heal version preservation (#52 Phase 5): when this slug already has
+        # a validated tool.py (a same-request regeneration after the old version
+        # started failing), stash it. The repair loop overwrites tool.py in place
+        # on every attempt, so if every attempt fails we must restore the prior
+        # working version — a failed self-heal must never leave the catalog worse
+        # off than before. Cleared only once a new build validates.
+        prior_code: str | None = (
+            tool_path.read_text(encoding="utf-8") if tool_path.exists() else None
+        )
+        validated_new = False
+
         generations = 0
         last_error = ""
         last_stdout = ""
@@ -1267,6 +1278,7 @@ class DynamicToolRunner:
                         valid, reason = self._validate_answer(
                             request, exec_result.answer, references=references)
                         if valid:
+                            validated_new = True  # new version is good; keep it
                             exec_result.slug = slug
                             exec_result.generations = generations
                             meta = self._last_meta or {}
@@ -1392,6 +1404,24 @@ class DynamicToolRunner:
             self.client.num_predict = saved_num_predict
             self.client.timeout_seconds = saved_timeout
             self.client.model = self.fast_model
+            # Rollback on regression (#52 Phase 5): if no new build validated but
+            # a prior working version existed, the repair loop has overwritten it
+            # with failing code. Restore the old version so the previously
+            # reusable tool survives the failed self-heal. (Its manifest entry was
+            # never rewritten — _register_manifest only runs on success — so
+            # restoring tool.py is enough to keep the old capability intact.)
+            if not validated_new and prior_code is not None:
+                try:
+                    tool_path.write_text(prior_code, encoding="utf-8")
+                    logger.info(
+                        "dynamic_tools: self-heal failed; rolled back to prior "
+                        "validated tool.py slug=%s", slug,
+                    )
+                except OSError:
+                    logger.debug(
+                        "dynamic_tools: rollback write failed slug=%s", slug,
+                        exc_info=True,
+                    )
 
     def _pass_syntax_gate(
         self, request: str, code: str, knowledge_rows, *,
@@ -2104,13 +2134,15 @@ class DynamicToolRunner:
             entry["tool_type"] = str(tool_type)
         entries.append(entry)
         self._save_manifest(entries)
-        # Seed a catalog state row so a freshly validated tool is immediately a
-        # reusable candidate (#52 §A). Best-effort: catalog bookkeeping must
+        # Record the validated build in the catalog (#52 §A/Phase 5). First build
+        # seeds a reusable candidate row; a rebuild of an existing slug is a
+        # self-heal that clears its failure streak so a repaired tool can recover
+        # out of the demoted/suppressed set. Best-effort: catalog bookkeeping must
         # never break code generation.
         try:
-            self.catalog.register(slug)
+            self.catalog.note_generation(slug)
         except Exception:
-            logger.debug("dynamic_tools: catalog.register failed slug=%s", slug, exc_info=True)
+            logger.debug("dynamic_tools: catalog.note_generation failed slug=%s", slug, exc_info=True)
 
     def _pick_reusable(self, request: str) -> dict | None:
         """Decide which existing tool (if any) to reuse.

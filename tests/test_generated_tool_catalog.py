@@ -376,3 +376,80 @@ def test_reusable_excludes_blocked_and_ineligible(tmp_path, catalog):
     blocked["path"] = "/abs/tool.py"
     _write_manifest(tmp_path, [good, static, blocked])
     assert sorted(e.slug for e in catalog.reusable()) == ["good"]
+
+
+# G. Top-k lexical retrieval (Phase 4) ------------------------------------------
+
+def _stock_entry(slug="tool_stock01"):
+    return {
+        "id": "deadbeef",
+        "slug": slug,
+        "request": "查詢台積電股價",
+        "description": "查詢股票即時報價",
+        "requires": [],
+        "created_at": "2026-06-02T00:00:00+00:00",
+        "path": f"{slug}/tool.py",
+        "param_schema": [{"name": "symbol", "type": "string", "desc": "股票代號"}],
+        "tool_type": "股票報價查詢",
+    }
+
+
+def test_retrieve_ranks_relevant_tool_first(tmp_path, catalog):
+    _write_manifest(tmp_path, [_weather_entry(), _stock_entry()])
+    hits = catalog.retrieve("查大阪天氣")
+    assert hits, "expected at least one retrieval hit"
+    assert hits[0].slug == "tool_ca00010a"  # weather tool, not the stock tool
+    assert hits[0].tool_type == "城市天氣查詢"
+
+
+def test_retrieve_disjoint_query_returns_nothing(tmp_path, catalog):
+    _write_manifest(tmp_path, [_weather_entry(), _stock_entry()])
+    # No lexical overlap with either tool's fields.
+    assert catalog.retrieve("xyzzy plugh foobar") == []
+
+
+def test_retrieve_empty_query_returns_empty(tmp_path, catalog):
+    _write_manifest(tmp_path, [_weather_entry()])
+    assert catalog.retrieve("") == []
+    assert catalog.retrieve("   ") == []
+
+
+def test_retrieve_respects_top_k(tmp_path, catalog):
+    entries = [_weather_entry(slug=f"w{i}") for i in range(5)]
+    _write_manifest(tmp_path, entries)
+    assert len(catalog.retrieve("查天氣", k=2)) == 2
+
+
+def test_retrieve_excludes_blocked_demoted_ineligible(tmp_path, catalog):
+    good = _weather_entry(slug="good")
+    blocked = _weather_entry(slug="blocked")
+    blocked["path"] = "/abs/tool.py"  # path escape -> blocked
+    static = _weather_entry(slug="static")  # ineligible (no schema)
+    static.pop("param_schema")
+    static.pop("tool_type")
+    demoted = _weather_entry(slug="demoted")
+    _write_manifest(tmp_path, [good, blocked, static, demoted])
+    for _ in range(3):
+        catalog.record_failure("demoted")
+    hits = {e.slug for e in catalog.retrieve("查天氣")}
+    assert hits == {"good"}
+
+
+def test_retrieve_promoted_only_filters_candidates(tmp_path, catalog):
+    promoted = _weather_entry(slug="promoted")
+    candidate = _weather_entry(slug="candidate")
+    _write_manifest(tmp_path, [promoted, candidate])
+    catalog.record_reuse_success("promoted")  # clean first-timer -> promoted
+    assert catalog.get("promoted").status == STATUS_PROMOTED
+    assert catalog.get("candidate").status == STATUS_CANDIDATE
+    hits = {e.slug for e in catalog.retrieve("查天氣", promoted_only=True)}
+    assert hits == {"promoted"}
+
+
+def test_planner_tools_returns_schema_without_metrics(tmp_path, catalog):
+    _write_manifest(tmp_path, [_weather_entry()])
+    views = catalog.planner_tools("查大阪天氣")
+    assert views[0]["name"] == "generated.tool_ca00010a"
+    assert views[0]["execution"] == "dynamic_tool_runner_reuse"
+    assert "metrics" not in views[0]
+    assert "example_request" not in views[0]  # planner surface stays minimal
