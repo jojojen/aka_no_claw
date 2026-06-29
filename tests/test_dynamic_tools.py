@@ -17,7 +17,10 @@ import pytest
 
 from openclaw_adapter.dynamic_tools import (
     CloudBackendUnavailable,
+    DynamicToolResult,
     DynamicToolRunner,
+    ReusePlan,
+    MistralTextClient,
     OllamaTextClient,
     OpenCodeCliTextClient,
     OpenCodeTextClient,
@@ -1680,26 +1683,43 @@ def test_validate_answer_both_pass(tmp_path):
     assert validator.calls["validate"] == 1
 
 
-def test_validate_answer_disagreement_marked(tmp_path):
-    # Generator self-approves; independent local validator dissents → not valid,
-    # tagged [歧見] so the repair loop can react and later fall back.
+def test_validate_answer_advisory_dissent_is_ignored(tmp_path):
+    # Primary reviewer PASSes; the local advisory (副審查) dissents. Advisory is
+    # reference-only, so the verdict stays the primary PASS (no dispute tag).
     primary = FakeClient(code_responses=[])  # PASS
     validator = FakeClient(code_responses=[],
                            validate_responses=["FAIL: 地點是東京不是夏威夷"])
     runner = _make_cross_runner(tmp_path, primary, validator)
     valid, reason = runner._validate_answer("夏威夷天氣", "東京 25度")
-    assert valid is False
-    assert reason.startswith("[歧見]")
-    assert "東京" in reason
+    assert valid is True
+    assert reason == ""
 
 
-def test_validate_answer_both_fail_no_disagreement_tag(tmp_path):
+def test_validate_answer_advisory_pass_does_not_override_primary_fail(tmp_path):
+    # Primary reviewer FAILs; the advisory PASSes. Primary is authoritative, so
+    # the FAIL reason passes through verbatim.
     primary = FakeClient(code_responses=[], validate_responses=["FAIL: 空洞"])
-    validator = FakeClient(code_responses=[], validate_responses=["FAIL: 也空洞"])
+    validator = FakeClient(code_responses=[])  # PASS
     runner = _make_cross_runner(tmp_path, primary, validator)
     valid, reason = runner._validate_answer("x", "y")
     assert valid is False
-    assert not reason.startswith("[歧見]")
+    assert reason == "空洞"
+
+
+def test_cloud_advisor_dissent_is_ignored(tmp_path):
+    # The cloud advisor (Mistral) is advisory-only: the generator self-validates
+    # as the authoritative gate. Generator PASSes, cloud advisor FAILs → verdict
+    # stays the generator's PASS.
+    generator = FakeClient(code_responses=[])  # self-validation PASSes
+    advisor = FakeClient(code_responses=[], validate_responses=["FAIL: 主題不符"])
+    runner = _make_runner(tmp_path, generator)
+    runner.cloud_advisor_client = advisor
+    runner.cloud_advisor_model = "mistral-large-latest"
+    valid, reason = runner._validate_answer("x", "y")
+    assert valid is True
+    assert reason == ""
+    assert generator.calls["validate"] == 1  # generator owns the authoritative gate
+    assert advisor.calls["validate"] == 1     # advisor consulted but not decisive
 
 
 class _SlowValidator:
@@ -1760,26 +1780,23 @@ def test_prewarm_validator_noop_without_validator(tmp_path):
     runner._prewarm_validator()  # must not raise when validator_client is None
 
 
-def test_cross_validation_disputed_fallback_on_exhaustion(tmp_path):
-    # Generator approves every attempt but the local validator always dissents.
-    # Repairs exhaust → ship the generator-approved answer WITH a caveat rather
-    # than hard-failing, and do NOT register it for reuse.
-    primary = FakeClient(code_responses=[GOOD_SCRIPT + f"\n# v{i}" for i in range(7)])
+def test_advisory_dissent_does_not_block_a_passing_answer(tmp_path):
+    # The local advisory reviewer (副審查) dissents on every attempt, but the
+    # primary reviewer approves. Advisory is reference-only → the first build
+    # ships clean on one generation, no caveat, and IS registered for reuse.
+    primary = FakeClient(code_responses=[GOOD_SCRIPT])  # primary PASSes
     validator = FakeClient(code_responses=[],
                            validate_responses=["FAIL: 地點是東京不是夏威夷"] * 7)
     runner = _make_cross_runner(tmp_path, primary, validator)
     res = runner.run_detailed("夏威夷天氣")
     assert res.ok
-    assert res.generations == 7
-    assert "本地交叉驗證有疑慮" in res.answer
-    assert "東京" in res.answer
-    assert len(runner._load_manifest()) == 0
+    assert res.generations == 1
+    assert "本地交叉驗證有疑慮" not in res.answer
+    assert len(runner._load_manifest()) == 1
 
 
-def test_builder_enables_cross_validation_for_opencode(tmp_path):
-    import unittest.mock as mock
-
-    settings = SimpleNamespace(
+def _opencode_settings(tmp_path, **overrides):
+    base = dict(
         openclaw_codegen_backend="opencode",
         openclaw_opencode_base_url="https://opencode.ai/zen/v1",
         openclaw_opencode_model="big-pickle",
@@ -1790,18 +1807,65 @@ def test_builder_enables_cross_validation_for_opencode(tmp_path):
         openclaw_local_text_endpoint="http://127.0.0.1:11434",
         openclaw_local_text_timeout_seconds=75,
         openclaw_codegen_fast_model=None,
+        openclaw_codegen_validator_model="qwen2.5-coder:7b",
+        openclaw_mistral_api_key=None,
+        openclaw_mistral_model="mistral-large-latest",
         knowledge_db_path=str(tmp_path / "knowledge.sqlite3"),
     )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def test_builder_wires_bigpickle_dev_mistral_and_local_advisory(tmp_path):
+    import unittest.mock as mock
+
+    settings = _opencode_settings(tmp_path, openclaw_mistral_api_key="sk-mistral")
     with mock.patch("openclaw_adapter.dynamic_tools.probe_opencode", return_value=True), \
          mock.patch("openclaw_adapter.dynamic_tools.probe_ollama", return_value=True):
         runner = build_dynamic_tool_runner_from_settings(settings)
 
+    # Big Pickle is the generator (主開發) and owns the authoritative gate.
     assert isinstance(runner.client, OpenCodeTextClient)
+    # Mistral is an advisory cloud reviewer (參考用), not authoritative.
+    assert isinstance(runner.cloud_advisor_client, MistralTextClient)
+    assert runner.cloud_advisor_model == "mistral-large-latest"
+    # Local qwen 7b is the other advisory reviewer (參考用).
     assert isinstance(runner.validator_client, OllamaTextClient)
-    assert runner.validator_model == "qwen3:14b"
-    assert "驗證" in runner.backend_label
-    # Cloud generator → enable restart-on-outage failover to the local runner.
+    assert runner.validator_model == "qwen2.5-coder:7b"
+    assert runner.backend_label.count("參考") == 2
+    assert "參考 mistral" in runner.backend_label
+    assert "參考 ollama" in runner.backend_label
     assert runner.cloud_failover_restart is True
+
+
+def test_builder_falls_back_to_mistral_generator_when_bigpickle_down(tmp_path):
+    import unittest.mock as mock
+
+    settings = _opencode_settings(tmp_path, openclaw_mistral_api_key="sk-mistral")
+    # Big Pickle HTTP unreachable but Mistral key present → Mistral becomes 主開發.
+    with mock.patch("openclaw_adapter.dynamic_tools.probe_opencode", return_value=False), \
+         mock.patch("openclaw_adapter.dynamic_tools.probe_ollama", return_value=True):
+        runner = build_dynamic_tool_runner_from_settings(settings)
+
+    assert isinstance(runner.client, MistralTextClient)
+    assert runner.fast_model == "mistral-large-latest"
+    # Mistral self-validates as generator; no separate cloud advisor wired.
+    assert runner.cloud_advisor_client is None
+    # Local advisory reviewer still attached.
+    assert isinstance(runner.validator_client, OllamaTextClient)
+    assert runner.cloud_failover_restart is True
+
+
+def test_builder_bigpickle_down_no_mistral_falls_to_ollama(tmp_path):
+    import unittest.mock as mock
+
+    settings = _opencode_settings(tmp_path)  # no mistral key
+    with mock.patch("openclaw_adapter.dynamic_tools.probe_opencode", return_value=False), \
+         mock.patch("openclaw_adapter.dynamic_tools.probe_ollama", return_value=True):
+        runner = build_dynamic_tool_runner_from_settings(settings)
+
+    assert isinstance(runner.client, OllamaTextClient)
+    assert runner.cloud_advisor_client is None
 
 
 class _DownCloudClient:
@@ -1865,3 +1929,103 @@ def test_run_no_failover_restart_when_disabled(tmp_path):
     popen.assert_not_called()
     assert "正在重啟" not in msg
     assert "連不上" in msg
+
+
+# --- #52 live Chat/planner integration: plan_for_text / run_reuse_plan ---------
+
+def _planner_runner(tmp_path, *, retrieve, pick, status):
+    """A runner with the catalog/classifier seams stubbed so plan_for_text's
+    decision branches are exercised deterministically (no Ollama)."""
+    runner = _make_runner(tmp_path, FakeClient(code_responses=[]))
+    runner.catalog.retrieve = lambda q, **kw: retrieve  # type: ignore[assignment]
+    runner._pick_reusable = lambda core: pick  # type: ignore[assignment]
+    runner.catalog.get = lambda slug: (  # type: ignore[assignment]
+        SimpleNamespace(status=status) if status is not None else None
+    )
+    return runner
+
+
+def test_plan_for_text_no_lexical_signal_returns_none(tmp_path):
+    # Random chatter with no relevant tool must not spin codegen or nag.
+    runner = _planner_runner(tmp_path, retrieve=[], pick=None, status=None)
+    plan = runner.plan_for_text("哈哈好喔")
+    assert plan.action == "none"
+
+
+def test_plan_for_text_signal_but_classifier_miss_offers_generate(tmp_path):
+    runner = _planner_runner(
+        tmp_path, retrieve=[SimpleNamespace(slug="w")], pick=None, status=None
+    )
+    plan = runner.plan_for_text("查大阪天氣")
+    assert plan.action == "confirm_generate"
+
+
+def test_plan_for_text_promoted_match_runs_immediately(tmp_path):
+    match = {"slug": "weather", "tool_type": "weather"}
+    runner = _planner_runner(
+        tmp_path, retrieve=[SimpleNamespace(slug="weather")], pick=match,
+        status="promoted",
+    )
+    plan = runner.plan_for_text("查大阪天氣")
+    assert plan.action == "run"
+    assert plan.slug == "weather"
+    assert plan.match is match
+
+
+def test_plan_for_text_fresh_match_asks_before_reuse(tmp_path):
+    match = {"slug": "weather", "tool_type": "weather"}
+    runner = _planner_runner(
+        tmp_path, retrieve=[SimpleNamespace(slug="weather")], pick=match,
+        status="candidate",
+    )
+    plan = runner.plan_for_text("查大阪天氣")
+    assert plan.action == "confirm_reuse"
+    assert plan.tool_type == "weather"
+
+
+def test_plan_for_text_empty_request_is_none(tmp_path):
+    runner = _planner_runner(tmp_path, retrieve=[], pick=None, status=None)
+    assert runner.plan_for_text("   ").action == "none"
+
+
+def test_run_reuse_plan_without_match_delegates_to_generate(tmp_path):
+    runner = _make_runner(tmp_path, FakeClient(code_responses=[]))
+    runner.run = lambda text: f"RAN:{text}"  # type: ignore[assignment]
+    plan = ReusePlan(action="confirm_generate", core="查天氣")
+    assert runner.run_reuse_plan(plan) == "RAN:查天氣"
+
+
+def test_run_reuse_plan_success_records_and_formats(tmp_path):
+    runner = _make_runner(tmp_path, FakeClient(code_responses=[]))
+    runner._reuse = lambda match, core: DynamicToolResult(  # type: ignore[assignment]
+        ok=True, reused=True, answer="大阪 晴", slug="weather"
+    )
+    captured = []
+    runner._record_catalog_outcome = lambda slug, ok, reason: captured.append((slug, ok))  # type: ignore[assignment]
+    plan = ReusePlan(action="run", slug="weather", match={"slug": "weather"}, core="查大阪天氣")
+    out = runner.run_reuse_plan(plan)
+    assert captured == [("weather", True)]
+    assert "♻️ 重用既有工具" in out
+    assert "大阪 晴" in out
+
+
+def test_run_reuse_plan_failed_reuse_records_failure_then_generates(tmp_path):
+    runner = _make_runner(tmp_path, FakeClient(code_responses=[]))
+    runner._reuse = lambda match, core: None  # type: ignore[assignment]
+    runner._generate_with_repair = lambda core: DynamicToolResult(  # type: ignore[assignment]
+        ok=True, reused=False, answer="新生成答案", slug="weather"
+    )
+    captured = []
+    runner._record_catalog_outcome = lambda slug, ok, reason: captured.append((slug, ok))  # type: ignore[assignment]
+    plan = ReusePlan(action="confirm_reuse", slug="weather", match={"slug": "weather"}, core="查大阪天氣")
+    out = runner.run_reuse_plan(plan)
+    assert captured == [("weather", False)]
+    assert "🛠 新生成工具" in out
+    assert "新生成答案" in out
+
+
+def test_format_result_failure_string(tmp_path):
+    runner = _make_runner(tmp_path, FakeClient(code_responses=[]))
+    out = runner._format_result(DynamicToolResult(ok=False, error="boom", generations=0))
+    assert "⚠️ 無法完成" in out
+    assert "boom" in out

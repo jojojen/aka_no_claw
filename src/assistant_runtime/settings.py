@@ -32,6 +32,9 @@ class AssistantSettings:
     # Fast, code-specialized tier-1 model for /new codegen. Escalates to the
     # (larger) openclaw_local_text_model only when this tier exhausts repairs.
     openclaw_codegen_fast_model: str | None = "qwen2.5-coder:7b"
+    # Local model used as the SECONDARY (advisory) reviewer for /new — kept light
+    # (7b) since its verdict is reference-only and must not slow the reply.
+    openclaw_codegen_validator_model: str | None = "qwen2.5-coder:7b"
     # /new codegen backend override. Empty/ollama preserves the local-only
     # behavior; opencode uses the OpenCode Zen OpenAI-compatible endpoint.
     openclaw_codegen_backend: str | None = None
@@ -237,6 +240,9 @@ def get_settings() -> AssistantSettings:
         openclaw_local_tts_speaker_id=_as_optional_int(os.getenv("OPENCLAW_LOCAL_TTS_SPEAKER_ID")),
         openclaw_codegen_fast_model=_none_if_empty(
             os.getenv("OPENCLAW_CODEGEN_FAST_MODEL", "qwen2.5-coder:7b")
+        ),
+        openclaw_codegen_validator_model=_none_if_empty(
+            os.getenv("OPENCLAW_CODEGEN_VALIDATOR_MODEL", "qwen2.5-coder:7b")
         ),
         openclaw_codegen_backend=_none_if_empty(os.getenv("OPENCLAW_CODEGEN_BACKEND")),
         openclaw_opencode_base_url=os.getenv(

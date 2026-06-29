@@ -55,6 +55,7 @@ from price_monitor_bot.watch_monitor import ensure_monitor as _ensure_watch_moni
 from tcg_tracker.image_lookup import TcgVisionSettings
 
 from .backup_command import BackupScheduler, build_backup_handler, build_recover_handler
+from .catalog_planner import CatalogPlanner
 from .opportunity_scorecard import build_scorecard_handler
 from .rag_daily_digest import RagDailyDigestScheduler, handle_ragdel_callback, handle_ragkeep_callback
 from .dynamic_tools import (
@@ -1698,6 +1699,13 @@ def run_telegram_polling(
     )
     home_schedule_scheduler = _start_home_schedule_scheduler(settings, command_handlers)
 
+    # Live Chat/planner integration (#52): a free-text message that matched no
+    # built-in intent gets a shot at the growing generated-tool catalog. The
+    # planner's inline-button confirmations route back through the callback
+    # registry, so merge its handlers in.
+    catalog_planner = CatalogPlanner(dynamic_tool_runner)
+    callback_handlers.update(catalog_planner.callback_handlers())
+
     _price_bot_module.TelegramCommandProcessor = (
         lambda **kwargs: TelegramCommandProcessor(settings=settings, **kwargs)
     )
@@ -1721,6 +1729,7 @@ def run_telegram_polling(
         callback_handlers=callback_handlers,
         view_handlers=view_handlers,
         item_deleter_handlers=item_deleter_handlers,
+        unknown_text_handler=catalog_planner.handle_text,
         watch_db=watch_db,
         watch_inbox=watch_inbox,
         sns_db=sns_db,

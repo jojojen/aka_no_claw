@@ -46,7 +46,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from .generated_tool_catalog import GeneratedToolCatalog
+from .generated_tool_catalog import GeneratedToolCatalog, STATUS_PROMOTED
 
 logger = logging.getLogger(__name__)
 
@@ -266,6 +266,29 @@ class DynamicToolResult:
     error: str = ""
     raw_stdout: str = ""
     trace: TaskTrace | None = None
+
+
+@dataclass
+class ReusePlan:
+    """A non-executing decision the Chat/planner layer can act on (#52 live
+    integration). ``action`` is one of:
+
+    - ``none``           — no relevant existing tool; stay silent / defer to the
+                           bot's default reply (don't spin codegen on chatter).
+    - ``run``            — a *promoted* (trusted) tool matched; run it now.
+    - ``confirm_reuse``  — a fresh (candidate/recovering) tool matched; ask the
+                           user before reusing it.
+    - ``confirm_generate`` — there was a relevance signal but no usable existing
+                           tool; offer to generate a new one.
+
+    ``match`` is the raw manifest entry (execution handle keyed by slug); it is
+    never built from model output, so the planner cannot run arbitrary code."""
+    action: str
+    slug: str | None = None
+    tool_type: str | None = None
+    match: dict | None = None
+    core: str = ""
+    format_spec: str = ""
 
 
 class TextGenerationClient(Protocol):
@@ -753,6 +776,8 @@ class DynamicToolRunner:
         distill_enabled: bool = False,
         fast_model: str | None = None,
         strong_model: str | None = None,
+        cloud_advisor_client: "TextGenerationClient | None" = None,
+        cloud_advisor_model: str | None = None,
         validator_client: "TextGenerationClient | None" = None,
         validator_model: str | None = None,
         validator_timeout_seconds: float = 25.0,
@@ -771,6 +796,16 @@ class DynamicToolRunner:
         # blind spots, so a second, independent pair of eyes catches errors the
         # self-validation rubber-stamps (e.g. copying a format template's example
         # location/date instead of the real query). None -> self-validation only.
+        #
+        # Review tiers (per operator config): the AUTHORITATIVE verdict that drives
+        # the repair loop is the generator self-grading (self.client at strong_model)
+        # — the generator (Big Pickle) is the strongest model, so it owns the gate.
+        # Both extra reviewers are ADVISORY ONLY: a cloud second opinion (Mistral,
+        # cloud_advisor_client) and the idle local qwen 7b (validator_client). Each
+        # runs concurrently, is logged when it dissents, but NEVER changes the
+        # verdict and is never waited on (fail-open on timeout).
+        self.cloud_advisor_client = cloud_advisor_client
+        self.cloud_advisor_model = cloud_advisor_model
         self.validator_client = validator_client
         self.validator_model = validator_model
         # Hard wall-clock cap on the independent (local) validation. The local
@@ -830,8 +865,12 @@ class DynamicToolRunner:
             label = f"ollama · {self.fast_model}"
         else:
             label = f"ollama · {self.fast_model}→{self.strong_model}"
+        if self.cloud_advisor_client is not None:
+            rname = type(self.cloud_advisor_client).__name__
+            tag = "mistral" if "Mistral" in rname else rname.replace("TextClient", "").lower()
+            label += f" + 參考 {tag}·{self.cloud_advisor_model}"
         if self.validator_client is not None:
-            label += f" + 驗證 ollama·{self.validator_model}"
+            label += f" + 參考 ollama·{self.validator_model}"
         return label
 
     def run(self, request: str) -> str:
@@ -851,6 +890,11 @@ class DynamicToolRunner:
         except Exception as exc:  # defensive — never crash the bot loop
             logger.exception("dynamic_tools: run failed")
             return f"動態工具執行失敗：{exc}"
+        return self._format_result(result)
+
+    def _format_result(self, result: DynamicToolResult) -> str:
+        """Render a DynamicToolResult into the Telegram-facing string. Shared by
+        the /new path (run) and the Chat reuse path (run_reuse_plan)."""
         if result.ok:
             tool_type = self._catalog_tool_type(result.slug)
             if result.reused:
@@ -963,6 +1007,73 @@ class DynamicToolRunner:
         if result.ok and format_spec:
             result.answer = self._apply_presentation(format_spec, result.answer)
         return result
+
+    def plan_for_text(self, request: str) -> ReusePlan:
+        """Decide what an existing-tool reuse would do for *request* WITHOUT
+        generating anything (#52 live Chat/planner integration).
+
+        A cheap lexical retrieval gate runs first: if no reusable tool is even
+        lexically relevant, return ``none`` so a stray chat message never spins
+        the ~50 s codegen path or nags the user to build a tool. When there is a
+        signal, the authoritative tool_type classifier picks the match; a
+        promoted (trusted) match runs immediately, a fresh one asks first, and a
+        classifier miss offers to generate."""
+        req = (request or "").strip()
+        if not req:
+            return ReusePlan(action="none")
+        core, format_spec = self._split_request_intent(req)
+        try:
+            relevant = self.catalog.retrieve(core)
+        except Exception:
+            logger.debug("dynamic_tools: catalog.retrieve failed", exc_info=True)
+            relevant = []
+        if not relevant:
+            return ReusePlan(action="none", core=core, format_spec=format_spec)
+        match = self._pick_reusable(core)
+        if match is None:
+            return ReusePlan(action="confirm_generate", core=core, format_spec=format_spec)
+        slug = match.get("slug")
+        status = None
+        try:
+            entry = self.catalog.get(slug)
+            status = entry.status if entry else None
+        except Exception:
+            logger.debug("dynamic_tools: catalog.get failed slug=%s", slug, exc_info=True)
+        action = "run" if status == STATUS_PROMOTED else "confirm_reuse"
+        return ReusePlan(
+            action=action, slug=slug, tool_type=match.get("tool_type"),
+            match=match, core=core, format_spec=format_spec,
+        )
+
+    def run_reuse_plan(self, plan: ReusePlan) -> str:
+        """Execute a matched-tool reuse the planner already decided on (a promoted
+        auto-run, or a user-confirmed fresh tool). Mirrors run()'s reuse branch:
+        record the lifecycle outcome, fall back to generation if the forced reuse
+        fails validation, then format the Telegram-facing string."""
+        if plan.match is None:
+            return self.run(plan.core or "")
+        try:
+            result = self._reuse(plan.match, plan.core)
+            if result is not None and result.ok:
+                self._record_catalog_outcome(plan.slug, True, None)
+            else:
+                self._record_catalog_outcome(
+                    plan.slug, False, "reuse failed validation/execution"
+                )
+                result = self._generate_with_repair(plan.core)
+            if result.ok and plan.format_spec:
+                result.answer = self._apply_presentation(plan.format_spec, result.answer)
+        except CloudBackendUnavailable as exc:
+            logger.warning("dynamic_tools: cloud backend unavailable (reuse): %s", exc)
+            if self.cloud_failover_restart and self._trigger_cloud_failover_restart():
+                return ("⚠️ 雲端 codegen 後端（big-pickle）連不上，正在重啟龍蝦改用地端模型，"
+                        "約 30 秒後請重試一次同樣的指令。")
+            return ("⚠️ 雲端 codegen 後端（big-pickle）連不上。"
+                    "若剛重啟過仍未恢復，請稍後再試或檢查後端狀態。")
+        except Exception as exc:  # defensive — never crash the bot loop
+            logger.exception("dynamic_tools: run_reuse_plan failed")
+            return f"動態工具執行失敗：{exc}"
+        return self._format_result(result)
 
     def _catalog_tool_type(self, slug: str | None) -> str | None:
         """tool_type of a generated tool, for the user-visible reuse trace.
@@ -1194,7 +1305,11 @@ class DynamicToolRunner:
         api_structure = None if has_recipe else self._explore_api(
             request, knowledge_rows, references=references)
 
-        slug = self._make_slug(request)
+        # Self-heal keys on a stable slug: a regeneration of the SAME request must
+        # land on the existing tool's slug (so version preservation, rollback and
+        # lifecycle-streak healing apply), not a fresh timestamp-salted one. Only
+        # mint a new slug for a genuinely new request.
+        slug = self._existing_slug_for(request) or self._make_slug(request)
         tool_dir = self.tools_dir / slug
         tool_dir.mkdir(parents=True, exist_ok=True)
         tool_path = tool_dir / "tool.py"
@@ -1213,13 +1328,6 @@ class DynamicToolRunner:
         generations = 0
         last_error = ""
         last_stdout = ""
-        # Cross-validation safety net: the most recent answer the PRIMARY validator
-        # approved but the independent validator disputed. If repairs run out with
-        # no clean (both-PASS) success, we ship this with a caveat rather than hard
-        # failing — never let the weaker independent model block a generator-approved
-        # answer. Not registered for reuse (it may be wrong); next run regenerates.
-        disputed_fallback: DynamicToolResult | None = None
-        disputed_reason = ""
 
         # The escalation path mutates client.model / num_predict / timeout; the
         # syntax gate may also bump num_predict. Save and restore so a complex
@@ -1309,19 +1417,8 @@ class DynamicToolRunner:
                             self._mark_knowledge_applied(knowledge_rows)
                             exec_result.trace = trace
                             return exec_result
-                        if reason.startswith("[歧見]"):
-                            # Primary approved, independent dissented. Remember it
-                            # as a last-resort answer, then keep repairing to try
-                            # to satisfy both validators.
-                            exec_result.slug = slug
-                            exec_result.generations = generations
-                            disputed_fallback = exec_result
-                            disputed_reason = reason[len("[歧見]"):].strip()
-                            obs = "execution succeeded but independent validator disputed: " + reason
-                            refl = "cross-validator dispute"
-                        else:
-                            obs = "execution succeeded but answer rejected: " + reason
-                            refl = "output contradicts request (semantic mismatch)"
+                        obs = "execution succeeded but answer rejected: " + reason
+                        refl = "output contradicts request (semantic mismatch)"
                         last_error = (
                             "答案驗證未通過（程式執行成功但輸出內容不符需求）：" + reason
                             + "\n（修正方向：改程式邏輯，讓輸出的依據取自真實資料點、"
@@ -1383,17 +1480,6 @@ class DynamicToolRunner:
                                                   references=references)
 
             trace.generations_used = generations
-            if disputed_fallback is not None:
-                # Repairs exhausted but the generator approved this answer; ship it
-                # with a visible caveat instead of failing on the weaker model's word.
-                disputed_fallback.answer = (
-                    disputed_fallback.answer
-                    + f"\n—\n⚠️ 本地交叉驗證有疑慮：{disputed_reason}"
-                )
-                disputed_fallback.generations = generations
-                trace.stop_condition = "budgets exhausted; shipped disputed answer with caveat"
-                disputed_fallback.trace = trace
-                return disputed_fallback
             trace.stop_condition = "budgets exhausted; no valid answer"
             return DynamicToolResult(
                 ok=False, slug=slug, generations=generations,
@@ -2268,47 +2354,52 @@ class DynamicToolRunner:
             f"答案：\n{_tail(answer, 800)}\n"
             "只輸出一行：PASS 或 FAIL: <一句原因>。不要任何解說。"
         )
-        # Primary verdict: the generator grading its own output (strong model).
-        # The gate is the last line of defense; the fast model rubber-stamped
-        # period/scope mismatches the strong one catches.
-        if self.validator_client is None:
+        # Authoritative verdict (drives the repair loop): the generator self-grading
+        # at its strong model. The generator (Big Pickle) is the strongest model, so
+        # it owns the gate — neither extra reviewer can block its answer.
+        light_prompt = (
+            "粗略判斷下面的『答案』是否合理回應了『需求』。不必嚴格細查，只看："
+            "主題對不對、有沒有明顯空洞/佔位文字/報錯/編造。\n"
+            f"需求：{request}\n答案：\n{_tail(answer, 600)}\n"
+            "只輸出一行：PASS 或 FAIL: <一句原因>。不要解說。"
+        )
+        # Advisory reviewers (參考用): a cloud second opinion (Mistral) and the idle
+        # local qwen 7b. Both run concurrently with a light prompt, are logged when
+        # they dissent, but NEVER change the verdict and are never waited on.
+        advisors = []
+        if self.cloud_advisor_client is not None:
+            advisors.append(("mistral", self.cloud_advisor_client, self.cloud_advisor_model))
+        if self.validator_client is not None:
+            advisors.append(("local", self.validator_client, self.validator_model))
+        if not advisors:
             return self._run_one_validation(self.client, self.strong_model, prompt)
 
-        # Cross-validation: a DIFFERENT model family (idle local Ollama) re-grades
-        # the same answer with the same rubric. The two clients are independent
-        # objects on independent compute (cloud CLI vs local HTTP), so run both
-        # concurrently — latency ≈ max, not sum.
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(advisors))
         try:
-            primary_fut = pool.submit(
-                self._run_one_validation, self.client, self.strong_model, prompt)
-            indep_fut = pool.submit(
-                self._run_one_validation, self.validator_client, self.validator_model, prompt)
-            primary_valid, primary_reason = primary_fut.result()
-            try:
-                indep_valid, indep_reason = indep_fut.result(
-                    timeout=self.validator_timeout_seconds)
-            except concurrent.futures.TimeoutError:
-                logger.info(
-                    "dynamic_tools: independent validator timed out after %ss; "
-                    "falling back to primary-only verdict",
-                    self.validator_timeout_seconds)
-                return primary_valid, primary_reason
+            adv_futs = [
+                (label, pool.submit(self._run_one_validation, c, m, light_prompt))
+                for (label, c, m) in advisors
+            ]
+            primary_valid, primary_reason = self._run_one_validation(
+                self.client, self.strong_model, prompt)
+            for label, fut in adv_futs:
+                try:
+                    adv_valid, adv_reason = fut.result(
+                        timeout=self.validator_timeout_seconds)
+                    if adv_valid != primary_valid:
+                        logger.info(
+                            "dynamic_tools: advisory(%s) reviewer disagrees with the "
+                            "generator verdict; generator_valid=%s advisory_valid=%s "
+                            "advisory_reason=%s (reference-only, verdict unchanged)",
+                            label, primary_valid, adv_valid, adv_reason)
+                except concurrent.futures.TimeoutError:
+                    logger.info(
+                        "dynamic_tools: advisory(%s) reviewer timed out after %ss; "
+                        "ignored (reference-only)", label, self.validator_timeout_seconds)
         finally:
-            # Never block the reply on a slow/orphaned local validation thread:
-            # on timeout the qwen3 call keeps running but we don't wait for it.
+            # Never block the reply on a slow/orphaned advisory thread.
             pool.shutdown(wait=False)
-
-        if primary_valid and indep_valid:
-            return True, ""
-        if not primary_valid and not indep_valid:
-            return False, primary_reason or indep_reason
-        # Disagreement: mark it so the repair loop can both (a) try to fix what the
-        # dissenter flagged and (b) fall back to the primary-approved answer with a
-        # caveat if repairs run out — a weaker independent model must never hard-block
-        # a generator-approved answer.
-        dissenting = indep_reason if primary_valid else primary_reason
-        return False, "[歧見] " + (dissenting or "獨立驗證與主驗證判定不一致")
+        return primary_valid, primary_reason
 
     def _run_one_validation(self, client, model: str,
                             prompt: str) -> tuple[bool, str]:
@@ -2506,6 +2597,16 @@ class DynamicToolRunner:
         suffix = sha1(f"{request}|{_utc_now_iso()}".encode("utf-8")).hexdigest()[:8]
         return f"{base}_{suffix}"
 
+    def _existing_slug_for(self, request: str) -> str | None:
+        """Slug of an already-generated tool for this exact request (whitespace/
+        case normalized), if any. Lets a same-request regeneration self-heal the
+        existing tool instead of forking a new timestamp-salted slug."""
+        norm = _normalize_request(request)
+        for e in self._load_manifest():
+            if _normalize_request(e.get("request", "")) == norm:
+                return e.get("slug")
+        return None
+
 
 # ── module helpers ───────────────────────────────────────────────────────────
 
@@ -2678,16 +2779,18 @@ def _opencode_cli_model(model: str) -> str:
 
 
 def _build_local_validator(settings) -> "tuple[TextGenerationClient | None, str | None]":
-    """Build an independent local Ollama validator (qwen3:14b) for cross-checking
-    the cloud generator's answers. Returns (None, None) when local Ollama is
-    unconfigured or unreachable, so the runner degrades to self-validation."""
+    """Build the idle local Ollama as an advisory reviewer (參考用). Prefers a light
+    7b model (openclaw_codegen_validator_model) since its verdict is reference-only
+    and a small model keeps the local turnaround short. Returns (None, None) when
+    local Ollama is unconfigured or unreachable."""
     backend = (settings.openclaw_local_text_backend or "").strip().lower()
     if backend != "ollama":
         return None, None
-    model = _select_model(settings.openclaw_local_text_model)
+    model = (getattr(settings, "openclaw_codegen_validator_model", None) or "").strip() \
+        or _select_model(settings.openclaw_local_text_model)
     endpoint = settings.openclaw_local_text_endpoint
     if not model or not probe_ollama(endpoint):
-        logger.warning("dynamic_tools: local validator unavailable; using self-validation only")
+        logger.warning("dynamic_tools: local advisory reviewer unavailable; primary review only")
         return None, None
     client = OllamaTextClient(
         endpoint=endpoint,
@@ -2698,8 +2801,22 @@ def _build_local_validator(settings) -> "tuple[TextGenerationClient | None, str 
         # keeps the slow local model's generation time down.
         num_predict=256,
     )
-    logger.info("dynamic_tools: cross-validation enabled with local validator model=%s", model)
+    logger.info("dynamic_tools: advisory(local) reviewer enabled model=%s", model)
     return client, model
+
+
+def _build_mistral_client(settings) -> "tuple[TextGenerationClient | None, str | None]":
+    """Build a Mistral cloud client (api.mistral.ai). Returns (None, None) when
+    no API key is configured. Used both as an advisory cloud reviewer (參考用)
+    alongside a Big-Pickle generator, and as the PRIMARY generator (主開發) when Big
+    Pickle is unreachable. Callers build separate instances per role so the
+    generator's per-tier model mutation never leaks into the advisory client."""
+    key = getattr(settings, "openclaw_mistral_api_key", None)
+    if not key:
+        return None, None
+    model = (getattr(settings, "openclaw_mistral_model", None) or _MISTRAL_DEFAULT_MODEL).strip()
+    timeout = max(60, int(getattr(settings, "openclaw_opencode_timeout_seconds", 900)))
+    return MistralTextClient(api_key=key, model=model, timeout_seconds=timeout), model
 
 
 def build_dynamic_tool_runner_from_settings(settings) -> DynamicToolRunner | None:
@@ -2717,21 +2834,37 @@ def build_dynamic_tool_runner_from_settings(settings) -> DynamicToolRunner | Non
                     or "https://opencode.ai/zen/v1").strip()
         # zen wants the bare model name (e.g. "big-pickle"); the CLI wants "opencode/big-pickle".
         http_model = model.split("/")[-1]
-        # Cloud generates; idle local model independently cross-validates.
+        # Review tiers (operator config): Big Pickle (the generator) self-validates
+        # as the authoritative gate — it is the strongest model. Mistral and the
+        # idle local qwen 7b are advisory-only second opinions (參考用, never block).
+        cloud_advisor_client, cloud_advisor_model = _build_mistral_client(settings)
         validator_client, validator_model = _build_local_validator(settings)
         # Prefer direct HTTP: no `opencode run` subprocess means no AGENTS.md/CLAUDE.md
         # context pollution (issue #59) and full control over the request. The CLI is
         # kept only as a fallback for when the HTTP endpoint is unreachable.
         if probe_opencode(base_url, model=http_model, timeout=10.0):
             client = OpenCodeTextClient(base_url=base_url, model=http_model, timeout_seconds=timeout)
-            logger.info("dynamic_tools: using OpenCode direct-HTTP codegen backend model=%s", http_model)
+            logger.info("dynamic_tools: Big Pickle 主開發 + 參考 mistral=%s + 參考 local=%s",
+                        cloud_advisor_model or "-", validator_model or "-")
             return _build_runner_with_client(
                 settings, client, fast_model=http_model, strong_model=http_model,
+                cloud_advisor_client=cloud_advisor_client, cloud_advisor_model=cloud_advisor_model,
+                validator_client=validator_client, validator_model=validator_model,
+                cloud_failover_restart=True)
+        # Big Pickle HTTP unreachable → fall back to Mistral as the PRIMARY generator
+        # (主開發). Mistral now self-validates; no separate cloud advisor (it would be
+        # Mistral reviewing itself) — the local qwen 7b stays as advisory reference.
+        gen_client, gen_model = _build_mistral_client(settings)
+        if gen_client is not None:
+            logger.info("dynamic_tools: Big Pickle down → Mistral 主開發 fallback (model=%s)", gen_model)
+            return _build_runner_with_client(
+                settings, gen_client, fast_model=gen_model, strong_model=gen_model,
+                cloud_advisor_client=None, cloud_advisor_model=None,
                 validator_client=validator_client, validator_model=validator_model,
                 cloud_failover_restart=True)
         # CLI fallback intentionally removed: auto-invoking `opencode run` risks
         # loading AGENTS.md / CLAUDE.md and violates the #59 isolation contract.
-        logger.warning("dynamic_tools: OpenCode HTTP unavailable; falling back to Ollama if configured")
+        logger.warning("dynamic_tools: OpenCode HTTP + Mistral both unavailable; falling back to Ollama if configured")
     elif codegen_backend and codegen_backend != "ollama":
         logger.warning("dynamic_tools: unsupported codegen backend=%s; falling back to Ollama", codegen_backend)
 
@@ -2776,6 +2909,8 @@ def _build_runner_with_client(
     *,
     fast_model: str,
     strong_model: str,
+    cloud_advisor_client: "TextGenerationClient | None" = None,
+    cloud_advisor_model: str | None = None,
     validator_client: "TextGenerationClient | None" = None,
     validator_model: str | None = None,
     cloud_failover_restart: bool = False,
@@ -2795,6 +2930,7 @@ def _build_runner_with_client(
     runner = DynamicToolRunner(
         client=client, tools_dir=tools_dir, knowledge_db=knowledge_db,
         fast_model=fast_model, strong_model=strong_model,
+        cloud_advisor_client=cloud_advisor_client, cloud_advisor_model=cloud_advisor_model,
         validator_client=validator_client, validator_model=validator_model,
         cloud_failover_restart=cloud_failover_restart,
         # Self-learning: abstract hard-won repairs into transferable RAG rules so
