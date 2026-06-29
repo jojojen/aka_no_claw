@@ -38,8 +38,17 @@ SCHEMA_VERSION = 1
 # A promoted tool that fails this many times in a row is demoted (#52 §6).
 DEMOTE_CONSECUTIVE_FAILURES = 3
 
+# Cautious re-promotion (Phase 3): a tool that has *ever* failed must earn back
+# trust with this many consecutive clean reuses before it returns to ``promoted``.
+# A clean first-timer (no recorded failure) still promotes after a single reuse,
+# so criterion C is preserved for the common case; only previously-broken tools
+# pay the recovery tax. This guards against a flaky tool oscillating
+# demoted→promoted→demoted on every other call.
+PROMOTE_CLEAN_REUSES_AFTER_FAILURE = 2
+
 STATUS_CANDIDATE = "candidate"
 STATUS_PROMOTED = "promoted"
+STATUS_RECOVERING = "recovering"
 STATUS_DEMOTED = "demoted"
 STATUS_BLOCKED = "blocked"
 STATUS_INELIGIBLE = "ineligible"
@@ -91,6 +100,10 @@ class ToolState:
     reuse_success_count: int = 0
     failure_count: int = 0
     consecutive_failures: int = 0
+    # Consecutive clean reuses since the last failure; drives cautious
+    # re-promotion (Phase 3). Reset to 0 on any failure, incremented on each
+    # successful reuse. Only meaningful once failure_count > 0.
+    clean_streak: int = 0
     last_success_at: str | None = None
     last_failure_at: str | None = None
     last_failure_reason: str | None = None
@@ -118,6 +131,7 @@ class ToolState:
             consecutive_failures=_coerce_nonneg_int(
                 data.get("consecutive_failures"), 0
             ),
+            clean_streak=_coerce_nonneg_int(data.get("clean_streak"), 0),
             last_success_at=_coerce_opt_str(data.get("last_success_at")),
             last_failure_at=_coerce_opt_str(data.get("last_failure_at")),
             last_failure_reason=_coerce_opt_str(data.get("last_failure_reason")),
@@ -299,10 +313,27 @@ class GeneratedToolCatalog:
             else (st.reuse_success_count >= 1 or st.manual_approved)
         )
         if eligible_to_promote and st.consecutive_failures == 0:
+            # Cautious recovery (Phase 3): a tool with a failure in its history
+            # must rebuild a clean streak before it returns to promoted, unless
+            # an operator has manually vouched for it. A clean first-timer skips
+            # this entirely. RECOVERING is still a reusable tier — it just isn't
+            # advertised as a trusted known tool yet.
+            if (
+                st.failure_count > 0
+                and not st.manual_approved
+                and st.clean_streak < PROMOTE_CLEAN_REUSES_AFTER_FAILURE
+            ):
+                return STATUS_RECOVERING, (
+                    f"rebuilding trust after failure: "
+                    f"{st.clean_streak}/{PROMOTE_CLEAN_REUSES_AFTER_FAILURE} "
+                    f"clean reuses"
+                )
             reasons = []
             reasons.append("validation_pass")
             if st.reuse_success_count >= 1:
                 reasons.append(f"successful_reuse×{st.reuse_success_count}")
+            if st.failure_count > 0:
+                reasons.append("recovered")
             if st.manual_approved:
                 reasons.append("manual_approval")
             return STATUS_PROMOTED, " + ".join(reasons)
@@ -352,11 +383,13 @@ class GeneratedToolCatalog:
 
     def reusable(self) -> list[CatalogEntry]:
         """Tools the system may consider for reuse evaluation: candidates +
-        promoted (not demoted/blocked/ineligible)."""
+        promoted + recovering (not demoted/blocked/ineligible). A recovering
+        tool is still offered for reuse — that is how it earns its clean streak
+        back — it is simply not yet advertised as a trusted known tool."""
         return [
             e
             for e in self.entries()
-            if e.status in (STATUS_CANDIDATE, STATUS_PROMOTED)
+            if e.status in (STATUS_CANDIDATE, STATUS_PROMOTED, STATUS_RECOVERING)
         ]
 
     def reuse_suppressed(self) -> set[str]:
@@ -402,6 +435,7 @@ class GeneratedToolCatalog:
         def fn(st: ToolState) -> None:
             st.reuse_success_count += 1
             st.consecutive_failures = 0
+            st.clean_streak += 1
             st.last_success_at = _utc_now_iso()
 
         return self._mutate(slug, fn)
@@ -410,6 +444,7 @@ class GeneratedToolCatalog:
         def fn(st: ToolState) -> None:
             st.failure_count += 1
             st.consecutive_failures += 1
+            st.clean_streak = 0
             st.last_failure_at = _utc_now_iso()
             st.last_failure_reason = reason
 

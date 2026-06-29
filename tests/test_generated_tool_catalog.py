@@ -17,6 +17,7 @@ from openclaw_adapter.generated_tool_catalog import (
     STATUS_DEMOTED,
     STATUS_INELIGIBLE,
     STATUS_PROMOTED,
+    STATUS_RECOVERING,
 )
 
 
@@ -140,6 +141,9 @@ def test_promoted_tool_demotes_after_threshold_failures(tmp_path, catalog):
 
 
 def test_success_resets_consecutive_failures(tmp_path, catalog):
+    # A success clears the consecutive-failure counter, but a tool with prior
+    # failures does NOT jump straight back to promoted (Phase 3 cautious
+    # recovery): one clean reuse leaves it RECOVERING, still reusable.
     _write_manifest(tmp_path, [_weather_entry()])
     catalog.record_failure("tool_ca00010a")
     catalog.record_failure("tool_ca00010a")
@@ -147,14 +151,61 @@ def test_success_resets_consecutive_failures(tmp_path, catalog):
     e = catalog.get("tool_ca00010a")
     assert e.metrics["consecutive_failures"] == 0
     assert e.metrics["failure_count"] == 2
-    assert e.status == STATUS_PROMOTED
+    assert e.metrics["clean_streak"] == 1
+    assert e.status == STATUS_RECOVERING
 
 
-def test_demoted_then_recovers_to_promoted_after_success(tmp_path, catalog):
+def test_demoted_then_recovers_cautiously_over_two_clean_reuses(tmp_path, catalog):
+    # A demoted tool earns trust back gradually: first clean reuse → recovering
+    # (still reusable so it can keep earning), second clean reuse → promoted.
     _write_manifest(tmp_path, [_weather_entry()])
     for _ in range(3):
         catalog.record_failure("tool_ca00010a")
     assert catalog.get("tool_ca00010a").status == STATUS_DEMOTED
+
+    catalog.record_reuse_success("tool_ca00010a")
+    e1 = catalog.get("tool_ca00010a")
+    assert e1.status == STATUS_RECOVERING
+    assert "1/2" in e1.promotion_reason
+    # a recovering tool stays in the reuse pool so it can keep earning trust
+    assert "tool_ca00010a" in [r.slug for r in catalog.reusable()]
+    assert "tool_ca00010a" not in catalog.reuse_suppressed()
+
+    catalog.record_reuse_success("tool_ca00010a")
+    e2 = catalog.get("tool_ca00010a")
+    assert e2.status == STATUS_PROMOTED
+    assert "recovered" in e2.promotion_reason
+
+
+def test_recovery_resets_if_it_fails_again(tmp_path, catalog):
+    # A flaky tool that fails mid-recovery loses its clean streak and must start
+    # the recovery climb over — this is the oscillation guard Phase 3 adds.
+    _write_manifest(tmp_path, [_weather_entry()])
+    for _ in range(3):
+        catalog.record_failure("tool_ca00010a")
+    catalog.record_reuse_success("tool_ca00010a")  # clean_streak 1, recovering
+    catalog.record_failure("tool_ca00010a")        # streak reset to 0
+    e = catalog.get("tool_ca00010a")
+    assert e.metrics["clean_streak"] == 0
+    catalog.record_reuse_success("tool_ca00010a")  # back to 1, still recovering
+    assert catalog.get("tool_ca00010a").status == STATUS_RECOVERING
+
+
+def test_manual_approval_skips_recovery_tax(tmp_path, catalog):
+    # An operator vouching for a tool overrides cautious recovery: one clean
+    # reuse after approval promotes immediately even with prior failures.
+    _write_manifest(tmp_path, [_weather_entry()])
+    catalog.record_failure("tool_ca00010a")
+    catalog.record_failure("tool_ca00010a")
+    catalog.approve("tool_ca00010a")
+    catalog.record_reuse_success("tool_ca00010a")
+    assert catalog.get("tool_ca00010a").status == STATUS_PROMOTED
+
+
+def test_clean_first_timer_still_promotes_in_one_reuse(tmp_path, catalog):
+    # Criterion C preserved: a tool that has NEVER failed promotes after a
+    # single reuse — the recovery tax only applies to previously-broken tools.
+    _write_manifest(tmp_path, [_weather_entry()])
     catalog.record_reuse_success("tool_ca00010a")
     assert catalog.get("tool_ca00010a").status == STATUS_PROMOTED
 
