@@ -49,6 +49,35 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def _coerce_nonneg_int(value, default: int) -> int:
+    """Coerce a sidecar value to a non-negative int, clamping anything invalid
+    to ``default``. ``catalog.json`` is untrusted input (#52 §H): a tampered or
+    corrupted value like ``"999"`` or ``None`` must never reach an int/str ``>=``
+    comparison in ``_classify`` (that would raise TypeError and brick every
+    catalog read — a denial of service)."""
+    if isinstance(value, bool):  # bool is an int subclass; reject as a count
+        return default
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        return default
+    return out if out >= 0 else default
+
+
+def _coerce_bool(value, default: bool = False) -> bool:
+    """Strict boolean coercion: only a real JSON bool is honored. A string like
+    ``"true"`` is treated as malformed and falls back to ``default`` rather than
+    being silently truthy."""
+    return value if isinstance(value, bool) else default
+
+
+def _coerce_opt_str(value) -> str | None:
+    """Coerce to a string or ``None``; never let a non-string type through."""
+    if value is None:
+        return None
+    return value if isinstance(value, str) else str(value)
+
+
 @dataclass
 class ToolState:
     """Mutable lifecycle metrics for one generated tool, keyed by slug.
@@ -72,9 +101,33 @@ class ToolState:
 
     @classmethod
     def from_dict(cls, slug: str, data: dict) -> "ToolState":
-        known = {f for f in cls.__dataclass_fields__ if f != "slug"}
-        kwargs = {k: v for k, v in data.items() if k in known}
-        return cls(slug=slug, **kwargs)
+        """Build a state from an *untrusted* sidecar dict, coercing every field
+        to its expected type and clamping malformed values to safe defaults so a
+        corrupted/tampered ``catalog.json`` can never crash a catalog read."""
+        if not isinstance(data, dict):
+            return cls(slug=slug)
+        return cls(
+            slug=slug,
+            generation_success_count=_coerce_nonneg_int(
+                data.get("generation_success_count"), 1
+            ),
+            reuse_success_count=_coerce_nonneg_int(
+                data.get("reuse_success_count"), 0
+            ),
+            failure_count=_coerce_nonneg_int(data.get("failure_count"), 0),
+            consecutive_failures=_coerce_nonneg_int(
+                data.get("consecutive_failures"), 0
+            ),
+            last_success_at=_coerce_opt_str(data.get("last_success_at")),
+            last_failure_at=_coerce_opt_str(data.get("last_failure_at")),
+            last_failure_reason=_coerce_opt_str(data.get("last_failure_reason")),
+            manual_approved=_coerce_bool(data.get("manual_approved")),
+            blocked=_coerce_bool(data.get("blocked")),
+            blocked_reason=_coerce_opt_str(data.get("blocked_reason")),
+            schema_version=_coerce_nonneg_int(
+                data.get("schema_version"), SCHEMA_VERSION
+            ),
+        )
 
     def to_dict(self) -> dict:
         d = self.__dict__.copy()
@@ -109,9 +162,11 @@ class CatalogEntry:
     def planner_view(self) -> dict:
         """Compact schema a planner/Chat layer can retrieve (#52 §3 surface).
 
-        Deliberately omits raw metrics and never exposes an executable path the
-        model could choose directly — execution always goes back through the
-        DynamicToolRunner reuse path keyed by slug."""
+        Omits raw metrics. ``source`` is included for provenance only (matching
+        the issue's example surface); it is NOT an execution handle. Execution
+        always routes through the DynamicToolRunner reuse path keyed by ``slug``,
+        so a planner must never select or run an arbitrary ``source`` path taken
+        from model output (#52 §H)."""
         return {
             "name": self.name,
             "tool_type": self.tool_type,
@@ -303,6 +358,20 @@ class GeneratedToolCatalog:
             for e in self.entries()
             if e.status in (STATUS_CANDIDATE, STATUS_PROMOTED)
         ]
+
+    def reuse_suppressed(self) -> set[str]:
+        """Slugs the in-``/new`` reuse path must skip: demoted (repeated reuse
+        failures) or manually blocked (safety). Read straight from the sidecar
+        so a tool with no recorded history is never suppressed.
+
+        Dependency/path classification governs *planner* exposure (Phase 4), not
+        in-``/new`` reuse — the existing generated-tool venv already installs
+        declared requires — so it is intentionally excluded here."""
+        out: set[str] = set()
+        for slug, st in self._load_states().items():
+            if st.blocked or st.consecutive_failures >= self.demote_threshold:
+                out.add(slug)
+        return out
 
     # ---- metric mutations --------------------------------------------------
 

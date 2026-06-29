@@ -220,6 +220,102 @@ def test_mutating_unknown_slug_returns_none(tmp_path, catalog):
         "does_not_exist" not in json.loads((tmp_path / "catalog.json").read_text())
 
 
+# Phase 1.1 — malformed sidecar hardening (review blocker) -----------------------
+
+def _write_sidecar(tmp_path, payload):
+    (tmp_path / "catalog.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def test_string_numbers_in_sidecar_do_not_crash_classification(tmp_path, catalog):
+    # A tampered/corrupted sidecar with string counts must not raise TypeError
+    # during the int >= int comparisons in _classify (catalog-read DoS).
+    _write_manifest(tmp_path, [_weather_entry()])
+    _write_sidecar(tmp_path, {"tool_ca00010a": {
+        "reuse_success_count": "999",
+        "consecutive_failures": "0",
+    }})
+    e = catalog.get("tool_ca00010a")  # must not raise
+    assert e.metrics["reuse_success_count"] == 999
+    assert e.metrics["consecutive_failures"] == 0
+    assert e.status == STATUS_PROMOTED
+
+
+def test_non_numeric_garbage_clamps_to_safe_defaults(tmp_path, catalog):
+    _write_manifest(tmp_path, [_weather_entry()])
+    _write_sidecar(tmp_path, {"tool_ca00010a": {
+        "reuse_success_count": "not-a-number",
+        "consecutive_failures": None,
+        "failure_count": [1, 2, 3],
+        "generation_success_count": {},
+    }})
+    e = catalog.get("tool_ca00010a")
+    assert e.metrics["reuse_success_count"] == 0
+    assert e.metrics["consecutive_failures"] == 0
+    assert e.metrics["failure_count"] == 0
+    assert e.metrics["generation_success_count"] == 1  # default
+    assert e.status == STATUS_CANDIDATE
+
+
+def test_negative_counts_clamp_to_default(tmp_path, catalog):
+    _write_manifest(tmp_path, [_weather_entry()])
+    _write_sidecar(tmp_path, {"tool_ca00010a": {"consecutive_failures": -5}})
+    e = catalog.get("tool_ca00010a")
+    assert e.metrics["consecutive_failures"] == 0
+    assert e.status == STATUS_CANDIDATE
+
+
+def test_non_bool_blocked_flag_is_not_truthy(tmp_path, catalog):
+    # A string "true" must NOT be honored as a real boolean (strict coercion).
+    _write_manifest(tmp_path, [_weather_entry()])
+    _write_sidecar(tmp_path, {"tool_ca00010a": {
+        "manual_approved": "true",
+        "blocked": 1,
+    }})
+    e = catalog.get("tool_ca00010a")
+    assert e.metrics["manual_approved"] is False
+    assert e.metrics["blocked"] is False
+    # neither forged flag promoted or blocked it
+    assert e.status == STATUS_CANDIDATE
+
+
+def test_real_json_bool_blocked_is_honored(tmp_path, catalog):
+    _write_manifest(tmp_path, [_weather_entry()])
+    _write_sidecar(tmp_path, {"tool_ca00010a": {"blocked": True,
+                                                "blocked_reason": "safety"}})
+    assert catalog.get("tool_ca00010a").status == STATUS_BLOCKED
+
+
+def test_non_string_reason_is_coerced(tmp_path, catalog):
+    _write_manifest(tmp_path, [_weather_entry()])
+    _write_sidecar(tmp_path, {"tool_ca00010a": {
+        "consecutive_failures": 3,
+        "last_failure_reason": 12345,
+    }})
+    e = catalog.get("tool_ca00010a")
+    assert e.metrics["last_failure_reason"] == "12345"
+    assert e.status == STATUS_DEMOTED
+
+
+def test_non_dict_state_row_is_ignored(tmp_path, catalog):
+    _write_manifest(tmp_path, [_weather_entry()])
+    _write_sidecar(tmp_path, {"tool_ca00010a": "garbage"})
+    assert catalog.get("tool_ca00010a").status == STATUS_CANDIDATE
+
+
+def test_corrupt_sidecar_json_is_ignored(tmp_path, catalog):
+    _write_manifest(tmp_path, [_weather_entry()])
+    (tmp_path / "catalog.json").write_text("{not valid json", encoding="utf-8")
+    assert catalog.get("tool_ca00010a").status == STATUS_CANDIDATE
+
+
+def test_reuse_suppressed_survives_malformed_sidecar(tmp_path, catalog):
+    _write_manifest(tmp_path, [_weather_entry()])
+    _write_sidecar(tmp_path, {"tool_ca00010a": {"consecutive_failures": "3"}})
+    assert catalog.reuse_suppressed() == {"tool_ca00010a"}
+
+
 def test_reusable_excludes_blocked_and_ineligible(tmp_path, catalog):
     good = _weather_entry(slug="good")
     static = _weather_entry(slug="static")
