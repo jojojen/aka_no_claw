@@ -663,6 +663,154 @@ def _clear_session(state_path: str) -> None:
         logger.warning("music: could not clear playbest session for %s", state_path)
 
 
+# --- queue navigation (#60): previous / next within a continuous queue -------
+# The continuous loop is forward-only; #60's "lighter" navigation layers a tiny
+# two-slot history (prev/current) and a one-shot "forced next" file on top of it.
+# `next` simply ends the current track so the loop auto-advances; `previous`
+# writes the prior track as the forced next so the loop replays it, after which
+# forward playback resumes by reshuffle. Both files live next to the player state
+# so the SAME signal crosses the Telegram-poller / command-bridge process split,
+# exactly like the session token.
+_NO_QUEUE_MSG = (
+    "目前沒有播放清單。\n請先使用：\n- /music playbest\n- 全部隨機播放"
+)
+
+
+def _nav_path(state_path: str) -> str:
+    return str(Path(state_path).with_name("music_playback_nav.json"))
+
+
+def _read_nav(state_path: str) -> dict:
+    data = _read_json(_nav_path(state_path))
+    return data if isinstance(data, dict) else {}
+
+
+def _shift_nav(state_path: str, entry: dict) -> None:
+    """Record ``entry`` as the current track, demoting the old current to prev."""
+    nav = _read_nav(state_path)
+    _write_json(
+        _nav_path(state_path),
+        {"prev": nav.get("current"), "current": {"name": entry.get("name"), "path": entry.get("path")}},
+    )
+
+
+def _clear_nav(state_path: str) -> None:
+    try:
+        Path(_nav_path(state_path)).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.warning("music: could not clear playback nav for %s", state_path)
+
+
+def _forced_path(state_path: str) -> str:
+    return str(Path(state_path).with_name("music_playback_forced.json"))
+
+
+def _read_forced(state_path: str) -> dict | None:
+    data = _read_json(_forced_path(state_path))
+    if isinstance(data, dict) and data.get("path"):
+        return data
+    return None
+
+
+def _write_forced(state_path: str, entry: dict) -> None:
+    _write_json(
+        _forced_path(state_path),
+        {"name": entry.get("name"), "path": entry.get("path")},
+    )
+
+
+def _clear_forced(state_path: str) -> None:
+    try:
+        Path(_forced_path(state_path)).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.warning("music: could not clear forced track for %s", state_path)
+
+
+def _has_active_queue(state_path: str) -> bool:
+    """A navigable queue exists only while a continuous session (playbest/random)
+    is running — the shared session token is its marker."""
+    return _read_session_token(state_path) is not None
+
+
+def _set_paused(state_path: str, paused: bool) -> None:
+    state = _read_json(state_path)
+    if not isinstance(state, dict):
+        return
+    state["paused"] = paused
+    _write_json(state_path, state)
+
+
+def _signal_pid(pid: int, sig: int) -> bool:
+    """Send ``sig`` to ``pid``; return False if the process is already gone.
+    Module-level so tests can stub it alongside the other process primitives."""
+    try:
+        os.kill(pid, sig)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def _continue_if_paused(state_path: str, running: dict) -> None:
+    """SIGCONT a paused track before terminating it, so a queued SIGTERM is not
+    held until the process is resumed (a stopped process never sees SIGTERM)."""
+    if not running.get("paused"):
+        return
+    try:
+        _signal_pid(int(running["pid"]), signal.SIGCONT)
+    except (ValueError, KeyError):
+        pass
+
+
+def _pause(state_path: str) -> str:
+    running = _current_running(state_path)
+    if running is None:
+        return "目前沒有播放中的音樂。"
+    if not _signal_pid(int(running["pid"]), signal.SIGSTOP):
+        return "目前沒有播放中的音樂。"
+    _set_paused(state_path, True)
+    return "⏸ 已暫停播放。"
+
+
+def _resume(state_path: str) -> str:
+    running = _current_running(state_path)
+    if running is None:
+        return "目前沒有可繼續播放的音樂。"
+    if not _signal_pid(int(running["pid"]), signal.SIGCONT):
+        return "目前沒有可繼續播放的音樂。"
+    _set_paused(state_path, False)
+    return "▶️ 已繼續播放。"
+
+
+def _next(state_path: str) -> str:
+    if not _has_active_queue(state_path):
+        return _NO_QUEUE_MSG
+    running = _current_running(state_path)
+    if running is None:
+        # Token present but nothing playing: the loop will advance on its own.
+        return "⏭ 已跳到下一首。"
+    _continue_if_paused(state_path, running)
+    _terminate(int(running["pid"]))  # loop auto-advances to the next track
+    return "⏭ 已跳到下一首。"
+
+
+def _previous(state_path: str) -> str:
+    if not _has_active_queue(state_path):
+        return _NO_QUEUE_MSG
+    prev = _read_nav(state_path).get("prev")
+    if not prev or not prev.get("path"):
+        return "已經是第一首了，沒有上一首。"
+    _write_forced(state_path, prev)  # loop replays this instead of reshuffling
+    running = _current_running(state_path)
+    if running is not None:
+        _continue_if_paused(state_path, running)
+        _terminate(int(running["pid"]))
+    return f"⏮ 回到上一首：\n{prev.get('name', '')}"
+
+
 def _terminate_running(state_path: str) -> None:
     """Stop and clear the currently recorded OpenClaw track, if any."""
     running = _current_running(state_path)
@@ -706,6 +854,8 @@ def _stop(state_path: str) -> str:
     # the next song the moment we kill the current track.
     had_session = _read_session_token(state_path) is not None
     _clear_session(state_path)
+    _clear_nav(state_path)  # #60: a stop ends the navigable queue
+    _clear_forced(state_path)
     _clear_failure(state_path)  # a manual stop resets any continuous-failure record
     # A manual stop also cancels any pending voice-interruption resume: if the
     # user deliberately stopped during/after a /saynow, music must NOT come back.
@@ -730,6 +880,8 @@ def _play(entry: dict, state_path: str) -> str:
     # for the player (and never leaves two OpenClaw songs playing at once). Clear
     # the shared session too, so a continuous loop in another process also stops.
     _clear_session(state_path)
+    _clear_nav(state_path)  # #60: a single play is queue-less; drop any queue nav
+    _clear_forced(state_path)
     _PLAYBEST.stop()
     try:
         _start_song(entry, state_path)
@@ -801,6 +953,10 @@ class PlaybestController:
         # deletes it — either way every running loop sees the change and halts.
         token = uuid.uuid4().hex
         _write_session(state_path, token)
+        # #60: a fresh continuous session starts with an empty navigation history
+        # and no leftover forced track from a prior session.
+        _clear_nav(state_path)
+        _clear_forced(state_path)
         with self._lock:
             self._active = True
             thread = threading.Thread(
@@ -840,7 +996,18 @@ class PlaybestController:
             return self.is_active() and (token is None or _read_session_token(state_path) == token)
 
         while _live():
-            entry = scheduler.next()
+            # #60: a `/music previous` writes the prior track as a one-shot forced
+            # next; consume it before the scheduler so the loop replays it instead
+            # of reshuffling forward. A forced replay does not shift the nav slots,
+            # so navigation stays single-level (replay last, then resume forward).
+            forced = _read_forced(state_path)
+            if forced is not None:
+                _clear_forced(state_path)
+                entry: dict | None = forced
+                is_forced = True
+            else:
+                entry = scheduler.next()
+                is_forced = False
             if entry is None:  # favorites empty / all missing → stop cleanly
                 break
             # Defence in depth: re-validate immediately before spawning so an
@@ -883,6 +1050,8 @@ class PlaybestController:
                     break
                 continue
             consecutive_failures = 0
+            if not is_forced:
+                _shift_nav(state_path, entry)
             if on_play is not None:
                 try:
                     on_play(entry)
@@ -1138,6 +1307,14 @@ def build_music_handler(
         low = arg.lower()
         if low == "stop":
             return _stop(state_path)
+        if low == "pause":
+            return _pause(state_path)
+        if low == "resume":
+            return _resume(state_path)
+        if low == "next":
+            return _next(state_path)
+        if low in ("previous", "prev"):
+            return _previous(state_path)
         if low == "now":
             return _format_health_text(playback_health(settings))
         if low == "playbest":
@@ -1232,6 +1409,8 @@ def _menu_text() -> str:
     return (
         "🎵 音樂控制\n"
         "也可直接輸入：/music random、/music <歌曲名>、/music stop、/music playbest\n"
+        "播放控制：/music previous、/music pause、/music resume、/music next\n"
+        "（上一首／下一首僅適用於 /music playbest 或全部隨機播放）\n"
         "音量：/musicmute、/musiclouder、/musiclower"
     )
 

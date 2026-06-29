@@ -848,3 +848,165 @@ def test_musicdiag_flags_missing_tools(settings, proc_table, monkeypatch):
     reply = mc.build_musicdiag_handler(settings)("", "chat-1")
     assert "找不到" in reply  # afplay unavailable
     assert "不可用" in reply  # output device unavailable
+
+
+# --- #60 queue navigation: pause / resume / next / previous ----------------
+import signal as _signal
+
+
+@pytest.fixture
+def signal_log(monkeypatch):
+    """Record SIGSTOP/SIGCONT sent to the player without touching real pids."""
+    calls = []
+
+    def _fake(pid, sig):
+        calls.append((pid, sig))
+        return True
+
+    monkeypatch.setattr(mc, "_signal_pid", _fake)
+    return calls
+
+
+def test_music_pause_and_resume(settings, proc_table, signal_log):
+    state_path = settings.openclaw_music_player_state_path
+    pid = mc._start_song({"name": "A", "path": "/m/A.flac"}, state_path, mode="single")
+    handler = mc.build_music_handler(settings)
+
+    assert handler("pause", "chat-1") == "⏸ 已暫停播放。"
+    assert (pid, _signal.SIGSTOP) in signal_log
+    assert mc._read_json(state_path)["paused"] is True
+
+    assert handler("resume", "chat-1") == "▶️ 已繼續播放。"
+    assert (pid, _signal.SIGCONT) in signal_log
+    assert mc._read_json(state_path)["paused"] is False
+
+
+def test_music_pause_when_nothing_playing(settings, proc_table, signal_log):
+    reply = mc.build_music_handler(settings)("pause", "chat-1")
+    assert reply == "目前沒有播放中的音樂。"
+    assert signal_log == []
+
+
+def test_music_resume_when_nothing_playing(settings, proc_table, signal_log):
+    reply = mc.build_music_handler(settings)("resume", "chat-1")
+    assert reply == "目前沒有可繼續播放的音樂。"
+    assert signal_log == []
+
+
+def test_music_next_without_queue(settings, proc_table):
+    # A single play creates no navigable queue → next must refuse with guidance.
+    handler = mc.build_music_handler(settings)
+    handler("間人間", "chat-1")
+    reply = handler("next", "chat-1")
+    assert reply == mc._NO_QUEUE_MSG
+    assert "playbest" in reply
+
+
+def test_music_previous_without_queue(settings, proc_table):
+    handler = mc.build_music_handler(settings)
+    handler("間人間", "chat-1")
+    reply = handler("previous", "chat-1")
+    assert reply == mc._NO_QUEUE_MSG
+
+
+def test_music_prev_alias_routes_to_previous(settings, proc_table):
+    reply = mc.build_music_handler(settings)("prev", "chat-1")
+    assert reply == mc._NO_QUEUE_MSG  # no active queue → same refusal as "previous"
+
+
+def test_music_next_skips_current_track(settings, proc_table, signal_log):
+    state_path = settings.openclaw_music_player_state_path
+    mc._write_session(state_path, "tok")  # an active continuous queue exists
+    pid = mc._start_song({"name": "Cur", "path": "/m/Cur.flac"}, state_path, mode="random")
+    reply = mc.build_music_handler(settings)("next", "chat-1")
+    assert reply == "⏭ 已跳到下一首。"
+    assert pid in proc_table["killed"]  # current track ended so the loop advances
+
+
+def test_music_next_with_queue_but_nothing_playing(settings, proc_table):
+    state_path = settings.openclaw_music_player_state_path
+    mc._write_session(state_path, "tok")
+    reply = mc.build_music_handler(settings)("next", "chat-1")
+    assert reply == "⏭ 已跳到下一首。"
+    assert proc_table["killed"] == []  # nothing to kill; loop advances on its own
+
+
+def test_music_previous_forces_prev_track(settings, proc_table, signal_log):
+    state_path = settings.openclaw_music_player_state_path
+    mc._write_session(state_path, "tok")
+    mc._write_json(
+        mc._nav_path(state_path),
+        {"prev": {"name": "Old", "path": "/m/Old.flac"}, "current": {"name": "Cur", "path": "/m/Cur.flac"}},
+    )
+    pid = mc._start_song({"name": "Cur", "path": "/m/Cur.flac"}, state_path, mode="random")
+    reply = mc.build_music_handler(settings)("previous", "chat-1")
+    assert "回到上一首" in reply and "Old" in reply
+    forced = mc._read_forced(state_path)
+    assert forced is not None and forced["path"] == "/m/Old.flac"
+    assert pid in proc_table["killed"]  # current track ended so the loop replays Old
+
+
+def test_music_previous_at_first_track(settings, proc_table):
+    state_path = settings.openclaw_music_player_state_path
+    mc._write_session(state_path, "tok")  # queue active but no prior track recorded
+    reply = mc.build_music_handler(settings)("previous", "chat-1")
+    assert reply == "已經是第一首了，沒有上一首。"
+    assert mc._read_forced(state_path) is None
+
+
+def test_shift_nav_demotes_current_to_prev(settings):
+    state_path = settings.openclaw_music_player_state_path
+    mc._shift_nav(state_path, {"name": "A", "path": "/m/A.flac"})
+    nav = mc._read_nav(state_path)
+    assert nav["prev"] is None and nav["current"] == {"name": "A", "path": "/m/A.flac"}
+    mc._shift_nav(state_path, {"name": "B", "path": "/m/B.flac"})
+    nav = mc._read_nav(state_path)
+    assert nav["prev"] == {"name": "A", "path": "/m/A.flac"}
+    assert nav["current"] == {"name": "B", "path": "/m/B.flac"}
+
+
+def test_stop_clears_nav_and_forced(settings, proc_table):
+    state_path = settings.openclaw_music_player_state_path
+    mc._write_json(mc._nav_path(state_path), {"prev": None, "current": {"name": "A", "path": "/m/A.flac"}})
+    mc._write_forced(state_path, {"name": "Old", "path": "/m/Old.flac"})
+    mc.build_music_handler(settings)("stop", "chat-1")
+    assert not Path(mc._nav_path(state_path)).exists()
+    assert not Path(mc._forced_path(state_path)).exists()
+
+
+def test_single_play_clears_nav_and_forced(settings, proc_table):
+    state_path = settings.openclaw_music_player_state_path
+    mc._write_json(mc._nav_path(state_path), {"prev": None, "current": {"name": "A", "path": "/m/A.flac"}})
+    mc._write_forced(state_path, {"name": "Old", "path": "/m/Old.flac"})
+    mc.build_music_handler(settings)("間人間", "chat-1")  # single play is queue-less
+    assert not Path(mc._nav_path(state_path)).exists()
+    assert not Path(mc._forced_path(state_path)).exists()
+
+
+def test_continuous_play_consumes_forced_previous(settings, music_dir, proc_table, monkeypatch):
+    # A /music previous writes a forced track; the running playbest loop must
+    # replay exactly that track next (instead of reshuffling) and then resume.
+    monkeypatch.setattr(mc, "_PLAYBEST_POLL_SECONDS", 0.01)
+    _store, fav_paths = _write_favorites(settings, music_dir)
+    state_path = settings.openclaw_music_player_state_path
+    # Force a track that is NOT a favorite, so a match can only come from the
+    # forced replay — never from the scheduler picking the same favorite.
+    all_flacs = [str(p) for p in sorted(music_dir.rglob("*.flac")) if not p.name.startswith("._")]
+    forced_path = next(p for p in all_flacs if p not in fav_paths)
+    handler = mc.build_music_handler(settings)
+    handler("playbest", "chat-1")
+    import time as _t
+    for _ in range(200):
+        if proc_table["spawned"]:
+            break
+        _t.sleep(0.01)
+    assert proc_table["spawned"]
+    mc._write_forced(state_path, {"name": "Forced", "path": forced_path})
+    proc_table["alive"].discard(proc_table["spawned"][-1][0])  # current song ends
+    for _ in range(200):
+        if any(p == forced_path for _, p in proc_table["spawned"]):
+            break
+        _t.sleep(0.01)
+    assert any(p == forced_path for _, p in proc_table["spawned"])  # forced track replayed
+    assert mc._read_forced(state_path) is None  # one-shot: consumed
+    handler("stop", "chat-1")
