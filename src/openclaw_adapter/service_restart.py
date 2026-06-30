@@ -75,6 +75,8 @@ LOG_DIR="$CLAW/logs"
 UID_NUM="$(id -u)"
 TMUX_SOCKET="openclaw_codex"
 TMUX_BIN="$(command -v tmux || true)"
+BROADLINK_PREFLIGHT_ATTEMPTS="${{BROADLINK_PREFLIGHT_ATTEMPTS:-3}}"
+BROADLINK_PREFLIGHT_SLEEP_SECONDS="${{BROADLINK_PREFLIGHT_SLEEP_SECONDS:-2}}"
 
 mkdir -p "$LOG_DIR"
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] restartall requested source=$SOURCE pid=$$"
@@ -184,6 +186,33 @@ start_tmux_service() {{
   echo "[$(date '+%H:%M:%S')] tmux start $label socket=$TMUX_SOCKET session=$session"
   "$TMUX_BIN" -L "$TMUX_SOCKET" new-session -d -s "$session" \\
     "cd '$cwd' && $*"
+}}
+
+broadlink_preflight() {{
+  local attempts="$BROADLINK_PREFLIGHT_ATTEMPTS"
+  local sleep_seconds="$BROADLINK_PREFLIGHT_SLEEP_SECONDS"
+  local attempt rc
+  if [ ! -x "$CLAW/.venv/bin/python" ]; then
+    echo "[$(date '+%H:%M:%S')] broadlink preflight skipped: missing $CLAW/.venv/bin/python"
+    return 0
+  fi
+  for attempt in $(seq 1 "$attempts"); do
+    echo "[$(date '+%H:%M:%S')] broadlink preflight attempt=$attempt/$attempts"
+    (
+      cd "$CLAW" || exit 1
+      export PYTHONPATH=".:src"
+      exec "$CLAW/.venv/bin/python" -m openclaw_adapter.ir_worker discover
+    )
+    rc="$?"
+    if [ "$rc" -eq 0 ]; then
+      echo "[$(date '+%H:%M:%S')] broadlink preflight ok"
+      return 0
+    fi
+    echo "[$(date '+%H:%M:%S')] broadlink preflight retry rc=$rc"
+    sleep "$sleep_seconds"
+  done
+  echo "[$(date '+%H:%M:%S')] broadlink preflight failed after $attempts attempts; continuing startup"
+  return 0
 }}
 
 # Kill ORPHAN copies of a launchd-managed worker (aka_no_claw#40). `kickstart -k`
@@ -310,6 +339,7 @@ if [ -n "$TMUX_BIN" ]; then
   echo "[$(date '+%H:%M:%S')] reset dedicated tmux socket=$TMUX_SOCKET"
   "$TMUX_BIN" -L "$TMUX_SOCKET" kill-server 2>/dev/null || true
 fi
+broadlink_preflight
 
 # Genuinely non-launchd services: (re)start detached with nohup.
 start_service "reputation_snapshot" "$REPUTATION" "$LOG_DIR/reputation_snapshot.log" "$REPUTATION/.venv/bin/python" app.py

@@ -53,6 +53,8 @@ WEB_FRONTEND_PORT="${WEB_FRONTEND_PORT:-5173}"
 COMMAND_BRIDGE_HOST="${COMMAND_BRIDGE_HOST:-0.0.0.0}"
 COMMAND_BRIDGE_PORT="${COMMAND_BRIDGE_PORT:-8781}"
 TMUX_SOCKET="${TMUX_SOCKET:-openclaw_codex}"
+BROADLINK_PREFLIGHT_ATTEMPTS="${BROADLINK_PREFLIGHT_ATTEMPTS:-3}"
+BROADLINK_PREFLIGHT_SLEEP_SECONDS="${BROADLINK_PREFLIGHT_SLEEP_SECONDS:-2}"
 
 mkdir -p "${RUN_DIR}" "${LOG_DIR}"
 
@@ -1029,6 +1031,36 @@ stop_tmux_services() {
   fi
 }
 
+broadlink_preflight() {
+  local attempts="${BROADLINK_PREFLIGHT_ATTEMPTS}"
+  local sleep_seconds="${BROADLINK_PREFLIGHT_SLEEP_SECONDS}"
+  local attempt
+  local rc
+
+  if [[ ! -x "${AKA_VENV}/bin/python" ]]; then
+    log "Skipping BroadLink preflight because ${AKA_VENV}/bin/python is missing."
+    return
+  fi
+
+  for attempt in $(seq 1 "${attempts}"); do
+    log "BroadLink preflight attempt ${attempt}/${attempts}..."
+    (
+      cd "${AKA_DIR}"
+      export PYTHONPATH=".:src"
+      exec "${AKA_VENV}/bin/python" -m openclaw_adapter.ir_worker discover
+    )
+    rc="$?"
+    if [[ "${rc}" == "0" ]]; then
+      log "BroadLink preflight ok."
+      return
+    fi
+    log "BroadLink preflight retry after rc=${rc}."
+    sleep "${sleep_seconds}"
+  done
+
+  log "BroadLink preflight failed after ${attempts} attempts; continuing startup."
+}
+
 start_detached_shell_service() {
   local session="$1"
   local label="$2"
@@ -1326,6 +1358,7 @@ main() {
   start_aivis_engine
   start_reputation_server
   wait_for_reputation_server
+  broadlink_preflight
   start_openclaw_telegram
   start_sns_monitor_service
   start_price_monitor_service

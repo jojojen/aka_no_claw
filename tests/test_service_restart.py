@@ -87,6 +87,25 @@ def test_broadlink_sensitive_services_start_in_dedicated_tmux_socket() -> None:
     )
 
 
+def test_restart_script_runs_broadlink_preflight_before_tmux_services() -> None:
+    # BroadLink sometimes wedges across restarts while a fresh short-lived IR
+    # worker can still auth successfully. /restartall should run that fresh
+    # discover/auth probe before Telegram and bridge come back.
+    script = _build_restart_script(
+        workspace_dir=Path("/tmp/workspace"),
+        claw_dir=Path("/tmp/workspace/aka_no_claw"),
+        source="test",
+    )
+    preflight_call = script.rindex("\nbroadlink_preflight\n")
+
+    assert 'BROADLINK_PREFLIGHT_ATTEMPTS="${BROADLINK_PREFLIGHT_ATTEMPTS:-3}"' in script
+    assert 'broadlink_preflight() {' in script
+    assert '"$CLAW/.venv/bin/python" -m openclaw_adapter.ir_worker discover' in script
+    assert preflight_call > script.index('kill-server 2>/dev/null || true')
+    assert preflight_call < script.index('start_tmux_service "telegram"')
+    assert preflight_call < script.index('start_tmux_service "bridge"')
+
+
 def test_bridge_port_reclaimed_before_relaunch() -> None:
     # A `pgrep -f` pattern stop can miss the running bridge; if :8781 stays bound
     # the fresh bridge dies on EADDRINUSE and the web path keeps serving old code.
