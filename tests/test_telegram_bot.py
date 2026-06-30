@@ -368,6 +368,76 @@ def test_openclaw_registries_include_ir_command() -> None:
     assert "ir" in callback_handlers
 
 
+# ── home_action NL executor ───────────────────────────────────────────────────
+
+def test_home_action_plan_dispatches_ir_send() -> None:
+    from telegram_nl.natural_language import TelegramNaturalLanguageIntent as NLIntent
+
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+    )
+
+    calls: list[str] = []
+    processor._command_registry["/ir"] = RegisteredCommand(
+        lambda raw, cid: calls.append(raw) or "ir_ok"
+    )
+
+    intent = NLIntent(intent="home_action", home_target="客廳電燈", home_command="on")
+    plan = processor._build_app_natural_language_reply_plan(intent, chat_id="123")
+
+    assert plan is not None
+    plan._execute_unpacked()
+    assert calls == ["send 客廳電燈 on"]
+
+
+def test_home_action_plan_off_command() -> None:
+    from telegram_nl.natural_language import TelegramNaturalLanguageIntent as NLIntent
+
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+    )
+
+    calls: list[str] = []
+    processor._command_registry["/ir"] = RegisteredCommand(
+        lambda raw, cid: calls.append(raw) or "ir_ok"
+    )
+
+    intent = NLIntent(intent="home_action", home_target="臥室燈", home_command="off")
+    plan = processor._build_app_natural_language_reply_plan(intent, chat_id="123")
+
+    assert plan is not None
+    plan._execute_unpacked()
+    assert calls == ["send 臥室燈 off"]
+
+
+def test_home_action_plan_when_ir_not_registered() -> None:
+    from telegram_nl.natural_language import TelegramNaturalLanguageIntent as NLIntent
+
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+    )
+    # Do NOT register /ir — simulate disabled command
+    processor._command_registry.pop("/ir", None)
+
+    intent = NLIntent(intent="home_action", home_target="燈", home_command="on")
+    plan = processor._build_app_natural_language_reply_plan(intent, chat_id="123")
+
+    assert plan is not None
+    assert plan.reply == "/ir 指令尚未啟用。"
+
+
 def test_build_registries_passes_knowledge_db_path_to_research_handler(monkeypatch, tmp_path: Path) -> None:
     settings = AssistantSettings(
         openclaw_telegram_chat_id="123",

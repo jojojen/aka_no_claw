@@ -3,11 +3,10 @@ from __future__ import annotations
 import pytest
 from assistant_runtime.settings import AssistantSettings
 from openclaw_adapter.natural_language import (
-    _aka_fallback_route,
     _select_router_model,
     build_telegram_natural_language_router_from_settings,
 )
-from price_monitor_bot.natural_language import fallback_route_telegram_natural_language
+from telegram_nl.natural_language import fallback_route_telegram_natural_language
 
 
 # ── Router settings tests ─────────────────────────────────────────────────────
@@ -49,7 +48,7 @@ def test_natural_language_router_loads_tool_spec_from_file() -> None:
     assert "web_research" in router.tool_spec
 
 
-def test_natural_language_router_carries_aka_extra_intents() -> None:
+def test_natural_language_router_builds_from_settings() -> None:
     settings = AssistantSettings(
         openclaw_local_text_backend="ollama",
         openclaw_local_text_model="gemma3:4b",
@@ -59,72 +58,6 @@ def test_natural_language_router_carries_aka_extra_intents() -> None:
     router = build_telegram_natural_language_router_from_settings(settings)
 
     assert router is not None
-    assert "create_workflow" in router._extra_allowed_intents
-    assert "play_music" in router._extra_allowed_intents
-
-
-# ── _aka_fallback_route — create_workflow keywords ───────────────────────────
-
-def test_aka_fallback_routes_create_workflow_chinese() -> None:
-    result = _aka_fallback_route("建立 workflow：每天查天氣並念出來")
-
-    assert result is not None
-    assert result.intent == "create_workflow"
-    assert result.workflow_description is not None
-    assert "天氣" in result.workflow_description
-
-
-def test_aka_fallback_routes_create_workflow_english() -> None:
-    result = _aka_fallback_route("create a workflow that checks weather daily")
-
-    assert result is not None
-    assert result.intent == "create_workflow"
-
-
-def test_aka_fallback_routes_create_workflow_automation_phrasing() -> None:
-    result = _aka_fallback_route("幫我建立自動化流程：先說早安，再播音樂")
-
-    assert result is not None
-    assert result.intent == "create_workflow"
-
-
-# ── _aka_fallback_route — play_music keywords ────────────────────────────────
-
-def test_aka_fallback_routes_play_music_chinese() -> None:
-    result = _aka_fallback_route("放音樂")
-
-    assert result is not None
-    assert result.intent == "play_music"
-    assert result.music_query is None
-
-
-def test_aka_fallback_routes_play_music_best() -> None:
-    result = _aka_fallback_route("放我最愛的音樂")
-
-    assert result is not None
-    assert result.intent == "play_music"
-    assert result.music_query == "playbest"
-
-
-def test_aka_fallback_routes_play_music_random() -> None:
-    result = _aka_fallback_route("隨機放一首")
-
-    assert result is not None
-    assert result.intent == "play_music"
-    assert result.music_query == "random"
-
-
-def test_aka_fallback_routes_play_music_english() -> None:
-    result = _aka_fallback_route("play music")
-
-    assert result is not None
-    assert result.intent == "play_music"
-
-
-def test_aka_fallback_returns_none_for_unrelated_text() -> None:
-    result = _aka_fallback_route("幫我查 pokemon 卡價格")
-
-    assert result is None
 
 
 # ── /help — capability / usage questions ─────────────────────────────────────
@@ -601,7 +534,7 @@ def test_fallback_prefers_schedule_when_both_signals_present() -> None:
 # flow through the LLM router. These tests verify the JSON payload path.
 
 def test_normalize_intent_accepts_bulk_remove_filter_payload() -> None:
-    from price_monitor_bot.natural_language import _normalize_intent
+    from telegram_nl.natural_language import _normalize_intent
 
     payload = {
         "intent": "sns_bulk_remove_filter",
@@ -615,7 +548,7 @@ def test_normalize_intent_accepts_bulk_remove_filter_payload() -> None:
 
 
 def test_normalize_intent_accepts_bulk_update_schedule_payload() -> None:
-    from price_monitor_bot.natural_language import _normalize_intent
+    from telegram_nl.natural_language import _normalize_intent
 
     payload = {
         "intent": "sns_bulk_update_schedule",
@@ -641,7 +574,7 @@ def test_existing_bulk_add_filter_still_routes_with_explicit_plural() -> None:
 # ── _normalize_intent accepts sns_bulk_add_filter LLM payload ────────────────
 
 def test_normalize_intent_accepts_bulk_filter_payload() -> None:
-    from price_monitor_bot.natural_language import _normalize_intent
+    from telegram_nl.natural_language import _normalize_intent
 
     payload = {
         "intent": "sns_bulk_add_filter",
@@ -656,7 +589,7 @@ def test_normalize_intent_accepts_bulk_filter_payload() -> None:
 
 
 def test_normalize_intent_aliases_bulk_target_domain_chinese() -> None:
-    from price_monitor_bot.natural_language import _normalize_intent
+    from telegram_nl.natural_language import _normalize_intent
 
     payload = {
         "intent": "sns_bulk_add_filter",
@@ -731,7 +664,7 @@ def test_unfollow_still_routes_to_sns_delete() -> None:
 # ── _normalize_intent accepts sns_clear_filter LLM payload ───────────────────
 
 def test_normalize_intent_accepts_clear_filter_payload() -> None:
-    from price_monitor_bot.natural_language import _normalize_intent
+    from telegram_nl.natural_language import _normalize_intent
 
     payload = {"intent": "sns_clear_filter", "sns_handle": "ARS_Arsales"}
     result = _normalize_intent(payload)
@@ -800,7 +733,7 @@ def test_fallback_does_not_populate_schedule_without_hint_keyword() -> None:
 
 
 def test_normalize_intent_accepts_sns_schedule_minutes_payload() -> None:
-    from price_monitor_bot.natural_language import _normalize_intent
+    from telegram_nl.natural_language import _normalize_intent
 
     payload = {
         "intent": "sns_add_account",
@@ -815,7 +748,7 @@ def test_normalize_intent_accepts_sns_schedule_minutes_payload() -> None:
 
 
 def test_normalize_intent_rejects_out_of_range_schedule_in_payload() -> None:
-    from price_monitor_bot.natural_language import _normalize_intent
+    from telegram_nl.natural_language import _normalize_intent
 
     # 4 is below the 5-minute floor; 1500 is above the 1440 ceiling;
     # garbage strings and None should also normalize to None.

@@ -1,4 +1,6 @@
-# Install price_monitor_bot first (provides market_monitor, tcg_tracker, price_monitor_bot packages).
+# Install telegram_nl first (provides the NL router core).
+-e ../telegram_nl
+# Install price_monitor_bot (provides market_monitor, tcg_tracker, price_monitor_bot packages).
 -e ../price_monitor_bot
 # Install sns_monitor_bot (provides sns_monitor package).
 -e ../sns_monitor_bot

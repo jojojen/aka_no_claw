@@ -520,7 +520,7 @@ class TestTelegramSnsCommands:
 
     def test_telegram_natural_language_sns_filter_update_falls_back_when_router_returns_unknown(self):
         """Natural-language SNS filter updates should still work when the LLM router returns unknown."""
-        from price_monitor_bot.natural_language import TelegramNaturalLanguageIntent
+        from telegram_nl.natural_language import TelegramNaturalLanguageIntent
         from sns_monitor.models import AccountWatch
         from sns_monitor.storage import SnsDatabase
 

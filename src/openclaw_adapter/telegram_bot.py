@@ -140,8 +140,8 @@ from .research_command import (
     format_research_detail_report,
     _build_seller_snapshot_section_result,
 )
-from .natural_language import build_telegram_natural_language_router_from_settings, _aka_fallback_route
-from price_monitor_bot.natural_language import TelegramNaturalLanguageIntent
+from .natural_language import build_telegram_natural_language_router_from_settings
+from telegram_nl.natural_language import TelegramNaturalLanguageIntent
 from .quiz_favorite_songs import extract_first_youtube_url
 from .opportunity_command import (
     build_hunt_callback_handler,
@@ -468,12 +468,6 @@ class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
             reply_markup=markup or None,
         )
 
-    def _route_natural_language(self, text: str) -> TelegramNaturalLanguageIntent | None:
-        result = super()._route_natural_language(text)
-        if result is not None:
-            return result
-        return _aka_fallback_route(text)
-
     def _build_app_natural_language_reply_plan(
         self,
         intent: TelegramNaturalLanguageIntent,
@@ -503,6 +497,18 @@ class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
                 ack=None,
                 reply=None,
                 reply_factory=lambda q=query, c=cid: music_spec.handler(q or "playbest", c),
+            )
+        if intent.intent == "home_action":
+            target = intent.home_target or ""
+            command = intent.home_command or "on"
+            ir_spec = self._command_registry.get("/ir")
+            if ir_spec is None:
+                return TelegramTextReplyPlan(ack=None, reply="/ir 指令尚未啟用。")
+            logger.info("Telegram NL routed intent=home_action target=%s cmd=%s", target, command)
+            return TelegramTextReplyPlan(
+                ack=None,
+                reply=None,
+                reply_factory=lambda t=target, cmd=command, c=cid: ir_spec.handler(f"send {t} {cmd}", c),
             )
         return None
 

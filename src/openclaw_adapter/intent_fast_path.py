@@ -17,7 +17,7 @@ import logging
 import re
 from pathlib import Path
 
-from price_monitor_bot.natural_language import TelegramNaturalLanguageIntent
+from telegram_nl.natural_language import TelegramNaturalLanguageIntent
 
 from .embedding_match import cosine, embed_unit_vectors, l2_normalize
 
