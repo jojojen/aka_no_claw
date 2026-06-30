@@ -174,6 +174,30 @@ def _format_signal_message(
     return "\n".join(lines)
 
 
+def _is_digest_worthy_signal(signal) -> bool:
+    """True when a product-intel signal has enough user-visible evidence.
+
+    The signal store may contain sparse internal observations used for later
+    aggregation. The daily Telegram digest is stricter: if we cannot show a
+    traceable source and at least one concrete product detail, the message is
+    just "IP + confidence" noise.
+    """
+    if signal.actionability == "blocked":
+        return False
+    if not signal.source_urls:
+        return False
+    has_concrete_detail = any(
+        (
+            signal.product_type and signal.product_type != "other",
+            signal.official_code,
+            signal.release_window,
+            signal.retail_price_jpy,
+            signal.product_family,
+        )
+    )
+    return bool(has_concrete_detail)
+
+
 def _make_reply_markup(entry_id: str) -> dict:
     return {
         "inline_keyboard": [[
@@ -229,19 +253,23 @@ class RagDailyDigestScheduler:
             time.sleep(23 * 3600)
 
     def _load_today_signals(self) -> list:
-        """Today's structured product-intelligence signals, or [] when the store
-        is not wired / unavailable. Blocked signals are skipped — they are not
-        product news the user should triage."""
+        """Today's structured product-intelligence signals, or [] when unavailable.
+
+        Use ``created_at`` instead of ``updated_at`` so an old signal refreshed by
+        a repeated observation does not keep reappearing as "new knowledge".
+        Sparse internal signals are also skipped; the digest should only contain
+        product intelligence with a source and concrete product detail.
+        """
         if self._signal_db_path is None or not self._signal_db_path.exists():
             return []
         try:
             from .collectible_signal_store import CollectibleSignalStore
             store = CollectibleSignalStore(self._signal_db_path)
-            signals = store.signals_since(_today_start_iso())
+            signals = store.signals_created_since(_today_start_iso())
         except Exception:
             logger.exception("RagDailyDigestScheduler: signal store read failed")
             return []
-        return [s for s in signals if s.actionability != "blocked"]
+        return [s for s in signals if _is_digest_worthy_signal(s)]
 
     def _send_digest(self) -> None:
         if not self._db_path.exists():

@@ -287,6 +287,25 @@ class CollectibleSignalStore:
             ).fetchall()
         return [_signal_from_row(row) for row in rows]
 
+    def signals_created_since(
+        self,
+        since_iso: str,
+        *,
+        limit: int = 200,
+    ) -> list[CollectibleSignal]:
+        """Signals first created at/after *since_iso* (UTC ISO), hottest first.
+
+        Daily "new knowledge" digests should not re-send an old product just
+        because a later observation refreshed ``updated_at``.
+        """
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM collectible_signals WHERE created_at >= ?"
+                " ORDER BY heat_score DESC, updated_at DESC LIMIT ?",
+                (since_iso, limit),
+            ).fetchall()
+        return [_signal_from_row(row) for row in rows]
+
 
 def _signal_from_row(row: sqlite3.Row) -> CollectibleSignal:
     # Rows are already normalized at write time, so reconstruct the frozen

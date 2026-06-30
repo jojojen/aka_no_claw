@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
+from openclaw_adapter.collectible_signal import make_signal
+from openclaw_adapter.collectible_signal_store import CollectibleSignalStore
 from openclaw_adapter.knowledge_db import KnowledgeDatabase, NO_DATA_SUMMARY
 from openclaw_adapter.rag_daily_digest import RagDailyDigestScheduler
 
@@ -145,3 +148,64 @@ def test_digest_mixed_sends_only_real(tmp_path):
     sched._send_digest()
     assert len(sent) == 1
     assert "union_arena".upper() in sent[0][1] or "UNION ARENA" in sent[0][1]
+
+
+def test_digest_skips_sparse_product_signal_without_source(tmp_path):
+    sent: list = []
+    sched, db_path = _make_scheduler(tmp_path, sent)
+    sig_path = tmp_path / "signals.sqlite3"
+    sig_store = CollectibleSignalStore(sig_path)
+    sig_store.bootstrap()
+    sig_store.upsert_signal(make_signal(
+        source_kind="official_store",
+        collectible_domain="tcg",
+        ip_canonical="鏈鋸人",
+        title="UA 鏈鋸人 BOX",
+        product_type="sealed_box",
+        confidence=0.95,
+        actionability="informational",
+    ))
+    sched = RagDailyDigestScheduler(
+        db_path=db_path,
+        chat_ids=("123",),
+        send_fn=lambda chat_id, text, markup: sent.append((chat_id, text)),
+        signal_db_path=sig_path,
+    )
+
+    sched._send_digest()
+
+    assert sent == []
+
+
+def test_digest_does_not_repeat_old_signal_refreshed_today(tmp_path):
+    sent: list = []
+    sched, db_path = _make_scheduler(tmp_path, sent)
+    sig_path = tmp_path / "signals.sqlite3"
+    sig_store = CollectibleSignalStore(sig_path)
+    sig_store.bootstrap()
+    old = replace(
+        make_signal(
+            source_kind="official_store",
+            collectible_domain="tcg",
+            ip_canonical="鏈鋸人",
+            title="UA 鏈鋸人 BOX",
+            product_type="sealed_box",
+            official_code="UA-CSM-01",
+            source_urls=("https://store.example/csm-box",),
+            confidence=0.95,
+            actionability="actionable",
+        ),
+        created_at="2020-01-01T00:00:00+00:00",
+    )
+    sig_store.upsert_signal(old)
+    sig_store.upsert_signal(replace(old, heat_score=0.9))
+    sched = RagDailyDigestScheduler(
+        db_path=db_path,
+        chat_ids=("123",),
+        send_fn=lambda chat_id, text, markup: sent.append((chat_id, text)),
+        signal_db_path=sig_path,
+    )
+
+    sched._send_digest()
+
+    assert sent == []
