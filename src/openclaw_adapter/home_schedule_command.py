@@ -93,9 +93,9 @@ def render_list(store: HomeScheduleStore) -> tuple[str, dict]:
         enabled = e.get("enabled", True)
         toggle_text = "⏸ 停用" if enabled else "▶️ 啟用"
         toggle_cb = f"sh:{'off' if enabled else 'on'}:{sid}"
+        rows.append([{"text": f"🚀 {_short(label)}", "callback_data": f"sh:run:{sid}"}])
         rows.append(
             [
-                {"text": f"🚀 {_short(label)}", "callback_data": f"sh:run:{sid}"},
                 {"text": toggle_text, "callback_data": toggle_cb},
                 {"text": "✏️", "callback_data": f"sh:edit:{sid}"},
                 {"text": "🗑", "callback_data": f"sh:del:{sid}"},
@@ -192,6 +192,12 @@ def build_schedulehome_handler(
 
         if sub == "add":
             return render_time_picker(7, 0)
+        if sub == "add_for_wf":
+            wf_id = arg
+            if not wf_id:
+                return "請指定 workflow id，例如 /schedulehome add_for_wf greeting_workflow"
+            store.begin_pending_wf(chat_id, wf_id)
+            return render_time_picker(7, 0)
         if sub in {"run", "on", "off", "delete", "del"} and not arg:
             return f"請指定排程 id，例如 /schedulehome {sub} sch_001"
 
@@ -235,8 +241,15 @@ def build_schedulehome_callback_handler(
         if action == "cancel":
             store.end_capture(chat_id)
             store.end_edit(chat_id)
+            store.end_pending_wf(chat_id)
             text, markup = render_list(store)
             return "已取消", text, markup
+
+        if action == "done":
+            sid = store.end_capture(chat_id)
+            entry = store.get(sid) if sid else None
+            n = len(entry.get("commands") or []) if entry else 0
+            return f"✅ 排程設定完成，已加入 {n} 個指令。", None, None
 
         if action == "list":
             text, markup = render_list(store)
@@ -335,6 +348,22 @@ def build_schedulehome_callback_handler(
                 store.end_edit(chat_id)
                 text, markup = render_list(store)
                 return "已更新排程", text, markup
+            # Auto-fill path (web#9): workflow_id was pre-specified, skip capture.
+            pending_wf = store.pending_wf_target(chat_id)
+            if pending_wf:
+                entry = store.add(
+                    time=f"{hh:02d}:{mm:02d}",
+                    days=days,
+                    commands=[f"/workflow run {pending_wf}"],
+                    label=pending_wf,
+                )
+                store.end_pending_wf(chat_id)
+                list_text, markup = render_list(store)
+                msg = (
+                    f"✅ 已建立排程（{entry['id']}），將執行 /workflow run {pending_wf}\n\n"
+                    + list_text
+                )
+                return None, msg, markup
             entry = store.add(time=f"{hh:02d}:{mm:02d}", days=days)
             store.begin_capture(chat_id, entry["id"])
             return "已建立排程", _capture_hint(entry), None

@@ -90,6 +90,7 @@ _BRIDGE_CHAT_ID = "web-bridge"
 # sessions by chat id; the web console is one user, so a constant id lets a
 # draft survive across the separate HTTP requests of a draft → edit → save flow.
 _WF_WEB_CHAT_ID = "web-workflow"
+_SH_WEB_CHAT_ID = "web-schedule"
 _HEARTBEAT_SECONDS = 10.0
 # Finished jobs linger this long so a phone that reconnects after a screen-lock
 # can still fetch the final report, then they are garbage-collected.
@@ -101,6 +102,17 @@ _SELLER_UNSUPPORTED_MSG = "賣家信譽快照目前尚未由本地 command bridg
 # "幫我做一個先問候再開燈的工作流" that telegram_nl misclassifies
 # as play_music because "開燈" fires other detection before the workflow check.
 _WF_BRIDGE_VERB_RE = re.compile(r"做|建立?|弄|規劃|設計|create", re.IGNORECASE)
+
+# Bridge-specific catch for "排程 + creation verb" phrases like "幫我建立排程" or
+# "排程執行 greeting_workflow" that don't need the full embedding path.
+_SH_BRIDGE_RE = re.compile(
+    r"(新增|建立|設定|排定|幫我).{0,10}排程|排程.{0,5}(執行|跑)",
+    re.IGNORECASE,
+)
+
+# Match slug-like words (lowercase + digits + underscore) containing an underscore.
+# Used to extract a workflow_id from a free-text schedule phrase.
+_WF_SLUG_RE = re.compile(r"\b([a-z][a-z0-9_\-]{2,})\b")
 
 # Web Chat continuity (#44). Prepended so the model continues the conversation
 # (e.g. resolves 「她/它/這個」 against earlier turns) instead of treating each
@@ -380,6 +392,12 @@ class CommandBridge:
         self._intent_fp: object | None = None
         self._intent_fp_built = False
         self._intent_fp_lock = threading.Lock()
+        # Schedule surface for web chat (web#9). Lazily built so the store
+        # singleton is shared with any Telegram-side scheduler that also runs.
+        self._sh_handler: object | None = None
+        self._sh_cb_handler: object | None = None
+        self._sh_store: object | None = None
+        self._sh_lock = threading.Lock()
 
     # --- handler registry (lazy, shared with the Telegram bot) ------------
     def _ensure_registries(self) -> None:
@@ -450,19 +468,19 @@ class CommandBridge:
 
     @staticmethod
     def _markup_to_actions(markup: object) -> list[dict]:
-        """Flatten a Telegram inline_keyboard into web action buttons. Each
-        button keeps its ``callback_data`` so a click can re-invoke the same
-        callback handler (e.g. switch the /research view)."""
+        """Convert a Telegram inline_keyboard to web action buttons, preserving
+        the row index so the frontend can re-group buttons into their original
+        keyboard rows (avoids misaligned layouts on multi-entry lists)."""
         actions: list[dict] = []
         if isinstance(markup, dict):
-            for row in markup.get("inline_keyboard", []):
+            for row_idx, row in enumerate(markup.get("inline_keyboard", [])):
                 for btn in row:
                     if not isinstance(btn, dict):
                         continue
                     cb = btn.get("callback_data")
                     label = btn.get("text")
                     if cb and label:
-                        actions.append({"label": str(label), "callback_data": str(cb)})
+                        actions.append({"label": str(label), "callback_data": str(cb), "row": row_idx})
         return actions
 
     # --- blocking entrypoint ---------------------------------------------
@@ -597,13 +615,13 @@ class CommandBridge:
             else:
                 yield stream_done(resp.message)
             return
-        # Workflow creation redirect (#web8 B2).  Two layers so the feature works
-        # even when the bge-m3 embedder is unavailable (e.g. first cold start):
-        #   1. Embedding fast-path (primary): bge-m3 cosine over phrasings JSON,
-        #      catches natural phrasing like "幫我做一個先問候再開燈的工作流".
-        #   2. NL-rule fallback (secondary): `fallback_route_telegram_natural_language`
-        #      keyword rules catch explicit phrasing like "建立 workflow / create workflow".
-        # Both emit stream_redirect and return before the LLM router runs.
+        # Workflow / schedule creation redirect (web#8 B2, web#9). Three layers so
+        # the feature works even when the bge-m3 embedder is unavailable:
+        #   1. Embedding fast-path (primary): bge-m3 cosine over phrasings JSON.
+        #   3a. Bridge "工作流 + verb" catch (before telegram_nl to avoid misclassification).
+        #   3b. Bridge "排程 + creation verb" catch for schedule creation.
+        #   4. NL-rule fallback (secondary): telegram_nl keyword rules (create workflow only).
+        # All layers emit stream_redirect and return before the LLM router runs.
         fp = self._get_intent_fast_path()
         if fp is not None:
             wf_intent = fp.route(text)
@@ -613,11 +631,22 @@ class CommandBridge:
                     wf_intent.workflow_description or text,
                 )
                 return
-        # Layer 3: bridge-specific two-signal catch — "工作流" noun + creation verb.
-        # Runs before telegram_nl fallback because that layer misclassifies natural
-        # phrases containing other action words (e.g. "放音樂") as a different intent.
+            if wf_intent is not None and wf_intent.intent == "create_schedule":
+                yield stream_redirect(
+                    "create_schedule", text,
+                    workflow_id=self._extract_wf_slug(text),
+                )
+                return
+        # Layer 3a: bridge "工作流 + verb" catch.
         if "工作流" in text and _WF_BRIDGE_VERB_RE.search(text):
             yield stream_redirect("create_workflow", text)
+            return
+        # Layer 3b: bridge "排程 + creation verb" catch.
+        if _SH_BRIDGE_RE.search(text):
+            yield stream_redirect(
+                "create_schedule", text,
+                workflow_id=self._extract_wf_slug(text),
+            )
             return
         from telegram_nl.natural_language import fallback_route_telegram_natural_language
         nl_intent = fallback_route_telegram_natural_language(text)
@@ -1512,6 +1541,128 @@ class CommandBridge:
         toast, new_text, markup = (list(result) + [None, None, None])[:3] \
             if isinstance(result, tuple) else (result, None, None)
         message = new_text if new_text else toast
+        return {
+            "status": STATUS_OK,
+            "message": str(message) if message is not None else "",
+            "actions": self._markup_to_actions(markup),
+        }
+
+    # --- schedule surface (web#9) -------------------------------------------
+    def _schedulehome_surface(self) -> tuple[object, object, object]:
+        """Lazily build the (command_handler, cb_handler, store) triple for web schedules.
+
+        Shares the same HomeScheduleStore singleton the Telegram bot and scheduler
+        use, so a schedule created via the web console is visible everywhere."""
+        if self._sh_handler is None:
+            with self._sh_lock:
+                if self._sh_handler is None:
+                    from .home_schedule_command import (
+                        build_schedulehome_handler,
+                        build_schedulehome_callback_handler,
+                    )
+                    from .home_schedule import get_home_schedule_store, make_run_slash_command
+                    store = get_home_schedule_store(
+                        self.settings.openclaw_home_schedules_path
+                    )
+                    run_cmd = make_run_slash_command(self._handlers())
+                    self._sh_store = store
+                    self._sh_cb_handler = build_schedulehome_callback_handler(store, run_cmd)
+                    self._sh_handler = build_schedulehome_handler(store, run_cmd)
+        return self._sh_handler, self._sh_cb_handler, self._sh_store  # type: ignore[return-value]
+
+    @staticmethod
+    def _extract_wf_slug(text: str) -> str:
+        """Return the last workflow slug (underscore or wf- kebab-case) in text, or ''."""
+        matches = [m for m in _WF_SLUG_RE.findall(text) if "_" in m or m.startswith("wf-")]
+        return matches[-1] if matches else ""
+
+    def run_schedulehome_command(self, text: str) -> dict:
+        """Run /schedulehome for the web console.
+
+        Three sub-cases:
+        1. Capture mode active (collecting slash commands for a new schedule): route
+           text to capture handler.  ``完成``/``done``/``結束`` finalises the schedule.
+        2. ``add_for_wf <id>`` — start add flow with workflow ID pre-filled; recurrence
+           ok auto-creates the schedule without entering capture mode.
+        3. Normal subcommands: list (empty), add, run/on/off/delete <id>."""
+        handler, _, store = self._schedulehome_surface()
+        raw = (text or "").strip()
+
+        sid = store.capture_target(_SH_WEB_CHAT_ID)
+        if sid is not None:
+            if raw in {"完成", "done", "結束"}:
+                store.end_capture(_SH_WEB_CHAT_ID)
+                entry = store.get(sid)
+                n = len(entry.get("commands") or []) if entry else 0
+                return {
+                    "status": STATUS_OK,
+                    "message": f"✅ 排程設定完成，已加入 {n} 個指令。",
+                    "actions": [],
+                }
+            if raw.startswith("/"):
+                store.add_command(sid, raw)
+                entry = store.get(sid)
+                n = len(entry.get("commands") or []) if entry else 0
+                return {
+                    "status": STATUS_OK,
+                    "message": (
+                        f"已加入第 {n} 個指令：{raw}\n"
+                        "繼續傳下一個指令，或輸入「完成」結束。"
+                    ),
+                    "actions": [{"label": "完成", "callback_data": "sh:done"}],
+                }
+            # Non-slash, non-done in capture: echo the hint back.
+            entry = store.get(sid)
+            hint = (
+                f"排程設定中，請傳入斜線指令（如 /workflow run greeting_workflow）"
+                f"或輸入「完成」。\n目前已加入 {len(entry.get('commands') or [])} 個指令。"
+                if entry else "排程設定中，請傳入斜線指令或「完成」。"
+            )
+            return {
+                "status": STATUS_OK,
+                "message": hint,
+                "actions": [{"label": "完成", "callback_data": "sh:done"}],
+            }
+
+        try:
+            result = handler(raw, _SH_WEB_CHAT_ID)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("schedulehome command failed text=%r", text)
+            return {"status": STATUS_ERROR, "message": f"排程指令失敗：{exc}", "actions": []}
+        # Command handler returns str | (message, markup) 2-tuple.
+        if isinstance(result, tuple):
+            message = result[0]
+            markup = result[1] if len(result) > 1 else None
+            return {
+                "status": STATUS_OK,
+                "message": str(message) if message is not None else "",
+                "actions": self._markup_to_actions(markup),
+            }
+        return {
+            "status": STATUS_OK,
+            "message": str(result) if result is not None else "",
+            "actions": [],
+        }
+
+    def run_schedulehome_action(self, callback_data: str) -> dict:
+        """Re-invoke a ``sh:`` schedulehome button for the web console (time/recurrence
+        pickers, list management, capture done/cancel)."""
+        _, cb_handler, _ = self._schedulehome_surface()
+        prefix, _, payload = (callback_data or "").partition(":")
+        if prefix != "sh":
+            return {
+                "status": STATUS_ERROR,
+                "message": f"未知的排程動作：{callback_data}",
+                "actions": [],
+            }
+        try:
+            result = cb_handler(payload, "", _SH_WEB_CHAT_ID)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("schedulehome action failed cb=%s", callback_data)
+            return {"status": STATUS_ERROR, "message": f"動作執行失敗：{exc}", "actions": []}
+        toast, new_text, markup = (list(result) + [None, None, None])[:3] \
+            if isinstance(result, tuple) else (result, None, None)
+        message = new_text if new_text is not None else toast
         return {
             "status": STATUS_OK,
             "message": str(message) if message is not None else "",

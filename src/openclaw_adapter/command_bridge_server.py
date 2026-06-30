@@ -88,6 +88,8 @@ def _build_handler(bridge: CommandBridge, *, lan_enabled: bool) -> type[BaseHTTP
                 self._handle_ir()
             elif path == "/api/command/workflow":
                 self._handle_workflow()
+            elif path == "/api/command/schedulehome":
+                self._handle_schedulehome()
             elif path == "/api/command/session":
                 self._handle_session_save()
             elif path == "/api/command/restartall":
@@ -241,6 +243,28 @@ def _build_handler(bridge: CommandBridge, *, lan_enabled: bool) -> type[BaseHTTP
                 self._write_json(bridge.run_workflow_action(callback_data))
                 return
             self._write_json(bridge.run_workflow_command(str(data.get("input") or "")))
+
+        def _handle_schedulehome(self) -> None:
+            """Schedule surface (web#9). ``callback_data`` (``sh:…``) dispatches a
+            picker/list button; ``input`` carries a subcommand (add, add_for_wf <id>,
+            run/on/off/delete <id>) or capture-mode text."""
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            try:
+                raw = self.rfile.read(length) if length else b""
+                data = json.loads(raw.decode("utf-8")) if raw else {}
+            except (ValueError, UnicodeDecodeError) as exc:
+                self._write_json({"status": "error", "message": f"無效的請求：{exc}"},
+                                 status=HTTPStatus.BAD_REQUEST)
+                return
+            if not isinstance(data, dict):
+                self._write_json({"status": "error", "message": "請求必須是 JSON 物件。"},
+                                 status=HTTPStatus.BAD_REQUEST)
+                return
+            callback_data = str(data.get("callback_data") or "")
+            if callback_data:
+                self._write_json(bridge.run_schedulehome_action(callback_data))
+                return
+            self._write_json(bridge.run_schedulehome_command(str(data.get("input") or "")))
 
         def _handle_session_save(self) -> None:
             """POST /api/command/session — replace the saved console snapshot.

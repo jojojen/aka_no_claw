@@ -104,12 +104,14 @@ def build_workflow_handler(
 
 # ── Subcommand implementations ────────────────────────────────────────────────
 
-def _cmd_list(store: WorkflowStore) -> str:
+def _cmd_list(store: WorkflowStore) -> str | tuple:
     workflows = store.list()
     if not workflows:
         return "尚無已儲存的 workflow。\n用 /workflow create <JSON> 新增一個。"
     lines = [f"• {wf.id}：{wf.goal}（{len(wf.steps)} 步驟）" for wf in workflows]
-    return "📋 Workflows\n" + "\n".join(lines)
+    text = "📋 Workflows\n" + "\n".join(lines)
+    rows = [[{"text": f"▶️ 排程執行 {wf.id}", "callback_data": f"add_for_wf {wf.id}"}] for wf in workflows]
+    return text, {"inline_keyboard": rows}
 
 
 def _cmd_show(workflow_id: str, store: WorkflowStore) -> str:

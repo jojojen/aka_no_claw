@@ -132,6 +132,16 @@
     "how do I scan a card from a photo",
     "拍照查卡的指令是什麼"
   ],
+  "create_schedule": [
+    "幫我排程執行 greeting_workflow",
+    "幫我設定 morning_routine 的排程",
+    "新增家庭排程",
+    "建立一個排程",
+    "幫我建立排程",
+    "add a home schedule",
+    "schedule workflow run",
+    "設定排程執行這個工作流"
+  ],
   "create_workflow": [
     "建立 workflow 先問候再開燈",
     "幫我做一個先問候再開燈的工作流",

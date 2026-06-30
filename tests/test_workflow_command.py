@@ -96,17 +96,21 @@ def test_cmd_list_shows_ids_and_goals(tmp_path):
     store = _make_store(tmp_path)
     store.save(Workflow(id="wf-a", goal="A の目標"))
     store.save(Workflow(id="wf-b", goal="B の目標"))
-    reply = _cmd_list(store)
-    assert "wf-a" in reply
-    assert "wf-b" in reply
-    assert "A の目標" in reply
+    text, markup = _cmd_list(store)
+    assert "wf-a" in text
+    assert "wf-b" in text
+    assert "A の目標" in text
+    # Each workflow gets a "排程執行" action button with add_for_wf callback.
+    cbs = [btn["callback_data"] for row in markup["inline_keyboard"] for btn in row]
+    assert "add_for_wf wf-a" in cbs
+    assert "add_for_wf wf-b" in cbs
 
 
 def test_cmd_list_shows_step_count(tmp_path):
     store = _make_store(tmp_path)
     store.save(_simple_wf())
-    reply = _cmd_list(store)
-    assert "1 步驟" in reply
+    text, _ = _cmd_list(store)
+    assert "1 步驟" in text
 
 
 # ── /workflow show ────────────────────────────────────────────────────────────

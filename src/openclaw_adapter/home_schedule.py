@@ -150,6 +150,9 @@ class HomeScheduleStore:
         # chat_id -> schedule id whose time/recurrence is being re-edited via the
         # time/recurrence pickers (no command capture; commands are left as-is).
         self._editing: dict[str, str] = {}
+        # chat_id -> workflow_id pre-filled for auto-create path (web#9 B).
+        # Set by add_for_wf; consumed and cleared on recurrence ok to skip capture.
+        self._pending_wf: dict[str, str] = {}
 
     # --- persistence ------------------------------------------------------
     def _load(self) -> list[dict]:
@@ -284,6 +287,19 @@ class HomeScheduleStore:
     def end_edit(self, chat_id: str) -> str | None:
         with self._lock:
             return self._editing.pop(str(chat_id), None)
+
+    # --- transient pending-workflow state (web#9 auto-fill path) ----------
+    def begin_pending_wf(self, chat_id: str, wf_id: str) -> None:
+        with self._lock:
+            self._pending_wf[str(chat_id)] = wf_id
+
+    def pending_wf_target(self, chat_id: str) -> str | None:
+        with self._lock:
+            return self._pending_wf.get(str(chat_id))
+
+    def end_pending_wf(self, chat_id: str) -> str | None:
+        with self._lock:
+            return self._pending_wf.pop(str(chat_id), None)
 
 
 _STORES: dict[str, HomeScheduleStore] = {}

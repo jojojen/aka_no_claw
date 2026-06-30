@@ -2161,3 +2161,253 @@ def test_stream_chat_nl_fallback_when_fast_path_misses(monkeypatch):
 
     req = parse_request({"mode": "chat", "input": "幫我建一個問候然後開燈的工作流"})
     _assert_single_redirect(list(b.stream(req, "test-rid3")), "工作流")
+
+
+# --- /schedulehome bridge route (web#9) ------------------------------------
+# Tests assert the bridge's schedulehome contract: command and action methods
+# proxy to the existing handler/callback chain; the stream emits redirect for
+# create_schedule NL phrases; the E2E run path reaches the workflow executor.
+
+class _FakeScheduleRouter:
+    """Stub EmbeddingIntentRouter: always returns create_schedule for any text."""
+    ready = True
+
+    def route(self, text: str):
+        from telegram_nl.natural_language import TelegramNaturalLanguageIntent
+        return TelegramNaturalLanguageIntent(
+            intent="create_schedule", workflow_description=text, confidence=0.91
+        )
+
+
+def _make_sh_bridge(tmp_path):
+    """Build a CommandBridge with the schedulehome surface pre-injected.
+
+    Bypasses `_handlers()` / Telegram registry so these tests don't need
+    quiz_db_path and the full settings graph."""
+    from openclaw_adapter.home_schedule import get_home_schedule_store, make_run_slash_command
+    from openclaw_adapter.home_schedule_command import (
+        build_schedulehome_handler,
+        build_schedulehome_callback_handler,
+    )
+
+    settings = SimpleNamespace(openclaw_home_schedules_path=str(tmp_path / "schedules.json"))
+    b = CommandBridge(settings=settings)
+    store = get_home_schedule_store(str(tmp_path / "schedules.json"))
+    run_cmd = make_run_slash_command({})  # empty registry — sufficient for picker tests
+    b._sh_store = store
+    b._sh_handler = build_schedulehome_handler(store, run_cmd)
+    b._sh_cb_handler = build_schedulehome_callback_handler(store, run_cmd)
+    return b
+
+
+def test_run_schedulehome_command_list(tmp_path):
+    """Empty input → list view with ➕ 新增排程 button."""
+    b = _make_sh_bridge(tmp_path)
+    result = b.run_schedulehome_command("")
+    assert result["status"] == "ok"
+    assert "排程" in result["message"]
+    cb_values = [a["callback_data"] for a in result.get("actions", [])]
+    assert any("sh:add" in cb for cb in cb_values)
+
+
+def test_run_schedulehome_command_add(tmp_path):
+    """'add' → time picker returned."""
+    b = _make_sh_bridge(tmp_path)
+    result = b.run_schedulehome_command("add")
+    assert result["status"] == "ok"
+    assert "時" in result["message"]
+    cb_values = [a["callback_data"] for a in result.get("actions", [])]
+    assert any("sh:t:" in cb for cb in cb_values)
+
+
+def test_run_schedulehome_action_time_adjust(tmp_path):
+    """sh:t:07:00:h+ → time picker with hour bumped to 08."""
+    b = _make_sh_bridge(tmp_path)
+    result = b.run_schedulehome_action("sh:t:07:00:h+")
+    assert result["status"] == "ok"
+    assert "08" in result["message"]
+
+
+def test_run_schedulehome_action_recurrence_ok_enters_capture(tmp_path):
+    """sh:r:07:30:1111100:ok (no pending_wf) → schedule created, capture hint."""
+    b = _make_sh_bridge(tmp_path)
+    result = b.run_schedulehome_action("sh:r:07:30:1111100:ok")
+    assert result["status"] == "ok"
+    assert "已建立排程" in result["message"] or "排程設定中" in result["message"] or "指令" in result["message"]
+
+
+def test_run_schedulehome_command_add_for_wf(tmp_path):
+    """add_for_wf greeting_workflow → time picker (pending_wf stored)."""
+    b = _make_sh_bridge(tmp_path)
+    result = b.run_schedulehome_command("add_for_wf greeting_workflow")
+    assert result["status"] == "ok"
+    assert "時" in result["message"]
+    cb_values = [a["callback_data"] for a in result.get("actions", [])]
+    assert any("sh:t:" in cb for cb in cb_values)
+
+
+def test_run_schedulehome_action_recurrence_ok_autofill(tmp_path):
+    """add_for_wf then recurrence ok → schedule auto-created with /workflow run."""
+    b = _make_sh_bridge(tmp_path)
+    b.run_schedulehome_command("add_for_wf greeting_workflow")
+    b.run_schedulehome_action("sh:t:07:00:ok")
+    result = b.run_schedulehome_action("sh:r:07:00:1111100:ok")
+    assert result["status"] == "ok"
+    assert "greeting_workflow" in result["message"]
+    assert "workflow run" in result["message"]
+
+
+def test_run_schedulehome_command_capture_appends(tmp_path):
+    """After capture begins, /cmd text is appended to the schedule."""
+    b = _make_sh_bridge(tmp_path)
+    b.run_schedulehome_action("sh:r:07:30:1111100:ok")
+    result = b.run_schedulehome_command("/workflow run greeting_workflow")
+    assert result["status"] == "ok"
+    assert "已加入" in result["message"]
+    assert any(a.get("callback_data") == "sh:done" for a in result.get("actions", []))
+
+
+def test_run_schedulehome_command_capture_done(tmp_path):
+    """完成 in capture mode → ends capture, returns completion message."""
+    b = _make_sh_bridge(tmp_path)
+    b.run_schedulehome_action("sh:r:07:30:1111100:ok")
+    b.run_schedulehome_command("/workflow run greeting_workflow")
+    result = b.run_schedulehome_command("完成")
+    assert result["status"] == "ok"
+    assert "完成" in result["message"] or "設定" in result["message"]
+
+
+def test_run_schedulehome_action_cancel_clears_state(tmp_path):
+    """sh:cancel during capture → ends capture, returns list."""
+    b = _make_sh_bridge(tmp_path)
+    b.run_schedulehome_action("sh:r:07:30:1111100:ok")
+    result = b.run_schedulehome_action("sh:cancel")
+    assert result["status"] == "ok"
+    assert "取消" in result["message"] or "排程" in result["message"]
+
+
+def test_stream_chat_emits_redirect_for_create_schedule(monkeypatch, tmp_path):
+    """Embedding fast-path create_schedule → stream_redirect with intent + workflow_id."""
+    b = _make_sh_bridge(tmp_path)
+    monkeypatch.setattr(b, "_get_intent_fast_path", lambda: _FakeScheduleRouter())
+
+    def _boom(_req):
+        raise AssertionError("LLM router must not be called for create_schedule")
+    monkeypatch.setattr(b, "_route_chat_decision", _boom)
+
+    req = parse_request({"mode": "chat", "input": "幫我排程執行 greeting_workflow"})
+    events = list(b.stream(req, "test-sh-rid"))
+    redirect_events = [e for e in events if e.get("type") == "redirect"]
+    assert len(redirect_events) == 1
+    ev = redirect_events[0]
+    assert ev["intent"] == "create_schedule"
+    assert "greeting_workflow" in ev["description"]
+    assert ev.get("workflow_id") == "greeting_workflow"
+
+
+def test_stream_chat_bridge_re_catches_schedule_phrase(monkeypatch, tmp_path):
+    """Bridge Layer 3b catches '幫我建立排程' when fast-path disabled."""
+    b = _make_sh_bridge(tmp_path)
+    monkeypatch.setattr(b, "_get_intent_fast_path", lambda: None)
+
+    def _boom(_req):
+        raise AssertionError("LLM router must not be called for create_schedule")
+    monkeypatch.setattr(b, "_route_chat_decision", _boom)
+
+    req = parse_request({"mode": "chat", "input": "幫我建立排程"})
+    events = list(b.stream(req, "test-sh-rid2"))
+    redirect_events = [e for e in events if e.get("type") == "redirect"]
+    assert len(redirect_events) == 1
+    assert redirect_events[0]["intent"] == "create_schedule"
+
+
+def test_run_schedule_manual_run_reaches_workflow_executor(tmp_path):
+    """E2E: schedule created via add_for_wf → run <id> invokes workflow executor."""
+    calls: list[str] = []
+
+    class _FakeWorkflowHandler:
+        def __call__(self, remainder: str, chat_id: str) -> str:
+            calls.append(remainder.strip())
+            return f"workflow ran: {remainder.strip()}"
+
+    from openclaw_adapter.home_schedule import get_home_schedule_store, make_run_slash_command
+    from openclaw_adapter.home_schedule_command import (
+        build_schedulehome_handler,
+        build_schedulehome_callback_handler,
+    )
+
+    schedules_path = str(tmp_path / "schedules.json")
+    b = CommandBridge(settings=SimpleNamespace(openclaw_home_schedules_path=schedules_path))
+    store = get_home_schedule_store(schedules_path)
+    fake_handlers = {"/workflow": SimpleNamespace(handler=_FakeWorkflowHandler())}
+    run_cmd = make_run_slash_command(fake_handlers)
+    b._sh_store = store
+    b._sh_handler = build_schedulehome_handler(store, run_cmd)
+    b._sh_cb_handler = build_schedulehome_callback_handler(store, run_cmd)
+
+    # Step 1: add_for_wf → time picker
+    b.run_schedulehome_command("add_for_wf greeting_workflow")
+    # Step 2: recurrence ok → auto-creates schedule with /workflow run greeting_workflow
+    b.run_schedulehome_action("sh:t:07:00:ok")
+    result = b.run_schedulehome_action("sh:r:07:00:1111100:ok")
+    assert "greeting_workflow" in result["message"]
+
+    entry = store.list()[0]
+    sid = entry["id"]
+    assert "/workflow run greeting_workflow" in entry.get("commands", [])
+
+    # Step 3: manual run → workflow executor invoked.
+    run_result = b.run_schedulehome_command(f"run {sid}")
+    assert run_result["status"] == "ok"
+    assert any("run greeting_workflow" in c for c in calls), f"calls={calls}"
+
+
+def test_run_schedulehome_command_list_empty(tmp_path):
+    """Empty schedule list returns ok with descriptive message."""
+    b = _make_sh_bridge(tmp_path)
+    result = b.run_schedulehome_command("")
+    assert result["status"] == "ok"
+    assert "排程" in result["message"] or "schedule" in result["message"].lower()
+
+
+def test_extract_wf_slug_kebab(tmp_path):
+    """_extract_wf_slug accepts wf- kebab-case ids (e.g. wf-morning-greeting)."""
+    slug = CommandBridge._extract_wf_slug("幫我排程執行 wf-morning-greeting")
+    assert slug == "wf-morning-greeting"
+
+
+def test_extract_wf_slug_underscore(tmp_path):
+    """_extract_wf_slug still accepts underscore ids (backward compat)."""
+    slug = CommandBridge._extract_wf_slug("幫我排程執行 greeting_workflow")
+    assert slug == "greeting_workflow"
+
+
+def test_extract_wf_slug_no_match():
+    """_extract_wf_slug returns '' when no workflow slug is present."""
+    assert CommandBridge._extract_wf_slug("幫我建立排程") == ""
+
+
+def test_stream_chat_emits_redirect_for_kebab_workflow(monkeypatch, tmp_path):
+    """create_schedule redirect with wf- kebab id populates workflow_id correctly."""
+    b = _make_sh_bridge(tmp_path)
+    monkeypatch.setattr(b, "_get_intent_fast_path", lambda: _FakeScheduleRouter())
+
+    def _boom(_req):
+        raise AssertionError("LLM router must not be called")
+    monkeypatch.setattr(b, "_route_chat_decision", _boom)
+
+    req = parse_request({"mode": "chat", "input": "幫我排程執行 wf-morning-greeting"})
+    events = list(b.stream(req, "test-kebab-rid"))
+    redirect_events = [e for e in events if e.get("type") == "redirect"]
+    assert len(redirect_events) == 1
+    ev = redirect_events[0]
+    assert ev["intent"] == "create_schedule"
+    assert ev.get("workflow_id") == "wf-morning-greeting"
+
+
+def test_run_schedulehome_command_add_for_wf_kebab(tmp_path):
+    """add_for_wf with kebab-case id stores pending_wf correctly."""
+    b = _make_sh_bridge(tmp_path)
+    result = b.run_schedulehome_command("add_for_wf wf-morning-greeting")
+    assert result["status"] == "ok"
+    assert b._sh_store.pending_wf_target("web-schedule") == "wf-morning-greeting"

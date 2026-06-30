@@ -397,8 +397,17 @@ def stream_error(message: str) -> dict[str, object]:
     return {"type": EVENT_ERROR, "message": message}
 
 
-def stream_redirect(intent: str, description: str) -> dict[str, object]:
-    return {"type": EVENT_REDIRECT, "intent": intent, "description": description}
+def stream_redirect(
+    intent: str, description: str, *, workflow_id: str = ""
+) -> dict[str, object]:
+    ev: dict[str, object] = {
+        "type": EVENT_REDIRECT,
+        "intent": intent,
+        "description": description,
+    }
+    if workflow_id:
+        ev["workflow_id"] = workflow_id
+    return ev
 
 
 def _opt_str(value: object) -> str | None:

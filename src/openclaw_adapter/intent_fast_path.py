@@ -39,7 +39,7 @@ URL_SLOT_INTENTS = frozenset({"product_research", "reputation_snapshot"})
 # fires on a confident match and sets workflow_description=text so the caller
 # (command_bridge._stream_chat) can emit a stream_redirect event and skip the
 # slow LLM router entirely.
-FULL_TEXT_INTENTS = frozenset({"create_workflow"})
+FULL_TEXT_INTENTS = frozenset({"create_workflow", "create_schedule"})
 
 _MERCARI_URL_RE = re.compile(
     r"https?://(?:jp\.|www\.)?mercari\.com/"
