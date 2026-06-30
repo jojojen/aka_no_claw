@@ -74,14 +74,18 @@ class _EditorSession:
 
 def _step_label(step: WorkflowStep) -> str:
     if step.kind == "tool_call":
-        args_str = ", ".join(f"{k}={v}" for k, v in (step.args or {}).items())
-        return f"[tool] {step.tool}({args_str}) → {step.output}"
+        args_str = " ".join(f"{k}={v}" for k, v in (step.args or {}).items())
+        label = f"run 生成工具 [{step.tool}]"
+        if args_str:
+            label += f" {args_str}"
+        return label
     if step.kind == "llm_transform":
         inputs = ", ".join(step.inputs or [])
         return f"[llm] [{inputs}] → {step.output}"
     if step.kind == "command_sink":
-        return f"[{step.command}] {step.input} → {step.output}"
-    return f"[{step.kind}] → {step.output}"
+        arg = step.literal or (f"{{{step.input}}}" if step.input else "")
+        return f"{step.command} {arg}".strip()
+    return f"[{step.kind}]"
 
 
 def _render_editor_card(session: _EditorSession) -> tuple[str, dict]:
