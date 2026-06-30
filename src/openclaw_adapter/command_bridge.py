@@ -2022,6 +2022,11 @@ class CommandBridge:
     def model_routes(self) -> dict:
         """Return the concrete model chain behind each web Chat model tab."""
         local = self._local_model()
+        gemini_chain = [
+            {"provider": "gemini", "model": model}
+            for model in self._gemini_route_models()
+        ]
+        gemini_chain.append({"provider": "local", "model": local})
         return {
             "status": STATUS_OK,
             "routes": [
@@ -2046,11 +2051,7 @@ class CommandBridge:
                     "label": "Gemini",
                     "requested_provider": "gemini",
                     "requested_model": self._gemini_pro_model(),
-                    "chain": [
-                        {"provider": "gemini", "model": self._gemini_pro_model()},
-                        {"provider": "gemini", "model": self._gemini_flash_model()},
-                        {"provider": "local", "model": local},
-                    ],
+                    "chain": gemini_chain,
                     "configured": bool(getattr(self.settings, "openclaw_gemini_api_key", None)),
                 },
                 {
@@ -2280,8 +2281,8 @@ class CommandBridge:
         self, prompt: str, *, temperature: float
     ) -> tuple[str, ModelMetadata]:
         attempts: list[ModelAttempt] = []
-        pro_model = self._gemini_pro_model()
-        flash_model = self._gemini_flash_model()
+        gemini_models = self._gemini_route_models()
+        pro_model = gemini_models[0]
 
         if not getattr(self.settings, "openclaw_gemini_api_key", None):
             attempts.append(
@@ -2303,7 +2304,7 @@ class CommandBridge:
             )
 
         last_reason = ""
-        for model in (pro_model, flash_model):
+        for model in gemini_models:
             client = self._build_gemini_chat_client(model)
             if client is None:
                 attempts.append(
@@ -2385,13 +2386,22 @@ class CommandBridge:
         return (getattr(self.settings, "openclaw_mistral_model", None) or "mistral-large-latest").strip()
 
     def _gemini_pro_model(self) -> str:
-        return (getattr(self.settings, "openclaw_gemini_pro_model", None) or "gemini-2.5-pro").strip()
+        return (getattr(self.settings, "openclaw_gemini_pro_model", None) or "gemini-2.5-flash").strip()
 
     def _gemini_flash_model(self) -> str:
         return (
             getattr(self.settings, "openclaw_gemini_flash_model", None)
             or "gemini-2.5-flash"
         ).strip()
+
+    def _gemini_route_models(self) -> tuple[str, ...]:
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for model in (self._gemini_pro_model(), self._gemini_flash_model()):
+            if model and model not in seen:
+                seen.add(model)
+                ordered.append(model)
+        return tuple(ordered)
 
     # --- translation -----------------------------------------------------
     def _image_translate_renderer(self):

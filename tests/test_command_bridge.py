@@ -398,12 +398,16 @@ def test_chat_cloud_unavailable_is_error(bridge, monkeypatch):
 
 
 def test_model_routes_reports_gemini_chain():
-    b = CommandBridge(settings=_tool_settings())
+    b = CommandBridge(
+        settings=_tool_settings(
+            gemini_primary_model="gemini-2.5-flash",
+            gemini_flash_model="gemini-2.5-flash",
+        )
+    )
     routes = b.model_routes()
     gemini = next(r for r in routes["routes"] if r["backend"] == "gemini")
-    assert gemini["requested_model"] == "gemini-2.5-pro"
+    assert gemini["requested_model"] == "gemini-2.5-flash"
     assert [m["model"] for m in gemini["chain"]] == [
-        "gemini-2.5-pro",
         "gemini-2.5-flash",
         b._local_model(),
     ]
@@ -562,7 +566,12 @@ def test_parse_router_decision_rejects_control_only_query():
 
 
 # --- #45 chat contextual tool routing -------------------------------------
-def _tool_settings(debug: bool = False, gemini_key: str | None = None):
+def _tool_settings(
+    debug: bool = False,
+    gemini_key: str | None = None,
+    gemini_primary_model: str = "gemini-2.5-pro",
+    gemini_flash_model: str = "gemini-2.5-flash",
+):
     return SimpleNamespace(
         openclaw_web_chat_tool_debug=debug,
         openclaw_local_text_model="qwen3:14b",
@@ -572,8 +581,8 @@ def _tool_settings(debug: bool = False, gemini_key: str | None = None):
         openclaw_mistral_api_key=None,
         openclaw_mistral_model="mistral-large-latest",
         openclaw_gemini_api_key=gemini_key,
-        openclaw_gemini_pro_model="gemini-2.5-pro",
-        openclaw_gemini_flash_model="gemini-2.5-flash",
+        openclaw_gemini_pro_model=gemini_primary_model,
+        openclaw_gemini_flash_model=gemini_flash_model,
         openclaw_music_dir="/tmp/test_music",
         openclaw_music_index_path="/tmp/test_music_index.json",
     )

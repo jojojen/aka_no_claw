@@ -142,6 +142,16 @@ def test_get_settings_reads_gemini_environment_keys(monkeypatch) -> None:
     assert settings.openclaw_gemini_flash_model == "gemini-flash-test"
 
 
+def test_get_settings_defaults_gemini_primary_to_flash(monkeypatch) -> None:
+    monkeypatch.delenv("OPENCLAW_GEMINI_PRO_MODEL", raising=False)
+    monkeypatch.delenv("OPENCLAW_GEMINI_FLASH_MODEL", raising=False)
+
+    settings = get_settings()
+
+    assert settings.openclaw_gemini_pro_model == "gemini-2.5-flash"
+    assert settings.openclaw_gemini_flash_model == "gemini-2.5-flash"
+
+
 def test_get_settings_reads_local_tts_environment_keys(monkeypatch) -> None:
     monkeypatch.setenv("OPENCLAW_LOCAL_TTS_ENDPOINT", "http://127.0.0.1:10101")
     monkeypatch.setenv("OPENCLAW_LOCAL_TTS_TIMEOUT_SECONDS", "25")
