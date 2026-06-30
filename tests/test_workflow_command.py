@@ -44,6 +44,18 @@ class _FakeLLM:
         return self.response
 
 
+class _DroppingLLM:
+    """Simulates the flaky cloud endpoint: the request itself raises a transport
+    error (probe passed, generation dropped)."""
+
+    def __init__(self):
+        self.prompts = []
+
+    def generate(self, prompt, *, temperature=0.0):
+        self.prompts.append(prompt)
+        raise ConnectionError("Remote end closed connection without response")
+
+
 class _FakeEditorDraft:
     def __init__(self):
         self.drafts = []
@@ -278,6 +290,45 @@ def test_cmd_create_nl_surfaces_local_fallback_warning(tmp_path):
     assert "本地模型" in text
 
 
+def test_generate_workflow_falls_back_when_cloud_request_drops():
+    cloud = _DroppingLLM()           # probe passed but request dies mid-flight
+    local = _FakeLLM(_MORNING_JSON)  # local Ollama still works
+    wf, err, used_fallback = _generate_workflow_from_nl(
+        "造工作流", cloud, None, fallback_client=local,
+    )
+    assert err is None
+    assert wf.id == "wf-morning-greeting"
+    assert used_fallback is True
+    assert cloud.prompts and local.prompts  # both were tried
+
+
+def test_generate_workflow_fails_when_both_clients_drop():
+    cloud = _DroppingLLM()
+    local = _DroppingLLM()
+    wf, err, used_fallback = _generate_workflow_from_nl(
+        "造工作流", cloud, None, fallback_client=local,
+    )
+    assert wf is None
+    assert "LLM 生成失敗" in err
+    assert used_fallback is False
+
+
+def test_cmd_create_surfaces_fallback_warning_on_cloud_drop(tmp_path):
+    store = _make_store(tmp_path)
+    cloud = _DroppingLLM()
+    local = _FakeLLM(_MORNING_JSON)
+    editor = _FakeEditorDraft()
+    fb_warn = "⚠️ 雲端模型（big-pickle）連線中斷，已改用本地模型生成草稿。\n\n"
+    text, _ = _cmd_create(
+        "早安工作流", store, "c",
+        llm_client=cloud, fallback_client=local, catalog=None, editor=editor,
+        fallback_warning=fb_warn,
+    )
+    assert text.startswith("⚠️")
+    assert "連線中斷" in text
+    assert editor.drafts  # draft still produced via local fallback
+
+
 def test_cmd_create_json_path_still_saves_directly(tmp_path):
     store = _make_store(tmp_path)
     editor = _FakeEditorDraft()
@@ -307,7 +358,7 @@ def test_extract_json_object_garbage_returns_none():
 
 def test_generate_workflow_from_nl_fills_missing_id_and_goal():
     llm = _FakeLLM(json.dumps({"goal": "", "steps": []}))   # no id, empty goal
-    wf, err = _generate_workflow_from_nl("我的描述", llm, None)
+    wf, err, _ = _generate_workflow_from_nl("我的描述", llm, None)
     assert err is None
     assert wf.id          # backfilled
     assert wf.goal == "我的描述"

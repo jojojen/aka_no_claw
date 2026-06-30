@@ -83,13 +83,15 @@ def build_workflow_handler(
         if subcmd == "delete":
             return _cmd_delete(arg, store)
         if subcmd == "create":
-            _client, _warning = _resolve_draft_client(settings, runner)
+            _client, _fallback, _warning, _fb_warning = _resolve_draft_client(settings, runner)
             return _cmd_create(
                 arg, store, chat_id,
                 llm_client=_client,
+                fallback_client=_fallback,
                 catalog=_catalog,
                 editor=workflow_editor,
                 client_warning=_warning,
+                fallback_warning=_fb_warning,
                 command_registry=command_registry,
             )
         if subcmd == "run":
@@ -151,9 +153,11 @@ def _cmd_create(
     chat_id: str = "",
     *,
     llm_client=None,
+    fallback_client=None,
     catalog=None,
     editor=None,
     client_warning: str | None = None,
+    fallback_warning: str | None = None,
     command_registry=None,
 ):
     """Create a workflow.
@@ -182,13 +186,17 @@ def _cmd_create(
             "自然語言生成需要卡片編輯器與 LLM（目前未啟用）。\n"
             "請改用 /workflow create <JSON>，或 /workflow new 手動建立。"
         )
-    wf, err = _generate_workflow_from_nl(stripped, llm_client, catalog,
-                                          command_registry=command_registry)
+    wf, err, used_fallback = _generate_workflow_from_nl(
+        stripped, llm_client, catalog,
+        command_registry=command_registry, fallback_client=fallback_client,
+    )
     if wf is None:
         return f"❌ 無法生成草稿：{err}\n可改用 /workflow new 手動建立。"
     text, markup = editor.start_from_draft(chat_id, wf)
     if client_warning:
         text = client_warning + text
+    elif used_fallback and fallback_warning:
+        text = fallback_warning + text
     return text, markup
 
 
@@ -209,15 +217,25 @@ def _cmd_create_json(arg: str, store: WorkflowStore, *, command_registry=None) -
     return f"✅ workflow '{wf.id}' 已儲存（{len(wf.steps)} 步驟）"
 
 
-def _resolve_draft_client(settings, runner) -> tuple[object, str | None]:
-    """Pick the LLM client for natural-language workflow drafting.
+def _resolve_draft_client(settings, runner) -> tuple[object, object, str | None, str | None]:
+    """Pick the LLM client(s) for natural-language workflow drafting.
 
     Drafting a whole workflow from one sentence is abstract reasoning, so we
-    prefer the cloud big-pickle model and only fall back to the runner's local
-    Ollama client when the cloud endpoint isn't reachable. The fallback is never
-    silent — a warning string is returned so the user is told it happened.
+    prefer the cloud big-pickle model and fall back to the runner's local Ollama
+    client. The fallback is never silent — a warning string is returned so the
+    user is told it happened.
 
-    Returns ``(client, warning_or_None)``."""
+    The cloud big-pickle endpoint (free, no-auth) is flaky: its HTTP probe can
+    pass while the heavier generation request gets dropped mid-flight
+    (``RemoteDisconnected``). So we hand back BOTH a primary and a request-time
+    fallback, and let the caller retry locally when the cloud request itself
+    fails — not only when the probe fails.
+
+    Returns ``(primary, fallback, primary_warning, fallback_warning)``:
+      - ``primary_warning`` is prepended unconditionally (set when we already had
+        to downgrade to local at probe time).
+      - ``fallback_warning`` is prepended only if the fallback is actually used."""
+    local = getattr(runner, "client", None)
     reason = ""
     try:
         from .dynamic_tools import OpenCodeTextClient, probe_opencode
@@ -229,21 +247,27 @@ def _resolve_draft_client(settings, runner) -> tuple[object, str | None]:
         raw_model = (getattr(settings, "openclaw_opencode_model", None) or "big-pickle").strip()
         model = raw_model.split("/")[-1] if "/" in raw_model else raw_model
         if probe_opencode(base_url, model=model, timeout=10.0):
-            return OpenCodeTextClient(
+            cloud = OpenCodeTextClient(
                 base_url=base_url,
                 model=model,
                 api_key=getattr(settings, "openclaw_opencode_api_key", None),
                 timeout_seconds=180,
-            ), None
+            )
+            fb_warning = None
+            if local is not None:
+                fb_warning = (
+                    "⚠️ 雲端模型（big-pickle）連線中斷，已改用本地模型"
+                    f"（{type(local).__name__}）生成草稿，品質可能較低。\n\n"
+                )
+            return cloud, local, None, fb_warning
         reason = "雲端端點 HTTP 探測失敗"
     except Exception as exc:  # noqa: BLE001 — any cloud-setup failure → local fallback
         logger.warning("workflow_command: cloud draft client setup failed, using local",
                        exc_info=True)
         reason = f"雲端模型設定失敗（{exc}）"
 
-    local = getattr(runner, "client", None)
     if local is None:
-        return None, None
+        return None, None, None, None
     local_label = type(local).__name__
     logger.warning("workflow_command: cloud draft client unavailable (%s); using local %s",
                    reason, local_label)
@@ -251,36 +275,55 @@ def _resolve_draft_client(settings, runner) -> tuple[object, str | None]:
         f"⚠️ 雲端模型（big-pickle）目前無法使用（{reason}），"
         f"已改用本地模型（{local_label}）生成草稿，品質可能較低。\n\n"
     )
-    return local, warning
+    return local, None, warning, None
 
 
-def _generate_workflow_from_nl(description: str, llm_client, catalog, *, command_registry=None):
+def _generate_workflow_from_nl(
+    description: str, llm_client, catalog, *,
+    command_registry=None, fallback_client=None,
+):
     """Ask the LLM to draft a Workflow from a one-line description.
 
-    Returns ``(Workflow, None)`` on success or ``(None, error_message)``.
-    Tool steps are grounded on the live generated-tool catalog so the draft
-    references real slugs where possible."""
-    prompt = _build_nl_workflow_prompt(description, catalog, command_registry=command_registry)
-    try:
-        raw = llm_client.generate(prompt, temperature=0.2)
-    except Exception as exc:  # noqa: BLE001 — surface any LLM/transport failure
-        logger.warning("workflow_command: LLM draft generation failed: %s", exc)
-        return None, f"LLM 生成失敗：{exc}"
+    Returns ``(Workflow, None, used_fallback)`` on success or
+    ``(None, error_message, used_fallback)`` on failure. Tool steps are grounded
+    on the live generated-tool catalog so the draft references real slugs.
 
-    data = _extract_json_object(raw)
-    if data is None:
-        return None, "LLM 未回傳有效的 JSON"
-    # Backfill the required top-level keys so a slightly-incomplete draft still
-    # opens in the editor (the user can fix it there) rather than hard-failing.
-    if not data.get("id"):
-        data["id"] = "wf-draft"
-    if not data.get("goal"):
-        data["goal"] = description
-    try:
-        wf = Workflow.from_dict(data)
-    except (KeyError, TypeError) as exc:
-        return None, f"草稿結構錯誤：{exc}"
-    return wf, None
+    Tries ``llm_client`` first; if its request itself fails (the cloud endpoint
+    drops the connection — ``RemoteDisconnected`` — even though the earlier probe
+    passed), retries once with ``fallback_client``. ``used_fallback`` tells the
+    caller whether to surface the local-fallback warning."""
+    prompt = _build_nl_workflow_prompt(description, catalog, command_registry=command_registry)
+    clients: list[tuple[object, bool]] = [(llm_client, False)]
+    if fallback_client is not None and fallback_client is not llm_client:
+        clients.append((fallback_client, True))
+
+    last_err: object = "無可用的 LLM client"
+    for client, is_fallback in clients:
+        if client is None:
+            continue
+        try:
+            raw = client.generate(prompt, temperature=0.2)
+        except Exception as exc:  # noqa: BLE001 — transport failure → try next client
+            logger.warning("workflow_command: draft via %s failed: %s",
+                           type(client).__name__, exc)
+            last_err = exc
+            continue
+        data = _extract_json_object(raw)
+        if data is None:
+            last_err = "LLM 未回傳有效的 JSON"
+            continue
+        # Backfill required top-level keys so a slightly-incomplete draft still
+        # opens in the editor (the user can fix it there) rather than hard-failing.
+        if not data.get("id"):
+            data["id"] = "wf-draft"
+        if not data.get("goal"):
+            data["goal"] = description
+        try:
+            wf = Workflow.from_dict(data)
+        except (KeyError, TypeError) as exc:
+            return None, f"草稿結構錯誤：{exc}", is_fallback
+        return wf, None, is_fallback
+    return None, f"LLM 生成失敗：{last_err}", False
 
 
 def _build_nl_workflow_prompt(description: str, catalog, *, command_registry=None) -> str:
