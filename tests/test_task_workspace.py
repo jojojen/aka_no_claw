@@ -862,6 +862,46 @@ def test_command_sink_literal_static_arg():
     assert music_called == ["playbest"]
 
 
+def test_command_sink_ir_usage_help_is_failure():
+    def ir(_: str) -> str:
+        return "IR 指令：\n/ir discover\n/ir send <裝置名> <按鍵名>"
+
+    ex, runner = _make_runner(commands={"/ir": ir})
+    step = WorkflowStep(id="s1", kind="command_sink", command="/ir",
+                        literal="send ceiling_light", output="out")
+    store = VariableStore()
+    step_trace, var_name = runner._run_command_sink(step, store)
+    assert step_trace.status == "failed"
+    assert var_name is None
+    assert "usage help" in (step_trace.error or "")
+
+
+def test_command_sink_ir_connection_error_halts_downstream_music():
+    calls: list[str] = []
+
+    def ir(_: str) -> str:
+        calls.append("ir")
+        return "找到 RM4 Mini 但無法連線：[Errno 65] No route to host"
+
+    def music(_: str) -> str:
+        calls.append("music")
+        return "開始連續隨機播放最愛歌曲。用 /music stop 可停止。"
+
+    ex, runner = _make_runner(commands={"/ir": ir, "/music": music})
+    wf = Workflow(id="wf", goal="開燈播放音樂", steps=[
+        WorkflowStep(id="s1", kind="command_sink", command="/ir",
+                     literal="send ceiling_light power", output="r1"),
+        WorkflowStep(id="s2", kind="command_sink", command="/music",
+                     literal="playbest", output="r2"),
+    ])
+    trace = runner.run(wf)
+    assert not trace.ok
+    assert trace.steps[0].status == "failed"
+    assert trace.steps[1].status == "skipped"
+    assert calls == ["ir"]
+    assert "No route to host" in (trace.final_result or "")
+
+
 def test_command_sink_literal_roundtrip():
     step = WorkflowStep(id="s1", kind="command_sink", command="/music",
                         literal="playbest", output="out")

@@ -115,10 +115,14 @@ def test_cmd_list_shows_ids_and_goals(tmp_path):
     assert "wf-a" in text
     assert "wf-b" in text
     assert "A の目標" in text
-    # Each workflow gets a "排程執行" action button with add_for_wf callback.
+    # Each workflow gets run, schedule-run, and delete action buttons.
     cbs = [btn["callback_data"] for row in markup["inline_keyboard"] for btn in row]
-    assert "add_for_wf wf-a" in cbs
-    assert "add_for_wf wf-b" in cbs
+    assert "wf:run:wf-a" in cbs
+    assert "wf:run:wf-b" in cbs
+    assert "wf:schedule:wf-a" in cbs
+    assert "wf:schedule:wf-b" in cbs
+    assert "wf:delete:wf-a" in cbs
+    assert "wf:delete:wf-b" in cbs
 
 
 def test_cmd_list_shows_step_count(tmp_path):
@@ -361,25 +365,25 @@ def test_nl_prompt_exposes_literal_field_and_rule():
 def test_nl_prompt_renders_command_usage_from_registry():
     registry = {
         "/music": types.SimpleNamespace(usage="playbest=播放最愛清單"),
-        "/ir": types.SimpleNamespace(usage="send <裝置> on/off，如 send ceiling_light"),
+        "/ir": types.SimpleNamespace(usage="send <裝置> <按鍵名>，如 send ceiling_light power"),
     }
     prompt = _build_nl_workflow_prompt("開燈播音樂", catalog=None, command_registry=registry)
     assert "playbest" in prompt
-    assert "ceiling_light" in prompt
+    assert "send ceiling_light power" in prompt
 
 
 def test_nl_prompt_falls_back_to_local_usage_map_without_registry():
     prompt = _build_nl_workflow_prompt("播放最愛", catalog=None, command_registry=None)
     # local _COMMAND_USAGE supplies the hints when no registry is wired
     assert "playbest" in prompt
-    assert "ceiling_light" in prompt
+    assert "send ceiling_light power" in prompt
 
 
 def test_command_usage_prefers_registry_over_local_map():
     registry = {"/music": types.SimpleNamespace(usage="REGISTRY-USAGE")}
     assert _command_usage("/music", registry) == "REGISTRY-USAGE"
     # unknown-in-registry → local map
-    assert "ceiling_light" in _command_usage("/ir", registry)
+    assert "send ceiling_light power" in _command_usage("/ir", registry)
     # nothing known → empty string
     assert _command_usage("/totally-unknown-xyz", registry) == ""
 
@@ -396,7 +400,7 @@ def test_generate_workflow_accepts_command_sink_literal(tmp_path):
         "goal": "開燈然後播放最愛音樂清單",
         "steps": [
             {"id": "s1", "kind": "command_sink", "command": "/ir",
-             "literal": "send ceiling_light", "output": "r1"},
+             "literal": "send ceiling_light power", "output": "r1"},
             {"id": "s2", "kind": "command_sink", "command": "/music",
              "literal": "playbest", "output": "r2"},
         ],
@@ -405,7 +409,7 @@ def test_generate_workflow_accepts_command_sink_literal(tmp_path):
     wf, err, _ = _generate_workflow_from_nl("開燈然後播放最愛音樂清單", llm, None)
     assert err is None
     assert [s.kind for s in wf.steps] == ["command_sink", "command_sink"]
-    assert wf.steps[0].literal == "send ceiling_light"
+    assert wf.steps[0].literal == "send ceiling_light power"
     assert wf.steps[1].command == "/music" and wf.steps[1].literal == "playbest"
     assert all(s.kind != "llm_transform" for s in wf.steps)
 

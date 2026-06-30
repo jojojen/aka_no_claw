@@ -1375,7 +1375,7 @@ def _build_registries(
         ),
         "/ir": RegisteredCommand(
             build_ir_handler(settings),
-            usage="紅外線家電控制：send <裝置> <on/off>，如 `send ceiling_light`（開天花板燈）",
+            usage="紅外線家電控制：send <裝置> <按鍵名>，如 `send ceiling_light power`（切換天花板燈電源）",
         ),
         "/research": RegisteredCommand(
             research_handler,
@@ -1447,6 +1447,37 @@ def _build_registries(
         new_text, markup = _rag_cb("ragdel", payload, original_text)
         return "🗑️ 已刪除", new_text, markup
 
+    def _workflow_list_adapter(payload: str, original_text: str, chat_id: str):
+        action, _, wf_id = (payload or "").partition(":")
+        wf_id = wf_id.strip()
+        if not wf_id:
+            return None, "缺少 workflow id。", None
+        if action == "run":
+            wf_spec = command_handlers.get("/workflow")
+            if wf_spec is None:
+                return None, "/workflow 指令尚未啟用。", None
+            result = wf_spec.handler(f"run {wf_id}", str(chat_id))
+            if isinstance(result, tuple):
+                return None, result[0], result[1] if len(result) > 1 else None
+            return None, result, None
+        if action == "schedule":
+            sh_spec = command_handlers.get("/schedulehome")
+            if sh_spec is None:
+                return None, "/schedulehome 指令尚未啟用。", None
+            result = sh_spec.handler(f"add_for_wf {wf_id}", str(chat_id))
+            if isinstance(result, tuple):
+                return None, result[0], result[1] if len(result) > 1 else None
+            return None, result, None
+        if action == "delete":
+            wf_spec = command_handlers.get("/workflow")
+            if wf_spec is None:
+                return None, "/workflow 指令尚未啟用。", None
+            result = wf_spec.handler(f"delete {wf_id}", str(chat_id))
+            if isinstance(result, tuple):
+                return None, result[0], result[1] if len(result) > 1 else None
+            return None, result, None
+        return None, f"未知的 workflow 動作：{action}", None
+
     callback_handlers: dict[str, Callable[[str, str, str], tuple[object, str, object]]] = {
         "quiz": build_quiz_callback_handler(settings),
         "voice": build_voice_callback_handler(settings),
@@ -1461,6 +1492,7 @@ def _build_registries(
         "music": build_music_callback_handler(settings),
         "bt": build_bluetooth_callback_handler(settings),
         "ir": build_ir_callback_handler(settings),
+        "wf": _workflow_list_adapter,
         "sh": build_schedulehome_callback_handler(_home_schedule_store, _run_slash_command),
     }
 

@@ -416,6 +416,61 @@ def test_openclaw_registries_include_ir_command() -> None:
     assert "ir" in callback_handlers
 
 
+def test_openclaw_registries_include_workflow_list_callbacks() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    command_handlers, callback_handlers, _, _ = _build_registries(settings, dynamic_tool_runner=None)
+    assert "/schedulehome" in command_handlers
+    assert "wf" in callback_handlers
+
+
+def test_workflow_list_run_callback_dispatches_workflow_command() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    command_handlers, callback_handlers, _, _ = _build_registries(settings, dynamic_tool_runner=None)
+    calls: list[tuple[str, str]] = []
+    command_handlers["/workflow"] = RegisteredCommand(
+        lambda raw, cid: calls.append((raw, cid)) or "workflow ok"
+    )
+
+    ack, text, markup = callback_handlers["wf"]("run:wf-test", "", "123")
+
+    assert ack is None
+    assert text == "workflow ok"
+    assert markup is None
+    assert calls == [("run wf-test", "123")]
+
+
+def test_workflow_list_schedule_callback_dispatches_schedulehome_command() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    command_handlers, callback_handlers, _, _ = _build_registries(settings, dynamic_tool_runner=None)
+    calls: list[tuple[str, str]] = []
+    command_handlers["/schedulehome"] = RegisteredCommand(
+        lambda raw, cid: calls.append((raw, cid)) or "schedule ok"
+    )
+
+    ack, text, markup = callback_handlers["wf"]("schedule:wf-test", "", "123")
+
+    assert ack is None
+    assert text == "schedule ok"
+    assert markup is None
+    assert calls == [("add_for_wf wf-test", "123")]
+
+
+def test_workflow_list_delete_callback_dispatches_workflow_command() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    command_handlers, callback_handlers, _, _ = _build_registries(settings, dynamic_tool_runner=None)
+    calls: list[tuple[str, str]] = []
+    command_handlers["/workflow"] = RegisteredCommand(
+        lambda raw, cid: calls.append((raw, cid)) or "deleted"
+    )
+
+    ack, text, markup = callback_handlers["wf"]("delete:wf-test", "", "123")
+
+    assert ack is None
+    assert text == "deleted"
+    assert markup is None
+    assert calls == [("delete wf-test", "123")]
+
+
 # ── home_action NL executor ───────────────────────────────────────────────────
 
 def test_home_action_plan_dispatches_ir_send() -> None:

@@ -6,6 +6,7 @@ WORKSPACE_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 AKA_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PRICE_DIR="${WORKSPACE_DIR}/price_monitor_bot"
 REPUTATION_DIR="${WORKSPACE_DIR}/reputation_snapshot"
+WEB_DIR="${WORKSPACE_DIR}/aka_no_claw_web/frontend"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 HOST="${REPUTATION_HOST:-127.0.0.1}"
@@ -47,8 +48,19 @@ AIVIS_READY_TIMEOUT_SECONDS="${AIVIS_READY_TIMEOUT_SECONDS:-60}"
 # chat-web app-layer guard, so LAN/public clients get 403.
 CHAT_WEB_HOST="${CHAT_WEB_HOST:-0.0.0.0}"
 CHAT_WEB_PORT="${CHAT_WEB_PORT:-8780}"
+WEB_FRONTEND_HOST="${WEB_FRONTEND_HOST:-0.0.0.0}"
+WEB_FRONTEND_PORT="${WEB_FRONTEND_PORT:-5173}"
+COMMAND_BRIDGE_HOST="${COMMAND_BRIDGE_HOST:-0.0.0.0}"
+COMMAND_BRIDGE_PORT="${COMMAND_BRIDGE_PORT:-8781}"
+TMUX_SOCKET="${TMUX_SOCKET:-openclaw_codex}"
 
 mkdir -p "${RUN_DIR}" "${LOG_DIR}"
+
+if [[ -x /opt/homebrew/bin/brew ]]; then
+  eval "$(/opt/homebrew/bin/brew shellenv)"
+elif [[ -x /usr/local/bin/brew ]]; then
+  eval "$(/usr/local/bin/brew shellenv)"
+fi
 
 # Per-service stdout/stderr is piped through scripts/log_rotator.py so each
 # redirected service log is size-capped + rotated. Without this the launchctl
@@ -280,6 +292,7 @@ install_system_packages() {
   brew update
   brew list python@3.12 >/dev/null 2>&1 || brew install python@3.12
   brew list tesseract >/dev/null 2>&1 || brew install tesseract
+  brew list tmux >/dev/null 2>&1 || brew install tmux
 }
 
 python_is_compatible() {
@@ -1010,6 +1023,33 @@ stop_launchctl_jobs() {
   done
 }
 
+stop_tmux_services() {
+  if have_command tmux; then
+    tmux -L "${TMUX_SOCKET}" kill-server >/dev/null 2>&1 || true
+  fi
+}
+
+start_detached_shell_service() {
+  local session="$1"
+  local label="$2"
+  local cwd="$3"
+  local command_text="$4"
+
+  if have_command tmux; then
+    log "Starting ${label} in tmux session ${session} socket=${TMUX_SOCKET}."
+    tmux -L "${TMUX_SOCKET}" kill-session -t "${session}" >/dev/null 2>&1 || true
+    tmux -L "${TMUX_SOCKET}" new-session -d -s "${session}" "cd '${cwd}' && ${command_text}"
+    return
+  fi
+
+  log "Starting ${label} with nohup because tmux is not available."
+  (
+    cd "${cwd}"
+    nohup bash -lc "${command_text}" >/dev/null 2>&1 &
+    echo $! >> "${PID_FILE}"
+  )
+}
+
 append_runtime_export() {
   local key="$1"
   local value="${2:-}"
@@ -1034,6 +1074,10 @@ stop_orphaned_stack_processes() {
       found=1
       log "Stopping orphaned OpenClaw process PID ${pid}."
       kill "${pid}" >/dev/null 2>&1 || true
+    elif [[ "${command_line}" == *"${WEB_DIR}"* && "${command_line}" == *"vite"* ]]; then
+      found=1
+      log "Stopping orphaned Web frontend PID ${pid}."
+      kill "${pid}" >/dev/null 2>&1 || true
     fi
   done < <(ps -eo pid=,command= 2>/dev/null || true)
   if [[ "${found}" == "1" ]]; then
@@ -1043,6 +1087,7 @@ stop_orphaned_stack_processes() {
 
 stop_existing_stack() {
   stop_launchctl_jobs
+  stop_tmux_services
   if [[ ! -f "${PID_FILE}" ]]; then
     stop_orphaned_stack_processes
     return
@@ -1151,8 +1196,7 @@ start_openclaw_telegram() {
     if [[ -n "${chromium_path}" ]]; then
       export PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH="${chromium_path}"
     fi
-    nohup bash -c "'${AKA_VENV}/bin/python' -m openclaw_adapter ${args[*]} </dev/null 2>&1 | $(rotator_cmd "${LOG_DIR}/openclaw_telegram.log")" >/dev/null 2>&1 &
-    echo $! >> "${PID_FILE}"
+    start_detached_shell_service "telegram" "OpenClaw Telegram bot" "${AKA_DIR}" "'${AKA_VENV}/bin/python' -m openclaw_adapter ${args[*]} </dev/null 2>&1 | $(rotator_cmd "${LOG_DIR}/openclaw_telegram.log")"
   )
 }
 
@@ -1217,6 +1261,30 @@ start_chat_web_service() {
   )
 }
 
+start_command_bridge_service() {
+  log "Starting OpenClaw command bridge (http://${COMMAND_BRIDGE_HOST}:${COMMAND_BRIDGE_PORT})..."
+  prepare_openclaw_runtime_env
+  start_detached_shell_service "bridge" "OpenClaw command bridge" "${AKA_DIR}" "source '${RUNTIME_ENV_FILE}' 2>/dev/null || true; export PYTHONPATH='.:src'; '${AKA_VENV}/bin/python' -m openclaw_adapter command-bridge --host '${COMMAND_BRIDGE_HOST}' --port '${COMMAND_BRIDGE_PORT}' --lan 2>&1 | $(rotator_cmd "${LOG_DIR}/command_bridge.log")"
+}
+
+start_web_frontend_service() {
+  if [[ ! -d "${WEB_DIR}" ]]; then
+    log "Skipping Web frontend because ${WEB_DIR} is missing."
+    return
+  fi
+  if ! have_command npm; then
+    log "Skipping Web frontend because npm is not available."
+    return
+  fi
+  if [[ ! -d "${WEB_DIR}/node_modules" ]]; then
+    log "Installing Web frontend dependencies..."
+    (cd "${WEB_DIR}" && npm install)
+  fi
+
+  log "Starting OpenClaw Web frontend (http://${WEB_FRONTEND_HOST}:${WEB_FRONTEND_PORT})..."
+  start_detached_shell_service "web" "OpenClaw Web frontend" "${WEB_DIR}" "LAN=1 OPENCLAW_BRIDGE_URL='http://127.0.0.1:${COMMAND_BRIDGE_PORT}' npm run dev -- --host '${WEB_FRONTEND_HOST}' --port '${WEB_FRONTEND_PORT}' --strictPort 2>&1 | ROTATE_BYTES='${ROTATE_BYTES}' ROTATE_KEEP='${ROTATE_KEEP}' '${AKA_VENV}/bin/python' '${ROTATOR_PY}' '${LOG_DIR}/openclaw_web_vite.log'"
+}
+
 start_opportunity_agent() {
   if ! opportunity_agent_enabled; then
     log "Skipping opportunity agent because OPENCLAW_OPPORTUNITY_AGENT_ENABLED=0."
@@ -1262,6 +1330,8 @@ main() {
   start_sns_monitor_service
   start_price_monitor_service
   start_chat_web_service
+  start_command_bridge_service
+  start_web_frontend_service
   start_opportunity_agent
 
   log "Started."
@@ -1272,6 +1342,8 @@ main() {
   log "  ${LOG_DIR}/openclaw_sns_monitor.log"
   log "  ${LOG_DIR}/openclaw_price_monitor.log"
   log "  ${LOG_DIR}/openclaw_chat_web.log"
+  log "  ${LOG_DIR}/command_bridge.log"
+  log "  ${LOG_DIR}/openclaw_web_vite.log"
   log "  ${LOG_DIR}/opportunity_agent.log"
   log "  ${LOG_DIR}/aivis_speech.log"
   if use_launchctl_services; then

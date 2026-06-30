@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 # they teach the drafting LLM the real argument shape so it fills `literal`
 # correctly instead of hallucinating commands like /musiclistbest.
 _COMMAND_USAGE: dict[str, str] = {
-    "/ir": "send <裝置> <on/off>，如 `send ceiling_light`（開天花板燈）",
+    "/ir": "send <裝置> <按鍵名>，如 `send ceiling_light power`（切換天花板燈電源）",
     "/music": "playbest=播放最愛清單；<關鍵字>=搜尋並播放",
     "/musicmute": "靜音（無參數）",
     "/musiclouder": "調高音量（無參數）",
@@ -149,7 +149,15 @@ def _cmd_list(store: WorkflowStore) -> str | tuple:
         return "尚無已儲存的 workflow。\n用 /workflow create <JSON> 新增一個。"
     lines = [f"• {wf.id}：{wf.goal}（{len(wf.steps)} 步驟）" for wf in workflows]
     text = "📋 Workflows\n" + "\n".join(lines)
-    rows = [[{"text": f"▶️ 排程執行 {wf.id}", "callback_data": f"add_for_wf {wf.id}"}] for wf in workflows]
+    rows = []
+    for wf in workflows:
+        rows.append([
+            {"text": f"▶️ 執行 {wf.id}", "callback_data": f"wf:run:{wf.id}"},
+            {"text": f"📅 排程執行 {wf.id}", "callback_data": f"wf:schedule:{wf.id}"},
+        ])
+        rows.append([
+            {"text": f"🗑 刪除 {wf.id}", "callback_data": f"wf:delete:{wf.id}"},
+        ])
     return text, {"inline_keyboard": rows}
 
 
@@ -375,7 +383,7 @@ def _build_nl_workflow_prompt(description: str, catalog, *, command_registry=Non
     tool_block = "\n".join(tool_lines) if tool_lines else "（目前沒有已生成的工具可參考）"
 
     # Render each allowlisted command WITH its usage so the LLM knows the real
-    # argument shape (e.g. /music playbest, /ir send ceiling_light) and fills
+    # argument shape (e.g. /music playbest, /ir send ceiling_light power) and fills
     # `literal` correctly instead of inventing commands or fabricating
     # llm_transform steps to produce fixed parameters.
     if command_registry is not None:
@@ -397,7 +405,7 @@ def _build_nl_workflow_prompt(description: str, catalog, *, command_registry=Non
         "- command_sink：呼叫一個 slash 指令。欄位：command、output（變數名），參數二選一：\n"
         "    • literal（固定字串參數）：當參數是固定的、不依賴前面步驟時用這個，直接填指令後面要帶的字串。\n"
         "      例：開最愛音樂清單 → {\"kind\":\"command_sink\",\"command\":\"/music\",\"literal\":\"playbest\",\"output\":\"r1\"}\n"
-        "      例：開天花板燈 → {\"kind\":\"command_sink\",\"command\":\"/ir\",\"literal\":\"send ceiling_light\",\"output\":\"r2\"}\n"
+        "      例：切換天花板燈電源 → {\"kind\":\"command_sink\",\"command\":\"/ir\",\"literal\":\"send ceiling_light power\",\"output\":\"r2\"}\n"
         "    • input（變數名）：只有當參數需要引用前面步驟產生的 output 變數時才用。\n"
         f"  command 只能是下列已登記的指令（請依其用法填 literal）：\n{command_block}\n\n"
         "可用的工具（tool_call 只能使用下列已存在的 slug；若沒有合適的，改用 llm_transform 或 command_sink，不可自行編造 slug）：\n"

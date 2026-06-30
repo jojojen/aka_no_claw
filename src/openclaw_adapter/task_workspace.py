@@ -77,6 +77,26 @@ COMMAND_SINK_INPUT_TYPES: dict[str, frozenset[str] | None] = {
 CommandDispatcher = dict[str, Callable[[str], str]]
 
 
+def _command_sink_failure_reason(command: str | None, result_text: str) -> str | None:
+    text = (result_text or "").strip()
+    if not text:
+        return None
+    if command == "/ir":
+        if text.startswith("IR 指令："):
+            return "IR command returned usage help instead of executing"
+        failure_markers = (
+            "No route to host",
+            "無法連線",
+            "找不到",
+            "名稱格式無效",
+            "失敗",
+            "逾時",
+        )
+        if any(marker in text for marker in failure_markers):
+            return text
+    return None
+
+
 # ── Schema ───────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -561,8 +581,19 @@ class WorkflowRunner:
             )
 
         provenance = f"{step.command}(input={step.input or repr(step.literal)})"
+        result_text = str(result) if result is not None else ""
+        failure_reason = _command_sink_failure_reason(step.command, result_text)
+        if failure_reason is not None:
+            return (
+                StepTrace(
+                    step_id=step.id, kind=step.kind, status="failed",
+                    error=f"{step.command} failed: {failure_reason}",
+                    provenance=provenance,
+                ),
+                None,
+            )
         var = store.bind(
-            step.output, str(result) if result is not None else "",
+            step.output, result_text,
             source_step=step.id,
             provenance=provenance,
             type_=VARIABLE_TYPE_COMMAND_RESULT,
