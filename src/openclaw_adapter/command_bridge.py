@@ -1679,7 +1679,10 @@ class CommandBridge:
         handler, editor = self._workflow_surface()
         raw = (text or "").strip()
 
-        if editor.is_capturing(_WF_WEB_CHAT_ID):
+        # Escape hatch (mirrors the Telegram path): a slash command is never
+        # swallowed by capture mode, so /workflow cancel (or any command to start
+        # over) always reaches the dispatcher instead of being eaten as field text.
+        if editor.is_capturing(_WF_WEB_CHAT_ID) and not raw.startswith("/"):
             try:
                 captured = editor.handle_text_capture(raw, _WF_WEB_CHAT_ID)
             except Exception as exc:  # noqa: BLE001

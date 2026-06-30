@@ -473,6 +473,7 @@ class _FakeEditor:
     def __init__(self):
         self.new_calls: list[str] = []
         self.edit_calls: list[tuple] = []
+        self.cancel_calls: list[str] = []
 
     def start_new(self, chat_id):
         self.new_calls.append(chat_id)
@@ -481,6 +482,10 @@ class _FakeEditor:
     def start_edit(self, chat_id, workflow_id):
         self.edit_calls.append((chat_id, workflow_id))
         return f"edit-{workflow_id}", {"inline_keyboard": []}
+
+    def cancel_session(self, chat_id):
+        self.cancel_calls.append(chat_id)
+        return "✖️ 已取消 workflow 編輯。"
 
 
 def _make_handler(tmp_path, editor=None):
@@ -535,11 +540,25 @@ def test_workflow_new_no_editor(tmp_path):
     assert "未啟用" in result
 
 
+def test_workflow_cancel_delegates_to_editor(tmp_path):
+    editor = _FakeEditor()
+    handler = _make_handler(tmp_path, editor=editor)
+    result = handler("cancel", "chat-7")
+    assert editor.cancel_calls == ["chat-7"]
+    assert "取消" in result
+
+
+def test_workflow_cancel_no_editor(tmp_path):
+    handler = _make_handler(tmp_path, editor=None)
+    result = handler("cancel", "chat-7")
+    assert "未啟用" in result
+
+
 # ── /workflow help ────────────────────────────────────────────────────────────
 
 def test_help_text():
     h = _help()
-    for sub in ["new", "edit", "list", "show", "run", "delete", "create", "traces"]:
+    for sub in ["new", "cancel", "edit", "list", "show", "run", "delete", "create", "traces"]:
         assert sub in h
 
 

@@ -225,6 +225,54 @@ def test_command_processor_restricts_unconfigured_chat() -> None:
     assert processor.build_reply(chat_id="123", text="/ping") is None
 
 
+class _FakeCaptureEditor:
+    """Editor stub that is always in capture mode; records whether the bot tried
+    to feed it a captured message."""
+    def __init__(self):
+        self.captured: list[str] = []
+
+    def is_capturing(self, chat_id):
+        return True
+
+    def handle_text_capture(self, text, chat_id):
+        self.captured.append(text)
+        return ("captured", {})
+
+
+def test_slash_command_escapes_workflow_capture() -> None:
+    """A slash command must break out of editor capture mode instead of being
+    eaten — otherwise the user is trapped with no way to cancel/restart."""
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+    )
+    editor = _FakeCaptureEditor()
+    processor._workflow_editor = editor
+
+    plan = processor._build_workflow_capture_plan(chat_id="123", text="/workflow cancel")
+    assert plan is None
+    assert editor.captured == []  # command was NOT swallowed
+
+
+def test_plain_text_still_captured_in_workflow_editor() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+    )
+    editor = _FakeCaptureEditor()
+    processor._workflow_editor = editor
+
+    plan = processor._build_workflow_capture_plan(chat_id="123", text="wf-x / 目標")
+    assert plan is not None
+    assert editor.captured == ["wf-x / 目標"]
+
+
 def test_plain_youtube_url_offers_like_song_confirmation(monkeypatch) -> None:
     monkeypatch.setattr(
         "openclaw_adapter.telegram_bot.build_like_song_confirmation",

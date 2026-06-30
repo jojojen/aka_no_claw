@@ -123,6 +123,19 @@ def _render_editor_card(session: _EditorSession) -> tuple[str, dict]:
     return "\n".join(lines), markup
 
 
+def _cancel_markup() -> dict:
+    """A lone full-cancel button. Shown on capture prompts so the user is never
+    trapped in text-collection with no visible escape (the plain-text dispatcher
+    is bypassed while collecting, so a tap-out is the reliable exit)."""
+    return {"inline_keyboard": [[{"text": "✖️ 取消", "callback_data": "wfe:cancel"}]]}
+
+
+def _add_cancel_markup() -> dict:
+    """Cancel-just-this-add button. Returns to the editor card instead of
+    discarding the whole workflow."""
+    return {"inline_keyboard": [[{"text": "✖️ 取消新增", "callback_data": "wfe:add_cancel"}]]}
+
+
 def _render_kind_picker() -> tuple[str, dict]:
     markup = {"inline_keyboard": [
         [{"text": "🌤 Tool Call（呼叫已生成工具）", "callback_data": "wfe:kind:tool_call"}],
@@ -172,8 +185,14 @@ class WorkflowEditor:
         self._sessions[str(chat_id)] = session
         return (
             "📝 新建 Workflow\n請輸入 ID 和目標，格式：\n`<id> / <目標>`\n例：`wf-morning / 早安工作流`",
-            {},
+            _cancel_markup(),
         )
+
+    def cancel_session(self, chat_id: str) -> str:
+        """Discard any active editor session for this chat. Safe to call when no
+        session exists (idempotent escape hatch for the /workflow cancel command)."""
+        existed = self._sessions.pop(str(chat_id), None) is not None
+        return "✖️ 已取消 workflow 編輯。" if existed else "目前沒有進行中的 workflow 編輯。"
 
     def start_edit(self, chat_id: str, workflow_id: str) -> tuple[str, dict]:
         """Load an existing workflow into the editor. Returns (text, markup)."""
@@ -244,7 +263,7 @@ class WorkflowEditor:
             wf_id = text.strip().replace(" ", "-").lower()
             goal = text.strip()
         if not wf_id:
-            return "ID 不能為空，請重新輸入（格式：`<id> / <目標>`）：", {}
+            return "ID 不能為空，請重新輸入（格式：`<id> / <目標>`）：", _cancel_markup()
         session.workflow.id = wf_id
         session.workflow.goal = goal
         session.collecting = None
@@ -265,18 +284,18 @@ class WorkflowEditor:
                     return (
                         f"找不到工具 `{text}`。\n"
                         f"已存在的工具：\n{slug_list}\n\n"
-                        "請輸入正確的 slug（或用 /new delete 先刪除再重新生成）：", {}
+                        "請輸入正確的 slug（或用 /new delete 先刪除再重新生成）：", _add_cancel_markup()
                     )
             adding.fields["tool"] = text
             adding.collecting = "args"
-            return "請輸入 args（JSON 格式，或傳空訊息跳過）：", {}
+            return "請輸入 args（JSON 格式，或傳空訊息跳過）：", _add_cancel_markup()
 
         if f == "args":
             if text:
                 try:
                     parsed = json.loads(text)
                     if not isinstance(parsed, dict):
-                        return "args 必須是 JSON 物件（`{...}`），請重新輸入：", {}
+                        return "args 必須是 JSON 物件（`{...}`），請重新輸入：", _add_cancel_markup()
                     adding.fields["args"] = parsed
                 except json.JSONDecodeError:
                     # Accept key=value format
@@ -286,25 +305,25 @@ class WorkflowEditor:
                             k, _, v = pair.partition("=")
                             d[k.strip()] = v.strip()
                     if not d:
-                        return "格式錯誤，請用 JSON `{\"key\":\"val\"}` 或 key=val，或傳空訊息跳過：", {}
+                        return "格式錯誤，請用 JSON `{\"key\":\"val\"}` 或 key=val，或傳空訊息跳過：", _add_cancel_markup()
                     adding.fields["args"] = d
             adding.collecting = "output"
-            return "請輸入輸出變數名稱（e.g. `weather`）：", {}
+            return "請輸入輸出變數名稱（e.g. `weather`）：", _add_cancel_markup()
 
         if f == "inputs":
             adding.fields["inputs"] = [v.strip() for v in text.split(",") if v.strip()]
             adding.collecting = "instructions"
-            return "請輸入 LLM 指示（instructions）：", {}
+            return "請輸入 LLM 指示（instructions）：", _add_cancel_markup()
 
         if f == "instructions":
             adding.fields["instructions"] = text
             adding.collecting = "output"
-            return "請輸入輸出變數名稱（e.g. `greeting`）：", {}
+            return "請輸入輸出變數名稱（e.g. `greeting`）：", _add_cancel_markup()
 
         if f == "input":
             adding.fields["input"] = text
             adding.collecting = "output"
-            return "請輸入輸出變數名稱（e.g. `speech_result`）：", {}
+            return "請輸入輸出變數名稱（e.g. `speech_result`）：", _add_cancel_markup()
 
         if f == "output":
             adding.fields["output"] = text
@@ -398,10 +417,10 @@ class WorkflowEditor:
             kind = arg
             if kind == "tool_call":
                 session.adding = _AddingStep(kind="tool_call", collecting="tool")
-                return None, "請輸入工具 slug（可從 /new list 查看）：", None
+                return None, "請輸入工具 slug（可從 /new list 查看）：", _add_cancel_markup()
             if kind == "llm_transform":
                 session.adding = _AddingStep(kind="llm_transform", collecting="inputs")
-                return None, "請輸入 inputs（逗號分隔的輸入變數名稱，e.g. `weather`）：", None
+                return None, "請輸入 inputs（逗號分隔的輸入變數名稱，e.g. `weather`）：", _add_cancel_markup()
             if kind == "command_sink":
                 text, markup = _render_command_picker(self._command_registry)
                 return None, text, markup
@@ -416,7 +435,7 @@ class WorkflowEditor:
                 fields={"command": cmd},
                 collecting="input",
             )
-            return None, f"請輸入 {cmd} 的輸入變數名稱（e.g. `greeting`）：", None
+            return None, f"請輸入 {cmd} 的輸入變數名稱（e.g. `greeting`）：", _add_cancel_markup()
 
         if action == "del":
             try:
@@ -444,14 +463,14 @@ class WorkflowEditor:
                 return None, (
                     f"✏️ 編輯步驟 {idx + 1}（目前工具：{step.tool}）\n"
                     "請輸入工具 slug（可從 /new list 查看）："
-                ), None
+                ), _add_cancel_markup()
             if step.kind == "llm_transform":
                 session.adding = _AddingStep(
                     kind="llm_transform", collecting="inputs", edit_index=idx)
                 return None, (
                     f"✏️ 編輯步驟 {idx + 1}（目前 inputs：{', '.join(step.inputs or [])}）\n"
                     "請輸入 inputs（逗號分隔的輸入變數名稱）："
-                ), None
+                ), _add_cancel_markup()
             if step.kind == "command_sink":
                 session.adding = _AddingStep(
                     kind="command_sink",
@@ -462,7 +481,7 @@ class WorkflowEditor:
                 return None, (
                     f"✏️ 編輯步驟 {idx + 1}（{step.command}，目前 input：{step.input}）\n"
                     f"請輸入 {step.command} 的輸入變數名稱："
-                ), None
+                ), _add_cancel_markup()
             return "未知步驟類型", None, None
 
         if action in ("up", "down"):

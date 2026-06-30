@@ -69,6 +69,10 @@ def build_workflow_handler(
                 return "Workflow 編輯器未啟用"
             text, markup = workflow_editor.start_new(chat_id)
             return text, markup or None
+        if subcmd == "cancel":
+            if workflow_editor is None:
+                return "Workflow 編輯器未啟用"
+            return workflow_editor.cancel_session(chat_id)
         if subcmd == "edit":
             if workflow_editor is None:
                 return "Workflow 編輯器未啟用"
@@ -481,6 +485,7 @@ def _help() -> str:
     return (
         "用法：\n"
         "  /workflow new               — 開啟卡片編輯器新建 workflow\n"
+        "  /workflow cancel            — 放棄目前編輯（卡住時用這個脫離）\n"
         "  /workflow edit <id>         — 開啟卡片編輯器編輯 workflow\n"
         "  /workflow list              — 列出所有 workflow\n"
         "  /workflow show <id>         — 顯示 workflow 的步驟\n"

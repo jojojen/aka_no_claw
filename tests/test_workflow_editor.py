@@ -505,3 +505,49 @@ def test_callback_with_no_session_warns(tmp_path):
     editor = _make_editor(tmp_path)
     toast, _, _ = editor._handle_callback("save", "", "chat-unknown")
     assert "過期" in (toast or "") or "⚠️" in (toast or "")
+
+
+# ── escape hatches (anti roach-motel) ─────────────────────────────────────────
+
+def test_start_new_prompt_has_cancel_button(tmp_path):
+    """The goal-collection prompt must offer a visible tap-out, otherwise the
+    user is trapped (plain-text dispatch is bypassed while collecting)."""
+    editor = _make_editor(tmp_path)
+    _, markup = editor.start_new("chat-1")
+    assert "wfe:cancel" in _callback_data(markup)
+
+
+def test_cancel_session_clears_active_session(tmp_path):
+    editor = _make_editor(tmp_path)
+    editor.start_new("chat-1")
+    assert editor.has_session("chat-1")
+    msg = editor.cancel_session("chat-1")
+    assert "取消" in msg
+    assert not editor.has_session("chat-1")
+    assert not editor.is_capturing("chat-1")
+
+
+def test_cancel_session_is_idempotent_with_no_session(tmp_path):
+    editor = _make_editor(tmp_path)
+    msg = editor.cancel_session("chat-nobody")
+    assert "沒有" in msg
+
+
+def test_goal_empty_id_retry_prompt_has_cancel_button(tmp_path):
+    editor = _make_editor(tmp_path)
+    editor.start_new("chat-1")
+    _, markup = editor.handle_text_capture(" / テスト", "chat-1")
+    assert "wfe:cancel" in _callback_data(markup)
+
+
+def test_add_field_prompt_has_cancel_add_button(tmp_path):
+    """Mid-add field prompts must expose a cancel-add button so the user can bail
+    out of a half-built step without losing the whole workflow."""
+    editor = _make_editor(tmp_path)
+    _setup_session(editor)
+    # open kind picker → choose tool_call → lands on "請輸入工具 slug" capture
+    _, _, markup = editor._handle_callback("kind:tool_call", "", "chat-1")
+    assert "wfe:add_cancel" in _callback_data(markup)
+    # next prompt (args) is reached via captured text and also carries the button
+    _, markup2 = editor.handle_text_capture("my-tool", "chat-1")
+    assert "wfe:add_cancel" in _callback_data(markup2)

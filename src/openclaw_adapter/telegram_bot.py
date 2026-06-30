@@ -458,6 +458,13 @@ class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
             return None
         if not self._workflow_editor.is_capturing(str(chat_id)):
             return None
+        # Escape hatch: never swallow a slash command. Otherwise the editor's
+        # text-collection state becomes a roach motel — /workflow cancel (or any
+        # command to restart) gets eaten before it reaches the dispatcher, leaving
+        # the user with no way to cancel, save, or start over. No capture field
+        # legitimately starts with "/", so letting these through is safe.
+        if text.strip().startswith("/"):
+            return None
         result = self._workflow_editor.handle_text_capture(text, str(chat_id))
         if result is None:
             return None
