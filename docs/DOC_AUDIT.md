@@ -58,6 +58,7 @@ for which question each one answers.
 | `SNS_MONITOR_TROUBLESHOOTING.md` | Current | sns | Keep as ops companion; cross-link to usage. |
 | `LOGGING.md` | Current | operations | Keep. |
 | `MAC_MINI_M4.md` | Current | operations | Keep; machine-specific, never copy paths into code. |
+| `BROADLINK_RESTART_RECOVERY_PLAYBOOK.md` | Current | operations | Keep; incident-derived BroadLink recovery/runbook for restart-context failures. |
 | `AUTO_LOGIN_SETUP.md` | Needs review | operations | Re-verify setup steps. |
 | `RASPBERRY_PI_5.md` | Needs review | operations | Re-verify Pi deployment relevance. |
 
