@@ -28,6 +28,39 @@ from .task_workspace import (
 logger = logging.getLogger(__name__)
 
 
+# Fallback usage hints for command_sink grounding. The authoritative source is
+# each command's RegisteredCommand.usage (set where the command is registered);
+# this map covers commands that don't declare one yet, and the test/headless
+# paths that build the prompt without the full registry. Keep entries short —
+# they teach the drafting LLM the real argument shape so it fills `literal`
+# correctly instead of hallucinating commands like /musiclistbest.
+_COMMAND_USAGE: dict[str, str] = {
+    "/ir": "send <裝置> <on/off>，如 `send ceiling_light`（開天花板燈）",
+    "/music": "playbest=播放最愛清單；<關鍵字>=搜尋並播放",
+    "/musicmute": "靜音（無參數）",
+    "/musiclouder": "調高音量（無參數）",
+    "/musiclower": "調低音量（無參數）",
+    "/musicnowbest": "把目前歌曲加入最愛清單（無參數）",
+    "/saynow": "立即用語音念出文字（參數＝要念的文字，通常用 input 變數帶入）",
+    "/say": "用語音念出文字（參數＝要念的文字）",
+    "/bluetooth": "連線／切換藍牙裝置（參數＝裝置名）",
+    "/translateja": "把文字翻成日文（參數＝原文，通常用 input 變數帶入）",
+    "/translatezh": "把文字翻成中文（參數＝原文，通常用 input 變數帶入）",
+}
+
+
+def _command_usage(command: str, command_registry=None) -> str:
+    """Resolve a command's usage hint: prefer the RegisteredCommand.usage that
+    the command declared at registration, fall back to the local _COMMAND_USAGE
+    map. Returns '' when nothing is known."""
+    if command_registry is not None:
+        reg = command_registry.get(command)
+        usage = getattr(reg, "usage", None) if reg is not None else None
+        if usage:
+            return str(usage).strip()
+    return _COMMAND_USAGE.get(command, "")
+
+
 def _workflow_store(runner) -> WorkflowStore:
     """Derive a WorkflowStore path from the runner's tools directory."""
     return WorkflowStore(Path(runner.tools_dir).parent / "workflow_store")
@@ -340,10 +373,20 @@ def _build_nl_workflow_prompt(description: str, catalog, *, command_registry=Non
         except Exception:  # noqa: BLE001 — catalog is best-effort grounding
             tool_lines = []
     tool_block = "\n".join(tool_lines) if tool_lines else "（目前沒有已生成的工具可參考）"
+
+    # Render each allowlisted command WITH its usage so the LLM knows the real
+    # argument shape (e.g. /music playbest, /ir send ceiling_light) and fills
+    # `literal` correctly instead of inventing commands or fabricating
+    # llm_transform steps to produce fixed parameters.
     if command_registry is not None:
-        allow = ", ".join(sorted(c for c in command_registry if is_command_sink_allowed(c)))
+        allowed_cmds = sorted(c for c in command_registry if is_command_sink_allowed(c))
     else:
-        allow = "（任何已登記的 slash 指令，如 /saynow, /music, /bluetooth 等）"
+        allowed_cmds = sorted(_COMMAND_USAGE)
+    cmd_lines = []
+    for c in allowed_cmds:
+        usage = _command_usage(c, command_registry)
+        cmd_lines.append(f"- {c}：{usage}" if usage else f"- {c}")
+    command_block = "\n".join(cmd_lines) if cmd_lines else "（目前沒有可用的指令）"
 
     return (
         "你是工作流草稿生成器。把使用者的一句話需求轉成結構化的 workflow JSON。\n\n"
@@ -351,15 +394,21 @@ def _build_nl_workflow_prompt(description: str, catalog, *, command_registry=Non
         "- tool_call：呼叫一個已生成的工具。欄位：tool（slug）、args（物件）、output（變數名）。\n"
         "- llm_transform：用 LLM 把輸入變數轉換成文字。欄位：inputs（變數名陣列）、"
         "instructions（指示）、output（變數名）。\n"
-        "- command_sink：把一個變數送進指令。欄位：command、input（變數名）、output（變數名）。\n"
-        f"  command 只能是：{allow}\n\n"
+        "- command_sink：呼叫一個 slash 指令。欄位：command、output（變數名），參數二選一：\n"
+        "    • literal（固定字串參數）：當參數是固定的、不依賴前面步驟時用這個，直接填指令後面要帶的字串。\n"
+        "      例：開最愛音樂清單 → {\"kind\":\"command_sink\",\"command\":\"/music\",\"literal\":\"playbest\",\"output\":\"r1\"}\n"
+        "      例：開天花板燈 → {\"kind\":\"command_sink\",\"command\":\"/ir\",\"literal\":\"send ceiling_light\",\"output\":\"r2\"}\n"
+        "    • input（變數名）：只有當參數需要引用前面步驟產生的 output 變數時才用。\n"
+        f"  command 只能是下列已登記的指令（請依其用法填 literal）：\n{command_block}\n\n"
         "可用的工具（tool_call 只能使用下列已存在的 slug；若沒有合適的，改用 llm_transform 或 command_sink，不可自行編造 slug）：\n"
         f"{tool_block}\n\n"
         "規則：\n"
         "1. 每個步驟都要有唯一的 output 變數名（英文小寫，如 weather、greeting）。\n"
-        "2. 後面步驟的 inputs／input 只能引用前面步驟產生的 output 變數。\n"
-        "3. id 用 kebab-case，並以 wf- 開頭（如 wf-morning-greeting）。\n"
-        "4. 只輸出 JSON，不要任何說明文字或 markdown 圍欄。\n\n"
+        "2. 參數固定時一律用 command_sink 的 literal 直接填，**不要**為了產生固定參數而多插一個 llm_transform 步驟。\n"
+        "3. 後面步驟的 inputs／input 只能引用前面步驟產生的 output 變數。\n"
+        "4. command 只能用上面列出的指令，不可自行編造（如 /musiclistbest 不存在）。\n"
+        "5. id 用 kebab-case，並以 wf- 開頭（如 wf-morning-greeting）。\n"
+        "6. 只輸出 JSON，不要任何說明文字或 markdown 圍欄。\n\n"
         "輸出格式：\n"
         '{"id":"wf-...","goal":"...","steps":[{"id":"s1","kind":"...","...":"..."}]}\n\n'
         f"使用者需求：{description}\n\n"

@@ -5,12 +5,15 @@ import pytest
 
 from openclaw_adapter.task_workspace import Workflow, WorkflowStep, WorkflowStore
 from openclaw_adapter.workflow_command import (
+    _build_nl_workflow_prompt,
     _cmd_create,
     _cmd_delete,
     _cmd_list,
     _cmd_run,
     _cmd_show,
     _cmd_traces,
+    _command_usage,
+    _COMMAND_USAGE,
     _extract_json_object,
     _generate_workflow_from_nl,
     _help,
@@ -338,6 +341,73 @@ def test_cmd_create_json_path_still_saves_directly(tmp_path):
     assert "✅" in reply
     assert store.get("wf-json") is not None
     assert not editor.drafts   # JSON path bypasses the draft editor
+
+
+# ── NL prompt grounding (literal + command usage) ─────────────────────────────
+
+import types
+
+
+def test_nl_prompt_exposes_literal_field_and_rule():
+    """The prompt must teach the LLM that command_sink can carry a static
+    `literal` argument, otherwise it fabricates llm_transform steps to produce
+    fixed parameters (the bug behind the 開燈/播放最愛 draft)."""
+    prompt = _build_nl_workflow_prompt("開燈然後播放最愛", catalog=None)
+    assert "literal" in prompt
+    # the rule discouraging a fabricated llm_transform for fixed params
+    assert "llm_transform" in prompt and "不要" in prompt
+
+
+def test_nl_prompt_renders_command_usage_from_registry():
+    registry = {
+        "/music": types.SimpleNamespace(usage="playbest=播放最愛清單"),
+        "/ir": types.SimpleNamespace(usage="send <裝置> on/off，如 send ceiling_light"),
+    }
+    prompt = _build_nl_workflow_prompt("開燈播音樂", catalog=None, command_registry=registry)
+    assert "playbest" in prompt
+    assert "ceiling_light" in prompt
+
+
+def test_nl_prompt_falls_back_to_local_usage_map_without_registry():
+    prompt = _build_nl_workflow_prompt("播放最愛", catalog=None, command_registry=None)
+    # local _COMMAND_USAGE supplies the hints when no registry is wired
+    assert "playbest" in prompt
+    assert "ceiling_light" in prompt
+
+
+def test_command_usage_prefers_registry_over_local_map():
+    registry = {"/music": types.SimpleNamespace(usage="REGISTRY-USAGE")}
+    assert _command_usage("/music", registry) == "REGISTRY-USAGE"
+    # unknown-in-registry → local map
+    assert "ceiling_light" in _command_usage("/ir", registry)
+    # nothing known → empty string
+    assert _command_usage("/totally-unknown-xyz", registry) == ""
+
+
+def test_command_usage_local_map_when_no_registry():
+    assert _command_usage("/music", None) == _COMMAND_USAGE["/music"]
+
+
+def test_generate_workflow_accepts_command_sink_literal(tmp_path):
+    """A draft that uses command_sink + literal (the correct shape for fixed
+    commands) must parse into a Workflow with no fabricated llm_transform."""
+    draft = json.dumps({
+        "id": "wf-light-music",
+        "goal": "開燈然後播放最愛音樂清單",
+        "steps": [
+            {"id": "s1", "kind": "command_sink", "command": "/ir",
+             "literal": "send ceiling_light", "output": "r1"},
+            {"id": "s2", "kind": "command_sink", "command": "/music",
+             "literal": "playbest", "output": "r2"},
+        ],
+    }, ensure_ascii=False)
+    llm = _FakeLLM(draft)
+    wf, err, _ = _generate_workflow_from_nl("開燈然後播放最愛音樂清單", llm, None)
+    assert err is None
+    assert [s.kind for s in wf.steps] == ["command_sink", "command_sink"]
+    assert wf.steps[0].literal == "send ceiling_light"
+    assert wf.steps[1].command == "/music" and wf.steps[1].literal == "playbest"
+    assert all(s.kind != "llm_transform" for s in wf.steps)
 
 
 # ── helpers: JSON extraction + generation ────────────────────────────────────

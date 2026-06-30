@@ -1250,17 +1250,20 @@ def _build_registries(
         ),
         "/voice": RegisteredCommand(build_voice_handler(settings)),
         "/say": RegisteredCommand(
-            build_say_handler(settings), ack="收到，正在合成語音…", background=True
+            build_say_handler(settings), ack="收到，正在合成語音…", background=True,
+            usage="用語音念出文字（參數＝要念的文字，通常用 input 變數帶入）",
         ),
         "/saynow": RegisteredCommand(
             build_saynow_handler(settings),
             ack="收到，正在合成並於 Mac mini 播放語音…",
             background=True,
+            usage="立即於 Mac mini 念出文字（參數＝要念的文字，通常用 input 變數帶入）",
         ),
         "/translateja": RegisteredCommand(
             build_translate_handler(settings, target="ja"),
             ack="收到，正在翻譯成日文…",
             background=True,
+            usage="把文字翻成日文（參數＝原文，通常用 input 變數帶入）",
         ),
         "/ja": RegisteredCommand(
             build_translate_handler(settings, target="ja"),
@@ -1276,6 +1279,7 @@ def _build_registries(
             build_translate_handler(settings, target="zh"),
             ack="收到，正在翻譯成繁體中文…",
             background=True,
+            usage="把文字翻成繁體中文（參數＝原文，通常用 input 變數帶入）",
         ),
         "/zh": RegisteredCommand(
             build_translate_handler(settings, target="zh"),
@@ -1317,15 +1321,39 @@ def _build_registries(
             build_knowledge_handler(settings, knowledge_inbox=knowledge_inbox)
         ),
         "/source": RegisteredCommand(build_source_handler(settings)),
-        "/music": RegisteredCommand(build_music_handler(settings)),
-        "/musiclistall": RegisteredCommand(build_musiclistall_handler(settings)),
-        "/musiclistbest": RegisteredCommand(_musiclistbest_handler),
-        "/musicnowbest": RegisteredCommand(build_musicnowbest_handler(settings)),
-        "/musicmute": RegisteredCommand(lambda r, c: mute_music(settings)),
-        "/musiclouder": RegisteredCommand(lambda r, c: louder_music(settings)),
-        "/musiclower": RegisteredCommand(lambda r, c: lower_music(settings)),
-        "/bluetooth": RegisteredCommand(build_bluetooth_handler(settings)),
-        "/ir": RegisteredCommand(build_ir_handler(settings)),
+        "/music": RegisteredCommand(
+            build_music_handler(settings),
+            usage="playbest=播放最愛清單；<關鍵字>=搜尋並播放該歌曲",
+        ),
+        "/musiclistall": RegisteredCommand(
+            build_musiclistall_handler(settings),
+            usage="列出全部曲目清單（不播放，無參數）",
+        ),
+        "/musiclistbest": RegisteredCommand(
+            _musiclistbest_handler,
+            usage="列出最愛曲目清單（不播放，無參數）；要『播放』最愛請改用 /music playbest",
+        ),
+        "/musicnowbest": RegisteredCommand(
+            build_musicnowbest_handler(settings),
+            usage="把目前播放的歌曲加入最愛清單（無參數）",
+        ),
+        "/musicmute": RegisteredCommand(
+            lambda r, c: mute_music(settings), usage="音樂靜音（無參數）",
+        ),
+        "/musiclouder": RegisteredCommand(
+            lambda r, c: louder_music(settings), usage="調高音量（無參數）",
+        ),
+        "/musiclower": RegisteredCommand(
+            lambda r, c: lower_music(settings), usage="調低音量（無參數）",
+        ),
+        "/bluetooth": RegisteredCommand(
+            build_bluetooth_handler(settings),
+            usage="連線／切換藍牙裝置（參數＝裝置名）",
+        ),
+        "/ir": RegisteredCommand(
+            build_ir_handler(settings),
+            usage="紅外線家電控制：send <裝置> <on/off>，如 `send ceiling_light`（開天花板燈）",
+        ),
         "/research": RegisteredCommand(
             research_handler,
             ack="收到，正在進行深度商品研究（會分階段回報進度）…",
