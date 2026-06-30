@@ -44,6 +44,9 @@ class AssistantSettings:
     openclaw_opencode_timeout_seconds: int = 900
     openclaw_mistral_api_key: str | None = None
     openclaw_mistral_model: str = "mistral-large-latest"
+    openclaw_gemini_api_key: str | None = None
+    openclaw_gemini_pro_model: str = "gemini-2.5-pro"
+    openclaw_gemini_flash_model: str = "gemini-2.5-flash"
     # /research appreciation enrichment backend, decoupled from /new's codegen
     # backend above. "opencode" routes the appreciation summariser to cloud
     # big-pickle (with single in-process local fallback); empty keeps it local.
@@ -258,6 +261,13 @@ def get_settings() -> AssistantSettings:
             _getenv_any("MISTRAL_API_KEY", "MISTRAL_KEY")
         ),
         openclaw_mistral_model=os.getenv("OPENCLAW_MISTRAL_MODEL", "mistral-large-latest"),
+        openclaw_gemini_api_key=_none_if_empty(
+            _getenv_any("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GEMINI_API_KEY")
+        ),
+        openclaw_gemini_pro_model=os.getenv("OPENCLAW_GEMINI_PRO_MODEL", "gemini-2.5-pro"),
+        openclaw_gemini_flash_model=os.getenv(
+            "OPENCLAW_GEMINI_FLASH_MODEL", "gemini-2.5-flash"
+        ),
         openclaw_research_cloud_enricher=_none_if_empty(
             os.getenv("OPENCLAW_RESEARCH_CLOUD_ENRICHER")
         ),

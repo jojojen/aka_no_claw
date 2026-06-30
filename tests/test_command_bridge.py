@@ -92,6 +92,11 @@ def test_parse_request_defaults():
     assert req.attachments == ()
 
 
+def test_parse_request_accepts_gemini_backend():
+    req = parse_request({"mode": "chat", "input": "hi", "chat_backend": "gemini"})
+    assert req.chat_backend == "gemini"
+
+
 def test_parse_request_rejects_bad_mode():
     with pytest.raises(RequestValidationError):
         parse_request({"mode": "nope"})
@@ -392,6 +397,72 @@ def test_chat_cloud_unavailable_is_error(bridge, monkeypatch):
     assert resp.status == STATUS_ERROR
 
 
+def test_model_routes_reports_gemini_chain():
+    b = CommandBridge(settings=_tool_settings())
+    routes = b.model_routes()
+    gemini = next(r for r in routes["routes"] if r["backend"] == "gemini")
+    assert gemini["requested_model"] == "gemini-2.5-pro"
+    assert [m["model"] for m in gemini["chain"]] == [
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        b._local_model(),
+    ]
+
+
+def test_chat_gemini_quota_falls_back_to_flash(monkeypatch):
+    b = CommandBridge(settings=_tool_settings(gemini_key="fake-key"))
+
+    class _Client:
+        def __init__(self, model):
+            self.model = model
+
+        def generate(self, prompt, *, temperature=0.0):
+            if self.model == "gemini-2.5-pro":
+                from openclaw_adapter.command_bridge import _GeminiRequestError
+
+                raise _GeminiRequestError("RESOURCE_EXHAUSTED", status="quota_exhausted")
+            return f"flash:{prompt}"
+
+    monkeypatch.setattr(b, "_build_gemini_chat_client", lambda model: _Client(model))
+    req = parse_request({"mode": "chat", "input": "hello", "chat_backend": "gemini"})
+    resp = b.handle(req)
+    assert resp.status == STATUS_OK
+    assert resp.message == "flash:hello"
+    meta = resp.to_dict()["model_metadata"]
+    assert meta["requested_model"] == "gemini-2.5-pro"
+    assert meta["final_model"] == "gemini-2.5-flash"
+    assert meta["attempted_models"][0]["status"] == "quota_exhausted"
+    assert meta["attempted_models"][1]["status"] == "ok"
+
+
+def test_chat_gemini_flash_quota_falls_back_to_local(monkeypatch):
+    b = CommandBridge(settings=_tool_settings(gemini_key="fake-key"))
+
+    class _Client:
+        def __init__(self, model):
+            self.model = model
+
+        def generate(self, prompt, *, temperature=0.0):
+            from openclaw_adapter.command_bridge import _GeminiRequestError
+
+            raise _GeminiRequestError("RESOURCE_EXHAUSTED", status="quota_exhausted")
+
+    monkeypatch.setattr(b, "_build_gemini_chat_client", lambda model: _Client(model))
+    monkeypatch.setattr(b, "_ollama_generate_blocking", lambda prompt: f"local:{prompt}")
+    req = parse_request({"mode": "chat", "input": "hello", "chat_backend": "gemini"})
+    resp = b.handle(req)
+    assert resp.status == STATUS_OK
+    assert resp.message == "local:hello"
+    meta = resp.to_dict()["model_metadata"]
+    assert meta["final_provider"] == "local"
+    assert meta["final_model"] == b._local_model()
+    assert [a["status"] for a in meta["attempted_models"]] == [
+        "quota_exhausted",
+        "quota_exhausted",
+        "ok",
+    ]
+
+
 def test_chat_local_blocking_uses_history(bridge, monkeypatch):
     captured: dict[str, str] = {}
 
@@ -491,13 +562,18 @@ def test_parse_router_decision_rejects_control_only_query():
 
 
 # --- #45 chat contextual tool routing -------------------------------------
-def _tool_settings(debug: bool = False):
+def _tool_settings(debug: bool = False, gemini_key: str | None = None):
     return SimpleNamespace(
         openclaw_web_chat_tool_debug=debug,
         openclaw_local_text_model="qwen3:14b",
         openclaw_local_text_endpoint="http://local",
         openclaw_local_text_timeout_seconds=60,
         openclaw_opencode_model="big-pickle",
+        openclaw_mistral_api_key=None,
+        openclaw_mistral_model="mistral-large-latest",
+        openclaw_gemini_api_key=gemini_key,
+        openclaw_gemini_pro_model="gemini-2.5-pro",
+        openclaw_gemini_flash_model="gemini-2.5-flash",
         openclaw_music_dir="/tmp/test_music",
         openclaw_music_index_path="/tmp/test_music_index.json",
     )

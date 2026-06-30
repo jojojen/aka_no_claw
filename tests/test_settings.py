@@ -129,6 +129,19 @@ def test_get_settings_reads_opencode_codegen_environment_keys(monkeypatch) -> No
     assert settings.openclaw_opencode_timeout_seconds == 321
 
 
+def test_get_settings_reads_gemini_environment_keys(monkeypatch) -> None:
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setenv("GOOGLE_API_KEY", "google-key")
+    monkeypatch.setenv("OPENCLAW_GEMINI_PRO_MODEL", "gemini-pro-test")
+    monkeypatch.setenv("OPENCLAW_GEMINI_FLASH_MODEL", "gemini-flash-test")
+
+    settings = get_settings()
+
+    assert settings.openclaw_gemini_api_key == "google-key"
+    assert settings.openclaw_gemini_pro_model == "gemini-pro-test"
+    assert settings.openclaw_gemini_flash_model == "gemini-flash-test"
+
+
 def test_get_settings_reads_local_tts_environment_keys(monkeypatch) -> None:
     monkeypatch.setenv("OPENCLAW_LOCAL_TTS_ENDPOINT", "http://127.0.0.1:10101")
     monkeypatch.setenv("OPENCLAW_LOCAL_TTS_TIMEOUT_SECONDS", "25")

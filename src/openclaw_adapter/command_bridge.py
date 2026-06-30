@@ -24,6 +24,7 @@ import re
 import threading
 import time
 from collections.abc import Iterator
+from urllib.parse import quote
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from uuid import uuid4
@@ -36,6 +37,7 @@ from .service_restart import RESTART_MESSAGE, trigger_restart_all
 from .command_bridge_models import (
     CHAT_BACKEND_CLOUD_MISTRAL,
     CHAT_BACKEND_CLOUD_PICKLE,
+    CHAT_BACKEND_GEMINI,
     CHAT_BACKEND_LOCAL,
     CHAT_TOOL_SEARCH,
     MUSIC_ACTION_LIST_ALL,
@@ -53,6 +55,8 @@ from .command_bridge_models import (
     MODE_CHAT,
     MODE_INVESTMENT,
     MODE_TRANSLATION,
+    ModelAttempt,
+    ModelMetadata,
     MusicIntent,
     ROUTER_DECISION_TOOL,
     RouterDecision,
@@ -124,6 +128,107 @@ _CHAT_SYSTEM_PROMPT = (
     "並以繁體中文自然作答。"
 )
 _CHAT_ROLE_LABELS = {"user": "使用者", "assistant": "助理", "system": "系統"}
+_MODEL_STATUS_OK = "ok"
+_MODEL_STATUS_ERROR = "error"
+_MODEL_STATUS_NOT_CONFIGURED = "not_configured"
+_MODEL_STATUS_QUOTA_EXHAUSTED = "quota_exhausted"
+_MODEL_STATUS_RATE_LIMITED = "rate_limited"
+_GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
+
+class _GeminiRequestError(RuntimeError):
+    def __init__(self, message: str, *, status: str = _MODEL_STATUS_ERROR) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+class _GeminiTextClient:
+    """Minimal Google Gemini generateContent client for web chat."""
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        timeout_seconds: int,
+        ssl_context: object | None = None,
+    ) -> None:
+        self.api_key = api_key
+        self.model = model
+        self.timeout_seconds = max(1, timeout_seconds)
+        self.ssl_context = ssl_context
+
+    def generate(self, prompt: str, *, temperature: float = 0.7) -> str:
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": temperature},
+        }
+        url = (
+            f"{_GEMINI_API_BASE}/models/{quote(self.model, safe='')}:generateContent"
+            f"?key={quote(self.api_key, safe='')}"
+        )
+        request = Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=self.timeout_seconds, context=self.ssl_context) as response:
+                body = response.read().decode("utf-8", errors="replace")
+        except HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")[:800]
+            except Exception:
+                detail = ""
+            raise _GeminiRequestError(
+                f"Gemini HTTP {exc.code}: {detail}",
+                status=_gemini_http_status(exc.code, detail),
+            ) from exc
+        except URLError as exc:
+            raise _GeminiRequestError(
+                f"Gemini request failed: {exc.reason}", status=_MODEL_STATUS_ERROR
+            ) from exc
+        try:
+            data = json.loads(body)
+        except ValueError as exc:
+            raise _GeminiRequestError(
+                "Gemini returned invalid JSON", status=_MODEL_STATUS_ERROR
+            ) from exc
+        text = _extract_gemini_text(data)
+        if not text:
+            raise _GeminiRequestError("Gemini returned no text", status=_MODEL_STATUS_ERROR)
+        return text
+
+
+def _gemini_http_status(code: int, detail: str) -> str:
+    lowered = detail.lower()
+    if code == 429 or "resource_exhausted" in lowered or "quota" in lowered:
+        return _MODEL_STATUS_QUOTA_EXHAUSTED
+    if code == 403 and ("rate" in lowered or "quota" in lowered):
+        return _MODEL_STATUS_RATE_LIMITED
+    return _MODEL_STATUS_ERROR
+
+
+def _is_gemini_fallback_status(status: str) -> bool:
+    return status in {_MODEL_STATUS_QUOTA_EXHAUSTED, _MODEL_STATUS_RATE_LIMITED}
+
+
+def _extract_gemini_text(data: object) -> str:
+    if not isinstance(data, dict):
+        return ""
+    parts: list[str] = []
+    for candidate in data.get("candidates") or []:
+        if not isinstance(candidate, dict):
+            continue
+        content = candidate.get("content")
+        if not isinstance(content, dict):
+            continue
+        for part in content.get("parts") or []:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+    return "".join(parts).strip()
 
 # Web Chat contextual tool routing (#45). A local router LLM decides, per chat
 # turn, whether to answer directly or call the one whitelisted tool (/search).
@@ -523,7 +628,7 @@ class CommandBridge:
             if response.status == STATUS_ERROR:
                 yield stream_error(response.message)
             else:
-                yield stream_done(response.message)
+                yield stream_done(response.message, model_metadata=response.model_metadata)
         except Exception as exc:  # noqa: BLE001
             logger.exception("command bridge stream failed mode=%s", req.mode)
             yield stream_error(f"後端處理失敗：{exc}")
@@ -563,7 +668,10 @@ class CommandBridge:
                     decision.tool, tool_result.source_count, tool_result.result_summary,
                 )
                 return WebCommandResponse(
-                    status=STATUS_OK, message=tool_result.answer, mode=MODE_CHAT
+                    status=STATUS_OK,
+                    message=tool_result.answer,
+                    mode=MODE_CHAT,
+                    model_metadata=tool_result.model_metadata,
                 )
             except Exception as exc:  # noqa: BLE001 — surface, don't crash the turn
                 logger.exception("chat tool failed tool=%s", decision.tool)
@@ -583,6 +691,12 @@ class CommandBridge:
                     mode=MODE_CHAT,
                 )
             message = client.generate(prompt, temperature=0.7)
+            metadata = self._model_metadata_for_backend(
+                req.chat_backend,
+                (ModelAttempt("opencode", self._big_pickle_model(), _MODEL_STATUS_OK),),
+                "opencode",
+                self._big_pickle_model(),
+            )
         elif req.chat_backend == CHAT_BACKEND_CLOUD_MISTRAL:
             client = self._build_mistral_chat_client()
             if client is None:
@@ -592,9 +706,25 @@ class CommandBridge:
                     mode=MODE_CHAT,
                 )
             message = client.generate(prompt, temperature=0.7)
+            metadata = self._model_metadata_for_backend(
+                req.chat_backend,
+                (ModelAttempt("mistral", self._mistral_model(), _MODEL_STATUS_OK),),
+                "mistral",
+                self._mistral_model(),
+            )
+        elif req.chat_backend == CHAT_BACKEND_GEMINI:
+            message, metadata = self._generate_gemini_with_fallback(prompt, temperature=0.7)
         else:
             message = self._ollama_generate_blocking(prompt)
-        return WebCommandResponse(status=STATUS_OK, message=message, mode=MODE_CHAT)
+            metadata = self._model_metadata_for_backend(
+                req.chat_backend,
+                (ModelAttempt("local", self._local_model(), _MODEL_STATUS_OK),),
+                "local",
+                self._local_model(),
+            )
+        return WebCommandResponse(
+            status=STATUS_OK, message=message, mode=MODE_CHAT, model_metadata=metadata
+        )
 
     def _stream_chat(self, req: WebCommandRequest) -> Iterator[dict]:
         text = (req.input or "").strip()
@@ -666,6 +796,8 @@ class CommandBridge:
             yield from self._stream_cloud_chat(prompt)
         elif req.chat_backend == CHAT_BACKEND_CLOUD_MISTRAL:
             yield from self._stream_mistral_chat(prompt)
+        elif req.chat_backend == CHAT_BACKEND_GEMINI:
+            yield from self._stream_gemini_chat(prompt)
         else:
             yield from self._stream_ollama_chat(prompt)
 
@@ -1092,6 +1224,7 @@ class CommandBridge:
             try:
                 tool_result: ChatToolResult = self._run_chat_tool(req, decision)
                 result["text"] = tool_result.answer
+                result["model_metadata"] = tool_result.model_metadata
                 logger.info(
                     "[chat-tool] tool=%s sources=%d summary=%r",
                     decision.tool, tool_result.source_count, tool_result.result_summary,
@@ -1117,7 +1250,11 @@ class CommandBridge:
         if "error" in result:
             yield stream_error(f"工具執行失敗：{result['error']}")
             return
-        yield stream_done(str(result.get("text") or "").strip())
+        metadata = result.get("model_metadata")
+        yield stream_done(
+            str(result.get("text") or "").strip(),
+            model_metadata=metadata if isinstance(metadata, ModelMetadata) else None,
+        )
 
     def _push_orphaned_result(self, text: str) -> None:
         """Push a completed assistant message into session memory when the
@@ -1174,7 +1311,7 @@ class CommandBridge:
             f"搜尋查詢：{query}", "",
             "搜尋結果：", source_pack, "", "回答：",
         ])
-        answer, model_label = self._synthesize_with_chat_backend(
+        answer, model_label, model_metadata = self._synthesize_with_chat_backend(
             req.chat_backend, prompt
         )
         message = (
@@ -1187,6 +1324,7 @@ class CommandBridge:
             answer=message,
             source_count=len(results),
             result_summary=f"query={query!r} sources={len(results)} model={model_label}",
+            model_metadata=model_metadata,
         )
 
     @staticmethod
@@ -1214,28 +1352,80 @@ class CommandBridge:
 
     def _synthesize_with_chat_backend(
         self, chat_backend: str, prompt: str
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, ModelMetadata]:
         """Compose the final grounded answer with the user's chat backend.
-        Returns (text, model_label). If cloud is requested but unavailable, fall
-        back to local synthesis so the search result is still usable."""
+        Returns (text, model_label, metadata). If cloud is requested but
+        unavailable, fall back to local synthesis so the search result is still
+        usable and visible."""
         if chat_backend == CHAT_BACKEND_CLOUD_PICKLE:
             client = self._build_cloud_chat_client()
             if client is None:
                 text = self._ollama_generate_blocking(prompt)
-                return text, f"本地 {self._local_model()}（雲端不可用，已改用本地）"
+                metadata = self._model_metadata_for_backend(
+                    chat_backend,
+                    (
+                        ModelAttempt(
+                            "opencode",
+                            self._big_pickle_model(),
+                            _MODEL_STATUS_NOT_CONFIGURED,
+                            "Big Pickle unavailable",
+                        ),
+                        ModelAttempt("local", self._local_model(), _MODEL_STATUS_OK),
+                    ),
+                    "local",
+                    self._local_model(),
+                    fallback_reason="Big Pickle unavailable",
+                )
+                return text, f"本地 {self._local_model()}（雲端不可用，已改用本地）", metadata
             text = client.generate(prompt, temperature=0.3)
-            model = (self.settings.openclaw_opencode_model or "big-pickle").strip()
-            return text, f"雲端 {model}"
+            model = self._big_pickle_model()
+            metadata = self._model_metadata_for_backend(
+                chat_backend,
+                (ModelAttempt("opencode", model, _MODEL_STATUS_OK),),
+                "opencode",
+                model,
+            )
+            return text, f"雲端 {model}", metadata
         if chat_backend == CHAT_BACKEND_CLOUD_MISTRAL:
             client = self._build_mistral_chat_client()
             if client is None:
                 text = self._ollama_generate_blocking(prompt)
-                return text, f"本地 {self._local_model()}（Mistral 不可用，已改用本地）"
+                metadata = self._model_metadata_for_backend(
+                    chat_backend,
+                    (
+                        ModelAttempt(
+                            "mistral",
+                            self._mistral_model(),
+                            _MODEL_STATUS_NOT_CONFIGURED,
+                            "Mistral API key missing",
+                        ),
+                        ModelAttempt("local", self._local_model(), _MODEL_STATUS_OK),
+                    ),
+                    "local",
+                    self._local_model(),
+                    fallback_reason="Mistral API key missing",
+                )
+                return text, f"本地 {self._local_model()}（Mistral 不可用，已改用本地）", metadata
             text = client.generate(prompt, temperature=0.3)
-            model = getattr(self.settings, "openclaw_mistral_model", "mistral-nemo-latest")
-            return text, f"Mistral {model}"
+            model = self._mistral_model()
+            metadata = self._model_metadata_for_backend(
+                chat_backend,
+                (ModelAttempt("mistral", model, _MODEL_STATUS_OK),),
+                "mistral",
+                model,
+            )
+            return text, f"Mistral {model}", metadata
+        if chat_backend == CHAT_BACKEND_GEMINI:
+            text, metadata = self._generate_gemini_with_fallback(prompt, temperature=0.3)
+            return text, f"{metadata.final_provider} {metadata.final_model}", metadata
         text = self._ollama_generate_blocking(prompt)
-        return text, f"本地 {self._local_model()}"
+        metadata = self._model_metadata_for_backend(
+            chat_backend,
+            (ModelAttempt("local", self._local_model(), _MODEL_STATUS_OK),),
+            "local",
+            self._local_model(),
+        )
+        return text, f"本地 {self._local_model()}", metadata
 
     # --- async job + poll (long research, decoupled from the connection) --
     def _get_job_store(self) -> JobStore:
@@ -1829,6 +2019,79 @@ class CommandBridge:
         logger.info("restartall: scheduled script=%s", script_path)
         return {"status": STATUS_OK, "message": RESTART_MESSAGE}
 
+    def model_routes(self) -> dict:
+        """Return the concrete model chain behind each web Chat model tab."""
+        local = self._local_model()
+        return {
+            "status": STATUS_OK,
+            "routes": [
+                {
+                    "backend": CHAT_BACKEND_LOCAL,
+                    "label": "本地模型",
+                    "requested_provider": "local",
+                    "requested_model": local,
+                    "chain": [{"provider": "local", "model": local}],
+                    "configured": True,
+                },
+                {
+                    "backend": CHAT_BACKEND_CLOUD_MISTRAL,
+                    "label": "Mistral",
+                    "requested_provider": "mistral",
+                    "requested_model": self._mistral_model(),
+                    "chain": [{"provider": "mistral", "model": self._mistral_model()}],
+                    "configured": bool(getattr(self.settings, "openclaw_mistral_api_key", None)),
+                },
+                {
+                    "backend": CHAT_BACKEND_GEMINI,
+                    "label": "Gemini",
+                    "requested_provider": "gemini",
+                    "requested_model": self._gemini_pro_model(),
+                    "chain": [
+                        {"provider": "gemini", "model": self._gemini_pro_model()},
+                        {"provider": "gemini", "model": self._gemini_flash_model()},
+                        {"provider": "local", "model": local},
+                    ],
+                    "configured": bool(getattr(self.settings, "openclaw_gemini_api_key", None)),
+                },
+                {
+                    "backend": CHAT_BACKEND_CLOUD_PICKLE,
+                    "label": "Big Pickle",
+                    "requested_provider": "opencode",
+                    "requested_model": self._big_pickle_model(),
+                    "chain": [{"provider": "opencode", "model": self._big_pickle_model()}],
+                    "configured": True,
+                },
+            ],
+        }
+
+    def _requested_model_for_backend(self, chat_backend: str) -> tuple[str, str]:
+        if chat_backend == CHAT_BACKEND_CLOUD_PICKLE:
+            return "opencode", self._big_pickle_model()
+        if chat_backend == CHAT_BACKEND_CLOUD_MISTRAL:
+            return "mistral", self._mistral_model()
+        if chat_backend == CHAT_BACKEND_GEMINI:
+            return "gemini", self._gemini_pro_model()
+        return "local", self._local_model()
+
+    def _model_metadata_for_backend(
+        self,
+        chat_backend: str,
+        attempted: tuple[ModelAttempt, ...],
+        final_provider: str,
+        final_model: str,
+        *,
+        fallback_reason: str | None = None,
+    ) -> ModelMetadata:
+        requested_provider, requested_model = self._requested_model_for_backend(chat_backend)
+        return ModelMetadata(
+            requested_provider=requested_provider,
+            requested_model=requested_model,
+            attempted_models=attempted,
+            final_provider=final_provider,
+            final_model=final_model,
+            fallback_reason=fallback_reason,
+        )
+
     def _stream_ollama_chat(self, prompt: str) -> Iterator[dict]:
         endpoint = self.settings.openclaw_local_text_endpoint.rstrip("/")
         model = self._local_model()
@@ -1871,7 +2134,13 @@ class CommandBridge:
         except URLError as exc:
             yield stream_error(f"本地模型無回應：{exc.reason}")
             return
-        yield stream_done("".join(full).strip())
+        metadata = self._model_metadata_for_backend(
+            CHAT_BACKEND_LOCAL,
+            (ModelAttempt("local", model, _MODEL_STATUS_OK),),
+            "local",
+            model,
+        )
+        yield stream_done("".join(full).strip(), model_metadata=metadata)
 
     def _stream_cloud_chat(self, prompt: str) -> Iterator[dict]:
         client = self._build_cloud_chat_client()
@@ -1911,7 +2180,13 @@ class CommandBridge:
         text = str(result.get("text") or "").strip()
         if text:
             yield stream_delta(text)
-        yield stream_done(text)
+        metadata = self._model_metadata_for_backend(
+            CHAT_BACKEND_CLOUD_PICKLE,
+            (ModelAttempt("opencode", self._big_pickle_model(), _MODEL_STATUS_OK),),
+            "opencode",
+            self._big_pickle_model(),
+        )
+        yield stream_done(text, model_metadata=metadata)
 
     def _ollama_generate_blocking(self, prompt: str) -> str:
         from .dynamic_tools import OllamaTextClient
@@ -1928,8 +2203,7 @@ class CommandBridge:
         from .dynamic_tools import OpenCodeTextClient, probe_opencode
 
         base_url = self.settings.openclaw_opencode_base_url
-        raw_model = (self.settings.openclaw_opencode_model or "big-pickle").strip()
-        model = raw_model.split("/")[-1] if "/" in raw_model else raw_model
+        model = self._big_pickle_model()
         if probe_opencode(base_url, model=model, timeout=10.0):
             return OpenCodeTextClient(
                 base_url=base_url,
@@ -1946,8 +2220,21 @@ class CommandBridge:
         key = getattr(self.settings, "openclaw_mistral_api_key", None)
         if not key:
             return None
-        model = getattr(self.settings, "openclaw_mistral_model", "mistral-nemo-latest")
+        model = self._mistral_model()
         return MistralTextClient(api_key=key, model=model, timeout_seconds=180)
+
+    def _build_gemini_chat_client(self, model: str):
+        """Gemini cloud chat client; returns None when no Google API key is configured."""
+        key = getattr(self.settings, "openclaw_gemini_api_key", None)
+        if not key:
+            return None
+        ssl_ctx = build_ssl_context(self.settings)
+        return _GeminiTextClient(
+            api_key=key,
+            model=model,
+            timeout_seconds=180,
+            ssl_context=ssl_ctx,
+        )
 
     def _stream_mistral_chat(self, prompt: str) -> "Iterator[dict]":
         client = self._build_mistral_chat_client()
@@ -1981,10 +2268,130 @@ class CommandBridge:
         text = str(result.get("text") or "").strip()
         if text:
             yield stream_delta(text)
-        yield stream_done(text)
+        metadata = self._model_metadata_for_backend(
+            CHAT_BACKEND_CLOUD_MISTRAL,
+            (ModelAttempt("mistral", self._mistral_model(), _MODEL_STATUS_OK),),
+            "mistral",
+            self._mistral_model(),
+        )
+        yield stream_done(text, model_metadata=metadata)
+
+    def _generate_gemini_with_fallback(
+        self, prompt: str, *, temperature: float
+    ) -> tuple[str, ModelMetadata]:
+        attempts: list[ModelAttempt] = []
+        pro_model = self._gemini_pro_model()
+        flash_model = self._gemini_flash_model()
+
+        if not getattr(self.settings, "openclaw_gemini_api_key", None):
+            attempts.append(
+                ModelAttempt(
+                    "gemini",
+                    pro_model,
+                    _MODEL_STATUS_NOT_CONFIGURED,
+                    "Gemini API key missing",
+                )
+            )
+            text = self._ollama_generate_blocking(prompt)
+            attempts.append(ModelAttempt("local", self._local_model(), _MODEL_STATUS_OK))
+            return text, self._model_metadata_for_backend(
+                CHAT_BACKEND_GEMINI,
+                tuple(attempts),
+                "local",
+                self._local_model(),
+                fallback_reason="Gemini API key missing",
+            )
+
+        last_reason = ""
+        for model in (pro_model, flash_model):
+            client = self._build_gemini_chat_client(model)
+            if client is None:
+                attempts.append(
+                    ModelAttempt(
+                        "gemini",
+                        model,
+                        _MODEL_STATUS_NOT_CONFIGURED,
+                        "Gemini API key missing",
+                    )
+                )
+                last_reason = "Gemini API key missing"
+                break
+            try:
+                text = client.generate(prompt, temperature=temperature)
+            except _GeminiRequestError as exc:
+                attempts.append(ModelAttempt("gemini", model, exc.status, str(exc)))
+                last_reason = str(exc)
+                if _is_gemini_fallback_status(exc.status):
+                    continue
+                raise
+            attempts.append(ModelAttempt("gemini", model, _MODEL_STATUS_OK))
+            fallback_reason = attempts[0].reason if len(attempts) > 1 else None
+            return text, self._model_metadata_for_backend(
+                CHAT_BACKEND_GEMINI,
+                tuple(attempts),
+                "gemini",
+                model,
+                fallback_reason=fallback_reason,
+            )
+
+        text = self._ollama_generate_blocking(prompt)
+        attempts.append(ModelAttempt("local", self._local_model(), _MODEL_STATUS_OK))
+        return text, self._model_metadata_for_backend(
+            CHAT_BACKEND_GEMINI,
+            tuple(attempts),
+            "local",
+            self._local_model(),
+            fallback_reason=last_reason or "Gemini quota or rate limit",
+        )
+
+    def _stream_gemini_chat(self, prompt: str) -> Iterator[dict]:
+        result: dict[str, object] = {}
+        done = threading.Event()
+
+        def _worker() -> None:
+            try:
+                text, metadata = self._generate_gemini_with_fallback(prompt, temperature=0.7)
+                result["text"] = text
+                result["model_metadata"] = metadata
+            except Exception as exc:  # noqa: BLE001
+                result["error"] = str(exc)
+            finally:
+                done.set()
+
+        threading.Thread(target=_worker, daemon=True).start()
+        while not done.wait(timeout=_HEARTBEAT_SECONDS):
+            yield stream_heartbeat()
+        if "error" in result:
+            yield stream_error(f"Gemini 後端失敗：{result['error']}")
+            return
+        text = str(result.get("text") or "").strip()
+        if text:
+            yield stream_delta(text)
+        metadata = result.get("model_metadata")
+        yield stream_done(
+            text, model_metadata=metadata if isinstance(metadata, ModelMetadata) else None
+        )
 
     def _local_model(self) -> str:
-        return (self.settings.openclaw_local_text_model or "qwen3:14b").split(",")[0].strip()
+        return (
+            getattr(self.settings, "openclaw_local_text_model", None) or "qwen3:14b"
+        ).split(",")[0].strip()
+
+    def _big_pickle_model(self) -> str:
+        raw = (getattr(self.settings, "openclaw_opencode_model", None) or "big-pickle").strip()
+        return raw.split("/")[-1] if "/" in raw else raw
+
+    def _mistral_model(self) -> str:
+        return (getattr(self.settings, "openclaw_mistral_model", None) or "mistral-large-latest").strip()
+
+    def _gemini_pro_model(self) -> str:
+        return (getattr(self.settings, "openclaw_gemini_pro_model", None) or "gemini-2.5-pro").strip()
+
+    def _gemini_flash_model(self) -> str:
+        return (
+            getattr(self.settings, "openclaw_gemini_flash_model", None)
+            or "gemini-2.5-flash"
+        ).strip()
 
     # --- translation -----------------------------------------------------
     def _image_translate_renderer(self):

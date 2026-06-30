@@ -113,6 +113,8 @@ def _build_handler(bridge: CommandBridge, *, lan_enabled: bool) -> type[BaseHTTP
                 self._write_json(bridge.load_session())
             elif split.path == "/api/command/music/now":
                 self._write_json(bridge.now_playing())
+            elif split.path == "/api/command/model-routes":
+                self._write_json(bridge.model_routes())
             else:
                 self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 

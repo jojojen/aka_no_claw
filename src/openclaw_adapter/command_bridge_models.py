@@ -38,7 +38,13 @@ SUBMODE_SELLER_REPUTATION_SNAPSHOT = "seller_reputation_snapshot"
 CHAT_BACKEND_LOCAL = "local"
 CHAT_BACKEND_CLOUD_PICKLE = "cloud_pickle"
 CHAT_BACKEND_CLOUD_MISTRAL = "cloud_mistral"
-_CHAT_BACKENDS = {CHAT_BACKEND_LOCAL, CHAT_BACKEND_CLOUD_PICKLE, CHAT_BACKEND_CLOUD_MISTRAL}
+CHAT_BACKEND_GEMINI = "gemini"
+_CHAT_BACKENDS = {
+    CHAT_BACKEND_LOCAL,
+    CHAT_BACKEND_CLOUD_PICKLE,
+    CHAT_BACKEND_CLOUD_MISTRAL,
+    CHAT_BACKEND_GEMINI,
+}
 
 # --- Response statuses ----------------------------------------------------
 STATUS_OK = "ok"
@@ -173,6 +179,46 @@ class Source:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelAttempt:
+    provider: str
+    model: str
+    status: str
+    reason: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        out: dict[str, object] = {
+            "provider": self.provider,
+            "model": self.model,
+            "status": self.status,
+        }
+        if self.reason:
+            out["reason"] = self.reason
+        return out
+
+
+@dataclass(frozen=True, slots=True)
+class ModelMetadata:
+    requested_provider: str
+    requested_model: str
+    attempted_models: tuple[ModelAttempt, ...]
+    final_provider: str
+    final_model: str
+    fallback_reason: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        out: dict[str, object] = {
+            "requested_provider": self.requested_provider,
+            "requested_model": self.requested_model,
+            "attempted_models": [a.to_dict() for a in self.attempted_models],
+            "final_provider": self.final_provider,
+            "final_model": self.final_model,
+        }
+        if self.fallback_reason:
+            out["fallback_reason"] = self.fallback_reason
+        return out
+
+
+@dataclass(frozen=True, slots=True)
 class WebCommandResponse:
     status: str
     message: str
@@ -181,6 +227,7 @@ class WebCommandResponse:
     actions: tuple[Action, ...] = ()
     warnings: tuple[str, ...] = ()
     sources: tuple[Source, ...] = ()
+    model_metadata: ModelMetadata | None = None
 
     def to_dict(self) -> dict[str, object]:
         out: dict[str, object] = {"status": self.status, "message": self.message}
@@ -194,6 +241,8 @@ class WebCommandResponse:
             out["warnings"] = list(self.warnings)
         if self.sources:
             out["sources"] = [s.to_dict() for s in self.sources]
+        if self.model_metadata is not None:
+            out["model_metadata"] = self.model_metadata.to_dict()
         return out
 
 
@@ -389,8 +438,13 @@ def stream_heartbeat() -> dict[str, object]:
     return {"type": EVENT_HEARTBEAT}
 
 
-def stream_done(message: str) -> dict[str, object]:
-    return {"type": EVENT_DONE, "message": message}
+def stream_done(
+    message: str, *, model_metadata: ModelMetadata | None = None
+) -> dict[str, object]:
+    ev: dict[str, object] = {"type": EVENT_DONE, "message": message}
+    if model_metadata is not None:
+        ev["model_metadata"] = model_metadata.to_dict()
+    return ev
 
 
 def stream_error(message: str) -> dict[str, object]:
@@ -564,6 +618,7 @@ class ChatToolResult:
     answer: str
     source_count: int = 0
     result_summary: str = ""
+    model_metadata: ModelMetadata | None = None
 
 
 def make_chat_tool_request(
