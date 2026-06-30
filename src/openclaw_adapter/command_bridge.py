@@ -439,28 +439,40 @@ def _image_temp_suffix(att) -> str:
 
 
 class _WorkflowShimRunner:
-    """Minimal runner exposing only what ``build_workflow_handler`` reads:
-    ``tools_dir`` (→ workflow_store path), ``catalog`` (so NL tool_call steps
-    ground on real generated-tool slugs), and ``client`` (the local fallback
-    for NL drafting when cloud big-pickle is unreachable).
+    """Local-only runner for the web workflow surface.
 
-    Deliberately NOT a full ``DynamicToolRunner`` — that would carry the
-    cloud-failover restart side effects, which must never fire from the web
-    bridge. Workflow *execution* in web is out of scope (the draft + button
-    version only authors/saves), so ``run_tool_step`` is intentionally absent;
-    ``/workflow run`` from web would surface a normal handler error."""
+    The web bridge needs enough of the ``DynamicToolRunner`` protocol for both
+    workflow authoring and execution:
+      - ``tools_dir`` for workflow_store path derivation
+      - ``catalog`` so NL drafting grounds on real generated-tool slugs
+      - ``client`` as the local drafting fallback
+      - ``run_tool_step`` so ``/workflow run`` works from web
+
+    Keep this shim local-only: never enable cloud-failover restart side effects
+    from the web bridge process."""
 
     def __init__(self, settings: AssistantSettings) -> None:
-        from .dynamic_tools import OllamaTextClient, _resolve_tools_dir
-        from .generated_tool_catalog import GeneratedToolCatalog
+        from .dynamic_tools import DynamicToolRunner, OllamaTextClient, _resolve_tools_dir
 
         self.tools_dir = _resolve_tools_dir()
-        self.catalog = GeneratedToolCatalog(self.tools_dir)
         self.client = OllamaTextClient(
             endpoint=settings.openclaw_local_text_endpoint,
             model=(settings.openclaw_local_text_model or "qwen3:14b").split(",")[0].strip(),
             timeout_seconds=settings.openclaw_local_text_timeout_seconds,
         )
+        self._tool_runner = DynamicToolRunner(
+            client=self.client,
+            tools_dir=self.tools_dir,
+            knowledge_db=None,
+            fast_model=self.client.model,
+            strong_model=self.client.model,
+            cloud_failover_restart=False,
+            distill_enabled=False,
+        )
+        self.catalog = self._tool_runner.catalog
+
+    def run_tool_step(self, slug: str, explicit_params: dict) -> tuple[bool, str]:
+        return self._tool_runner.run_tool_step(slug, explicit_params)
 
 
 class CommandBridge:
@@ -731,20 +743,6 @@ class CommandBridge:
         if not text:
             yield stream_error("請輸入訊息。")
             return
-        # Music fast-path (#49/#50)
-        music_intent = detect_music_intent(text)
-        if music_intent is not None:
-            try:
-                resp = self._exec_music_intent(req, music_intent)
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("music intent failed action=%s", music_intent.action)
-                yield stream_error(f"音樂操作失敗：{exc}")
-                return
-            if resp.status == STATUS_ERROR:
-                yield stream_error(resp.message)
-            else:
-                yield stream_done(resp.message)
-            return
         # Workflow / schedule creation redirect (web#8 B2, web#9). Three layers so
         # the feature works even when the bge-m3 embedder is unavailable:
         #   1. Embedding fast-path (primary): bge-m3 cosine over phrasings JSON.
@@ -785,6 +783,24 @@ class CommandBridge:
                 "create_workflow",
                 nl_intent.workflow_description or text,
             )
+            return
+        # Music fast-path (#49/#50)
+        #
+        # Keep this AFTER workflow/schedule creation redirects. Phrases like
+        # "建立工作流：播放最愛音樂清單，然後開燈" contain music keywords but are
+        # meta authoring requests, not immediate playback commands.
+        music_intent = detect_music_intent(text)
+        if music_intent is not None:
+            try:
+                resp = self._exec_music_intent(req, music_intent)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("music intent failed action=%s", music_intent.action)
+                yield stream_error(f"音樂操作失敗：{exc}")
+                return
+            if resp.status == STATUS_ERROR:
+                yield stream_error(resp.message)
+            else:
+                yield stream_done(resp.message)
             return
 
         decision = self._route_chat_decision(req)

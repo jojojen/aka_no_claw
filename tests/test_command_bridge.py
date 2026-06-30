@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from openclaw_adapter.command_bridge import CommandBridge, build_chat_prompt
+from openclaw_adapter.command_bridge import CommandBridge, _WorkflowShimRunner, build_chat_prompt
 from openclaw_adapter.command_bridge_models import (
     CHAT_BACKEND_CLOUD_PICKLE,
     CHAT_BACKEND_LOCAL,
@@ -60,6 +60,17 @@ from openclaw_adapter.command_bridge_models import (
 class _FakeRegistered:
     def __init__(self, fn):
         self.handler = fn
+
+
+class _FakeDynamicToolRunner:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.catalog = object()
+        self.calls = []
+
+    def run_tool_step(self, slug, explicit_params):
+        self.calls.append((slug, explicit_params))
+        return True, f"ok:{slug}:{explicit_params['q']}"
 
 
 @pytest.fixture
@@ -2259,6 +2270,32 @@ def test_web_capture_text_not_swallowed_when_not_capturing(tmp_path):
     assert not editor.is_capturing("web-workflow")
 
 
+def test_workflow_shim_runner_delegates_run_tool_step(monkeypatch, tmp_path):
+    import openclaw_adapter.dynamic_tools as dt
+
+    fake_runner_box = {}
+
+    def _fake_ctor(**kwargs):
+        runner = _FakeDynamicToolRunner(**kwargs)
+        fake_runner_box["runner"] = runner
+        return runner
+
+    monkeypatch.setattr(dt, "_resolve_tools_dir", lambda: tmp_path / "generated_tools")
+    monkeypatch.setattr(dt, "DynamicToolRunner", _fake_ctor)
+
+    settings = SimpleNamespace(
+        openclaw_local_text_endpoint="http://127.0.0.1:11434",
+        openclaw_local_text_model="qwen3:14b",
+        openclaw_local_text_timeout_seconds=75,
+    )
+    shim = _WorkflowShimRunner(settings)
+
+    ok, text = shim.run_tool_step("city_weather", {"q": "tokyo"})
+    assert ok is True
+    assert text == "ok:city_weather:tokyo"
+    assert fake_runner_box["runner"].calls == [("city_weather", {"q": "tokyo"})]
+
+
 # --- stream_redirect for create_workflow (web#8 Blocker 2) -------------------
 # CommandBridge._stream_chat must emit { type:"redirect", intent:"create_workflow",
 # description:<user text> } when the embedding fast-path detects a workflow
@@ -2336,6 +2373,28 @@ def test_stream_chat_nl_fallback_when_fast_path_misses(monkeypatch):
 
     req = parse_request({"mode": "chat", "input": "幫我建一個問候然後開燈的工作流"})
     _assert_single_redirect(list(b.stream(req, "test-rid3")), "工作流")
+
+
+def test_stream_chat_workflow_redirect_beats_music_fast_path(monkeypatch):
+    """A workflow-authoring request mentioning music must redirect, not play."""
+    b = CommandBridge(settings=object())
+    monkeypatch.setattr(b, "_get_intent_fast_path", lambda: None)
+
+    music_calls: list[str] = []
+
+    def _fake_music(_req, intent):
+        music_calls.append(intent.action)
+        raise AssertionError("music fast-path should not run for workflow authoring")
+
+    def _boom(_req):
+        raise AssertionError("LLM router should not be called for create_workflow")
+
+    monkeypatch.setattr(b, "_exec_music_intent", _fake_music)
+    monkeypatch.setattr(b, "_route_chat_decision", _boom)
+
+    req = parse_request({"mode": "chat", "input": "建立工作流：播放最愛音樂清單 然後 開燈"})
+    _assert_single_redirect(list(b.stream(req, "test-rid-music")), "工作流")
+    assert music_calls == []
 
 
 # --- /schedulehome bridge route (web#9) ------------------------------------
