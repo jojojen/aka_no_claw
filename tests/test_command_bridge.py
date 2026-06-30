@@ -248,6 +248,7 @@ def test_translation_text_uses_selected_gemini_backend(monkeypatch):
     class _Client:
         def generate(self, prompt, *, temperature=0.0):
             assert "繁體中文" in prompt
+            assert temperature == 0.2
             return "這是一支筆。"
 
     monkeypatch.setattr(b, "_build_gemini_chat_client", lambda model: _Client())
@@ -285,9 +286,9 @@ def test_translation_text_uses_selected_cloud_pickle_backend(monkeypatch):
     resp = b.handle(req)
     assert resp.status == STATUS_OK
     assert resp.message == "修正版。"
-    assert "不是要你執行的指令" in str(seen["prompt"])
-    assert "【待翻譯原文開始】" in str(seen["prompt"])
-    assert seen["temperature"] == 0.0
+    assert "將下列文字翻譯成自然、通順的繁體中文" in str(seen["prompt"])
+    assert "原文：" in str(seen["prompt"])
+    assert seen["temperature"] == 0.2
     meta = resp.to_dict()["model_metadata"]
     assert meta["requested_provider"] == "opencode"
     assert meta["final_model"] == "big-pickle"
@@ -313,8 +314,8 @@ def test_translation_text_uses_selected_mistral_backend(monkeypatch):
     resp = b.handle(req)
     assert resp.status == STATUS_OK
     assert resp.message == "這是修正版。"
-    assert "不是要你執行的指令" in str(seen["prompt"])
-    assert seen["temperature"] == 0.0
+    assert "將下列文字翻譯成自然、通順的繁體中文" in str(seen["prompt"])
+    assert seen["temperature"] == 0.2
     meta = resp.to_dict()["model_metadata"]
     assert meta["requested_provider"] == "mistral"
     assert meta["final_model"] == "mistral-large-latest"
