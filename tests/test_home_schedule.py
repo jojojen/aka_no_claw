@@ -374,18 +374,61 @@ def test_list_has_edit_button(store):
     assert "sh:edit:sch_001" in cbs
 
 
-def test_callback_edit_opens_time_picker_seeded(store):
+def test_callback_edit_opens_menu(store):
     store.add(label="x", time="08:30", days=["mon", "wed"], commands=["/music a"])
     cb = hc.build_schedulehome_callback_handler(store, lambda c, cid: "ok")
     toast, text, markup = cb("edit:sch_001", "", "chat1")
+    # ✏️ now opens a sub-menu, not the time picker directly.
+    labels = [b["callback_data"] for row in markup["inline_keyboard"] for b in row]
+    assert "sh:edittime:sch_001" in labels
+    assert "sh:rename:sch_001" in labels
+    assert store.edit_target("chat1") is None  # not in edit mode yet
+
+
+def test_callback_edittime_opens_time_picker_seeded(store):
+    store.add(label="x", time="08:30", days=["mon", "wed"], commands=["/music a"])
+    cb = hc.build_schedulehome_callback_handler(store, lambda c, cid: "ok")
+    toast, text, markup = cb("edittime:sch_001", "", "chat1")
     assert "08:30" in text  # picker seeded with the schedule's current time
     assert store.edit_target("chat1") == "sch_001"
+
+
+def test_callback_rename_enters_capture(store):
+    store.add(label="x", time="08:30", days=["mon"], commands=["/music a"])
+    cb = hc.build_schedulehome_callback_handler(store, lambda c, cid: "ok")
+    toast, text, markup = cb("rename:sch_001", "", "chat1")
+    assert store.rename_target("chat1") == "sch_001"
+    assert "新的名稱" in text
+
+
+def test_callback_cancel_ends_rename(store):
+    store.add(time="07:00", days=["mon"])
+    store.begin_rename("chat1", "sch_001")
+    cb = hc.build_schedulehome_callback_handler(store, lambda c, cid: "ok")
+    cb("cancel", "", "chat1")
+    assert store.rename_target("chat1") is None
+
+
+def test_set_label_and_rename_session(store):
+    store.add(label="old", time="07:00", days=["mon"])
+    assert store.set_label("sch_001", "早安鬧鐘")["label"] == "早安鬧鐘"
+    store.begin_rename("chat1", "sch_001")
+    assert store.rename_target("chat1") == "sch_001"
+    assert store.end_rename("chat1") == "sch_001"
+    assert store.rename_target("chat1") is None
+
+
+def test_delete_clears_rename(store):
+    store.add(time="07:00", days=["mon"])
+    store.begin_rename("chat1", "sch_001")
+    store.delete("sch_001")
+    assert store.rename_target("chat1") is None
 
 
 def test_callback_edit_seeds_recurrence_from_existing_days(store):
     store.add(label="x", time="08:30", days=["mon", "wed"], commands=["/music a"])
     cb = hc.build_schedulehome_callback_handler(store, lambda c, cid: "ok")
-    cb("edit:sch_001", "", "chat1")
+    cb("edittime:sch_001", "", "chat1")
     # Stepping to the recurrence picker must pre-tick Mon+Wed.
     toast, text, markup = cb("t:08:30:ok", "", "chat1")
     day_buttons = markup["inline_keyboard"][0]
@@ -397,7 +440,7 @@ def test_callback_edit_seeds_recurrence_from_existing_days(store):
 def test_callback_edit_updates_in_place_keeps_commands(store):
     store.add(label="x", time="08:30", days=["mon"], commands=["/music a", "/say hi"])
     cb = hc.build_schedulehome_callback_handler(store, lambda c, cid: "ok")
-    cb("edit:sch_001", "", "chat1")
+    cb("edittime:sch_001", "", "chat1")
     toast, text, markup = cb("r:09:15:1111100:ok", "", "chat1")
     assert toast == "已更新排程"
     entry = store.get("sch_001")

@@ -153,6 +153,9 @@ class HomeScheduleStore:
         # chat_id -> workflow_id pre-filled for auto-create path (web#9 B).
         # Set by add_for_wf; consumed and cleared on recurrence ok to skip capture.
         self._pending_wf: dict[str, str] = {}
+        # chat_id -> schedule id whose label is being re-typed (rename capture):
+        # the next plain-text message becomes the new label.
+        self._renaming: dict[str, str] = {}
 
     # --- persistence ------------------------------------------------------
     def _load(self) -> list[dict]:
@@ -260,6 +263,7 @@ class HomeScheduleStore:
             # Drop any capture/edit session pointing at the deleted schedule.
             self._capture = {c: s for c, s in self._capture.items() if s != sid}
             self._editing = {c: s for c, s in self._editing.items() if s != sid}
+            self._renaming = {c: s for c, s in self._renaming.items() if s != sid}
             return True
 
     # --- transient capture state -----------------------------------------
@@ -300,6 +304,19 @@ class HomeScheduleStore:
     def end_pending_wf(self, chat_id: str) -> str | None:
         with self._lock:
             return self._pending_wf.pop(str(chat_id), None)
+
+    # --- transient rename state (label re-typing capture) ----------------
+    def begin_rename(self, chat_id: str, sid: str) -> None:
+        with self._lock:
+            self._renaming[str(chat_id)] = sid
+
+    def rename_target(self, chat_id: str) -> str | None:
+        with self._lock:
+            return self._renaming.get(str(chat_id))
+
+    def end_rename(self, chat_id: str) -> str | None:
+        with self._lock:
+            return self._renaming.pop(str(chat_id), None)
 
 
 _STORES: dict[str, HomeScheduleStore] = {}

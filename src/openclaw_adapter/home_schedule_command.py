@@ -158,6 +158,33 @@ def render_recurrence_picker(hh: int, mm: int, mask: str) -> tuple[str, dict]:
     return text, markup
 
 
+def render_edit_menu(entry: dict) -> tuple[str, dict]:
+    sid = str(entry.get("id"))
+    label = entry.get("label") or sid
+    sched = entry.get("schedule") or {}
+    text = (
+        f"✏️ 編輯排程「{label}」\n"
+        f"目前：{sched.get('time') or '--:--'} "
+        f"{days_label(sched.get('days') or [])}\n"
+        "要改什麼？"
+    )
+    markup = {
+        "inline_keyboard": [
+            [{"text": "🕐 改時間／星期", "callback_data": f"sh:edittime:{sid}"}],
+            [{"text": "✏️ 改名稱", "callback_data": f"sh:rename:{sid}"}],
+            [{"text": "↩️ 返回", "callback_data": "sh:list"}],
+        ]
+    }
+    return text, markup
+
+
+def _rename_hint(entry: dict) -> str:
+    return (
+        f"✏️ 重新命名排程「{entry.get('label') or entry.get('id')}」\n"
+        "請直接傳新的名稱（一行文字）。輸入「取消」可放棄。"
+    )
+
+
 def _format_run(entry: dict, results: list[str]) -> str:
     label = entry.get("label") or entry.get("id")
     if not results:
@@ -242,6 +269,7 @@ def build_schedulehome_callback_handler(
             store.end_capture(chat_id)
             store.end_edit(chat_id)
             store.end_pending_wf(chat_id)
+            store.end_rename(chat_id)
             text, markup = render_list(store)
             return "已取消", text, markup
 
@@ -257,7 +285,15 @@ def build_schedulehome_callback_handler(
 
         if action == "edit":
             sid = parts[1] if len(parts) > 1 else ""
+            return _handle_edit_menu(sid)
+
+        if action == "edittime":
+            sid = parts[1] if len(parts) > 1 else ""
             return _handle_edit_start(sid, chat_id)
+
+        if action == "rename":
+            sid = parts[1] if len(parts) > 1 else ""
+            return _handle_rename_start(sid, chat_id)
 
         if action == "t":
             return _handle_time(parts, chat_id)
@@ -271,11 +307,34 @@ def build_schedulehome_callback_handler(
 
         return "未知的排程動作。", None, None
 
+    def _handle_edit_menu(sid: str):
+        # ✏️ on a row opens a small menu: change time/days, or rename. Keeps the
+        # row buttons uncluttered while giving a path to edit the label.
+        if not sid:
+            return "缺少排程 id。", None, None
+        entry = store.get(sid)
+        if entry is None:
+            return "找不到這個排程。", None, None
+        text, markup = render_edit_menu(entry)
+        return None, text, markup
+
+    def _handle_rename_start(sid: str, chat_id: str):
+        # 「✏️ 改名稱」: enter rename capture so the next plain-text message becomes
+        # the new label (handled in telegram_bot.py build_reply_plan).
+        if not sid:
+            return "缺少排程 id。", None, None
+        entry = store.get(sid)
+        if entry is None:
+            return "找不到這個排程。", None, None
+        store.begin_rename(chat_id, sid)
+        return "請輸入新名稱", _rename_hint(entry), None
+
     def _handle_edit_start(sid: str, chat_id: str):
-        # ✏️ on a row: re-run the time → recurrence pickers against an existing
-        # schedule. We only re-set time/days here; the command list is left as-is
-        # (editing commands is deliberately out of scope). The edit target is
-        # held in store session state so picker "ok" updates instead of creates.
+        # 「🕐 改時間／星期」: re-run the time → recurrence pickers against an
+        # existing schedule. We only re-set time/days here; the command list is
+        # left as-is (editing commands is deliberately out of scope). The edit
+        # target is held in store session state so picker "ok" updates instead
+        # of creates.
         if not sid:
             return "缺少排程 id。", None, None
         entry = store.get(sid)

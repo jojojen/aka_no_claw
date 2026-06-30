@@ -419,6 +419,29 @@ class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
         if text is None or not self.is_allowed_chat(chat_id):
             return None
         store = get_home_schedule_store(self._settings.openclaw_home_schedules_path)
+        rename_sid = store.rename_target(chat_id)
+        if rename_sid is not None:
+            content = text.strip()
+            # Escape hatch: let /schedulehome (and any slash) through so the user
+            # can bail out instead of being trapped in rename mode.
+            if content.startswith("/"):
+                return None
+            if content in {"取消", "cancel"}:
+                store.end_rename(chat_id)
+                list_text, markup = render_home_schedule_list(store)
+                return TelegramTextReplyPlan(
+                    ack=None, reply=f"已取消改名。\n\n{list_text}", reply_markup=markup
+                )
+            if not content:
+                return None
+            store.set_label(rename_sid, content)
+            store.end_rename(chat_id)
+            list_text, markup = render_home_schedule_list(store)
+            return TelegramTextReplyPlan(
+                ack=None,
+                reply=f"✅ 已改名為「{content}」。\n\n{list_text}",
+                reply_markup=markup,
+            )
         sid = store.capture_target(chat_id)
         if sid is None:
             return None
