@@ -45,7 +45,7 @@ class AssistantSettings:
     openclaw_mistral_api_key: str | None = None
     openclaw_mistral_model: str = "mistral-large-latest"
     openclaw_gemini_api_key: str | None = None
-    openclaw_gemini_pro_model: str = "gemini-2.5-flash"
+    openclaw_gemini_primary_model: str = "gemini-2.5-flash"
     openclaw_gemini_flash_model: str = "gemini-2.5-flash"
     # /research appreciation enrichment backend, decoupled from /new's codegen
     # backend above. "opencode" routes the appreciation summariser to cloud
@@ -264,7 +264,11 @@ def get_settings() -> AssistantSettings:
         openclaw_gemini_api_key=_none_if_empty(
             _getenv_any("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GEMINI_API_KEY")
         ),
-        openclaw_gemini_pro_model=os.getenv("OPENCLAW_GEMINI_PRO_MODEL", "gemini-2.5-flash"),
+        openclaw_gemini_primary_model=_getenv_any(
+            "OPENCLAW_GEMINI_PRIMARY_MODEL",
+            "OPENCLAW_GEMINI_PRO_MODEL",
+        )
+        or "gemini-2.5-flash",
         openclaw_gemini_flash_model=os.getenv(
             "OPENCLAW_GEMINI_FLASH_MODEL", "gemini-2.5-flash"
         ),

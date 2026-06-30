@@ -581,7 +581,7 @@ def _tool_settings(
         openclaw_mistral_api_key=None,
         openclaw_mistral_model="mistral-large-latest",
         openclaw_gemini_api_key=gemini_key,
-        openclaw_gemini_pro_model=gemini_primary_model,
+        openclaw_gemini_primary_model=gemini_primary_model,
         openclaw_gemini_flash_model=gemini_flash_model,
         openclaw_music_dir="/tmp/test_music",
         openclaw_music_index_path="/tmp/test_music_index.json",

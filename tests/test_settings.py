@@ -132,24 +132,34 @@ def test_get_settings_reads_opencode_codegen_environment_keys(monkeypatch) -> No
 def test_get_settings_reads_gemini_environment_keys(monkeypatch) -> None:
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.setenv("GOOGLE_API_KEY", "google-key")
-    monkeypatch.setenv("OPENCLAW_GEMINI_PRO_MODEL", "gemini-pro-test")
+    monkeypatch.setenv("OPENCLAW_GEMINI_PRIMARY_MODEL", "gemini-primary-test")
     monkeypatch.setenv("OPENCLAW_GEMINI_FLASH_MODEL", "gemini-flash-test")
 
     settings = get_settings()
 
     assert settings.openclaw_gemini_api_key == "google-key"
-    assert settings.openclaw_gemini_pro_model == "gemini-pro-test"
+    assert settings.openclaw_gemini_primary_model == "gemini-primary-test"
     assert settings.openclaw_gemini_flash_model == "gemini-flash-test"
 
 
 def test_get_settings_defaults_gemini_primary_to_flash(monkeypatch) -> None:
+    monkeypatch.delenv("OPENCLAW_GEMINI_PRIMARY_MODEL", raising=False)
     monkeypatch.delenv("OPENCLAW_GEMINI_PRO_MODEL", raising=False)
     monkeypatch.delenv("OPENCLAW_GEMINI_FLASH_MODEL", raising=False)
 
     settings = get_settings()
 
-    assert settings.openclaw_gemini_pro_model == "gemini-2.5-flash"
+    assert settings.openclaw_gemini_primary_model == "gemini-2.5-flash"
     assert settings.openclaw_gemini_flash_model == "gemini-2.5-flash"
+
+
+def test_get_settings_accepts_legacy_gemini_pro_model_alias(monkeypatch) -> None:
+    monkeypatch.delenv("OPENCLAW_GEMINI_PRIMARY_MODEL", raising=False)
+    monkeypatch.setenv("OPENCLAW_GEMINI_PRO_MODEL", "gemini-pro-legacy")
+
+    settings = get_settings()
+
+    assert settings.openclaw_gemini_primary_model == "gemini-pro-legacy"
 
 
 def test_get_settings_reads_local_tts_environment_keys(monkeypatch) -> None:

@@ -2050,7 +2050,7 @@ class CommandBridge:
                     "backend": CHAT_BACKEND_GEMINI,
                     "label": "Gemini",
                     "requested_provider": "gemini",
-                    "requested_model": self._gemini_pro_model(),
+                    "requested_model": self._gemini_primary_model(),
                     "chain": gemini_chain,
                     "configured": bool(getattr(self.settings, "openclaw_gemini_api_key", None)),
                 },
@@ -2071,7 +2071,7 @@ class CommandBridge:
         if chat_backend == CHAT_BACKEND_CLOUD_MISTRAL:
             return "mistral", self._mistral_model()
         if chat_backend == CHAT_BACKEND_GEMINI:
-            return "gemini", self._gemini_pro_model()
+            return "gemini", self._gemini_primary_model()
         return "local", self._local_model()
 
     def _model_metadata_for_backend(
@@ -2282,13 +2282,13 @@ class CommandBridge:
     ) -> tuple[str, ModelMetadata]:
         attempts: list[ModelAttempt] = []
         gemini_models = self._gemini_route_models()
-        pro_model = gemini_models[0]
+        primary_model = gemini_models[0]
 
         if not getattr(self.settings, "openclaw_gemini_api_key", None):
             attempts.append(
                 ModelAttempt(
                     "gemini",
-                    pro_model,
+                    primary_model,
                     _MODEL_STATUS_NOT_CONFIGURED,
                     "Gemini API key missing",
                 )
@@ -2385,8 +2385,12 @@ class CommandBridge:
     def _mistral_model(self) -> str:
         return (getattr(self.settings, "openclaw_mistral_model", None) or "mistral-large-latest").strip()
 
-    def _gemini_pro_model(self) -> str:
-        return (getattr(self.settings, "openclaw_gemini_pro_model", None) or "gemini-2.5-flash").strip()
+    def _gemini_primary_model(self) -> str:
+        return (
+            getattr(self.settings, "openclaw_gemini_primary_model", None)
+            or getattr(self.settings, "openclaw_gemini_pro_model", None)
+            or "gemini-2.5-flash"
+        ).strip()
 
     def _gemini_flash_model(self) -> str:
         return (
@@ -2397,7 +2401,7 @@ class CommandBridge:
     def _gemini_route_models(self) -> tuple[str, ...]:
         seen: set[str] = set()
         ordered: list[str] = []
-        for model in (self._gemini_pro_model(), self._gemini_flash_model()):
+        for model in (self._gemini_primary_model(), self._gemini_flash_model()):
             if model and model not in seen:
                 seen.add(model)
                 ordered.append(model)
