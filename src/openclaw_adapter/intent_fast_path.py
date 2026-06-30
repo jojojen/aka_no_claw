@@ -35,6 +35,12 @@ ZERO_ARG_INTENTS = frozenset(
 # A bare URL (no verb residual) stays None → the LLM router asks the user which.
 URL_SLOT_INTENTS = frozenset({"product_research", "reputation_snapshot"})
 
+# Intents where the full user utterance IS the slot value. The fast-path
+# fires on a confident match and sets workflow_description=text so the caller
+# (command_bridge._stream_chat) can emit a stream_redirect event and skip the
+# slow LLM router entirely.
+FULL_TEXT_INTENTS = frozenset({"create_workflow"})
+
 _MERCARI_URL_RE = re.compile(
     r"https?://(?:jp\.|www\.)?mercari\.com/"
     r"(?:item/m\d+|shops/product/[A-Za-z0-9]+)(?:[/?#]\S*)?",
@@ -68,12 +74,14 @@ class EmbeddingIntentRouter:
         margin: float = _DEFAULT_MARGIN,
         zero_arg_intents=ZERO_ARG_INTENTS,
         url_slot_intents=URL_SLOT_INTENTS,
+        full_text_intents=FULL_TEXT_INTENTS,
     ) -> None:
         self._embedder = embedder
         self._min_score = min_score
         self._margin = margin
         self._zero_arg = frozenset(zero_arg_intents)
         self._url_slot = frozenset(url_slot_intents)
+        self._full_text = frozenset(full_text_intents)
         self._index: dict[str, list[list[float]]] = {}
         # URLs carry no intent signal (and the URL-slot path matches a
         # URL-stripped residual), so strip them before embedding the phrasings.
@@ -103,20 +111,29 @@ class EmbeddingIntentRouter:
         scored.sort(key=lambda t: t[1], reverse=True)
         top_intent, top_score = scored[0]
         second = scored[1][1] if len(scored) > 1 else 0.0
-        if (
-            top_intent in self._zero_arg
-            and top_score >= self._min_score
-            and (top_score - second) >= self._margin
-        ):
-            logger.info(
-                "intent fast-path hit intent=%s score=%.3f margin=%.3f",
-                top_intent,
-                top_score,
-                top_score - second,
-            )
-            return TelegramNaturalLanguageIntent(
-                intent=top_intent, confidence=float(top_score)
-            )
+        if top_score >= self._min_score and (top_score - second) >= self._margin:
+            if top_intent in self._zero_arg:
+                logger.info(
+                    "intent fast-path hit intent=%s score=%.3f margin=%.3f",
+                    top_intent,
+                    top_score,
+                    top_score - second,
+                )
+                return TelegramNaturalLanguageIntent(
+                    intent=top_intent, confidence=float(top_score)
+                )
+            if top_intent in self._full_text:
+                logger.info(
+                    "intent fast-path full-text hit intent=%s score=%.3f margin=%.3f",
+                    top_intent,
+                    top_score,
+                    top_score - second,
+                )
+                return TelegramNaturalLanguageIntent(
+                    intent=top_intent,
+                    workflow_description=text,
+                    confidence=float(top_score),
+                )
 
         url_intent = self._route_url_slot(text)
         if url_intent is not None:

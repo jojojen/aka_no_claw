@@ -12,6 +12,7 @@ import math
 import pytest
 
 from openclaw_adapter.intent_fast_path import (
+    FULL_TEXT_INTENTS,
     URL_SLOT_INTENTS,
     ZERO_ARG_INTENTS,
     EmbeddingIntentRouter,
@@ -29,6 +30,7 @@ class WordSetEmbedder:
         "list", "sns", "twitter", "watch", "mercari", "status", "model",
         "tools", "help", "scan", "photo", "track", "price", "card", "buy",
         "research", "reputation", "seller", "item", "value", "investment",
+        "workflow", "create", "automate",
     ]
 
     def __call__(self, text: str) -> list[float] | None:
@@ -55,6 +57,11 @@ PHRASINGS = {
     "reputation_snapshot": [
         "reputation seller check https://jp.mercari.com/item/m1",
         "seller reputation",
+    ],
+    # Full-text intent: the user utterance IS the description.
+    "create_workflow": [
+        "create workflow automate",
+        "workflow create automate",
     ],
 }
 
@@ -179,3 +186,27 @@ def test_bare_mercari_url_defers_to_llm(router):
 def test_non_mercari_url_is_not_url_slot_fast_pathed(router):
     # URL-slot only fires for Mercari product URLs; other URLs defer.
     assert router.route("research item value https://example.com/item/1") is None
+
+
+# ── FULL_TEXT_INTENTS ────────────────────────────────────────────────────────
+
+def test_full_text_intent_short_circuits_with_description(router):
+    text = "create workflow automate"
+    intent = router.route(text)
+    assert intent is not None
+    assert intent.intent == "create_workflow"
+    assert intent.workflow_description == text
+    assert intent.confidence is not None and intent.confidence >= 0.6
+
+
+def test_full_text_intents_set_is_subset_of_phrasings():
+    import json
+    from pathlib import Path
+
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "data"
+        / "intent_routing_phrasings.json"
+    )
+    shipped = set(json.loads(path.read_text(encoding="utf-8")))
+    assert FULL_TEXT_INTENTS <= shipped

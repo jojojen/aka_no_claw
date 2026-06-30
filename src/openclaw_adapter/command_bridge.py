@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 from collections.abc import Iterator
@@ -71,6 +72,7 @@ from .command_bridge_models import (
     stream_done,
     stream_error,
     stream_heartbeat,
+    stream_redirect,
     stream_start,
 )
 from .task_loop import (
@@ -94,6 +96,11 @@ _HEARTBEAT_SECONDS = 10.0
 _JOB_TTL_SECONDS = 1800.0
 
 _SELLER_UNSUPPORTED_MSG = "賣家信譽快照目前尚未由本地 command bridge 支援。"
+
+# Bridge-specific catch for natural "工作流" phrases like
+# "幫我做一個先問候再開燈的工作流" that telegram_nl misclassifies
+# as play_music because "開燈" fires other detection before the workflow check.
+_WF_BRIDGE_VERB_RE = re.compile(r"做|建立?|弄|規劃|設計|create", re.IGNORECASE)
 
 # Web Chat continuity (#44). Prepended so the model continues the conversation
 # (e.g. resolves 「她/它/這個」 against earlier turns) instead of treating each
@@ -368,6 +375,11 @@ class CommandBridge:
         self._workflow_handler: object | None = None
         self._workflow_editor: object | None = None
         self._workflow_lock = threading.Lock()
+        # Embedding intent fast-path for workflow creation redirect (#web8 B2).
+        # Built lazily on first chat message; None means disabled (no embedder).
+        self._intent_fp: object | None = None
+        self._intent_fp_built = False
+        self._intent_fp_lock = threading.Lock()
 
     # --- handler registry (lazy, shared with the Telegram bot) ------------
     def _ensure_registries(self) -> None:
@@ -392,6 +404,15 @@ class CommandBridge:
                     self._command_handlers = command_handlers
                     self._view_handlers = view_handlers
                     self._item_deleter_handlers = item_deleter_handlers
+
+    def _get_intent_fast_path(self):
+        if not self._intent_fp_built:
+            with self._intent_fp_lock:
+                if not self._intent_fp_built:
+                    from .intent_fast_path import build_intent_fast_path
+                    self._intent_fp = build_intent_fast_path(self.settings)
+                    self._intent_fp_built = True
+        return self._intent_fp
 
     def _handlers(self) -> dict:
         self._ensure_registries()
@@ -576,6 +597,37 @@ class CommandBridge:
             else:
                 yield stream_done(resp.message)
             return
+        # Workflow creation redirect (#web8 B2).  Two layers so the feature works
+        # even when the bge-m3 embedder is unavailable (e.g. first cold start):
+        #   1. Embedding fast-path (primary): bge-m3 cosine over phrasings JSON,
+        #      catches natural phrasing like "幫我做一個先問候再開燈的工作流".
+        #   2. NL-rule fallback (secondary): `fallback_route_telegram_natural_language`
+        #      keyword rules catch explicit phrasing like "建立 workflow / create workflow".
+        # Both emit stream_redirect and return before the LLM router runs.
+        fp = self._get_intent_fast_path()
+        if fp is not None:
+            wf_intent = fp.route(text)
+            if wf_intent is not None and wf_intent.intent == "create_workflow":
+                yield stream_redirect(
+                    "create_workflow",
+                    wf_intent.workflow_description or text,
+                )
+                return
+        # Layer 3: bridge-specific two-signal catch — "工作流" noun + creation verb.
+        # Runs before telegram_nl fallback because that layer misclassifies natural
+        # phrases containing other action words (e.g. "放音樂") as a different intent.
+        if "工作流" in text and _WF_BRIDGE_VERB_RE.search(text):
+            yield stream_redirect("create_workflow", text)
+            return
+        from telegram_nl.natural_language import fallback_route_telegram_natural_language
+        nl_intent = fallback_route_telegram_natural_language(text)
+        if nl_intent is not None and nl_intent.intent == "create_workflow":
+            yield stream_redirect(
+                "create_workflow",
+                nl_intent.workflow_description or text,
+            )
+            return
+
         decision = self._route_chat_decision(req)
         if decision is not None and decision.decision == ROUTER_DECISION_TOOL:
             yield from self._stream_chat_tool(req, decision)
@@ -1394,7 +1446,7 @@ class CommandBridge:
 
     def run_workflow_command(self, text: str) -> dict:
         """Run the ``/workflow`` handler for the web console. ``text`` is the
-        remainder after the command (e.g. ``create 每天早上查東京天氣…``); a
+        remainder after the command (e.g. ``create 先查天氣再念出來…``); a
         natural-language ``create`` drafts a workflow via the cloud-preferred LLM
         and lands it in an editable card (the same flow the Telegram bot uses, so
         tool_call steps reuse real generated-tool slugs).

@@ -131,5 +131,15 @@
     "傳圖片辨識卡片怎麼操作",
     "how do I scan a card from a photo",
     "拍照查卡的指令是什麼"
+  ],
+  "create_workflow": [
+    "建立 workflow 先問候再開燈",
+    "幫我做一個先問候再開燈的工作流",
+    "設定自動化流程先說早安再播音樂",
+    "create a workflow that checks weather then reads it aloud",
+    "建立自動化：先發通知，再播音樂",
+    "幫我建一個先查天氣再念出來的工作流程",
+    "我想建立一個自動執行多個步驟的流程",
+    "make an automation that greets me then turns on the lights"
   ]
 }

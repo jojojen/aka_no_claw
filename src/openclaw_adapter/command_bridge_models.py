@@ -52,6 +52,7 @@ EVENT_DELTA = "delta"
 EVENT_HEARTBEAT = "heartbeat"
 EVENT_DONE = "done"
 EVENT_ERROR = "error"
+EVENT_REDIRECT = "redirect"
 
 DEFAULT_SOURCE = "aka_no_claw_web"
 
@@ -394,6 +395,10 @@ def stream_done(message: str) -> dict[str, object]:
 
 def stream_error(message: str) -> dict[str, object]:
     return {"type": EVENT_ERROR, "message": message}
+
+
+def stream_redirect(intent: str, description: str) -> dict[str, object]:
+    return {"type": EVENT_REDIRECT, "intent": intent, "description": description}
 
 
 def _opt_str(value: object) -> str | None:

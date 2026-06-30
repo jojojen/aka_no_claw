@@ -2082,3 +2082,82 @@ def test_web_capture_text_not_swallowed_when_not_capturing(tmp_path):
     assert res["status"] == STATUS_OK
     # response is from the real /workflow list handler
     assert not editor.is_capturing("web-workflow")
+
+
+# --- stream_redirect for create_workflow (web#8 Blocker 2) -------------------
+# CommandBridge._stream_chat must emit { type:"redirect", intent:"create_workflow",
+# description:<user text> } when the embedding fast-path detects a workflow
+# creation request, and must NOT fall through to the LLM router or music path.
+
+class _FakeWorkflowRouter:
+    """Stub for EmbeddingIntentRouter: always returns create_workflow for any text."""
+    ready = True
+
+    def route(self, text: str):
+        from telegram_nl.natural_language import TelegramNaturalLanguageIntent
+        return TelegramNaturalLanguageIntent(
+            intent="create_workflow",
+            workflow_description=text,
+            confidence=0.92,
+        )
+
+
+class _FakeMissRouter:
+    """Stub that never matches — simulates embedding fast-path miss."""
+    ready = True
+
+    def route(self, _text: str):
+        return None
+
+
+def _assert_single_redirect(events: list, description_contains: str) -> None:
+    redirect_events = [e for e in events if e.get("type") == "redirect"]
+    assert len(redirect_events) == 1, f"expected exactly one redirect event, got: {events}"
+    ev = redirect_events[0]
+    assert ev["intent"] == "create_workflow"
+    assert description_contains in ev["description"], (
+        f"expected {description_contains!r} in description, got {ev['description']!r}"
+    )
+    assert not any(e.get("type") in {"delta", "done", "error"} for e in events), (
+        f"LLM output leaked into stream: {events}"
+    )
+
+
+def test_stream_chat_emits_redirect_for_create_workflow(monkeypatch):
+    """Embedding fast-path hit → stream emits redirect, LLM router not called."""
+    b = CommandBridge(settings=object())
+    monkeypatch.setattr(b, "_get_intent_fast_path", lambda: _FakeWorkflowRouter())
+
+    def _boom(_req):
+        raise AssertionError("LLM router should not be called for create_workflow")
+    monkeypatch.setattr(b, "_route_chat_decision", _boom)
+
+    req = parse_request({"mode": "chat", "input": "幫我建一個先問候再開燈的工作流"})
+    _assert_single_redirect(list(b.stream(req, "test-rid")), "工作流")
+
+
+def test_stream_chat_nl_fallback_when_fast_path_disabled(monkeypatch):
+    """When fast-path is None (no embedder), bridge Layer 3 catches natural '工作流 + verb' phrase."""
+    b = CommandBridge(settings=object())
+    monkeypatch.setattr(b, "_get_intent_fast_path", lambda: None)
+
+    def _boom(_req):
+        raise AssertionError("LLM router should not be called for create_workflow")
+    monkeypatch.setattr(b, "_route_chat_decision", _boom)
+
+    # Natural phrase: "工作流" noun + "做" creation verb; no time/frequency.
+    req = parse_request({"mode": "chat", "input": "幫我做一個先問候再開燈的工作流"})
+    _assert_single_redirect(list(b.stream(req, "test-rid2")), "工作流")
+
+
+def test_stream_chat_nl_fallback_when_fast_path_misses(monkeypatch):
+    """When fast-path router returns None (miss), bridge Layer 3 catches natural '工作流 + verb' phrase."""
+    b = CommandBridge(settings=object())
+    monkeypatch.setattr(b, "_get_intent_fast_path", lambda: _FakeMissRouter())
+
+    def _boom(_req):
+        raise AssertionError("LLM router should not be called for create_workflow")
+    monkeypatch.setattr(b, "_route_chat_decision", _boom)
+
+    req = parse_request({"mode": "chat", "input": "幫我建一個問候然後開燈的工作流"})
+    _assert_single_redirect(list(b.stream(req, "test-rid3")), "工作流")
