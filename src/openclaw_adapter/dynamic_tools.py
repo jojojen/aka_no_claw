@@ -878,6 +878,10 @@ class DynamicToolRunner:
         req = (request or "").strip()
         if not req:
             return "用法：/new <你的需求>，例如 /new 幫我查0050今年以來到5月的年化報酬"
+        if req == "list":
+            return self._cmd_list_tools()
+        if req.startswith("delete "):
+            return self._cmd_delete_tool(req[7:].strip())
         try:
             result = self.run_detailed(req)
         except CloudBackendUnavailable as exc:
@@ -891,6 +895,35 @@ class DynamicToolRunner:
             logger.exception("dynamic_tools: run failed")
             return f"動態工具執行失敗：{exc}"
         return self._format_result(result)
+
+    def _cmd_list_tools(self) -> str:
+        manifest = self.catalog._load_manifest()
+        if not manifest:
+            return "尚無已生成的工具。\n用 /new <需求> 生成第一個工具。"
+        lines = [f"🛠 已生成工具（共 {len(manifest)} 個）："]
+        for e in manifest:
+            slug = e.get("slug", "?")
+            desc = (e.get("description") or e.get("request") or "")[:60]
+            lines.append(f"• {slug}：{desc}")
+        lines.append("\n用 /new delete <slug> 刪除工具")
+        return "\n".join(lines)
+
+    def _cmd_delete_tool(self, slug: str) -> str:
+        if not slug:
+            return "用法：/new delete <slug>"
+        manifest = self.catalog._load_manifest()
+        new_manifest = [e for e in manifest if e.get("slug") != slug]
+        if len(new_manifest) == len(manifest):
+            known = ", ".join(e.get("slug", "") for e in manifest) or "（無）"
+            return f"找不到工具 '{slug}'。\n現有工具：{known}"
+        manifest_path = self.catalog._manifest_path()
+        manifest_path.write_text(
+            json.dumps(new_manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        tool_dir = self.tools_dir / slug
+        if tool_dir.exists():
+            shutil.rmtree(tool_dir)
+        return f"✅ 已刪除工具 '{slug}'"
 
     def _format_result(self, result: DynamicToolResult) -> str:
         """Render a DynamicToolResult into the Telegram-facing string. Shared by

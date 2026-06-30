@@ -157,10 +157,11 @@ def _render_command_picker(command_registry=None) -> tuple[str, dict]:
 class WorkflowEditor:
     """Per-chat card editor for building and modifying Workflows."""
 
-    def __init__(self, store: WorkflowStore, command_registry=None) -> None:
+    def __init__(self, store: WorkflowStore, command_registry=None, catalog=None) -> None:
         self._store = store
         self._sessions: dict[str, _EditorSession] = {}
         self._command_registry = command_registry
+        self._catalog = catalog
 
     # ── Public entry points ───────────────────────────────────────────────────
 
@@ -257,6 +258,15 @@ class WorkflowEditor:
         f = adding.collecting
 
         if f == "tool":
+            if self._catalog is not None:
+                known = {e.slug for e in self._catalog.entries()}
+                if known and text not in known:
+                    slug_list = "\n".join(f"• {s}" for s in sorted(known))
+                    return (
+                        f"找不到工具 `{text}`。\n"
+                        f"已存在的工具：\n{slug_list}\n\n"
+                        "請輸入正確的 slug（或用 /new delete 先刪除再重新生成）：", {}
+                    )
             adding.fields["tool"] = text
             adding.collecting = "args"
             return "請輸入 args（JSON 格式，或傳空訊息跳過）：", {}

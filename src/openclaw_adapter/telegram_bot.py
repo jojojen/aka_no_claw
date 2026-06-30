@@ -1794,7 +1794,8 @@ def run_telegram_polling(
     _wf_editor: WorkflowEditor | None = None
     if dynamic_tool_runner is not None:
         _wf_editor = WorkflowEditor(_workflow_store(dynamic_tool_runner),
-                                      command_registry=command_handlers)
+                                      command_registry=command_handlers,
+                                      catalog=dynamic_tool_runner.catalog)
         callback_handlers.update(_wf_editor.callback_handlers())
         command_handlers["/workflow"] = RegisteredCommand(
             build_workflow_handler(settings, dynamic_tool_runner, workflow_editor=_wf_editor,

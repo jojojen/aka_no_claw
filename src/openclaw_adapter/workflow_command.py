@@ -306,7 +306,7 @@ def _build_nl_workflow_prompt(description: str, catalog, *, command_registry=Non
         "instructions（指示）、output（變數名）。\n"
         "- command_sink：把一個變數送進指令。欄位：command、input（變數名）、output（變數名）。\n"
         f"  command 只能是：{allow}\n\n"
-        "可用的工具（tool_call 請盡量用下列 slug；若沒有合適的，就用描述性的 slug 讓使用者稍後修改）：\n"
+        "可用的工具（tool_call 只能使用下列已存在的 slug；若沒有合適的，改用 llm_transform 或 command_sink，不可自行編造 slug）：\n"
         f"{tool_block}\n\n"
         "規則：\n"
         "1. 每個步驟都要有唯一的 output 變數名（英文小寫，如 weather、greeting）。\n"

@@ -1655,6 +1655,7 @@ class CommandBridge:
                     editor = WorkflowEditor(
                         _workflow_store(runner),
                         command_registry=command_registry,
+                        catalog=runner.catalog,
                     )
                     self._workflow_editor = editor
                     self._workflow_handler = build_workflow_handler(
