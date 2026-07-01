@@ -1,5 +1,9 @@
 # Bluetooth / XGIMI Z8X Debug Record
 
+Last reviewed: 2026-07-01
+Status: Current
+Owner area: operations
+
 Date: 2026-07-01 12:03 JST
 
 Context: aka_no_claw Web UI `生活 -> Bluetooth` can scan devices, but connecting

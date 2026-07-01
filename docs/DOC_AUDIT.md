@@ -58,6 +58,7 @@ for which question each one answers.
 | `SNS_MONITOR_TROUBLESHOOTING.md` | Current | sns | Keep as ops companion; cross-link to usage. |
 | `LOGGING.md` | Current | operations | Keep. |
 | `MAC_MINI_M4.md` | Current | operations | Keep; machine-specific, never copy paths into code. |
+| `BLUETOOTH_XGIMI_DEBUG_2026-07-01.md` | Current | operations | Keep as sanitized incident/debug record for the XGIMI Bluetooth permission and reconnect issue. |
 | `BROADLINK_RESTART_RECOVERY_PLAYBOOK.md` | Current | operations | Keep; incident-derived BroadLink recovery/runbook for restart-context failures. |
 | `AUTO_LOGIN_SETUP.md` | Needs review | operations | Re-verify setup steps. |
 | `RASPBERRY_PI_5.md` | Needs review | operations | Re-verify Pi deployment relevance. |

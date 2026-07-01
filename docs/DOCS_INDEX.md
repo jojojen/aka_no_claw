@@ -61,6 +61,7 @@ Full inventory with recommended actions is in [DOC_AUDIT.md](DOC_AUDIT.md).
 | [LOGGING.md](LOGGING.md) | Current | operations | Logging conventions. |
 | [AUTO_LOGIN_SETUP.md](AUTO_LOGIN_SETUP.md) | Needs review | operations | Local login/setup notes. |
 | [MAC_MINI_M4.md](MAC_MINI_M4.md) | Current | operations | Machine-specific operational notes; avoid copying paths into code. |
+| [BLUETOOTH_XGIMI_DEBUG_2026-07-01.md](BLUETOOTH_XGIMI_DEBUG_2026-07-01.md) | Current | operations | Sanitized incident/debug record for XGIMI Bluetooth reconnect and macOS Bluetooth permission behavior. |
 | [BROADLINK_RESTART_RECOVERY_PLAYBOOK.md](BROADLINK_RESTART_RECOVERY_PLAYBOOK.md) | Current | operations | BroadLink instability playbook: distinguish device/network failures from startup-context failures; documents the restart preflight approach. |
 | [MUSIC_PLAYBACK_TROUBLESHOOTING.md](MUSIC_PLAYBACK_TROUBLESHOOTING.md) | Current | music | afplay/CoreAudio -66681 wedge: coreaudiod-restart self-heal + one-time NOPASSWD sudo setup. |
 | [RASPBERRY_PI_5.md](RASPBERRY_PI_5.md) | Needs review | operations | Pi deployment notes. |
