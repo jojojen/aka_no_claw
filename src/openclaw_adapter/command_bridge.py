@@ -37,6 +37,7 @@ from .service_restart import RESTART_MESSAGE, trigger_restart_all
 from .command_bridge_models import (
     CHAT_BACKEND_CLOUD_MISTRAL,
     CHAT_BACKEND_CLOUD_PICKLE,
+    CHAT_BACKEND_CLOUD_POOL,
     CHAT_BACKEND_GEMINI,
     CHAT_BACKEND_LOCAL,
     CHAT_TOOL_BLUETOOTH,
@@ -714,6 +715,8 @@ class CommandBridge:
             )
         elif req.chat_backend == CHAT_BACKEND_GEMINI:
             message, metadata = self._generate_gemini_with_fallback(prompt, temperature=0.7)
+        elif req.chat_backend == CHAT_BACKEND_CLOUD_POOL:
+            message, metadata = self._handle_cloud_pool_blocking(prompt)
         else:
             message = self._ollama_generate_blocking(prompt)
             metadata = self._model_metadata_for_backend(
@@ -783,6 +786,8 @@ class CommandBridge:
             yield from self._stream_mistral_chat(prompt)
         elif req.chat_backend == CHAT_BACKEND_GEMINI:
             yield from self._stream_gemini_chat(prompt)
+        elif req.chat_backend == CHAT_BACKEND_CLOUD_POOL:
+            yield from self._stream_cloud_pool_chat(prompt)
         else:
             yield from self._stream_ollama_chat(prompt)
 
@@ -1466,6 +1471,9 @@ class CommandBridge:
         if chat_backend == CHAT_BACKEND_GEMINI:
             text, metadata = self._generate_gemini_with_fallback(prompt, temperature=0.3)
             return text, f"{metadata.final_provider} {metadata.final_model}", metadata
+        if chat_backend == CHAT_BACKEND_CLOUD_POOL:
+            text, metadata = self._handle_cloud_pool_blocking(prompt)
+            return text, f"{metadata.final_provider} {metadata.final_model}", metadata
         text = self._ollama_generate_blocking(prompt)
         metadata = self._model_metadata_for_backend(
             chat_backend,
@@ -2087,12 +2095,27 @@ class CommandBridge:
             for model in self._gemini_route_models()
         ]
         gemini_chain.append({"provider": "local", "model": local})
+        cp_providers = [
+            {"provider": "gemini", "model": self._gemini_primary_model()},
+            {"provider": "mistral", "model": self._mistral_model()},
+            {"provider": "opencode", "model": self._big_pickle_model()},
+        ]
+        # Pick the first actually usable provider as the preview (no probe).
+        cp_preview_provider, cp_preview_model = self._cloud_pool_preview()
         return {
             "status": STATUS_OK,
             "routes": [
                 {
+                    "backend": CHAT_BACKEND_CLOUD_POOL,
+                    "label": "雲端池",
+                    "requested_provider": cp_preview_provider,
+                    "requested_model": cp_preview_model,
+                    "chain": cp_providers,
+                    "configured": True,
+                },
+                {
                     "backend": CHAT_BACKEND_LOCAL,
-                    "label": "本地模型",
+                    "label": "本地",
                     "requested_provider": "local",
                     "requested_model": local,
                     "chain": [{"provider": "local", "model": local}],
@@ -2132,6 +2155,8 @@ class CommandBridge:
             return "mistral", self._mistral_model()
         if chat_backend == CHAT_BACKEND_GEMINI:
             return "gemini", self._gemini_primary_model()
+        if chat_backend == CHAT_BACKEND_CLOUD_POOL:
+            return self._cloud_pool_chain()[0][0], self._cloud_pool_chain()[0][1]
         return "local", self._local_model()
 
     def _model_metadata_for_backend(
@@ -2433,6 +2458,180 @@ class CommandBridge:
             text, model_metadata=metadata if isinstance(metadata, ModelMetadata) else None
         )
 
+    def _cloud_pool_chain(self) -> list[tuple[str, str, object, object]]:
+        """Return ordered list of (provider_label, model_name, build_fn, is_configured_fn)."""
+        gemini_model = self._gemini_primary_model()
+        mistral_model = self._mistral_model()
+        bp_model = self._big_pickle_model()
+        return [
+            ("gemini", gemini_model, self._build_gemini_chat_client,
+             lambda: bool(getattr(self.settings, "openclaw_gemini_api_key", None))),
+            ("mistral", mistral_model, self._build_mistral_chat_client,
+             lambda: bool(getattr(self.settings, "openclaw_mistral_api_key", None))),
+            ("opencode", bp_model, self._build_cloud_chat_client,
+             lambda: True),
+        ]
+
+    def _cloud_pool_preview(self) -> tuple[str, str]:
+        """First actually usable (provider, model) for the cloud_pool tab preview.
+        Checks settings only — no probing. Falls through to Big Pickle which is
+        always considered configured."""
+        for provider, model_name, _build_fn, configured_fn in self._cloud_pool_chain():
+            if configured_fn():
+                return provider, model_name
+        return "local", self._local_model()
+
+    def _handle_cloud_pool_blocking(
+        self, prompt: str
+    ) -> tuple[str, ModelMetadata]:
+        """Try Gemini → Mistral → Big Pickle → local; return (text, metadata)."""
+        attempts: list[ModelAttempt] = []
+
+        for provider, model_name, build_fn, configured_fn in self._cloud_pool_chain():
+            if not configured_fn():
+                attempts.append(ModelAttempt(
+                    provider, model_name, _MODEL_STATUS_NOT_CONFIGURED,
+                    f"{provider} not configured",
+                ))
+                continue
+            client = build_fn(model_name) if provider == "gemini" else build_fn()
+            if client is None:
+                attempts.append(ModelAttempt(
+                    provider, model_name, _MODEL_STATUS_NOT_CONFIGURED,
+                    f"{provider} unavailable",
+                ))
+                continue
+            try:
+                text = client.generate(prompt, temperature=0.7)
+            except _GeminiRequestError as exc:
+                attempts.append(ModelAttempt(provider, model_name, exc.status, str(exc)))
+                continue
+            except Exception as exc:
+                attempts.append(ModelAttempt(provider, model_name, _MODEL_STATUS_ERROR, str(exc)))
+                continue
+            attempts.append(ModelAttempt(provider, model_name, _MODEL_STATUS_OK))
+            fb = len(attempts) > 1
+            first_provider = self._cloud_pool_chain()[0][0]
+            first_model = self._cloud_pool_chain()[0][1]
+            return text, ModelMetadata(
+                requested_provider=first_provider,
+                requested_model=first_model,
+                attempted_models=tuple(attempts),
+                final_provider=provider,
+                final_model=model_name,
+                fallback_reason=None if not fb else f"Fell back from {attempts[0].provider}",
+                fallback_occurred=fb,
+                requested_tab=CHAT_BACKEND_CLOUD_POOL,
+            )
+
+        local_model = self._local_model()
+        text = self._ollama_generate_blocking(prompt)
+        attempts.append(ModelAttempt("local", local_model, _MODEL_STATUS_OK))
+        first_provider = self._cloud_pool_chain()[0][0]
+        first_model = self._cloud_pool_chain()[0][1]
+        return text, ModelMetadata(
+            requested_provider=first_provider,
+            requested_model=first_model,
+            attempted_models=tuple(attempts),
+            final_provider="local",
+            final_model=local_model,
+            fallback_reason="All cloud providers unavailable",
+            fallback_occurred=True,
+            requested_tab=CHAT_BACKEND_CLOUD_POOL,
+        )
+
+    def _stream_cloud_pool_chat(self, prompt: str) -> Iterator[dict]:
+        """Try Gemini → Mistral → Big Pickle → local for streaming."""
+        attempts: list[ModelAttempt] = []
+
+        for provider, model_name, build_fn, configured_fn in self._cloud_pool_chain():
+            if not configured_fn():
+                attempts.append(ModelAttempt(
+                    provider, model_name, _MODEL_STATUS_NOT_CONFIGURED,
+                    f"{provider} not configured",
+                ))
+                continue
+            client = build_fn(model_name) if provider == "gemini" else build_fn()
+            if client is None:
+                attempts.append(ModelAttempt(
+                    provider, model_name, _MODEL_STATUS_NOT_CONFIGURED,
+                    f"{provider} unavailable",
+                ))
+                continue
+
+            result: dict[str, object] = {}
+            done = threading.Event()
+
+            def _worker(
+                _client=client, _prompt=prompt,
+            ) -> None:
+                try:
+                    result["text"] = _client.generate(_prompt, temperature=0.7)
+                except _GeminiRequestError as exc:
+                    result["error"] = str(exc)
+                    result["error_status"] = exc.status
+                except Exception as exc:
+                    result["error"] = str(exc)
+                finally:
+                    done.set()
+
+            worker = threading.Thread(target=_worker, daemon=True)
+            worker.start()
+            try:
+                while not done.wait(timeout=_HEARTBEAT_SECONDS):
+                    yield stream_heartbeat()
+            except GeneratorExit:
+                abort = getattr(client, "abort", None)
+                if callable(abort):
+                    abort()
+                raise
+
+            if "error" in result:
+                error_status = str(result.get("error_status", _MODEL_STATUS_ERROR))
+                attempts.append(ModelAttempt(
+                    provider, model_name, error_status, str(result["error"]),
+                ))
+                continue
+
+            attempts.append(ModelAttempt(provider, model_name, _MODEL_STATUS_OK))
+            text = str(result.get("text") or "").strip()
+            if text:
+                yield stream_delta(text)
+            fb = len(attempts) > 1
+            first_provider = self._cloud_pool_chain()[0][0]
+            first_model = self._cloud_pool_chain()[0][1]
+            metadata = ModelMetadata(
+                requested_provider=first_provider,
+                requested_model=first_model,
+                attempted_models=tuple(attempts),
+                final_provider=provider,
+                final_model=model_name,
+                fallback_reason=None if not fb else f"Fell back from {attempts[0].provider}",
+                fallback_occurred=fb,
+                requested_tab=CHAT_BACKEND_CLOUD_POOL,
+            )
+            yield stream_done(text, model_metadata=metadata)
+            return
+
+        local_model = self._local_model()
+        text = self._ollama_generate_blocking(prompt)
+        attempts.append(ModelAttempt("local", local_model, _MODEL_STATUS_OK))
+        first_provider = self._cloud_pool_chain()[0][0]
+        first_model = self._cloud_pool_chain()[0][1]
+        metadata = ModelMetadata(
+            requested_provider=first_provider,
+            requested_model=first_model,
+            attempted_models=tuple(attempts),
+            final_provider="local",
+            final_model=local_model,
+            fallback_reason="All cloud providers unavailable",
+            fallback_occurred=True,
+            requested_tab=CHAT_BACKEND_CLOUD_POOL,
+        )
+        if text:
+            yield stream_delta(text)
+        yield stream_done(text, model_metadata=metadata)
+
     def _local_model(self) -> str:
         return (
             getattr(self.settings, "openclaw_local_text_model", None) or "qwen3:14b"
@@ -2559,6 +2758,8 @@ class CommandBridge:
             return message, metadata
         if chat_backend == CHAT_BACKEND_GEMINI:
             return self._generate_gemini_with_fallback(prompt, temperature=0.2)
+        if chat_backend == CHAT_BACKEND_CLOUD_POOL:
+            return self._handle_cloud_pool_blocking(prompt)
 
         message = self._run_command("/zh", text)
         metadata = self._model_metadata_for_backend(

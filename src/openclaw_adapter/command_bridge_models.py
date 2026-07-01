@@ -39,11 +39,13 @@ CHAT_BACKEND_LOCAL = "local"
 CHAT_BACKEND_CLOUD_PICKLE = "cloud_pickle"
 CHAT_BACKEND_CLOUD_MISTRAL = "cloud_mistral"
 CHAT_BACKEND_GEMINI = "gemini"
+CHAT_BACKEND_CLOUD_POOL = "cloud_pool"
 _CHAT_BACKENDS = {
     CHAT_BACKEND_LOCAL,
     CHAT_BACKEND_CLOUD_PICKLE,
     CHAT_BACKEND_CLOUD_MISTRAL,
     CHAT_BACKEND_GEMINI,
+    CHAT_BACKEND_CLOUD_POOL,
 }
 
 # --- Response statuses ----------------------------------------------------
@@ -204,6 +206,8 @@ class ModelMetadata:
     final_provider: str
     final_model: str
     fallback_reason: str | None = None
+    fallback_occurred: bool = False
+    requested_tab: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         out: dict[str, object] = {
@@ -215,6 +219,10 @@ class ModelMetadata:
         }
         if self.fallback_reason:
             out["fallback_reason"] = self.fallback_reason
+        if self.fallback_occurred:
+            out["fallback_occurred"] = True
+        if self.requested_tab is not None:
+            out["requested_tab"] = self.requested_tab
         return out
 
 

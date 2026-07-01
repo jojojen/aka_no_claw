@@ -20,6 +20,7 @@ import pytest
 from openclaw_adapter.command_bridge import CommandBridge, _WorkflowShimRunner, build_chat_prompt
 from openclaw_adapter.command_bridge_models import (
     CHAT_BACKEND_CLOUD_PICKLE,
+    CHAT_BACKEND_CLOUD_POOL,
     CHAT_BACKEND_LOCAL,
     CHAT_TOOL_BLUETOOTH,
     CHAT_TOOL_IR,
@@ -691,6 +692,7 @@ def test_parse_router_decision_rejects_control_only_query():
 def _tool_settings(
     debug: bool = False,
     gemini_key: str | None = None,
+    mistral_key: str | None = None,
     gemini_primary_model: str = "gemini-2.5-pro",
     gemini_flash_model: str = "gemini-2.5-flash",
 ):
@@ -700,7 +702,8 @@ def _tool_settings(
         openclaw_local_text_endpoint="http://local",
         openclaw_local_text_timeout_seconds=60,
         openclaw_opencode_model="big-pickle",
-        openclaw_mistral_api_key=None,
+        openclaw_opencode_base_url="http://localhost:8080",
+        openclaw_mistral_api_key=mistral_key,
         openclaw_mistral_model="mistral-large-latest",
         openclaw_gemini_api_key=gemini_key,
         openclaw_gemini_primary_model=gemini_primary_model,
@@ -2759,3 +2762,239 @@ def test_run_schedulehome_command_add_for_wf_kebab(tmp_path):
     result = b.run_schedulehome_command("add_for_wf wf-morning-greeting")
     assert result["status"] == "ok"
     assert b._sh_store.pending_wf_target("web-schedule") == "wf-morning-greeting"
+
+
+# --- Cloud pool provider fallback (#65) ------------------------------------
+
+class _FakeCloudClient:
+    def __init__(self, name: str, fail: bool = False, fail_status: str = ""):
+        self.name = name
+        self.fail = fail
+        self.fail_status = fail_status
+
+    def generate(self, prompt: str, *, temperature: float = 0.0) -> str:
+        if self.fail:
+            from openclaw_adapter.command_bridge import _GeminiRequestError
+            raise _GeminiRequestError(
+                f"{self.name} failed", status=self.fail_status or "error"
+            )
+        return f"{self.name}:{prompt}"
+
+
+def test_cloud_pool_success_with_gemini(monkeypatch):
+    """cloud_pool uses Gemini when it is configured and succeeds (no fallback)."""
+    b = CommandBridge(settings=_tool_settings(gemini_key="fake-key"))
+    monkeypatch.setattr(b, "_build_gemini_chat_client", lambda model: _FakeCloudClient("gemini"))
+    req = parse_request({"mode": "chat", "input": "hello", "chat_backend": "cloud_pool"})
+    resp = b.handle(req)
+    assert resp.status == STATUS_OK
+    assert resp.message == "gemini:hello"
+    meta = resp.to_dict()["model_metadata"]
+    assert meta["final_provider"] == "gemini"
+    assert meta["final_model"] == "gemini-2.5-pro"
+    assert "fallback_occurred" not in meta  # False → omitted
+    assert meta["requested_tab"] == "cloud_pool"
+
+
+def test_cloud_pool_gemini_fails_mistral_succeeds(monkeypatch):
+    """Gemini fails (quota) → Mistral succeeds."""
+    b = CommandBridge(settings=_tool_settings(
+        gemini_key="fake-key", mistral_key="fake-mistral",
+    ))
+    monkeypatch.setattr(b, "_build_gemini_chat_client",
+                        lambda model: _FakeCloudClient("gemini", fail=True, fail_status="quota_exhausted"))
+    monkeypatch.setattr(b, "_build_mistral_chat_client",
+                        lambda: _FakeCloudClient("mistral"))
+    monkeypatch.setattr(b, "_build_cloud_chat_client", lambda: None)
+
+    req = parse_request({"mode": "chat", "input": "hello", "chat_backend": "cloud_pool"})
+    resp = b.handle(req)
+    assert resp.status == STATUS_OK
+    assert resp.message == "mistral:hello"
+    meta = resp.to_dict()["model_metadata"]
+    assert meta["final_provider"] == "mistral"
+    assert meta["final_model"] == "mistral-large-latest"
+    assert meta["fallback_occurred"] is True
+    assert meta["requested_tab"] == "cloud_pool"
+    assert len(meta["attempted_models"]) == 2
+    assert meta["attempted_models"][0]["status"] == "quota_exhausted"
+    assert meta["attempted_models"][1]["status"] == "ok"
+
+
+def test_cloud_pool_gemini_mistral_fail_big_pickle_succeeds(monkeypatch):
+    """Gemini + Mistral both fail → Big Pickle succeeds."""
+    b = CommandBridge(settings=_tool_settings(
+        gemini_key="fake-key", mistral_key="fake-mistral",
+    ))
+
+    monkeypatch.setattr(b, "_build_gemini_chat_client",
+                        lambda model: _FakeCloudClient("gemini", fail=True))
+    monkeypatch.setattr(b, "_build_mistral_chat_client",
+                        lambda: _FakeCloudClient("mistral", fail=True))
+    monkeypatch.setattr(b, "_build_cloud_chat_client",
+                        lambda: _FakeCloudClient("bigpickle"))
+
+    req = parse_request({"mode": "chat", "input": "hello", "chat_backend": "cloud_pool"})
+    resp = b.handle(req)
+    assert resp.status == STATUS_OK
+    assert resp.message == "bigpickle:hello"
+    meta = resp.to_dict()["model_metadata"]
+    assert meta["final_provider"] == "opencode"
+    assert meta["final_model"] == "big-pickle"
+    assert meta["fallback_occurred"] is True
+
+
+def test_cloud_pool_all_cloud_fail_fallback_to_local(monkeypatch):
+    """All cloud providers fail/unconfigured → local fallback."""
+    b = CommandBridge(settings=_tool_settings(gemini_key=None))
+    monkeypatch.setattr(b, "_build_cloud_chat_client", lambda: None)
+    monkeypatch.setattr(b, "_ollama_generate_blocking", lambda prompt: f"local:{prompt}")
+
+    req = parse_request({"mode": "chat", "input": "hello", "chat_backend": "cloud_pool"})
+    resp = b.handle(req)
+    assert resp.status == STATUS_OK
+    assert resp.message == "local:hello"
+    meta = resp.to_dict()["model_metadata"]
+    assert meta["final_provider"] == "local"
+    assert meta["final_model"] == b._local_model()
+    assert meta["fallback_occurred"] is True
+    assert meta["fallback_reason"] == "All cloud providers unavailable"
+
+
+def test_cloud_pool_gemini_not_configured_mistral_succeeds(monkeypatch):
+    """Gemini not configured (no api key) → Mistral succeeds."""
+    b = CommandBridge(settings=_tool_settings(gemini_key=None, mistral_key="fake-mistral"))
+    monkeypatch.setattr(b, "_build_mistral_chat_client",
+                        lambda: _FakeCloudClient("mistral"))
+    monkeypatch.setattr(b, "_build_cloud_chat_client", lambda: None)
+
+    req = parse_request({"mode": "chat", "input": "hello", "chat_backend": "cloud_pool"})
+    resp = b.handle(req)
+    assert resp.status == STATUS_OK
+    assert resp.message == "mistral:hello"
+    meta = resp.to_dict()["model_metadata"]
+    assert meta["final_provider"] == "mistral"
+    assert meta["fallback_occurred"] is True
+    # First attempt should be not_configured (Gemini key missing)
+    assert meta["attempted_models"][0]["status"] == "not_configured"
+
+
+def test_cloud_pool_stream_gemini_success(monkeypatch):
+    """Cloud pool streaming works when Gemini succeeds."""
+    b = CommandBridge(settings=_tool_settings(gemini_key="fake-key"))
+    monkeypatch.setattr(b, "_build_gemini_chat_client",
+                        lambda model: _FakeCloudClient("gemini"))
+    monkeypatch.setattr(b, "_build_cloud_chat_client", lambda: None)
+    req = parse_request({"mode": "chat", "input": "hello", "chat_backend": "cloud_pool"})
+    events = list(b.stream(req, "test-rid"))
+    done = [e for e in events if e.get("type") == "done"]
+    assert len(done) == 1
+    assert done[0]["message"] == "gemini:hello"
+    meta = done[0].get("model_metadata", {})
+    assert meta["final_provider"] == "gemini"
+
+
+def test_cloud_pool_stream_all_fail_fallback_local(monkeypatch):
+    """Cloud pool streaming falls back to local when all cloud fails."""
+    b = CommandBridge(settings=_tool_settings(gemini_key="fake-key"))
+    monkeypatch.setattr(b, "_build_gemini_chat_client",
+                        lambda model: _FakeCloudClient("gemini", fail=True))
+    monkeypatch.setattr(b, "_build_mistral_chat_client",
+                        lambda: _FakeCloudClient("mistral", fail=True))
+    monkeypatch.setattr(b, "_build_cloud_chat_client", lambda: None)
+    monkeypatch.setattr(b, "_ollama_generate_blocking", lambda prompt: f"local:{prompt}")
+
+    req = parse_request({"mode": "chat", "input": "hello", "chat_backend": "cloud_pool"})
+    events = list(b.stream(req, "test-rid"))
+    deltas = [e for e in events if e.get("type") == "delta"]
+    errors = [e for e in events if e.get("type") == "error"]
+    done = [e for e in events if e.get("type") == "done"]
+    assert len(errors) == 0
+    assert len(done) == 1
+    assert "local:hello" in done[0]["message"]
+    meta = done[0].get("model_metadata", {})
+    assert meta["final_provider"] == "local"
+    assert meta["fallback_occurred"] is True
+
+
+def test_model_routes_includes_cloud_pool():
+    """model_routes includes cloud_pool with configured: true."""
+    b = CommandBridge(settings=_tool_settings())
+    routes = b.model_routes()
+    pool = next(r for r in routes["routes"] if r["backend"] == "cloud_pool")
+    assert pool["configured"] is True
+    assert pool["label"] == "雲端池"
+    assert len(pool["chain"]) == 3  # gemini, mistral, big pickle
+    assert routes["routes"][0]["backend"] == "cloud_pool"  # first in list
+
+
+def test_cloud_pool_preview_falls_to_big_pickle_when_no_keys():
+    """No API keys → cloud_pool preview shows Big Pickle (always configured)."""
+    b = CommandBridge(settings=_tool_settings(gemini_key=None, mistral_key=None))
+    provider, model = b._cloud_pool_preview()
+    assert provider == "opencode"
+    assert model == b._big_pickle_model()
+
+
+def test_cloud_pool_preview_shows_mistral_when_only_mistral_configured():
+    """Only Mistral has a key → preview shows Mistral."""
+    b = CommandBridge(settings=_tool_settings(gemini_key=None, mistral_key="mk"))
+    provider, model = b._cloud_pool_preview()
+    assert provider == "mistral"
+    assert model == b._mistral_model()
+
+
+def test_cloud_pool_preview_shows_gemini_when_configured():
+    """Gemini has a key → preview shows Gemini."""
+    b = CommandBridge(settings=_tool_settings(gemini_key="gk"))
+    provider, model = b._cloud_pool_preview()
+    assert provider == "gemini"
+    assert model == b._gemini_primary_model()
+
+
+def test_model_routes_local_label_renamed():
+    """Local route label changed from 本地模型 to 本地."""
+    b = CommandBridge(settings=_tool_settings())
+    routes = b.model_routes()
+    local = next(r for r in routes["routes"] if r["backend"] == "local")
+    assert local["label"] == "本地"
+
+
+def test_parse_request_accepts_cloud_pool_backend():
+    """parse_request accepts cloud_pool as a valid chat_backend."""
+    req = parse_request({"mode": "chat", "input": "hi", "chat_backend": "cloud_pool"})
+    assert req.chat_backend == "cloud_pool"
+
+
+def test_model_metadata_new_fields():
+    """ModelMetadata serializes fallback_occurred and requested_tab."""
+    from openclaw_adapter.command_bridge_models import ModelAttempt, ModelMetadata
+    meta = ModelMetadata(
+        requested_provider="gemini",
+        requested_model="g-2.5-pro",
+        attempted_models=(ModelAttempt("gemini", "g-2.5-pro", "ok"),),
+        final_provider="gemini",
+        final_model="g-2.5-pro",
+        fallback_occurred=False,
+        requested_tab="cloud_pool",
+    )
+    d = meta.to_dict()
+    assert "fallback_occurred" not in d  # False → omitted
+    assert d["requested_tab"] == "cloud_pool"
+
+    meta2 = ModelMetadata(
+        requested_provider="gemini",
+        requested_model="g-2.5-pro",
+        attempted_models=(
+            ModelAttempt("gemini", "g-2.5-pro", "quota_exhausted"),
+            ModelAttempt("local", "qwen3:14b", "ok"),
+        ),
+        final_provider="local",
+        final_model="qwen3:14b",
+        fallback_reason="Gemini quota",
+        fallback_occurred=True,
+        requested_tab="cloud_pool",
+    )
+    d2 = meta2.to_dict()
+    assert d2["fallback_occurred"] is True
+    assert d2["requested_tab"] == "cloud_pool"
