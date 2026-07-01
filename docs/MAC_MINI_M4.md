@@ -50,7 +50,7 @@ chmod +x launchers/start-mac-mini-stack.command
 The startup script will:
 
 - detect macOS, CPU architecture, model, and memory
-- install Homebrew if needed, then install Python 3.12 and Tesseract
+- install Homebrew if needed, then install Python 3.12, Tesseract, tmux, and blueutil
 - create `aka_no_claw/.env` from `.env.example` if missing
 - prompt once for Telegram bot token and chat id
 - generate `REPUTATION_AGENT_ADMIN_TOKEN` if it is empty
@@ -88,6 +88,11 @@ To skip Homebrew package setup after you have prepared dependencies yourself:
 ```bash
 AUTO_INSTALL_SYSTEM_DEPS=0 ./launchers/start-mac-mini-stack.command
 ```
+
+`/restartall` is a live service restart only. It does not install or upgrade
+Homebrew packages. When a new macOS runtime dependency is added, run the
+cold-start launcher once with `AUTO_INSTALL_SYSTEM_DEPS=1`, or install the
+package manually, then use `/restartall` to reload the services.
 
 The reputation snapshot service defaults to port `5000`. If that port is already
 in use on macOS, the launcher automatically falls back to a nearby local port

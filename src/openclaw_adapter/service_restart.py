@@ -74,9 +74,18 @@ SOURCE={_sh(source)}
 LOG_DIR="$CLAW/logs"
 UID_NUM="$(id -u)"
 TMUX_SOCKET="openclaw_codex"
-TMUX_BIN="$(command -v tmux || true)"
 BROADLINK_PREFLIGHT_ATTEMPTS="${{BROADLINK_PREFLIGHT_ATTEMPTS:-3}}"
 BROADLINK_PREFLIGHT_SLEEP_SECONDS="${{BROADLINK_PREFLIGHT_SLEEP_SECONDS:-2}}"
+
+# /restartall is a live restart, not a package installer, but it must refresh
+# Homebrew's PATH after a reboot so already-installed tools (tmux, blueutil,
+# SwitchAudioSource, etc.) are discoverable from the detached restart shell.
+if [ -x /opt/homebrew/bin/brew ]; then
+  eval "$(/opt/homebrew/bin/brew shellenv)"
+elif [ -x /usr/local/bin/brew ]; then
+  eval "$(/usr/local/bin/brew shellenv)"
+fi
+TMUX_BIN="$(command -v tmux || true)"
 
 mkdir -p "$LOG_DIR"
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] restartall requested source=$SOURCE pid=$$"
@@ -344,7 +353,7 @@ broadlink_preflight
 # Genuinely non-launchd services: (re)start detached with nohup.
 start_service "reputation_snapshot" "$REPUTATION" "$LOG_DIR/reputation_snapshot.log" "$REPUTATION/.venv/bin/python" app.py
 start_tmux_service "telegram" "telegram" "$CLAW" "source '$CLAW/run/mac-mini-stack.env' 2>/dev/null || true; export PYTHONPATH='.:src'; exec '$CLAW/.venv/bin/python' -m openclaw_adapter telegram-poll --with-reputation-agent --no-dashboard"
-start_tmux_service "bridge" "command bridge" "$CLAW" "exec '$CLAW/.venv/bin/python' -m openclaw_adapter command-bridge --lan --port 8781"
+start_tmux_service "bridge" "command bridge" "$CLAW" "source '$CLAW/run/mac-mini-stack.env' 2>/dev/null || true; export PYTHONPATH='.:src'; exec '$CLAW/.venv/bin/python' -m openclaw_adapter command-bridge --lan --port 8781"
 start_service "web frontend" "$WEB" "$LOG_DIR/openclaw_web_vite.log" npm run dev -- --host 0.0.0.0
 
 sleep 2

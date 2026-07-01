@@ -295,6 +295,7 @@ install_system_packages() {
   brew list python@3.12 >/dev/null 2>&1 || brew install python@3.12
   brew list tesseract >/dev/null 2>&1 || brew install tesseract
   brew list tmux >/dev/null 2>&1 || brew install tmux
+  brew list blueutil >/dev/null 2>&1 || brew install blueutil
 }
 
 python_is_compatible() {
@@ -1089,6 +1090,29 @@ append_runtime_export() {
   printf '%q\n' "${value}" >> "${RUNTIME_ENV_FILE}"
 }
 
+append_runtime_export_if_set() {
+  local key="$1"
+  local value="${!key:-}"
+  if [[ -n "${value}" ]]; then
+    append_runtime_export "${key}" "${value}"
+  fi
+}
+
+append_openclaw_runtime_exports() {
+  append_runtime_export "PATH" "${PATH}"
+  append_runtime_export_if_set "REPUTATION_AGENT_SERVER_URL"
+  append_runtime_export_if_set "REPUTATION_AGENT_ADMIN_TOKEN"
+  append_runtime_export_if_set "OPENCLAW_TESSERACT_PATH"
+  append_runtime_export_if_set "OPENCLAW_TESSDATA_DIR"
+  append_runtime_export_if_set "OPENCLAW_LOCAL_TEXT_BACKEND"
+  append_runtime_export_if_set "OPENCLAW_LOCAL_TEXT_ENDPOINT"
+  append_runtime_export_if_set "OPENCLAW_LOCAL_TEXT_MODEL"
+  append_runtime_export_if_set "OPENCLAW_LOCAL_VISION_BACKEND"
+  append_runtime_export_if_set "OPENCLAW_LOCAL_VISION_ENDPOINT"
+  append_runtime_export_if_set "OPENCLAW_LOCAL_VISION_MODEL"
+  append_runtime_export_if_set "PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH"
+}
+
 reset_runtime_env_file() {
   : > "${RUNTIME_ENV_FILE}"
   chmod 600 "${RUNTIME_ENV_FILE}" || true
@@ -1228,6 +1252,7 @@ start_openclaw_telegram() {
     if [[ -n "${chromium_path}" ]]; then
       export PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH="${chromium_path}"
     fi
+    append_openclaw_runtime_exports
     start_detached_shell_service "telegram" "OpenClaw Telegram bot" "${AKA_DIR}" "'${AKA_VENV}/bin/python' -m openclaw_adapter ${args[*]} </dev/null 2>&1 | $(rotator_cmd "${LOG_DIR}/openclaw_telegram.log")"
   )
 }
@@ -1296,6 +1321,7 @@ start_chat_web_service() {
 start_command_bridge_service() {
   log "Starting OpenClaw command bridge (http://${COMMAND_BRIDGE_HOST}:${COMMAND_BRIDGE_PORT})..."
   prepare_openclaw_runtime_env
+  append_openclaw_runtime_exports
   start_detached_shell_service "bridge" "OpenClaw command bridge" "${AKA_DIR}" "source '${RUNTIME_ENV_FILE}' 2>/dev/null || true; export PYTHONPATH='.:src'; '${AKA_VENV}/bin/python' -m openclaw_adapter command-bridge --host '${COMMAND_BRIDGE_HOST}' --port '${COMMAND_BRIDGE_PORT}' --lan 2>&1 | $(rotator_cmd "${LOG_DIR}/command_bridge.log")"
 }
 

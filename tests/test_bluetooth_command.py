@@ -136,9 +136,29 @@ def test_callback_data_never_exposes_mac(settings, monkeypatch):
 
 def test_connect_missing_blueutil_returns_install_help(settings, monkeypatch):
     monkeypatch.setattr(bt.shutil, "which", lambda name: None)
+    monkeypatch.setattr(bt, "_BLUEUTIL_FALLBACK_PATHS", ())
     msg = bt.connect_device(settings, _XGIMI_ADDR, "XGIMI Z8X")
     assert "blueutil" in msg
     assert "brew install blueutil" in msg
+
+
+def test_connect_finds_homebrew_blueutil_when_path_is_narrow(settings, monkeypatch, tmp_path):
+    blueutil = tmp_path / "blueutil"
+    blueutil.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(bt.shutil, "which", lambda name: None)
+    monkeypatch.setattr(bt, "_BLUEUTIL_FALLBACK_PATHS", (str(blueutil),))
+    seen: dict[str, object] = {}
+
+    def _run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(bt.subprocess, "run", _run)
+
+    msg = bt.connect_device(settings, _XGIMI_ADDR, "XGIMI Z8X")
+
+    assert msg == "已連線：XGIMI Z8X"
+    assert seen["cmd"][0] == str(blueutil)
 
 
 def test_connect_rejects_non_mac_before_running(settings, monkeypatch):
@@ -162,6 +182,21 @@ def test_connect_success(settings, monkeypatch):
     )
     msg = bt.connect_device(settings, _XGIMI_ADDR, "XGIMI Z8X")
     assert msg == "已連線：XGIMI Z8X"
+
+
+def test_connect_timeout_mentions_macos_bluetooth_permission(settings, monkeypatch):
+    monkeypatch.setattr(bt.shutil, "which", lambda name: "/usr/bin/blueutil")
+
+    def _timeout(*args, **kwargs):
+        raise bt.subprocess.TimeoutExpired(cmd="blueutil", timeout=25)
+
+    monkeypatch.setattr(bt.subprocess, "run", _timeout)
+
+    msg = bt.connect_device(settings, _XGIMI_ADDR, "XGIMI Z8X")
+
+    assert "逾時" in msg
+    assert "藍牙權限" in msg
+    assert "Terminal" in msg
 
 
 def test_connect_failure_surfaces_error(settings, monkeypatch):

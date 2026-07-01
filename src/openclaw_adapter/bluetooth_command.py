@@ -4,9 +4,11 @@ Scanning reads ``system_profiler SPBluetoothDataType -json`` — no extra instal
 is needed and this Mac already reports ``XGIMI Z8X`` there — to list the
 currently connected and known not-connected devices with their addresses.
 
-Connecting uses ``blueutil --connect <address>``. ``blueutil`` is optional: if it
-is not installed we return a clear ``brew install blueutil`` help message instead
-of failing silently, so the scan/list surface keeps working without it.
+Connecting uses ``blueutil --connect <address>``. The bot may run under launchd
+or tmux with a narrow PATH, so we resolve ``blueutil`` via PATH and the known
+Homebrew install locations. If it is not installed we return a clear
+``brew install blueutil`` help message instead of failing silently, so the
+scan/list surface keeps working without it.
 
 MAC addresses are never shown in normal user-facing text. Each device button
 carries an opaque token that maps to its address via a gitignored runtime cache
@@ -37,6 +39,7 @@ _CONNECT_TIMEOUT_SECONDS = 25
 _PROFILER_BINARY = "system_profiler"
 _PROFILER_DATATYPE = "SPBluetoothDataType"
 _BLUEUTIL_BINARY = "blueutil"
+_BLUEUTIL_FALLBACK_PATHS = ("/opt/homebrew/bin/blueutil", "/usr/local/bin/blueutil")
 
 # A real colon-separated MAC (e.g. 80:9F:9B:46:9C:21). Resolved tokens are
 # re-checked against this before reaching blueutil, defence-in-depth against a
@@ -51,6 +54,16 @@ _INSTALL_HELP = (
 
 def _is_mac(address: str) -> bool:
     return bool(_MAC_RE.match(address or ""))
+
+
+def _blueutil_binary() -> str | None:
+    found = shutil.which(_BLUEUTIL_BINARY)
+    if found:
+        return found
+    for candidate in _BLUEUTIL_FALLBACK_PATHS:
+        if Path(candidate).is_file():
+            return candidate
+    return None
 
 
 @dataclass(frozen=True)
@@ -174,7 +187,7 @@ def connect_device(settings: AssistantSettings, address: str, name: str) -> str:
     """Connect a device by MAC via ``blueutil``. Returns a user-facing message."""
     if not _is_mac(address):
         return "藍牙位址格式無效，請重新掃描。"
-    blueutil = shutil.which(_BLUEUTIL_BINARY)
+    blueutil = _blueutil_binary()
     if blueutil is None:
         return _INSTALL_HELP
     try:
@@ -185,7 +198,10 @@ def connect_device(settings: AssistantSettings, address: str, name: str) -> str:
             timeout=_CONNECT_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
-        return f"連線「{name}」逾時，請確認裝置已開機且在範圍內。"
+        return (
+            f"連線「{name}」逾時。請確認裝置已開機且在範圍內；"
+            "若 macOS 跳出藍牙權限提示，請允許 Terminal/啟動龍蝦的 App 使用藍牙。"
+        )
     except OSError as exc:
         return f"連線「{name}」失敗：{exc}"
     if proc.returncode == 0:

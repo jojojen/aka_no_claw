@@ -76,10 +76,13 @@ def test_broadlink_sensitive_services_start_in_dedicated_tmux_socket() -> None:
 
     assert 'TMUX_SOCKET="openclaw_codex"' in script
     assert "TMUX_BIN=\"$(command -v tmux || true)\"" in script
+    assert "/opt/homebrew/bin/brew shellenv" in script
+    assert "/usr/local/bin/brew shellenv" in script
     assert 'tmux start $label socket=$TMUX_SOCKET' in script
     assert '"$TMUX_BIN" -L "$TMUX_SOCKET" kill-server' in script
     assert 'start_tmux_service "telegram" "telegram"' in script
     assert 'start_tmux_service "bridge" "command bridge"' in script
+    assert "source '$CLAW/run/mac-mini-stack.env' 2>/dev/null || true" in script
     assert 'start_service "telegram"' not in script
     assert 'start_service "command bridge"' not in script
     assert script.index('free_port "command bridge" 8781') < script.index(
