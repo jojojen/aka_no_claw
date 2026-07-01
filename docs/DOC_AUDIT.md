@@ -40,6 +40,7 @@ for which question each one answers.
 | `LIQUIDITY_METHODOLOGY.md` | Current | price/liquidity | Keep; update with scoring changes. |
 | `RESEARCH_COMMAND_PLAN.md` | Current | research | Keep; living `/research` status. |
 | `BROWSER_UI_VALIDATION_PLAYBOOK.md` | Current | verification | Keep; browser smoke-test playbook for local web console validation. |
+| `ISSUE_66_PHASE2_PROGRESS.md` | Current | agent-maintenance | Keep; living phase-2 implementation record for llm-pool settings and Web Chat routing alignment. |
 | `NEW_DYNAMIC_TOOLS_PROGRESS.md` | Current | dynamic-tools | Keep; canonical `/new` doc. |
 | `NEW_E2E_DISCRIMINATING_TESTS.md` | Current | dynamic-tools | Keep; cross-link from dynamic-tools canonical. |
 | `NEW_OPENCODE_DECOUPLING_PLAN.md` | Planned | dynamic-tools | Keep until shipped; then fold into canonical and archive. Cross-linked from canonical. |
