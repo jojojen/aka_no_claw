@@ -1,6 +1,6 @@
 # OpenClaw Telegram Tool Spec
 
-Last reviewed: 2026-06-20
+Last reviewed: 2026-07-01
 Status: Needs review
 Owner area: telegram
 
@@ -82,8 +82,8 @@ The Telegram assistant can reach these tools:
     - `x:` — X (Twitter) via Nitter RSS. Account form `@handle`, keyword form `keyword:<term>`, trend form `trend:<category>`.
     - `reddit:` — Reddit via public JSON API. Subreddit form `r/<sub>`, keyword form `keyword:<term>`. No trend form.
   - Examples:
-    - `/snsadd x:@akanoclaw domain[pokemon]`
-    - `/snsadd x:@elonmusk filter[buy, sell] domain[stock] schedule:30`
+    - `/snsadd x:@example_tcg domain[pokemon]`
+    - `/snsadd x:@example_news filter[buy, sell] domain[stock] schedule:30`
     - `/snsadd x:keyword:機動戰士 domain[gundam, anime]`
     - `/snsadd x:trend:trending domain[news]`
     - `/snsadd reddit:r/PokemonTCG domain[pokemon] schedule:30`
@@ -99,8 +99,8 @@ The Telegram assistant can reach these tools:
   - List all watch rules. Each row shows `[source] <target> filter[…] domain[…] schedule:NNm`; rules awaiting LLM backfill display `domain[?]`.
 
 - `/snsdelete <target>`
-  - Remove a watch rule. `<target>` may be a rule ID prefix, an @handle (X), `r/<sub>` (Reddit), `keyword:<term>`, or a source-prefixed form (`x:@elon`, `reddit:r/PokemonTCG`, `reddit:keyword:…`).
-  - Examples: `/snsdelete @elonmusk`, `/snsdelete abc12345`, `/snsdelete keyword:機動戰士`, `/snsdelete reddit:r/PokemonTCG`
+  - Remove a watch rule. `<target>` may be a rule ID prefix, an @handle (X), `r/<sub>` (Reddit), `keyword:<term>`, or a source-prefixed form (`x:@example_news`, `reddit:r/PokemonTCG`, `reddit:keyword:…`).
+  - Examples: `/snsdelete @example_news`, `/snsdelete abc12345`, `/snsdelete keyword:機動戰士`, `/snsdelete reddit:r/PokemonTCG`
 
 - Clear filter (natural language only, no slash form)
   - Pattern: `把 @<handle> 的 filter 全部拿掉` / `清空 @<handle> 的篩選` / `clear filter on @<handle>`
@@ -156,9 +156,9 @@ Free-text values are accepted (normalised to lowercase). Untagged rules are auto
 
 Natural-language examples for SNS intents (router must distinguish these from Mercari watch intents — any `@handle` or X/Twitter/推特 keyword forces SNS):
 
-- "追蹤 @elonmusk" → `sns_add_account`, sns_handle="elonmusk"
-- "刪除追蹤 @elonmusk" / "取消追蹤 @elonmusk" / "unfollow @elonmusk" → `sns_delete`, sns_handle="elonmusk"
-- "把 @ARS_Arsales 的 filter 全部拿掉" / "清空 @elonmusk 的篩選" / "clear filter on @aka_claw" → `sns_clear_filter`, sns_handle="<handle>"
+- "追蹤 @example_news" → `sns_add_account`, sns_handle="example_news"
+- "刪除追蹤 @example_news" / "取消追蹤 @example_news" / "unfollow @example_news" → `sns_delete`, sns_handle="example_news"
+- "把 @example_tcg 的 filter 全部拿掉" / "清空 @example_news 的篩選" / "clear filter on @example_bot" → `sns_clear_filter`, sns_handle="<handle>"
 - "我的 X 追蹤清單" / "推主追蹤" → `sns_list`
 - "整理一下 amd 最近熱門討論" → `sns_buzz`, sns_buzz_query="amd"
 - "remove target 2 from opportunity list" → `opportunity_remove`, opportunity_target="2"
@@ -177,35 +177,42 @@ Routing rules:
 - A bare Mercari item/shops product URL with no reputation-or-research wording is ambiguous between `reputation_snapshot` and `product_research`: set `query_url` and return confidence below 0.5 so the caller asks the user which one.
 - Return `web_research` when the user asks about price direction, market sentiment, recent news, or any why/how/explanatory question that needs web sources and summarization.
 - Return `opportunity_remove` when the user wants to remove/dismiss a target from the opportunity/hunt list.
-- Return `create_workflow` when the user wants to build/create/設定 a new workflow / 工作流 / 自動化流程; set `workflow_description` to the full task description.
+- Return `create_workflow` when the OpenClaw app-intent extension is enabled and the user wants to build/create/設定 a new workflow / 工作流 / 自動化流程; set `workflow_description` to the full task description.
+- Return `play_music` and `home_action` only through the OpenClaw app-intent extension; they are not base `telegram_nl` intents.
 - Return watch intents for tracking requests.
 - Return `unknown` when the request is unrelated or too ambiguous.
 
 ## Natural-language routing pipeline
 
-A non-slash message is routed in two stages (`TelegramCommandProcessor._route_natural_language`):
+A non-slash message is routed by `TelegramCommandProcessor._route_natural_language`
+with generic routing owned by `telegram_nl` and OpenClaw-only semantics owned by
+`openclaw_adapter`:
 
-1. **Embedding fast-path** (`openclaw_adapter/intent_fast_path.py`). One bge-m3
+1. **OpenClaw embedding fast-path** (`openclaw_adapter/intent_fast_path.py`). One bge-m3
    embedding of the message is compared (cosine) against canonical phrasings in
    `data/intent_routing_phrasings.json`. It short-circuits **only** when the top
-   intent is a zero-arg command — `help`, `status`, `tools`, `scan_help`,
-   `sns_list`, `list_watches` — AND the score clears `OPENCLAW_INTENT_FASTPATH_MIN_SCORE`
-   (default 0.65) AND beats the runner-up by a small margin. ~130 ms.
-   It returns the intent label only; it never extracts slots.
-2. **LLM router** (`qwen3:14b`, `price_monitor_bot.natural_language`). Everything
-   the fast-path declines — slot-bearing intents (`add_watch`, `lookup_card`,
-   `sns_add_account`, …) and any low-confidence / ambiguous message — falls
-   through here unchanged, so parameter extraction is exactly as before. ~50 s.
-3. A deterministic regex fallback still backstops the LLM for a few bulk-filter
-   sentences.
+   intent is explicitly safe to short-circuit. Zero-arg list/info commands
+   return labels only; full-text app intents such as `create_workflow` return
+   the original message as the description.
+2. **Generic `telegram_nl` fast path**. Deterministic structured cases such as
+   SNS filter clearing and bulk filter/schedule updates run before the model so
+   common LLM field-drop errors are avoided.
+3. **LLM router** (`telegram_nl.TelegramNaturalLanguageRouter`). OpenClaw builds
+   this router with an app-specific prompt suffix and `extra_allowed_intents`
+   for `create_workflow`, `play_music`, and `home_action`; the base
+   `telegram_nl` package does not own those app intents.
+4. **Generic slow fallback**. Residual generic fallback only runs after the LLM
+   misses or is unavailable.
+5. **OpenClaw app fallback** (`fallback_route_openclaw_natural_language`). This
+   catches workflow/music/home app phrases after the generic router returns no
+   useful intent, keeping app semantics out of the generic package.
 
 Design notes:
 
-- This is a **fast-path, not a replacement**: the only thing it can decide is
-  "this is confidently a zero-arg list/info command". The blast radius of a
-  wrong short-circuit is bounded to those six harmless commands.
+- Fast paths are narrow by design: they only short-circuit intents whose slots
+  are either absent, mechanically extracted, or the full user utterance.
 - Fully reversible: an empty/blank embed model, a missing phrasings file, or any
-  embed failure disables the fast-path and every message routes through the LLM.
+   embed failure disables the fast-path and every message routes through the LLM.
 - Tune the floor with `OPENCLAW_INTENT_FASTPATH_MIN_SCORE`. Lower = faster /
   riskier; higher = more messages fall through to the slow LLM router.
 - Spike evidence (20 real utterances, both routers 20/20 on intent, embedding

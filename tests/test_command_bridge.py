@@ -20,17 +20,15 @@ import pytest
 from openclaw_adapter.command_bridge import CommandBridge, _WorkflowShimRunner, build_chat_prompt
 from openclaw_adapter.command_bridge_models import (
     CHAT_BACKEND_CLOUD_PICKLE,
+    CHAT_BACKEND_CLOUD_POOL,
     CHAT_BACKEND_LOCAL,
+    CHAT_TOOL_BLUETOOTH,
+    CHAT_TOOL_IR,
+    CHAT_TOOL_MUSIC,
     CHAT_TOOL_SEARCH,
     MAX_HISTORY_TURNS,
     MAX_ROUTER_QUERY_LEN,
-    MUSIC_ACTION_LIST_ALL,
-    MUSIC_ACTION_LIST_FAVORITES,
-    MUSIC_ACTION_NOW,
     MUSIC_ACTION_PLAN,
-    MUSIC_ACTION_PLAY_QUERY,
-    MUSIC_ACTION_RANDOM,
-    MUSIC_ACTION_STOP,
     ChatToolPolicy,
     ChatToolRequest,
     ChatToolResult,
@@ -50,7 +48,6 @@ from openclaw_adapter.command_bridge_models import (
     SUBMODE_SELLER_REPUTATION_SNAPSHOT,
     SUBMODE_TEXT_TRANSLATION,
     RequestValidationError,
-    detect_music_intent,
     make_chat_tool_request,
     parse_request,
     parse_router_decision,
@@ -621,6 +618,33 @@ def test_parse_router_decision_tool():
     assert d.query == "初音 新歌"
 
 
+def test_parse_router_decision_music_tool():
+    d = parse_router_decision(
+        '{"decision":"tool","tool":"/music","query":"stop","reason_summary":"音樂控制"}'
+    )
+    assert d.decision == ROUTER_DECISION_TOOL
+    assert d.tool == CHAT_TOOL_MUSIC
+    assert d.query == "stop"
+
+
+def test_parse_router_decision_bluetooth_tool():
+    d = parse_router_decision(
+        '{"decision":"tool","tool":"/bluetooth","query":"scan","reason_summary":"藍牙控制"}'
+    )
+    assert d.decision == ROUTER_DECISION_TOOL
+    assert d.tool == CHAT_TOOL_BLUETOOTH
+    assert d.query == "scan"
+
+
+def test_parse_router_decision_ir_tool():
+    d = parse_router_decision(
+        '{"decision":"tool","tool":"/ir","query":"send ceiling_light power","reason_summary":"IR 控制"}'
+    )
+    assert d.decision == ROUTER_DECISION_TOOL
+    assert d.tool == CHAT_TOOL_IR
+    assert d.query == "send ceiling_light power"
+
+
 def test_parse_router_decision_extracts_json_from_noise():
     raw = '<think>嗯</think> 好的：\n```json\n{"decision":"tool","tool":"/search","query":"q"}\n```'
     d = parse_router_decision(raw)
@@ -668,6 +692,7 @@ def test_parse_router_decision_rejects_control_only_query():
 def _tool_settings(
     debug: bool = False,
     gemini_key: str | None = None,
+    mistral_key: str | None = None,
     gemini_primary_model: str = "gemini-2.5-pro",
     gemini_flash_model: str = "gemini-2.5-flash",
 ):
@@ -677,7 +702,8 @@ def _tool_settings(
         openclaw_local_text_endpoint="http://local",
         openclaw_local_text_timeout_seconds=60,
         openclaw_opencode_model="big-pickle",
-        openclaw_mistral_api_key=None,
+        openclaw_opencode_base_url="http://localhost:8080",
+        openclaw_mistral_api_key=mistral_key,
         openclaw_mistral_model="mistral-large-latest",
         openclaw_gemini_api_key=gemini_key,
         openclaw_gemini_primary_model=gemini_primary_model,
@@ -732,6 +758,113 @@ def test_chat_tool_search_triggers_grounded_answer(monkeypatch):
     assert CHAT_TOOL_SEARCH in resp.message
     # Sources are always appended so the answer is traceable.
     assert "https://miku.example/news" in resp.message
+
+
+def test_router_prompt_includes_registered_control_tool_usage(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        b,
+        "_handlers",
+        lambda: {
+            "/music": SimpleNamespace(
+                usage="stop=停止；playbest=播放最愛",
+                chat_tool_purpose="當使用者要控制本機音樂播放時使用",
+                chat_tool_query_hint="query 只輸出 /music 後面的參數",
+            ),
+            "/bluetooth": SimpleNamespace(
+                usage="scan=掃描；<裝置名>=連線",
+                chat_tool_purpose="當使用者要掃描藍牙裝置時使用",
+                chat_tool_query_hint="query 只輸出 /bluetooth 後面的參數",
+            ),
+            "/ir": SimpleNamespace(
+                usage="discover=掃描裝置；send <裝置> <按鍵名>=發送",
+                chat_tool_purpose="當使用者要控制紅外線家電時使用",
+                chat_tool_query_hint="query 只輸出 /ir 後面的參數",
+            ),
+        },
+    )
+
+    prompt = b._build_router_prompt(parse_request({"mode": "chat", "input": "停止播放音樂"}))
+
+    assert "/music" in prompt
+    assert "stop=停止" in prompt
+    assert "playbest=播放最愛" in prompt
+    assert "當使用者要控制本機音樂播放時使用" in prompt
+    assert "/bluetooth" in prompt
+    assert "scan=掃描" in prompt
+    assert "當使用者要掃描藍牙裝置時使用" in prompt
+    assert "/ir" in prompt
+    assert "discover=掃描裝置" in prompt
+    assert "當使用者要控制紅外線家電時使用" in prompt
+
+
+def test_chat_tool_music_dispatches_registered_music_command(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        b,
+        "_generate_router_json",
+        lambda prompt: '{"decision":"tool","tool":"/music","query":"stop"}',
+    )
+    called = {}
+
+    def _mock_run_music_command(text):
+        called["text"] = text
+        return {"status": STATUS_OK, "message": "已停止目前由龍蝦播放的音樂。", "actions": []}
+
+    monkeypatch.setattr(b, "run_music_command", _mock_run_music_command)
+    resp = b.handle(parse_request({"mode": "chat", "input": "停止播放音樂"}))
+
+    assert resp.status == STATUS_OK
+    assert called["text"] == "stop"
+    assert "已使用工具" in resp.message
+    assert "音樂控制" in resp.message
+    assert "已停止目前由龍蝦播放的音樂" in resp.message
+
+
+def test_chat_tool_bluetooth_dispatches_registered_bluetooth_command(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        b,
+        "_generate_router_json",
+        lambda prompt: '{"decision":"tool","tool":"/bluetooth","query":"scan"}',
+    )
+    called = {}
+
+    def _mock_run_bluetooth_command(text=""):
+        called["text"] = text
+        return {"status": STATUS_OK, "message": "找到 2 個藍牙裝置。", "actions": []}
+
+    monkeypatch.setattr(b, "run_bluetooth_command", _mock_run_bluetooth_command)
+    resp = b.handle(parse_request({"mode": "chat", "input": "掃描藍牙裝置"}))
+
+    assert resp.status == STATUS_OK
+    assert called["text"] == "scan"
+    assert "已使用工具" in resp.message
+    assert "藍牙控制" in resp.message
+    assert "找到 2 個藍牙裝置" in resp.message
+
+
+def test_chat_tool_ir_dispatches_registered_ir_command(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        b,
+        "_generate_router_json",
+        lambda prompt: '{"decision":"tool","tool":"/ir","query":"send ceiling_light power"}',
+    )
+    called = {}
+
+    def _mock_run_ir_command(text):
+        called["text"] = text
+        return {"status": STATUS_OK, "message": "已切換天花板燈電源。", "actions": []}
+
+    monkeypatch.setattr(b, "run_ir_command", _mock_run_ir_command)
+    resp = b.handle(parse_request({"mode": "chat", "input": "切換天花板燈"}))
+
+    assert resp.status == STATUS_OK
+    assert called["text"] == "send ceiling_light power"
+    assert "已使用工具" in resp.message
+    assert "紅外線控制" in resp.message
+    assert "已切換天花板燈電源" in resp.message
 
 
 def test_router_prompt_includes_history_for_rewrite(monkeypatch):
@@ -1549,6 +1682,27 @@ def test_ir_command_normalizes_full_slash_command(monkeypatch):
     assert res["message"] == "IR sent"
 
 
+def test_bluetooth_command_normalizes_scan_and_full_slash_command(monkeypatch):
+    b = CommandBridge(settings=object())
+    seen: list[dict[str, str]] = []
+
+    def _run(command, remainder):
+        seen.append({"command": command, "remainder": remainder})
+        return ("BT ok", {"inline_keyboard": []})
+
+    monkeypatch.setattr(b, "_run_command_raw", _run)
+
+    scan_res = b.run_bluetooth_command("scan")
+    connect_res = b.run_bluetooth_command("/bluetooth XGIMI Z8X")
+
+    assert seen == [
+        {"command": "/bluetooth", "remainder": ""},
+        {"command": "/bluetooth", "remainder": "XGIMI Z8X"},
+    ]
+    assert scan_res["status"] == STATUS_OK
+    assert connect_res["message"] == "BT ok"
+
+
 def test_server_music_route_dispatches_callback(monkeypatch):
     """POST /api/command/music with callback_data → run_music_action; with
     input → run_music_command; empty body → music menu."""
@@ -1636,6 +1790,53 @@ def test_server_ir_route_dispatches_command_and_callback(monkeypatch):
     seen.clear()
     out = _invoke(b'{"input":"/ir send ceiling_light power"}')
     assert seen["command"] == "/ir send ceiling_light power"
+    assert out["message"] == "cmd"
+
+
+def test_server_bluetooth_route_dispatches_command_and_callback(monkeypatch):
+    from http.server import BaseHTTPRequestHandler
+
+    from openclaw_adapter import command_bridge_server as srv
+
+    seen: dict[str, object] = {}
+
+    class _FakeBridge:
+        def run_bluetooth_action(self, cb):
+            seen["action"] = cb
+            return {"status": STATUS_OK, "message": "act", "actions": []}
+
+        def run_bluetooth_command(self, text=""):
+            seen["command"] = text
+            return {"status": STATUS_OK, "message": "cmd", "actions": []}
+
+    def _invoke(body: bytes) -> dict:
+        handler_cls = srv._build_handler(_FakeBridge(), lan_enabled=False)
+        h = handler_cls.__new__(handler_cls)
+        h.headers = {"Content-Length": str(len(body))}
+        h.rfile = io.BytesIO(body)
+        h.wfile = io.BytesIO()
+        h.request_version = "HTTP/1.1"
+        h.protocol_version = "HTTP/1.0"
+        h.requestline = "POST /api/command/bluetooth HTTP/1.1"
+        h.responses = BaseHTTPRequestHandler.responses
+        h.client_address = ("127.0.0.1", 1)
+        h._handle_bluetooth()
+        raw = h.wfile.getvalue().split(b"\r\n\r\n", 1)[1]
+        import json as _json
+        return _json.loads(raw.decode("utf-8"))
+
+    out = _invoke(b'{"callback_data":"bt:scan"}')
+    assert seen["action"] == "bt:scan"
+    assert out["message"] == "act"
+
+    seen.clear()
+    out = _invoke(b'{"input":"XGIMI Z8X"}')
+    assert seen["command"] == "XGIMI Z8X"
+    assert out["message"] == "cmd"
+
+    seen.clear()
+    out = _invoke(b"{}")
+    assert seen["command"] == ""
     assert out["message"] == "cmd"
 
 
@@ -1787,137 +1988,23 @@ def test_exec_grounded_search_source_count(monkeypatch):
     assert "sources=2" in result.result_summary
 
 
-# --- Issue #49: music fast-path detection ---------------------------------
+# --- /music chat tool routing -----------------------------------------------
 
-@pytest.mark.parametrize("text,expected_action,expected_query", [
-    ("播放一首歌", MUSIC_ACTION_RANDOM, ""),
-    ("放一首", MUSIC_ACTION_RANDOM, ""),
-    ("隨機播放", MUSIC_ACTION_RANDOM, ""),
-    ("播歌", MUSIC_ACTION_RANDOM, ""),
-    ("停止音樂", MUSIC_ACTION_STOP, ""),
-    ("停播", MUSIC_ACTION_STOP, ""),
-    ("現在播什麼", MUSIC_ACTION_NOW, ""),
-    ("正在播的是什麼", MUSIC_ACTION_NOW, ""),
-    ("列出歌曲", MUSIC_ACTION_LIST_ALL, ""),
-    ("可以播放的歌", MUSIC_ACTION_LIST_ALL, ""),
-    ("列出最愛", MUSIC_ACTION_LIST_FAVORITES, ""),
-    ("我的歌單", MUSIC_ACTION_LIST_FAVORITES, ""),
-    ("播放 One Last Kiss", MUSIC_ACTION_PLAY_QUERY, "One Last Kiss"),
-    ("播放Lemon", MUSIC_ACTION_PLAY_QUERY, "Lemon"),
-    ("播 KICK BACK", MUSIC_ACTION_PLAY_QUERY, "KICK BACK"),
-])
-def test_detect_music_intent_simple(text, expected_action, expected_query):
-    intent = detect_music_intent(text)
-    assert intent is not None, f"expected intent for {text!r}"
-    assert intent.action == expected_action
-    if expected_query:
-        assert intent.query == expected_query
-
-
-@pytest.mark.parametrize("text", [
-    "幫我查今天天氣",
-    "初音未來是誰",
-    "",
-    "   ",
-])
-def test_detect_music_intent_returns_none_for_non_music(text):
-    assert detect_music_intent(text) is None
-
-
-def test_detect_music_intent_plan_qualifier():
-    intent = detect_music_intent("播放米津玄師熱門單曲")
-    assert intent is not None
-    assert intent.action == MUSIC_ACTION_PLAN
-    assert intent.query == "米津玄師"
-    assert intent.qualifier == "熱門"
-
-
-def test_detect_music_intent_plan_latest():
-    intent = detect_music_intent("播放 YOASOBI 最新歌曲")
-    assert intent is not None
-    assert intent.action == MUSIC_ACTION_PLAN
-    assert intent.query == "YOASOBI"
-    assert intent.qualifier == "最新"
-
-
-def test_detect_music_intent_plan_does_not_match_simple_title():
-    # "One Last Kiss" has no qualifier → simple play_query
-    intent = detect_music_intent("播放 One Last Kiss")
-    assert intent is not None
-    assert intent.action == MUSIC_ACTION_PLAY_QUERY
-    assert intent.query == "One Last Kiss"
-
-
-def test_chat_random_play_dispatches_to_music_command(monkeypatch):
+def test_stream_chat_music_tool_emits_done(monkeypatch):
     b = CommandBridge(settings=_tool_settings())
-    called = {}
-
-    def _mock_run_music_command(text):
-        called["text"] = text
-        return {"status": STATUS_OK, "message": "🎵 Now playing: ランダム曲", "actions": []}
-
-    monkeypatch.setattr(b, "run_music_command", _mock_run_music_command)
-    resp = b.handle(parse_request({"mode": "chat", "input": "播放一首歌"}))
-    assert resp.status == STATUS_OK
-    assert called["text"] == "random"
-    assert "ランダム曲" in resp.message
-
-
-def test_chat_play_query_passes_song_name(monkeypatch):
-    b = CommandBridge(settings=_tool_settings())
-    called = {}
-
-    def _mock_run_music_command(text):
-        called["text"] = text
-        return {"status": STATUS_OK, "message": f"▶️ {text}", "actions": []}
-
-    monkeypatch.setattr(b, "run_music_command", _mock_run_music_command)
-    resp = b.handle(parse_request({"mode": "chat", "input": "播放 One Last Kiss"}))
-    assert resp.status == STATUS_OK
-    assert called["text"] == "One Last Kiss"
-    assert "One Last Kiss" in resp.message
-
-
-def test_chat_stop_music(monkeypatch):
-    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        b,
+        "_generate_router_json",
+        lambda prompt: '{"decision":"tool","tool":"/music","query":"stop"}',
+    )
     monkeypatch.setattr(b, "run_music_command",
-                        lambda t: {"status": STATUS_OK, "message": "⏹ 已停止", "actions": []})
-    resp = b.handle(parse_request({"mode": "chat", "input": "停止音樂"}))
-    assert resp.status == STATUS_OK
-    assert "已停止" in resp.message
-
-
-def test_chat_list_all_returns_actions(monkeypatch):
-    b = CommandBridge(settings=_tool_settings())
-    markup_actions = [{"label": "🎵 Song A", "callback_data": "music:sd:tokA"}]
-    monkeypatch.setattr(b, "run_music_action",
-                        lambda cb: {"status": STATUS_OK, "message": "📁 全部歌曲", "actions": markup_actions})
-    resp = b.handle(parse_request({"mode": "chat", "input": "列出歌曲"}))
-    assert resp.status == STATUS_OK
-    assert "全部歌曲" in resp.message
-    assert len(resp.actions) == 1
-    assert resp.actions[0].label == "🎵 Song A"
-    assert resp.actions[0].command == "music:sd:tokA"
-
-
-def test_chat_music_bypasses_llm_router(monkeypatch):
-    """Music fast-path must not invoke the LLM router at all."""
-    b = CommandBridge(settings=_tool_settings())
-    router_called = []
-    monkeypatch.setattr(b, "_route_chat_decision", lambda req: router_called.append(1) or None)
-    monkeypatch.setattr(b, "run_music_command",
-                        lambda t: {"status": STATUS_OK, "message": "ok", "actions": []})
-    b.handle(parse_request({"mode": "chat", "input": "停播"}))
-    assert not router_called, "LLM router must not be called for music intents"
-
-
-def test_stream_chat_music_emits_done(monkeypatch):
-    b = CommandBridge(settings=_tool_settings())
-    monkeypatch.setattr(b, "run_music_command",
-                        lambda t: {"status": STATUS_OK, "message": "🎵 Playing", "actions": []})
-    events = list(b.stream(parse_request({"mode": "chat", "input": "播歌"}), "rid-m"))
+                        lambda t: {"status": STATUS_OK, "message": "已停止", "actions": []})
+    events = list(b.stream(parse_request({"mode": "chat", "input": "停止播放音樂"}), "rid-m"))
     assert events[0]["type"] == "start"
-    assert events[-1] == {"type": "done", "message": "🎵 Playing"}
+    assert events[1]["type"] == "delta"
+    assert "音樂控制" in events[1]["text"]
+    assert events[-1]["type"] == "done"
+    assert "已停止" in events[-1]["message"]
 
 
 # --- Issue #50: bounded multi-tool music plan ----------------------------
@@ -2375,7 +2462,7 @@ def test_stream_chat_nl_fallback_when_fast_path_misses(monkeypatch):
     _assert_single_redirect(list(b.stream(req, "test-rid3")), "工作流")
 
 
-def test_stream_chat_workflow_redirect_beats_music_fast_path(monkeypatch):
+def test_stream_chat_workflow_redirect_beats_music_tool_route(monkeypatch):
     """A workflow-authoring request mentioning music must redirect, not play."""
     b = CommandBridge(settings=object())
     monkeypatch.setattr(b, "_get_intent_fast_path", lambda: None)
@@ -2384,7 +2471,7 @@ def test_stream_chat_workflow_redirect_beats_music_fast_path(monkeypatch):
 
     def _fake_music(_req, intent):
         music_calls.append(intent.action)
-        raise AssertionError("music fast-path should not run for workflow authoring")
+        raise AssertionError("music playback should not run for workflow authoring")
 
     def _boom(_req):
         raise AssertionError("LLM router should not be called for create_workflow")
@@ -2395,6 +2482,36 @@ def test_stream_chat_workflow_redirect_beats_music_fast_path(monkeypatch):
     req = parse_request({"mode": "chat", "input": "建立工作流：播放最愛音樂清單 然後 開燈"})
     _assert_single_redirect(list(b.stream(req, "test-rid-music")), "工作流")
     assert music_calls == []
+
+
+def test_stream_chat_music_uses_router_tool_path(monkeypatch):
+    """Web chat music control should go through the shared router tool path."""
+    b = CommandBridge(settings=object())
+    monkeypatch.setattr(b, "_get_intent_fast_path", lambda: None)
+    monkeypatch.setattr(
+        b,
+        "_route_chat_decision",
+        lambda req: RouterDecision(
+            decision=ROUTER_DECISION_TOOL,
+            tool=CHAT_TOOL_MUSIC,
+            query="playbest",
+        ),
+    )
+
+    music_queries: list[str] = []
+
+    def _fake_run_music_command(query):
+        music_queries.append(query)
+        return {"status": "ok", "message": "開始連續隨機播放最愛歌曲。", "actions": []}
+
+    monkeypatch.setattr(b, "run_music_command", _fake_run_music_command)
+
+    req = parse_request({"mode": "chat", "input": "播放我的最愛清單歌曲"})
+    events = list(b.stream(req, "test-rid-playbest"))
+
+    assert music_queries == ["playbest"]
+    assert events[-1]["type"] == "done"
+    assert "開始連續" in events[-1]["message"]
 
 
 # --- /schedulehome bridge route (web#9) ------------------------------------
@@ -2645,3 +2762,239 @@ def test_run_schedulehome_command_add_for_wf_kebab(tmp_path):
     result = b.run_schedulehome_command("add_for_wf wf-morning-greeting")
     assert result["status"] == "ok"
     assert b._sh_store.pending_wf_target("web-schedule") == "wf-morning-greeting"
+
+
+# --- Cloud pool provider fallback (#65) ------------------------------------
+
+class _FakeCloudClient:
+    def __init__(self, name: str, fail: bool = False, fail_status: str = ""):
+        self.name = name
+        self.fail = fail
+        self.fail_status = fail_status
+
+    def generate(self, prompt: str, *, temperature: float = 0.0) -> str:
+        if self.fail:
+            from openclaw_adapter.command_bridge import _GeminiRequestError
+            raise _GeminiRequestError(
+                f"{self.name} failed", status=self.fail_status or "error"
+            )
+        return f"{self.name}:{prompt}"
+
+
+def test_cloud_pool_success_with_gemini(monkeypatch):
+    """cloud_pool uses Gemini when it is configured and succeeds (no fallback)."""
+    b = CommandBridge(settings=_tool_settings(gemini_key="fake-key"))
+    monkeypatch.setattr(b, "_build_gemini_chat_client", lambda model: _FakeCloudClient("gemini"))
+    req = parse_request({"mode": "chat", "input": "hello", "chat_backend": "cloud_pool"})
+    resp = b.handle(req)
+    assert resp.status == STATUS_OK
+    assert resp.message == "gemini:hello"
+    meta = resp.to_dict()["model_metadata"]
+    assert meta["final_provider"] == "gemini"
+    assert meta["final_model"] == "gemini-2.5-pro"
+    assert "fallback_occurred" not in meta  # False → omitted
+    assert meta["requested_tab"] == "cloud_pool"
+
+
+def test_cloud_pool_gemini_fails_mistral_succeeds(monkeypatch):
+    """Gemini fails (quota) → Mistral succeeds."""
+    b = CommandBridge(settings=_tool_settings(
+        gemini_key="fake-key", mistral_key="fake-mistral",
+    ))
+    monkeypatch.setattr(b, "_build_gemini_chat_client",
+                        lambda model: _FakeCloudClient("gemini", fail=True, fail_status="quota_exhausted"))
+    monkeypatch.setattr(b, "_build_mistral_chat_client",
+                        lambda: _FakeCloudClient("mistral"))
+    monkeypatch.setattr(b, "_build_cloud_chat_client", lambda: None)
+
+    req = parse_request({"mode": "chat", "input": "hello", "chat_backend": "cloud_pool"})
+    resp = b.handle(req)
+    assert resp.status == STATUS_OK
+    assert resp.message == "mistral:hello"
+    meta = resp.to_dict()["model_metadata"]
+    assert meta["final_provider"] == "mistral"
+    assert meta["final_model"] == "mistral-large-latest"
+    assert meta["fallback_occurred"] is True
+    assert meta["requested_tab"] == "cloud_pool"
+    assert len(meta["attempted_models"]) == 2
+    assert meta["attempted_models"][0]["status"] == "quota_exhausted"
+    assert meta["attempted_models"][1]["status"] == "ok"
+
+
+def test_cloud_pool_gemini_mistral_fail_big_pickle_succeeds(monkeypatch):
+    """Gemini + Mistral both fail → Big Pickle succeeds."""
+    b = CommandBridge(settings=_tool_settings(
+        gemini_key="fake-key", mistral_key="fake-mistral",
+    ))
+
+    monkeypatch.setattr(b, "_build_gemini_chat_client",
+                        lambda model: _FakeCloudClient("gemini", fail=True))
+    monkeypatch.setattr(b, "_build_mistral_chat_client",
+                        lambda: _FakeCloudClient("mistral", fail=True))
+    monkeypatch.setattr(b, "_build_cloud_chat_client",
+                        lambda: _FakeCloudClient("bigpickle"))
+
+    req = parse_request({"mode": "chat", "input": "hello", "chat_backend": "cloud_pool"})
+    resp = b.handle(req)
+    assert resp.status == STATUS_OK
+    assert resp.message == "bigpickle:hello"
+    meta = resp.to_dict()["model_metadata"]
+    assert meta["final_provider"] == "opencode"
+    assert meta["final_model"] == "big-pickle"
+    assert meta["fallback_occurred"] is True
+
+
+def test_cloud_pool_all_cloud_fail_fallback_to_local(monkeypatch):
+    """All cloud providers fail/unconfigured → local fallback."""
+    b = CommandBridge(settings=_tool_settings(gemini_key=None))
+    monkeypatch.setattr(b, "_build_cloud_chat_client", lambda: None)
+    monkeypatch.setattr(b, "_ollama_generate_blocking", lambda prompt: f"local:{prompt}")
+
+    req = parse_request({"mode": "chat", "input": "hello", "chat_backend": "cloud_pool"})
+    resp = b.handle(req)
+    assert resp.status == STATUS_OK
+    assert resp.message == "local:hello"
+    meta = resp.to_dict()["model_metadata"]
+    assert meta["final_provider"] == "local"
+    assert meta["final_model"] == b._local_model()
+    assert meta["fallback_occurred"] is True
+    assert meta["fallback_reason"] == "All cloud providers unavailable"
+
+
+def test_cloud_pool_gemini_not_configured_mistral_succeeds(monkeypatch):
+    """Gemini not configured (no api key) → Mistral succeeds."""
+    b = CommandBridge(settings=_tool_settings(gemini_key=None, mistral_key="fake-mistral"))
+    monkeypatch.setattr(b, "_build_mistral_chat_client",
+                        lambda: _FakeCloudClient("mistral"))
+    monkeypatch.setattr(b, "_build_cloud_chat_client", lambda: None)
+
+    req = parse_request({"mode": "chat", "input": "hello", "chat_backend": "cloud_pool"})
+    resp = b.handle(req)
+    assert resp.status == STATUS_OK
+    assert resp.message == "mistral:hello"
+    meta = resp.to_dict()["model_metadata"]
+    assert meta["final_provider"] == "mistral"
+    assert meta["fallback_occurred"] is True
+    # First attempt should be not_configured (Gemini key missing)
+    assert meta["attempted_models"][0]["status"] == "not_configured"
+
+
+def test_cloud_pool_stream_gemini_success(monkeypatch):
+    """Cloud pool streaming works when Gemini succeeds."""
+    b = CommandBridge(settings=_tool_settings(gemini_key="fake-key"))
+    monkeypatch.setattr(b, "_build_gemini_chat_client",
+                        lambda model: _FakeCloudClient("gemini"))
+    monkeypatch.setattr(b, "_build_cloud_chat_client", lambda: None)
+    req = parse_request({"mode": "chat", "input": "hello", "chat_backend": "cloud_pool"})
+    events = list(b.stream(req, "test-rid"))
+    done = [e for e in events if e.get("type") == "done"]
+    assert len(done) == 1
+    assert done[0]["message"] == "gemini:hello"
+    meta = done[0].get("model_metadata", {})
+    assert meta["final_provider"] == "gemini"
+
+
+def test_cloud_pool_stream_all_fail_fallback_local(monkeypatch):
+    """Cloud pool streaming falls back to local when all cloud fails."""
+    b = CommandBridge(settings=_tool_settings(gemini_key="fake-key"))
+    monkeypatch.setattr(b, "_build_gemini_chat_client",
+                        lambda model: _FakeCloudClient("gemini", fail=True))
+    monkeypatch.setattr(b, "_build_mistral_chat_client",
+                        lambda: _FakeCloudClient("mistral", fail=True))
+    monkeypatch.setattr(b, "_build_cloud_chat_client", lambda: None)
+    monkeypatch.setattr(b, "_ollama_generate_blocking", lambda prompt: f"local:{prompt}")
+
+    req = parse_request({"mode": "chat", "input": "hello", "chat_backend": "cloud_pool"})
+    events = list(b.stream(req, "test-rid"))
+    deltas = [e for e in events if e.get("type") == "delta"]
+    errors = [e for e in events if e.get("type") == "error"]
+    done = [e for e in events if e.get("type") == "done"]
+    assert len(errors) == 0
+    assert len(done) == 1
+    assert "local:hello" in done[0]["message"]
+    meta = done[0].get("model_metadata", {})
+    assert meta["final_provider"] == "local"
+    assert meta["fallback_occurred"] is True
+
+
+def test_model_routes_includes_cloud_pool():
+    """model_routes includes cloud_pool with configured: true."""
+    b = CommandBridge(settings=_tool_settings())
+    routes = b.model_routes()
+    pool = next(r for r in routes["routes"] if r["backend"] == "cloud_pool")
+    assert pool["configured"] is True
+    assert pool["label"] == "雲端池"
+    assert len(pool["chain"]) == 3  # gemini, mistral, big pickle
+    assert routes["routes"][0]["backend"] == "cloud_pool"  # first in list
+
+
+def test_cloud_pool_preview_falls_to_big_pickle_when_no_keys():
+    """No API keys → cloud_pool preview shows Big Pickle (always configured)."""
+    b = CommandBridge(settings=_tool_settings(gemini_key=None, mistral_key=None))
+    provider, model = b._cloud_pool_preview()
+    assert provider == "opencode"
+    assert model == b._big_pickle_model()
+
+
+def test_cloud_pool_preview_shows_mistral_when_only_mistral_configured():
+    """Only Mistral has a key → preview shows Mistral."""
+    b = CommandBridge(settings=_tool_settings(gemini_key=None, mistral_key="mk"))
+    provider, model = b._cloud_pool_preview()
+    assert provider == "mistral"
+    assert model == b._mistral_model()
+
+
+def test_cloud_pool_preview_shows_gemini_when_configured():
+    """Gemini has a key → preview shows Gemini."""
+    b = CommandBridge(settings=_tool_settings(gemini_key="gk"))
+    provider, model = b._cloud_pool_preview()
+    assert provider == "gemini"
+    assert model == b._gemini_primary_model()
+
+
+def test_model_routes_local_label_renamed():
+    """Local route label changed from 本地模型 to 本地."""
+    b = CommandBridge(settings=_tool_settings())
+    routes = b.model_routes()
+    local = next(r for r in routes["routes"] if r["backend"] == "local")
+    assert local["label"] == "本地"
+
+
+def test_parse_request_accepts_cloud_pool_backend():
+    """parse_request accepts cloud_pool as a valid chat_backend."""
+    req = parse_request({"mode": "chat", "input": "hi", "chat_backend": "cloud_pool"})
+    assert req.chat_backend == "cloud_pool"
+
+
+def test_model_metadata_new_fields():
+    """ModelMetadata serializes fallback_occurred and requested_tab."""
+    from openclaw_adapter.command_bridge_models import ModelAttempt, ModelMetadata
+    meta = ModelMetadata(
+        requested_provider="gemini",
+        requested_model="g-2.5-pro",
+        attempted_models=(ModelAttempt("gemini", "g-2.5-pro", "ok"),),
+        final_provider="gemini",
+        final_model="g-2.5-pro",
+        fallback_occurred=False,
+        requested_tab="cloud_pool",
+    )
+    d = meta.to_dict()
+    assert "fallback_occurred" not in d  # False → omitted
+    assert d["requested_tab"] == "cloud_pool"
+
+    meta2 = ModelMetadata(
+        requested_provider="gemini",
+        requested_model="g-2.5-pro",
+        attempted_models=(
+            ModelAttempt("gemini", "g-2.5-pro", "quota_exhausted"),
+            ModelAttempt("local", "qwen3:14b", "ok"),
+        ),
+        final_provider="local",
+        final_model="qwen3:14b",
+        fallback_reason="Gemini quota",
+        fallback_occurred=True,
+        requested_tab="cloud_pool",
+    )
+    d2 = meta2.to_dict()
+    assert d2["fallback_occurred"] is True
+    assert d2["requested_tab"] == "cloud_pool"

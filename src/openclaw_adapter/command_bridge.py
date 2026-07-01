@@ -37,17 +37,14 @@ from .service_restart import RESTART_MESSAGE, trigger_restart_all
 from .command_bridge_models import (
     CHAT_BACKEND_CLOUD_MISTRAL,
     CHAT_BACKEND_CLOUD_PICKLE,
+    CHAT_BACKEND_CLOUD_POOL,
     CHAT_BACKEND_GEMINI,
     CHAT_BACKEND_LOCAL,
+    CHAT_TOOL_BLUETOOTH,
+    CHAT_TOOL_IR,
+    CHAT_TOOL_MUSIC,
     CHAT_TOOL_SEARCH,
-    MUSIC_ACTION_LIST_ALL,
-    MUSIC_ACTION_LIST_FAVORITES,
-    MUSIC_ACTION_NOW,
     MUSIC_ACTION_PLAN,
-    MUSIC_ACTION_PLAY_QUERY,
-    MUSIC_ACTION_RANDOM,
-    MUSIC_ACTION_STOP,
-    Action,
     ChatToolPolicy,
     ChatToolRequest,
     ChatToolResult,
@@ -69,7 +66,6 @@ from .command_bridge_models import (
     SUBMODE_TEXT_TRANSLATION,
     WebCommandRequest,
     WebCommandResponse,
-    detect_music_intent,
     make_chat_tool_request,
     parse_router_decision,
     stream_delta,
@@ -231,20 +227,18 @@ def _extract_gemini_text(data: object) -> str:
     return "".join(parts).strip()
 
 # Web Chat contextual tool routing (#45). A local router LLM decides, per chat
-# turn, whether to answer directly or call the one whitelisted tool (/search).
+# turn, whether to answer directly or call a closed allowlist of tools.
 # The router gets the recent history so it can resolve pronouns into a
 # self-contained search query (e.g. 「她的歌」→「初音未來 歌曲」). It must emit a
 # single strict-JSON object; anything else is treated as "direct" (fail soft).
 _ROUTER_TIMEOUT_CAP_SECONDS = 30
-_ROUTER_SYSTEM_PROMPT = (
+_ROUTER_SYSTEM_PROMPT_TEMPLATE = (
     "你是 aka_no_claw 聊天助理的路由器。根據對話判斷要不要使用工具來回答使用者的『最新訊息』。\n"
-    "可用工具：\n"
-    "- /search：當回答需要『即時、最新或你不確定的事實資訊』（新聞、價格、商品規格、人物近況、"
-    "賽事結果等）時使用。\n"
+    "可用工具：\n{tool_lines}\n"
     "其他情況（閒聊、改寫、翻譯、一般常識、可由上文直接回答）一律 direct，不要用工具。\n"
     "只輸出一個 JSON 物件，不要加任何多餘文字或說明：\n"
-    '{"decision":"direct|tool","tool":"/search","query":"...","reason_summary":"..."}\n'
-    "當 decision=tool 時，query 必須是適合丟給搜尋引擎、語意完整的查詢；"
+    '{{"decision":"direct|tool","tool":"{tool_choices}","query":"...","reason_summary":"..."}}\n'
+    "當 decision=tool 時，query 必須是該工具可直接執行的參數；"
     "若使用者用代名詞（她／它／這個），請用對話紀錄把主詞補回 query。"
 )
 _SEARCH_SYNTHESIS_PROMPT = (
@@ -262,7 +256,12 @@ _SEARCH_SYNTHESIS_PROMPT = (
 #    still evident after streaming completes. Both are always on (never gated by
 #    the debug flag) — only the synthesis-model label stays behind that flag.
 _TOOL_USED_PREFIX = "🔧 已使用工具："
-_TOOL_FRIENDLY_NAMES = {CHAT_TOOL_SEARCH: "網路搜尋"}
+_TOOL_FRIENDLY_NAMES = {
+    CHAT_TOOL_SEARCH: "網路搜尋",
+    CHAT_TOOL_MUSIC: "音樂控制",
+    CHAT_TOOL_BLUETOOTH: "藍牙控制",
+    CHAT_TOOL_IR: "紅外線控制",
+}
 
 # Search snippets are external (search-engine) text fed into the final synthesis
 # LLM, so they are budgeted before entering the prompt: per-field caps bound any
@@ -284,6 +283,9 @@ _SEARCH_TOOL_POLICY = ChatToolPolicy(
     max_source_field_chars=_SOURCE_PACK_SNIPPET_CAP,
     max_source_pack_chars=_SOURCE_PACK_TOTAL_CAP,
 )
+_MUSIC_TOOL_POLICY = ChatToolPolicy(display_name="音樂控制", max_query_chars=128)
+_BLUETOOTH_TOOL_POLICY = ChatToolPolicy(display_name="藍牙控制", max_query_chars=128)
+_IR_TOOL_POLICY = ChatToolPolicy(display_name="紅外線控制", max_query_chars=128)
 
 
 def _clip(text: str, cap: int) -> str:
@@ -658,19 +660,6 @@ class CommandBridge:
         resumed = self._maybe_resume_music_plan(req, text)
         if resumed is not None:
             return resumed
-        # Music fast-path (#49/#50): fires before the LLM router for obvious music
-        # intents so there is no LLM round-trip for "播放一首歌" / "停止音樂" etc.
-        music_intent = detect_music_intent(text)
-        if music_intent is not None:
-            try:
-                return self._exec_music_intent(req, music_intent)
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("music intent failed action=%s", music_intent.action)
-                return WebCommandResponse(
-                    status=STATUS_ERROR,
-                    message=f"音樂操作失敗：{exc}",
-                    mode=MODE_CHAT,
-                )
         decision = self._route_chat_decision(req)
         if decision is not None and decision.decision == ROUTER_DECISION_TOOL:
             try:
@@ -726,6 +715,8 @@ class CommandBridge:
             )
         elif req.chat_backend == CHAT_BACKEND_GEMINI:
             message, metadata = self._generate_gemini_with_fallback(prompt, temperature=0.7)
+        elif req.chat_backend == CHAT_BACKEND_CLOUD_POOL:
+            message, metadata = self._handle_cloud_pool_blocking(prompt)
         else:
             message = self._ollama_generate_blocking(prompt)
             metadata = self._model_metadata_for_backend(
@@ -776,33 +767,14 @@ class CommandBridge:
                 workflow_id=self._extract_wf_slug(text),
             )
             return
-        from telegram_nl.natural_language import fallback_route_telegram_natural_language
-        nl_intent = fallback_route_telegram_natural_language(text)
+        from .natural_language import fallback_route_openclaw_natural_language
+        nl_intent = fallback_route_openclaw_natural_language(text)
         if nl_intent is not None and nl_intent.intent == "create_workflow":
             yield stream_redirect(
                 "create_workflow",
                 nl_intent.workflow_description or text,
             )
             return
-        # Music fast-path (#49/#50)
-        #
-        # Keep this AFTER workflow/schedule creation redirects. Phrases like
-        # "建立工作流：播放最愛音樂清單，然後開燈" contain music keywords but are
-        # meta authoring requests, not immediate playback commands.
-        music_intent = detect_music_intent(text)
-        if music_intent is not None:
-            try:
-                resp = self._exec_music_intent(req, music_intent)
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("music intent failed action=%s", music_intent.action)
-                yield stream_error(f"音樂操作失敗：{exc}")
-                return
-            if resp.status == STATUS_ERROR:
-                yield stream_error(resp.message)
-            else:
-                yield stream_done(resp.message)
-            return
-
         decision = self._route_chat_decision(req)
         if decision is not None and decision.decision == ROUTER_DECISION_TOOL:
             yield from self._stream_chat_tool(req, decision)
@@ -814,16 +786,17 @@ class CommandBridge:
             yield from self._stream_mistral_chat(prompt)
         elif req.chat_backend == CHAT_BACKEND_GEMINI:
             yield from self._stream_gemini_chat(prompt)
+        elif req.chat_backend == CHAT_BACKEND_CLOUD_POOL:
+            yield from self._stream_cloud_pool_chat(prompt)
         else:
             yield from self._stream_ollama_chat(prompt)
 
-    # --- music intent fast-path (#49 / #50) ---------------------------------
+    # --- bounded music plan (#50) --------------------------------------------
     def _exec_music_intent(
         self, req: WebCommandRequest, intent: MusicIntent
     ) -> WebCommandResponse:
-        """Dispatch a music intent to the appropriate bridge method.
+        """Dispatch a bounded music plan intent.
 
-        Simple intents (#49) call run_music_command / run_music_action directly.
         The PLAN action (#50) runs a bounded multi-step flow that inspects the
         local library and searches for external popularity context before playing.
         Never executes arbitrary slash commands — only the closed MUSIC_ACTION_*
@@ -834,31 +807,7 @@ class CommandBridge:
         )
         if intent.action == MUSIC_ACTION_PLAN:
             return self._exec_music_plan(req, intent)
-        if intent.action == MUSIC_ACTION_RANDOM:
-            result = self.run_music_command("random")
-        elif intent.action == MUSIC_ACTION_PLAY_QUERY:
-            result = self.run_music_command(intent.query)
-        elif intent.action == MUSIC_ACTION_STOP:
-            result = self.run_music_command("stop")
-        elif intent.action == MUSIC_ACTION_NOW:
-            result = self.run_music_command("now")
-        elif intent.action == MUSIC_ACTION_LIST_ALL:
-            result = self.run_music_action("music:ls:root:0")
-        elif intent.action == MUSIC_ACTION_LIST_FAVORITES:
-            result = self.run_music_action("pg:mb:0:r")
-        else:
-            raise ValueError(f"unknown music action: {intent.action!r}")
-        actions = tuple(
-            Action(label=str(a.get("label", "")), command=str(a.get("callback_data", "")))
-            for a in result.get("actions", [])
-            if a.get("label") and a.get("callback_data")
-        )
-        return WebCommandResponse(
-            status=result.get("status", STATUS_OK),
-            message=result.get("message", ""),
-            mode=MODE_CHAT,
-            actions=actions,
-        )
+        raise ValueError(f"unknown music action: {intent.action!r}")
 
     def _exec_music_plan(
         self, req: WebCommandRequest, intent: MusicIntent
@@ -1176,12 +1125,60 @@ class CommandBridge:
         return decision
 
     def _build_router_prompt(self, req: WebCommandRequest) -> str:
-        lines = [_ROUTER_SYSTEM_PROMPT, "", "對話紀錄："]
+        lines = [self._router_system_prompt(), "", "對話紀錄："]
         for turn in req.history:
             label = _CHAT_ROLE_LABELS.get(turn.role, turn.role)
             lines.append(f"{label}：{turn.content}")
         lines += ["", f"使用者最新訊息：{(req.input or '').strip()}", "", "JSON："]
         return "\n".join(lines)
+
+    def _router_system_prompt(self) -> str:
+        tools = [CHAT_TOOL_SEARCH]
+        tool_lines = [
+            "- /search：當回答需要即時、最新或你不確定的事實資訊時使用；query 是適合搜尋引擎的完整查詢。",
+        ]
+        for tool in (CHAT_TOOL_MUSIC, CHAT_TOOL_BLUETOOTH, CHAT_TOOL_IR):
+            line = self._registered_chat_tool_prompt_line(tool)
+            if not line:
+                continue
+            tools.append(tool)
+            tool_lines.append(line)
+        tool_choices = "|".join(t.split("/", 1)[-1] for t in tools)
+        tool_choices = "/" + "|/".join(tool_choices.split("|"))
+        return _ROUTER_SYSTEM_PROMPT_TEMPLATE.format(
+            tool_lines="\n".join(tool_lines),
+            tool_choices=tool_choices,
+        )
+
+    def _registered_command_usage(self, command: str) -> str:
+        try:
+            registered = self._handlers().get(command)
+        except Exception:  # noqa: BLE001
+            logger.debug("router prompt: command registry unavailable for %s", command, exc_info=True)
+            return ""
+        return str(getattr(registered, "usage", "") or "").strip()
+
+    def _registered_chat_tool_prompt_line(self, command: str) -> str:
+        try:
+            registered = self._handlers().get(command)
+        except Exception:  # noqa: BLE001
+            logger.debug("router prompt: command registry unavailable for %s", command, exc_info=True)
+            return ""
+        if registered is None:
+            return ""
+        usage = str(getattr(registered, "usage", "") or "").strip()
+        if not usage:
+            return ""
+        purpose = str(getattr(registered, "chat_tool_purpose", "") or "").strip()
+        query_hint = str(getattr(registered, "chat_tool_query_hint", "") or "").strip()
+        parts = [f"- {command}：{usage}"]
+        if purpose:
+            parts.append(purpose)
+        if query_hint:
+            parts.append(query_hint)
+        else:
+            parts.append(f"query 只輸出 {command} 後面的參數")
+        return "。".join(parts)
 
     def _generate_router_json(self, prompt: str) -> str:
         from .dynamic_tools import OllamaTextClient
@@ -1206,6 +1203,12 @@ class CommandBridge:
         happen — parse_router_decision already guards the whitelist)."""
         policy_map: dict[str, tuple[ChatToolPolicy, object]] = {
             CHAT_TOOL_SEARCH: (_SEARCH_TOOL_POLICY, self._exec_grounded_search),
+            CHAT_TOOL_MUSIC: (_MUSIC_TOOL_POLICY, self._exec_registered_command_chat_tool),
+            CHAT_TOOL_BLUETOOTH: (
+                _BLUETOOTH_TOOL_POLICY,
+                self._exec_registered_command_chat_tool,
+            ),
+            CHAT_TOOL_IR: (_IR_TOOL_POLICY, self._exec_registered_command_chat_tool),
         }
         entry = policy_map.get(decision.tool)
         if entry is None:
@@ -1343,6 +1346,40 @@ class CommandBridge:
             model_metadata=model_metadata,
         )
 
+    def _exec_music_chat_tool(
+        self, req: WebCommandRequest, tool_req: ChatToolRequest
+    ) -> ChatToolResult:
+        return self._exec_registered_command_chat_tool(req, tool_req)
+
+    def _exec_registered_command_chat_tool(
+        self, req: WebCommandRequest, tool_req: ChatToolRequest
+    ) -> ChatToolResult:
+        query = tool_req.query
+        runner_map = {
+            CHAT_TOOL_MUSIC: ("CommandBridge.run_music_command", self.run_music_command),
+            CHAT_TOOL_BLUETOOTH: (
+                "CommandBridge.run_bluetooth_command",
+                self.run_bluetooth_command,
+            ),
+            CHAT_TOOL_IR: ("CommandBridge.run_ir_command", self.run_ir_command),
+        }
+        entry = runner_map.get(tool_req.tool)
+        if entry is None:
+            raise ValueError(f"unknown registered command chat tool: {tool_req.tool!r}")
+        fn_name, runner = entry
+        logger.info("[chat-tool] tool=%s fn=%s query=%r", tool_req.tool, fn_name, query)
+        result = runner(query)
+        status = str(result.get("status", STATUS_OK))
+        message = str(result.get("message", "")).strip()
+        banner = f"{_TOOL_USED_PREFIX}{tool_req.policy.display_name}（{tool_req.tool}）｜指令：{query}"
+        if status == STATUS_ERROR:
+            message = message or f"{tool_req.policy.display_name}失敗。"
+        return ChatToolResult(
+            answer=f"{banner}\n\n{message}",
+            source_count=0,
+            result_summary=f"query={query!r} status={status}",
+        )
+
     @staticmethod
     def _format_search_source_pack(results, policy: ChatToolPolicy) -> str:
         lines: list[str] = []
@@ -1433,6 +1470,9 @@ class CommandBridge:
             return text, f"Mistral {model}", metadata
         if chat_backend == CHAT_BACKEND_GEMINI:
             text, metadata = self._generate_gemini_with_fallback(prompt, temperature=0.3)
+            return text, f"{metadata.final_provider} {metadata.final_model}", metadata
+        if chat_backend == CHAT_BACKEND_CLOUD_POOL:
+            text, metadata = self._handle_cloud_pool_blocking(prompt)
             return text, f"{metadata.final_provider} {metadata.final_model}", metadata
         text = self._ollama_generate_blocking(prompt)
         metadata = self._model_metadata_for_backend(
@@ -1880,10 +1920,18 @@ class CommandBridge:
         }
 
     # --- 生活 mode: bluetooth control surface (aka_no_claw#38 / web#7) ------
-    def run_bluetooth_command(self) -> dict:
-        """Scan Bluetooth devices for the web 生活 mode — returns the device list
-        (text + connect buttons). Same handler the Telegram ``/bluetooth`` uses."""
-        message, markup = self._run_command_raw("/bluetooth", "")
+    def run_bluetooth_command(self, text: str = "") -> dict:
+        """Run the Telegram ``/bluetooth`` handler from the web console.
+
+        Empty input (or ``scan``) keeps the existing scan behavior; any other
+        text is passed through as the device name so Web Chat and the 生活 mode
+        both hit the same command handler."""
+        remainder = (text or "").strip()
+        if remainder.startswith("/bluetooth"):
+            remainder = remainder[len("/bluetooth"):].strip()
+        if remainder.lower() == "scan":
+            remainder = ""
+        message, markup = self._run_command_raw("/bluetooth", remainder)
         return {
             "status": STATUS_OK,
             "message": message,
@@ -2047,12 +2095,27 @@ class CommandBridge:
             for model in self._gemini_route_models()
         ]
         gemini_chain.append({"provider": "local", "model": local})
+        cp_providers = [
+            {"provider": "gemini", "model": self._gemini_primary_model()},
+            {"provider": "mistral", "model": self._mistral_model()},
+            {"provider": "opencode", "model": self._big_pickle_model()},
+        ]
+        # Pick the first actually usable provider as the preview (no probe).
+        cp_preview_provider, cp_preview_model = self._cloud_pool_preview()
         return {
             "status": STATUS_OK,
             "routes": [
                 {
+                    "backend": CHAT_BACKEND_CLOUD_POOL,
+                    "label": "雲端池",
+                    "requested_provider": cp_preview_provider,
+                    "requested_model": cp_preview_model,
+                    "chain": cp_providers,
+                    "configured": True,
+                },
+                {
                     "backend": CHAT_BACKEND_LOCAL,
-                    "label": "本地模型",
+                    "label": "本地",
                     "requested_provider": "local",
                     "requested_model": local,
                     "chain": [{"provider": "local", "model": local}],
@@ -2092,6 +2155,8 @@ class CommandBridge:
             return "mistral", self._mistral_model()
         if chat_backend == CHAT_BACKEND_GEMINI:
             return "gemini", self._gemini_primary_model()
+        if chat_backend == CHAT_BACKEND_CLOUD_POOL:
+            return self._cloud_pool_chain()[0][0], self._cloud_pool_chain()[0][1]
         return "local", self._local_model()
 
     def _model_metadata_for_backend(
@@ -2393,6 +2458,180 @@ class CommandBridge:
             text, model_metadata=metadata if isinstance(metadata, ModelMetadata) else None
         )
 
+    def _cloud_pool_chain(self) -> list[tuple[str, str, object, object]]:
+        """Return ordered list of (provider_label, model_name, build_fn, is_configured_fn)."""
+        gemini_model = self._gemini_primary_model()
+        mistral_model = self._mistral_model()
+        bp_model = self._big_pickle_model()
+        return [
+            ("gemini", gemini_model, self._build_gemini_chat_client,
+             lambda: bool(getattr(self.settings, "openclaw_gemini_api_key", None))),
+            ("mistral", mistral_model, self._build_mistral_chat_client,
+             lambda: bool(getattr(self.settings, "openclaw_mistral_api_key", None))),
+            ("opencode", bp_model, self._build_cloud_chat_client,
+             lambda: True),
+        ]
+
+    def _cloud_pool_preview(self) -> tuple[str, str]:
+        """First actually usable (provider, model) for the cloud_pool tab preview.
+        Checks settings only — no probing. Falls through to Big Pickle which is
+        always considered configured."""
+        for provider, model_name, _build_fn, configured_fn in self._cloud_pool_chain():
+            if configured_fn():
+                return provider, model_name
+        return "local", self._local_model()
+
+    def _handle_cloud_pool_blocking(
+        self, prompt: str
+    ) -> tuple[str, ModelMetadata]:
+        """Try Gemini → Mistral → Big Pickle → local; return (text, metadata)."""
+        attempts: list[ModelAttempt] = []
+
+        for provider, model_name, build_fn, configured_fn in self._cloud_pool_chain():
+            if not configured_fn():
+                attempts.append(ModelAttempt(
+                    provider, model_name, _MODEL_STATUS_NOT_CONFIGURED,
+                    f"{provider} not configured",
+                ))
+                continue
+            client = build_fn(model_name) if provider == "gemini" else build_fn()
+            if client is None:
+                attempts.append(ModelAttempt(
+                    provider, model_name, _MODEL_STATUS_NOT_CONFIGURED,
+                    f"{provider} unavailable",
+                ))
+                continue
+            try:
+                text = client.generate(prompt, temperature=0.7)
+            except _GeminiRequestError as exc:
+                attempts.append(ModelAttempt(provider, model_name, exc.status, str(exc)))
+                continue
+            except Exception as exc:
+                attempts.append(ModelAttempt(provider, model_name, _MODEL_STATUS_ERROR, str(exc)))
+                continue
+            attempts.append(ModelAttempt(provider, model_name, _MODEL_STATUS_OK))
+            fb = len(attempts) > 1
+            first_provider = self._cloud_pool_chain()[0][0]
+            first_model = self._cloud_pool_chain()[0][1]
+            return text, ModelMetadata(
+                requested_provider=first_provider,
+                requested_model=first_model,
+                attempted_models=tuple(attempts),
+                final_provider=provider,
+                final_model=model_name,
+                fallback_reason=None if not fb else f"Fell back from {attempts[0].provider}",
+                fallback_occurred=fb,
+                requested_tab=CHAT_BACKEND_CLOUD_POOL,
+            )
+
+        local_model = self._local_model()
+        text = self._ollama_generate_blocking(prompt)
+        attempts.append(ModelAttempt("local", local_model, _MODEL_STATUS_OK))
+        first_provider = self._cloud_pool_chain()[0][0]
+        first_model = self._cloud_pool_chain()[0][1]
+        return text, ModelMetadata(
+            requested_provider=first_provider,
+            requested_model=first_model,
+            attempted_models=tuple(attempts),
+            final_provider="local",
+            final_model=local_model,
+            fallback_reason="All cloud providers unavailable",
+            fallback_occurred=True,
+            requested_tab=CHAT_BACKEND_CLOUD_POOL,
+        )
+
+    def _stream_cloud_pool_chat(self, prompt: str) -> Iterator[dict]:
+        """Try Gemini → Mistral → Big Pickle → local for streaming."""
+        attempts: list[ModelAttempt] = []
+
+        for provider, model_name, build_fn, configured_fn in self._cloud_pool_chain():
+            if not configured_fn():
+                attempts.append(ModelAttempt(
+                    provider, model_name, _MODEL_STATUS_NOT_CONFIGURED,
+                    f"{provider} not configured",
+                ))
+                continue
+            client = build_fn(model_name) if provider == "gemini" else build_fn()
+            if client is None:
+                attempts.append(ModelAttempt(
+                    provider, model_name, _MODEL_STATUS_NOT_CONFIGURED,
+                    f"{provider} unavailable",
+                ))
+                continue
+
+            result: dict[str, object] = {}
+            done = threading.Event()
+
+            def _worker(
+                _client=client, _prompt=prompt,
+            ) -> None:
+                try:
+                    result["text"] = _client.generate(_prompt, temperature=0.7)
+                except _GeminiRequestError as exc:
+                    result["error"] = str(exc)
+                    result["error_status"] = exc.status
+                except Exception as exc:
+                    result["error"] = str(exc)
+                finally:
+                    done.set()
+
+            worker = threading.Thread(target=_worker, daemon=True)
+            worker.start()
+            try:
+                while not done.wait(timeout=_HEARTBEAT_SECONDS):
+                    yield stream_heartbeat()
+            except GeneratorExit:
+                abort = getattr(client, "abort", None)
+                if callable(abort):
+                    abort()
+                raise
+
+            if "error" in result:
+                error_status = str(result.get("error_status", _MODEL_STATUS_ERROR))
+                attempts.append(ModelAttempt(
+                    provider, model_name, error_status, str(result["error"]),
+                ))
+                continue
+
+            attempts.append(ModelAttempt(provider, model_name, _MODEL_STATUS_OK))
+            text = str(result.get("text") or "").strip()
+            if text:
+                yield stream_delta(text)
+            fb = len(attempts) > 1
+            first_provider = self._cloud_pool_chain()[0][0]
+            first_model = self._cloud_pool_chain()[0][1]
+            metadata = ModelMetadata(
+                requested_provider=first_provider,
+                requested_model=first_model,
+                attempted_models=tuple(attempts),
+                final_provider=provider,
+                final_model=model_name,
+                fallback_reason=None if not fb else f"Fell back from {attempts[0].provider}",
+                fallback_occurred=fb,
+                requested_tab=CHAT_BACKEND_CLOUD_POOL,
+            )
+            yield stream_done(text, model_metadata=metadata)
+            return
+
+        local_model = self._local_model()
+        text = self._ollama_generate_blocking(prompt)
+        attempts.append(ModelAttempt("local", local_model, _MODEL_STATUS_OK))
+        first_provider = self._cloud_pool_chain()[0][0]
+        first_model = self._cloud_pool_chain()[0][1]
+        metadata = ModelMetadata(
+            requested_provider=first_provider,
+            requested_model=first_model,
+            attempted_models=tuple(attempts),
+            final_provider="local",
+            final_model=local_model,
+            fallback_reason="All cloud providers unavailable",
+            fallback_occurred=True,
+            requested_tab=CHAT_BACKEND_CLOUD_POOL,
+        )
+        if text:
+            yield stream_delta(text)
+        yield stream_done(text, model_metadata=metadata)
+
     def _local_model(self) -> str:
         return (
             getattr(self.settings, "openclaw_local_text_model", None) or "qwen3:14b"
@@ -2519,6 +2758,8 @@ class CommandBridge:
             return message, metadata
         if chat_backend == CHAT_BACKEND_GEMINI:
             return self._generate_gemini_with_fallback(prompt, temperature=0.2)
+        if chat_backend == CHAT_BACKEND_CLOUD_POOL:
+            return self._handle_cloud_pool_blocking(prompt)
 
         message = self._run_command("/zh", text)
         metadata = self._model_metadata_for_backend(

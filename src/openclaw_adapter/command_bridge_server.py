@@ -198,7 +198,7 @@ def _build_handler(bridge: CommandBridge, *, lan_enabled: bool) -> type[BaseHTTP
             if callback_data:
                 self._write_json(bridge.run_bluetooth_action(callback_data))
                 return
-            self._write_json(bridge.run_bluetooth_command())
+            self._write_json(bridge.run_bluetooth_command(str(data.get("input") or "")))
 
         def _handle_ir(self) -> None:
             """生活 mode IR/home-appliance surface. ``input`` carries an /ir slash
