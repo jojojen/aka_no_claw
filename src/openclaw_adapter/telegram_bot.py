@@ -93,7 +93,7 @@ from .home_schedule_command import (
     build_schedulehome_handler,
     render_list as render_home_schedule_list,
 )
-from .workflow_command import build_workflow_handler, _workflow_store
+from .workflow_command import build_workflow_handler, command_metadata, _workflow_store
 from .workflow_editor import WorkflowEditor
 from .music_favorites import (
     FavoritesStore,
@@ -141,6 +141,7 @@ from .research_command import (
     _build_seller_snapshot_section_result,
 )
 from .natural_language import build_telegram_natural_language_router_from_settings
+from .natural_language import fallback_route_openclaw_natural_language
 from telegram_nl.natural_language import TelegramNaturalLanguageIntent
 from .quiz_favorite_songs import extract_first_youtube_url
 from .opportunity_command import (
@@ -540,6 +541,20 @@ class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
                 reply=None,
                 reply_factory=lambda t=target, cmd=command, c=cid: ir_spec.handler(f"send {t} {cmd}", c),
             )
+        return None
+
+    def _route_natural_language(self, text: str) -> TelegramNaturalLanguageIntent | None:
+        intent = super()._route_natural_language(text)
+        if intent is not None:
+            return intent
+        app_intent = fallback_route_openclaw_natural_language(text)
+        if app_intent is not None and app_intent.intent != "unknown":
+            logger.info(
+                "Telegram openclaw fallback intent=%s confidence=%s",
+                app_intent.intent,
+                app_intent.confidence,
+            )
+            return app_intent
         return None
 
     def build_reply_plan(self, *, chat_id: str | int, text: str | None) -> TelegramTextReplyPlan:
@@ -1274,19 +1289,19 @@ def _build_registries(
         "/voice": RegisteredCommand(build_voice_handler(settings)),
         "/say": RegisteredCommand(
             build_say_handler(settings), ack="收到，正在合成語音…", background=True,
-            usage="用語音念出文字（參數＝要念的文字，通常用 input 變數帶入）",
+            **command_metadata("/say"),
         ),
         "/saynow": RegisteredCommand(
             build_saynow_handler(settings),
             ack="收到，正在合成並於 Mac mini 播放語音…",
             background=True,
-            usage="立即於 Mac mini 念出文字（參數＝要念的文字，通常用 input 變數帶入）",
+            **command_metadata("/saynow"),
         ),
         "/translateja": RegisteredCommand(
             build_translate_handler(settings, target="ja"),
             ack="收到，正在翻譯成日文…",
             background=True,
-            usage="把文字翻成日文（參數＝原文，通常用 input 變數帶入）",
+            **command_metadata("/translateja"),
         ),
         "/ja": RegisteredCommand(
             build_translate_handler(settings, target="ja"),
@@ -1302,7 +1317,7 @@ def _build_registries(
             build_translate_handler(settings, target="zh"),
             ack="收到，正在翻譯成繁體中文…",
             background=True,
-            usage="把文字翻成繁體中文（參數＝原文，通常用 input 變數帶入）",
+            **command_metadata("/translatezh"),
         ),
         "/zh": RegisteredCommand(
             build_translate_handler(settings, target="zh"),
@@ -1346,36 +1361,36 @@ def _build_registries(
         "/source": RegisteredCommand(build_source_handler(settings)),
         "/music": RegisteredCommand(
             build_music_handler(settings),
-            usage="playbest=播放最愛清單；<關鍵字>=搜尋並播放該歌曲",
+            **command_metadata("/music"),
         ),
         "/musiclistall": RegisteredCommand(
             build_musiclistall_handler(settings),
-            usage="列出全部曲目清單（不播放，無參數）",
+            **command_metadata("/musiclistall"),
         ),
         "/musiclistbest": RegisteredCommand(
             _musiclistbest_handler,
-            usage="列出最愛曲目清單（不播放，無參數）；要『播放』最愛請改用 /music playbest",
+            **command_metadata("/musiclistbest"),
         ),
         "/musicnowbest": RegisteredCommand(
             build_musicnowbest_handler(settings),
-            usage="把目前播放的歌曲加入最愛清單（無參數）",
+            **command_metadata("/musicnowbest"),
         ),
         "/musicmute": RegisteredCommand(
-            lambda r, c: mute_music(settings), usage="音樂靜音（無參數）",
+            lambda r, c: mute_music(settings), **command_metadata("/musicmute"),
         ),
         "/musiclouder": RegisteredCommand(
-            lambda r, c: louder_music(settings), usage="調高音量（無參數）",
+            lambda r, c: louder_music(settings), **command_metadata("/musiclouder"),
         ),
         "/musiclower": RegisteredCommand(
-            lambda r, c: lower_music(settings), usage="調低音量（無參數）",
+            lambda r, c: lower_music(settings), **command_metadata("/musiclower"),
         ),
         "/bluetooth": RegisteredCommand(
             build_bluetooth_handler(settings),
-            usage="連線／切換藍牙裝置（參數＝裝置名）",
+            **command_metadata("/bluetooth"),
         ),
         "/ir": RegisteredCommand(
             build_ir_handler(settings),
-            usage="紅外線家電控制：send <裝置> <按鍵名>，如 `send ceiling_light power`（切換天花板燈電源）",
+            **command_metadata("/ir"),
         ),
         "/research": RegisteredCommand(
             research_handler,

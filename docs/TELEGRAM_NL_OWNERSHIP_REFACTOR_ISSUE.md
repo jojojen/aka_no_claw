@@ -1,11 +1,101 @@
 # Telegram NL Ownership Refactor Issue Draft
 
-Last reviewed: 2026-06-30
+Last reviewed: 2026-07-01
 Status: Planned
 Owner area: telegram
 
 Draft GitHub issue / planning note for cleaning up the cross-repo ownership
 problem exposed by issue #53.
+
+## Task 1 Work Log
+
+2026-07-01 characterization pass for the model-first refactor:
+
+- Goal of task 1: lock the current `telegram_nl` routing boundary before any
+  fallback shrink or prompt trimming work.
+- Decision: keep the execution log in this existing planning doc rather than
+  create a parallel worklog, so docs governance stays simple and the refactor
+  state is in one place.
+- Current downstream dependency to protect:
+  `price_monitor_bot/src/price_monitor_bot/bot.py` still runs the LLM router
+  and then `fallback_route_telegram_natural_language(text)`, with explicit
+  preference rules for deterministic fallback hits such as
+  `sns_bulk_add_filter` and `sns_clear_filter`.
+- Characterization focus added to `telegram_nl/tests/test_natural_language.py`:
+  `sns_clear_filter` vs `sns_delete`, single-handle schedule updates,
+  bulk schedule updates, explicit non-matches for bare marketplace URLs, and
+  unrelated messages that should keep falling through to the model/app layer.
+- Success condition for task 1: the pure `telegram_nl` test suite becomes the
+  authoritative guardrail for fallback routing boundaries, so task 2 can
+  safely reduce fallback scope without depending on app-layer tests to spot
+  regressions.
+
+## Task 2 Work Log
+
+2026-07-01 routing split for model-first execution:
+
+- Added three layers in `telegram_nl`:
+  `fast_route_telegram_natural_language()`,
+  `slow_fallback_route_telegram_natural_language()`, and the existing
+  `fallback_route_telegram_natural_language()` kept as a compatibility wrapper
+  (`fast or slow`).
+- `price_monitor_bot.TelegramCommandProcessor` now runs routing in this order:
+  app fast path, generic `telegram_nl` fast path, LLM router, then slow
+  fallback.
+- This removes the old need for post-LLM "rescue" branches for
+  `sns_bulk_add_filter` and `sns_clear_filter`; those deterministic structured
+  cases are now decided before the model path.
+- Kept compatibility for downstream direct callers that still import
+  `fallback_route_telegram_natural_language()` so repo-wide churn stays small
+  during the refactor.
+- Added processor-level coverage proving a generic fast-path hit short-circuits
+  before the LLM router is even called.
+
+## Task 3 Work Log
+
+2026-07-01 app-intent ownership moved back to `aka_no_claw`:
+
+- Removed `create_workflow`, `play_music`, and `home_action` from
+  `telegram_nl`'s generic deterministic fallback and generic LLM prompt.
+- Removed those intents from the base `telegram_nl` allowed-intent set; they
+  are now accepted only when a caller explicitly opts in via
+  `extra_allowed_intents`.
+- `aka_no_claw` now injects its app-intent prompt suffix and allowed-intent
+  list when building the Telegram NL router, including the cloud-first wrapper.
+- Added `fallback_route_openclaw_natural_language()` in `aka_no_claw` for the
+  residual app-specific fallback path, and wired both
+  `openclaw_adapter.telegram_bot.TelegramCommandProcessor` and
+  `openclaw_adapter.command_bridge` to use it instead of the generic package.
+- Result: `telegram_nl` owns generic Telegram NL mechanics; `aka_no_claw`
+  owns workflow/music/home semantics and examples.
+
+## Verification Log
+
+2026-07-01 post-refactor verification:
+
+- `telegram_nl`: `.venv/bin/python -m pytest -q` -> 61 passed.
+- `price_monitor_bot`: `.venv/bin/python -m pytest tests/test_natural_language.py tests/test_telegram_bot.py -q` -> 178 passed.
+- `aka_no_claw`: `.venv/bin/python -m pytest tests/test_natural_language.py tests/test_telegram_bot.py tests/test_command_bridge.py tests/test_intent_fast_path.py tests/test_workflow_command.py tests/test_music_command.py tests/test_ir_command.py -q` -> 484 passed.
+- Docs health: `.venv/bin/python scripts/check_docs_health.py` -> passed.
+- Local command bridge e2e smoke:
+  started `openclaw_adapter command-bridge --host 127.0.0.1 --port 8791`,
+  then `POST /api/command/stream` for workflow creation returned
+  `redirect:create_workflow` for both explicit `workflow` wording and
+  `自動化流程` wording.
+- Live configured router smoke:
+  routed `create_workflow`, `play_music`, `home_action`, and generic
+  `sns_clear_filter` representative phrases through the configured router.
+- Telegram connectivity smoke:
+  `telegram-send-test` sent a non-command connectivity message to the configured
+  chat successfully.
+- Local incoming Telegram pipeline smoke:
+  `handle_telegram_message` with stubbed `/music`, `/ir`, and `/workflow`
+  handlers routed `放我最愛的音樂`, `關掉臥室燈`, and workflow creation to the
+  expected command handlers without touching real devices.
+- Not run automatically:
+  real incoming Telegram messages that execute music/IR/workflow on live
+  hardware. A production `telegram-poll` process was already running, so a
+  second poller was not started.
 
 ## Current Discussion State
 
@@ -428,6 +518,17 @@ scheduler -> /workflow run -> workflow runner -> allowed command sinks
 - Do not make workflow execution run arbitrary model-generated slash strings.
 - Do not close #53 solely by doing this refactor; #53 still needs command sink
   breadth, Web capture, and workflow/music E2E coverage.
+
+## 2026-07-01 Web / Telegram Alignment Note
+
+- Web chat checks the OpenClaw app-level NL fallback before generic chat tools
+  for app-owned music intents with an explicit `music_query`.
+- This keeps phrases such as "播放我的最愛清單歌曲" aligned with the Telegram
+  path: OpenClaw NL resolves `play_music` with `music_query="playbest"`, then Web
+  dispatches through the existing `/music` handler instead of rendering the
+  favorite-list view.
+- Generic Web controls now fall through to the shared Web Chat `/music` tool
+  route instead of a bridge-local music detector.
 
 ## Notes
 
