@@ -5,6 +5,7 @@ from assistant_runtime.settings import AssistantSettings
 from openclaw_adapter.natural_language import (
     _select_router_model,
     build_telegram_natural_language_router_from_settings,
+    fallback_route_openclaw_natural_language,
 )
 from telegram_nl.natural_language import fallback_route_telegram_natural_language
 
@@ -58,6 +59,54 @@ def test_natural_language_router_builds_from_settings() -> None:
     router = build_telegram_natural_language_router_from_settings(settings)
 
     assert router is not None
+
+
+def test_natural_language_router_adds_openclaw_app_intents() -> None:
+    settings = AssistantSettings(
+        openclaw_local_text_backend="ollama",
+        openclaw_local_text_model="gemma3:4b",
+        openclaw_local_vision_model=None,
+    )
+
+    router = build_telegram_natural_language_router_from_settings(settings)
+
+    assert router is not None
+    assert "create_workflow" in router._extra_allowed_intents
+    assert "play_music" in router._extra_allowed_intents
+    assert "home_action" in router._extra_allowed_intents
+
+
+def test_openclaw_fallback_routes_create_workflow() -> None:
+    result = fallback_route_openclaw_natural_language("建立 workflow：每天查天氣並念出來")
+
+    assert result is not None
+    assert result.intent == "create_workflow"
+    assert result.workflow_description is not None
+
+
+def test_openclaw_fallback_routes_play_music() -> None:
+    result = fallback_route_openclaw_natural_language("放我最愛的音樂")
+
+    assert result is not None
+    assert result.intent == "play_music"
+    assert result.music_query == "playbest"
+
+
+def test_openclaw_fallback_routes_play_favorite_playlist() -> None:
+    result = fallback_route_openclaw_natural_language("播放我的最愛清單歌曲")
+
+    assert result is not None
+    assert result.intent == "play_music"
+    assert result.music_query == "playbest"
+
+
+def test_openclaw_fallback_routes_home_action() -> None:
+    result = fallback_route_openclaw_natural_language("關掉臥室燈")
+
+    assert result is not None
+    assert result.intent == "home_action"
+    assert result.home_command == "off"
+    assert result.home_target == "臥室燈"
 
 
 # ── /help — capability / usage questions ─────────────────────────────────────
@@ -605,41 +654,41 @@ def test_normalize_intent_aliases_bulk_target_domain_chinese() -> None:
 
 def test_fallback_routes_clear_filter_for_at_handle() -> None:
     result = fallback_route_telegram_natural_language(
-        "把 @ARS_Arsales 的 filter 全部拿掉"
+        "把 @example_tcg 的 filter 全部拿掉"
     )
 
     assert result is not None
     assert result.intent == "sns_clear_filter"
-    assert result.sns_handle == "ARS_Arsales"
+    assert result.sns_handle == "example_tcg"
 
 
 def test_fallback_routes_clear_filter_with_qingkong() -> None:
-    result = fallback_route_telegram_natural_language("清空 @elonmusk 的篩選")
+    result = fallback_route_telegram_natural_language("清空 @example_news 的篩選")
 
     assert result is not None
     assert result.intent == "sns_clear_filter"
-    assert result.sns_handle == "elonmusk"
+    assert result.sns_handle == "example_news"
 
 
 def test_fallback_routes_clear_filter_with_qingchu() -> None:
-    result = fallback_route_telegram_natural_language("把 @aka_claw 的關鍵字清除")
+    result = fallback_route_telegram_natural_language("把 @example_bot 的關鍵字清除")
 
     assert result is not None
     assert result.intent == "sns_clear_filter"
-    assert result.sns_handle == "aka_claw"
+    assert result.sns_handle == "example_bot"
 
 
 def test_fallback_routes_clear_filter_english() -> None:
-    result = fallback_route_telegram_natural_language("clear filter on @aka_claw")
+    result = fallback_route_telegram_natural_language("clear filter on @example_bot")
 
     assert result is not None
     assert result.intent == "sns_clear_filter"
-    assert result.sns_handle == "aka_claw"
+    assert result.sns_handle == "example_bot"
 
 
 def test_clear_filter_requires_both_clear_verb_and_filter_hint() -> None:
     """'拿掉 @X' alone (no filter/篩選 keyword) must NOT become sns_clear_filter."""
-    result = fallback_route_telegram_natural_language("拿掉 @aka_claw")
+    result = fallback_route_telegram_natural_language("拿掉 @example_bot")
 
     assert result is None or result.intent != "sns_clear_filter"
 
@@ -647,15 +696,15 @@ def test_clear_filter_requires_both_clear_verb_and_filter_hint() -> None:
 # ── Regression — sns_delete keeps working for the right phrases ──────────────
 
 def test_delete_zhuizong_still_routes_to_sns_delete() -> None:
-    result = fallback_route_telegram_natural_language("刪除追蹤 @elonmusk")
+    result = fallback_route_telegram_natural_language("刪除追蹤 @example_news")
 
     assert result is not None
     assert result.intent == "sns_delete"
-    assert result.sns_handle == "elonmusk"
+    assert result.sns_handle == "example_news"
 
 
 def test_unfollow_still_routes_to_sns_delete() -> None:
-    result = fallback_route_telegram_natural_language("unfollow @elonmusk")
+    result = fallback_route_telegram_natural_language("unfollow @example_news")
 
     assert result is not None
     assert result.intent == "sns_delete"
@@ -666,23 +715,23 @@ def test_unfollow_still_routes_to_sns_delete() -> None:
 def test_normalize_intent_accepts_clear_filter_payload() -> None:
     from telegram_nl.natural_language import _normalize_intent
 
-    payload = {"intent": "sns_clear_filter", "sns_handle": "ARS_Arsales"}
+    payload = {"intent": "sns_clear_filter", "sns_handle": "example_tcg"}
     result = _normalize_intent(payload)
 
     assert result.intent == "sns_clear_filter"
-    assert result.sns_handle == "ARS_Arsales"
+    assert result.sns_handle == "example_tcg"
 
 
 # ── sns_add_account with schedule update via NL ──────────────────────────────
 
 def test_fallback_routes_schedule_update_to_sns_add_account_with_minutes() -> None:
     result = fallback_route_telegram_natural_language(
-        "把 @PokeGetInfoMain 的追蹤排程改成每 720分鐘"
+        "把 @example_sched 的追蹤排程改成每 720分鐘"
     )
 
     assert result is not None
     assert result.intent == "sns_add_account"
-    assert result.sns_handle == "PokeGetInfoMain"
+    assert result.sns_handle == "example_sched"
     assert result.sns_schedule_minutes == 720
 
 
@@ -690,42 +739,42 @@ def test_fallback_routes_schedule_only_phrasing_without_watch_verbs() -> None:
     # "排程" alone (no 追蹤/監控) should still trigger sns_add_account because
     # the schedule extractor is itself a watch-add intent signal.
     result = fallback_route_telegram_natural_language(
-        "把 @aka_claw 的排程改成每 60 分鐘"
+        "把 @example_bot 的排程改成每 60 分鐘"
     )
 
     assert result is not None
     assert result.intent == "sns_add_account"
-    assert result.sns_handle == "aka_claw"
+    assert result.sns_handle == "example_bot"
     assert result.sns_schedule_minutes == 60
 
 
 def test_fallback_routes_english_schedule_phrasing() -> None:
     result = fallback_route_telegram_natural_language(
-        "schedule @elonmusk to 90 minutes"
+        "schedule @example_news to 90 minutes"
     )
 
     assert result is not None
     assert result.intent == "sns_add_account"
-    assert result.sns_handle == "elonmusk"
+    assert result.sns_handle == "example_news"
     assert result.sns_schedule_minutes == 90
 
 
 def test_fallback_rejects_out_of_range_schedule() -> None:
     result = fallback_route_telegram_natural_language(
-        "把 @aka_claw 的排程改成每 99999 分鐘"
+        "把 @example_bot 的排程改成每 99999 分鐘"
     )
 
     # Out-of-range schedule must be dropped, but the @handle trigger keeps
     # sns_add_account as the routed intent so the user still gets a useful ack.
     assert result is not None
     assert result.intent == "sns_add_account"
-    assert result.sns_handle == "aka_claw"
+    assert result.sns_handle == "example_bot"
     assert result.sns_schedule_minutes is None
 
 
 def test_fallback_does_not_populate_schedule_without_hint_keyword() -> None:
     # Bare "追蹤 @X" has no schedule hint → sns_schedule_minutes stays None.
-    result = fallback_route_telegram_natural_language("追蹤 @elonmusk")
+    result = fallback_route_telegram_natural_language("追蹤 @example_news")
 
     assert result is not None
     assert result.intent == "sns_add_account"
@@ -737,13 +786,13 @@ def test_normalize_intent_accepts_sns_schedule_minutes_payload() -> None:
 
     payload = {
         "intent": "sns_add_account",
-        "sns_handle": "PokeGetInfoMain",
+        "sns_handle": "example_sched",
         "sns_schedule_minutes": 720,
     }
     result = _normalize_intent(payload)
 
     assert result.intent == "sns_add_account"
-    assert result.sns_handle == "PokeGetInfoMain"
+    assert result.sns_handle == "example_sched"
     assert result.sns_schedule_minutes == 720
 
 

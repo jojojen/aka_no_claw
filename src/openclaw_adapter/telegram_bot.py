@@ -141,6 +141,7 @@ from .research_command import (
     _build_seller_snapshot_section_result,
 )
 from .natural_language import build_telegram_natural_language_router_from_settings
+from .natural_language import fallback_route_openclaw_natural_language
 from telegram_nl.natural_language import TelegramNaturalLanguageIntent
 from .quiz_favorite_songs import extract_first_youtube_url
 from .opportunity_command import (
@@ -540,6 +541,20 @@ class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
                 reply=None,
                 reply_factory=lambda t=target, cmd=command, c=cid: ir_spec.handler(f"send {t} {cmd}", c),
             )
+        return None
+
+    def _route_natural_language(self, text: str) -> TelegramNaturalLanguageIntent | None:
+        intent = super()._route_natural_language(text)
+        if intent is not None:
+            return intent
+        app_intent = fallback_route_openclaw_natural_language(text)
+        if app_intent is not None and app_intent.intent != "unknown":
+            logger.info(
+                "Telegram openclaw fallback intent=%s confidence=%s",
+                app_intent.intent,
+                app_intent.confidence,
+            )
+            return app_intent
         return None
 
     def build_reply_plan(self, *, chat_id: str | int, text: str | None) -> TelegramTextReplyPlan:
@@ -1346,7 +1361,11 @@ def _build_registries(
         "/source": RegisteredCommand(build_source_handler(settings)),
         "/music": RegisteredCommand(
             build_music_handler(settings),
-            usage="playbest=播放最愛清單；<關鍵字>=搜尋並播放該歌曲",
+            usage=(
+                "playbest=播放最愛清單；random=隨機播放；stop=停止；"
+                "pause=暫停；resume=繼續；next/previous=切歌；"
+                "<關鍵字>=搜尋並播放該歌曲"
+            ),
         ),
         "/musiclistall": RegisteredCommand(
             build_musiclistall_handler(settings),

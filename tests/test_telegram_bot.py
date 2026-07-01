@@ -541,6 +541,22 @@ def test_home_action_plan_when_ir_not_registered() -> None:
     assert plan.reply == "/ir 指令尚未啟用。"
 
 
+def test_route_natural_language_uses_openclaw_app_fallback() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+    )
+
+    intent = processor._route_natural_language("放我最愛的音樂")
+
+    assert intent is not None
+    assert intent.intent == "play_music"
+    assert intent.music_query == "playbest"
+
+
 def test_build_registries_passes_knowledge_db_path_to_research_handler(monkeypatch, tmp_path: Path) -> None:
     settings = AssistantSettings(
         openclaw_telegram_chat_id="123",

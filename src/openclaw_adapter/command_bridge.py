@@ -39,14 +39,9 @@ from .command_bridge_models import (
     CHAT_BACKEND_CLOUD_PICKLE,
     CHAT_BACKEND_GEMINI,
     CHAT_BACKEND_LOCAL,
+    CHAT_TOOL_MUSIC,
     CHAT_TOOL_SEARCH,
-    MUSIC_ACTION_LIST_ALL,
-    MUSIC_ACTION_LIST_FAVORITES,
-    MUSIC_ACTION_NOW,
     MUSIC_ACTION_PLAN,
-    MUSIC_ACTION_PLAY_QUERY,
-    MUSIC_ACTION_RANDOM,
-    MUSIC_ACTION_STOP,
     Action,
     ChatToolPolicy,
     ChatToolRequest,
@@ -69,7 +64,6 @@ from .command_bridge_models import (
     SUBMODE_TEXT_TRANSLATION,
     WebCommandRequest,
     WebCommandResponse,
-    detect_music_intent,
     make_chat_tool_request,
     parse_router_decision,
     stream_delta,
@@ -231,20 +225,18 @@ def _extract_gemini_text(data: object) -> str:
     return "".join(parts).strip()
 
 # Web Chat contextual tool routing (#45). A local router LLM decides, per chat
-# turn, whether to answer directly or call the one whitelisted tool (/search).
+# turn, whether to answer directly or call a closed allowlist of tools.
 # The router gets the recent history so it can resolve pronouns into a
 # self-contained search query (e.g. 「她的歌」→「初音未來 歌曲」). It must emit a
 # single strict-JSON object; anything else is treated as "direct" (fail soft).
 _ROUTER_TIMEOUT_CAP_SECONDS = 30
-_ROUTER_SYSTEM_PROMPT = (
+_ROUTER_SYSTEM_PROMPT_TEMPLATE = (
     "你是 aka_no_claw 聊天助理的路由器。根據對話判斷要不要使用工具來回答使用者的『最新訊息』。\n"
-    "可用工具：\n"
-    "- /search：當回答需要『即時、最新或你不確定的事實資訊』（新聞、價格、商品規格、人物近況、"
-    "賽事結果等）時使用。\n"
+    "可用工具：\n{tool_lines}\n"
     "其他情況（閒聊、改寫、翻譯、一般常識、可由上文直接回答）一律 direct，不要用工具。\n"
     "只輸出一個 JSON 物件，不要加任何多餘文字或說明：\n"
-    '{"decision":"direct|tool","tool":"/search","query":"...","reason_summary":"..."}\n'
-    "當 decision=tool 時，query 必須是適合丟給搜尋引擎、語意完整的查詢；"
+    '{{"decision":"direct|tool","tool":"{tool_choices}","query":"...","reason_summary":"..."}}\n'
+    "當 decision=tool 時，query 必須是該工具可直接執行的參數；"
     "若使用者用代名詞（她／它／這個），請用對話紀錄把主詞補回 query。"
 )
 _SEARCH_SYNTHESIS_PROMPT = (
@@ -262,7 +254,7 @@ _SEARCH_SYNTHESIS_PROMPT = (
 #    still evident after streaming completes. Both are always on (never gated by
 #    the debug flag) — only the synthesis-model label stays behind that flag.
 _TOOL_USED_PREFIX = "🔧 已使用工具："
-_TOOL_FRIENDLY_NAMES = {CHAT_TOOL_SEARCH: "網路搜尋"}
+_TOOL_FRIENDLY_NAMES = {CHAT_TOOL_SEARCH: "網路搜尋", CHAT_TOOL_MUSIC: "音樂控制"}
 
 # Search snippets are external (search-engine) text fed into the final synthesis
 # LLM, so they are budgeted before entering the prompt: per-field caps bound any
@@ -284,6 +276,7 @@ _SEARCH_TOOL_POLICY = ChatToolPolicy(
     max_source_field_chars=_SOURCE_PACK_SNIPPET_CAP,
     max_source_pack_chars=_SOURCE_PACK_TOTAL_CAP,
 )
+_MUSIC_TOOL_POLICY = ChatToolPolicy(display_name="音樂控制", max_query_chars=128)
 
 
 def _clip(text: str, cap: int) -> str:
@@ -658,19 +651,11 @@ class CommandBridge:
         resumed = self._maybe_resume_music_plan(req, text)
         if resumed is not None:
             return resumed
-        # Music fast-path (#49/#50): fires before the LLM router for obvious music
-        # intents so there is no LLM round-trip for "播放一首歌" / "停止音樂" etc.
-        music_intent = detect_music_intent(text)
-        if music_intent is not None:
-            try:
-                return self._exec_music_intent(req, music_intent)
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("music intent failed action=%s", music_intent.action)
-                return WebCommandResponse(
-                    status=STATUS_ERROR,
-                    message=f"音樂操作失敗：{exc}",
-                    mode=MODE_CHAT,
-                )
+        from .natural_language import fallback_route_openclaw_natural_language
+        nl_intent = fallback_route_openclaw_natural_language(text)
+        nl_response = self._exec_openclaw_nl_intent(req, nl_intent)
+        if nl_response is not None:
+            return nl_response
         decision = self._route_chat_decision(req)
         if decision is not None and decision.decision == ROUTER_DECISION_TOOL:
             try:
@@ -776,33 +761,21 @@ class CommandBridge:
                 workflow_id=self._extract_wf_slug(text),
             )
             return
-        from telegram_nl.natural_language import fallback_route_telegram_natural_language
-        nl_intent = fallback_route_telegram_natural_language(text)
+        from .natural_language import fallback_route_openclaw_natural_language
+        nl_intent = fallback_route_openclaw_natural_language(text)
         if nl_intent is not None and nl_intent.intent == "create_workflow":
             yield stream_redirect(
                 "create_workflow",
                 nl_intent.workflow_description or text,
             )
             return
-        # Music fast-path (#49/#50)
-        #
-        # Keep this AFTER workflow/schedule creation redirects. Phrases like
-        # "建立工作流：播放最愛音樂清單，然後開燈" contain music keywords but are
-        # meta authoring requests, not immediate playback commands.
-        music_intent = detect_music_intent(text)
-        if music_intent is not None:
-            try:
-                resp = self._exec_music_intent(req, music_intent)
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("music intent failed action=%s", music_intent.action)
-                yield stream_error(f"音樂操作失敗：{exc}")
-                return
-            if resp.status == STATUS_ERROR:
-                yield stream_error(resp.message)
+        nl_response = self._exec_openclaw_nl_intent(req, nl_intent)
+        if nl_response is not None:
+            if nl_response.status == STATUS_ERROR:
+                yield stream_error(nl_response.message)
             else:
-                yield stream_done(resp.message)
+                yield stream_done(nl_response.message)
             return
-
         decision = self._route_chat_decision(req)
         if decision is not None and decision.decision == ROUTER_DECISION_TOOL:
             yield from self._stream_chat_tool(req, decision)
@@ -817,13 +790,12 @@ class CommandBridge:
         else:
             yield from self._stream_ollama_chat(prompt)
 
-    # --- music intent fast-path (#49 / #50) ---------------------------------
+    # --- bounded music plan (#50) --------------------------------------------
     def _exec_music_intent(
         self, req: WebCommandRequest, intent: MusicIntent
     ) -> WebCommandResponse:
-        """Dispatch a music intent to the appropriate bridge method.
+        """Dispatch a bounded music plan intent.
 
-        Simple intents (#49) call run_music_command / run_music_action directly.
         The PLAN action (#50) runs a bounded multi-step flow that inspects the
         local library and searches for external popularity context before playing.
         Never executes arbitrary slash commands — only the closed MUSIC_ACTION_*
@@ -834,20 +806,24 @@ class CommandBridge:
         )
         if intent.action == MUSIC_ACTION_PLAN:
             return self._exec_music_plan(req, intent)
-        if intent.action == MUSIC_ACTION_RANDOM:
-            result = self.run_music_command("random")
-        elif intent.action == MUSIC_ACTION_PLAY_QUERY:
-            result = self.run_music_command(intent.query)
-        elif intent.action == MUSIC_ACTION_STOP:
-            result = self.run_music_command("stop")
-        elif intent.action == MUSIC_ACTION_NOW:
-            result = self.run_music_command("now")
-        elif intent.action == MUSIC_ACTION_LIST_ALL:
-            result = self.run_music_action("music:ls:root:0")
-        elif intent.action == MUSIC_ACTION_LIST_FAVORITES:
-            result = self.run_music_action("pg:mb:0:r")
-        else:
-            raise ValueError(f"unknown music action: {intent.action!r}")
+        raise ValueError(f"unknown music action: {intent.action!r}")
+
+    def _exec_openclaw_nl_intent(
+        self,
+        req: WebCommandRequest,
+        intent,
+    ) -> WebCommandResponse | None:
+        """Execute app-owned NL intents through the same command handlers as Telegram."""
+        if intent is None:
+            return None
+        if intent.intent == "play_music":
+            if not intent.music_query:
+                return None
+            result = self.run_music_command(intent.music_query)
+            return self._music_result_response(result)
+        return None
+
+    def _music_result_response(self, result: dict) -> WebCommandResponse:
         actions = tuple(
             Action(label=str(a.get("label", "")), command=str(a.get("callback_data", "")))
             for a in result.get("actions", [])
@@ -1176,12 +1152,39 @@ class CommandBridge:
         return decision
 
     def _build_router_prompt(self, req: WebCommandRequest) -> str:
-        lines = [_ROUTER_SYSTEM_PROMPT, "", "對話紀錄："]
+        lines = [self._router_system_prompt(), "", "對話紀錄："]
         for turn in req.history:
             label = _CHAT_ROLE_LABELS.get(turn.role, turn.role)
             lines.append(f"{label}：{turn.content}")
         lines += ["", f"使用者最新訊息：{(req.input or '').strip()}", "", "JSON："]
         return "\n".join(lines)
+
+    def _router_system_prompt(self) -> str:
+        tools = [CHAT_TOOL_SEARCH]
+        tool_lines = [
+            "- /search：當回答需要即時、最新或你不確定的事實資訊時使用；query 是適合搜尋引擎的完整查詢。",
+        ]
+        music_usage = self._registered_command_usage(CHAT_TOOL_MUSIC)
+        if music_usage:
+            tools.append(CHAT_TOOL_MUSIC)
+            tool_lines.append(
+                f"- /music：{music_usage}。當使用者要控制本機音樂播放時使用；"
+                "query 只輸出 /music 後面的參數，例如 stop、pause、resume、next、previous、random、playbest 或歌曲關鍵字。"
+            )
+        tool_choices = "|".join(t.split("/", 1)[-1] for t in tools)
+        tool_choices = "/" + "|/".join(tool_choices.split("|"))
+        return _ROUTER_SYSTEM_PROMPT_TEMPLATE.format(
+            tool_lines="\n".join(tool_lines),
+            tool_choices=tool_choices,
+        )
+
+    def _registered_command_usage(self, command: str) -> str:
+        try:
+            registered = self._handlers().get(command)
+        except Exception:  # noqa: BLE001
+            logger.debug("router prompt: command registry unavailable for %s", command, exc_info=True)
+            return ""
+        return str(getattr(registered, "usage", "") or "").strip()
 
     def _generate_router_json(self, prompt: str) -> str:
         from .dynamic_tools import OllamaTextClient
@@ -1206,6 +1209,7 @@ class CommandBridge:
         happen — parse_router_decision already guards the whitelist)."""
         policy_map: dict[str, tuple[ChatToolPolicy, object]] = {
             CHAT_TOOL_SEARCH: (_SEARCH_TOOL_POLICY, self._exec_grounded_search),
+            CHAT_TOOL_MUSIC: (_MUSIC_TOOL_POLICY, self._exec_music_chat_tool),
         }
         entry = policy_map.get(decision.tool)
         if entry is None:
@@ -1341,6 +1345,26 @@ class CommandBridge:
             source_count=len(results),
             result_summary=f"query={query!r} sources={len(results)} model={model_label}",
             model_metadata=model_metadata,
+        )
+
+    def _exec_music_chat_tool(
+        self, req: WebCommandRequest, tool_req: ChatToolRequest
+    ) -> ChatToolResult:
+        query = tool_req.query
+        logger.info(
+            "[chat-tool] tool=%s fn=CommandBridge.run_music_command query=%r",
+            tool_req.tool, query,
+        )
+        result = self.run_music_command(query)
+        status = str(result.get("status", STATUS_OK))
+        message = str(result.get("message", "")).strip()
+        banner = f"{_TOOL_USED_PREFIX}音樂控制（{tool_req.tool}）｜指令：{query}"
+        if status == STATUS_ERROR:
+            message = message or "音樂操作失敗。"
+        return ChatToolResult(
+            answer=f"{banner}\n\n{message}",
+            source_count=0,
+            result_summary=f"query={query!r} status={status}",
         )
 
     @staticmethod

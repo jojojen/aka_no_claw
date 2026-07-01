@@ -21,16 +21,11 @@ from openclaw_adapter.command_bridge import CommandBridge, _WorkflowShimRunner, 
 from openclaw_adapter.command_bridge_models import (
     CHAT_BACKEND_CLOUD_PICKLE,
     CHAT_BACKEND_LOCAL,
+    CHAT_TOOL_MUSIC,
     CHAT_TOOL_SEARCH,
     MAX_HISTORY_TURNS,
     MAX_ROUTER_QUERY_LEN,
-    MUSIC_ACTION_LIST_ALL,
-    MUSIC_ACTION_LIST_FAVORITES,
-    MUSIC_ACTION_NOW,
     MUSIC_ACTION_PLAN,
-    MUSIC_ACTION_PLAY_QUERY,
-    MUSIC_ACTION_RANDOM,
-    MUSIC_ACTION_STOP,
     ChatToolPolicy,
     ChatToolRequest,
     ChatToolResult,
@@ -50,7 +45,6 @@ from openclaw_adapter.command_bridge_models import (
     SUBMODE_SELLER_REPUTATION_SNAPSHOT,
     SUBMODE_TEXT_TRANSLATION,
     RequestValidationError,
-    detect_music_intent,
     make_chat_tool_request,
     parse_request,
     parse_router_decision,
@@ -621,6 +615,15 @@ def test_parse_router_decision_tool():
     assert d.query == "初音 新歌"
 
 
+def test_parse_router_decision_music_tool():
+    d = parse_router_decision(
+        '{"decision":"tool","tool":"/music","query":"stop","reason_summary":"音樂控制"}'
+    )
+    assert d.decision == ROUTER_DECISION_TOOL
+    assert d.tool == CHAT_TOOL_MUSIC
+    assert d.query == "stop"
+
+
 def test_parse_router_decision_extracts_json_from_noise():
     raw = '<think>嗯</think> 好的：\n```json\n{"decision":"tool","tool":"/search","query":"q"}\n```'
     d = parse_router_decision(raw)
@@ -732,6 +735,44 @@ def test_chat_tool_search_triggers_grounded_answer(monkeypatch):
     assert CHAT_TOOL_SEARCH in resp.message
     # Sources are always appended so the answer is traceable.
     assert "https://miku.example/news" in resp.message
+
+
+def test_router_prompt_includes_registered_music_usage(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        b,
+        "_handlers",
+        lambda: {"/music": SimpleNamespace(usage="stop=停止；playbest=播放最愛")},
+    )
+
+    prompt = b._build_router_prompt(parse_request({"mode": "chat", "input": "停止播放音樂"}))
+
+    assert "/music" in prompt
+    assert "stop=停止" in prompt
+    assert "playbest=播放最愛" in prompt
+
+
+def test_chat_tool_music_dispatches_registered_music_command(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        b,
+        "_generate_router_json",
+        lambda prompt: '{"decision":"tool","tool":"/music","query":"stop"}',
+    )
+    called = {}
+
+    def _mock_run_music_command(text):
+        called["text"] = text
+        return {"status": STATUS_OK, "message": "已停止目前由龍蝦播放的音樂。", "actions": []}
+
+    monkeypatch.setattr(b, "run_music_command", _mock_run_music_command)
+    resp = b.handle(parse_request({"mode": "chat", "input": "停止播放音樂"}))
+
+    assert resp.status == STATUS_OK
+    assert called["text"] == "stop"
+    assert "已使用工具" in resp.message
+    assert "音樂控制" in resp.message
+    assert "已停止目前由龍蝦播放的音樂" in resp.message
 
 
 def test_router_prompt_includes_history_for_rewrite(monkeypatch):
@@ -1787,137 +1828,23 @@ def test_exec_grounded_search_source_count(monkeypatch):
     assert "sources=2" in result.result_summary
 
 
-# --- Issue #49: music fast-path detection ---------------------------------
+# --- /music chat tool routing -----------------------------------------------
 
-@pytest.mark.parametrize("text,expected_action,expected_query", [
-    ("播放一首歌", MUSIC_ACTION_RANDOM, ""),
-    ("放一首", MUSIC_ACTION_RANDOM, ""),
-    ("隨機播放", MUSIC_ACTION_RANDOM, ""),
-    ("播歌", MUSIC_ACTION_RANDOM, ""),
-    ("停止音樂", MUSIC_ACTION_STOP, ""),
-    ("停播", MUSIC_ACTION_STOP, ""),
-    ("現在播什麼", MUSIC_ACTION_NOW, ""),
-    ("正在播的是什麼", MUSIC_ACTION_NOW, ""),
-    ("列出歌曲", MUSIC_ACTION_LIST_ALL, ""),
-    ("可以播放的歌", MUSIC_ACTION_LIST_ALL, ""),
-    ("列出最愛", MUSIC_ACTION_LIST_FAVORITES, ""),
-    ("我的歌單", MUSIC_ACTION_LIST_FAVORITES, ""),
-    ("播放 One Last Kiss", MUSIC_ACTION_PLAY_QUERY, "One Last Kiss"),
-    ("播放Lemon", MUSIC_ACTION_PLAY_QUERY, "Lemon"),
-    ("播 KICK BACK", MUSIC_ACTION_PLAY_QUERY, "KICK BACK"),
-])
-def test_detect_music_intent_simple(text, expected_action, expected_query):
-    intent = detect_music_intent(text)
-    assert intent is not None, f"expected intent for {text!r}"
-    assert intent.action == expected_action
-    if expected_query:
-        assert intent.query == expected_query
-
-
-@pytest.mark.parametrize("text", [
-    "幫我查今天天氣",
-    "初音未來是誰",
-    "",
-    "   ",
-])
-def test_detect_music_intent_returns_none_for_non_music(text):
-    assert detect_music_intent(text) is None
-
-
-def test_detect_music_intent_plan_qualifier():
-    intent = detect_music_intent("播放米津玄師熱門單曲")
-    assert intent is not None
-    assert intent.action == MUSIC_ACTION_PLAN
-    assert intent.query == "米津玄師"
-    assert intent.qualifier == "熱門"
-
-
-def test_detect_music_intent_plan_latest():
-    intent = detect_music_intent("播放 YOASOBI 最新歌曲")
-    assert intent is not None
-    assert intent.action == MUSIC_ACTION_PLAN
-    assert intent.query == "YOASOBI"
-    assert intent.qualifier == "最新"
-
-
-def test_detect_music_intent_plan_does_not_match_simple_title():
-    # "One Last Kiss" has no qualifier → simple play_query
-    intent = detect_music_intent("播放 One Last Kiss")
-    assert intent is not None
-    assert intent.action == MUSIC_ACTION_PLAY_QUERY
-    assert intent.query == "One Last Kiss"
-
-
-def test_chat_random_play_dispatches_to_music_command(monkeypatch):
+def test_stream_chat_music_tool_emits_done(monkeypatch):
     b = CommandBridge(settings=_tool_settings())
-    called = {}
-
-    def _mock_run_music_command(text):
-        called["text"] = text
-        return {"status": STATUS_OK, "message": "🎵 Now playing: ランダム曲", "actions": []}
-
-    monkeypatch.setattr(b, "run_music_command", _mock_run_music_command)
-    resp = b.handle(parse_request({"mode": "chat", "input": "播放一首歌"}))
-    assert resp.status == STATUS_OK
-    assert called["text"] == "random"
-    assert "ランダム曲" in resp.message
-
-
-def test_chat_play_query_passes_song_name(monkeypatch):
-    b = CommandBridge(settings=_tool_settings())
-    called = {}
-
-    def _mock_run_music_command(text):
-        called["text"] = text
-        return {"status": STATUS_OK, "message": f"▶️ {text}", "actions": []}
-
-    monkeypatch.setattr(b, "run_music_command", _mock_run_music_command)
-    resp = b.handle(parse_request({"mode": "chat", "input": "播放 One Last Kiss"}))
-    assert resp.status == STATUS_OK
-    assert called["text"] == "One Last Kiss"
-    assert "One Last Kiss" in resp.message
-
-
-def test_chat_stop_music(monkeypatch):
-    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        b,
+        "_generate_router_json",
+        lambda prompt: '{"decision":"tool","tool":"/music","query":"stop"}',
+    )
     monkeypatch.setattr(b, "run_music_command",
-                        lambda t: {"status": STATUS_OK, "message": "⏹ 已停止", "actions": []})
-    resp = b.handle(parse_request({"mode": "chat", "input": "停止音樂"}))
-    assert resp.status == STATUS_OK
-    assert "已停止" in resp.message
-
-
-def test_chat_list_all_returns_actions(monkeypatch):
-    b = CommandBridge(settings=_tool_settings())
-    markup_actions = [{"label": "🎵 Song A", "callback_data": "music:sd:tokA"}]
-    monkeypatch.setattr(b, "run_music_action",
-                        lambda cb: {"status": STATUS_OK, "message": "📁 全部歌曲", "actions": markup_actions})
-    resp = b.handle(parse_request({"mode": "chat", "input": "列出歌曲"}))
-    assert resp.status == STATUS_OK
-    assert "全部歌曲" in resp.message
-    assert len(resp.actions) == 1
-    assert resp.actions[0].label == "🎵 Song A"
-    assert resp.actions[0].command == "music:sd:tokA"
-
-
-def test_chat_music_bypasses_llm_router(monkeypatch):
-    """Music fast-path must not invoke the LLM router at all."""
-    b = CommandBridge(settings=_tool_settings())
-    router_called = []
-    monkeypatch.setattr(b, "_route_chat_decision", lambda req: router_called.append(1) or None)
-    monkeypatch.setattr(b, "run_music_command",
-                        lambda t: {"status": STATUS_OK, "message": "ok", "actions": []})
-    b.handle(parse_request({"mode": "chat", "input": "停播"}))
-    assert not router_called, "LLM router must not be called for music intents"
-
-
-def test_stream_chat_music_emits_done(monkeypatch):
-    b = CommandBridge(settings=_tool_settings())
-    monkeypatch.setattr(b, "run_music_command",
-                        lambda t: {"status": STATUS_OK, "message": "🎵 Playing", "actions": []})
-    events = list(b.stream(parse_request({"mode": "chat", "input": "播歌"}), "rid-m"))
+                        lambda t: {"status": STATUS_OK, "message": "已停止", "actions": []})
+    events = list(b.stream(parse_request({"mode": "chat", "input": "停止播放音樂"}), "rid-m"))
     assert events[0]["type"] == "start"
-    assert events[-1] == {"type": "done", "message": "🎵 Playing"}
+    assert events[1]["type"] == "delta"
+    assert "音樂控制" in events[1]["text"]
+    assert events[-1]["type"] == "done"
+    assert "已停止" in events[-1]["message"]
 
 
 # --- Issue #50: bounded multi-tool music plan ----------------------------
@@ -2375,7 +2302,7 @@ def test_stream_chat_nl_fallback_when_fast_path_misses(monkeypatch):
     _assert_single_redirect(list(b.stream(req, "test-rid3")), "工作流")
 
 
-def test_stream_chat_workflow_redirect_beats_music_fast_path(monkeypatch):
+def test_stream_chat_workflow_redirect_beats_music_tool_route(monkeypatch):
     """A workflow-authoring request mentioning music must redirect, not play."""
     b = CommandBridge(settings=object())
     monkeypatch.setattr(b, "_get_intent_fast_path", lambda: None)
@@ -2384,7 +2311,7 @@ def test_stream_chat_workflow_redirect_beats_music_fast_path(monkeypatch):
 
     def _fake_music(_req, intent):
         music_calls.append(intent.action)
-        raise AssertionError("music fast-path should not run for workflow authoring")
+        raise AssertionError("music playback should not run for workflow authoring")
 
     def _boom(_req):
         raise AssertionError("LLM router should not be called for create_workflow")
@@ -2395,6 +2322,31 @@ def test_stream_chat_workflow_redirect_beats_music_fast_path(monkeypatch):
     req = parse_request({"mode": "chat", "input": "建立工作流：播放最愛音樂清單 然後 開燈"})
     _assert_single_redirect(list(b.stream(req, "test-rid-music")), "工作流")
     assert music_calls == []
+
+
+def test_stream_chat_uses_openclaw_nl_for_play_music(monkeypatch):
+    """Web chat should align with Telegram/OpenClaw NL before generic chat tools."""
+    b = CommandBridge(settings=object())
+    monkeypatch.setattr(b, "_get_intent_fast_path", lambda: None)
+
+    music_queries: list[str] = []
+
+    def _fake_run_music_command(query):
+        music_queries.append(query)
+        return {"status": "ok", "message": "開始連續隨機播放最愛歌曲。"}
+
+    def _boom(_req):
+        raise AssertionError("LLM router should not be called for play_music")
+
+    monkeypatch.setattr(b, "run_music_command", _fake_run_music_command)
+    monkeypatch.setattr(b, "_route_chat_decision", _boom)
+
+    req = parse_request({"mode": "chat", "input": "播放我的最愛清單歌曲"})
+    events = list(b.stream(req, "test-rid-playbest"))
+
+    assert music_queries == ["playbest"]
+    assert events[-1]["type"] == "done"
+    assert "開始連續" in events[-1]["message"]
 
 
 # --- /schedulehome bridge route (web#9) ------------------------------------
