@@ -92,6 +92,8 @@ def _build_handler(bridge: CommandBridge, *, lan_enabled: bool) -> type[BaseHTTP
                 self._handle_schedulehome()
             elif path == "/api/command/session":
                 self._handle_session_save()
+            elif path == "/api/command/chat-settings":
+                self._handle_chat_settings_save()
             elif path == "/api/command/restartall":
                 self._write_json(bridge.restart_all())
             else:
@@ -115,6 +117,8 @@ def _build_handler(bridge: CommandBridge, *, lan_enabled: bool) -> type[BaseHTTP
                 self._write_json(bridge.now_playing())
             elif split.path == "/api/command/model-routes":
                 self._write_json(bridge.model_routes())
+            elif split.path == "/api/command/chat-settings":
+                self._write_json(bridge.load_chat_settings())
             else:
                 self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
@@ -221,6 +225,27 @@ def _build_handler(bridge: CommandBridge, *, lan_enabled: bool) -> type[BaseHTTP
                 self._write_json(bridge.run_ir_action(callback_data))
                 return
             self._write_json(bridge.run_ir_command(str(data.get("input") or "")))
+
+        def _handle_chat_settings_save(self) -> None:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            try:
+                raw = self.rfile.read(length) if length else b""
+                data = json.loads(raw.decode("utf-8")) if raw else {}
+            except (ValueError, UnicodeDecodeError) as exc:
+                self._write_json(
+                    {"status": "error", "message": f"無效的請求：{exc}"},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+            if not isinstance(data, dict):
+                self._write_json(
+                    {"status": "error", "message": "請求必須是 JSON 物件。"},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+            result = bridge.save_chat_settings(data)
+            status = HTTPStatus.OK if result.get("status") != "error" else HTTPStatus.BAD_REQUEST
+            self._write_json(result, status=status)
 
         def _handle_workflow(self) -> None:
             """Workflow surface (#53). ``callback_data`` (``wfe:…``) replays an

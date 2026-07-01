@@ -109,6 +109,14 @@ For web console work, validate these baseline states:
 5. Returning from a specialized card to normal chat does not misroute the next
    message unless capture mode is intentionally open.
 
+Mobile layout regression checks:
+
+- Important nav labels, action buttons, and model tabs must stay single-line on
+  phone-width viewports; do not accept stacked two-line labels such as header
+  buttons or model pills wrapping inside their own control.
+- If a label risks overflow, shorten copy or adjust the control/layout so the
+  full label remains visible within the viewport.
+
 ## Workflow And Schedule Smoke
 
 For `/workflow` plus `/schedulehome` web changes, run this browser path:

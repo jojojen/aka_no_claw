@@ -6,6 +6,7 @@ venv/
 .env
 .env.*
 !.env.example
+config/llm_pool.json
 
 # Python caches
 __pycache__/

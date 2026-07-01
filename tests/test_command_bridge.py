@@ -11,6 +11,7 @@ network — is what's under test.
 from __future__ import annotations
 
 import io
+import json
 import threading
 import time
 from types import SimpleNamespace
@@ -25,10 +26,12 @@ from openclaw_adapter.command_bridge_models import (
     CHAT_TOOL_BLUETOOTH,
     CHAT_TOOL_IR,
     CHAT_TOOL_MUSIC,
+    CHAT_TOOL_NO_TOOL,
     CHAT_TOOL_SEARCH,
     MAX_HISTORY_TURNS,
     MAX_ROUTER_QUERY_LEN,
     MUSIC_ACTION_PLAN,
+    ChatToolPlan,
     ChatToolPolicy,
     ChatToolRequest,
     ChatToolResult,
@@ -37,9 +40,6 @@ from openclaw_adapter.command_bridge_models import (
     MODE_INVESTMENT,
     MODE_TRANSLATION,
     MusicIntent,
-    ROUTER_DECISION_DIRECT,
-    ROUTER_DECISION_TOOL,
-    RouterDecision,
     STATUS_ERROR,
     STATUS_OK,
     STATUS_UNSUPPORTED,
@@ -49,8 +49,8 @@ from openclaw_adapter.command_bridge_models import (
     SUBMODE_TEXT_TRANSLATION,
     RequestValidationError,
     make_chat_tool_request,
+    parse_chat_tool_plan,
     parse_request,
-    parse_router_decision,
 )
 
 
@@ -603,88 +603,99 @@ def test_chat_stream_uses_history(bridge, monkeypatch):
     assert "再講一首" in captured["prompt"]
 
 
-# --- #45 router decision parsing (trust boundary) -------------------------
-def test_parse_router_decision_direct():
-    d = parse_router_decision('{"decision":"direct","reason_summary":"閒聊"}')
-    assert d == RouterDecision(decision=ROUTER_DECISION_DIRECT, reason_summary="閒聊")
-
-
-def test_parse_router_decision_tool():
-    d = parse_router_decision(
-        '{"decision":"tool","tool":"/search","query":"初音 新歌","reason_summary":"需即時"}'
+# --- #45 chat tool plan parsing (trust boundary) --------------------------
+def test_parse_chat_tool_plan_direct_answer():
+    plan = parse_chat_tool_plan('{"tool":"__no_tool__","answer":"米津玄師是日本歌手","reason_summary":"一般知識"}')
+    assert plan == ChatToolPlan(
+        tool=CHAT_TOOL_NO_TOOL,
+        answer="米津玄師是日本歌手",
+        reason_summary="一般知識",
     )
-    assert d.decision == ROUTER_DECISION_TOOL
-    assert d.tool == CHAT_TOOL_SEARCH
-    assert d.query == "初音 新歌"
 
 
-def test_parse_router_decision_music_tool():
-    d = parse_router_decision(
-        '{"decision":"tool","tool":"/music","query":"stop","reason_summary":"音樂控制"}'
+def test_parse_chat_tool_plan_search_tool():
+    plan = parse_chat_tool_plan(
+        '{"tool":"/search","query":"初音 新歌","reason_summary":"需即時"}'
     )
-    assert d.decision == ROUTER_DECISION_TOOL
-    assert d.tool == CHAT_TOOL_MUSIC
-    assert d.query == "stop"
-
-
-def test_parse_router_decision_bluetooth_tool():
-    d = parse_router_decision(
-        '{"decision":"tool","tool":"/bluetooth","query":"scan","reason_summary":"藍牙控制"}'
+    assert plan == ChatToolPlan(
+        tool=CHAT_TOOL_SEARCH,
+        query="初音 新歌",
+        reason_summary="需即時",
     )
-    assert d.decision == ROUTER_DECISION_TOOL
-    assert d.tool == CHAT_TOOL_BLUETOOTH
-    assert d.query == "scan"
 
 
-def test_parse_router_decision_ir_tool():
-    d = parse_router_decision(
-        '{"decision":"tool","tool":"/ir","query":"send ceiling_light power","reason_summary":"IR 控制"}'
+def test_parse_chat_tool_plan_music_tool():
+    plan = parse_chat_tool_plan(
+        '{"tool":"/music","query":"stop","reason_summary":"音樂控制"}'
     )
-    assert d.decision == ROUTER_DECISION_TOOL
-    assert d.tool == CHAT_TOOL_IR
-    assert d.query == "send ceiling_light power"
+    assert plan == ChatToolPlan(
+        tool=CHAT_TOOL_MUSIC,
+        query="stop",
+        reason_summary="音樂控制",
+    )
 
 
-def test_parse_router_decision_extracts_json_from_noise():
-    raw = '<think>嗯</think> 好的：\n```json\n{"decision":"tool","tool":"/search","query":"q"}\n```'
-    d = parse_router_decision(raw)
-    assert d is not None and d.tool == CHAT_TOOL_SEARCH and d.query == "q"
+def test_parse_chat_tool_plan_bluetooth_tool():
+    plan = parse_chat_tool_plan(
+        '{"tool":"/bluetooth","query":"scan","reason_summary":"藍牙控制"}'
+    )
+    assert plan == ChatToolPlan(
+        tool=CHAT_TOOL_BLUETOOTH,
+        query="scan",
+        reason_summary="藍牙控制",
+    )
+
+
+def test_parse_chat_tool_plan_ir_tool():
+    plan = parse_chat_tool_plan(
+        '{"tool":"/ir","query":"send ceiling_light power","reason_summary":"IR 控制"}'
+    )
+    assert plan == ChatToolPlan(
+        tool=CHAT_TOOL_IR,
+        query="send ceiling_light power",
+        reason_summary="IR 控制",
+    )
+
+
+def test_parse_chat_tool_plan_extracts_json_from_noise():
+    raw = '<think>嗯</think> 好的：\n```json\n{"tool":"/search","query":"q"}\n```'
+    plan = parse_chat_tool_plan(raw)
+    assert plan is not None and plan.tool == CHAT_TOOL_SEARCH and plan.query == "q"
 
 
 @pytest.mark.parametrize("raw", [
     None,
     42,
     "not json at all",
-    '{"decision":"tool","tool":"/rm-rf","query":"x"}',   # tool not whitelisted
-    '{"decision":"tool","tool":"/search","query":"   "}',  # empty query
-    '{"decision":"tool","tool":"/search"}',                # missing query
-    '{"decision":"teleport"}',                             # unknown decision
+    '{"tool":"/rm-rf","query":"x"}',
+    '{"tool":"/search","query":"   "}',
+    '{"tool":"/search"}',
+    '{"tool":"__no_tool__","answer":"   "}',
+    '{"tool":"teleport"}',
 ])
-def test_parse_router_decision_rejects_untrusted(raw):
-    assert parse_router_decision(raw) is None
+def test_parse_chat_tool_plan_rejects_untrusted(raw):
+    assert parse_chat_tool_plan(raw) is None
 
 
-def test_parse_router_decision_caps_overlong_query():
+def test_parse_chat_tool_plan_caps_overlong_query():
     long_q = "あ" * 1000
-    d = parse_router_decision(
-        '{"decision":"tool","tool":"/search","query":"' + long_q + '"}'
+    plan = parse_chat_tool_plan(
+        '{"tool":"/search","query":"' + long_q + '"}'
     )
-    assert d is not None and d.decision == ROUTER_DECISION_TOOL
-    assert len(d.query) == MAX_ROUTER_QUERY_LEN
-    assert d.query == "あ" * MAX_ROUTER_QUERY_LEN
+    assert plan is not None and plan.tool == CHAT_TOOL_SEARCH
+    assert len(plan.query) == MAX_ROUTER_QUERY_LEN
+    assert plan.query == "あ" * MAX_ROUTER_QUERY_LEN
 
 
-def test_parse_router_decision_collapses_noisy_query():
-    # Newlines, tabs, control chars and runs of spaces collapse to single spaces.
-    raw = '{"decision":"tool","tool":"/search","query":"初音\\n\\t  未來\\u0007 新歌  "}'
-    d = parse_router_decision(raw)
-    assert d is not None and d.query == "初音 未來 新歌"
+def test_parse_chat_tool_plan_collapses_noisy_query():
+    raw = '{"tool":"/search","query":"初音\\n\\t  未來\\u0007 新歌  "}'
+    plan = parse_chat_tool_plan(raw)
+    assert plan is not None and plan.query == "初音 未來 新歌"
 
 
-def test_parse_router_decision_rejects_control_only_query():
-    # A query that normalizes to empty (only whitespace/control chars) is unsafe.
-    assert parse_router_decision(
-        '{"decision":"tool","tool":"/search","query":"\\n\\t \\u0000"}'
+def test_parse_chat_tool_plan_rejects_control_only_query():
+    assert parse_chat_tool_plan(
+        '{"tool":"/search","query":"\\n\\t \\u0000"}'
     ) is None
 
 
@@ -695,19 +706,22 @@ def _tool_settings(
     mistral_key: str | None = None,
     gemini_primary_model: str = "gemini-2.5-pro",
     gemini_flash_model: str = "gemini-2.5-flash",
+    opencode_model: str = "big-pickle",
+    llm_pool_config_path: str = "/tmp/test_llm_pool.json",
 ):
     return SimpleNamespace(
         openclaw_web_chat_tool_debug=debug,
         openclaw_local_text_model="qwen3:14b",
         openclaw_local_text_endpoint="http://local",
         openclaw_local_text_timeout_seconds=60,
-        openclaw_opencode_model="big-pickle",
+        openclaw_opencode_model=opencode_model,
         openclaw_opencode_base_url="http://localhost:8080",
         openclaw_mistral_api_key=mistral_key,
         openclaw_mistral_model="mistral-large-latest",
         openclaw_gemini_api_key=gemini_key,
         openclaw_gemini_primary_model=gemini_primary_model,
         openclaw_gemini_flash_model=gemini_flash_model,
+        openclaw_llm_pool_config_path=llm_pool_config_path,
         openclaw_music_dir="/tmp/test_music",
         openclaw_music_index_path="/tmp/test_music_index.json",
     )
@@ -719,8 +733,14 @@ def _result(title, url, snippet):
 
 def test_chat_direct_decision_does_not_call_tool(monkeypatch):
     b = CommandBridge(settings=_tool_settings())
-    monkeypatch.setattr(b, "_generate_router_json", lambda prompt: '{"decision":"direct"}')
-    monkeypatch.setattr(b, "_ollama_generate_blocking", lambda prompt: f"direct:{prompt}")
+    monkeypatch.setattr(
+        b,
+        "_select_chat_tool_plan",
+        lambda req: (
+            ChatToolPlan(tool=CHAT_TOOL_NO_TOOL, answer="direct:嗨", reason_summary="閒聊"),
+            None,
+        ),
+    )
 
     def _no_search(*a, **k):
         raise AssertionError("web_search must not run on a direct decision")
@@ -728,14 +748,37 @@ def test_chat_direct_decision_does_not_call_tool(monkeypatch):
     monkeypatch.setattr("openclaw_adapter.web_search.web_search", _no_search)
     resp = b.handle(parse_request({"mode": "chat", "input": "嗨", "chat_backend": "local"}))
     assert resp.status == STATUS_OK
-    assert resp.message.startswith("direct:")
+    assert resp.message == "direct:嗨"
+    assert "已使用工具" not in resp.message
+
+
+def test_stream_direct_no_tool_plan_does_not_emit_tool_notice(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+
+    def _plan(req):
+        if False:
+            yield {}
+        return ChatToolPlan(tool=CHAT_TOOL_NO_TOOL, answer="米津玄師是日本創作歌手"), None
+
+    monkeypatch.setattr(b, "_stream_chat_tool_plan", _plan)
+    events = list(b.stream(parse_request({"mode": "chat", "input": "米津玄師是誰"}), "rid-direct"))
+
+    deltas = [e["text"] for e in events if e["type"] == "delta"]
+    assert deltas == ["米津玄師是日本創作歌手"]
+    assert all("正在調用" not in text for text in deltas)
+    assert events[-1]["type"] == "done"
+    assert events[-1]["message"] == "米津玄師是日本創作歌手"
 
 
 def test_chat_tool_search_triggers_grounded_answer(monkeypatch):
     b = CommandBridge(settings=_tool_settings())
     monkeypatch.setattr(
-        b, "_generate_router_json",
-        lambda prompt: '{"decision":"tool","tool":"/search","query":"初音 最新單曲"}',
+        b,
+        "_select_chat_tool_plan",
+        lambda req: (
+            ChatToolPlan(tool=CHAT_TOOL_SEARCH, query="初音 最新單曲", reason_summary="需即時"),
+            None,
+        ),
     )
     seen = {}
 
@@ -784,7 +827,7 @@ def test_router_prompt_includes_registered_control_tool_usage(monkeypatch):
         },
     )
 
-    prompt = b._build_router_prompt(parse_request({"mode": "chat", "input": "停止播放音樂"}))
+    prompt = b._build_chat_tool_plan_prompt(parse_request({"mode": "chat", "input": "停止播放音樂"}))
 
     assert "/music" in prompt
     assert "stop=停止" in prompt
@@ -802,8 +845,11 @@ def test_chat_tool_music_dispatches_registered_music_command(monkeypatch):
     b = CommandBridge(settings=_tool_settings())
     monkeypatch.setattr(
         b,
-        "_generate_router_json",
-        lambda prompt: '{"decision":"tool","tool":"/music","query":"stop"}',
+        "_select_chat_tool_plan",
+        lambda req: (
+            ChatToolPlan(tool=CHAT_TOOL_MUSIC, query="stop", reason_summary="音樂控制"),
+            None,
+        ),
     )
     called = {}
 
@@ -825,8 +871,11 @@ def test_chat_tool_bluetooth_dispatches_registered_bluetooth_command(monkeypatch
     b = CommandBridge(settings=_tool_settings())
     monkeypatch.setattr(
         b,
-        "_generate_router_json",
-        lambda prompt: '{"decision":"tool","tool":"/bluetooth","query":"scan"}',
+        "_select_chat_tool_plan",
+        lambda req: (
+            ChatToolPlan(tool=CHAT_TOOL_BLUETOOTH, query="scan", reason_summary="藍牙控制"),
+            None,
+        ),
     )
     called = {}
 
@@ -848,8 +897,15 @@ def test_chat_tool_ir_dispatches_registered_ir_command(monkeypatch):
     b = CommandBridge(settings=_tool_settings())
     monkeypatch.setattr(
         b,
-        "_generate_router_json",
-        lambda prompt: '{"decision":"tool","tool":"/ir","query":"send ceiling_light power"}',
+        "_select_chat_tool_plan",
+        lambda req: (
+            ChatToolPlan(
+                tool=CHAT_TOOL_IR,
+                query="send ceiling_light power",
+                reason_summary="IR 控制",
+            ),
+            None,
+        ),
     )
     called = {}
 
@@ -867,21 +923,20 @@ def test_chat_tool_ir_dispatches_registered_ir_command(monkeypatch):
     assert "已切換天花板燈電源" in resp.message
 
 
-def test_router_prompt_includes_history_for_rewrite(monkeypatch):
+def test_chat_tool_plan_prompt_includes_history_for_rewrite(monkeypatch):
     b = CommandBridge(settings=_tool_settings())
     seen = {}
 
-    def _router(prompt):
+    def _planner(_backend, prompt):
         seen["prompt"] = prompt
-        return '{"decision":"direct"}'
+        return ('{"tool":"__no_tool__","answer":"ok"}', None)
 
-    monkeypatch.setattr(b, "_generate_router_json", _router)
-    monkeypatch.setattr(b, "_ollama_generate_blocking", lambda prompt: "ok")
+    monkeypatch.setattr(b, "_generate_chat_tool_plan_with_chat_backend", _planner)
     b.handle(parse_request({
         "mode": "chat", "input": "她有新歌嗎", "chat_backend": "local",
         "history": [{"role": "user", "content": "初音未來是誰"}],
     }))
-    # The prior subject must reach the router so it can rewrite the pronoun query.
+    # The prior subject must reach the planner so it can rewrite the pronoun query.
     assert "初音未來" in seen["prompt"]
     assert "她有新歌嗎" in seen["prompt"]
 
@@ -889,8 +944,9 @@ def test_router_prompt_includes_history_for_rewrite(monkeypatch):
 def test_synthesis_prompt_includes_source_fields(monkeypatch):
     b = CommandBridge(settings=_tool_settings())
     monkeypatch.setattr(
-        b, "_generate_router_json",
-        lambda prompt: '{"decision":"tool","tool":"/search","query":"q"}',
+        b,
+        "_select_chat_tool_plan",
+        lambda req: (ChatToolPlan(tool=CHAT_TOOL_SEARCH, query="q"), None),
     )
     monkeypatch.setattr(
         "openclaw_adapter.web_search.web_search",
@@ -919,8 +975,9 @@ def test_synthesis_source_pack_truncates_long_fields_but_keeps_url(monkeypatch):
 
     b = CommandBridge(settings=_tool_settings())
     monkeypatch.setattr(
-        b, "_generate_router_json",
-        lambda prompt: '{"decision":"tool","tool":"/search","query":"q"}',
+        b,
+        "_select_chat_tool_plan",
+        lambda req: (ChatToolPlan(tool=CHAT_TOOL_SEARCH, query="q"), None),
     )
     long_title = "標" * 1000
     long_snippet = "摘" * 5000
@@ -956,8 +1013,9 @@ def test_synthesis_source_pack_total_budget_drops_overflow(monkeypatch):
 
     b = CommandBridge(settings=_tool_settings())
     monkeypatch.setattr(
-        b, "_generate_router_json",
-        lambda prompt: '{"decision":"tool","tool":"/search","query":"q"}',
+        b,
+        "_select_chat_tool_plan",
+        lambda req: (ChatToolPlan(tool=CHAT_TOOL_SEARCH, query="q"), None),
     )
     # Many max-snippet sources: their cumulative pack size exceeds the total cap,
     # so the later sources are dropped from the synthesis prompt. Sized so the
@@ -990,8 +1048,9 @@ def test_synthesis_source_pack_total_budget_drops_overflow(monkeypatch):
 def test_chat_tool_uses_chosen_cloud_backend_for_synthesis(monkeypatch):
     b = CommandBridge(settings=_tool_settings())
     monkeypatch.setattr(
-        b, "_generate_router_json",
-        lambda prompt: '{"decision":"tool","tool":"/search","query":"q"}',
+        b,
+        "_select_chat_tool_plan",
+        lambda req: (ChatToolPlan(tool=CHAT_TOOL_SEARCH, query="q"), None),
     )
     monkeypatch.setattr(
         "openclaw_adapter.web_search.web_search",
@@ -1015,8 +1074,9 @@ def test_chat_tool_uses_chosen_cloud_backend_for_synthesis(monkeypatch):
 def test_debug_flag_appends_model_label(monkeypatch):
     b = CommandBridge(settings=_tool_settings(debug=True))
     monkeypatch.setattr(
-        b, "_generate_router_json",
-        lambda prompt: '{"decision":"tool","tool":"/search","query":"q"}',
+        b,
+        "_select_chat_tool_plan",
+        lambda req: (ChatToolPlan(tool=CHAT_TOOL_SEARCH, query="q"), None),
     )
     monkeypatch.setattr(
         "openclaw_adapter.web_search.web_search",
@@ -1030,8 +1090,9 @@ def test_debug_flag_appends_model_label(monkeypatch):
 def test_debug_flag_off_hides_model_label(monkeypatch):
     b = CommandBridge(settings=_tool_settings(debug=False))
     monkeypatch.setattr(
-        b, "_generate_router_json",
-        lambda prompt: '{"decision":"tool","tool":"/search","query":"q"}',
+        b,
+        "_select_chat_tool_plan",
+        lambda req: (ChatToolPlan(tool=CHAT_TOOL_SEARCH, query="q"), None),
     )
     monkeypatch.setattr(
         "openclaw_adapter.web_search.web_search",
@@ -1044,27 +1105,39 @@ def test_debug_flag_off_hides_model_label(monkeypatch):
     assert "已使用工具" in resp.message
 
 
-def test_router_unavailable_falls_back_to_direct(monkeypatch):
+def test_chat_tool_plan_unavailable_falls_back_to_direct(monkeypatch):
     b = CommandBridge(settings=_tool_settings())
 
-    def _boom(prompt):
+    def _boom(_backend, _prompt):
         raise RuntimeError("ollama down")
 
-    monkeypatch.setattr(b, "_generate_router_json", _boom)
-    monkeypatch.setattr(b, "_ollama_generate_blocking", lambda prompt: "direct-answer")
+    monkeypatch.setattr(b, "_generate_chat_tool_plan_with_chat_backend", _boom)
+    monkeypatch.setattr(
+        b,
+        "_generate_chat_response_blocking",
+        lambda prompt, backend: ("direct-answer", None),
+    )
     monkeypatch.setattr(
         "openclaw_adapter.web_search.web_search",
-        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no tool on router failure")),
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no tool on planner failure")),
     )
     resp = b.handle(parse_request({"mode": "chat", "input": "嗨", "chat_backend": "local"}))
     assert resp.status == STATUS_OK
     assert resp.message == "direct-answer"
 
 
-def test_invalid_router_json_falls_back_to_direct(monkeypatch):
+def test_invalid_chat_tool_plan_json_falls_back_to_direct(monkeypatch):
     b = CommandBridge(settings=_tool_settings())
-    monkeypatch.setattr(b, "_generate_router_json", lambda prompt: "totally not json")
-    monkeypatch.setattr(b, "_ollama_generate_blocking", lambda prompt: "direct-answer")
+    monkeypatch.setattr(
+        b,
+        "_generate_chat_tool_plan_with_chat_backend",
+        lambda backend, prompt: ("totally not json", None),
+    )
+    monkeypatch.setattr(
+        b,
+        "_generate_chat_response_blocking",
+        lambda prompt, backend: ("direct-answer", None),
+    )
     monkeypatch.setattr(
         "openclaw_adapter.web_search.web_search",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("no tool on bad JSON")),
@@ -1076,10 +1149,15 @@ def test_invalid_router_json_falls_back_to_direct(monkeypatch):
 def test_non_whitelisted_tool_falls_back_to_direct(monkeypatch):
     b = CommandBridge(settings=_tool_settings())
     monkeypatch.setattr(
-        b, "_generate_router_json",
-        lambda prompt: '{"decision":"tool","tool":"/shell","query":"rm -rf /"}',
+        b,
+        "_generate_chat_tool_plan_with_chat_backend",
+        lambda backend, prompt: ('{"tool":"/shell","query":"rm -rf /"}', None),
     )
-    monkeypatch.setattr(b, "_ollama_generate_blocking", lambda prompt: "direct-answer")
+    monkeypatch.setattr(
+        b,
+        "_generate_chat_response_blocking",
+        lambda prompt, backend: ("direct-answer", None),
+    )
     monkeypatch.setattr(
         "openclaw_adapter.web_search.web_search",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("never dispatch unknown tool")),
@@ -1091,8 +1169,9 @@ def test_non_whitelisted_tool_falls_back_to_direct(monkeypatch):
 def test_search_no_results_returns_readable_message(monkeypatch):
     b = CommandBridge(settings=_tool_settings())
     monkeypatch.setattr(
-        b, "_generate_router_json",
-        lambda prompt: '{"decision":"tool","tool":"/search","query":"obscure"}',
+        b,
+        "_select_chat_tool_plan",
+        lambda req: (ChatToolPlan(tool=CHAT_TOOL_SEARCH, query="obscure"), None),
     )
     monkeypatch.setattr(
         "openclaw_adapter.web_search.web_search",
@@ -1107,11 +1186,56 @@ def test_search_no_results_returns_readable_message(monkeypatch):
     assert "找不到" in resp.message
 
 
-def test_non_chat_modes_do_not_route(bridge, monkeypatch):
-    def _no_route(req):
-        raise AssertionError("non-chat modes must not invoke the chat router")
+def test_select_chat_tool_plan_uses_selected_gemini_backend_not_local(monkeypatch):
+    b = CommandBridge(settings=_tool_settings(gemini_key="fake-key"))
 
-    monkeypatch.setattr(bridge, "_route_chat_decision", _no_route)
+    def _local_planner_should_not_run(_prompt: str):
+        raise AssertionError("local planner must not run for gemini backend")
+
+    class _GeminiClient:
+        def generate(self, prompt: str, *, temperature: float = 0.0) -> str:
+            assert "米津玄師是誰" in prompt
+            assert temperature == 0.2
+            return '{"tool":"__no_tool__","answer":"米津玄師是日本創作歌手","reason_summary":"一般知識"}'
+
+    monkeypatch.setattr(b, "_generate_local_chat_tool_plan", _local_planner_should_not_run)
+    monkeypatch.setattr(b, "_build_gemini_chat_client", lambda model: _GeminiClient())
+
+    plan, _metadata = b._select_chat_tool_plan(
+        parse_request({"mode": "chat", "input": "米津玄師是誰", "chat_backend": "gemini"})
+    )
+    assert plan == ChatToolPlan(
+        tool=CHAT_TOOL_NO_TOOL,
+        answer="米津玄師是日本創作歌手",
+        reason_summary="一般知識",
+    )
+
+
+def test_select_chat_tool_plan_gemini_failure_does_not_fallback_to_local(monkeypatch):
+    b = CommandBridge(settings=_tool_settings(gemini_key="fake-key"))
+
+    def _local_planner_should_not_run(_prompt: str):
+        raise AssertionError("local planner must not run after gemini planner failure")
+
+    class _GeminiClient:
+        def generate(self, prompt: str, *, temperature: float = 0.0) -> str:
+            raise RuntimeError("gemini down")
+
+    monkeypatch.setattr(b, "_generate_local_chat_tool_plan", _local_planner_should_not_run)
+    monkeypatch.setattr(b, "_build_gemini_chat_client", lambda model: _GeminiClient())
+
+    plan, metadata = b._select_chat_tool_plan(
+        parse_request({"mode": "chat", "input": "米津玄師是誰", "chat_backend": "gemini"})
+    )
+    assert plan is None
+    assert metadata is None
+
+
+def test_non_chat_modes_do_not_plan_chat_tools(bridge, monkeypatch):
+    def _no_plan(req):
+        raise AssertionError("non-chat modes must not invoke the chat tool planner")
+
+    monkeypatch.setattr(bridge, "_select_chat_tool_plan", _no_plan)
     resp = bridge.handle(parse_request({
         "mode": "translation", "submode": "text_translation", "input": "abc",
     }))
@@ -1120,13 +1244,16 @@ def test_non_chat_modes_do_not_route(bridge, monkeypatch):
 
 def test_stream_tool_emits_live_calling_notice_then_done(monkeypatch):
     b = CommandBridge(settings=_tool_settings())
-    monkeypatch.setattr(
-        b, "_route_chat_decision",
-        lambda req: RouterDecision(decision=ROUTER_DECISION_TOOL, tool=CHAT_TOOL_SEARCH, query="q"),
-    )
+
+    def _plan(req):
+        if False:
+            yield {}
+        return ChatToolPlan(tool=CHAT_TOOL_SEARCH, query="q"), None
+
+    monkeypatch.setattr(b, "_stream_chat_tool_plan", _plan)
     monkeypatch.setattr("openclaw_adapter.command_bridge._HEARTBEAT_SECONDS", 0.01)
 
-    def _slow_tool(req, decision):
+    def _slow_tool(req, plan):
         time.sleep(0.05)
         return ChatToolResult(answer="grounded answer", source_count=1)
 
@@ -1144,12 +1271,15 @@ def test_stream_tool_emits_live_calling_notice_then_done(monkeypatch):
 
 def test_stream_tool_failure_emits_readable_error(monkeypatch):
     b = CommandBridge(settings=_tool_settings())
-    monkeypatch.setattr(
-        b, "_route_chat_decision",
-        lambda req: RouterDecision(decision=ROUTER_DECISION_TOOL, tool=CHAT_TOOL_SEARCH, query="q"),
-    )
 
-    def _boom(req, decision):
+    def _plan(req):
+        if False:
+            yield {}
+        return ChatToolPlan(tool=CHAT_TOOL_SEARCH, query="q"), None
+
+    monkeypatch.setattr(b, "_stream_chat_tool_plan", _plan)
+
+    def _boom(req, plan):
         raise RuntimeError("synthesis exploded")
 
     monkeypatch.setattr(b, "_run_chat_tool", _boom)
@@ -1918,13 +2048,9 @@ def test_run_chat_tool_returns_chat_tool_result(monkeypatch):
     )
     monkeypatch.setattr(b, "_ollama_generate_blocking", lambda p: "answer text")
 
-    decision = RouterDecision(
-        decision=ROUTER_DECISION_TOOL,
-        tool=CHAT_TOOL_SEARCH,
-        query="初音 新曲",
-    )
+    plan = ChatToolPlan(tool=CHAT_TOOL_SEARCH, query="初音 新曲")
     req = parse_request({"mode": "chat", "input": "她有新歌嗎", "chat_backend": "local"})
-    result = b._run_chat_tool(req, decision)
+    result = b._run_chat_tool(req, plan)
     assert isinstance(result, ChatToolResult)
     assert "answer text" in result.answer
     assert result.source_count == 1
@@ -1932,14 +2058,10 @@ def test_run_chat_tool_returns_chat_tool_result(monkeypatch):
 
 def test_run_chat_tool_unknown_raises():
     b = CommandBridge(settings=_tool_settings())
-    decision = RouterDecision(
-        decision=ROUTER_DECISION_TOOL,
-        tool="/unknown",
-        query="q",
-    )
+    plan = ChatToolPlan(tool="/unknown", query="q")
     req = parse_request({"mode": "chat", "input": "x"})
     with pytest.raises(ValueError, match="unknown chat tool"):
-        b._run_chat_tool(req, decision)
+        b._run_chat_tool(req, plan)
 
 
 def test_source_pack_respects_policy_budget():
@@ -1992,11 +2114,13 @@ def test_exec_grounded_search_source_count(monkeypatch):
 
 def test_stream_chat_music_tool_emits_done(monkeypatch):
     b = CommandBridge(settings=_tool_settings())
-    monkeypatch.setattr(
-        b,
-        "_generate_router_json",
-        lambda prompt: '{"decision":"tool","tool":"/music","query":"stop"}',
-    )
+
+    def _plan(req):
+        if False:
+            yield {}
+        return ChatToolPlan(tool=CHAT_TOOL_MUSIC, query="stop"), None
+
+    monkeypatch.setattr(b, "_stream_chat_tool_plan", _plan)
     monkeypatch.setattr(b, "run_music_command",
                         lambda t: {"status": STATUS_OK, "message": "已停止", "actions": []})
     events = list(b.stream(parse_request({"mode": "chat", "input": "停止播放音樂"}), "rid-m"))
@@ -2423,13 +2547,13 @@ def _assert_single_redirect(events: list, description_contains: str) -> None:
 
 
 def test_stream_chat_emits_redirect_for_create_workflow(monkeypatch):
-    """Embedding fast-path hit → stream emits redirect, LLM router not called."""
+    """Embedding fast-path hit → stream emits redirect, planner not called."""
     b = CommandBridge(settings=object())
     monkeypatch.setattr(b, "_get_intent_fast_path", lambda: _FakeWorkflowRouter())
 
     def _boom(_req):
-        raise AssertionError("LLM router should not be called for create_workflow")
-    monkeypatch.setattr(b, "_route_chat_decision", _boom)
+        raise AssertionError("chat tool planner should not be called for create_workflow")
+    monkeypatch.setattr(b, "_select_chat_tool_plan", _boom)
 
     req = parse_request({"mode": "chat", "input": "幫我建一個先問候再開燈的工作流"})
     _assert_single_redirect(list(b.stream(req, "test-rid")), "工作流")
@@ -2441,8 +2565,8 @@ def test_stream_chat_nl_fallback_when_fast_path_disabled(monkeypatch):
     monkeypatch.setattr(b, "_get_intent_fast_path", lambda: None)
 
     def _boom(_req):
-        raise AssertionError("LLM router should not be called for create_workflow")
-    monkeypatch.setattr(b, "_route_chat_decision", _boom)
+        raise AssertionError("chat tool planner should not be called for create_workflow")
+    monkeypatch.setattr(b, "_select_chat_tool_plan", _boom)
 
     # Natural phrase: "工作流" noun + "做" creation verb; no time/frequency.
     req = parse_request({"mode": "chat", "input": "幫我做一個先問候再開燈的工作流"})
@@ -2455,8 +2579,8 @@ def test_stream_chat_nl_fallback_when_fast_path_misses(monkeypatch):
     monkeypatch.setattr(b, "_get_intent_fast_path", lambda: _FakeMissRouter())
 
     def _boom(_req):
-        raise AssertionError("LLM router should not be called for create_workflow")
-    monkeypatch.setattr(b, "_route_chat_decision", _boom)
+        raise AssertionError("chat tool planner should not be called for create_workflow")
+    monkeypatch.setattr(b, "_select_chat_tool_plan", _boom)
 
     req = parse_request({"mode": "chat", "input": "幫我建一個問候然後開燈的工作流"})
     _assert_single_redirect(list(b.stream(req, "test-rid3")), "工作流")
@@ -2474,29 +2598,27 @@ def test_stream_chat_workflow_redirect_beats_music_tool_route(monkeypatch):
         raise AssertionError("music playback should not run for workflow authoring")
 
     def _boom(_req):
-        raise AssertionError("LLM router should not be called for create_workflow")
+        raise AssertionError("chat tool planner should not be called for create_workflow")
 
     monkeypatch.setattr(b, "_exec_music_intent", _fake_music)
-    monkeypatch.setattr(b, "_route_chat_decision", _boom)
+    monkeypatch.setattr(b, "_select_chat_tool_plan", _boom)
 
     req = parse_request({"mode": "chat", "input": "建立工作流：播放最愛音樂清單 然後 開燈"})
     _assert_single_redirect(list(b.stream(req, "test-rid-music")), "工作流")
     assert music_calls == []
 
 
-def test_stream_chat_music_uses_router_tool_path(monkeypatch):
-    """Web chat music control should go through the shared router tool path."""
+def test_stream_chat_music_uses_shared_tool_plan_path(monkeypatch):
+    """Web chat music control should go through the shared tool-plan path."""
     b = CommandBridge(settings=object())
     monkeypatch.setattr(b, "_get_intent_fast_path", lambda: None)
-    monkeypatch.setattr(
-        b,
-        "_route_chat_decision",
-        lambda req: RouterDecision(
-            decision=ROUTER_DECISION_TOOL,
-            tool=CHAT_TOOL_MUSIC,
-            query="playbest",
-        ),
-    )
+
+    def _plan(req):
+        if False:
+            yield {}
+        return ChatToolPlan(tool=CHAT_TOOL_MUSIC, query="playbest"), None
+
+    monkeypatch.setattr(b, "_stream_chat_tool_plan", _plan)
 
     music_queries: list[str] = []
 
@@ -2643,8 +2765,8 @@ def test_stream_chat_emits_redirect_for_create_schedule(monkeypatch, tmp_path):
     monkeypatch.setattr(b, "_get_intent_fast_path", lambda: _FakeScheduleRouter())
 
     def _boom(_req):
-        raise AssertionError("LLM router must not be called for create_schedule")
-    monkeypatch.setattr(b, "_route_chat_decision", _boom)
+        raise AssertionError("chat tool planner must not be called for create_schedule")
+    monkeypatch.setattr(b, "_select_chat_tool_plan", _boom)
 
     req = parse_request({"mode": "chat", "input": "幫我排程執行 greeting_workflow"})
     events = list(b.stream(req, "test-sh-rid"))
@@ -2662,8 +2784,8 @@ def test_stream_chat_bridge_re_catches_schedule_phrase(monkeypatch, tmp_path):
     monkeypatch.setattr(b, "_get_intent_fast_path", lambda: None)
 
     def _boom(_req):
-        raise AssertionError("LLM router must not be called for create_schedule")
-    monkeypatch.setattr(b, "_route_chat_decision", _boom)
+        raise AssertionError("chat tool planner must not be called for create_schedule")
+    monkeypatch.setattr(b, "_select_chat_tool_plan", _boom)
 
     req = parse_request({"mode": "chat", "input": "幫我建立排程"})
     events = list(b.stream(req, "test-sh-rid2"))
@@ -2744,8 +2866,8 @@ def test_stream_chat_emits_redirect_for_kebab_workflow(monkeypatch, tmp_path):
     monkeypatch.setattr(b, "_get_intent_fast_path", lambda: _FakeScheduleRouter())
 
     def _boom(_req):
-        raise AssertionError("LLM router must not be called")
-    monkeypatch.setattr(b, "_route_chat_decision", _boom)
+        raise AssertionError("chat tool planner must not be called")
+    monkeypatch.setattr(b, "_select_chat_tool_plan", _boom)
 
     req = parse_request({"mode": "chat", "input": "幫我排程執行 wf-morning-greeting"})
     events = list(b.stream(req, "test-kebab-rid"))
@@ -2998,3 +3120,131 @@ def test_model_metadata_new_fields():
     d2 = meta2.to_dict()
     assert d2["fallback_occurred"] is True
     assert d2["requested_tab"] == "cloud_pool"
+
+
+def test_save_chat_settings_persists_order_and_disable(tmp_path):
+    cfg_path = tmp_path / "llm_pool.json"
+    b = CommandBridge(settings=_tool_settings(llm_pool_config_path=str(cfg_path)))
+    res = b.save_chat_settings({
+        "default_chat_provider": "cloud_pool",
+        "cloud_pool": ["mistral", "gemini", "big_pickle"],
+        "providers": {
+            "gemini": {"enabled": True, "model": "gemini-2.5-pro"},
+            "mistral": {"enabled": False, "model": "mistral-large-latest"},
+            "big_pickle": {"enabled": True, "model": "big-pickle"},
+            "local": {"enabled": True, "model": "qwen3:14b"},
+        },
+    })
+    assert res["status"] == STATUS_OK
+    loaded = b.load_chat_settings()
+    assert loaded["settings"]["cloud_pool"] == ["mistral", "gemini", "big_pickle"]
+    assert loaded["settings"]["providers"]["mistral"]["enabled"] is False
+
+
+def test_save_chat_settings_cloud_model_change_affects_next_request(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "llm_pool.json"
+    b = CommandBridge(settings=_tool_settings(
+        gemini_key="fake-key",
+        llm_pool_config_path=str(cfg_path),
+    ))
+    seen: list[str] = []
+
+    class _Client:
+        def __init__(self, model: str) -> None:
+            self.model = model
+
+        def generate(self, prompt: str, *, temperature: float = 0.7) -> str:
+            return f"{self.model}:{prompt}"
+
+    monkeypatch.setattr(b, "_build_gemini_chat_client", lambda model: seen.append(model) or _Client(model))
+
+    b.save_chat_settings({
+        "default_chat_provider": "gemini",
+        "providers": {
+            "gemini": {"enabled": True, "model": "gemini-2.5-pro"},
+            "mistral": {"enabled": True, "model": "mistral-large-latest"},
+            "big_pickle": {"enabled": True, "model": "big-pickle"},
+            "local": {"enabled": True, "model": "qwen3:14b"},
+        },
+    })
+    resp1 = b.handle(parse_request({"mode": "chat", "input": "hello", "chat_backend": "gemini"}))
+    assert resp1.status == STATUS_OK
+    assert seen[-1] == "gemini-2.5-pro"
+
+    b.save_chat_settings({
+        "default_chat_provider": "gemini",
+        "providers": {
+            "gemini": {"enabled": True, "model": "gemini-2.5-flash"},
+            "mistral": {"enabled": True, "model": "mistral-large-latest"},
+            "big_pickle": {"enabled": True, "model": "big-pickle"},
+            "local": {"enabled": True, "model": "qwen3:14b"},
+        },
+    })
+    resp2 = b.handle(parse_request({"mode": "chat", "input": "world", "chat_backend": "gemini"}))
+    assert resp2.status == STATUS_OK
+    assert seen[-1] == "gemini-2.5-flash"
+
+
+def test_save_chat_settings_local_reload_success(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "llm_pool.json"
+    b = CommandBridge(settings=_tool_settings(llm_pool_config_path=str(cfg_path)))
+    monkeypatch.setattr(b, "_warm_local_model", lambda model: None)
+    res = b.save_chat_settings({
+        "default_chat_provider": "cloud_pool",
+        "providers": {
+            "gemini": {"enabled": True, "model": "gemini-2.5-pro"},
+            "mistral": {"enabled": True, "model": "mistral-large-latest"},
+            "big_pickle": {"enabled": True, "model": "big-pickle"},
+            "local": {"enabled": True, "model": "qwen3:4b"},
+        },
+    })
+    assert res["status"] == STATUS_OK
+    assert res["local_reload"]["status"] == "ok"
+    assert b.load_chat_settings()["settings"]["providers"]["local"]["model"] == "qwen3:4b"
+
+
+def test_save_chat_settings_local_reload_failure_keeps_previous_model(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "llm_pool.json"
+    b = CommandBridge(settings=_tool_settings(llm_pool_config_path=str(cfg_path)))
+    ok = b.save_chat_settings({
+        "default_chat_provider": "cloud_pool",
+        "providers": {
+            "gemini": {"enabled": True, "model": "gemini-2.5-pro"},
+            "mistral": {"enabled": True, "model": "mistral-large-latest"},
+            "big_pickle": {"enabled": True, "model": "big-pickle"},
+            "local": {"enabled": True, "model": "qwen3:14b"},
+        },
+    })
+    assert ok["status"] == STATUS_OK
+    monkeypatch.setattr(b, "_warm_local_model", lambda model: (_ for _ in ()).throw(RuntimeError("model not found")))
+    res = b.save_chat_settings({
+        "default_chat_provider": "cloud_pool",
+        "providers": {
+            "gemini": {"enabled": True, "model": "gemini-2.5-pro"},
+            "mistral": {"enabled": True, "model": "mistral-large-latest"},
+            "big_pickle": {"enabled": True, "model": "big-pickle"},
+            "local": {"enabled": True, "model": "qwen3:4b"},
+        },
+    })
+    assert res["status"] == "partial"
+    assert res["local_reload"]["status"] == "error"
+    assert b.load_chat_settings()["settings"]["providers"]["local"]["model"] == "qwen3:14b"
+
+
+def test_load_chat_settings_migrates_legacy_opencode_auto(tmp_path):
+    cfg_path = tmp_path / "llm_pool.json"
+    cfg_path.write_text(
+        json.dumps({
+            "default_chat_provider": "cloud_pickle",
+            "providers": {
+                "big_pickle": {"enabled": True, "model": "auto"},
+            },
+        }),
+        encoding="utf-8",
+    )
+    b = CommandBridge(settings=_tool_settings(
+        llm_pool_config_path=str(cfg_path),
+        opencode_model="deepseek-v4-flash-free",
+    ))
+    loaded = b.load_chat_settings()
+    assert loaded["settings"]["providers"]["big_pickle"]["model"] == "deepseek-v4-flash-free"
