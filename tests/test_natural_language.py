@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 from assistant_runtime.settings import AssistantSettings
 from openclaw_adapter.natural_language import (
+    _GeminiRouterClient,
     _select_router_model,
     build_telegram_natural_language_router_from_settings,
     fallback_route_openclaw_natural_language,
@@ -22,14 +23,42 @@ def test_natural_language_router_is_disabled_without_text_backend() -> None:
     assert build_telegram_natural_language_router_from_settings(settings) is None
 
 
-def test_select_router_model_prefers_strongest_available_local_model() -> None:
+def test_select_router_model_uses_resolved_local_model_before_vision_candidates(tmp_path) -> None:
     settings = AssistantSettings(
         openclaw_local_text_backend="ollama",
         openclaw_local_text_model="qwen3:4b",
         openclaw_local_vision_model="qwen2.5vl:7b,gemma3:12b",
+        openclaw_llm_pool_config_path=str(tmp_path / "missing_llm_pool.json"),
     )
 
-    assert _select_router_model(settings) == "gemma3:12b"
+    assert _select_router_model(settings) == "qwen3:4b"
+
+
+def test_select_router_model_respects_llm_pool_local_selection(tmp_path) -> None:
+    cfg_path = tmp_path / "llm_pool.json"
+    cfg_path.write_text(
+        """
+{
+  "default_chat_provider": "local",
+  "cloud_pool": ["gemini", "mistral", "big_pickle"],
+  "providers": {
+    "gemini": {"enabled": true, "model": "gemini-2.5-pro"},
+    "mistral": {"enabled": true, "model": "mistral-large-latest"},
+    "big_pickle": {"enabled": true, "model": "big-pickle"},
+    "local": {"enabled": true, "model": "qwen2.5-coder:7b"}
+  }
+}
+""".strip(),
+        encoding="utf-8",
+    )
+    settings = AssistantSettings(
+        openclaw_local_text_backend="ollama",
+        openclaw_local_text_model="qwen3:4b,qwen3:14b",
+        openclaw_local_vision_model=None,
+        openclaw_llm_pool_config_path=str(cfg_path),
+    )
+
+    assert _select_router_model(settings) == "qwen2.5-coder:7b"
 
 
 def test_natural_language_router_loads_tool_spec_from_file() -> None:
@@ -74,6 +103,41 @@ def test_natural_language_router_adds_openclaw_app_intents() -> None:
     assert "create_workflow" in router._extra_allowed_intents
     assert "play_music" in router._extra_allowed_intents
     assert "home_action" in router._extra_allowed_intents
+
+
+def test_gemini_router_client_generates_prompt_json(monkeypatch) -> None:
+    settings = AssistantSettings(
+        openclaw_gemini_api_key="fake-google-key",
+        openclaw_gemini_primary_model="gemini-test",
+    )
+    captured: dict[str, object] = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return (
+                b'{"candidates":[{"content":{"parts":[{"text":"'
+                b'{\\"intent\\":\\"tools\\"}'
+                b'"}]}}]}'
+            )
+
+    def _fake_urlopen(request, *, timeout, context):
+        captured["body"] = request.data.decode("utf-8")
+        captured["timeout"] = timeout
+        captured["context"] = context
+        return _Response()
+
+    monkeypatch.setattr("openclaw_adapter.natural_language.urlopen", _fake_urlopen)
+
+    client = _GeminiRouterClient(settings, "gemini-test")
+    assert client.generate("hello", temperature=0.1) == '{"intent":"tools"}'
+    assert '"hello"' in str(captured["body"])
+    assert captured["timeout"] == 60
 
 
 def test_openclaw_fallback_routes_create_workflow() -> None:

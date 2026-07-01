@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 from assistant_runtime import AssistantSettings, build_ssl_context
 from telegram_nl.natural_language import (  # noqa: F401
@@ -15,9 +19,19 @@ from telegram_nl.natural_language import (  # noqa: F401
     _load_json_fragment,
     _normalize_intent,
 )
+from .llm_pool_settings import (
+    LLM_PROVIDER_GEMINI,
+    chat_backend_enabled,
+    default_chat_backend,
+    enabled_cloud_pool_providers,
+    provider_enabled,
+    provider_is_configured,
+    resolve_provider_model,
+)
 
 logger = logging.getLogger(__name__)
 _ROUTER_SPEC_PATH = Path(__file__).resolve().parents[2] / "docs" / "TELEGRAM_TOOL_SPEC.md"
+_GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 _APP_ALLOWED_INTENTS = frozenset({"create_workflow", "play_music", "home_action"})
 _WF_CREATE_KEYWORDS = (
     "建立 workflow", "建一個 workflow", "建立一個 workflow",
@@ -65,50 +79,60 @@ _OPENCLAW_PROMPT_SUFFIX = (
 )
 
 
-class _CloudFirstRouter:
-    """Cloud-big-pickle first NL router; falls back to local ollama on failure."""
+class _PoolAwareRouter:
+    """Settings-driven NL router shared with the web chat llm pool."""
 
-    backend = "cloud-first"
+    backend = "llm-pool"
 
-    def __init__(
-        self,
-        local_router: TelegramNaturalLanguageRouter,
-        cloud_client: object,
-    ) -> None:
-        self._local = local_router
-        self._cloud = cloud_client
+    def __init__(self, settings: AssistantSettings) -> None:
+        self._settings = settings
 
     @property
     def descriptor(self) -> str:
-        return f"cloud-first:{getattr(self._cloud, 'model', '?')}+{self._local.descriptor}"
+        default_backend = default_chat_backend(self._settings)
+        local = _build_local_router(self._settings)
+        local_desc = local.descriptor if local is not None else "local:none"
+        cloud_client = _build_router_cloud_client(self._settings)
+        cloud_desc = getattr(cloud_client, "model", "none")
+        return f"llm-pool:{default_backend}:{cloud_desc}+{local_desc}"
 
     @property
     def tool_spec(self) -> str:
-        return self._local.tool_spec
+        return _load_router_tool_spec()
 
     @property
     def _extra_allowed_intents(self) -> frozenset[str]:
-        return self._local._extra_allowed_intents
+        return _APP_ALLOWED_INTENTS
 
     def route(self, text: str) -> TelegramNaturalLanguageIntent | None:
         content = text.strip()
         if not content:
             return None
-        try:
-            prompt = self._local._build_prompt(content)
-            raw = self._cloud.generate(prompt, temperature=0.0)
-            parsed = _load_json_fragment(raw)
-            if not isinstance(parsed, dict):
-                raise RuntimeError(f"Cloud router returned non-dict: {type(parsed).__name__}")
-            return _normalize_intent(parsed, extra_allowed_intents=self._local._extra_allowed_intents)
-        except Exception as exc:
-            logger.warning("Cloud NL router failed, falling back to local: %s", exc)
-            return self._local.route(text)
+        local_router = _build_local_router(self._settings)
+        cloud_client = _build_router_cloud_client(self._settings)
+        if cloud_client is not None and local_router is not None:
+            try:
+                prompt = local_router._build_prompt(content)
+                raw = cloud_client.generate(prompt, temperature=0.0)
+                parsed = _load_json_fragment(raw)
+                if not isinstance(parsed, dict):
+                    raise RuntimeError(
+                        f"Cloud router returned non-dict: {type(parsed).__name__}"
+                    )
+                return _normalize_intent(
+                    parsed,
+                    extra_allowed_intents=local_router._extra_allowed_intents,
+                )
+            except Exception as exc:
+                logger.warning("Cloud NL router failed, falling back to local: %s", exc)
+        if local_router is None or not provider_enabled(self._settings, "local"):
+            return None
+        return local_router.route(text)
 
 
 def build_telegram_natural_language_router_from_settings(
     settings: AssistantSettings,
-) -> TelegramNaturalLanguageRouter | _CloudFirstRouter | None:
+) -> TelegramNaturalLanguageRouter | _PoolAwareRouter | None:
     model = _select_router_model(settings)
     if model is None:
         return None
@@ -119,45 +143,135 @@ def build_telegram_natural_language_router_from_settings(
     if backend != "ollama":
         logger.warning("Unsupported Telegram natural-language router backend=%s", backend)
         return None
+    return _PoolAwareRouter(settings)
 
-    local_router = build_telegram_natural_language_router(
+
+def _select_router_model(settings: AssistantSettings) -> str | None:
+    selected = (resolve_provider_model(settings, "local") or "").strip()
+    if selected:
+        return selected
+    candidates = _split_models(settings.openclaw_local_text_model) + _split_models(
+        settings.openclaw_local_vision_model
+    )
+    if not candidates:
+        return None
+    return max(candidates, key=_router_model_rank)
+
+
+def _build_local_router(settings: AssistantSettings) -> TelegramNaturalLanguageRouter | None:
+    model = _select_router_model(settings)
+    if model is None:
+        return None
+    return build_telegram_natural_language_router(
         endpoint=settings.openclaw_local_text_endpoint,
         model=model,
-        backend=backend,
+        backend="ollama",
         timeout_seconds=max(1, settings.openclaw_local_text_timeout_seconds),
         tool_spec=_load_router_tool_spec(),
-        ssl_context=build_ssl_context(settings) if settings.openclaw_local_text_endpoint.startswith("https://") else None,
+        ssl_context=build_ssl_context(settings)
+        if settings.openclaw_local_text_endpoint.startswith("https://")
+        else None,
         extra_prompt_suffix=_OPENCLAW_PROMPT_SUFFIX,
         extra_allowed_intents=_APP_ALLOWED_INTENTS,
     )
 
-    cloud_client = _build_cloud_router_client(settings)
-    if cloud_client is not None and local_router is not None:
-        return _CloudFirstRouter(local_router, cloud_client)
-    return local_router
+
+def _build_router_cloud_client(settings: AssistantSettings) -> object | None:
+    for provider in _router_cloud_providers(settings):
+        if not provider_is_configured(settings, provider):
+            continue
+        if provider == LLM_PROVIDER_GEMINI:
+            return _GeminiRouterClient(settings, resolve_provider_model(settings, provider))
+        if provider == "mistral":
+            from .dynamic_tools import MistralTextClient
+
+            return MistralTextClient(
+                api_key=getattr(settings, "openclaw_mistral_api_key", None),
+                model=resolve_provider_model(settings, provider),
+                timeout_seconds=60,
+            )
+        if provider == "big_pickle":
+            from .dynamic_tools import OpenCodeTextClient
+
+            return OpenCodeTextClient(
+                base_url=(getattr(settings, "openclaw_opencode_base_url", None) or "").strip(),
+                model=resolve_provider_model(settings, provider),
+                api_key=getattr(settings, "openclaw_opencode_api_key", None),
+                timeout_seconds=60,
+                max_tokens=2048,
+            )
+    return None
 
 
-def _build_cloud_router_client(settings: AssistantSettings) -> object | None:
-    from .dynamic_tools import OpenCodeTextClient
-    base_url = (getattr(settings, "openclaw_opencode_base_url", None) or "").strip()
-    if not base_url:
-        return None
-    raw_model = (getattr(settings, "openclaw_opencode_model", None) or "big-pickle").strip()
-    model = raw_model.split("/")[-1] if "/" in raw_model else raw_model
-    return OpenCodeTextClient(
-        base_url=base_url,
-        model=model,
-        api_key=getattr(settings, "openclaw_opencode_api_key", None),
-        timeout_seconds=60,
-        max_tokens=2048,
-    )
+def _router_cloud_providers(settings: AssistantSettings) -> tuple[str, ...]:
+    default_backend = default_chat_backend(settings)
+    if default_backend == "cloud_pool":
+        return enabled_cloud_pool_providers(settings)
+    if default_backend == "gemini" and chat_backend_enabled(settings, default_backend):
+        return ("gemini",)
+    if default_backend == "cloud_mistral" and chat_backend_enabled(settings, default_backend):
+        return ("mistral",)
+    if default_backend == "cloud_pickle" and chat_backend_enabled(settings, default_backend):
+        return ("big_pickle",)
+    return ()
 
 
-def _select_router_model(settings: AssistantSettings) -> str | None:
-    candidates = _split_models(settings.openclaw_local_text_model) + _split_models(settings.openclaw_local_vision_model)
-    if not candidates:
-        return None
-    return max(candidates, key=_router_model_rank)
+class _GeminiRouterClient:
+    def __init__(self, settings: AssistantSettings, model: str) -> None:
+        self._settings = settings
+        self.model = model
+
+    def generate(self, prompt: str, *, temperature: float = 0.0) -> str:
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": temperature},
+        }
+        key = getattr(self._settings, "openclaw_gemini_api_key", None) or ""
+        url = (
+            f"{_GEMINI_API_BASE}/models/{quote(self.model, safe='')}:generateContent"
+            f"?key={quote(key, safe='')}"
+        )
+        request = Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method="POST",
+        )
+        ssl_context = (
+            build_ssl_context(self._settings)
+            if getattr(self._settings, "openclaw_ca_bundle_path", None)
+            or getattr(self._settings, "openclaw_tls_insecure_skip_verify", False)
+            else None
+        )
+        try:
+            with urlopen(request, timeout=60, context=ssl_context) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Gemini HTTP {exc.code}: {detail}") from exc
+        except URLError as exc:
+            raise RuntimeError(f"Gemini request failed: {exc.reason}") from exc
+        data = _load_json_fragment(raw)
+        text = _extract_gemini_text(data)
+        if not text:
+            raise RuntimeError("Gemini returned no text")
+        return text
+
+
+def _extract_gemini_text(data: object) -> str:
+    if not isinstance(data, dict):
+        return ""
+    parts: list[str] = []
+    for candidate in data.get("candidates") or []:
+        if not isinstance(candidate, dict):
+            continue
+        content = candidate.get("content")
+        if not isinstance(content, dict):
+            continue
+        for part in content.get("parts") or []:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+    return "".join(parts).strip()
 
 
 def _split_models(raw_models: str | None) -> tuple[str, ...]:

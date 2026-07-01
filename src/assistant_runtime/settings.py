@@ -166,6 +166,10 @@ class AssistantSettings:
     # reconnects restores its session from the Mac mini. Gitignored runtime data
     # under .openclaw_tmp/, never committed and never written to knowledge.sqlite3.
     openclaw_web_memory_dir: str = ".openclaw_tmp/web_console_memory"
+    # ── chat LLM pool settings (issue #66) ────────────────────────────────
+    # User-editable provider order, enable flags, and selected model ids for
+    # Web Chat + Telegram natural-language routing. Secrets stay in .env.
+    openclaw_llm_pool_config_path: str = "config/llm_pool.json"
     # ── web chat contextual tool routing (issue #45) ───────────────────────
     # When on, the grounded /search tool answer appends a one-line note saying
     # which model synthesized it (本地 qwen3:14b / 雲端 big-pickle) for debugging.
@@ -464,6 +468,9 @@ def get_settings() -> AssistantSettings:
         ),
         openclaw_web_memory_dir=_resolve_runtime_path(
             os.getenv("OPENCLAW_WEB_MEMORY_DIR", ".openclaw_tmp/web_console_memory")
+        ),
+        openclaw_llm_pool_config_path=_resolve_runtime_path(
+            os.getenv("OPENCLAW_LLM_POOL_CONFIG_PATH", "config/llm_pool.json")
         ),
         openclaw_web_chat_tool_debug=_as_bool(
             os.getenv("OPENCLAW_WEB_CHAT_TOOL_DEBUG")

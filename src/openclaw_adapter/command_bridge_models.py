@@ -339,19 +339,17 @@ def _sanitize_history(raw: object) -> tuple[ChatTurn, ...]:
     return tuple(kept)
 
 
-# --- Web Chat contextual tool routing (issue #45) ------------------------
-# Phase 2: before answering a chat message the bridge asks a local router LLM
-# whether the question needs a tool. Tools stay on a closed allowlist. The router
-# speaks strict JSON; this module owns the *trust boundary* around that output:
-# a malformed payload, an unknown decision/tool, or an empty tool query is
-# rejected so the caller falls back to a plain answer instead of executing
-# anything unsafe.
-ROUTER_DECISION_DIRECT = "direct"
-ROUTER_DECISION_TOOL = "tool"
+# --- Web Chat tool planning (issue #45 follow-up) ------------------------
+# The selected chat backend emits one strict-JSON "chat tool plan" per turn.
+# That plan is either:
+#   - a hidden no-tool direct answer, or
+#   - an explicit allowlisted tool call with its query
+# This module owns the trust boundary around that output.
 CHAT_TOOL_SEARCH = "/search"
 CHAT_TOOL_MUSIC = "/music"
 CHAT_TOOL_BLUETOOTH = "/bluetooth"
 CHAT_TOOL_IR = "/ir"
+CHAT_TOOL_NO_TOOL = "__no_tool__"
 # Hardcoding the tool whitelist is deliberate (a closed protocol allowlist, not
 # open-ended recognition): only these exact tools may ever be dispatched.
 CHAT_TOOLS = {
@@ -377,10 +375,10 @@ def _normalize_router_query(query: str) -> str:
 
 
 @dataclass(frozen=True, slots=True)
-class RouterDecision:
-    decision: str  # ROUTER_DECISION_DIRECT | ROUTER_DECISION_TOOL
-    tool: str | None = None
+class ChatToolPlan:
+    tool: str
     query: str = ""
+    answer: str = ""
     reason_summary: str = ""
 
 
@@ -405,40 +403,38 @@ def _loads_first_json_object(text: str) -> object:
         return None
 
 
-def parse_router_decision(raw: object) -> RouterDecision | None:
-    """Coerce raw router LLM output into a trusted RouterDecision, or ``None``.
+def parse_chat_tool_plan(raw: object) -> ChatToolPlan | None:
+    """Parse a single chat-tool plan emitted by the selected chat backend.
 
-    Returns ``None`` (→ caller falls back to direct chat) on anything that can't
-    be trusted: non-string input, unparseable JSON, an unknown ``decision``, a
-    tool not on the whitelist, or a tool decision with an empty ``query``. Extra
-    fields are ignored. A valid ``direct`` decision returns a RouterDecision so
-    the caller can log the router's reasoning even when no tool runs."""
+    Trusted outputs are:
+
+    - ``{"tool":"__no_tool__","answer":"..."}`` for the hidden direct-answer path
+    - ``{"tool":"/search|/music|/bluetooth|/ir","query":"..."}`` for explicit tools
+
+    Any malformed / untrusted payload returns ``None`` so the caller can fall
+    back safely instead of executing arbitrary side effects.
+    """
     if not isinstance(raw, str):
         return None
     data = _loads_first_json_object(raw.strip())
     if not isinstance(data, dict):
         return None
-    decision = data.get("decision")
+    tool = data.get("tool")
     reason = _opt_str(data.get("reason_summary")) or ""
-    if decision == ROUTER_DECISION_DIRECT:
-        return RouterDecision(decision=ROUTER_DECISION_DIRECT, reason_summary=reason)
-    if decision == ROUTER_DECISION_TOOL:
-        tool = data.get("tool")
-        if tool not in CHAT_TOOLS:
+    if tool == CHAT_TOOL_NO_TOOL:
+        answer = _opt_str(data.get("answer")) or ""
+        if not answer:
             return None
-        query = data.get("query")
-        if not isinstance(query, str):
-            return None
-        query = _normalize_router_query(query)
-        if not query:
-            return None
-        return RouterDecision(
-            decision=ROUTER_DECISION_TOOL,
-            tool=tool,
-            query=query,
-            reason_summary=reason,
-        )
-    return None
+        return ChatToolPlan(tool=CHAT_TOOL_NO_TOOL, answer=answer, reason_summary=reason)
+    if tool not in CHAT_TOOLS:
+        return None
+    query = data.get("query")
+    if not isinstance(query, str):
+        return None
+    query = _normalize_router_query(query)
+    if not query:
+        return None
+    return ChatToolPlan(tool=tool, query=query, reason_summary=reason)
 
 
 # --- Streaming event constructors ----------------------------------------
