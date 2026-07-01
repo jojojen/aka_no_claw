@@ -342,9 +342,16 @@ ROUTER_DECISION_DIRECT = "direct"
 ROUTER_DECISION_TOOL = "tool"
 CHAT_TOOL_SEARCH = "/search"
 CHAT_TOOL_MUSIC = "/music"
+CHAT_TOOL_BLUETOOTH = "/bluetooth"
+CHAT_TOOL_IR = "/ir"
 # Hardcoding the tool whitelist is deliberate (a closed protocol allowlist, not
 # open-ended recognition): only these exact tools may ever be dispatched.
-CHAT_TOOLS = {CHAT_TOOL_SEARCH, CHAT_TOOL_MUSIC}
+CHAT_TOOLS = {
+    CHAT_TOOL_SEARCH,
+    CHAT_TOOL_MUSIC,
+    CHAT_TOOL_BLUETOOTH,
+    CHAT_TOOL_IR,
+}
 
 # The router ``query`` is untrusted LLM output that flows into logs, the visible
 # tool banner, and ``web_search()`` — so it is normalized and budgeted before it

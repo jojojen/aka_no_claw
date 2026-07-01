@@ -21,6 +21,8 @@ from openclaw_adapter.command_bridge import CommandBridge, _WorkflowShimRunner, 
 from openclaw_adapter.command_bridge_models import (
     CHAT_BACKEND_CLOUD_PICKLE,
     CHAT_BACKEND_LOCAL,
+    CHAT_TOOL_BLUETOOTH,
+    CHAT_TOOL_IR,
     CHAT_TOOL_MUSIC,
     CHAT_TOOL_SEARCH,
     MAX_HISTORY_TURNS,
@@ -624,6 +626,24 @@ def test_parse_router_decision_music_tool():
     assert d.query == "stop"
 
 
+def test_parse_router_decision_bluetooth_tool():
+    d = parse_router_decision(
+        '{"decision":"tool","tool":"/bluetooth","query":"scan","reason_summary":"藍牙控制"}'
+    )
+    assert d.decision == ROUTER_DECISION_TOOL
+    assert d.tool == CHAT_TOOL_BLUETOOTH
+    assert d.query == "scan"
+
+
+def test_parse_router_decision_ir_tool():
+    d = parse_router_decision(
+        '{"decision":"tool","tool":"/ir","query":"send ceiling_light power","reason_summary":"IR 控制"}'
+    )
+    assert d.decision == ROUTER_DECISION_TOOL
+    assert d.tool == CHAT_TOOL_IR
+    assert d.query == "send ceiling_light power"
+
+
 def test_parse_router_decision_extracts_json_from_noise():
     raw = '<think>嗯</think> 好的：\n```json\n{"decision":"tool","tool":"/search","query":"q"}\n```'
     d = parse_router_decision(raw)
@@ -737,12 +757,28 @@ def test_chat_tool_search_triggers_grounded_answer(monkeypatch):
     assert "https://miku.example/news" in resp.message
 
 
-def test_router_prompt_includes_registered_music_usage(monkeypatch):
+def test_router_prompt_includes_registered_control_tool_usage(monkeypatch):
     b = CommandBridge(settings=_tool_settings())
     monkeypatch.setattr(
         b,
         "_handlers",
-        lambda: {"/music": SimpleNamespace(usage="stop=停止；playbest=播放最愛")},
+        lambda: {
+            "/music": SimpleNamespace(
+                usage="stop=停止；playbest=播放最愛",
+                chat_tool_purpose="當使用者要控制本機音樂播放時使用",
+                chat_tool_query_hint="query 只輸出 /music 後面的參數",
+            ),
+            "/bluetooth": SimpleNamespace(
+                usage="scan=掃描；<裝置名>=連線",
+                chat_tool_purpose="當使用者要掃描藍牙裝置時使用",
+                chat_tool_query_hint="query 只輸出 /bluetooth 後面的參數",
+            ),
+            "/ir": SimpleNamespace(
+                usage="discover=掃描裝置；send <裝置> <按鍵名>=發送",
+                chat_tool_purpose="當使用者要控制紅外線家電時使用",
+                chat_tool_query_hint="query 只輸出 /ir 後面的參數",
+            ),
+        },
     )
 
     prompt = b._build_router_prompt(parse_request({"mode": "chat", "input": "停止播放音樂"}))
@@ -750,6 +786,13 @@ def test_router_prompt_includes_registered_music_usage(monkeypatch):
     assert "/music" in prompt
     assert "stop=停止" in prompt
     assert "playbest=播放最愛" in prompt
+    assert "當使用者要控制本機音樂播放時使用" in prompt
+    assert "/bluetooth" in prompt
+    assert "scan=掃描" in prompt
+    assert "當使用者要掃描藍牙裝置時使用" in prompt
+    assert "/ir" in prompt
+    assert "discover=掃描裝置" in prompt
+    assert "當使用者要控制紅外線家電時使用" in prompt
 
 
 def test_chat_tool_music_dispatches_registered_music_command(monkeypatch):
@@ -773,6 +816,52 @@ def test_chat_tool_music_dispatches_registered_music_command(monkeypatch):
     assert "已使用工具" in resp.message
     assert "音樂控制" in resp.message
     assert "已停止目前由龍蝦播放的音樂" in resp.message
+
+
+def test_chat_tool_bluetooth_dispatches_registered_bluetooth_command(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        b,
+        "_generate_router_json",
+        lambda prompt: '{"decision":"tool","tool":"/bluetooth","query":"scan"}',
+    )
+    called = {}
+
+    def _mock_run_bluetooth_command(text=""):
+        called["text"] = text
+        return {"status": STATUS_OK, "message": "找到 2 個藍牙裝置。", "actions": []}
+
+    monkeypatch.setattr(b, "run_bluetooth_command", _mock_run_bluetooth_command)
+    resp = b.handle(parse_request({"mode": "chat", "input": "掃描藍牙裝置"}))
+
+    assert resp.status == STATUS_OK
+    assert called["text"] == "scan"
+    assert "已使用工具" in resp.message
+    assert "藍牙控制" in resp.message
+    assert "找到 2 個藍牙裝置" in resp.message
+
+
+def test_chat_tool_ir_dispatches_registered_ir_command(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        b,
+        "_generate_router_json",
+        lambda prompt: '{"decision":"tool","tool":"/ir","query":"send ceiling_light power"}',
+    )
+    called = {}
+
+    def _mock_run_ir_command(text):
+        called["text"] = text
+        return {"status": STATUS_OK, "message": "已切換天花板燈電源。", "actions": []}
+
+    monkeypatch.setattr(b, "run_ir_command", _mock_run_ir_command)
+    resp = b.handle(parse_request({"mode": "chat", "input": "切換天花板燈"}))
+
+    assert resp.status == STATUS_OK
+    assert called["text"] == "send ceiling_light power"
+    assert "已使用工具" in resp.message
+    assert "紅外線控制" in resp.message
+    assert "已切換天花板燈電源" in resp.message
 
 
 def test_router_prompt_includes_history_for_rewrite(monkeypatch):
@@ -1590,6 +1679,27 @@ def test_ir_command_normalizes_full_slash_command(monkeypatch):
     assert res["message"] == "IR sent"
 
 
+def test_bluetooth_command_normalizes_scan_and_full_slash_command(monkeypatch):
+    b = CommandBridge(settings=object())
+    seen: list[dict[str, str]] = []
+
+    def _run(command, remainder):
+        seen.append({"command": command, "remainder": remainder})
+        return ("BT ok", {"inline_keyboard": []})
+
+    monkeypatch.setattr(b, "_run_command_raw", _run)
+
+    scan_res = b.run_bluetooth_command("scan")
+    connect_res = b.run_bluetooth_command("/bluetooth XGIMI Z8X")
+
+    assert seen == [
+        {"command": "/bluetooth", "remainder": ""},
+        {"command": "/bluetooth", "remainder": "XGIMI Z8X"},
+    ]
+    assert scan_res["status"] == STATUS_OK
+    assert connect_res["message"] == "BT ok"
+
+
 def test_server_music_route_dispatches_callback(monkeypatch):
     """POST /api/command/music with callback_data → run_music_action; with
     input → run_music_command; empty body → music menu."""
@@ -1677,6 +1787,53 @@ def test_server_ir_route_dispatches_command_and_callback(monkeypatch):
     seen.clear()
     out = _invoke(b'{"input":"/ir send ceiling_light power"}')
     assert seen["command"] == "/ir send ceiling_light power"
+    assert out["message"] == "cmd"
+
+
+def test_server_bluetooth_route_dispatches_command_and_callback(monkeypatch):
+    from http.server import BaseHTTPRequestHandler
+
+    from openclaw_adapter import command_bridge_server as srv
+
+    seen: dict[str, object] = {}
+
+    class _FakeBridge:
+        def run_bluetooth_action(self, cb):
+            seen["action"] = cb
+            return {"status": STATUS_OK, "message": "act", "actions": []}
+
+        def run_bluetooth_command(self, text=""):
+            seen["command"] = text
+            return {"status": STATUS_OK, "message": "cmd", "actions": []}
+
+    def _invoke(body: bytes) -> dict:
+        handler_cls = srv._build_handler(_FakeBridge(), lan_enabled=False)
+        h = handler_cls.__new__(handler_cls)
+        h.headers = {"Content-Length": str(len(body))}
+        h.rfile = io.BytesIO(body)
+        h.wfile = io.BytesIO()
+        h.request_version = "HTTP/1.1"
+        h.protocol_version = "HTTP/1.0"
+        h.requestline = "POST /api/command/bluetooth HTTP/1.1"
+        h.responses = BaseHTTPRequestHandler.responses
+        h.client_address = ("127.0.0.1", 1)
+        h._handle_bluetooth()
+        raw = h.wfile.getvalue().split(b"\r\n\r\n", 1)[1]
+        import json as _json
+        return _json.loads(raw.decode("utf-8"))
+
+    out = _invoke(b'{"callback_data":"bt:scan"}')
+    assert seen["action"] == "bt:scan"
+    assert out["message"] == "act"
+
+    seen.clear()
+    out = _invoke(b'{"input":"XGIMI Z8X"}')
+    assert seen["command"] == "XGIMI Z8X"
+    assert out["message"] == "cmd"
+
+    seen.clear()
+    out = _invoke(b"{}")
+    assert seen["command"] == ""
     assert out["message"] == "cmd"
 
 
@@ -2324,22 +2481,27 @@ def test_stream_chat_workflow_redirect_beats_music_tool_route(monkeypatch):
     assert music_calls == []
 
 
-def test_stream_chat_uses_openclaw_nl_for_play_music(monkeypatch):
-    """Web chat should align with Telegram/OpenClaw NL before generic chat tools."""
+def test_stream_chat_music_uses_router_tool_path(monkeypatch):
+    """Web chat music control should go through the shared router tool path."""
     b = CommandBridge(settings=object())
     monkeypatch.setattr(b, "_get_intent_fast_path", lambda: None)
+    monkeypatch.setattr(
+        b,
+        "_route_chat_decision",
+        lambda req: RouterDecision(
+            decision=ROUTER_DECISION_TOOL,
+            tool=CHAT_TOOL_MUSIC,
+            query="playbest",
+        ),
+    )
 
     music_queries: list[str] = []
 
     def _fake_run_music_command(query):
         music_queries.append(query)
-        return {"status": "ok", "message": "開始連續隨機播放最愛歌曲。"}
-
-    def _boom(_req):
-        raise AssertionError("LLM router should not be called for play_music")
+        return {"status": "ok", "message": "開始連續隨機播放最愛歌曲。", "actions": []}
 
     monkeypatch.setattr(b, "run_music_command", _fake_run_music_command)
-    monkeypatch.setattr(b, "_route_chat_decision", _boom)
 
     req = parse_request({"mode": "chat", "input": "播放我的最愛清單歌曲"})
     events = list(b.stream(req, "test-rid-playbest"))

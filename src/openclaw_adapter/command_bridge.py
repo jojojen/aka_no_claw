@@ -39,10 +39,11 @@ from .command_bridge_models import (
     CHAT_BACKEND_CLOUD_PICKLE,
     CHAT_BACKEND_GEMINI,
     CHAT_BACKEND_LOCAL,
+    CHAT_TOOL_BLUETOOTH,
+    CHAT_TOOL_IR,
     CHAT_TOOL_MUSIC,
     CHAT_TOOL_SEARCH,
     MUSIC_ACTION_PLAN,
-    Action,
     ChatToolPolicy,
     ChatToolRequest,
     ChatToolResult,
@@ -254,7 +255,12 @@ _SEARCH_SYNTHESIS_PROMPT = (
 #    still evident after streaming completes. Both are always on (never gated by
 #    the debug flag) — only the synthesis-model label stays behind that flag.
 _TOOL_USED_PREFIX = "🔧 已使用工具："
-_TOOL_FRIENDLY_NAMES = {CHAT_TOOL_SEARCH: "網路搜尋", CHAT_TOOL_MUSIC: "音樂控制"}
+_TOOL_FRIENDLY_NAMES = {
+    CHAT_TOOL_SEARCH: "網路搜尋",
+    CHAT_TOOL_MUSIC: "音樂控制",
+    CHAT_TOOL_BLUETOOTH: "藍牙控制",
+    CHAT_TOOL_IR: "紅外線控制",
+}
 
 # Search snippets are external (search-engine) text fed into the final synthesis
 # LLM, so they are budgeted before entering the prompt: per-field caps bound any
@@ -277,6 +283,8 @@ _SEARCH_TOOL_POLICY = ChatToolPolicy(
     max_source_pack_chars=_SOURCE_PACK_TOTAL_CAP,
 )
 _MUSIC_TOOL_POLICY = ChatToolPolicy(display_name="音樂控制", max_query_chars=128)
+_BLUETOOTH_TOOL_POLICY = ChatToolPolicy(display_name="藍牙控制", max_query_chars=128)
+_IR_TOOL_POLICY = ChatToolPolicy(display_name="紅外線控制", max_query_chars=128)
 
 
 def _clip(text: str, cap: int) -> str:
@@ -651,11 +659,6 @@ class CommandBridge:
         resumed = self._maybe_resume_music_plan(req, text)
         if resumed is not None:
             return resumed
-        from .natural_language import fallback_route_openclaw_natural_language
-        nl_intent = fallback_route_openclaw_natural_language(text)
-        nl_response = self._exec_openclaw_nl_intent(req, nl_intent)
-        if nl_response is not None:
-            return nl_response
         decision = self._route_chat_decision(req)
         if decision is not None and decision.decision == ROUTER_DECISION_TOOL:
             try:
@@ -769,13 +772,6 @@ class CommandBridge:
                 nl_intent.workflow_description or text,
             )
             return
-        nl_response = self._exec_openclaw_nl_intent(req, nl_intent)
-        if nl_response is not None:
-            if nl_response.status == STATUS_ERROR:
-                yield stream_error(nl_response.message)
-            else:
-                yield stream_done(nl_response.message)
-            return
         decision = self._route_chat_decision(req)
         if decision is not None and decision.decision == ROUTER_DECISION_TOOL:
             yield from self._stream_chat_tool(req, decision)
@@ -807,34 +803,6 @@ class CommandBridge:
         if intent.action == MUSIC_ACTION_PLAN:
             return self._exec_music_plan(req, intent)
         raise ValueError(f"unknown music action: {intent.action!r}")
-
-    def _exec_openclaw_nl_intent(
-        self,
-        req: WebCommandRequest,
-        intent,
-    ) -> WebCommandResponse | None:
-        """Execute app-owned NL intents through the same command handlers as Telegram."""
-        if intent is None:
-            return None
-        if intent.intent == "play_music":
-            if not intent.music_query:
-                return None
-            result = self.run_music_command(intent.music_query)
-            return self._music_result_response(result)
-        return None
-
-    def _music_result_response(self, result: dict) -> WebCommandResponse:
-        actions = tuple(
-            Action(label=str(a.get("label", "")), command=str(a.get("callback_data", "")))
-            for a in result.get("actions", [])
-            if a.get("label") and a.get("callback_data")
-        )
-        return WebCommandResponse(
-            status=result.get("status", STATUS_OK),
-            message=result.get("message", ""),
-            mode=MODE_CHAT,
-            actions=actions,
-        )
 
     def _exec_music_plan(
         self, req: WebCommandRequest, intent: MusicIntent
@@ -1164,13 +1132,12 @@ class CommandBridge:
         tool_lines = [
             "- /search：當回答需要即時、最新或你不確定的事實資訊時使用；query 是適合搜尋引擎的完整查詢。",
         ]
-        music_usage = self._registered_command_usage(CHAT_TOOL_MUSIC)
-        if music_usage:
-            tools.append(CHAT_TOOL_MUSIC)
-            tool_lines.append(
-                f"- /music：{music_usage}。當使用者要控制本機音樂播放時使用；"
-                "query 只輸出 /music 後面的參數，例如 stop、pause、resume、next、previous、random、playbest 或歌曲關鍵字。"
-            )
+        for tool in (CHAT_TOOL_MUSIC, CHAT_TOOL_BLUETOOTH, CHAT_TOOL_IR):
+            line = self._registered_chat_tool_prompt_line(tool)
+            if not line:
+                continue
+            tools.append(tool)
+            tool_lines.append(line)
         tool_choices = "|".join(t.split("/", 1)[-1] for t in tools)
         tool_choices = "/" + "|/".join(tool_choices.split("|"))
         return _ROUTER_SYSTEM_PROMPT_TEMPLATE.format(
@@ -1185,6 +1152,28 @@ class CommandBridge:
             logger.debug("router prompt: command registry unavailable for %s", command, exc_info=True)
             return ""
         return str(getattr(registered, "usage", "") or "").strip()
+
+    def _registered_chat_tool_prompt_line(self, command: str) -> str:
+        try:
+            registered = self._handlers().get(command)
+        except Exception:  # noqa: BLE001
+            logger.debug("router prompt: command registry unavailable for %s", command, exc_info=True)
+            return ""
+        if registered is None:
+            return ""
+        usage = str(getattr(registered, "usage", "") or "").strip()
+        if not usage:
+            return ""
+        purpose = str(getattr(registered, "chat_tool_purpose", "") or "").strip()
+        query_hint = str(getattr(registered, "chat_tool_query_hint", "") or "").strip()
+        parts = [f"- {command}：{usage}"]
+        if purpose:
+            parts.append(purpose)
+        if query_hint:
+            parts.append(query_hint)
+        else:
+            parts.append(f"query 只輸出 {command} 後面的參數")
+        return "。".join(parts)
 
     def _generate_router_json(self, prompt: str) -> str:
         from .dynamic_tools import OllamaTextClient
@@ -1209,7 +1198,12 @@ class CommandBridge:
         happen — parse_router_decision already guards the whitelist)."""
         policy_map: dict[str, tuple[ChatToolPolicy, object]] = {
             CHAT_TOOL_SEARCH: (_SEARCH_TOOL_POLICY, self._exec_grounded_search),
-            CHAT_TOOL_MUSIC: (_MUSIC_TOOL_POLICY, self._exec_music_chat_tool),
+            CHAT_TOOL_MUSIC: (_MUSIC_TOOL_POLICY, self._exec_registered_command_chat_tool),
+            CHAT_TOOL_BLUETOOTH: (
+                _BLUETOOTH_TOOL_POLICY,
+                self._exec_registered_command_chat_tool,
+            ),
+            CHAT_TOOL_IR: (_IR_TOOL_POLICY, self._exec_registered_command_chat_tool),
         }
         entry = policy_map.get(decision.tool)
         if entry is None:
@@ -1350,17 +1344,31 @@ class CommandBridge:
     def _exec_music_chat_tool(
         self, req: WebCommandRequest, tool_req: ChatToolRequest
     ) -> ChatToolResult:
+        return self._exec_registered_command_chat_tool(req, tool_req)
+
+    def _exec_registered_command_chat_tool(
+        self, req: WebCommandRequest, tool_req: ChatToolRequest
+    ) -> ChatToolResult:
         query = tool_req.query
-        logger.info(
-            "[chat-tool] tool=%s fn=CommandBridge.run_music_command query=%r",
-            tool_req.tool, query,
-        )
-        result = self.run_music_command(query)
+        runner_map = {
+            CHAT_TOOL_MUSIC: ("CommandBridge.run_music_command", self.run_music_command),
+            CHAT_TOOL_BLUETOOTH: (
+                "CommandBridge.run_bluetooth_command",
+                self.run_bluetooth_command,
+            ),
+            CHAT_TOOL_IR: ("CommandBridge.run_ir_command", self.run_ir_command),
+        }
+        entry = runner_map.get(tool_req.tool)
+        if entry is None:
+            raise ValueError(f"unknown registered command chat tool: {tool_req.tool!r}")
+        fn_name, runner = entry
+        logger.info("[chat-tool] tool=%s fn=%s query=%r", tool_req.tool, fn_name, query)
+        result = runner(query)
         status = str(result.get("status", STATUS_OK))
         message = str(result.get("message", "")).strip()
-        banner = f"{_TOOL_USED_PREFIX}音樂控制（{tool_req.tool}）｜指令：{query}"
+        banner = f"{_TOOL_USED_PREFIX}{tool_req.policy.display_name}（{tool_req.tool}）｜指令：{query}"
         if status == STATUS_ERROR:
-            message = message or "音樂操作失敗。"
+            message = message or f"{tool_req.policy.display_name}失敗。"
         return ChatToolResult(
             answer=f"{banner}\n\n{message}",
             source_count=0,
@@ -1904,10 +1912,18 @@ class CommandBridge:
         }
 
     # --- 生活 mode: bluetooth control surface (aka_no_claw#38 / web#7) ------
-    def run_bluetooth_command(self) -> dict:
-        """Scan Bluetooth devices for the web 生活 mode — returns the device list
-        (text + connect buttons). Same handler the Telegram ``/bluetooth`` uses."""
-        message, markup = self._run_command_raw("/bluetooth", "")
+    def run_bluetooth_command(self, text: str = "") -> dict:
+        """Run the Telegram ``/bluetooth`` handler from the web console.
+
+        Empty input (or ``scan``) keeps the existing scan behavior; any other
+        text is passed through as the device name so Web Chat and the 生活 mode
+        both hit the same command handler."""
+        remainder = (text or "").strip()
+        if remainder.startswith("/bluetooth"):
+            remainder = remainder[len("/bluetooth"):].strip()
+        if remainder.lower() == "scan":
+            remainder = ""
+        message, markup = self._run_command_raw("/bluetooth", remainder)
         return {
             "status": STATUS_OK,
             "message": message,

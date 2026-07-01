@@ -28,25 +28,69 @@ from .task_workspace import (
 logger = logging.getLogger(__name__)
 
 
-# Fallback usage hints for command_sink grounding. The authoritative source is
-# each command's RegisteredCommand.usage (set where the command is registered);
-# this map covers commands that don't declare one yet, and the test/headless
-# paths that build the prompt without the full registry. Keep entries short —
-# they teach the drafting LLM the real argument shape so it fills `literal`
-# correctly instead of hallucinating commands like /musiclistbest.
-_COMMAND_USAGE: dict[str, str] = {
-    "/ir": "send <裝置> <按鍵名>，如 `send ceiling_light power`（切換天花板燈電源）",
-    "/music": "playbest=播放最愛清單；<關鍵字>=搜尋並播放",
-    "/musicmute": "靜音（無參數）",
-    "/musiclouder": "調高音量（無參數）",
-    "/musiclower": "調低音量（無參數）",
-    "/musicnowbest": "把目前歌曲加入最愛清單（無參數）",
-    "/saynow": "立即用語音念出文字（參數＝要念的文字，通常用 input 變數帶入）",
-    "/say": "用語音念出文字（參數＝要念的文字）",
-    "/bluetooth": "連線／切換藍牙裝置（參數＝裝置名）",
-    "/translateja": "把文字翻成日文（參數＝原文，通常用 input 變數帶入）",
-    "/translatezh": "把文字翻成中文（參數＝原文，通常用 input 變數帶入）",
+# Shared command metadata for Telegram registry wiring, Web Chat tool routing,
+# and workflow drafting. Keep semantics in one table so the three surfaces
+# cannot drift.
+_COMMAND_METADATA: dict[str, dict[str, str]] = {
+    "/ir": {
+        "usage": (
+            "discover=掃描可用紅外線裝置；devices=列出已註冊裝置；"
+            "send <裝置> <按鍵名>=發送紅外線指令，如 `send ceiling_light power`"
+        ),
+        "chat_tool_purpose": "當使用者要控制紅外線家電時使用",
+        "chat_tool_query_hint": (
+            "query 只輸出 /ir 後面的參數，例如 discover、devices 或 "
+            "send ceiling_light power"
+        ),
+    },
+    "/music": {
+        "usage": (
+            "playbest=播放最愛清單；random=隨機播放；stop=停止；"
+            "pause=暫停；resume=繼續；next/previous=切歌；"
+            "<關鍵字>=搜尋並播放該歌曲"
+        ),
+        "chat_tool_purpose": "當使用者要控制本機音樂播放時使用",
+        "chat_tool_query_hint": (
+            "query 只輸出 /music 後面的參數，例如 stop、pause、resume、"
+            "next、previous、random、playbest 或歌曲關鍵字"
+        ),
+    },
+    "/musicmute": {"usage": "音樂靜音（無參數）"},
+    "/musiclouder": {"usage": "調高音量（無參數）"},
+    "/musiclower": {"usage": "調低音量（無參數）"},
+    "/musicnowbest": {"usage": "把目前播放的歌曲加入最愛清單（無參數）"},
+    "/musiclistall": {"usage": "列出全部曲目清單（不播放，無參數）"},
+    "/musiclistbest": {
+        "usage": "列出最愛曲目清單（不播放，無參數）；要『播放』最愛請改用 /music playbest",
+    },
+    "/saynow": {
+        "usage": "立即於 Mac mini 念出文字（參數＝要念的文字，通常用 input 變數帶入）",
+    },
+    "/say": {
+        "usage": "用語音念出文字（參數＝要念的文字，通常用 input 變數帶入）",
+    },
+    "/bluetooth": {
+        "usage": "scan=掃描藍牙裝置；<裝置名>=連線／切換藍牙裝置",
+        "chat_tool_purpose": "當使用者要掃描、查看、連線或切換藍牙裝置時使用",
+        "chat_tool_query_hint": "query 只輸出 /bluetooth 後面的參數；掃描時輸出 scan，連線時輸出裝置名",
+    },
+    "/translateja": {
+        "usage": "把文字翻成日文（參數＝原文，通常用 input 變數帶入）",
+    },
+    "/translatezh": {
+        "usage": "把文字翻成繁體中文（參數＝原文，通常用 input 變數帶入）",
+    },
 }
+
+# Backward-compatible usage view for tests/callers that only care about the
+# command argument shape.
+_COMMAND_USAGE: dict[str, str] = {
+    command: meta["usage"] for command, meta in _COMMAND_METADATA.items() if meta.get("usage")
+}
+
+
+def command_metadata(command: str) -> dict[str, str]:
+    return dict(_COMMAND_METADATA.get(command, {}))
 
 
 def _command_usage(command: str, command_registry=None) -> str:
@@ -58,7 +102,7 @@ def _command_usage(command: str, command_registry=None) -> str:
         usage = getattr(reg, "usage", None) if reg is not None else None
         if usage:
             return str(usage).strip()
-    return _COMMAND_USAGE.get(command, "")
+    return command_metadata(command).get("usage", "")
 
 
 def _workflow_store(runner) -> WorkflowStore:
