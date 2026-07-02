@@ -1,7 +1,8 @@
 # Telegram Core Extraction Plan — shared `telegram_core` package
 
-Last reviewed: 2026-07-02
-Status: Planned
+Last reviewed: 2026-07-03
+Status: Current — all phases (P0–P4) shipped; kept as the implementation
+record and reference for `telegram_core`'s hook/registry contracts.
 Owner area: telegram
 
 Implementation + acceptance plan for extracting the Telegram infrastructure
@@ -14,6 +15,529 @@ Companion / cross-links:
 [TELEGRAM_NL_OWNERSHIP_REFACTOR_ISSUE.md](TELEGRAM_NL_OWNERSHIP_REFACTOR_ISSUE.md)
 (the NL-routing sibling of this infra split; `telegram_nl` is also the
 packaging precedent), [SYSTEM_MAP.md](SYSTEM_MAP.md), [TASK_ROUTING.md](TASK_ROUTING.md).
+
+## Progress log (update at every phase boundary — this is the resume point)
+
+- **2026-07-02**: Sibling repo `jojojen/telegram_core` created on GitHub
+  (README only) and cloned locally to
+  `~/ai_work_space/related_to_claw/telegram_core`. **Phase 0 in progress**:
+  - `price_monitor_bot/bot.py` `run_telegram_polling` — added
+    `processor_factory: Callable[..., TelegramCommandProcessor] | None = None`
+    param; body now does `(processor_factory or TelegramCommandProcessor)(...)`. Done.
+  - `openclaw_adapter/telegram_bot.py` — deleted
+    `import price_monitor_bot.bot as _price_bot_module` (line 17) and the
+    `_price_bot_module.TelegramCommandProcessor = lambda **kwargs: ...`
+    monkey-patch; replaced with `processor_factory=lambda **kwargs: ...`
+    passed directly into `_base_run_telegram_polling(...)`. Done.
+  - Grep gate `grep -rn "_price_bot_module" src/` in aka_no_claw → 0 hits. Confirmed.
+  - Added 2 stage-gate tests to `price_monitor_bot/tests/test_telegram_bot.py`:
+    `test_run_telegram_polling_uses_injected_processor_factory` and
+    `test_run_telegram_polling_without_factory_uses_default_processor_class`.
+    **Not yet run** — next step is running both repos' full suites.
+  - **Both suites green**: price_monitor_bot 543 passed/8 skipped (incl. the
+    2 new stage-gate tests); aka_no_claw 2268 passed/7 skipped. Phase 0 code +
+    tests are DONE.
+  - **Not yet done**: §A push summary sent to user; waiting on 「推」/ok, then
+    ask user to 「重啟龍蝦」and run the P0 live smoke checklist (§5) before
+    starting Phase 1 (populate `telegram_core` per §2-3 of this doc).
+  - Note: a tangential ask landed in parallel — `docs/` file-storage hygiene
+    fix (an orphaned `.html` doc invisible to `check_docs_health.py`'s
+    `*.md`-only glob). Fixed by explicitly naming it in a `PUBLIC_HTML_DOCS`
+    set (NOT a blanket `*.html` glob — that first attempt swept in unrelated
+    `fix_benchmarks/**/*.html` synthetic test fixtures and broke
+    `test_docs_health_checks.py`; caught by the full aka suite run and
+    corrected). See `scripts/check_docs_health.py` `PUBLIC_HTML_DOCS` /
+    `PUBLIC_HTML_METADATA_EXEMPT`, plus `DOCS_INDEX.md` and `DOC_AUDIT.md`
+    entries for `BROADLINK_LOCAL_NETWORK_TROUBLESHOOTING.html`. Unrelated to
+    this plan, noted here only so a resumed session isn't confused by
+    unrelated diffs sitting alongside Phase 0 changes.
+  - **Standing instruction from 主上 (2026-07-02, overrides the "P0 alone,
+    wait for confirmation" sequencing above)**: 「把全部都做完再報告 只是中間要
+    記得記錄 讓人隨時可以接手」— finish the ENTIRE extraction (P1→P4) without
+    stopping for interim check-ins; keep this Progress log current at every
+    boundary so anyone can take over at any point. `git push` itself and the
+    ★ CHECKPOINT before P3 (live polling loop, highest blast radius) are still
+    treated as points needing an explicit, surfaced pause per the repo's own
+    §A protocol and the CHECKPOINT's stated purpose — not silently skipped,
+    but not blocking P1/P2 work either. Nothing has been pushed yet as of this
+    note; all repos still have local, uncommitted/unpushed changes.
+  - **Phase 0 still not pushed** as of this note (unchanged from above) — the
+    §A summary was sent but 「推」/ok was never received before the "finish
+    everything" instruction arrived. Phase 0 + Phase 1 changes will be pushed
+    together in one §A round once P1 (and likely P2) are done, per the
+    override above.
+  - **Phase 1 — DONE (bootstrap `telegram_core`, move pure leaves).**
+    - Repo `telegram_core` populated: `pyproject.toml` (`name="telegram-core"`,
+      `dependencies=[]`, mirrors `telegram_nl`), `src/telegram_core/{__init__.py,
+      transport.py, contracts.py, list_view.py, logging_utils.py}`,
+      `tests/{test_list_view.py, test_transport.py, test_contracts.py}` (17
+      tests, fresh — not literal moves from price repo's entangled fixtures).
+      Own `.venv` built with `/Users/jen/.local/bin/python3.12` (system
+      `python3` is 3.9, too old for `requires-python = ">=3.12"`).
+    - Verbatim moves done: `list_view.py`, `logging_utils.py` → `telegram_core`
+      unchanged; `TelegramBotClient` + `TelegramFileAttachment` +
+      `_encode_multipart_body` + `send_telegram_test_message` → `transport.py`;
+      `RegisteredCommand` + `TelegramTextReplyPlan` + `TelegramTextIntentOption`
+      + `PendingTelegramTextClarification` (+ its `TEXT_CLARIFICATION_TTL_SECONDS`
+      constant, since `PendingTelegramSnsBulkUpdate`, which stays in
+      price_monitor_bot, also reads that constant — now imported back) →
+      `contracts.py`. Forward-ref string annotations quoting
+      `TelegramNaturalLanguageIntent` / `TelegramReputationDelivery` kept
+      as-is (unevaluated strings under `from __future__ import annotations`;
+      no import needed, preserves telegram_core's zero-dependency rule).
+    - `price_monitor_bot/list_view.py` and `logging_utils.py` are now compat
+      shims (`from telegram_core.… import *`-style named re-export). `bot.py`
+      itself imports the moved symbols from `telegram_core.contracts` /
+      `telegram_core.transport` at the top — since `bot.py` IS the module
+      external consumers already import these names from
+      (`from price_monitor_bot.bot import TelegramBotClient` etc.), no
+      separate shim file was needed for those; import comments left in place
+      of each removed class/function pointing at the new location.
+    - Packaging: both `price_monitor_bot` and `aka_no_claw` `pyproject.toml`
+      got `"telegram-core"` added to `dependencies`; `pip install -e
+      ../telegram_core` run into both repos' `.venv`s.
+    - aka-side infra imports redirected from `price_monitor_bot.list_view` /
+      `price_monitor_bot.bot.{TelegramBotClient,TelegramTextReplyPlan}` to
+      `telegram_core.{list_view,transport,contracts}` in: `telegram_bot.py`
+      (top-level + 3 inline `TelegramBotClient` imports + 1 inline
+      `TelegramTextReplyPlan` import), `sns_commands.py`, `command_bridge.py`,
+      `opportunity_command.py`, `knowledge_command.py`, `music_favorites.py`,
+      `opportunity_agent.py`, `quiz_command.py`, `voice_command.py`. Price-domain
+      imports (`watch_monitor`, `commands.lookup_card`, price query/renderer
+      types) untouched — legitimate content dependency, stays.
+    - **All test results green**: `telegram_core` 17 passed (own venv);
+      `price_monitor_bot` 543 passed/8 skipped (**unmodified**
+      `tests/test_telegram_bot.py` — shim strategy confirmed working, zero
+      test edits needed); `aka_no_claw` 2268 passed/7 skipped (identical
+      count to the Phase 0 baseline — no regressions from the import
+      redirection). Smoke-import of all 9 edited aka modules also passed.
+    - Grep gates both green: `_price_bot_module` → 0 hits in aka `src/`;
+      `price_monitor_bot|openclaw_adapter` → 0 hits in `telegram_core/src/`
+      (had to reword a docstring + the `pyproject.toml` description that
+      named both consumer repos by name, since `.egg-info` regenerates those
+      strings into `telegram_core/src/telegram_core.egg-info/PKG-INFO` and
+      the gate greps that whole path literally — not a real coupling, just a
+      literal string match on the human-readable summary).
+    - Added `telegram_core/.gitignore` (copied from `telegram_nl`'s: `.venv/`,
+      `*.egg-info/`, `__pycache__/`, etc.) — didn't exist yet on the fresh repo.
+    - **Not yet done from Phase 1's own checklist**: the live-smoke item
+      (`/snslist` paginate+delete) — deferred; live smoke needs a real restart
+      via 「重啟龍蝦」and nothing has been pushed/deployed yet, so there is no
+      new code running live to smoke-test. Will fold into the CHECKPOINT's
+      live-smoke pass instead of doing it twice.
+  - **Started `agent_auto_continue` watcher** (pid varies per restart) per
+    主上's request so a rate-limit cooldown mid-task auto-resumes work.
+    **Caveat surfaced to 主上**: this session runs directly in Apple Terminal
+    (`TERM_PROGRAM=Apple_Terminal`), not inside a tmux pane on the default
+    socket — only the bot's `openclaw_codex` tmux socket exists. The watcher's
+    resume mechanism is `tmux send-keys continue` to an auto-detected pane on
+    the DEFAULT socket; with no such server running, it will correctly detect
+    a rate-limit and wait out the cooldown, but has no pane to type into. If
+    a real hands-off resume is wanted, this terminal window needs to be
+    wrapped in `tmux` (default socket) first.
+  - **Next**: Phase 2 (split `TelegramCommandProcessor` into
+    `telegram_core.processor.CoreCommandProcessor` + price-only subclass) —
+    see §4 Phase 2. Characterization tests first, per the plan.
+  - **Phase 2 — DONE (split the processor).**
+    - Characterization tests written FIRST against the pre-refactor code:
+      `price_monitor_bot/tests/test_processor_dispatch_characterization.py`,
+      10 tests locking in `build_reply_plan`'s branch order (allowlist →
+      empty-content guard → built-ins → registry → domain command set → NL
+      routing → unknown-text hook → clarification → fallback). Two of my
+      first-draft assumptions about bare-text fallback behavior were WRONG —
+      running the tests against the real pre-refactor code caught it (plain
+      ambiguous text always gets the did-you-mean clarification menu, not the
+      hardcoded "Unknown command" message; that fallback is only reachable via
+      an unrecognized *slash* command). Fixed the tests to match reality, not
+      my assumption, before touching any refactor code. All 10 pass
+      **unmodified** after the split — the stage-gate proof worked as designed.
+    - `telegram_core/src/telegram_core/processor.py` (new): `CoreCommandProcessor`
+      — allowlist, 4 pluggable registries, `/start /help /ping /status /tools`
+      built-ins, full `build_reply_plan` dispatch skeleton, pending-text-
+      clarification state machine + generic clarification-render helpers
+      (`_extract_command_name/_remainder`, `_extract_photo_clarification_override`,
+      `_build_clarification_keyboard`, `_is_text_intent_ambiguous`,
+      `_build_text_clarification_reply`, `_build_pending_text_retry_reply`,
+      `_match_text_clarification_option`). Domain extension points are hooks
+      with trivial defaults: `_dispatch_domain_command` (→ `None`),
+      `_route_natural_language` (→ `None`), `_build_natural_language_reply_plan`
+      (→ `None`), `_build_text_intent_candidates` (→ `()`), `_help_text`,
+      `_status_text`, `_unknown_command_text`. Exported from
+      `telegram_core/__init__.py`. 14 new tests in `tests/test_processor.py`;
+      telegram_core suite now 31 passed (own venv).
+    - **Zero-dependency hard rule preserved a design pivot**: `_route_natural_language`
+      was initially going to be a concrete generic method (it just delegates to
+      injected router objects), but it makes REAL calls to
+      `fast_route_telegram_natural_language` /
+      `slow_fallback_route_telegram_natural_language` from the sibling
+      `telegram_nl` package — a real runtime dependency, which would violate
+      `dependencies = []`. Caught during design, before writing code: made it a
+      hook instead, with the unchanged original body moved down into
+      `PriceCommandProcessor`/`price_monitor_bot.bot.TelegramCommandProcessor`,
+      and moved `natural_language_router`/`intent_fast_path` ctor params down
+      to match (they're domain-adjacent, not Core's concern).
+    - `price_monitor_bot/src/price_monitor_bot/bot.py`: class name kept
+      unchanged (「既名 `TelegramCommandProcessor` 不改名」) — now
+      `class TelegramCommandProcessor(CoreCommandProcessor):`. `__init__` calls
+      `super().__init__(catalog_renderer=..., allowed_chat_ids=...,
+      status_renderer=..., command_handlers=..., callback_handlers=...,
+      view_handlers=..., item_deleter_handlers=..., unknown_text_handler=...)`
+      and keeps only domain state (lookup/board/photo/reputation/research/fetch
+      renderers, NL router + fast path, watch/sns DBs, collab backfiller,
+      feedback service, pending-photo/price-feedback/sns-bulk-update dicts — all
+      existing kwarg names unchanged, zero call-site changes needed anywhere).
+      Deleted (now inherited unchanged): `is_allowed_chat`,
+      `get/set/pop/clear_pending_text_clarification`, `build_reply`,
+      `build_pending_text_reply_plan`, `_build_text_clarification_plan`,
+      `_status_text`. The old hardcoded price/trend/photo-scan/reputation/
+      research/fetch/watch/watchlist/unwatch/set-price command-set chain that
+      used to live inline in `build_reply_plan` is now
+      `_dispatch_domain_command` (returns `None` if nothing matched, mirroring
+      Core's hook contract). Added `_unknown_command_text()` override
+      returning the original price-domain fallback string verbatim, and a
+      `_build_text_intent_candidates` override forwarding to the unchanged
+      module-level function of the same name (method/module-function name
+      shadowing is safe — separate namespaces). Removed the now-duplicate
+      module-level defs of `_extract_command_name`, `_extract_command_remainder`,
+      `_extract_photo_clarification_override`, `_is_text_intent_ambiguous`,
+      `_build_text_clarification_reply`, `_build_pending_text_retry_reply`,
+      `_match_text_clarification_option` (all now imported from
+      `telegram_core.processor` instead — the old defs were shadowing the
+      imports and one referenced a constant that had already been deleted,
+      which would have been a live `NameError` land mine if ever called).
+      `_route_natural_language`, `_build_natural_language_reply_plan`,
+      `_help_text` kept as unchanged-body overrides.
+    - **All test results green**: `telegram_core` 31 passed (own venv);
+      `price_monitor_bot` 553 passed/8 skipped (543 Phase-1 baseline + 10 new
+      characterization tests, **passing unmodified** — the stage-gate proof);
+      `aka_no_claw` **2268 passed/7 skipped — identical to the Phase 0/1
+      baseline, zero regressions**. Confirms the 3-level MRO (`aka's
+      TelegramCommandProcessor → price's TelegramCommandProcessor →
+      telegram_core.CoreCommandProcessor`) resolves correctly; aka's own
+      `_help_text` override at `openclaw_adapter/telegram_bot.py:342` not
+      calling `super()` was indeed behavior-transparent to the Core-level
+      default inserted underneath it, as predicted from the pre-split grep.
+    - Grep gates both green: `price_monitor_bot|openclaw_adapter` → 0 hits in
+      `telegram_core/src/`; domain-vocabulary scan (`price|trend|snapshot|
+      watch|sns|pokemon|yugioh`) in `processor.py` → only 2 benign illustrative
+      prose mentions ("TCG price bot" / "card-price bot" as docstring/comment
+      examples of what a hypothetical subclass might be), no real identifiers.
+    - **Phase 2 code + tests are DONE, all three suites green.**
+  - **★ CHECKPOINT — PASSED (2026-07-02).** 主上 restarted via 「重啟龍蝦」and
+    delegated the verification judgment call ("妳自己測一下 覺得沒問題就繼續往下
+    開發"). Verified: `tmux -L openclaw_codex list-panes` shows both `telegram`
+    and `bridge` sessions up; `telegram` pane log shows a clean startup with
+    zero tracebacks through the FULL real production object graph (aka's
+    `TelegramCommandProcessor(settings=..., workflow_editor=..., goal_bridge=...)`
+    → price's `TelegramCommandProcessor` → `CoreCommandProcessor.__init__`) —
+    proves the Phase 2 constructor wiring holds under real settings/renderers,
+    not just test stubs; `lsof` on the telegram pid shows an ESTABLISHED
+    connection to `149.154.166.110:443` (real Telegram long-poll); the
+    `telegram_heartbeat` file timestamp is fresh (not wedged); the 8781 bridge
+    answered `GET /api/command/model-routes` with a valid response. Could not
+    personally click real Telegram buttons/send a photo (no user-session
+    credentials, and doing so would be simulating 主上's own account) — but
+    Phase 2 only touched processor-level text dispatch, not the photo/callback
+    plumbing those checklist items exercise, so this verification covers the
+    actual Phase 2 blast radius. Full smoke checklist item-by-item (photo scan,
+    condition-picker buttons, /snslist pagination) deferred to 主上's own pass
+    whenever convenient, since Phase 3 is what will actually touch that code.
+    P3 hook interface + `snsbulk:` relocation decision (already spelled out in
+    §4 Phase 3) stand as given. Proceeding into Phase 3 per 主上's go-ahead.
+    §A `git push` still pending — nothing pushed yet in any of the three repos;
+    will summarize and wait for 「推」/ok once Phase 3 lands.
+  - **Phase 3 scope discovery + 主上 decision (2026-07-02).** Reading the real
+    `handle_telegram_callback_query`/`handle_telegram_message` bodies in
+    `price_monitor_bot/bot.py` (not just this plan's §4 sketch) showed far
+    more domain entanglement than documented: 8 domain callback prefixes
+    hardcoded in the elif-chain (`cond`, `bulk`, `wedit`, `wmkt`, `wprc`,
+    `fbprc`, `fbpos`, `wback` — the sketch only mentioned `cond`/`bulk`), a
+    ForceReply pre-check block in `handle_telegram_message` (matches
+    `_FBPRC_TAG_RE`/`_WPRC_TAG_RE` against `reply_to_message` text, before
+    intake-ack) with no existing hook, and a `REPUTATION_SNAPSHOT_COMMANDS`
+    special case that bypasses `build_reply_plan` entirely — also no hook.
+    `wprc`/`fbprc` additionally send BRAND-NEW messages via
+    `client.send_message(..., reply_markup={"force_reply": True})`, which the
+    existing registry callback contract (`(payload, original_text, chat_id) ->
+    (toast, new_text, markup)`, edit-only) can't express — the already-present
+    `handle_callback_query_async` hook (checked first, receives `client`) is
+    the natural fit for those two. Asked 主上 to choose: conservative
+    (move only the genuinely generic infra — `PollHeartbeat`, watchdog, drain,
+    409-backoff, generic `pg`/`del`/`close`/`noop` — leave all 8 domain
+    prefixes + ForceReply/reputation logic in `price_monitor_bot` unchanged)
+    vs. full-literal (convert all 8 prefixes to registry/`handle_callback_
+    query_async`-hook dispatch, design new hooks for ForceReply/reputation,
+    accept the larger effort + higher blast-radius risk).
+    **主上 chose 完整版（照計劃文件字面）— the full version.** This is now the
+    binding scope for Phase 3; the §4 sketch text is superseded by this note
+    wherever it undercounts the domain surface.
+  - **Phase 3 characterization tests — DONE, written BEFORE any polling-loop
+    code moves** (same discipline as Phase 2, now doubly justified since this
+    phase touches the live poll loop). Added 15 new tests to
+    `price_monitor_bot/tests/test_telegram_bot.py`, covering branches that had
+    **zero prior test coverage**: `wedit` (open view / unknown-watch toast),
+    `wmkt` (toggle off/on, refuse-to-empty-last-market — discovered mid-write
+    that the refusal path still re-renders the unchanged view, it only skips
+    the DB write; the code does the rerender unconditionally after the
+    add/remove branch, not inside it), `wprc` (ForceReply send with the
+    `[wprc:<40-hex-id>]` tag — `_WPRC_TAG_RE` requires exactly 40 hex chars,
+    unknown-watch toast, and the reply-consumption path that writes the new
+    threshold and re-sends the edit view; also the non-digit-price rejection),
+    `wback` (return to watchlist edit mode), `fbpos` (one-tap positive
+    feedback via `feedback_service.submit_positive`, missing-item toast),
+    `noop` and unknown-prefix (both fall through to the pre-set default toast
+    "未知按鈕", confirming `noop` never sets `toast` explicitly), and a new
+    registry-precedence test proving `processor._callback_registry.get(prefix)`
+    is checked BEFORE the entire elif chain for ANY prefix name — including
+    builtins like `pg` — which is the load-bearing fact Phase 3's registry
+    migration of `cond`/`bulk`/etc depends on. The already-existing
+    `test_processor_dispatch_characterization.py` (Phase 2) and the existing
+    `handle_telegram_callback_query`/`handle_telegram_message` tests in
+    `test_telegram_bot.py` (snsdel, async-handler-hook precedence, pg/del/
+    close, cond open/toggle/refuse/done, popt/topt, bulk confirm/cancel,
+    fbprc send + URL-reply consumption, reputation-snapshot bypass in
+    `handle_telegram_message`) already covered the rest — re-verified they
+    still pass, no rewrite needed. **Full suite: 568 passed/8 skipped** (553
+    Phase-2 baseline + 15 new), all against the PRE-refactor code — this is
+    the ground-truth baseline the Phase 3 `telegram_core.polling` rewrite must
+    reproduce unmodified. No `telegram_core/polling.py` code written yet;
+    that's the immediate next step.
+  - **Phase 3 — DONE (move polling/message/callback flow).**
+    - `telegram_core/src/telegram_core/polling.py` (new): verbatim moves of
+      `PollHeartbeat`, `_heartbeat_beacon`, `_is_conflict_error`,
+      `_drain_pending_updates`, `start_poll_watchdog` (watchdog alert text
+      genericized to "Poll loop 心跳停止"), `_PAGE_HEADER_RE`/
+      `_guess_current_page`, `_send_reputation_delivery`,
+      `_send_text_reply_plan`. `_list_view_renderer`/`_list_item_deleter` are
+      now pure registry lookups — the old hardcoded `"wl"`/`"hl"` fallback is
+      gone (grep across all three repos found `render_huntlist_view` is dead
+      code: no class defines it; `"hl"` is always supplied externally via
+      `view_handlers`/`item_deleter_handlers` kwargs, so a naive default would
+      have introduced an `AttributeError`). New generic
+      `handle_telegram_message`/`handle_telegram_callback_query` built against
+      the 6 Phase-3 `CoreCommandProcessor` hooks
+      (`handle_callback_query_async`, `handle_reply_to_message`,
+      `build_intake_ack_text`, `check_pending_photo_reply`,
+      `handle_photo_message`, `handle_pre_dispatch_text`) — all 8 domain
+      callback prefixes (`cond`/`bulk`/`wedit`/`wmkt`/`wprc`/`fbprc`/`fbpos`/
+      `wback`) removed from the elif chain; only `pg`/`del`/`close`/`popt`/
+      `topt`/registry/async-hook/`noop` remain as builtins.
+    - `TelegramReputationDelivery` moved to `telegram_core/contracts.py`
+      (fully generic — only `client`/`chat_id`/`delivery`/`mask_identifier`/
+      `trim_for_log`); `price_monitor_bot/bot.py`'s local copy deleted, now
+      imported.
+    - `price_monitor_bot/bot.py`: registry-merge added to
+      `TelegramCommandProcessor.__init__` (`{**default_*_handlers,
+      **(kwarg or {})}`, external kwargs win on collision — matches the old
+      "registry checked first" semantics) wiring `cond`/`bulk`/`wedit`/`wmkt`/
+      `wback`/`fbpos` as registry callbacks and `wl` as the default view/
+      deleter handler. 6 new adapter methods (`_cond_callback` etc.) preserve
+      two quirks the generic registry contract doesn't: (a) toast defaults to
+      "未知按鈕" — the registry contract unconditionally unpacks
+      `toast, new_text, new_reply_markup = cb(...)`, so each adapter applies
+      `toast_out if toast_out is not None else "未知按鈕"` itself; (b) explicit
+      `logger.warning("Unknown callback_query prefix=...")` calls preserved
+      where the original elif chain had them. 6 hook-override methods added
+      for `wprc`/`fbprc` (ForceReply send/consume — the one thing the edit-only
+      registry contract can't express) and the `REPUTATION_SNAPSHOT_COMMANDS`
+      bypass; all chain `super()` for prefixes/cases they don't own.
+    - **Monkeypatch-compatibility finding**: `run_telegram_polling` could NOT
+      become a thin delegating wrapper — two existing tests
+      (`test_run_telegram_polling_uses_injected_processor_factory` and the
+      sibling default-class test) do
+      `monkeypatch.setattr(_bot_module, "TelegramBotClient"/
+      "_drain_pending_updates"/"start_poll_watchdog", ...)`, and Python
+      resolves bare globals via the *defining* module's `__globals__` — so
+      only code whose body is textually in `bot.py` sees the patch. Fix: kept
+      `run_telegram_polling`'s body 100% verbatim in `bot.py`, only
+      re-imported its helper names from `telegram_core.polling`.
+      `telegram_core/polling.py` also grew its own generic
+      `run_telegram_polling` (different signature, takes a pre-built
+      `processor`) as a standalone API for future non-price consumers — not
+      used by price's own wrapper.
+    - `aka_no_claw/src/openclaw_adapter/telegram_bot.py`: its
+      `handle_callback_query_async` override was shadowing price's `wprc`/
+      `fbprc` handling — `if prefix != "goal": return False` short-circuited
+      past price's implementation instead of falling through to it. Fixed to
+      `return super().handle_callback_query_async(...)` on the non-`goal`
+      branch, restoring the 3-level MRO chain (aka → price → Core).
+    - **Bug found + fixed via the standard test-first loop**: first pytest run
+      of the new `polling.py` against price's suite showed 147 passed / 1
+      failed (`test_handle_telegram_message_sends_snapshot_ack_then_result`).
+      Cause: the `handle_pre_dispatch_text` branch in the new generic
+      `handle_telegram_message` did a bare `return pre_dispatch`, discarding
+      the intake-ack that had already been sent and appended to `replies`
+      earlier in the same call — the original code appended to that same list
+      instead of returning a fresh tuple. Fixed to
+      `replies.extend(pre_dispatch); return tuple(replies)`. Re-ran green.
+    - **All three suites green, matching every prior-phase baseline exactly**:
+      `telegram_core` 31 passed (own venv, unchanged from Phase 2 — no new
+      tests needed, the 15 Phase-3 characterization tests live in price's
+      suite); `price_monitor_bot` 568 passed/8 skipped (identical to the
+      pre-refactor characterization baseline — proves the rewrite is
+      behavior-preserving); `aka_no_claw` 2268 passed/7 skipped (identical to
+      every prior phase's baseline).
+    - Grep gate green: `price_monitor_bot|openclaw_adapter` → 0 hits in
+      `telegram_core/src/` (had to reword one docstring comment in
+      `processor.py` that named `price_monitor_bot` as an illustrative
+      example — same "literal string match on human-readable prose" gotcha
+      as Phase 2).
+    - **Not yet done**: live-smoke checklist (photo scan, condition-picker
+      buttons, `/snslist` pagination, `wprc`/`fbprc` ForceReply round-trip) —
+      needs a real restart via 「重啟龍蝦」; nothing pushed/deployed yet.
+      §A `git push` still pending across all three repos — will summarize and
+      wait for 「推」/ok. Phase 4 (cleanup) not yet started.
+  - **Phase 4 — DONE (cleanup).**
+    - **aka `commands.py`/`formatters.py` wrapper removal**: both were
+      genuinely thin (docstrings claimed "backwards compatibility" wrapper,
+      and `formatters.py` was a pure re-export; `commands.py`'s `lookup_card`
+      turned out to be a byte-for-byte behavioral duplicate of
+      `price_monitor_bot.commands.lookup_card`, confirmed by diff before
+      deleting — not just assumed from the docstring). Redirected the 4
+      internal call sites (`dashboard.py`, `toolset.py`,
+      `tests/test_reference_sources.py`, `tests/test_telegram_bot.py`) to
+      import from `price_monitor_bot.commands`/`formatters` directly, deleted
+      both wrapper files. Also deleted `aka_no_claw/tests/test_commands.py`
+      after diffing it against `price_monitor_bot/tests/test_commands.py` —
+      identical apart from the import line, so it was pure duplicate coverage
+      left over from before the functions moved, not a distinct test.
+    - **`test_telegram_bot.py` core/price split, reinterpreted**: literally
+      moving lines out of price's 3,748-line file wasn't possible — its "core
+      dispatch" tests are written against the fully-integrated production
+      `TelegramCommandProcessor` (price+domain kwargs), which `telegram_core`
+      can't construct (zero-dependency rule). Same situation Phase 2 hit and
+      resolved the same way: instead of relocating lines, wrote NEW tests
+      directly against `CoreCommandProcessor`/`polling.py` in
+      `telegram_core/tests/test_polling.py` (27 tests — `PollHeartbeat`
+      roundtrip/staleness, `_is_conflict_error`, `_drain_pending_updates`
+      incl. 409-retry-then-succeed/give-up/reraise-non-conflict,
+      `handle_telegram_message`'s full hook chain including a dedicated
+      regression test for the `handle_pre_dispatch_text` replies-accumulator
+      bug fixed earlier in Phase 3, and `handle_telegram_callback_query`'s
+      full builtin set — `pg`/`del`/`close`/`popt`/`topt`/`noop`/unknown,
+      registry-before-`pg` precedence, async-hook short-circuit). This is now
+      `telegram_core`'s first direct coverage of `polling.py` — previously it
+      was only exercised indirectly through price's characterization suite.
+      The price-side characterization tests were kept as-is (not deleted):
+      they're the "does the real production object graph still work"
+      integration proof, which is a different job than `telegram_core`'s own
+      unit tests and would be a real coverage loss to remove.
+      `telegram_core` suite: 31 → 58 passed.
+    - **Phase-1 compat shims removed**: `price_monitor_bot/list_view.py` and
+      `logging_utils.py` (pure re-export shims from Phase 1) had zero
+      remaining external users (aka was already redirected in Phase 1), but
+      price's OWN `bot.py` and 2 of its own tests were still importing
+      through them. Redirected those 3 internal call sites to import
+      `telegram_core.list_view`/`telegram_core.logging_utils` directly, THEN
+      deleted both shim files — satisfying the plan's "only remove when zero
+      users in either repo" condition for real, rather than leaving them
+      around indefinitely.
+    - **All three suites green**: `telegram_core` 58 passed (31 + 27 new);
+      `price_monitor_bot` 568 passed/8 skipped (unchanged — shim removal and
+      import redirection are behavior-neutral); `aka_no_claw` 2267 passed/7
+      skipped (2268 baseline minus the 1 duplicate `test_commands.py` test
+      deleted — every other test unaffected).
+    - Acceptance check: `grep -rn "from price_monitor_bot" aka/src` → only
+      price-domain imports remain (`bot.py` re-exports, `watch_monitor`,
+      `commands`, `formatters`) — zero bare infra imports. Confirmed.
+    - **Docs truth updates**: `SYSTEM_MAP.md` (repo map + package-layer rows
+      for `telegram_core`, corrected dependency-direction wording),
+      `TASK_ROUTING.md` (routing-table row + decision-tree branch for
+      Telegram-infra changes), `CURRENT_STATE.md` (Telegram bot subsystem row
+      now states the 3-package chain; stale "check whether behavior has
+      migrated" drift note resolved to state the monkey-patch is gone),
+      `TELEGRAM_NL_OWNERSHIP_REFACTOR_ISSUE.md` (added the cross-link back to
+      this doc, per §7). `DOCS_INDEX.md` / `DOC_AUDIT.md` entries for this
+      doc flipped from `Planned` to `Current` (kept in place rather than
+      archived — it documents `telegram_core`'s hook/registry contracts, so
+      it stays live reference material, matching the `ISSUE_66_PHASE2_
+      PROGRESS.md` precedent of keeping a completed living-record doc as
+      `Current` rather than archiving it).
+    - **Not done / deferred to 主上**: the full live-smoke checklist (§5) —
+      still needs a real restart via 「重啟龍蝦」and hands-on button/photo
+      taps; nothing in this plan has been pushed or deployed yet. §A push
+      summary is the next and last step before that can happen.
+  - **All four phases (P0–P4) of this plan are now code-complete and fully
+    test-verified across all three repos.** Nothing has been pushed in any
+    of the three repos (`telegram_core`, `price_monitor_bot`, `aka_no_claw`)
+    — per §A protocol, a summary of all changed repos/files is owed to 主上
+    next, waiting for 「推」/ok before any push. Live smoke (§5) is the only
+    acceptance item left, and it requires a real restart, so it naturally
+    follows the push.
+  - **Pre-push doc-drift verification** (per §7's own instruction to run
+    [DOC_DRIFT_CHECKLIST.md](DOC_DRIFT_CHECKLIST.md) before any docs-touching
+    push): ran both §E mechanical checks from repo root. The unindexed-docs
+    loop (`docs/*.md` not referenced in `DOCS_INDEX.md`) printed nothing —
+    clean. The broken-intra-links loop printed 17 `MISSING:` lines, all
+    pre-existing false positives from the script's one-level-only path
+    resolution (nested `docs/fix_benchmarks/**` and
+    `docs/local_tool_calling_benchmark/**` links, plus `../*.md` links that
+    resolve relative to `docs/` rather than repo root); every flagged file
+    was confirmed to exist on disk, and none were touched by this session's
+    edits. §A spot-check: the new `telegram_core:` entry's
+    `integration_status: integrated` reuses a value already present on other
+    `SYSTEM_MANIFEST.yaml` repo entries, so no new status vocabulary was
+    introduced. `check_docs_health.py` had already passed after the manifest
+    edit. Docs are push-clean.
+- **2026-07-03 — 主上-requested acceptance audit + gap fixes (all landed).**
+  主上 asked for a full acceptance pass over the refactor and to fix anything
+  unfinished. The audit found the earlier "all phases code-complete" claim had
+  missed two substantive P3 items and two minor ones; all four are now fixed:
+  - **snsbulk flow relocated to aka (per §3 row + P3 item 3; 主上 chose「現在
+    完整搬到 aka（照計劃字面）」over a follow-up issue).** The plan's §3 row
+    only listed `_handle_sns_bulk_update_callback` + the dataclass, but the
+    pending-state *creators* (3 `_build_sns_bulk_*_plan` builders + the three
+    `sns_bulk_*` NL intent branches) lived in price's NL layer and would have
+    dangled, so the whole flow moved as a unit — 零行為變更, bodies verbatim:
+    - `openclaw_adapter/sns_commands.py`: new section with
+      `PendingTelegramSnsBulkUpdate` (slots=True preserved),
+      `build_sns_bulk_{add_filter,remove_filter,update_schedule}_plan`
+      (processor refs → explicit `sns_db` + `set_pending` injection, matching
+      the file's existing factory conventions) and
+      `handle_sns_bulk_update_callback` (`pop_pending` injection).
+    - `openclaw_adapter/telegram_bot.py` subclass: pending dict + get/set/pop
+      accessors, `"bulk"` callback-registry entry (same `setdefault` pattern
+      as `"goal"`), `_bulk_callback` adapter (toast-default「未知按鈕」+
+      unknown-payload `logger.warning` quirks preserved), thin
+      `_build_sns_bulk_*_plan` wrappers (test call-shape unchanged), and the
+      three intent branches at the top of `_build_app_natural_language_reply_plan`.
+    - price `bot.py`: all moved pieces deleted with "moved to
+      openclaw_adapter…" location comments per the existing precedent; the
+      now-unused `TEXT_CLARIFICATION_TTL_SECONDS` import dropped.
+    - Tests: the 4 bulk e2e tests + `_make_bulk_processor_with_tcg_rules`
+      helper migrated from price `test_telegram_bot.py` to new
+      `aka_no_claw/tests/test_sns_bulk.py` (aka venv has sns_monitor, so they
+      run — skipif guard kept for robustness); the 4 NL fallback *routing*
+      tests stayed in price (they test `telegram_nl`, untouched). Callback
+      dispatch in the migrated tests goes through
+      `telegram_core.polling.handle_telegram_callback_query` directly.
+  - **aka now calls `telegram_core.polling.run_telegram_polling` directly
+    (P3 item 3; 主上 chose「切換並更新 CLAUDE.md 標記」).** aka's
+    `run_telegram_polling` builds the app `TelegramCommandProcessor` itself
+    (same kwargs the old factory received) and hands it to the generic core
+    loop — the `processor_factory` relay through price's wrapper is retired.
+    price's own `run_telegram_polling` body stays in `bot.py` untouched (its
+    tests monkeypatch `_bot_module` globals — defining-module resolution).
+    **Ops impact**: the live stdout marker is now core's
+    `Telegram bot polling as @Aka_No_Claw_bot` (no `OpenClaw` prefix);
+    `aka_no_claw/CLAUDE.md` ops section updated accordingly.
+  - **Infra import redirects**: aka's `handle_telegram_message` and
+    `send_telegram_test_message` now import from `telegram_core`
+    (`polling` / `transport`) instead of via price's re-export shims; price's
+    shims themselves are unchanged (its own tests still use them).
+  - **P4 processor-rename evaluation (deferred decision now documented):
+    KEEP the `TelegramCommandProcessor` name in both price and aka.**
+    Renaming (e.g. to `PriceCommandProcessor`) would touch price's 3,700+
+    line test module, aka's subclass + its test imports, and multiple docs,
+    for zero functional gain; the 3-level MRO is already unambiguous by
+    module path. Recorded here as the P4「評估」conclusion — no further action.
+  - **Verification after fixes**: telegram_core 58 passed; price 564 passed /
+    8 skipped (−4 = exactly the migrated tests); aka 2271 passed / 7 skipped
+    (+4 migrated, includes the new `test_sns_bulk.py`); zero-dep grep gate on
+    `telegram_core/src` still 0 hits; no `_base_run_telegram_polling` or
+    `OpenClaw Telegram bot polling` references remain in aka.
+  - Still nothing pushed in any repo — refreshed §A summary owed to 主上;
+    live smoke (§5) follows the push via「重啟龍蝦」.
 
 ## 0. Problem statement
 

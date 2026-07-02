@@ -3,13 +3,14 @@
 Status: Current
 Owner area: agent-maintenance
 
-Last reviewed: 2026-06-20
+Last reviewed: 2026-07-03
 
 ## Quick Routing Table
 
 | User request / task | Primary repo | Primary layer/module | Notes |
 |---|---|---|---|
 | Add or change Telegram command | `aka_no_claw` | `src/openclaw_adapter/telegram_bot.py`, `toolset.py` | Keep command wiring thin. Move business logic to dedicated modules. |
+| Change Telegram infra (transport, poll loop, list-view pagination, generic dispatch/registries) | `telegram_core` | `src/telegram_core/{transport,polling,processor,list_view,contracts}.py` | Zero-dependency shared package; both `aka_no_claw` and `price_monitor_bot` consume it. Never add domain vocabulary (command names, callback prefixes) here — that belongs in a consumer repo's hook overrides/registries. Run its own `pytest` plus both consumer suites after any change. |
 | Change CLI command | `aka_no_claw` | `src/openclaw_adapter/toolset.py`, `__main__.py` | Update docs and verification matrix if entry points change. |
 | Change card matching or card aliases | `price_monitor_bot` | `src/tcg_tracker` | `aka_no_claw` imports this package through `requirements.txt`; do not put TCG rules in `market_monitor`. |
 | Change generic price source logic | `price_monitor_bot` | `src/market_monitor` | `aka_no_claw` imports this package through `requirements.txt`; keep domain-specific rules out. |
@@ -40,7 +41,11 @@ Last reviewed: 2026-06-20
    Go to sibling repo `reputation_snapshot`, then check `aka_no_claw` `/snapshot` integration.
 6. Is it old Telegram price-bot behavior still living in `price_monitor_bot`?
    Inspect `price_monitor_bot` first, then decide whether the fix belongs there or in `aka_no_claw` integration.
-7. Is it only documentation or agent maintenance?
+7. Is it Telegram transport, the poll loop, list-view pagination, or the
+   generic command/callback dispatch mechanism itself (not a specific
+   command)? Go to sibling repo `telegram_core` — both `aka_no_claw` and
+   `price_monitor_bot` depend on it, so a fix there benefits both.
+8. Is it only documentation or agent maintenance?
    Keep it in `aka_no_claw/docs` unless it documents a sibling repo behavior that must be edited at the source.
 
 ## Cross-Repo Rules

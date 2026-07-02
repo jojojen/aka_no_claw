@@ -27,7 +27,7 @@ import subprocess
 from typing import Callable
 
 from assistant_runtime import AssistantSettings, build_ssl_context
-from price_monitor_bot.bot import TelegramBotClient
+from telegram_core.transport import TelegramBotClient
 
 from .audio_recovery import restart_coreaudiod
 from .music_command import acquire_audio_session, resume_after_voice

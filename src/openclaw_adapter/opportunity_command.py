@@ -9,7 +9,7 @@ import logging
 import re
 from typing import TYPE_CHECKING, Callable, Sequence
 
-from price_monitor_bot.list_view import (
+from telegram_core.list_view import (
     LIST_VIEW_MODE_READ,
     ListRow,
     build_list_view,

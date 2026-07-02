@@ -14,9 +14,12 @@ fall back to direct ``sns_db`` access (used in tests / standalone mode).
 from __future__ import annotations
 
 import logging
+import time
+from dataclasses import dataclass, field
 from typing import Callable
 
-from price_monitor_bot.list_view import LIST_VIEW_MODE_READ, ListRow, build_list_view
+from telegram_core.contracts import TEXT_CLARIFICATION_TTL_SECONDS, TelegramTextReplyPlan
+from telegram_core.list_view import LIST_VIEW_MODE_READ, ListRow, build_list_view
 
 logger = logging.getLogger(__name__)
 
@@ -584,3 +587,349 @@ def build_snsfb_callback_handler(sns_db, sns_inbox=None) -> Callable[[str, str, 
         return toast, new_text, None
 
     return handler
+
+
+# ---------------------------------------------------------------------------
+# SNS bulk update (preview → confirm/cancel) — moved from price_monitor_bot.bot
+# ---------------------------------------------------------------------------
+
+@dataclass(slots=True)
+class PendingTelegramSnsBulkUpdate:
+    """A SNS bulk-rule update that's been previewed to the user and is
+    waiting on a confirm / cancel inline-button tap.
+
+    The ``action`` field selects which apply helper runs on confirm:
+    - ``"add"``           → apply_bulk_keyword_filter_add (uses keywords)
+    - ``"remove"``        → apply_bulk_keyword_filter_remove (uses keywords)
+    - ``"set_schedule"``  → apply_bulk_schedule_update (uses schedule_minutes)
+    """
+    chat_id: str
+    bulk_target_domain: str
+    keywords: tuple[str, ...]
+    affected_rule_ids: tuple[str, ...]
+    action: str = "add"
+    schedule_minutes: int | None = None
+    created_at: float = field(default_factory=time.monotonic)
+
+    def is_expired(self) -> bool:
+        return (time.monotonic() - self.created_at) > TEXT_CLARIFICATION_TTL_SECONDS
+
+
+def build_sns_bulk_add_filter_plan(
+    sns_db,
+    *,
+    chat_id: str | int,
+    target_domain: str,
+    keywords: tuple[str, ...],
+    set_pending: Callable[[PendingTelegramSnsBulkUpdate], None],
+) -> TelegramTextReplyPlan:
+    """Build the preview message for ``sns_bulk_add_filter`` and stash a
+    PendingTelegramSnsBulkUpdate so the confirm/cancel inline buttons
+    know what to do."""
+    if sns_db is None:
+        return TelegramTextReplyPlan(ack=None, reply="SNS 監控尚未啟用（sns_db 未設定）。")
+    if not target_domain:
+        return TelegramTextReplyPlan(ack=None, reply="我看不太懂你要對哪類帳號加 filter，請重講一次。")
+    if not keywords:
+        return TelegramTextReplyPlan(ack=None, reply="請告訴我要加哪個 filter 關鍵字。")
+
+    try:
+        from sns_monitor.bulk_filter import (
+            find_accounts_matching_domain,
+            resolve_target_domain_set,
+        )
+    except ImportError:
+        logger.exception("sns_monitor.bulk_filter import failed")
+        return TelegramTextReplyPlan(ack=None, reply="SNS bulk-filter 模組載入失敗。")
+
+    target_set = resolve_target_domain_set(target_domain)
+    accounts = find_accounts_matching_domain(sns_db, target_set)
+    if not accounts:
+        return TelegramTextReplyPlan(
+            ack=None,
+            reply=f"找不到任何 domain 跟 {target_domain} 有交集的 SNS 帳號。",
+        )
+
+    kw_display = "、".join(keywords)
+    lines = [
+        f"🎯 找到 {len(accounts)} 個 {target_domain} 相關帳號，要把 filter 加上：{kw_display}",
+        "",
+    ]
+    for rule in accounts[:10]:
+        existing = (
+            f" 現有 filter[{', '.join(rule.include_keywords)}]"
+            if rule.include_keywords else " 現有 filter[]"
+        )
+        domain_label = f" domain[{', '.join(rule.domains)}]" if rule.domains else ""
+        lines.append(f"- @{rule.screen_name}{domain_label}{existing}")
+    if len(accounts) > 10:
+        lines.append(f"  …以及另外 {len(accounts) - 10} 筆")
+    lines.append("")
+    lines.append(f"確認要把「{kw_display}」加進這 {len(accounts)} 個帳號的 filter 嗎？")
+
+    pending = PendingTelegramSnsBulkUpdate(
+        chat_id=str(chat_id),
+        bulk_target_domain=target_domain,
+        keywords=keywords,
+        affected_rule_ids=tuple(r.rule_id for r in accounts),
+        action="add",
+    )
+    set_pending(pending)
+
+    reply_markup = {
+        "inline_keyboard": [
+            [{"text": f"✓ 全部修改 ({len(accounts)})", "callback_data": "bulk:c"}],
+            [{"text": "✖️ 取消", "callback_data": "bulk:x"}],
+        ]
+    }
+    return TelegramTextReplyPlan(
+        ack=None,
+        reply="\n".join(lines),
+        reply_markup=reply_markup,
+    )
+
+
+def build_sns_bulk_remove_filter_plan(
+    sns_db,
+    *,
+    chat_id: str | int,
+    target_domain: str,
+    keywords: tuple[str, ...],
+    set_pending: Callable[[PendingTelegramSnsBulkUpdate], None],
+) -> TelegramTextReplyPlan:
+    """Preview for ``sns_bulk_remove_filter`` — symmetric to the add plan
+    but the message text describes a removal, and the pending state
+    carries ``action="remove"``."""
+    if sns_db is None:
+        return TelegramTextReplyPlan(ack=None, reply="SNS 監控尚未啟用（sns_db 未設定）。")
+    if not target_domain:
+        return TelegramTextReplyPlan(ack=None, reply="我看不太懂你要對哪類帳號移除 filter 關鍵字，請重講一次。")
+    if not keywords:
+        return TelegramTextReplyPlan(ack=None, reply="請告訴我要移除哪個 filter 關鍵字。")
+
+    try:
+        from sns_monitor.bulk_filter import (
+            find_accounts_matching_domain,
+            resolve_target_domain_set,
+        )
+    except ImportError:
+        logger.exception("sns_monitor.bulk_filter import failed")
+        return TelegramTextReplyPlan(ack=None, reply="SNS bulk-filter 模組載入失敗。")
+
+    target_set = resolve_target_domain_set(target_domain)
+    accounts = find_accounts_matching_domain(sns_db, target_set)
+    if not accounts:
+        return TelegramTextReplyPlan(
+            ack=None,
+            reply=f"找不到任何 domain 跟 {target_domain} 有交集的 SNS 帳號。",
+        )
+
+    drop_set = {kw.casefold() for kw in keywords if kw}
+    affected_count = sum(
+        1 for r in accounts if any(kw.casefold() in drop_set for kw in r.include_keywords)
+    )
+
+    kw_display = "、".join(keywords)
+    lines = [
+        f"🗑 找到 {len(accounts)} 個 {target_domain} 相關帳號，要從 filter 移除：{kw_display}",
+        f"   其中 {affected_count} 個目前有這些 keyword（會被改），{len(accounts) - affected_count} 個沒有（不會動）",
+        "",
+    ]
+    for rule in accounts[:10]:
+        existing = (
+            f" 現有 filter[{', '.join(rule.include_keywords)}]"
+            if rule.include_keywords else " 現有 filter[]"
+        )
+        domain_label = f" domain[{', '.join(rule.domains)}]" if rule.domains else ""
+        lines.append(f"- @{rule.screen_name}{domain_label}{existing}")
+    if len(accounts) > 10:
+        lines.append(f"  …以及另外 {len(accounts) - 10} 筆")
+    lines.append("")
+    lines.append(f"確認要從這 {len(accounts)} 個帳號的 filter 移除「{kw_display}」嗎？")
+
+    pending = PendingTelegramSnsBulkUpdate(
+        chat_id=str(chat_id),
+        bulk_target_domain=target_domain,
+        keywords=keywords,
+        affected_rule_ids=tuple(r.rule_id for r in accounts),
+        action="remove",
+    )
+    set_pending(pending)
+
+    reply_markup = {
+        "inline_keyboard": [
+            [{"text": f"✓ 全部移除 ({affected_count})", "callback_data": "bulk:c"}],
+            [{"text": "✖️ 取消", "callback_data": "bulk:x"}],
+        ]
+    }
+    return TelegramTextReplyPlan(
+        ack=None,
+        reply="\n".join(lines),
+        reply_markup=reply_markup,
+    )
+
+
+def build_sns_bulk_update_schedule_plan(
+    sns_db,
+    *,
+    chat_id: str | int,
+    target_domain: str,
+    minutes: int | None,
+    set_pending: Callable[[PendingTelegramSnsBulkUpdate], None],
+) -> TelegramTextReplyPlan:
+    """Preview for ``sns_bulk_update_schedule`` — same pattern but the
+    pending state carries ``action="set_schedule"`` and ``schedule_minutes``."""
+    if sns_db is None:
+        return TelegramTextReplyPlan(ack=None, reply="SNS 監控尚未啟用（sns_db 未設定）。")
+    if not target_domain:
+        return TelegramTextReplyPlan(ack=None, reply="我看不太懂你要對哪類帳號改 schedule，請重講一次。")
+    if minutes is None or not (5 <= minutes <= 1440):
+        return TelegramTextReplyPlan(ack=None, reply="請給一個有效的分鐘數 (5-1440)。")
+
+    try:
+        from sns_monitor.bulk_filter import (
+            find_accounts_matching_domain,
+            resolve_target_domain_set,
+        )
+    except ImportError:
+        logger.exception("sns_monitor.bulk_filter import failed")
+        return TelegramTextReplyPlan(ack=None, reply="SNS bulk-filter 模組載入失敗。")
+
+    target_set = resolve_target_domain_set(target_domain)
+    accounts = find_accounts_matching_domain(sns_db, target_set)
+    if not accounts:
+        return TelegramTextReplyPlan(
+            ack=None,
+            reply=f"找不到任何 domain 跟 {target_domain} 有交集的 SNS 帳號。",
+        )
+    already_count = sum(1 for r in accounts if r.schedule_minutes == minutes)
+    will_change = len(accounts) - already_count
+
+    lines = [
+        f"⏱ 找到 {len(accounts)} 個 {target_domain} 相關帳號，要把 schedule 改成 {minutes} 分鐘",
+        f"   其中 {already_count} 個本來就是 {minutes} 分鐘（不會動），{will_change} 個會被改",
+        "",
+    ]
+    for rule in accounts[:10]:
+        domain_label = f" domain[{', '.join(rule.domains)}]" if rule.domains else ""
+        lines.append(f"- @{rule.screen_name}{domain_label} 目前 schedule={rule.schedule_minutes}m")
+    if len(accounts) > 10:
+        lines.append(f"  …以及另外 {len(accounts) - 10} 筆")
+    lines.append("")
+    lines.append(f"確認要把這 {len(accounts)} 個帳號的 schedule 改成 {minutes} 分鐘嗎？")
+
+    pending = PendingTelegramSnsBulkUpdate(
+        chat_id=str(chat_id),
+        bulk_target_domain=target_domain,
+        keywords=(),
+        affected_rule_ids=tuple(r.rule_id for r in accounts),
+        action="set_schedule",
+        schedule_minutes=minutes,
+    )
+    set_pending(pending)
+
+    reply_markup = {
+        "inline_keyboard": [
+            [{"text": f"✓ 全部修改 ({will_change})", "callback_data": "bulk:c"}],
+            [{"text": "✖️ 取消", "callback_data": "bulk:x"}],
+        ]
+    }
+    return TelegramTextReplyPlan(
+        ack=None,
+        reply="\n".join(lines),
+        reply_markup=reply_markup,
+    )
+
+
+def handle_sns_bulk_update_callback(
+    *,
+    sns_db,
+    pop_pending: Callable[[str | int], PendingTelegramSnsBulkUpdate | None],
+    action: str,
+    chat_id: str | int,
+    original_text: str,
+) -> tuple[str | None, str | None, dict[str, object] | None]:
+    """Resolve a `bulk:c` / `bulk:x` callback (confirm / cancel of an SNS
+    bulk filter-add preview). Returns (toast, edit_text, edit_reply_markup).
+
+    The pending preview state is popped on either action so a second tap is
+    harmless. Confirm applies the keyword merge via
+    ``sns_monitor.bulk_filter.apply_bulk_keyword_filter_add`` against the
+    rule ids captured at preview time — fresh DB lookups, so any concurrent
+    deletion shows up as fewer updates.
+    """
+    pending = pop_pending(chat_id)
+    if pending is None:
+        return "操作已過期，請重新輸入", f"{original_text}\n\n（操作已過期）", None
+
+    if action == "x":
+        return "已取消", f"{original_text}\n\n（已取消）", None
+
+    if action != "c":
+        return "未知操作", None, None
+
+    if sns_db is None:
+        return "SNS 監控未啟用", f"{original_text}\n\n（SNS 監控未啟用）", None
+
+    try:
+        from sns_monitor.bulk_filter import (
+            apply_bulk_keyword_filter_add,
+            apply_bulk_keyword_filter_remove,
+            apply_bulk_schedule_update,
+        )
+    except ImportError:
+        logger.exception("sns_monitor.bulk_filter import failed in bulk callback")
+        return "套用失敗", f"{original_text}\n\n（套用失敗：模組載入錯誤）", None
+
+    fresh_accounts = []
+    for rule_id in pending.affected_rule_ids:
+        rule = sns_db.get_watch_rule(rule_id)
+        if rule is not None:
+            fresh_accounts.append(rule)
+
+    if pending.action == "remove":
+        updated = apply_bulk_keyword_filter_remove(
+            sns_db, fresh_accounts, pending.keywords
+        )
+        kw_display = "、".join(pending.keywords)
+        if not updated:
+            return (
+                "沒有需要更新的帳號",
+                f"{original_text}\n\n（沒有帳號需要更新，沒人有「{kw_display}」）",
+                None,
+            )
+        toast = f"已修改 {len(updated)} 個帳號"
+        new_text = f"{original_text}\n\n✓ 已從 {len(updated)} 個帳號 filter 移除「{kw_display}」"
+        return toast, new_text, None
+
+    if pending.action == "set_schedule":
+        if pending.schedule_minutes is None:
+            return "套用失敗", f"{original_text}\n\n（套用失敗：schedule_minutes 未設定）", None
+        updated = apply_bulk_schedule_update(
+            sns_db, fresh_accounts, pending.schedule_minutes
+        )
+        if not updated:
+            return (
+                "沒有需要更新的帳號",
+                f"{original_text}\n\n（沒有帳號需要更新，全部已經是 {pending.schedule_minutes} 分鐘）",
+                None,
+            )
+        toast = f"已修改 {len(updated)} 個帳號"
+        new_text = f"{original_text}\n\n✓ 已把 {len(updated)} 個帳號的 schedule 改成 {pending.schedule_minutes} 分鐘"
+        return toast, new_text, None
+
+    # Default / "add"
+    updated = apply_bulk_keyword_filter_add(
+        sns_db, fresh_accounts, pending.keywords
+    )
+
+    kw_display = "、".join(pending.keywords)
+    if not updated:
+        return (
+            "沒有需要更新的帳號",
+            f"{original_text}\n\n（沒有帳號需要更新，全部已經有「{kw_display}」）",
+            None,
+        )
+    toast = f"已修改 {len(updated)} 個帳號"
+    new_text = f"{original_text}\n\n✓ 已修改 {len(updated)} 個帳號 filter 加上「{kw_display}」"
+    return toast, new_text, None

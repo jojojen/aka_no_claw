@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from openclaw_adapter.commands import list_reference_sources
+from price_monitor_bot.commands import list_reference_sources
 
 
 def test_reference_sources_include_official_and_marketplace_entries() -> None:

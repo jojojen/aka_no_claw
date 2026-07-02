@@ -3270,7 +3270,7 @@ class CommandBridge:
         """Generic paginated-list callbacks (favorites use list kind ``mb``):
         ``pg`` repaginate/toggle mode, ``del`` remove a row then re-render in
         edit mode, ``close`` clear the list."""
-        from price_monitor_bot.list_view import LIST_VIEW_MODE_EDIT
+        from telegram_core.list_view import LIST_VIEW_MODE_EDIT
 
         if prefix == "close":
             return {"status": STATUS_OK, "message": "已關閉清單。", "actions": []}

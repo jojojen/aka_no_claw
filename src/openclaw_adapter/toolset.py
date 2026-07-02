@@ -12,9 +12,9 @@ from pathlib import Path
 from assistant_runtime import AssistantSettings, AssistantTool, ToolRegistry, build_ssl_context, get_settings
 from tcg_tracker.catalog import SUPPORTED_GAMES, normalize_game_key
 
-from .commands import list_reference_sources, lookup_card, seed_example_watchlist
 from .dashboard import serve_dashboard
-from .formatters import (
+from price_monitor_bot.commands import list_reference_sources, lookup_card, seed_example_watchlist
+from price_monitor_bot.formatters import (
     format_lookup_result,
     format_reference_sources,
     lookup_result_to_json,

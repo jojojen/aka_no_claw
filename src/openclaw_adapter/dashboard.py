@@ -23,8 +23,8 @@ from market_monitor.storage import (
 from tcg_tracker.catalog import normalize_game_key, supported_game_hint
 from tcg_tracker.hot_cards import HotCardBoard, TcgHotCardService
 
-from .commands import lookup_card
-from .formatters import lookup_result_payload, reference_sources_payload
+from price_monitor_bot.commands import lookup_card
+from price_monitor_bot.formatters import lookup_result_payload, reference_sources_payload
 
 ASSET_DIR = Path(__file__).with_name("dashboard_assets")
 TEXT_ASSET_TYPES = {

@@ -13,6 +13,7 @@ dependencies = [
   "broadlink>=0.19,<1",
   "playwright>=1.54,<2",
   "price-monitor-bot",
+  "telegram-core",
   "requests>=2.31,<3",
   "SudachiDict-full>=20260428,<20270101",
   "SudachiPy>=0.6,<1",

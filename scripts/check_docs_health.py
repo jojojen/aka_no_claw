@@ -45,6 +45,17 @@ GENERATED_REPORT_RE = re.compile(
 # Docs that index themselves / are pure listings — exempt from "must be indexed".
 INDEX_SELF_EXEMPT = {"DOCS_INDEX.md"}
 
+# Standalone public-facing HTML docs (e.g. sanitized troubleshooting guides meant
+# to be shared outside the repo), named explicitly rather than glob-matched so
+# this doesn't also sweep in the many synthetic *.html fixtures under
+# fix_benchmarks/ (those are test data, not documentation). They intentionally
+# carry no internal governance metadata — forcing "Owner area:"/"Last reviewed:"
+# into a public artifact would leak internal process detail it's designed to
+# omit. Rule A (must be indexed) still applies so they don't rot invisibly;
+# only rule B (metadata) is waived for them.
+PUBLIC_HTML_DOCS = {"BROADLINK_LOCAL_NETWORK_TROUBLESHOOTING.html"}
+PUBLIC_HTML_METADATA_EXEMPT = PUBLIC_HTML_DOCS
+
 LINK_RE = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
 INDEX_TARGET_RE = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
 
@@ -59,7 +70,9 @@ def _index_link_targets() -> set[str]:
 
 
 def _docs_files() -> list[Path]:
-    return sorted(p for p in DOCS.rglob("*.md") if p.is_file())
+    md_files = (p for p in DOCS.rglob("*.md") if p.is_file())
+    html_docs = (DOCS / name for name in PUBLIC_HTML_DOCS if (DOCS / name).is_file())
+    return sorted({*md_files, *html_docs})
 
 
 def check_indexing(errors: list[str]) -> None:
@@ -80,6 +93,8 @@ def check_metadata(errors: list[str]) -> None:
         if rel.startswith("archive/"):
             continue  # archive docs are frozen historical snapshots
         if GENERATED_REPORT_RE.match(rel):
+            continue
+        if rel in PUBLIC_HTML_METADATA_EXEMPT:
             continue
         text = path.read_text(encoding="utf-8")
         for field in REQUIRED_METADATA:

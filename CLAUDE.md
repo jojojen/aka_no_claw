@@ -58,5 +58,6 @@ tmux -L openclaw_codex list-panes -a -F "#{session_name} pid=#{pane_pid}"  # tel
 lsof -nP -p <telegram-pid> | grep ESTABLISHED   # expect a conn to a Telegram IP 149.154.x.x:443
 ```
 
-The stdout marker `OpenClaw Telegram bot polling as @Aka_No_Claw_bot` is a
+The stdout marker `Telegram bot polling as @Aka_No_Claw_bot` (printed by the
+generic `telegram_core.polling` loop, which aka now calls directly) is a
 block-buffered `print`, so it may lag — its absence is NOT proof of failure.

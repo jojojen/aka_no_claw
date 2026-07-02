@@ -1,6 +1,6 @@
 # Docs Index
 
-Last reviewed: 2026-06-30
+Last reviewed: 2026-07-03
 
 Governance for this index lives in [DOCUMENTATION_GOVERNANCE.md](DOCUMENTATION_GOVERNANCE.md).
 Full inventory with recommended actions is in [DOC_AUDIT.md](DOC_AUDIT.md).
@@ -39,7 +39,7 @@ Full inventory with recommended actions is in [DOC_AUDIT.md](DOC_AUDIT.md).
 | [NEW_OPENCODE_DECOUPLING_PLAN.md](NEW_OPENCODE_DECOUPLING_PLAN.md) | Planned | dynamic-tools | Companion: plan to move `/new` + Chat off OpenCode CLI to direct HTTP; add Mistral switch (issues #51/#59). |
 | [CHAT_GOAL_LOOP_PLAN.md](CHAT_GOAL_LOOP_PLAN.md) | Planned | dynamic-tools | Companion: chat goal loop — plan-then-execute multi-tool runs with replan, budget-continue UX, narrated trace, eval harness (issues #50–#54). |
 | [TELEGRAM_NL_OWNERSHIP_REFACTOR_ISSUE.md](TELEGRAM_NL_OWNERSHIP_REFACTOR_ISSUE.md) | Planned | telegram | Draft issue for moving aka-specific Telegram NL workflow routing out of `price_monitor_bot`. |
-| [TELEGRAM_CORE_EXTRACTION_PLAN.md](TELEGRAM_CORE_EXTRACTION_PLAN.md) | Planned | telegram | Phased plan to extract shared `telegram_core` package (transport, dispatcher contract, polling, list_view) from `price_monitor_bot`; kills the processor monkey-patch. |
+| [TELEGRAM_CORE_EXTRACTION_PLAN.md](TELEGRAM_CORE_EXTRACTION_PLAN.md) | Current | telegram | Shared `telegram_core` package (transport, dispatcher contract, polling, list_view) extracted from `price_monitor_bot`, P0–P4 shipped; kept as the implementation record and hook/registry contract reference. |
 | [KB_EMBEDDING_PLAN.md](KB_EMBEDDING_PLAN.md) | Needs review | knowledge | Embedding/RAG plan and status may need fresh verification. |
 | [OPENCLAW_TCG_MONITOR_PLAN.md](OPENCLAW_TCG_MONITOR_PLAN.md) | Needs review | price/tcg | Original monitor plan; verify against current code before relying on it. |
 | [OPPORTUNITY_AGENT_SPEC.md](OPPORTUNITY_AGENT_SPEC.md) | Needs review (canonical: opportunity) | opportunity | Spec for recommendation pipeline; verify thresholds against code. |
@@ -66,6 +66,7 @@ Full inventory with recommended actions is in [DOC_AUDIT.md](DOC_AUDIT.md).
 | [MAC_MINI_M4.md](MAC_MINI_M4.md) | Current | operations | Machine-specific operational notes; avoid copying paths into code. |
 | [BLUETOOTH_XGIMI_DEBUG_2026-07-01.md](BLUETOOTH_XGIMI_DEBUG_2026-07-01.md) | Current | operations | Sanitized incident/debug record for XGIMI Bluetooth reconnect and macOS Bluetooth permission behavior. |
 | [BROADLINK_RESTART_RECOVERY_PLAYBOOK.md](BROADLINK_RESTART_RECOVERY_PLAYBOOK.md) | Current | operations | BroadLink instability playbook: distinguish device/network failures from startup-context failures; documents the restart preflight approach. |
+| [BROADLINK_LOCAL_NETWORK_TROUBLESHOOTING.html](BROADLINK_LOCAL_NETWORK_TROUBLESHOOTING.html) | Current | operations | Sanitized, public-shareable standalone HTML version of the BroadLink LAN troubleshooting guide (no internal paths/IPs/ports); linked from MUSIC_PLAYBACK_TROUBLESHOOTING.md. Exempt from internal metadata headers by design (see DOCUMENTATION_GOVERNANCE.md). |
 | [MUSIC_PLAYBACK_TROUBLESHOOTING.md](MUSIC_PLAYBACK_TROUBLESHOOTING.md) | Current | music | afplay/CoreAudio -66681 wedge: coreaudiod-restart self-heal + one-time NOPASSWD sudo setup. |
 | [RASPBERRY_PI_5.md](RASPBERRY_PI_5.md) | Needs review | operations | Pi deployment notes. |
 

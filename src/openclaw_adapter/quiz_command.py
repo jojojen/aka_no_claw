@@ -54,7 +54,7 @@ import re
 from typing import Callable
 
 from assistant_runtime import AssistantSettings, build_ssl_context
-from price_monitor_bot.bot import TelegramBotClient
+from telegram_core.transport import TelegramBotClient
 
 from .quiz_db import is_reading_exam_point as _is_reading
 from .quiz_vocab_audio import (
