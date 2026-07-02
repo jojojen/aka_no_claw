@@ -1,6 +1,6 @@
 # Documentation Audit
 
-Last reviewed: 2026-06-30
+Last reviewed: 2026-07-03
 Owner area: agent-maintenance
 
 Full inventory of repository documentation with lifecycle status, owner area, and
@@ -46,7 +46,7 @@ for which question each one answers.
 | `NEW_OPENCODE_DECOUPLING_PLAN.md` | Planned | dynamic-tools | Keep until shipped; then fold into canonical and archive. Cross-linked from canonical. |
 | `CHAT_GOAL_LOOP_PLAN.md` | Planned | dynamic-tools | Keep until shipped (chat goal loop + eval harness, issues #50–#54); then mark Current or fold into canonical and archive. |
 | `TELEGRAM_NL_OWNERSHIP_REFACTOR_ISSUE.md` | Planned | telegram | Draft issue; keep until the cross-repo NL ownership refactor is filed/resolved. |
-| `TELEGRAM_CORE_EXTRACTION_PLAN.md` | Planned | telegram | Keep until `telegram_core` extraction ships (phases P0–P4); then mark Current or fold into SYSTEM_MAP and archive. |
+| `TELEGRAM_CORE_EXTRACTION_PLAN.md` | Current | telegram | Extraction shipped (phases P0–P4, all 3 repos' suites green); kept in place (not archived) as the `telegram_core` hook/registry contract reference. |
 | `OPPORTUNITY_AGENT_SPEC.md` | Needs review | opportunity | Verify thresholds vs code; canonical Opportunity doc. |
 | `OPPORTUNITY_AGENT_HANDOFF.md` | Needs review | opportunity | Keep as operational companion; cross-link to spec. |
 | `KB_EMBEDDING_PLAN.md` | Needs review | knowledge | Re-verify embedding/RAG status. |
@@ -63,6 +63,7 @@ for which question each one answers.
 | `MAC_MINI_M4.md` | Current | operations | Keep; machine-specific, never copy paths into code. |
 | `BLUETOOTH_XGIMI_DEBUG_2026-07-01.md` | Current | operations | Keep as sanitized incident/debug record for the XGIMI Bluetooth permission and reconnect issue. |
 | `BROADLINK_RESTART_RECOVERY_PLAYBOOK.md` | Current | operations | Keep; incident-derived BroadLink recovery/runbook for restart-context failures. |
+| `BROADLINK_LOCAL_NETWORK_TROUBLESHOOTING.html` | Current | operations | Keep; sanitized public-shareable HTML companion to the recovery playbook, linked from MUSIC_PLAYBACK_TROUBLESHOOTING.md. Explicitly named (not glob-matched) in check_docs_health.py so fix_benchmarks/ HTML test fixtures aren't swept into doc governance. |
 | `AUTO_LOGIN_SETUP.md` | Needs review | operations | Re-verify setup steps. |
 | `RASPBERRY_PI_5.md` | Needs review | operations | Re-verify Pi deployment relevance. |
 

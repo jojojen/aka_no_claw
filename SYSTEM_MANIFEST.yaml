@@ -1,5 +1,5 @@
 schema_version: 1
-last_reviewed: "2026-06-20"
+last_reviewed: "2026-07-03"
 system_name: OpenClaw
 primary_repo: aka_no_claw
 status_vocabulary:
@@ -44,6 +44,21 @@ repos:
       - src/assistant_runtime
       - src/openclaw_adapter
       - requirements.txt
+
+  telegram_core:
+    role: shared_telegram_infra_package
+    default_branch: main
+    responsibility:
+      - Telegram transport (TelegramBotClient)
+      - generic poll loop and message/callback_query dispatch
+      - list-view pagination rendering
+      - CoreCommandProcessor (allowlist, registries, Phase-3 hooks)
+    integration_status: integrated
+    notes: zero runtime dependencies; depended on by BOTH aka_no_claw and
+      price_monitor_bot, never the reverse. No domain (price/SNS/photo)
+      vocabulary lives here. See docs/TELEGRAM_CORE_EXTRACTION_PLAN.md.
+    key_paths:
+      - src/telegram_core
 
   price_monitor_bot:
     role: tcg_price_monitor_package

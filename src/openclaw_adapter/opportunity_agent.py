@@ -20,7 +20,7 @@ from typing import Any, Sequence
 from assistant_runtime import AssistantSettings, build_ssl_context, get_settings
 from market_monitor.mercari_search import DEFAULT_CONDITION_IDS, search_mercari
 from market_monitor.storage import MarketplaceWatch, MonitorDatabase
-from price_monitor_bot.bot import TelegramBotClient
+from telegram_core.transport import TelegramBotClient
 from price_monitor_bot.commands import lookup_card
 from tcg_tracker.catalog import normalize_game_key, supported_game_hint
 from tcg_tracker.hot_cards import TcgHotCardService

@@ -3,7 +3,7 @@
 Status: Current
 Owner area: agent-maintenance
 
-Last reviewed: 2026-06-25
+Last reviewed: 2026-07-03
 
 ## Status Legend
 
@@ -20,7 +20,7 @@ Last reviewed: 2026-06-25
 
 | Subsystem | Status | Entry points | Data stores | Notes |
 |---|---|---|---|---|
-| Telegram bot | `beta` | `python -m openclaw_adapter telegram-poll --notify-startup`, `launchers/start-telegram-bot.*` | Telegram-facing runtime settings, inbox DBs | Main user interface. Requires token/chat ID in `.env`. |
+| Telegram bot | `beta` | `python -m openclaw_adapter telegram-poll --notify-startup`, `launchers/start-telegram-bot.*` | Telegram-facing runtime settings, inbox DBs | Main user interface. Requires token/chat ID in `.env`. Three-package split: `telegram_core` (zero-dep transport/poll-loop/dispatch, shared) → `price_monitor_bot.bot.TelegramCommandProcessor` (price-domain hooks/registries) → `openclaw_adapter.telegram_bot.TelegramCommandProcessor` (aka-domain hooks/registries, the class actually run in production). See [TELEGRAM_CORE_EXTRACTION_PLAN.md](TELEGRAM_CORE_EXTRACTION_PLAN.md). |
 | CLI tool registry | `shipped` | `python -m openclaw_adapter list-tools` | n/a | Central registry for assistant tools. |
 | Price lookup | `beta` | `/price`, `python -m openclaw_adapter lookup-card` | Source caches / runtime DBs | Uses TCG and market layers plus historical price monitor behavior. |
 | Liquidity board | `beta` | `/liquidity`, dashboard | Market/source data | Methodology is documented in `LIQUIDITY_METHODOLOGY.md`. |
@@ -38,7 +38,7 @@ Last reviewed: 2026-06-25
 ## Known Drift / Mismatch
 
 - Some README sections are operational and long; use [DOCS_INDEX.md](DOCS_INDEX.md) for the current documentation map.
-- `price_monitor_bot` still carries historical Telegram price-bot behavior; check whether behavior has migrated into `aka_no_claw` adapters before editing.
+- `price_monitor_bot` still carries historical Telegram price-bot behavior (lookup/watch/photo/reputation-snapshot commands); the shared transport/poll-loop/dispatch machinery has been extracted to `telegram_core` (see [TELEGRAM_CORE_EXTRACTION_PLAN.md](TELEGRAM_CORE_EXTRACTION_PLAN.md)) — the old `aka_no_claw` → `price_monitor_bot` monkey-patch is gone.
 - `sns_monitor_bot` owns SNS monitor internals, while `aka_no_claw` owns Telegram and service wiring.
 - `reputation_snapshot` remains independently runnable; OpenClaw integration should not assume it is only an embedded component.
 - Some older plan docs are historical. Prefer files marked `Current` in [DOCS_INDEX.md](DOCS_INDEX.md).

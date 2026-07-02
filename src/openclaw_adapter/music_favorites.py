@@ -20,7 +20,7 @@ import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
-from price_monitor_bot.list_view import (
+from telegram_core.list_view import (
     LIST_VIEW_MODE_READ,
     ListRow,
     build_list_view,

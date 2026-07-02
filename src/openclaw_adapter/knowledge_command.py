@@ -86,7 +86,7 @@ def build_knowledge_market_view_fn(
     for the market knowledge paginated list view (list_kind ``km``)."""
 
     from .knowledge_db import KnowledgeDatabase
-    from price_monitor_bot.list_view import LIST_VIEW_MODE_READ, ListRow, build_list_view
+    from telegram_core.list_view import LIST_VIEW_MODE_READ, ListRow, build_list_view
 
     db_path = settings.knowledge_db_path
 
@@ -120,7 +120,7 @@ def build_knowledge_coding_view_fn(
     for the coding knowledge paginated list view (list_kind ``kc``)."""
 
     from .knowledge_db import KnowledgeDatabase
-    from price_monitor_bot.list_view import LIST_VIEW_MODE_READ, ListRow, build_list_view
+    from telegram_core.list_view import LIST_VIEW_MODE_READ, ListRow, build_list_view
 
     db_path = settings.knowledge_db_path
 

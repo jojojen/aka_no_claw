@@ -17,7 +17,7 @@ from price_monitor_bot.bot import (
     TelegramPhotoIntentOption,
 )
 
-from openclaw_adapter.formatters import format_lookup_result_telegram
+from price_monitor_bot.formatters import format_lookup_result_telegram
 from openclaw_adapter.natural_language import TelegramNaturalLanguageIntent
 from openclaw_adapter.reputation_snapshot import ReputationSnapshotResult, SnapshotStillPending
 from openclaw_adapter.telegram_bot import (

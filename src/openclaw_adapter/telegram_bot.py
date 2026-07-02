@@ -14,7 +14,6 @@ from urllib.request import Request, urlopen
 from pathlib import Path
 from typing import Callable
 
-import price_monitor_bot.bot as _price_bot_module
 from assistant_runtime import AssistantSettings, build_ssl_context
 from assistant_runtime.logging_utils import trim_for_log
 
@@ -27,8 +26,6 @@ from price_monitor_bot.bot import (  # noqa: F401
     PhotoLookupReply,
     ResearchRenderer,
     ReputationRenderer,
-    TelegramBotClient,
-    TelegramFileAttachment,
     TelegramLookupQuery,
     TelegramPhotoIntentAnalysis,
     TelegramPhotoIntentOption,
@@ -36,20 +33,25 @@ from price_monitor_bot.bot import (  # noqa: F401
     TelegramResearchQuery,
     TelegramReputationDelivery,
     TelegramReputationQuery,
-    TelegramTextReplyPlan,
-    RegisteredCommand,
     build_processing_ack,
     default_board_loader as _base_default_board_loader,
     default_lookup_renderer as _base_default_lookup_renderer,
     default_photo_renderer as _base_default_photo_renderer,
     format_liquidity_board,
     format_photo_lookup_result,
-    handle_telegram_message,
     parse_lookup_command,
     parse_reputation_snapshot_command,
-    run_telegram_polling as _base_run_telegram_polling,
-    send_telegram_test_message as _base_send_telegram_test_message,
     TelegramCommandProcessor as _BaseTelegramCommandProcessor,
+)
+from telegram_core.contracts import RegisteredCommand, TelegramTextReplyPlan  # noqa: F401
+from telegram_core.polling import (  # noqa: F401
+    handle_telegram_message,
+    run_telegram_polling as _core_run_telegram_polling,
+)
+from telegram_core.transport import (  # noqa: F401
+    TelegramBotClient,
+    TelegramFileAttachment,
+    send_telegram_test_message as _base_send_telegram_test_message,
 )
 from price_monitor_bot.watch_monitor import ensure_monitor as _ensure_watch_monitor
 from tcg_tracker.image_lookup import TcgVisionSettings
@@ -107,8 +109,13 @@ from .music_favorites import (
     build_music_best_view_fn,
     build_music_best_item_deleter,
 )
-from price_monitor_bot.list_view import LIST_VIEW_MODE_READ as _MB_READ
+from telegram_core.list_view import LIST_VIEW_MODE_READ as _MB_READ
 from .sns_commands import (
+    PendingTelegramSnsBulkUpdate,
+    build_sns_bulk_add_filter_plan,
+    build_sns_bulk_remove_filter_plan,
+    build_sns_bulk_update_schedule_plan,
+    handle_sns_bulk_update_callback,
     build_sns_add_handler,
     build_snslist_handler,
     build_snslist_view_fn,
@@ -176,7 +183,7 @@ from .web_search import (
     summarize_web_sources_with_ollama,
     web_search,
 )
-from price_monitor_bot.bot import TelegramTextReplyPlan
+from telegram_core.contracts import TelegramTextReplyPlan
 
 logger = logging.getLogger(__name__)
 
@@ -341,6 +348,86 @@ class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
             allowed_chat_ids = frozenset({settings.openclaw_telegram_chat_id})
         super().__init__(allowed_chat_ids=allowed_chat_ids, **kwargs)
         self._callback_registry.setdefault("goal", self._handle_goal_callback)
+        self._pending_sns_bulk_updates: dict[str, PendingTelegramSnsBulkUpdate] = {}
+        self._callback_registry.setdefault("bulk", self._bulk_callback)
+
+    def get_pending_sns_bulk_update(self, chat_id: str | int) -> PendingTelegramSnsBulkUpdate | None:
+        key = str(chat_id)
+        pending = self._pending_sns_bulk_updates.get(key)
+        if pending is None:
+            return None
+        if not pending.is_expired():
+            return pending
+        self._pending_sns_bulk_updates.pop(key, None)
+        return None
+
+    def set_pending_sns_bulk_update(self, pending: PendingTelegramSnsBulkUpdate) -> None:
+        self._pending_sns_bulk_updates[pending.chat_id] = pending
+
+    def pop_pending_sns_bulk_update(self, chat_id: str | int) -> PendingTelegramSnsBulkUpdate | None:
+        return self._pending_sns_bulk_updates.pop(str(chat_id), None)
+
+    def _bulk_callback(
+        self, payload: str, original_text: str, chat_id: str
+    ) -> tuple[str | None, str | None, dict[str, object] | None]:
+        # Preserves the pre-Phase-3 quirk that `toast` defaults to "未知按鈕"
+        # unless the underlying handler explicitly overrides it.
+        if payload not in ("c", "x"):
+            logger.warning("Unknown callback_query prefix=%r data=%r", "bulk", f"bulk:{payload}")
+            return "未知按鈕", None, None
+        toast_out, edit_text, edit_kb = handle_sns_bulk_update_callback(
+            sns_db=self._sns_db,
+            pop_pending=self.pop_pending_sns_bulk_update,
+            action=payload,
+            chat_id=chat_id,
+            original_text=original_text,
+        )
+        return (toast_out if toast_out is not None else "未知按鈕"), edit_text, edit_kb
+
+    def _build_sns_bulk_add_filter_plan(
+        self,
+        *,
+        chat_id: str | int,
+        target_domain: str,
+        keywords: tuple[str, ...],
+    ) -> TelegramTextReplyPlan:
+        return build_sns_bulk_add_filter_plan(
+            self._sns_db,
+            chat_id=chat_id,
+            target_domain=target_domain,
+            keywords=keywords,
+            set_pending=self.set_pending_sns_bulk_update,
+        )
+
+    def _build_sns_bulk_remove_filter_plan(
+        self,
+        *,
+        chat_id: str | int,
+        target_domain: str,
+        keywords: tuple[str, ...],
+    ) -> TelegramTextReplyPlan:
+        return build_sns_bulk_remove_filter_plan(
+            self._sns_db,
+            chat_id=chat_id,
+            target_domain=target_domain,
+            keywords=keywords,
+            set_pending=self.set_pending_sns_bulk_update,
+        )
+
+    def _build_sns_bulk_update_schedule_plan(
+        self,
+        *,
+        chat_id: str | int,
+        minutes: int | None,
+        target_domain: str,
+    ) -> TelegramTextReplyPlan:
+        return build_sns_bulk_update_schedule_plan(
+            self._sns_db,
+            chat_id=chat_id,
+            target_domain=target_domain,
+            minutes=minutes,
+            set_pending=self.set_pending_sns_bulk_update,
+        )
 
     def _help_text(self) -> str:
         return _build_openclaw_help_text(getattr(self, "_command_registry", None))
@@ -515,6 +602,24 @@ class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
         chat_id: str | int = "",
     ) -> TelegramTextReplyPlan | None:
         cid = str(chat_id)
+        if intent.intent == "sns_bulk_add_filter":
+            return self._build_sns_bulk_add_filter_plan(
+                chat_id=chat_id,
+                target_domain=intent.bulk_target_domain or "",
+                keywords=intent.bulk_filter_keywords,
+            )
+        if intent.intent == "sns_bulk_remove_filter":
+            return self._build_sns_bulk_remove_filter_plan(
+                chat_id=chat_id,
+                target_domain=intent.bulk_target_domain or "",
+                keywords=intent.bulk_filter_keywords,
+            )
+        if intent.intent == "sns_bulk_update_schedule":
+            return self._build_sns_bulk_update_schedule_plan(
+                chat_id=chat_id,
+                target_domain=intent.bulk_target_domain or "",
+                minutes=intent.sns_schedule_minutes,
+            )
         if intent.intent == "create_workflow":
             desc = intent.workflow_description or ""
             wf_spec = self._command_registry.get("/workflow")
@@ -683,7 +788,15 @@ class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
         original_text: str,
     ) -> bool:
         if prefix != "goal":
-            return False
+            return super().handle_callback_query_async(
+                client=client,
+                callback_id=callback_id,
+                chat_id=chat_id,
+                message_id=message_id,
+                prefix=prefix,
+                payload=payload,
+                original_text=original_text,
+            )
         try:
             client.answer_callback_query(
                 callback_query_id=callback_id,
@@ -2248,17 +2361,17 @@ def run_telegram_polling(
         )
 
     goal_bridge = CommandBridge(settings=settings)
-    _price_bot_module.TelegramCommandProcessor = (
-        lambda **kwargs: TelegramCommandProcessor(
-            settings=settings, workflow_editor=_wf_editor, goal_bridge=goal_bridge, **kwargs
-        )
-    )
-    return _base_run_telegram_polling(
-        token=token,
+    # P3 completion: build the app processor here and hand it to the generic
+    # telegram_core loop — the price_monitor_bot processor_factory relay is
+    # retired. Startup stdout marker is now core's
+    # "Telegram bot polling as @…" (see CLAUDE.md ops section).
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        workflow_editor=_wf_editor,
+        goal_bridge=goal_bridge,
         lookup_renderer=lookup_renderer,
         board_loader=board_loader,
         catalog_renderer=catalog_renderer,
-        photo_renderer=photo_renderer or build_photo_renderer(settings, research_renderer=research_renderer),
         photo_intent_analyzer=default_photo_intent_analyzer(settings),
         reputation_renderer=default_reputation_renderer(settings),
         research_renderer=research_renderer,
@@ -2266,7 +2379,6 @@ def run_telegram_polling(
         natural_language_router=build_telegram_natural_language_router_from_settings(settings),
         intent_fast_path=_build_intent_fast_path(settings),
         image_translate_recognizer=build_image_translate_caption_recognizer(settings),
-        ssl_context=build_ssl_context(settings),
         allowed_chat_ids=frozenset(settings.openclaw_telegram_chat_ids),
         status_renderer=lambda: _build_status_text(settings, dynamic_tool_runner),
         command_handlers=command_handlers,
@@ -2279,6 +2391,13 @@ def run_telegram_polling(
         sns_db=sns_db,
         sns_buzz_fn=sns_buzz_fn,
         feedback_service=feedback_service,
+    )
+    return _core_run_telegram_polling(
+        token=token,
+        processor=processor,
+        photo_renderer=photo_renderer or build_photo_renderer(settings, research_renderer=research_renderer),
+        ssl_context=build_ssl_context(settings),
+        allowed_chat_ids=frozenset(settings.openclaw_telegram_chat_ids),
         poll_timeout=poll_timeout,
         notify_startup=notify_startup,
         drop_pending_updates=drop_pending_updates,
@@ -2298,7 +2417,7 @@ def _build_feedback_service(watch_db: MonitorDatabase):
 
 def _start_rag_daily_digest(settings) -> RagDailyDigestScheduler | None:
     """Start the daily RAG digest daemon (fires at 22:00 local time)."""
-    from price_monitor_bot.bot import TelegramBotClient
+    from telegram_core.transport import TelegramBotClient
     chat_ids = tuple(cid for cid in settings.openclaw_telegram_chat_ids if cid)
     if not chat_ids:
         logger.warning("_start_rag_daily_digest: no chat_ids configured — skipping")
@@ -2332,7 +2451,7 @@ def _start_home_schedule_scheduler(settings, command_handlers) -> HomeScheduleSc
     """Start the /schedulehome daemon (issue #39): fires due home schedules at
     minute resolution, re-dispatching their stored slash commands through the
     same command registry the bot uses. Results are reported back to Telegram."""
-    from price_monitor_bot.bot import TelegramBotClient
+    from telegram_core.transport import TelegramBotClient
 
     chat_ids = tuple(cid for cid in settings.openclaw_telegram_chat_ids if cid)
     try:
@@ -2491,7 +2610,7 @@ def _build_backup_notify(settings):
         logger.warning("_build_backup_notify: no chat_ids configured — backup runs silent")
         return None
     try:
-        from price_monitor_bot.bot import TelegramBotClient
+        from telegram_core.transport import TelegramBotClient
         token = require_telegram_token(settings)
         client = TelegramBotClient(token, ssl_context=build_ssl_context(settings))
     except Exception:

@@ -3,14 +3,15 @@
 Status: Current
 Owner area: architecture
 
-Last reviewed: 2026-06-20
+Last reviewed: 2026-07-03
 
 ## Repo Map
 
 | Repo | Role | Current relationship |
 |---|---|---|
 | `aka_no_claw` | Primary OpenClaw orchestrator. Owns assistant runtime, CLI, Telegram adapter, dashboard, opportunity pipeline, service wiring, dynamic tools, and docs. | Primary repo. |
-| `price_monitor_bot` | Historical TCG price monitor and reusable Telegram-domain package. | Still provides price-monitoring behavior used by OpenClaw flows. |
+| `telegram_core` | Zero-dependency shared package: Telegram transport (`TelegramBotClient`), generic dispatch contracts, list-view rendering, and the domain-free poll loop (`CoreCommandProcessor`, `polling.py`). | Depended on by BOTH `aka_no_claw` and `price_monitor_bot` — the correct dependency direction (see [TELEGRAM_CORE_EXTRACTION_PLAN.md](TELEGRAM_CORE_EXTRACTION_PLAN.md), now Current/complete). Neither consumer repo is imported by it. |
+| `price_monitor_bot` | Historical TCG price monitor and reusable Telegram-domain package. | Still provides price-monitoring behavior (lookup/watch/photo/reputation-snapshot commands) used by OpenClaw flows; its `TelegramCommandProcessor` subclasses `telegram_core.processor.CoreCommandProcessor`. |
 | `sns_monitor_bot` | SNS/X watch storage, polling, signal extraction, feedback-aware monitoring, reminders, and 4chan buzz digest logic. | Integrated through `openclaw_adapter.sns_tools` and `sns_monitor_service`. |
 | `reputation_snapshot` | Mercari profile/item reputation capture, signed proof generation, and proof verification UI/API. | Integrated through `openclaw_adapter.reputation_agent` and `/snapshot`. |
 
@@ -19,6 +20,7 @@ Last reviewed: 2026-06-20
 | Layer | Path | Responsibility |
 |---|---|---|
 | Runtime | `src/assistant_runtime` | Settings, logging, TLS, registry, and generic assistant runtime foundations. |
+| Telegram core | `telegram_core` (sibling package, zero deps) | Transport, list-view rendering, dispatch contracts, and the generic poll loop / `CoreCommandProcessor`. Both `aka_no_claw` and `price_monitor_bot` depend on it; it depends on neither. Telegram-domain command/callback vocabulary (`/price`, `cond:`, `wprc:`, SNS bulk, photo pipeline, ...) does NOT live here — only in the two consumer repos' hook overrides and registries. |
 | Generic market core | `price_monitor_bot/src/market_monitor` | Generic monitoring and source-management logic imported through the sibling package. Keep card-specific heuristics out. |
 | TCG domain | `price_monitor_bot/src/tcg_tracker` | Card aliases, matching, TCG source adapters, and TCG-specific lookup behavior imported through the sibling package. |
 | OpenClaw adapter | `src/openclaw_adapter` | CLI, Telegram, dashboard, dynamic tools, `/research`, SNS integration, opportunity agent, and sibling repo adapters. |

@@ -7,6 +7,12 @@ Owner area: telegram
 Draft GitHub issue / planning note for cleaning up the cross-repo ownership
 problem exposed by issue #53.
 
+Companion / cross-links: [TELEGRAM_CORE_EXTRACTION_PLAN.md](TELEGRAM_CORE_EXTRACTION_PLAN.md)
+is the sibling infra split (transport/poll-loop/dispatch → `telegram_core`,
+now shipped); this doc's NL-routing ownership move is a separate concern —
+`CoreCommandProcessor._route_natural_language` is a hook precisely so this
+refactor can relocate the router without touching `telegram_core`.
+
 ## Task 1 Work Log
 
 2026-07-01 characterization pass for the model-first refactor:
