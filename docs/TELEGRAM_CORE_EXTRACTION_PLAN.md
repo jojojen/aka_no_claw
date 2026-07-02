@@ -538,6 +538,69 @@ packaging precedent), [SYSTEM_MAP.md](SYSTEM_MAP.md), [TASK_ROUTING.md](TASK_ROU
     `OpenClaw Telegram bot polling` references remain in aka.
   - Still nothing pushed in any repo — refreshed §A summary owed to 主上;
     live smoke (§5) follows the push via「重啟龍蝦」.
+- **2026-07-03 (later same day) — push, live smoke, PRs, CI fix (all landed)**:
+  - Pushed all three repos per the §A summary (主上 replied 推): `telegram_core`
+    `95504dd` direct to `master`; `price_monitor_bot` `4c63f82` on
+    `codex/telegram-goal-callback-async`; `aka_no_claw` `c1bfec7` on
+    `issue-54-chat-goal-loop-foundation`.
+  - 主上 restarted the bot (`/restartall`); live smoke confirmed: tmux
+    `openclaw_codex` has both `telegram`/`bridge` sessions up, `lsof` shows an
+    ESTABLISHED connection to a Telegram `149.154.x.x:443` IP, and a
+    `telegram_core.transport` test-send round-tripped successfully.
+  - PRs: marked price_monitor_bot's existing draft PR #2 ready-for-review
+    (commented re: the extra commit); opened new aka_no_claw PR #69 (its prior
+    PR #68 had already merged before this session's commit landed);
+    telegram_core needed no PR (pushed straight to its own default branch).
+  - **CI failure surfaced on PR #69** (`goal-loop-evals` job):
+    `ModuleNotFoundError: No module named 'market_monitor'`. Root-caused via
+    `gh run list`/`gh run view --log-failed` history as PRE-EXISTING —
+    identical failure already present on the commit immediately before this
+    refactor's push, so NOT a regression. True cause: `tests.yml`'s
+    `PYTHONPATH` trick assumed sibling-repo checkouts exist next to
+    `aka_no_claw`, true only in local multi-repo dev layout, false on a
+    GitHub-hosted single-repo `ubuntu-latest` runner. 主上 chose 「順手修」
+    (fix now, not deferred).
+  - **Fix, take 1**: added explicit `actions/checkout@v4` steps for
+    `price_monitor_bot`, `telegram_nl`, `telegram_core` with
+    `path: ../<repo>` to mirror the local sibling layout. Failed:
+    `actions/checkout@v4` rejects any `path:` outside `$GITHUB_WORKSPACE`.
+  - **Fix, take 2** (commits `ce4a963`, `f2428dc`): changed the three sibling
+    checkouts to `path: _deps/<repo>` (subdirectories of the workspace) and
+    updated `PYTHONPATH` to `.:src:_deps/price_monitor_bot/src:_deps/telegram_nl/src:_deps/telegram_core/src`.
+    This resolved the `market_monitor` import; CI then surfaced a second,
+    previously-latent failure: `ModuleNotFoundError: No module named
+    'truststore'` (once `market_monitor` resolved, the import chain reached
+    `assistant_runtime/tls.py`'s unconditional `import truststore`).
+  - Root cause of the `truststore` gap: it's a genuine third-party PyPI
+    package (`price_monitor_bot/pyproject.toml` declares
+    `truststore>=0.10,<1`), present in local dev venvs only because
+    `pip install -e ../price_monitor_bot` pulls it in transitively; CI's job
+    never installs anything beyond `pytest`, relying purely on `sys.path`
+    injection for everything.
+  - Before patching, exhaustively grepped every top-level import in the
+    `goal-loop-evals` job's 5 test files' dependency graph
+    (`llm_pool_settings.py`, `goal_planner.py`, `goal_loop.py`,
+    `task_loop.py`, `task_workspace.py`, `eval_runner.py`,
+    `command_bridge_models.py`, plus `market_monitor/*.py` and
+    `assistant_runtime/*.py`) to confirm `truststore` is the ONLY missing
+    third-party package for this slice — avoiding a third whack-a-mole
+    failure. All other modules touched are stdlib + intra-package only.
+  - **Fix, take 3** (commit `fd4f460`, pushed): added `truststore` to the
+    existing `pip install pytest` step (→ `pip install pytest truststore`);
+    corrected the now-stale comment above the sibling-checkout steps (it
+    previously claimed "no pip install needed" for the companion repos,
+    which is still true for their own code but was misleading about
+    `truststore`). Deliberately did NOT switch to full `pip install -e .` of
+    aka/price/telegram_nl — aka's own `pyproject.toml` pulls in `playwright`,
+    `broadlink`, and `SudachiDict-full` (a large JA dictionary package),
+    which would make this narrow eval-slice job slow/heavy for no benefit.
+  - **Verified green**: `gh run list` on `issue-54-chat-goal-loop-foundation`
+    shows both `tests` and `docs-health` workflows `success` on head SHA
+    `fd4f460`; `gh pr view 69` confirms both check runs (`docs-health`,
+    `goal-loop-evals`) report `SUCCESS`.
+  - **Status: extraction complete, PRs open awaiting 主上's manual merge, CI
+    fully green.** No further action pending on this plan unless new gaps
+    surface during review.
 
 ## 0. Problem statement
 
