@@ -9,24 +9,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Sibling repos, checked out next to this one (`../<repo>`) so the
-      # PYTHONPATH below mirrors the local multi-repo dev layout. These
-      # provide pure-stdlib modules only (market_monitor, telegram_nl,
-      # telegram_core) — no pip install needed for the slice this job runs.
+      # Companion repos, checked out as subdirectories of this workspace
+      # (actions/checkout refuses a `path` outside $GITHUB_WORKSPACE, so a
+      # true `../<repo>` sibling — matching the local multi-repo dev layout
+      # — isn't possible here). These provide pure-stdlib modules only
+      # (market_monitor, telegram_nl, telegram_core) — no pip install
+      # needed for the slice this job runs.
       - uses: actions/checkout@v4
         with:
           repository: jojojen/price_monitor_bot
-          path: ../price_monitor_bot
+          path: _deps/price_monitor_bot
 
       - uses: actions/checkout@v4
         with:
           repository: jojojen/telegram_nl
-          path: ../telegram_nl
+          path: _deps/telegram_nl
 
       - uses: actions/checkout@v4
         with:
           repository: jojojen/telegram_core
-          path: ../telegram_core
+          path: _deps/telegram_core
 
       - uses: actions/setup-python@v5
         with:
@@ -37,7 +39,7 @@ jobs:
 
       - name: Run goal-loop eval slice
         run: |
-          PYTHONPATH=.:src:../price_monitor_bot/src:../telegram_nl/src:../telegram_core/src \
+          PYTHONPATH=.:src:_deps/price_monitor_bot/src:_deps/telegram_nl/src:_deps/telegram_core/src \
           python -m pytest \
           tests/test_eval_cases.py \
           tests/test_goal_loop.py \
