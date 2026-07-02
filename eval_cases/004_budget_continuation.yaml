@@ -1,0 +1,25 @@
+{
+  "id": "004_budget_continuation",
+  "goal": "需要續跑一次",
+  "max_steps": 1,
+  "resume_once": true,
+  "drafts": [
+    {
+      "workflow": {
+        "id": "wf-pause",
+        "goal": "需要續跑一次",
+        "steps": [
+          {"id": "s1", "kind": "tool_call", "tool": "real_tool", "args": {}, "output": "done_text"}
+        ]
+      }
+    }
+  ],
+  "tool_responses": [
+    {"slug": "real_tool", "responses": [{"ok": true, "text": "done"}]}
+  ],
+  "expected": {
+    "final_state": "done",
+    "first_run_paused": true,
+    "tool_called": "real_tool"
+  }
+}

@@ -24,6 +24,7 @@ from openclaw_adapter.command_bridge_models import (
     CHAT_BACKEND_CLOUD_POOL,
     CHAT_BACKEND_LOCAL,
     CHAT_TOOL_BLUETOOTH,
+    CHAT_TOOL_GOAL,
     CHAT_TOOL_IR,
     CHAT_TOOL_MUSIC,
     CHAT_TOOL_NO_TOOL,
@@ -48,10 +49,14 @@ from openclaw_adapter.command_bridge_models import (
     SUBMODE_SELLER_REPUTATION_SNAPSHOT,
     SUBMODE_TEXT_TRANSLATION,
     RequestValidationError,
+    WebCommandResponse,
     make_chat_tool_request,
     parse_chat_tool_plan,
     parse_request,
 )
+from openclaw_adapter.goal_loop import GoalLoopContinuation, GoalLoopReport
+from openclaw_adapter.task_loop import ContinuationState
+from openclaw_adapter.task_workspace import Workflow
 
 
 class _FakeRegistered:
@@ -657,6 +662,17 @@ def test_parse_chat_tool_plan_ir_tool():
     )
 
 
+def test_parse_chat_tool_plan_goal_tool():
+    plan = parse_chat_tool_plan(
+        '{"tool":"__goal__","query":"先查天氣再播報的工作流","reason_summary":"多步驟目標"}'
+    )
+    assert plan == ChatToolPlan(
+        tool=CHAT_TOOL_GOAL,
+        query="先查天氣再播報的工作流",
+        reason_summary="多步驟目標",
+    )
+
+
 def test_parse_chat_tool_plan_extracts_json_from_noise():
     raw = '<think>嗯</think> 好的：\n```json\n{"tool":"/search","query":"q"}\n```'
     plan = parse_chat_tool_plan(raw)
@@ -670,6 +686,7 @@ def test_parse_chat_tool_plan_extracts_json_from_noise():
     '{"tool":"/rm-rf","query":"x"}',
     '{"tool":"/search","query":"   "}',
     '{"tool":"/search"}',
+    '{"tool":"__goal__","query":"   "}',
     '{"tool":"__no_tool__","answer":"   "}',
     '{"tool":"teleport"}',
 ])
@@ -833,6 +850,8 @@ def test_router_prompt_includes_registered_control_tool_usage(monkeypatch):
     assert "stop=停止" in prompt
     assert "playbest=播放最愛" in prompt
     assert "當使用者要控制本機音樂播放時使用" in prompt
+    assert "__goal__" in prompt
+    assert "多步驟目標" in prompt
     assert "/bluetooth" in prompt
     assert "scan=掃描" in prompt
     assert "當使用者要掃描藍牙裝置時使用" in prompt
@@ -1229,6 +1248,240 @@ def test_select_chat_tool_plan_gemini_failure_does_not_fallback_to_local(monkeyp
     )
     assert plan is None
     assert metadata is None
+
+
+def test_chat_goal_plan_returns_preview(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        b,
+        "_select_chat_tool_plan",
+        lambda req: (
+            ChatToolPlan(
+                tool=CHAT_TOOL_GOAL,
+                query="先查天氣再播報的工作流",
+                reason_summary="多步驟目標",
+            ),
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        b,
+        "_preview_goal_loop",
+        lambda req, goal, planner_metadata=None: SimpleNamespace(
+            status=STATUS_OK,
+            message=f"preview:{goal}",
+            mode=MODE_CHAT,
+            model_metadata=None,
+        ),
+    )
+    resp = b.handle(parse_request({"mode": "chat", "input": "幫我規劃先查天氣再播報"}))
+    assert resp.status == STATUS_OK
+    assert resp.message == "preview:先查天氣再播報的工作流"
+
+
+def test_stream_goal_plan_returns_preview(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+
+    def _plan(req):
+        if False:
+            yield {}
+        return ChatToolPlan(
+            tool=CHAT_TOOL_GOAL,
+            query="先查天氣再播報的工作流",
+            reason_summary="多步驟目標",
+        ), None
+
+    monkeypatch.setattr(b, "_stream_chat_tool_plan", _plan)
+
+    def _stream_goal(req, goal, planner_metadata=None):
+        yield {"type": "done", "message": f"preview:{goal}"}
+
+    monkeypatch.setattr(b, "_stream_goal_preview", _stream_goal)
+    events = list(b.stream(parse_request({"mode": "chat", "input": "幫我規劃先查天氣再播報"}), "rid-goal"))
+    assert [e["type"] for e in events] == ["start", "done"]
+    assert events[-1]["message"] == "preview:先查天氣再播報的工作流"
+
+
+def test_chat_goal_resume_uses_saved_continuation(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    continuation = GoalLoopContinuation(
+        state=ContinuationState(
+            goal="先查天氣再播報",
+            next_action="run_workflow",
+            stop_condition="step budget reached",
+        ),
+        workflow=Workflow(id="wf-weather", goal="先查天氣再播報", steps=[]),
+        replans_used=0,
+        narration=("已理解目標為：先查天氣再播報",),
+    )
+    req = parse_request({"mode": "chat", "input": "幫我規劃先查天氣再播報", "conversation_id": "g1"})
+    b._store_goal_continuation(req, continuation, chat_backend=CHAT_BACKEND_LOCAL, planner_metadata=None)
+
+    monkeypatch.setattr(
+        b,
+        "_execute_goal_loop",
+        lambda **kwargs: GoalLoopReport(
+            done=True,
+            final_result="完成了",
+            workflow=kwargs["resume"].workflow,
+            trace=None,
+            continuation=None,
+            replans_used=0,
+            narration=("續跑中",),
+        ),
+    )
+    resumed = b.handle(parse_request({"mode": "chat", "input": "繼續", "conversation_id": "g1"}))
+    assert resumed.status == STATUS_OK
+    assert "續跑中" in resumed.message
+    assert "完成了" in resumed.message
+    assert "g1" not in b._goal_continuations
+
+
+def test_stream_goal_resume_emits_heartbeat_then_done(monkeypatch):
+    from openclaw_adapter import command_bridge as bridge_mod
+
+    b = CommandBridge(settings=_tool_settings())
+    continuation = GoalLoopContinuation(
+        state=ContinuationState(goal="先查天氣再播報", next_action="run_workflow"),
+        workflow=Workflow(id="wf-weather", goal="先查天氣再播報", steps=[]),
+    )
+    req = parse_request({"mode": "chat", "input": "x", "conversation_id": "g2"})
+    b._store_goal_continuation(req, continuation, chat_backend=CHAT_BACKEND_LOCAL, planner_metadata=None)
+    monkeypatch.setattr(bridge_mod, "_HEARTBEAT_SECONDS", 0.01)
+
+    def _resume(_req, entry):
+        time.sleep(0.03)
+        return WebCommandResponse(status=STATUS_OK, message="resumed", mode=MODE_CHAT)
+
+    monkeypatch.setattr(b, "_resume_goal_loop", _resume)
+    events = list(b.stream(parse_request({"mode": "chat", "input": "繼續", "conversation_id": "g2"}), "rid-resume"))
+    assert events[0]["type"] == "start"
+    assert any(event["type"] == "heartbeat" for event in events)
+    assert events[-1]["type"] == "done"
+    assert events[-1]["message"] == "resumed"
+
+
+def test_stream_goal_resume_error_emits_stream_error(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    continuation = GoalLoopContinuation(
+        state=ContinuationState(goal="先查天氣再播報", next_action="run_workflow"),
+        workflow=Workflow(id="wf-weather", goal="先查天氣再播報", steps=[]),
+    )
+    req = parse_request({"mode": "chat", "input": "x", "conversation_id": "g3"})
+    b._store_goal_continuation(req, continuation, chat_backend=CHAT_BACKEND_LOCAL, planner_metadata=None)
+    monkeypatch.setattr(
+        b,
+        "_resume_goal_loop",
+        lambda _req, entry: WebCommandResponse(status=STATUS_ERROR, message="resume failed", mode=MODE_CHAT),
+    )
+    events = list(b.stream(parse_request({"mode": "chat", "input": "繼續", "conversation_id": "g3"}), "rid-resume-err"))
+    assert events[0]["type"] == "start"
+    assert events[-1]["type"] == "error"
+    assert events[-1]["message"] == "resume failed"
+
+
+def test_goal_budget_message_and_actions_for_step_pause():
+    b = CommandBridge(settings=_tool_settings())
+    cont = GoalLoopContinuation(
+        state=ContinuationState(
+            goal="先查天氣再播報",
+            completed=["draft: drafted wf-weather with 2 step(s)"],
+            attempted_fixes=["run_workflow: timeout"],
+            budget={"steps_used": 6, "steps_limit": 6, "replans_used": 1, "replans_limit": 2},
+            next_action="run_workflow",
+            stop_condition="step budget reached",
+        ),
+        workflow=Workflow(id="wf-weather", goal="先查天氣再播報", steps=[]),
+    )
+    text = b._format_goal_budget_status(cont)
+    actions = b._goal_web_actions(
+        parse_request({"mode": "chat", "input": "x"}),
+        GoalLoopReport(done=False, final_result="partial", continuation=cont),
+    )
+    assert "目標：先查天氣再播報" in text
+    assert "steps 6/6" in text
+    assert actions[0].label == "繼續（再 6 步）"
+    assert actions[0].input == "__goal_continue__"
+
+
+def test_goal_actions_use_search_continue_until_hard_cap():
+    b = CommandBridge(settings=_tool_settings())
+    cont = GoalLoopContinuation(
+        state=ContinuationState(
+            goal="查資料",
+            budget={
+                "steps_used": 2,
+                "steps_limit": 6,
+                "search_used": 10,
+                "search_limit": 10,
+                "search_hard_limit": 20,
+            },
+            next_action="run_workflow",
+            stop_condition="search soft cap reached (10/10)",
+        ),
+    )
+    actions = b._goal_web_actions(
+        parse_request({"mode": "chat", "input": "x"}),
+        GoalLoopReport(done=False, final_result="partial", continuation=cont),
+    )
+    assert actions[0].label == "繼續（再 5 次搜尋）"
+    assert actions[0].input == "__goal_continue_search__"
+
+    hard_cap_cont = GoalLoopContinuation(
+        state=ContinuationState(
+            goal="查資料",
+            budget={"search_used": 20, "search_limit": 20, "search_hard_limit": 20},
+            next_action="run_workflow",
+            stop_condition="search hard cap reached (20/20)",
+        ),
+    )
+    hard_actions = b._goal_web_actions(
+        parse_request({"mode": "chat", "input": "x"}),
+        GoalLoopReport(done=False, final_result="partial", continuation=hard_cap_cont),
+    )
+    assert [a.label for a in hard_actions] == ["停止並總結"]
+
+
+def test_goal_continue_control_expires_after_ttl():
+    b = CommandBridge(settings=_tool_settings())
+    continuation = GoalLoopContinuation(
+        state=ContinuationState(goal="先查天氣再播報", next_action="run_workflow"),
+        workflow=Workflow(id="wf-weather", goal="先查天氣再播報", steps=[]),
+    )
+    req = parse_request({"mode": "chat", "input": "x", "conversation_id": "g-expire"})
+    b._store_goal_continuation(req, continuation, chat_backend=CHAT_BACKEND_LOCAL, planner_metadata=None)
+    b._goal_continuations["g-expire"]["created_at"] = 0
+
+    response = b.handle(parse_request({"mode": "chat", "input": "__goal_continue__", "conversation_id": "g-expire"}))
+
+    assert response.status == STATUS_ERROR
+    assert "已逾時" in response.message
+
+
+def test_continue_goal_loop_with_search_extension_grants_then_resumes(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    continuation = GoalLoopContinuation(
+        state=ContinuationState(
+            goal="查資料",
+            budget={"search_used": 10, "search_limit": 10, "search_hard_limit": 20},
+            next_action="run_workflow",
+            stop_condition="search soft cap reached (10/10)",
+        ),
+        workflow=Workflow(id="wf-search", goal="查資料", steps=[]),
+    )
+    req = parse_request({"mode": "chat", "input": "x", "conversation_id": "g-search"})
+    b._store_goal_continuation(req, continuation, chat_backend=CHAT_BACKEND_LOCAL, planner_metadata=None)
+    monkeypatch.setattr(b, "_grant_goal_search_extension", lambda n: 5)
+    monkeypatch.setattr(
+        b,
+        "_resume_goal_loop",
+        lambda _req, _entry: WebCommandResponse(status=STATUS_OK, message="resumed", mode=MODE_CHAT),
+    )
+
+    response = b.handle(parse_request({"mode": "chat", "input": "__goal_continue_search__", "conversation_id": "g-search"}))
+
+    assert response.status == STATUS_OK
+    assert response.message == "resumed"
 
 
 def test_non_chat_modes_do_not_plan_chat_tools(bridge, monkeypatch):

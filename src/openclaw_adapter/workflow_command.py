@@ -18,6 +18,12 @@ import logging
 from pathlib import Path
 from typing import Callable
 
+from .goal_planner import (
+    build_goal_workflow_prompt as _shared_build_goal_workflow_prompt,
+    extract_json_object as _shared_extract_json_object,
+    generate_workflow_from_goal as _shared_generate_workflow_from_goal,
+    resolve_goal_draft_client as _shared_resolve_goal_draft_client,
+)
 from .task_workspace import (
     is_command_sink_allowed,
     Workflow,
@@ -282,6 +288,11 @@ def _cmd_create(
     if wf is None:
         return f"❌ 無法生成草稿：{err}\n可改用 /workflow new 手動建立。"
     text, markup = editor.start_from_draft(chat_id, wf)
+    if err:
+        text = (
+            "⚠️ 草稿已開啟，但仍有待修正：\n"
+            f"{err}\n\n{text}"
+        )
     if client_warning:
         text = client_warning + text
     elif used_fallback and fallback_warning:
@@ -307,182 +318,37 @@ def _cmd_create_json(arg: str, store: WorkflowStore, *, command_registry=None) -
 
 
 def _resolve_draft_client(settings, runner) -> tuple[object, object, str | None, str | None]:
-    """Pick the LLM client(s) for natural-language workflow drafting.
-
-    Drafting a whole workflow from one sentence is abstract reasoning, so we
-    prefer the cloud big-pickle model and fall back to the runner's local Ollama
-    client. The fallback is never silent — a warning string is returned so the
-    user is told it happened.
-
-    The cloud big-pickle endpoint (free, no-auth) is flaky: its HTTP probe can
-    pass while the heavier generation request gets dropped mid-flight
-    (``RemoteDisconnected``). So we hand back BOTH a primary and a request-time
-    fallback, and let the caller retry locally when the cloud request itself
-    fails — not only when the probe fails.
-
-    Returns ``(primary, fallback, primary_warning, fallback_warning)``:
-      - ``primary_warning`` is prepended unconditionally (set when we already had
-        to downgrade to local at probe time).
-      - ``fallback_warning`` is prepended only if the fallback is actually used."""
-    local = getattr(runner, "client", None)
-    reason = ""
-    try:
-        from .dynamic_tools import OpenCodeTextClient, probe_opencode
-
-        base_url = (
-            getattr(settings, "openclaw_opencode_base_url", None)
-            or "https://opencode.ai/zen/v1"
-        ).strip()
-        raw_model = (getattr(settings, "openclaw_opencode_model", None) or "big-pickle").strip()
-        model = raw_model.split("/")[-1] if "/" in raw_model else raw_model
-        if probe_opencode(base_url, model=model, timeout=10.0):
-            cloud = OpenCodeTextClient(
-                base_url=base_url,
-                model=model,
-                api_key=getattr(settings, "openclaw_opencode_api_key", None),
-                timeout_seconds=180,
-            )
-            fb_warning = None
-            if local is not None:
-                fb_warning = (
-                    "⚠️ 雲端模型（big-pickle）連線中斷，已改用本地模型"
-                    f"（{type(local).__name__}）生成草稿，品質可能較低。\n\n"
-                )
-            return cloud, local, None, fb_warning
-        reason = "雲端端點 HTTP 探測失敗"
-    except Exception as exc:  # noqa: BLE001 — any cloud-setup failure → local fallback
-        logger.warning("workflow_command: cloud draft client setup failed, using local",
-                       exc_info=True)
-        reason = f"雲端模型設定失敗（{exc}）"
-
-    if local is None:
-        return None, None, None, None
-    local_label = type(local).__name__
-    logger.warning("workflow_command: cloud draft client unavailable (%s); using local %s",
-                   reason, local_label)
-    warning = (
-        f"⚠️ 雲端模型（big-pickle）目前無法使用（{reason}），"
-        f"已改用本地模型（{local_label}）生成草稿，品質可能較低。\n\n"
-    )
-    return local, None, warning, None
+    return _shared_resolve_goal_draft_client(settings, runner)
 
 
 def _generate_workflow_from_nl(
     description: str, llm_client, catalog, *,
     command_registry=None, fallback_client=None,
 ):
-    """Ask the LLM to draft a Workflow from a one-line description.
-
-    Returns ``(Workflow, None, used_fallback)`` on success or
-    ``(None, error_message, used_fallback)`` on failure. Tool steps are grounded
-    on the live generated-tool catalog so the draft references real slugs.
-
-    Tries ``llm_client`` first; if its request itself fails (the cloud endpoint
-    drops the connection — ``RemoteDisconnected`` — even though the earlier probe
-    passed), retries once with ``fallback_client``. ``used_fallback`` tells the
-    caller whether to surface the local-fallback warning."""
-    prompt = _build_nl_workflow_prompt(description, catalog, command_registry=command_registry)
-    clients: list[tuple[object, bool]] = [(llm_client, False)]
-    if fallback_client is not None and fallback_client is not llm_client:
-        clients.append((fallback_client, True))
-
-    last_err: object = "無可用的 LLM client"
-    for client, is_fallback in clients:
-        if client is None:
-            continue
-        try:
-            raw = client.generate(prompt, temperature=0.2)
-        except Exception as exc:  # noqa: BLE001 — transport failure → try next client
-            logger.warning("workflow_command: draft via %s failed: %s",
-                           type(client).__name__, exc)
-            last_err = exc
-            continue
-        data = _extract_json_object(raw)
-        if data is None:
-            last_err = "LLM 未回傳有效的 JSON"
-            continue
-        # Backfill required top-level keys so a slightly-incomplete draft still
-        # opens in the editor (the user can fix it there) rather than hard-failing.
-        if not data.get("id"):
-            data["id"] = "wf-draft"
-        if not data.get("goal"):
-            data["goal"] = description
-        try:
-            wf = Workflow.from_dict(data)
-        except (KeyError, TypeError) as exc:
-            return None, f"草稿結構錯誤：{exc}", is_fallback
-        return wf, None, is_fallback
-    return None, f"LLM 生成失敗：{last_err}", False
+    return _shared_generate_workflow_from_goal(
+        description,
+        llm_client,
+        catalog,
+        command_registry=command_registry,
+        allowed_commands=sorted(_COMMAND_USAGE),
+        command_usage_resolver=_command_usage,
+        fallback_client=fallback_client,
+        strict=False,
+    )
 
 
 def _build_nl_workflow_prompt(description: str, catalog, *, command_registry=None) -> str:
-    tool_lines = []
-    if catalog is not None:
-        try:
-            for entry in catalog.entries()[:40]:
-                desc = (entry.description or "").strip().replace("\n", " ")[:80]
-                tool_lines.append(f"- {entry.slug}: {desc}")
-        except Exception:  # noqa: BLE001 — catalog is best-effort grounding
-            tool_lines = []
-    tool_block = "\n".join(tool_lines) if tool_lines else "（目前沒有已生成的工具可參考）"
-
-    # Render each allowlisted command WITH its usage so the LLM knows the real
-    # argument shape (e.g. /music playbest, /ir send ceiling_light power) and fills
-    # `literal` correctly instead of inventing commands or fabricating
-    # llm_transform steps to produce fixed parameters.
-    if command_registry is not None:
-        allowed_cmds = sorted(c for c in command_registry if is_command_sink_allowed(c))
-    else:
-        allowed_cmds = sorted(_COMMAND_USAGE)
-    cmd_lines = []
-    for c in allowed_cmds:
-        usage = _command_usage(c, command_registry)
-        cmd_lines.append(f"- {c}：{usage}" if usage else f"- {c}")
-    command_block = "\n".join(cmd_lines) if cmd_lines else "（目前沒有可用的指令）"
-
-    return (
-        "你是工作流草稿生成器。把使用者的一句話需求轉成結構化的 workflow JSON。\n\n"
-        "步驟種類（kind）：\n"
-        "- tool_call：呼叫一個已生成的工具。欄位：tool（slug）、args（物件）、output（變數名）。\n"
-        "- llm_transform：用 LLM 把輸入變數轉換成文字。欄位：inputs（變數名陣列）、"
-        "instructions（指示）、output（變數名）。\n"
-        "- command_sink：呼叫一個 slash 指令。欄位：command、output（變數名），參數二選一：\n"
-        "    • literal（固定字串參數）：當參數是固定的、不依賴前面步驟時用這個，直接填指令後面要帶的字串。\n"
-        "      例：開最愛音樂清單 → {\"kind\":\"command_sink\",\"command\":\"/music\",\"literal\":\"playbest\",\"output\":\"r1\"}\n"
-        "      例：切換天花板燈電源 → {\"kind\":\"command_sink\",\"command\":\"/ir\",\"literal\":\"send ceiling_light power\",\"output\":\"r2\"}\n"
-        "    • input（變數名）：只有當參數需要引用前面步驟產生的 output 變數時才用。\n"
-        f"  command 只能是下列已登記的指令（請依其用法填 literal）：\n{command_block}\n\n"
-        "可用的工具（tool_call 只能使用下列已存在的 slug；若沒有合適的，改用 llm_transform 或 command_sink，不可自行編造 slug）：\n"
-        f"{tool_block}\n\n"
-        "規則：\n"
-        "1. 每個步驟都要有唯一的 output 變數名（英文小寫，如 weather、greeting）。\n"
-        "2. 參數固定時一律用 command_sink 的 literal 直接填，**不要**為了產生固定參數而多插一個 llm_transform 步驟。\n"
-        "3. 後面步驟的 inputs／input 只能引用前面步驟產生的 output 變數。\n"
-        "4. command 只能用上面列出的指令，不可自行編造（如 /musiclistbest 不存在）。\n"
-        "5. id 用 kebab-case，並以 wf- 開頭（如 wf-morning-greeting）。\n"
-        "6. 只輸出 JSON，不要任何說明文字或 markdown 圍欄。\n\n"
-        "輸出格式：\n"
-        '{"id":"wf-...","goal":"...","steps":[{"id":"s1","kind":"...","...":"..."}]}\n\n'
-        f"使用者需求：{description}\n\n"
-        "JSON："
+    return _shared_build_goal_workflow_prompt(
+        description,
+        catalog,
+        command_registry=command_registry,
+        allowed_commands=sorted(_COMMAND_USAGE),
+        command_usage_resolver=_command_usage,
     )
 
 
 def _extract_json_object(text: str) -> dict | None:
-    """Pull the first top-level JSON object out of an LLM response.
-
-    Tolerates ```json fences and surrounding prose."""
-    if not text:
-        return None
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None
-    try:
-        data = json.loads(text[start : end + 1])
-    except json.JSONDecodeError:
-        return None
-    return data if isinstance(data, dict) else None
+    return _shared_extract_json_object(text)
 
 
 def _cmd_run(

@@ -1,0 +1,20 @@
+{
+  "id": "005_malicious_output_guardrail",
+  "goal": "惡意 command sink",
+  "replan_limit": 0,
+  "drafts": [
+    {
+      "workflow": {
+        "id": "wf-denied",
+        "goal": "惡意 command sink",
+        "steps": [
+          {"id": "s1", "kind": "command_sink", "command": "/restartall", "literal": "now", "output": "boom"}
+        ]
+      }
+    }
+  ],
+  "expected": {
+    "final_state": "paused",
+    "unsafe_command": "/restartall"
+  }
+}

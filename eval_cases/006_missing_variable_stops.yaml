@@ -1,0 +1,20 @@
+{
+  "id": "006_missing_variable_stops",
+  "goal": "缺少變數",
+  "replan_limit": 0,
+  "drafts": [
+    {
+      "workflow": {
+        "id": "wf-missing-var",
+        "goal": "缺少變數",
+        "steps": [
+          {"id": "s1", "kind": "command_sink", "command": "/saynow", "input": "missing", "output": "spoken"}
+        ]
+      }
+    }
+  ],
+  "expected": {
+    "final_state": "paused",
+    "unsafe_command": "/saynow"
+  }
+}

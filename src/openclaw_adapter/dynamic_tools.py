@@ -114,6 +114,16 @@ _TRUNCATION_MARKERS = (
 )
 
 
+def _coerce_nonneg_int(value, default: int) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        return default
+    return out if out >= 0 else default
+
+
 def _syntax_error(code: str) -> str:
     """Return a one-line SyntaxError description, or "" if the code parses."""
     try:
@@ -266,6 +276,22 @@ class DynamicToolResult:
     error: str = ""
     raw_stdout: str = ""
     trace: TaskTrace | None = None
+
+
+@dataclass(frozen=True)
+class SearchGroundingBudgetExhausted:
+    count: int
+    effective_limit: int
+    soft_cap: int
+    hard_cap: int
+    granted_extra: int
+
+
+@dataclass(frozen=True)
+class SearchGroundingResult:
+    block: str | None = None
+    query_burned: bool = False
+    budget_exhausted: SearchGroundingBudgetExhausted | None = None
 
 
 @dataclass
@@ -782,6 +808,8 @@ class DynamicToolRunner:
         validator_model: str | None = None,
         validator_timeout_seconds: float = 25.0,
         cloud_failover_restart: bool = False,
+        search_daily_soft_cap: int = 10,
+        search_daily_hard_cap: int = 20,
     ) -> None:
         self.client = client
         # Cascade: fast_model handles explore + tier-1 codegen; strong_model is
@@ -842,11 +870,14 @@ class DynamicToolRunner:
         # Raw text of fetched `參考:` pages, keyed by URL (per-process politeness cache).
         self._reference_cache: dict[str, str] = {}
         # Search-grounding fallback reuses /search's Yahoo backend; injectable for
-        # tests. Hard budget: the user's IP must never get banned, so at most
-        # search_daily_cap queries/day, persisted in search_state_path (which
-        # also caches distilled results so re-runs cost zero queries).
+        # tests. Daily budget is a normal soft cap plus persisted temporary
+        # grants, never beyond the hard cap; state also caches distilled inputs
+        # so re-runs cost zero new queries.
         self.search_fn = None  # (query, max_results) -> Sequence[WebSearchResult]
-        self.search_daily_cap = 4
+        self.search_daily_soft_cap = max(0, int(search_daily_soft_cap))
+        self.search_daily_hard_cap = max(
+            self.search_daily_soft_cap, int(search_daily_hard_cap)
+        )
         self.search_state_path = Path(tools_dir) / "search_state.json"
         self.tools_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1010,7 +1041,7 @@ class DynamicToolRunner:
                 trace = TaskTrace(
                     goal=core,
                     generations_limit=2 * self.max_repairs + 1,
-                    search_limit=self.search_daily_cap,
+                    search_limit=self._current_search_limit(),
                     tier=0, tier_limit=3,
                 )
                 trace.record(
@@ -1286,7 +1317,7 @@ class DynamicToolRunner:
         trace = TaskTrace(
             goal=request,
             generations_limit=2 * self.max_repairs + 1,
-            search_limit=self.search_daily_cap,
+            search_limit=self._current_search_limit(),
             tier_limit=3,
         )
         always_on, topical = self._load_rules_split()
@@ -1337,23 +1368,40 @@ class DynamicToolRunner:
         references = self._ground_references(request, knowledge_rows)
         if references is None:
             if self._needs_search_grounding(request, ""):
-                trace.search_used += 1
+                grounded = self._search_ground(request)
+                if grounded.query_burned:
+                    trace.search_used += 1
+                observation = "no stored reference; grounding via bounded web search"
+                if grounded.budget_exhausted is not None:
+                    budget = grounded.budget_exhausted
+                    observation = (
+                        "no stored reference; web-search grounding budget exhausted "
+                        f"({budget.count}/{budget.effective_limit})"
+                    )
                 trace.record(
                     phase=0, attempt=0, action="search_grounding",
-                    observation="no stored reference; grounding via bounded web search",
+                    observation=observation,
                     next_action="generate_code",
                 )
-                references = self._search_ground(request)
+                references = grounded.block
         elif self._needs_search_grounding(request, references):
-            trace.search_used += 1
+            grounded = self._search_ground(request)
+            if grounded.query_burned:
+                trace.search_used += 1
+            observation = "stored reference lacks a current value; augmenting via web search"
+            if grounded.budget_exhausted is not None:
+                budget = grounded.budget_exhausted
+                observation = (
+                    "stored reference lacks a current value; web-search grounding "
+                    f"budget exhausted ({budget.count}/{budget.effective_limit})"
+                )
             trace.record(
                 phase=0, attempt=0, action="search_grounding",
-                observation="stored reference lacks a current value; augmenting via web search",
+                observation=observation,
                 next_action="generate_code",
             )
-            extra = self._search_ground(request)
-            if extra:
-                references = references + "\n" + extra
+            if grounded.block:
+                references = references + "\n" + grounded.block
 
         # Phase 0: live API exploration only for domains without a stored recipe —
         # a selected recipe already carries a verified endpoint + field structure,
@@ -1884,9 +1932,11 @@ class DynamicToolRunner:
             state = {}
         today = date.today().isoformat()
         if state.get("date") != today:
-            state = {"date": today, "count": 0, "cache": {}}
-        state.setdefault("count", 0)
-        state.setdefault("cache", {})
+            state = {"date": today, "count": 0, "granted_extra": 0, "cache": {}}
+        state["count"] = _coerce_nonneg_int(state.get("count"), 0)
+        state["granted_extra"] = _coerce_nonneg_int(state.get("granted_extra"), 0)
+        cache = state.get("cache")
+        state["cache"] = cache if isinstance(cache, dict) else {}
         return state
 
     def _save_search_state(self, state: dict) -> None:
@@ -1895,6 +1945,38 @@ class DynamicToolRunner:
                 json.dumps(state, ensure_ascii=False), encoding="utf-8")
         except Exception:
             logger.exception("dynamic_tools: search state save failed")
+
+    def _effective_search_limit(self, state: dict) -> int:
+        granted_extra = _coerce_nonneg_int(state.get("granted_extra"), 0)
+        return min(
+            self.search_daily_soft_cap + granted_extra,
+            self.search_daily_hard_cap,
+        )
+
+    def _current_search_limit(self) -> int:
+        return self._effective_search_limit(self._load_search_state())
+
+    def grant_search_extension(self, extra_queries: int) -> int:
+        """Persist a same-day budget extension, clamped by the hard cap.
+
+        Returns the resulting ``granted_extra`` value after clamping. A new day
+        automatically resets the prior grant via ``_load_search_state``.
+        """
+        state = self._load_search_state()
+        requested = max(0, int(extra_queries))
+        max_extra = max(0, self.search_daily_hard_cap - self.search_daily_soft_cap)
+        state["granted_extra"] = min(
+            max_extra,
+            _coerce_nonneg_int(state.get("granted_extra"), 0) + requested,
+        )
+        self._save_search_state(state)
+        logger.info(
+            "dynamic_tools: granted search extension requested=%d resulting_extra=%d effective_limit=%d",
+            requested,
+            state["granted_extra"],
+            self._effective_search_limit(state),
+        )
+        return state["granted_extra"]
 
     def _needs_search_grounding(self, request: str, references: str) -> bool:
         """Rule grounding can 'succeed' with a generic formula page while the
@@ -1935,35 +2017,50 @@ class DynamicToolRunner:
                     "YES" if need else "NO", _tail(ans, 120))
         return need
 
-    def _search_ground(self, request: str) -> str | None:
+    def _search_ground(self, request: str) -> SearchGroundingResult:
         """When no rule reference page covers the request, fall back to ONE web
         search (same Yahoo backend as /search) + page fetches (same extractor
         as /fetch), distilled like rule grounding. Hard daily budget + per-day
         result cache keep query volume near zero; everything fails open."""
         if self.search_fn is None:
             # Not wired (unit tests / minimal configs): never reach the network.
-            return None
+            return SearchGroundingResult()
         try:
             state = self._load_search_state()
             cached = state["cache"].get(request)
             if cached is not None:
                 logger.info("dynamic_tools: search grounding cache hit for request")
                 if isinstance(cached, str):  # legacy entries cached the distilled block
-                    return cached or None
+                    return SearchGroundingResult(block=cached or None)
                 texts = list(cached.get("texts") or [])
                 sources = list(cached.get("sources") or [])
                 if not texts:
-                    return None
+                    return SearchGroundingResult()
                 # Raw page texts are cached (not the distillate) so distillation
                 # improvements take effect on re-runs without a new query.
                 extract = self._distill_reference_texts(request, texts)
                 if not extract:
-                    return None
-                return extract + "\n來源:\n" + "\n".join(sources)
-            if state["count"] >= self.search_daily_cap:
-                logger.info("dynamic_tools: search grounding budget exhausted (%d/%d) — skipping",
-                            state["count"], self.search_daily_cap)
-                return None
+                    return SearchGroundingResult()
+                return SearchGroundingResult(
+                    block=extract + "\n來源:\n" + "\n".join(sources)
+                )
+            effective_limit = self._effective_search_limit(state)
+            if state["count"] >= effective_limit:
+                logger.info(
+                    "dynamic_tools: search grounding budget exhausted (%d/%d; soft=%d hard=%d extra=%d) — skipping",
+                    state["count"], effective_limit,
+                    self.search_daily_soft_cap, self.search_daily_hard_cap,
+                    state["granted_extra"],
+                )
+                return SearchGroundingResult(
+                    budget_exhausted=SearchGroundingBudgetExhausted(
+                        count=state["count"],
+                        effective_limit=effective_limit,
+                        soft_cap=self.search_daily_soft_cap,
+                        hard_cap=self.search_daily_hard_cap,
+                        granted_extra=state["granted_extra"],
+                    )
+                )
             saved_model = self.client.model
             try:
                 self.client.model = self.fast_model
@@ -1984,7 +2081,7 @@ class DynamicToolRunner:
             state["count"] += 1
             self._save_search_state(state)
             logger.info("dynamic_tools: search grounding query=%r (budget %d/%d)",
-                        query, state["count"], self.search_daily_cap)
+                        query, state["count"], effective_limit)
             results = list(search(query, 4) or [])
             logger.info("dynamic_tools: search grounding got %d result(s): %s",
                         len(results), [getattr(r, "url", "") for r in results])
@@ -2031,10 +2128,10 @@ class DynamicToolRunner:
             # reruns on each hit so prompt fixes don't need a fresh search.
             state["cache"][request] = {"texts": texts, "sources": sources}
             self._save_search_state(state)
-            return block or None
+            return SearchGroundingResult(block=block or None, query_burned=True)
         except Exception:
             logger.exception("dynamic_tools: search grounding failed; continuing without it")
-            return None
+            return SearchGroundingResult()
 
     def _explore_api(self, request: str, knowledge_rows: list,
                      references: str | None = None) -> str | None:
@@ -2989,6 +3086,8 @@ def _build_runner_with_client(
         cloud_advisor_client=cloud_advisor_client, cloud_advisor_model=cloud_advisor_model,
         validator_client=validator_client, validator_model=validator_model,
         cloud_failover_restart=cloud_failover_restart,
+        search_daily_soft_cap=getattr(settings, "openclaw_search_daily_soft_cap", 10),
+        search_daily_hard_cap=getattr(settings, "openclaw_search_daily_hard_cap", 20),
         # Self-learning: abstract hard-won repairs into transferable RAG rules so
         # novel question types get easier over time instead of relying on seeds.
         distill_enabled=True,

@@ -1,0 +1,29 @@
+{
+  "id": "001_goal_multistep_happy",
+  "goal": "查天氣後播報",
+  "drafts": [
+    {
+      "workflow": {
+        "id": "wf-happy",
+        "goal": "查天氣後播報",
+        "steps": [
+          {"id": "s1", "kind": "tool_call", "tool": "weather_search", "args": {"q": "東京天氣"}, "output": "weather"},
+          {"id": "s2", "kind": "llm_transform", "inputs": ["weather"], "instructions": "整理成播報稿", "output": "greeting"},
+          {"id": "s3", "kind": "command_sink", "command": "/saynow", "input": "greeting", "output": "spoken"}
+        ]
+      }
+    }
+  ],
+  "tool_responses": [
+    {"slug": "weather_search", "responses": [{"ok": true, "text": "{\"temp\": 30, \"city\": \"東京\"}"}]}
+  ],
+  "llm_outputs": ["東京今天 30 度，出門記得補水。"],
+  "command_responses": [
+    {"command": "/saynow", "responses": ["spoken ok"]}
+  ],
+  "expected": {
+    "tool_order": ["weather_search"],
+    "final_state": "done",
+    "command_input": {"command": "/saynow", "input": "東京今天 30 度，出門記得補水。"}
+  }
+}

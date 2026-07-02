@@ -77,6 +77,37 @@ COMMAND_SINK_INPUT_TYPES: dict[str, frozenset[str] | None] = {
 CommandDispatcher = dict[str, Callable[[str], str]]
 
 
+@dataclass(frozen=True)
+class WorkflowBudgetExhausted:
+    kind: str
+    used: int
+    limit: int
+    hard_limit: int | None = None
+    granted_extra: int = 0
+
+    def to_dict(self) -> dict:
+        out = {
+            "kind": self.kind,
+            "used": self.used,
+            "limit": self.limit,
+            "granted_extra": self.granted_extra,
+        }
+        if self.hard_limit is not None:
+            out["hard_limit"] = self.hard_limit
+        return out
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "WorkflowBudgetExhausted":
+        hard_limit = data.get("hard_limit")
+        return cls(
+            kind=str(data.get("kind") or ""),
+            used=int(data.get("used") or 0),
+            limit=int(data.get("limit") or 0),
+            hard_limit=int(hard_limit) if hard_limit is not None else None,
+            granted_extra=int(data.get("granted_extra") or 0),
+        )
+
+
 def _command_sink_failure_reason(command: str | None, result_text: str) -> str | None:
     text = (result_text or "").strip()
     if not text:
@@ -289,6 +320,7 @@ class StepTrace:
     output_var: str | None = None
     error: str | None = None
     provenance: str | None = None
+    budget_exhausted: WorkflowBudgetExhausted | None = None
 
     def to_dict(self) -> dict:
         d: dict = {
@@ -302,6 +334,8 @@ class StepTrace:
             d["error"] = self.error
         if self.provenance is not None:
             d["provenance"] = self.provenance
+        if self.budget_exhausted is not None:
+            d["budget_exhausted"] = self.budget_exhausted.to_dict()
         return d
 
 
@@ -311,10 +345,12 @@ class WorkflowTrace:
     goal: str
     variables: dict[str, Variable] = field(default_factory=dict)
     steps: list[StepTrace] = field(default_factory=list)
+    narration: list[str] = field(default_factory=list)
     final_result: str | None = None
     # Set when the workflow fails structural validation before any step runs.
     # An empty step list alone does not mean failure; this field makes it explicit.
     validation_error: str | None = None
+    budget_exhausted: WorkflowBudgetExhausted | None = None
 
     @property
     def ok(self) -> bool:
@@ -338,10 +374,13 @@ class WorkflowTrace:
                 for k, v in self.variables.items()
             },
             "steps": [s.to_dict() for s in self.steps],
+            "narration": list(self.narration),
             "final_result": self.final_result,
         }
         if self.validation_error is not None:
             d["validation_error"] = self.validation_error
+        if self.budget_exhausted is not None:
+            d["budget_exhausted"] = self.budget_exhausted.to_dict()
         return d
 
     @classmethod
@@ -358,6 +397,11 @@ class WorkflowTrace:
                 step_id=s["step_id"], kind=s["kind"], status=s["status"],
                 output_var=s.get("output_var"), error=s.get("error"),
                 provenance=s.get("provenance"),
+                budget_exhausted=(
+                    WorkflowBudgetExhausted.from_dict(s["budget_exhausted"])
+                    if isinstance(s.get("budget_exhausted"), dict)
+                    else None
+                ),
             )
             for s in d.get("steps", [])
         ]
@@ -366,8 +410,14 @@ class WorkflowTrace:
             goal=d["goal"],
             variables=variables,
             steps=steps,
+            narration=[str(x) for x in (d.get("narration") or [])],
             final_result=d.get("final_result"),
             validation_error=d.get("validation_error"),
+            budget_exhausted=(
+                WorkflowBudgetExhausted.from_dict(d["budget_exhausted"])
+                if isinstance(d.get("budget_exhausted"), dict)
+                else None
+            ),
         )
 
 
@@ -433,13 +483,22 @@ class WorkflowRunner:
             trace.steps.append(step_trace)
 
             if step_trace.status == "failed":
+                if step_trace.budget_exhausted is not None:
+                    trace.budget_exhausted = step_trace.budget_exhausted
+                    trace.final_result = (
+                        f"工作流在步驟 {step.id} 暫停："
+                        f"{step_trace.error or 'budget exhausted'}"
+                    )
+                    break
                 failed = True
             elif produced_var:
                 last_output_var = produced_var
 
         trace.variables = store.snapshot()
 
-        if not failed and last_output_var:
+        if trace.budget_exhausted is not None:
+            pass
+        elif not failed and last_output_var:
             trace.final_result = store.resolve(last_output_var)
         elif failed:
             for st in trace.steps:
@@ -489,6 +548,7 @@ class WorkflowRunner:
 
         slug = step.tool or ""
         ok, result_text = self.executor.run_tool_step(slug, resolved_args)
+        exhausted = getattr(self.executor, "last_budget_exhausted", None)
 
         if ok:
             provenance = f"{slug}({resolved_args})"
@@ -509,7 +569,35 @@ class WorkflowRunner:
         return (
             StepTrace(
                 step_id=step.id, kind=step.kind, status="failed",
-                output_var=step.output, error=result_text,
+                output_var=step.output,
+                error=result_text,
+                budget_exhausted=(
+                    WorkflowBudgetExhausted(
+                        kind="search",
+                        used=int(
+                            getattr(exhausted, "count", getattr(exhausted, "used", 0)) or 0
+                        ),
+                        limit=int(
+                            getattr(
+                                exhausted,
+                                "effective_limit",
+                                getattr(exhausted, "limit", 0),
+                            )
+                            or 0
+                        ),
+                        hard_limit=int(
+                            getattr(
+                                exhausted,
+                                "hard_cap",
+                                getattr(exhausted, "hard_limit", 0),
+                            )
+                            or 0
+                        ),
+                        granted_extra=int(getattr(exhausted, "granted_extra", 0) or 0),
+                    )
+                    if exhausted is not None
+                    else None
+                ),
             ),
             None,
         )

@@ -21,9 +21,11 @@ from __future__ import annotations
 import json
 import logging
 import re
+import secrets
 import threading
 import time
 from collections.abc import Iterator
+from pathlib import Path
 from urllib.parse import quote
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -52,12 +54,14 @@ from .llm_pool_settings import (
     save_chat_llm_pool_settings,
 )
 from .command_bridge_models import (
+    Action,
     CHAT_BACKEND_CLOUD_MISTRAL,
     CHAT_BACKEND_CLOUD_PICKLE,
     CHAT_BACKEND_CLOUD_POOL,
     CHAT_BACKEND_GEMINI,
     CHAT_BACKEND_LOCAL,
     CHAT_TOOL_BLUETOOTH,
+    CHAT_TOOL_GOAL,
     CHAT_TOOL_IR,
     CHAT_TOOL_MUSIC,
     CHAT_TOOL_NO_TOOL,
@@ -92,6 +96,8 @@ from .command_bridge_models import (
     stream_redirect,
     stream_start,
 )
+from .goal_loop import GoalLoop, GoalLoopContinuation, GoalLoopReport
+from .goal_planner import GoalPlanner
 from .task_loop import (
     BoundedTaskLoop,
     ContinuationState,
@@ -112,6 +118,15 @@ _HEARTBEAT_SECONDS = 10.0
 # Finished jobs linger this long so a phone that reconnects after a screen-lock
 # can still fetch the final report, then they are garbage-collected.
 _JOB_TTL_SECONDS = 1800.0
+_GOAL_RESUME_TOKENS = frozenset({"繼續", "continue", "繼續執行", "再繼續", "resume"})
+_GOAL_PENDING_TTL_SECONDS = 600.0
+_GOAL_CONFIRM_INPUT = "__goal_confirm__"
+_GOAL_CONTINUE_INPUT = "__goal_continue__"
+_GOAL_CONTINUE_SEARCH_INPUT = "__goal_continue_search__"
+_GOAL_STOP_INPUT = "__goal_stop__"
+_GOAL_STEP_GRANT = 6
+_GOAL_REPLAN_LIMIT = 2
+_GOAL_SEARCH_GRANT = 5
 
 _SELLER_UNSUPPORTED_MSG = "賣家信譽快照目前尚未由本地 command bridge 支援。"
 
@@ -258,8 +273,14 @@ _CHAT_TOOL_PLAN_PROMPT_TEMPLATE = (
     '{{"tool":"__no_tool__","answer":"...","reason_summary":"..."}}\n'
     "或\n"
     '{{"tool":"{tool_choices}","query":"...","reason_summary":"..."}}\n'
+    "例如：\n"
+    '- 問「米津玄師是誰」→ {{"tool":"__no_tool__","answer":"...","reason_summary":"一般知識"}}\n'
+    '- 問「今天東京天氣」→ {{"tool":"/search","query":"東京 今天天氣","reason_summary":"需要最新資訊"}}\n'
+    '- 問「幫我規劃一個先查天氣再播報的工作流」→ {{"tool":"__goal__","query":"先查天氣再播報的工作流","reason_summary":"多步驟目標"}}\n'
     "當 tool=__no_tool__ 時，answer 必須是給使用者看的最終答案，"
     "用繁體中文自然回答。\n"
+    "當 tool=__goal__ 時，query 必須是使用者想完成的多步驟目標描述，"
+    "不要回答成最終執行結果。\n"
     "當 tool 是真實工具時，query 必須是該工具可直接執行的參數；"
     "若使用者用代名詞（她／它／這個），請用對話紀錄把主詞補回 query。"
 )
@@ -522,6 +543,10 @@ class CommandBridge:
         # In-process only: a resume is a follow-up turn within the same bridge run.
         self._music_continuations: dict[str, dict] = {}
         self._music_cont_lock = threading.Lock()
+        self._goal_continuations: dict[str, dict] = {}
+        self._goal_cont_lock = threading.Lock()
+        self._goal_pending_confirms: dict[str, dict] = {}
+        self._goal_pending_lock = threading.Lock()
         # #53: workflow surface for web chat (NL draft + editable card buttons).
         # Built lazily — the shared editor must persist draft sessions across the
         # separate HTTP requests that a draft → reorder → save flow spans.
@@ -676,12 +701,18 @@ class CommandBridge:
             return WebCommandResponse(
                 status=STATUS_ERROR, message="請輸入訊息。", mode=MODE_CHAT
             )
+        goal_control = self._handle_goal_control_input(req, text)
+        if goal_control is not None:
+            return goal_control
         # #51 PR3: if this conversation has a paused music plan and the user's
         # message names one of the offered tracks, resume the loop (play that
         # track) instead of routing — the live resume client for the bounded loop.
         resumed = self._maybe_resume_music_plan(req, text)
         if resumed is not None:
             return resumed
+        resumed_goal = self._maybe_resume_goal_loop(req, text)
+        if resumed_goal is not None:
+            return resumed_goal
         if not chat_backend_enabled(self.settings, req.chat_backend):
             return WebCommandResponse(
                 status=STATUS_ERROR,
@@ -690,6 +721,8 @@ class CommandBridge:
             )
         prompt = build_chat_prompt(req.input, req.history)
         plan, metadata = self._select_chat_tool_plan(req)
+        if plan is not None and plan.tool == CHAT_TOOL_GOAL:
+            return self._preview_goal_loop(req, plan.query, planner_metadata=metadata)
         if plan is not None and plan.tool != CHAT_TOOL_NO_TOOL:
             try:
                 tool_result = self._run_chat_tool(req, plan)
@@ -722,6 +755,12 @@ class CommandBridge:
         text = (req.input or "").strip()
         if not text:
             yield stream_error("請輸入訊息。")
+            return
+        if self._is_goal_control_input(text):
+            yield from self._stream_goal_control_input(req, text)
+            return
+        if self._should_resume_goal_loop(req, text):
+            yield from self._stream_resume_goal_loop(req)
             return
         # Workflow / schedule creation redirect (web#8 B2, web#9). Three layers so
         # the feature works even when the bge-m3 embedder is unavailable:
@@ -769,6 +808,9 @@ class CommandBridge:
             return
         prompt = build_chat_prompt(req.input, req.history)
         plan, metadata = yield from self._stream_chat_tool_plan(req)
+        if plan is not None and plan.tool == CHAT_TOOL_GOAL:
+            yield from self._stream_goal_preview(req, plan.query, planner_metadata=metadata)
+            return
         if plan is not None and plan.tool != CHAT_TOOL_NO_TOOL:
             yield from self._stream_chat_tool(req, plan)
             return
@@ -1061,6 +1103,741 @@ class CommandBridge:
             mode=MODE_CHAT,
         )
 
+    def _store_goal_continuation(
+        self,
+        req: WebCommandRequest,
+        continuation: GoalLoopContinuation,
+        *,
+        chat_backend: str,
+        planner_metadata: ModelMetadata | None,
+    ) -> None:
+        with self._goal_cont_lock:
+            self._goal_continuations[self._conversation_key(req)] = {
+                "continuation": continuation.to_dict(),
+                "chat_backend": chat_backend,
+                "planner_metadata": planner_metadata.to_dict() if planner_metadata is not None else None,
+                "created_at": time.time(),
+            }
+
+    def _store_goal_pending_confirm(
+        self,
+        req: WebCommandRequest,
+        continuation: GoalLoopContinuation,
+        *,
+        chat_backend: str,
+        planner_metadata: ModelMetadata | None,
+    ) -> None:
+        with self._goal_pending_lock:
+            self._goal_pending_confirms[self._conversation_key(req)] = {
+                "continuation": continuation.to_dict(),
+                "chat_backend": chat_backend,
+                "planner_metadata": planner_metadata.to_dict() if planner_metadata is not None else None,
+                "created_at": time.time(),
+            }
+
+    def _goal_pending_confirm_entry(self, req: WebCommandRequest) -> dict | None:
+        with self._goal_pending_lock:
+            entry = self._goal_pending_confirms.get(self._conversation_key(req))
+            if entry is None:
+                return None
+            if time.time() - float(entry.get("created_at") or 0.0) > _GOAL_PENDING_TTL_SECONDS:
+                self._goal_pending_confirms.pop(self._conversation_key(req), None)
+                return None
+            return entry
+
+    def _clear_goal_pending_confirm(self, req: WebCommandRequest) -> None:
+        with self._goal_pending_lock:
+            self._goal_pending_confirms.pop(self._conversation_key(req), None)
+
+    @staticmethod
+    def _is_goal_control_input(text: str) -> bool:
+        return text in {
+            _GOAL_CONFIRM_INPUT,
+            _GOAL_CONTINUE_INPUT,
+            _GOAL_CONTINUE_SEARCH_INPUT,
+            _GOAL_STOP_INPUT,
+        }
+
+    def _handle_goal_control_input(
+        self, req: WebCommandRequest, text: str
+    ) -> WebCommandResponse | None:
+        if text == _GOAL_CONFIRM_INPUT:
+            return self._confirm_goal_loop(req)
+        if text == _GOAL_CONTINUE_INPUT:
+            entry = self._goal_continuation_entry(req)
+            if entry is None:
+                return WebCommandResponse(
+                    status=STATUS_ERROR,
+                    message="目標續跑已逾時，請重新描述一次需求。",
+                    mode=MODE_CHAT,
+                )
+            return self._resume_goal_loop(req, entry)
+        if text == _GOAL_CONTINUE_SEARCH_INPUT:
+            return self._continue_goal_loop_with_search_extension(req)
+        if text == _GOAL_STOP_INPUT:
+            return self._stop_goal_loop(req)
+        return None
+
+    def _stream_goal_control_input(
+        self, req: WebCommandRequest, text: str
+    ) -> Iterator[dict]:
+        if text == _GOAL_CONFIRM_INPUT:
+            yield from self._stream_confirm_goal_loop(req)
+            return
+        if text == _GOAL_CONTINUE_INPUT:
+            yield from self._stream_resume_goal_loop(req)
+            return
+        if text == _GOAL_CONTINUE_SEARCH_INPUT:
+            yield from self._stream_continue_goal_loop_with_search_extension(req)
+            return
+        if text == _GOAL_STOP_INPUT:
+            response = self._stop_goal_loop(req)
+            if response.status == STATUS_ERROR:
+                yield stream_error(response.message)
+            else:
+                yield stream_done(
+                    response.message,
+                    model_metadata=response.model_metadata,
+                    actions=self._stream_actions(response),
+                )
+            return
+        yield stream_error("未知的目標控制指令。")
+
+    def _goal_continuation_entry(self, req: WebCommandRequest) -> dict | None:
+        with self._goal_cont_lock:
+            entry = self._goal_continuations.get(self._conversation_key(req))
+            if entry is None:
+                return None
+            if time.time() - float(entry.get("created_at") or 0.0) > _GOAL_PENDING_TTL_SECONDS:
+                self._goal_continuations.pop(self._conversation_key(req), None)
+                return None
+            return entry
+
+    def _should_resume_goal_loop(self, req: WebCommandRequest, text: str) -> bool:
+        return text.strip().lower() in _GOAL_RESUME_TOKENS and self._goal_continuation_entry(req) is not None
+
+    def _maybe_resume_goal_loop(
+        self, req: WebCommandRequest, text: str
+    ) -> WebCommandResponse | None:
+        entry = self._goal_continuation_entry(req) if text.strip().lower() in _GOAL_RESUME_TOKENS else None
+        if not entry:
+            return None
+        return self._resume_goal_loop(req, entry)
+
+    def _stream_resume_goal_loop(self, req: WebCommandRequest) -> Iterator[dict]:
+        result: dict[str, object] = {}
+        done = threading.Event()
+        entry = self._goal_continuation_entry(req)
+        if not entry:
+            yield stream_error("目標續跑已逾時，請重新描述一次需求。")
+            return
+
+        def _worker() -> None:
+            try:
+                result["response"] = self._resume_goal_loop(req, entry)
+            except Exception as exc:  # noqa: BLE001
+                result["error"] = str(exc)
+            finally:
+                done.set()
+
+        threading.Thread(target=_worker, daemon=True).start()
+        while not done.wait(timeout=_HEARTBEAT_SECONDS):
+            yield stream_heartbeat()
+        if "error" in result:
+            yield stream_error(f"目標續跑失敗：{result['error']}")
+            return
+        response = result.get("response")
+        if not isinstance(response, WebCommandResponse):
+            yield stream_error("目標續跑失敗：缺少結果。")
+            return
+        if response.status == STATUS_ERROR:
+            yield stream_error(response.message)
+            return
+        yield stream_done(
+            response.message,
+            model_metadata=response.model_metadata,
+            actions=self._stream_actions(response),
+        )
+
+    def _continue_goal_loop_with_search_extension(self, req: WebCommandRequest) -> WebCommandResponse:
+        entry = self._goal_continuation_entry(req)
+        if entry is None:
+            return WebCommandResponse(
+                status=STATUS_ERROR,
+                message="目標續跑已逾時，請重新描述一次需求。",
+                mode=MODE_CHAT,
+            )
+        continuation_data = entry.get("continuation")
+        if not isinstance(continuation_data, dict):
+            return WebCommandResponse(
+                status=STATUS_ERROR,
+                message="目標續跑狀態已損壞，請重新描述一次需求。",
+                mode=MODE_CHAT,
+            )
+        continuation = GoalLoopContinuation.from_dict(continuation_data)
+        budget = continuation.state.budget or {}
+        search_limit = int(budget.get("search_limit") or 0)
+        search_used = int(budget.get("search_used") or 0)
+        search_hard_limit = int(budget.get("search_hard_limit") or 0)
+        if search_hard_limit and search_used >= search_hard_limit:
+            return WebCommandResponse(
+                status=STATUS_OK,
+                message=f"今日搜尋硬上限已達 ({search_used}/{search_hard_limit})，明天重置。",
+                mode=MODE_CHAT,
+            )
+        granted = self._grant_goal_search_extension(_GOAL_SEARCH_GRANT)
+        if granted <= 0:
+            hard = search_hard_limit or search_limit
+            return WebCommandResponse(
+                status=STATUS_OK,
+                message=f"今日搜尋硬上限已達 ({search_used}/{hard})，明天重置。",
+                mode=MODE_CHAT,
+            )
+        return self._resume_goal_loop(req, entry)
+
+    def _stream_continue_goal_loop_with_search_extension(
+        self, req: WebCommandRequest
+    ) -> Iterator[dict]:
+        result: dict[str, object] = {}
+        done = threading.Event()
+
+        def _worker() -> None:
+            try:
+                result["response"] = self._continue_goal_loop_with_search_extension(req)
+            except Exception as exc:  # noqa: BLE001
+                result["error"] = str(exc)
+            finally:
+                done.set()
+
+        threading.Thread(target=_worker, daemon=True).start()
+        while not done.wait(timeout=_HEARTBEAT_SECONDS):
+            yield stream_heartbeat()
+        if "error" in result:
+            yield stream_error(f"目標續跑失敗：{result['error']}")
+            return
+        response = result.get("response")
+        if not isinstance(response, WebCommandResponse):
+            yield stream_error("目標續跑失敗：缺少結果。")
+            return
+        if response.status == STATUS_ERROR:
+            yield stream_error(response.message)
+            return
+        yield stream_done(
+            response.message,
+            model_metadata=response.model_metadata,
+            actions=self._stream_actions(response),
+        )
+
+    def _confirm_goal_loop(self, req: WebCommandRequest) -> WebCommandResponse:
+        entry = self._goal_pending_confirm_entry(req)
+        if entry is None:
+            return WebCommandResponse(
+                status=STATUS_ERROR,
+                message="目標確認已逾時，請重新描述一次需求。",
+                mode=MODE_CHAT,
+            )
+        self._clear_goal_pending_confirm(req)
+        continuation_data = entry.get("continuation")
+        if not isinstance(continuation_data, dict):
+            return WebCommandResponse(
+                status=STATUS_ERROR,
+                message="目標確認狀態已損壞，請重新描述一次需求。",
+                mode=MODE_CHAT,
+            )
+        chat_backend = str(entry.get("chat_backend") or req.chat_backend or CHAT_BACKEND_LOCAL)
+        try:
+            report = self._execute_goal_loop(
+                goal="",
+                chat_backend=chat_backend,
+                resume=GoalLoopContinuation.from_dict(continuation_data),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("goal loop confirm failed")
+            return WebCommandResponse(
+                status=STATUS_ERROR,
+                message=f"目標執行失敗：{exc}",
+                mode=MODE_CHAT,
+            )
+        if report.continuation is not None:
+            self._store_goal_continuation(
+                req,
+                report.continuation,
+                chat_backend=chat_backend,
+                planner_metadata=None,
+            )
+        else:
+            with self._goal_cont_lock:
+                self._goal_continuations.pop(self._conversation_key(req), None)
+        return WebCommandResponse(
+            status=STATUS_OK,
+            message=self._format_goal_loop_message(report),
+            mode=MODE_CHAT,
+            actions=self._goal_web_actions(req, report),
+        )
+
+    def _stream_confirm_goal_loop(self, req: WebCommandRequest) -> Iterator[dict]:
+        result: dict[str, object] = {}
+        done = threading.Event()
+
+        def _worker() -> None:
+            try:
+                result["response"] = self._confirm_goal_loop(req)
+            except Exception as exc:  # noqa: BLE001
+                result["error"] = str(exc)
+            finally:
+                done.set()
+
+        threading.Thread(target=_worker, daemon=True).start()
+        while not done.wait(timeout=_HEARTBEAT_SECONDS):
+            yield stream_heartbeat()
+        if "error" in result:
+            yield stream_error(f"目標執行失敗：{result['error']}")
+            return
+        response = result.get("response")
+        if not isinstance(response, WebCommandResponse):
+            yield stream_error("目標執行失敗：缺少結果。")
+            return
+        if response.status == STATUS_ERROR:
+            yield stream_error(response.message)
+            return
+        yield stream_done(
+            response.message,
+            model_metadata=response.model_metadata,
+            actions=self._stream_actions(response),
+        )
+
+    def _resume_goal_loop(self, req: WebCommandRequest, entry: dict) -> WebCommandResponse:
+        continuation_data = entry.get("continuation")
+        if not isinstance(continuation_data, dict):
+            return WebCommandResponse(
+                status=STATUS_ERROR,
+                message="目標續跑狀態已損壞，請重新描述一次需求。",
+                mode=MODE_CHAT,
+            )
+        chat_backend = str(entry.get("chat_backend") or req.chat_backend or CHAT_BACKEND_LOCAL)
+        try:
+            report = self._execute_goal_loop(
+                goal="",
+                chat_backend=chat_backend,
+                resume=GoalLoopContinuation.from_dict(continuation_data),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("goal loop resume failed")
+            return WebCommandResponse(
+                status=STATUS_ERROR,
+                message=f"目標續跑失敗：{exc}",
+                mode=MODE_CHAT,
+            )
+        with self._goal_cont_lock:
+            if report.continuation is None:
+                self._goal_continuations.pop(self._conversation_key(req), None)
+            else:
+                self._goal_continuations[self._conversation_key(req)] = {
+                    "continuation": report.continuation.to_dict(),
+                    "chat_backend": chat_backend,
+                    "planner_metadata": entry.get("planner_metadata"),
+                    "created_at": time.time(),
+                }
+        return WebCommandResponse(
+            status=STATUS_OK,
+            message=self._format_goal_loop_message(report),
+            mode=MODE_CHAT,
+            actions=self._goal_web_actions(req, report),
+        )
+
+    def _stop_goal_loop(self, req: WebCommandRequest) -> WebCommandResponse:
+        entry = self._goal_continuation_entry(req)
+        if entry is None:
+            entry = self._goal_pending_confirm_entry(req)
+            if entry is None:
+                return WebCommandResponse(
+                    status=STATUS_ERROR,
+                    message="沒有可停止的目標。",
+                    mode=MODE_CHAT,
+                )
+            self._clear_goal_pending_confirm(req)
+            continuation_data = entry.get("continuation")
+            if not isinstance(continuation_data, dict):
+                return WebCommandResponse(
+                    status=STATUS_ERROR,
+                    message="目標狀態已損壞，請重新描述一次需求。",
+                    mode=MODE_CHAT,
+                )
+            continuation = GoalLoopContinuation.from_dict(continuation_data)
+        else:
+            with self._goal_cont_lock:
+                self._goal_continuations.pop(self._conversation_key(req), None)
+            continuation_data = entry.get("continuation")
+            if not isinstance(continuation_data, dict):
+                return WebCommandResponse(
+                    status=STATUS_ERROR,
+                    message="目標狀態已損壞，請重新描述一次需求。",
+                    mode=MODE_CHAT,
+                )
+            continuation = GoalLoopContinuation.from_dict(continuation_data)
+        summary = self._format_goal_stop_summary(continuation)
+        return WebCommandResponse(
+            status=STATUS_OK,
+            message=summary,
+            mode=MODE_CHAT,
+        )
+
+    @staticmethod
+    def _format_goal_stop_summary(continuation: GoalLoopContinuation) -> str:
+        parts = [
+            "已停止目前目標。",
+            "\n".join(continuation.narration).strip(),
+        ]
+        if continuation.trace is not None and continuation.trace.final_result:
+            parts.append(f"目前最後結果：{continuation.trace.final_result}")
+        elif continuation.state.current_status:
+            parts.append(f"目前進度：{continuation.state.current_status}")
+        return "\n\n".join(part for part in parts if part)
+
+    def _run_goal_loop_blocking(
+        self,
+        req: WebCommandRequest,
+        goal: str,
+        *,
+        planner_metadata: ModelMetadata | None,
+    ) -> WebCommandResponse:
+        try:
+            report = self._execute_goal_loop(
+                goal=goal,
+                chat_backend=req.chat_backend,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("goal loop failed goal=%r", goal)
+            return WebCommandResponse(
+                status=STATUS_ERROR,
+                message=f"目標執行失敗：{exc}",
+                mode=MODE_CHAT,
+            )
+        if report.continuation is not None:
+            self._store_goal_continuation(
+                req,
+                report.continuation,
+                chat_backend=req.chat_backend,
+                planner_metadata=planner_metadata,
+            )
+        else:
+            with self._goal_cont_lock:
+                self._goal_continuations.pop(self._conversation_key(req), None)
+        return WebCommandResponse(
+            status=STATUS_OK,
+            message=self._format_goal_loop_message(report),
+            mode=MODE_CHAT,
+            model_metadata=None,
+        )
+
+    def _preview_goal_loop(
+        self,
+        req: WebCommandRequest,
+        goal: str,
+        *,
+        planner_metadata: ModelMetadata | None,
+    ) -> WebCommandResponse:
+        try:
+            continuation = self._draft_goal_preview(goal=goal, chat_backend=req.chat_backend)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("goal preview failed goal=%r", goal)
+            return WebCommandResponse(
+                status=STATUS_ERROR,
+                message=f"目標規劃失敗：{exc}",
+                mode=MODE_CHAT,
+            )
+        self._store_goal_pending_confirm(
+            req,
+            continuation,
+            chat_backend=req.chat_backend,
+            planner_metadata=planner_metadata,
+        )
+        return WebCommandResponse(
+            status=STATUS_OK,
+            message=self._format_goal_preview_message(continuation),
+            mode=MODE_CHAT,
+            actions=self._goal_preview_actions(),
+        )
+
+    def _stream_goal_preview(
+        self,
+        req: WebCommandRequest,
+        goal: str,
+        *,
+        planner_metadata: ModelMetadata | None,
+    ) -> Iterator[dict]:
+        result: dict[str, object] = {}
+        done = threading.Event()
+
+        def _worker() -> None:
+            try:
+                result["response"] = self._preview_goal_loop(
+                    req,
+                    goal,
+                    planner_metadata=planner_metadata,
+                )
+            except Exception as exc:  # noqa: BLE001
+                result["error"] = str(exc)
+            finally:
+                done.set()
+
+        threading.Thread(target=_worker, daemon=True).start()
+        while not done.wait(timeout=_HEARTBEAT_SECONDS):
+            yield stream_heartbeat()
+        if "error" in result:
+            yield stream_error(f"目標規劃失敗：{result['error']}")
+            return
+        response = result.get("response")
+        if not isinstance(response, WebCommandResponse):
+            yield stream_error("目標規劃失敗：缺少結果。")
+            return
+        if response.status == STATUS_ERROR:
+            yield stream_error(response.message)
+            return
+        yield stream_done(
+            response.message,
+            model_metadata=response.model_metadata,
+            actions=self._stream_actions(response),
+        )
+
+    def _draft_goal_preview(self, *, goal: str, chat_backend: str) -> GoalLoopContinuation:
+        runner = _WorkflowShimRunner(self.settings)
+        planner = self._build_goal_planner(chat_backend, runner)
+        workflow, error, _used_fallback = planner.draft(goal)
+        if workflow is None:
+            raise RuntimeError(error or "無法產生工作流草稿")
+        narration = (
+            f"已理解目標為：{goal}",
+            "規劃任務工作流草稿…",
+            f"草稿完成：{workflow.id}（{len(workflow.steps)} 步）",
+        )
+        return GoalLoopContinuation(
+            state=ContinuationState(
+                goal=goal,
+                constraints=f"replan at most 2 time(s); use registered commands only",
+                completed=[f"draft: drafted {workflow.id} with {len(workflow.steps)} step(s)"],
+                current_status="awaiting user confirmation",
+                attempted_fixes=[],
+                budget={
+                    "steps_used": 1,
+                    "steps_limit": _GOAL_STEP_GRANT,
+                    "replans_used": 0,
+                    "replans_limit": _GOAL_REPLAN_LIMIT,
+                },
+                next_action="run_workflow",
+                stop_condition="awaiting user confirmation",
+            ),
+            workflow=workflow,
+            trace=None,
+            replans_used=0,
+            narration=narration,
+        )
+
+    def _stream_goal_loop(
+        self,
+        req: WebCommandRequest,
+        goal: str,
+        *,
+        planner_metadata: ModelMetadata | None,
+    ) -> Iterator[dict]:
+        result: dict[str, object] = {}
+        done = threading.Event()
+
+        def _worker() -> None:
+            try:
+                result["report"] = self._execute_goal_loop(
+                    goal=goal,
+                    chat_backend=req.chat_backend,
+                )
+            except Exception as exc:  # noqa: BLE001
+                result["error"] = str(exc)
+            finally:
+                done.set()
+
+        threading.Thread(target=_worker, daemon=True).start()
+        while not done.wait(timeout=_HEARTBEAT_SECONDS):
+            yield stream_heartbeat()
+        if "error" in result:
+            yield stream_error(f"目標執行失敗：{result['error']}")
+            return
+        report = result.get("report")
+        if not isinstance(report, GoalLoopReport):
+            yield stream_error("目標執行失敗：缺少結果。")
+            return
+        if report.continuation is not None:
+            self._store_goal_continuation(
+                req,
+                report.continuation,
+                chat_backend=req.chat_backend,
+                planner_metadata=planner_metadata,
+            )
+        else:
+            with self._goal_cont_lock:
+                self._goal_continuations.pop(self._conversation_key(req), None)
+        yield stream_done(
+            self._format_goal_loop_message(report),
+            model_metadata=None,
+        )
+
+    def _execute_goal_loop(
+        self,
+        *,
+        goal: str,
+        chat_backend: str,
+        resume: GoalLoopContinuation | None = None,
+    ):
+        runner = _WorkflowShimRunner(self.settings)
+        loop = GoalLoop(
+            goal=resume.state.goal if resume is not None else goal,
+            planner=self._build_goal_planner(chat_backend, runner),
+            executor=runner,
+            command_registry=self._handlers(),
+            trace_saver=self._goal_trace_saver(runner),
+            chat_id=_BRIDGE_CHAT_ID,
+            max_steps=_GOAL_STEP_GRANT,
+            replan_limit=_GOAL_REPLAN_LIMIT,
+        )
+        report = loop.run(resume=resume)
+        logger.info(
+            "[chat-goal-plan] done=%s replans=%s final=%r",
+            report.done,
+            report.replans_used,
+            report.final_result,
+        )
+        return report
+
+    def _build_goal_planner(self, chat_backend: str, runner: _WorkflowShimRunner) -> GoalPlanner:
+        return GoalPlanner(
+            catalog=runner.catalog,
+            llm_client=self._goal_planner_client(chat_backend),
+            command_registry=self._handlers(),
+            command_usage_resolver=lambda command, _registry: self._registered_command_usage(command),
+        )
+
+    def _grant_goal_search_extension(self, extra_queries: int) -> int:
+        runner = _WorkflowShimRunner(self.settings)
+        before = runner._tool_runner._current_search_limit()
+        granted_extra = runner._tool_runner.grant_search_extension(extra_queries)
+        after = runner._tool_runner._current_search_limit()
+        logger.info(
+            "[chat-goal-plan] granted search extension extra=%s granted_extra=%s limit=%s->%s",
+            extra_queries,
+            granted_extra,
+            before,
+            after,
+        )
+        return max(0, after - before)
+
+    def _goal_planner_client(self, chat_backend: str):
+        bridge = self
+
+        class _PlannerClient:
+            def generate(self, prompt: str, *, temperature: float = 0.0) -> str:
+                text, _metadata = bridge._generate_chat_tool_plan_with_chat_backend(
+                    chat_backend,
+                    prompt,
+                )
+                return text
+
+        return _PlannerClient()
+
+    @staticmethod
+    def _format_goal_loop_message(report) -> str:
+        parts = ["\n".join(report.narration).strip()]
+        if report.final_result:
+            parts.append(report.final_result.strip())
+        if report.continuation is not None:
+            parts.append(CommandBridge._format_goal_budget_status(report.continuation))
+        return "\n\n".join(part for part in parts if part)
+
+    @staticmethod
+    def _format_goal_budget_status(continuation: GoalLoopContinuation) -> str:
+        budget = continuation.state.budget or {}
+        bits = []
+        if "steps_used" in budget and "steps_limit" in budget:
+            bits.append(f"steps {budget.get('steps_used')}/{budget.get('steps_limit')}")
+        if "replans_used" in budget and "replans_limit" in budget:
+            bits.append(f"replans {budget.get('replans_used')}/{budget.get('replans_limit')}")
+        if "search_used" in budget and "search_limit" in budget:
+            search_text = f"search {budget.get('search_used')}/{budget.get('search_limit')}"
+            if budget.get("search_hard_limit"):
+                search_text += f"（今日硬上限 {budget.get('search_hard_limit')}）"
+            bits.append(search_text)
+        return (
+            "⏸ 已達執行上限\n"
+            f"目標：{continuation.state.goal}\n"
+            f"已完成：{len(continuation.state.completed)} 步；"
+            f"已重試 {len(continuation.state.attempted_fixes)} 次\n"
+            f"額度：{' · '.join(bits) if bits else 'n/a'}\n"
+            f"下一步（若繼續）：{continuation.state.next_action or '（無）'}"
+        )
+
+    @staticmethod
+    def _format_goal_preview_message(continuation: GoalLoopContinuation) -> str:
+        workflow = continuation.workflow
+        if workflow is None:
+            return "\n".join(continuation.narration)
+        lines = [
+            "\n".join(continuation.narration),
+            "",
+            "以下是準備執行的工作流：",
+        ]
+        for index, step in enumerate(workflow.steps, 1):
+            if step.kind == "tool_call":
+                lines.append(f"{index}. tool_call {step.tool} → {step.output}")
+            elif step.kind == "command_sink":
+                arg = step.literal if step.literal is not None else f"${step.input}"
+                lines.append(f"{index}. {step.command} {arg or ''} → {step.output}".strip())
+            else:
+                lines.append(f"{index}. llm_transform {step.inputs} → {step.output}")
+        lines.append("")
+        lines.append("確認後才會開始執行。")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _goal_preview_actions() -> tuple[Action, ...]:
+        return (
+            Action(label="開始執行", command="chat", input=_GOAL_CONFIRM_INPUT),
+            Action(label="取消", command="chat", input=_GOAL_STOP_INPUT),
+        )
+
+    @staticmethod
+    def _goal_web_actions(req: WebCommandRequest, report: GoalLoopReport) -> tuple[Action, ...]:
+        if report.continuation is None:
+            return ()
+        budget = report.continuation.state.budget or {}
+        search_used = int(budget.get("search_used") or 0)
+        search_hard_limit = int(budget.get("search_hard_limit") or 0)
+        if "search" in (report.continuation.state.stop_condition or ""):
+            actions = []
+            if not search_hard_limit or search_used < search_hard_limit:
+                actions.append(
+                    Action(
+                        label=f"繼續（再 {_GOAL_SEARCH_GRANT} 次搜尋）",
+                        command="chat",
+                        input=_GOAL_CONTINUE_SEARCH_INPUT,
+                    )
+                )
+            actions.append(Action(label="停止並總結", command="chat", input=_GOAL_STOP_INPUT))
+            return tuple(actions)
+        return (
+            Action(label=f"繼續（再 {_GOAL_STEP_GRANT} 步）", command="chat", input=_GOAL_CONTINUE_INPUT),
+            Action(label="停止並總結", command="chat", input=_GOAL_STOP_INPUT),
+        )
+
+    @staticmethod
+    def _stream_actions(response: WebCommandResponse) -> list[dict] | None:
+        if not response.actions:
+            return None
+        return [action.to_dict() for action in response.actions]
+
+    @staticmethod
+    def _goal_trace_saver(runner: _WorkflowShimRunner):
+        from .task_workspace import WorkflowStore
+
+        store = WorkflowStore(Path(runner.tools_dir).parent / "workflow_store")
+        return store.save_trace
+
     @staticmethod
     def _rank_local_by_web_mentions(
         local_candidates: list[dict], web_results: list
@@ -1164,6 +1941,7 @@ class CommandBridge:
         tools = [CHAT_TOOL_SEARCH]
         tool_lines = [
             "- /search：當回答需要即時、最新或你不確定的事實資訊時使用；query 是適合搜尋引擎的完整查詢。",
+            "- __goal__：當使用者其實是在描述一個多步驟目標、想建立流程或持續完成任務時使用；query 是精簡後的目標描述。",
         ]
         for tool in (CHAT_TOOL_MUSIC, CHAT_TOOL_BLUETOOTH, CHAT_TOOL_IR):
             line = self._registered_chat_tool_prompt_line(tool)
@@ -1171,8 +1949,7 @@ class CommandBridge:
                 continue
             tools.append(tool)
             tool_lines.append(line)
-        tool_choices = "|".join(t.split("/", 1)[-1] for t in tools)
-        tool_choices = "/" + "|/".join(tool_choices.split("|"))
+        tool_choices = "__goal__|" + "|".join(tools)
         return _CHAT_TOOL_PLAN_PROMPT_TEMPLATE.format(
             tool_lines="\n".join(tool_lines),
             tool_choices=tool_choices,

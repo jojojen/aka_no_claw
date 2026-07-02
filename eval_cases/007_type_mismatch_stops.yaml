@@ -1,0 +1,25 @@
+{
+  "id": "007_type_mismatch_stops",
+  "goal": "型別不符",
+  "replan_limit": 0,
+  "drafts": [
+    {
+      "workflow": {
+        "id": "wf-type-mismatch",
+        "goal": "型別不符",
+        "steps": [
+          {"id": "s1", "kind": "command_sink", "command": "/music", "literal": "playbest", "output": "music_result"},
+          {"id": "s2", "kind": "command_sink", "command": "/saynow", "input": "music_result", "output": "spoken"}
+        ]
+      }
+    }
+  ],
+  "command_responses": [
+    {"command": "/music", "responses": ["music ok"]},
+    {"command": "/saynow", "responses": ["spoken ok"]}
+  ],
+  "expected": {
+    "final_state": "paused",
+    "command_input": {"command": "/music", "input": "playbest"}
+  }
+}
