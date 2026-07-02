@@ -12,9 +12,12 @@ jobs:
       # Companion repos, checked out as subdirectories of this workspace
       # (actions/checkout refuses a `path` outside $GITHUB_WORKSPACE, so a
       # true `../<repo>` sibling — matching the local multi-repo dev layout
-      # — isn't possible here). These provide pure-stdlib modules only
-      # (market_monitor, telegram_nl, telegram_core) — no pip install
-      # needed for the slice this job runs.
+      # — isn't possible here). Their own code is pure-stdlib (market_monitor,
+      # telegram_nl, telegram_core), so no `pip install -e` of them is needed —
+      # sys.path injection below is enough. But assistant_runtime.tls imports
+      # the real PyPI package `truststore` (a price_monitor_bot dependency
+      # normally pulled in transitively via editable install locally), so
+      # that one still needs an explicit pip install — see below.
       - uses: actions/checkout@v4
         with:
           repository: jojojen/price_monitor_bot
@@ -35,7 +38,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install pytest
-        run: python -m pip install pytest
+        run: python -m pip install pytest truststore
 
       - name: Run goal-loop eval slice
         run: |
