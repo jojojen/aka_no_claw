@@ -1,0 +1,23 @@
+{
+  "id": "002_reuse_fast_path",
+  "goal": "直接用既有工具查資料",
+  "drafts": [
+    {
+      "workflow": {
+        "id": "wf-reuse",
+        "goal": "直接用既有工具查資料",
+        "steps": [
+          {"id": "s1", "kind": "tool_call", "tool": "promoted_lookup", "args": {"q": "初音ミク"}, "output": "result"}
+        ]
+      }
+    }
+  ],
+  "tool_responses": [
+    {"slug": "promoted_lookup", "responses": [{"ok": true, "text": "lookup ok"}]}
+  ],
+  "expected": {
+    "tool_called": "promoted_lookup",
+    "final_state": "done",
+    "codegen_calls": 0
+  }
+}

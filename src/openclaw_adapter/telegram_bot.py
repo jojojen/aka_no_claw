@@ -95,6 +95,8 @@ from .home_schedule_command import (
 )
 from .workflow_command import build_workflow_handler, command_metadata, _workflow_store
 from .workflow_editor import WorkflowEditor
+from .llm_pool_settings import default_chat_backend
+from .command_bridge_models import STATUS_OK, WebCommandResponse, parse_request
 from .music_favorites import (
     FavoritesStore,
     MUSIC_BEST_LIST_KIND,
@@ -325,13 +327,16 @@ class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
         settings: AssistantSettings | None = None,
         allowed_chat_ids: frozenset[str] | None = None,
         workflow_editor=None,
+        goal_bridge=None,
         **kwargs,
     ) -> None:
         self._settings = settings
         self._workflow_editor = workflow_editor
+        self._goal_bridge = goal_bridge
         if allowed_chat_ids is None and settings is not None and settings.openclaw_telegram_chat_id:
             allowed_chat_ids = frozenset({settings.openclaw_telegram_chat_id})
         super().__init__(allowed_chat_ids=allowed_chat_ids, **kwargs)
+        self._callback_registry.setdefault("goal", self._handle_goal_callback)
 
     def _help_text(self) -> str:
         return _build_openclaw_help_text()
@@ -541,6 +546,17 @@ class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
                 reply=None,
                 reply_factory=lambda t=target, cmd=command, c=cid: ir_spec.handler(f"send {t} {cmd}", c),
             )
+        if intent.intent == "execute_goal":
+            goal = (intent.workflow_description or "").strip()
+            if not goal:
+                return TelegramTextReplyPlan(ack=None, reply="我沒有抓到要執行的目標內容。")
+            logger.info("Telegram NL routed intent=execute_goal goal=%s", goal[:120])
+            return TelegramTextReplyPlan(
+                ack="收到，先幫你規劃工作流並請你確認…",
+                reply=None,
+                reply_factory=lambda g=goal, c=cid: self._execute_goal_bridge_reply(g, c),
+                run_in_background=True,
+            )
         return None
 
     def _route_natural_language(self, text: str) -> TelegramNaturalLanguageIntent | None:
@@ -555,6 +571,9 @@ class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
                 app_intent.confidence,
             )
             return app_intent
+        goal_intent = self._route_goal_loop_intent(text)
+        if goal_intent is not None:
+            return goal_intent
         return None
 
     def build_reply_plan(self, *, chat_id: str | int, text: str | None) -> TelegramTextReplyPlan:
@@ -571,6 +590,141 @@ class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
         if translate_plan is not None:
             return translate_plan
         return super().build_reply_plan(chat_id=chat_id, text=text)
+
+    def _get_goal_bridge(self):
+        if self._goal_bridge is None and self._settings is not None:
+            from .command_bridge import CommandBridge
+
+            self._goal_bridge = CommandBridge(settings=self._settings)
+        return self._goal_bridge
+
+    def _goal_chat_backend(self) -> str:
+        if self._settings is None:
+            return "local"
+        return default_chat_backend(self._settings)
+
+    @staticmethod
+    def _goal_conversation_id(chat_id: str | int) -> str:
+        return f"telegram:{chat_id}"
+
+    def _build_goal_bridge_request(self, text: str, chat_id: str | int):
+        return parse_request(
+            {
+                "mode": "chat",
+                "input": text,
+                "conversation_id": self._goal_conversation_id(chat_id),
+                "chat_backend": self._goal_chat_backend(),
+                "source": "telegram",
+            }
+        )
+
+    def _route_goal_loop_intent(self, text: str) -> TelegramNaturalLanguageIntent | None:
+        bridge = self._get_goal_bridge()
+        if bridge is None:
+            return None
+        try:
+            plan, _metadata = bridge._select_chat_tool_plan(self._build_goal_bridge_request(text, "router"))
+        except Exception:
+            logger.exception("Telegram goal-loop router failed text=%s", trim_for_log(text, limit=240))
+            return None
+        if plan is None or plan.tool != "__goal__":
+            return None
+        return TelegramNaturalLanguageIntent(
+            intent="execute_goal",
+            workflow_description=plan.query,
+            confidence=0.8,
+        )
+
+    def _execute_goal_bridge(self, text: str, chat_id: str | int) -> WebCommandResponse:
+        bridge = self._get_goal_bridge()
+        if bridge is None:
+            return WebCommandResponse(status="error", message="goal bridge 尚未啟用。")
+        return bridge.handle(self._build_goal_bridge_request(text, chat_id))
+
+    def _preview_goal_bridge(self, goal: str, chat_id: str | int) -> WebCommandResponse:
+        bridge = self._get_goal_bridge()
+        if bridge is None:
+            return WebCommandResponse(status="error", message="goal bridge 尚未啟用。")
+        req = self._build_goal_bridge_request(goal, chat_id)
+        return bridge._preview_goal_loop(req, goal, planner_metadata=None)
+
+    def _execute_goal_bridge_reply(
+        self,
+        text: str,
+        chat_id: str | int,
+    ) -> tuple[str, dict[str, object] | None]:
+        response = self._preview_goal_bridge(text, chat_id)
+        return response.message, self._goal_reply_markup(response)
+
+    def _handle_goal_callback(
+        self,
+        payload: str,
+        original_text: str,
+        chat_id: str,
+    ) -> tuple[object, str | None, object]:
+        response = self._execute_goal_bridge(payload, chat_id)
+        if response.status != STATUS_OK:
+            return response.message, None, None
+        return None, response.message, self._goal_reply_markup(response)
+
+    def handle_callback_query_async(
+        self,
+        *,
+        client,
+        callback_id: str,
+        chat_id: str,
+        message_id: int,
+        prefix: str,
+        payload: str,
+        original_text: str,
+    ) -> bool:
+        if prefix != "goal":
+            return False
+        try:
+            client.answer_callback_query(
+                callback_query_id=callback_id,
+                text="收到，正在處理…",
+            )
+        except Exception:
+            logger.exception("answer_callback_query failed for async goal callback chat_id=%s", chat_id)
+
+        def _worker() -> None:
+            try:
+                response = self._execute_goal_bridge(payload, chat_id)
+                reply_markup = self._goal_reply_markup(response) if response.status == STATUS_OK else None
+                client.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=response.message,
+                    reply_markup=reply_markup,
+                )
+            except Exception:
+                logger.exception("async goal callback worker failed chat_id=%s payload=%s", chat_id, payload)
+                try:
+                    client.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=f"{original_text}\n\n⚠️ 目標執行失敗，請稍後再試。",
+                        reply_markup=None,
+                    )
+                except Exception:
+                    logger.exception("async goal callback fallback edit failed chat_id=%s", chat_id)
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return True
+
+    @staticmethod
+    def _goal_reply_markup(response: WebCommandResponse) -> dict[str, object] | None:
+        if not response.actions:
+            return None
+        rows = []
+        for action in response.actions:
+            if action.command != "chat" or not action.input:
+                continue
+            rows.append([{"text": action.label, "callback_data": f"goal:{action.input}"}])
+        if not rows:
+            return None
+        return {"inline_keyboard": rows}
 
 
 def default_lookup_renderer(settings: AssistantSettings) -> LookupRenderer:
@@ -1859,6 +2013,8 @@ def run_telegram_polling(
     drop_pending_updates: bool = True,
 ) -> int:
     token = require_telegram_token(settings)
+    from .command_bridge import CommandBridge
+
     _wire_kb_embedder(settings)
     watch_db = _bootstrap_watch_db(settings)
     # Price monitor now runs in local.openclaw.price_monitor (separate process).
@@ -1909,9 +2065,10 @@ def run_telegram_polling(
             background=True,
         )
 
+    goal_bridge = CommandBridge(settings=settings)
     _price_bot_module.TelegramCommandProcessor = (
         lambda **kwargs: TelegramCommandProcessor(
-            settings=settings, workflow_editor=_wf_editor, **kwargs
+            settings=settings, workflow_editor=_wf_editor, goal_bridge=goal_bridge, **kwargs
         )
     )
     return _base_run_telegram_polling(
@@ -2331,7 +2488,7 @@ def _build_status_text(settings: AssistantSettings, dynamic_tool_runner=None) ->
     tesseract = settings.openclaw_tesseract_path or configured.get("OPENCLAW_TESSERACT_PATH") or "PATH lookup"
     tessdata = settings.openclaw_tessdata_dir or configured.get("OPENCLAW_TESSDATA_DIR") or "auto"
     text_backend = (settings.openclaw_local_text_backend or "").strip().lower() or "none"
-    text_model = _select_router_model_for_status(settings)
+    text_model = _select_router_model_for_status(settings) if text_backend != "none" else None
     configured_text_backend = configured.get("OPENCLAW_LOCAL_TEXT_BACKEND") or "none"
     configured_text_model = configured.get("OPENCLAW_LOCAL_TEXT_MODEL")
     configured_text_timeout = configured.get("OPENCLAW_LOCAL_TEXT_TIMEOUT_SECONDS") or str(settings.openclaw_local_text_timeout_seconds)

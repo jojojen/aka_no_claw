@@ -175,6 +175,10 @@ class AssistantSettings:
     # which model synthesized it (本地 qwen3:14b / 雲端 big-pickle) for debugging.
     # Default off so end users never see the internal label.
     openclaw_web_chat_tool_debug: bool = False
+    # /new search grounding budget: normal daily allowance plus persisted
+    # temporary grants, but never beyond the hard cap.
+    openclaw_search_daily_soft_cap: int = 10
+    openclaw_search_daily_hard_cap: int = 20
     # ── local timed home scheduler (issue #39) ─────────────────────────────
     # Persisted home schedules (/schedulehome): timed runs of existing slash
     # commands (/music, /say, /bluetooth) that survive bot restarts. Gitignored
@@ -474,6 +478,14 @@ def get_settings() -> AssistantSettings:
         ),
         openclaw_web_chat_tool_debug=_as_bool(
             os.getenv("OPENCLAW_WEB_CHAT_TOOL_DEBUG")
+        ),
+        openclaw_search_daily_soft_cap=_as_int(
+            os.getenv("OPENCLAW_SEARCH_DAILY_SOFT_CAP"),
+            default=10,
+        ),
+        openclaw_search_daily_hard_cap=_as_int(
+            os.getenv("OPENCLAW_SEARCH_DAILY_HARD_CAP"),
+            default=20,
         ),
         openclaw_home_schedules_path=_resolve_runtime_path(
             os.getenv("OPENCLAW_HOME_SCHEDULES_PATH", ".openclaw_tmp/home_schedules.json")

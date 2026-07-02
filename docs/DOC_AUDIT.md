@@ -44,7 +44,9 @@ for which question each one answers.
 | `NEW_DYNAMIC_TOOLS_PROGRESS.md` | Current | dynamic-tools | Keep; canonical `/new` doc. |
 | `NEW_E2E_DISCRIMINATING_TESTS.md` | Current | dynamic-tools | Keep; cross-link from dynamic-tools canonical. |
 | `NEW_OPENCODE_DECOUPLING_PLAN.md` | Planned | dynamic-tools | Keep until shipped; then fold into canonical and archive. Cross-linked from canonical. |
+| `CHAT_GOAL_LOOP_PLAN.md` | Planned | dynamic-tools | Keep until shipped (chat goal loop + eval harness, issues #50–#54); then mark Current or fold into canonical and archive. |
 | `TELEGRAM_NL_OWNERSHIP_REFACTOR_ISSUE.md` | Planned | telegram | Draft issue; keep until the cross-repo NL ownership refactor is filed/resolved. |
+| `TELEGRAM_CORE_EXTRACTION_PLAN.md` | Planned | telegram | Keep until `telegram_core` extraction ships (phases P0–P4); then mark Current or fold into SYSTEM_MAP and archive. |
 | `OPPORTUNITY_AGENT_SPEC.md` | Needs review | opportunity | Verify thresholds vs code; canonical Opportunity doc. |
 | `OPPORTUNITY_AGENT_HANDOFF.md` | Needs review | opportunity | Keep as operational companion; cross-link to spec. |
 | `KB_EMBEDDING_PLAN.md` | Needs review | knowledge | Re-verify embedding/RAG status. |

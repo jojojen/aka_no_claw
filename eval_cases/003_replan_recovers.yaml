@@ -1,0 +1,35 @@
+{
+  "id": "003_replan_recovers",
+  "goal": "先失敗再修好",
+  "drafts": [
+    {
+      "workflow": {
+        "id": "wf-bad",
+        "goal": "先失敗再修好",
+        "steps": [
+          {"id": "s1", "kind": "tool_call", "tool": "broken_tool", "args": {}, "output": "broken"}
+        ]
+      }
+    }
+  ],
+  "replans": [
+    {
+      "workflow": {
+        "id": "wf-good",
+        "goal": "先失敗再修好",
+        "steps": [
+          {"id": "s1", "kind": "tool_call", "tool": "real_tool", "args": {}, "output": "fixed"}
+        ]
+      }
+    }
+  ],
+  "tool_responses": [
+    {"slug": "broken_tool", "responses": [{"ok": false, "text": "boom"}]},
+    {"slug": "real_tool", "responses": [{"ok": true, "text": "done"}]}
+  ],
+  "expected": {
+    "tool_order": ["broken_tool", "real_tool"],
+    "final_state": "done",
+    "replan_calls": 1
+  }
+}
