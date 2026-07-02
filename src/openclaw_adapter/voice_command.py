@@ -1,7 +1,7 @@
-"""Telegram-side handlers for ``/voice`` and ``/say`` (AivisSpeech tuning).
+"""Telegram-side handlers for ``/voice`` and ``/generateaudio`` (AivisSpeech tuning).
 
 aka_no_claw owns the ``QuizDatabase`` (which now stores per-chat ``VoiceParams``)
-and the synthesizers; price_monitor_bot's ``/voice`` / ``/say`` branches just call
+and the synthesizers; price_monitor_bot's ``/voice`` / ``/generateaudio`` branches just call
 the handlers built here. Contracts mirror the ``/quiz`` handlers:
 
   - command handler  ``handler(raw, chat_id) -> str | (text, reply_markup)``
@@ -10,8 +10,9 @@ the handlers built here. Contracts mirror the ``/quiz`` handlers:
                        stripped by bot.py).
 
 ``/voice`` shows the current five AivisSpeech scales with an inline ➖/➕ keyboard;
-``/voice <param> <value>`` / ``/voice reset`` set them by text. ``/say <日文>``
-synthesizes the text with the chat's stored params and sends back the WAV.
+``/voice <param> <value>`` / ``/voice reset`` set them by text.
+``/generateaudio <日文>`` converts text to a generated audio file and sends back
+the WAV.
 
 Callback payloads (prefix ``voice`` stripped):
   <param>:+ / <param>:-   — step one param up/down, persist, redraw
@@ -124,7 +125,7 @@ def _render(params: VoiceParams) -> "tuple[str, dict]":
         val = getattr(params, name)
         lines.append(f"・{label} {name}: {val}（{lo}~{hi}）")
     lines.append("")
-    lines.append("用 ➖/➕ 微調，或 /voice <參數> <值>、/voice reset；/say <日文> 試聽。")
+    lines.append("用 ➖/➕ 微調，或 /voice <參數> <值>、/voice reset；/generateaudio <文字> 產生音訊檔。")
     rows: list[list[dict]] = []
     for name, label in _PARAM_LABELS:
         val = getattr(params, name)
@@ -207,7 +208,7 @@ def build_voice_callback_handler(
     return handler
 
 
-def build_say_handler(
+def build_generateaudio_handler(
     settings: AssistantSettings,
 ) -> Callable[[str, str], object]:
     db = _open_db(settings)
@@ -216,12 +217,12 @@ def build_say_handler(
         cid = str(chat_id or "")
         text = (raw or "").strip()
         if not text:
-            return "用法：/say <日文文字>（用目前語音參數朗讀）。"
+            return "用法：/generateaudio <文字>（用目前語音參數產生音訊檔案）。"
         token = getattr(settings, "openclaw_telegram_bot_token", None)
         if not token:
-            return "缺少 Telegram bot token，無法送出語音。"
+            return "缺少 Telegram bot token，無法送出音訊檔案。"
         if not cid:
-            return "找不到 chat_id，無法送出語音。"
+            return "找不到 chat_id，無法送出音訊檔案。"
         params = db.get_voice_params(cid)
         synth = build_vocab_synthesizer(settings, params)
         cache_dir = build_vocab_audio_cache_dir(settings=settings)
@@ -230,7 +231,7 @@ def build_say_handler(
         except QuizVocabAudioError as exc:
             return f"合成失敗：{exc}"
         except Exception as exc:
-            logger.exception("/say synthesis failed text=%s", text[:40])
+            logger.exception("/generateaudio synthesis failed text=%s", text[:40])
             return f"合成失敗：{exc}"
         client = TelegramBotClient(token, ssl_context=build_ssl_context(settings))
         caption = f"音源：{audio.engine_label}\n文字：{text}"
@@ -248,8 +249,8 @@ def build_saynow_handler(
     settings: AssistantSettings,
 ) -> Callable[[str, str], object]:
     """``/saynow <日文>``: synthesize with the chat's voice params (same path as
-    ``/say``) and play it OUT THE MAC MINI'S SPEAKERS instead of sending a
-    Telegram voice file. This is the form home schedules use for spoken
+    ``/generateaudio``) and play it OUT THE MAC MINI'S SPEAKERS instead of sending a
+    generated audio file to Telegram. This is the form home schedules use for spoken
     announcements — it needs no chat to deliver to, so it works unattended."""
     db = _open_db(settings)
 

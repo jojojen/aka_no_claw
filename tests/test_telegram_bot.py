@@ -597,13 +597,13 @@ def test_execute_goal_plan_uses_bridge_and_renders_buttons() -> None:
     settings = AssistantSettings(openclaw_telegram_chat_id="123")
 
     class _Bridge:
-        def _preview_goal_loop(self, req, goal, planner_metadata=None):
+        def _run_goal_loop_blocking(self, req, goal, planner_metadata=None):
             return WebCommandResponse(
                 status=STATUS_OK,
-                message="preview text",
+                message="run report text",
                 actions=(
-                    Action(label="開始執行", command="chat", input="__goal_confirm__"),
-                    Action(label="取消", command="chat", input="__goal_stop__"),
+                    Action(label="繼續（再 6 步）", command="chat", input="__goal_continue__"),
+                    Action(label="停止並總結", command="chat", input="__goal_stop__"),
                 ),
             )
 
@@ -623,11 +623,11 @@ def test_execute_goal_plan_uses_bridge_and_renders_buttons() -> None:
 
     assert plan is not None
     text, markup = plan._execute_unpacked()
-    assert text == "preview text"
+    assert text == "run report text"
     assert markup == {
         "inline_keyboard": [
-            [{"text": "開始執行", "callback_data": "goal:__goal_confirm__"}],
-            [{"text": "取消", "callback_data": "goal:__goal_stop__"}],
+            [{"text": "繼續（再 6 步）", "callback_data": "goal:__goal_continue__"}],
+            [{"text": "停止並總結", "callback_data": "goal:__goal_stop__"}],
         ]
     }
 
@@ -661,15 +661,15 @@ def test_goal_callback_routes_back_into_bridge() -> None:
     }
 
 
-def test_goal_free_text_uses_preview_not_second_handle_call() -> None:
+def test_goal_free_text_runs_goal_loop_not_second_handle_call() -> None:
     settings = AssistantSettings(openclaw_telegram_chat_id="123")
     seen = {}
 
     class _Bridge:
-        def _preview_goal_loop(self, req, goal, planner_metadata=None):
+        def _run_goal_loop_blocking(self, req, goal, planner_metadata=None):
             seen["goal"] = goal
             seen["conversation_id"] = req.conversation_id
-            return WebCommandResponse(status=STATUS_OK, message="preview only")
+            return WebCommandResponse(status=STATUS_OK, message="run report only")
 
         def handle(self, req):
             raise AssertionError("should not re-route goal text through handle()")
@@ -684,7 +684,7 @@ def test_goal_free_text_uses_preview_not_second_handle_call() -> None:
 
     text, markup = processor._execute_goal_bridge_reply("先查天氣再播報", "123")
 
-    assert text == "preview only"
+    assert text == "run report only"
     assert markup is None
     assert seen == {
         "goal": "先查天氣再播報",

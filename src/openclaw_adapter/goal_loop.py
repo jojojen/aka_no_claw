@@ -12,7 +12,12 @@ from typing import Callable
 
 from .goal_planner import GoalPlanner
 from .task_loop import BoundedTaskLoop, ContinuationState, LoopContext, LoopResult, StepOutcome
-from .task_workspace import Workflow, WorkflowRunner, WorkflowTrace
+from .task_workspace import (
+    Workflow,
+    WorkflowRunner,
+    WorkflowTrace,
+    describe_workflow_step,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +85,8 @@ class GoalLoop:
         chat_id: str = "",
         max_steps: int = 6,
         replan_limit: int = 2,
+        narrator: Callable[[str], None] | None = None,
+        result_judge: Callable[[str, str], tuple[bool, str]] | None = None,
     ) -> None:
         self.goal = goal
         self.planner = planner
@@ -90,6 +97,8 @@ class GoalLoop:
         self.chat_id = chat_id
         self.max_steps = max_steps
         self.replan_limit = replan_limit
+        self.narrator = narrator
+        self.result_judge = result_judge
 
     def run(self, resume: GoalLoopContinuation | None = None) -> GoalLoopReport:
         scratch = {
@@ -99,12 +108,12 @@ class GoalLoop:
             "needs_replan": False,
             "pause_reason": None,
             "abort": None,
-            "narration": list(resume.narration) if resume is not None else [f"已理解目標為：{self.goal}"],
+            "narration": list(resume.narration) if resume is not None else [],
         }
-        if not scratch["narration"]:
-            scratch["narration"] = [f"已理解目標為：{self.goal}"]
         for line in scratch["narration"]:
             logger.info("[goal-loop] %s", line)
+        if not scratch["narration"]:
+            self._narrate(scratch, f"已理解目標為：{self.goal}")
         if scratch["trace"] is not None and not scratch["trace"].ok:
             scratch["needs_replan"] = True
         loop = BoundedTaskLoop(
@@ -279,6 +288,7 @@ class GoalLoop:
                 return StepOutcome(observation="draft failed", failed=True, reflection=scratch["abort"])
             scratch["workflow"] = workflow
             self._narrate(scratch, f"草稿完成：{workflow.id}（{len(workflow.steps)} 步）")
+            self._narrate_workflow_steps(scratch, workflow)
             return StepOutcome(observation=f"drafted {workflow.id} with {len(workflow.steps)} step(s)")
 
         def run_workflow(ctx: LoopContext) -> StepOutcome:
@@ -287,11 +297,37 @@ class GoalLoop:
                 scratch["abort"] = "沒有可執行的工作流草稿"
                 return StepOutcome(observation="no workflow", failed=True, reflection=scratch["abort"])
             self._narrate(scratch, f"開始執行工作流：{workflow.id}")
-            trace = self._build_runner().run(workflow)
+            trace = self._build_runner(
+                step_observer=lambda line: self._narrate(scratch, line)
+            ).run(workflow)
             scratch["trace"] = trace
             scratch["needs_replan"] = False
             scratch["pause_reason"] = None
             if trace.ok:
+                # Every step succeeding is not the same as the goal being
+                # achieved (e.g. a command replying with a follow-up question).
+                # Judge the final result against the goal; if it falls short,
+                # feed the reason back into replan instead of declaring done.
+                achieved, reason = self._judge_result(scratch, trace.final_result or "")
+                if not achieved:
+                    scratch["needs_replan"] = True
+                    self._narrate(
+                        scratch,
+                        f"結果未達成目標：{reason or '（無說明）'}，準備重新規劃",
+                    )
+                    trace.narration = list(scratch["narration"])
+                    if self.trace_saver is not None:
+                        try:
+                            self.trace_saver(trace)
+                        except Exception:  # noqa: BLE001
+                            logger.exception(
+                                "goal_loop: failed to save trace workflow=%s", workflow.id
+                            )
+                    return StepOutcome(
+                        observation=trace.final_result or "workflow result did not achieve goal",
+                        failed=True,
+                        reflection=reason or "workflow completed but goal not achieved",
+                    )
                 self._narrate(scratch, f"工作流完成：{trace.final_result or '（無輸出）'}")
                 trace.narration = list(scratch["narration"])
                 if self.trace_saver is not None:
@@ -339,7 +375,12 @@ class GoalLoop:
             scratch["workflow"] = revised
             scratch["replans_used"] += 1
             scratch["needs_replan"] = False
+            # drop the pre-replan trace: it may be ok=True (judged not achieving
+            # the goal), and a stale ok trace would stop the decider before the
+            # revised workflow gets its run
+            scratch["trace"] = None
             self._narrate(scratch, f"重規劃完成：{revised.id}（{len(revised.steps)} 步）")
+            self._narrate_workflow_steps(scratch, revised)
             return StepOutcome(observation=f"replanned to {revised.id}")
 
         return {
@@ -357,20 +398,24 @@ class GoalLoop:
             done = {c.split(":", 1)[0] for c in ctx.completed}
             if "draft" not in done:
                 return "draft"
-            if scratch.get("trace") is None:
-                return "run_workflow"
             trace = scratch.get("trace")
-            if trace is not None and trace.ok:
-                return ""
+            if trace is None:
+                return "run_workflow"
+            # needs_replan can be true even when trace.ok (goal-achievement
+            # judge rejected the result), so it must be checked first.
             if scratch["needs_replan"] and scratch["replans_used"] >= self.replan_limit:
-                scratch["abort"] = trace.final_result if trace is not None else "replan limit reached"
+                scratch["abort"] = trace.final_result or "replan limit reached"
                 return ""
             if scratch["needs_replan"]:
                 return "replan"
+            if trace.ok:
+                return ""
             return "run_workflow"
         return decide
 
-    def _build_runner(self) -> WorkflowRunner:
+    def _build_runner(
+        self, step_observer: Callable[[str], None] | None = None
+    ) -> WorkflowRunner:
         return WorkflowRunner(
             executor=self.executor,
             command_dispatcher=_command_dispatcher_for_chat(
@@ -378,12 +423,38 @@ class GoalLoop:
                 chat_id=self.chat_id,
             ),
             llm_client=self.llm_client,
+            step_observer=step_observer,
         )
 
-    @staticmethod
-    def _narrate(scratch: dict, line: str) -> None:
+    def _judge_result(self, scratch: dict, final_result: str) -> tuple[bool, str]:
+        """LLM judgment of whether ``final_result`` achieves the goal. No
+        keyword heuristics — open-world adequacy is the judge's call. A judge
+        failure must not sink an otherwise successful run, so it counts as
+        achieved."""
+        if self.result_judge is None:
+            return True, ""
+        self._narrate(scratch, "檢查結果是否達成目標…")
+        try:
+            achieved, reason = self.result_judge(self.goal, final_result)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("goal_loop: result judge failed")
+            self._narrate(scratch, f"結果檢查不可用（{exc}），視為完成")
+            return True, ""
+        return bool(achieved), str(reason or "")
+
+    def _narrate(self, scratch: dict, line: str) -> None:
         scratch["narration"].append(line)
         logger.info("[goal-loop] %s", line)
+        if self.narrator is not None:
+            try:
+                self.narrator(line)
+            except Exception:  # noqa: BLE001
+                logger.exception("goal_loop: narrator callback failed")
+
+    def _narrate_workflow_steps(self, scratch: dict, workflow: Workflow) -> None:
+        self._narrate(scratch, "子任務：")
+        for index, step in enumerate(workflow.steps, 1):
+            self._narrate(scratch, f"{index}. {describe_workflow_step(step)}")
 
     @staticmethod
     def _budget_pause_reason(budget) -> str:

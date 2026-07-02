@@ -181,7 +181,7 @@ class AssistantSettings:
     openclaw_search_daily_hard_cap: int = 20
     # ── local timed home scheduler (issue #39) ─────────────────────────────
     # Persisted home schedules (/schedulehome): timed runs of existing slash
-    # commands (/music, /say, /bluetooth) that survive bot restarts. Gitignored
+    # commands (/music, /generateaudio, /bluetooth) that survive bot restarts. Gitignored
     # runtime data; never committed.
     openclaw_home_schedules_path: str = ".openclaw_tmp/home_schedules.json"
 

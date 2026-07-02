@@ -156,7 +156,7 @@ def _render_command_picker(command_registry=None) -> tuple[str, dict]:
         # Fallback when no registry is available: show a curated set of
         # well-known safe commands rather than an empty picker.
         cmds = sorted(c for c in (
-            "/saynow", "/say", "/music", "/musicmute", "/musiclouder",
+            "/saynow", "/generateaudio", "/music", "/musicmute", "/musiclouder",
             "/musiclower", "/musicnowbest", "/bluetooth", "/ir",
             "/translateja", "/translatezh",
         ) if is_command_sink_allowed(c))

@@ -346,7 +346,9 @@ def _sanitize_history(raw: object) -> tuple[ChatTurn, ...]:
 #   - an explicit allowlisted tool call with its query
 # This module owns the trust boundary around that output.
 CHAT_TOOL_SEARCH = "/search"
+CHAT_TOOL_RESEARCH = "/research"
 CHAT_TOOL_MUSIC = "/music"
+CHAT_TOOL_MUSICQUEUE = "/musicqueue"
 CHAT_TOOL_BLUETOOTH = "/bluetooth"
 CHAT_TOOL_IR = "/ir"
 CHAT_TOOL_GOAL = "__goal__"
@@ -355,7 +357,9 @@ CHAT_TOOL_NO_TOOL = "__no_tool__"
 # open-ended recognition): only these exact tools may ever be dispatched.
 CHAT_TOOLS = {
     CHAT_TOOL_SEARCH,
+    CHAT_TOOL_RESEARCH,
     CHAT_TOOL_MUSIC,
+    CHAT_TOOL_MUSICQUEUE,
     CHAT_TOOL_BLUETOOTH,
     CHAT_TOOL_IR,
 }
@@ -411,7 +415,7 @@ def parse_chat_tool_plan(raw: object) -> ChatToolPlan | None:
 
     - ``{"tool":"__no_tool__","answer":"..."}`` for the hidden direct-answer path
     - ``{"tool":"__goal__","query":"..."}`` for a multi-step goal classification
-    - ``{"tool":"/search|/music|/bluetooth|/ir","query":"..."}`` for explicit tools
+    - ``{"tool":"/search|/research|/music|/musicqueue|/bluetooth|/ir","query":"..."}`` for explicit tools
 
     Any malformed / untrusted payload returns ``None`` so the caller can fall
     back safely instead of executing arbitrary side effects.

@@ -207,13 +207,15 @@ def test_starting_new_song_stops_previous(settings, proc_table):
     assert len(proc_table["spawned"]) == 2
 
 
-def test_music_ambiguous_query_returns_list_without_playing(settings, proc_table):
+def test_music_ambiguous_query_plays_top_candidate_and_lists_others(settings, proc_table):
+    # Multiple matches: play the best-ranked one immediately instead of asking
+    # (user can re-specify); the alternatives are mentioned in the reply.
     handler = mc.build_music_handler(settings)
     reply = handler("ずっと真夜中でいいのに", "chat-1")
-    assert "請輸入更精確的名稱" in reply
+    assert "正在播放" in reply
+    assert "也找到相似歌曲" in reply
     assert "地球存在しない説" in reply
-    assert "間人間" in reply
-    assert proc_table["spawned"] == []  # ambiguous => never plays
+    assert len(proc_table["spawned"]) == 1
 
 
 def test_stop_terminates_current(settings, proc_table):
@@ -1010,3 +1012,77 @@ def test_continuous_play_consumes_forced_previous(settings, music_dir, proc_tabl
     assert any(p == forced_path for _, p in proc_table["spawned"])  # forced track replayed
     assert mc._read_forced(state_path) is None  # one-shot: consumed
     handler("stop", "chat-1")
+
+
+# --- /musicqueue: ordered play-once-through queue ---------------------------
+def test_musicqueue_plays_named_songs_in_order_then_stops(settings, proc_table, monkeypatch):
+    monkeypatch.setattr(mc, "_PLAYBEST_POLL_SECONDS", 0.01)
+    handler = mc.build_musicqueue_handler(settings)
+    reply = handler("間人間、Get Lucky", "chat-1")
+    assert "開始依序連續播放" in reply
+    assert reply.index("間人間") < reply.index("Get Lucky")  # listed in queue order
+    import time as _t
+    for _ in range(200):
+        if proc_table["spawned"]:
+            break
+        _t.sleep(0.01)
+    assert proc_table["spawned"], "queue should have started its first song"
+    assert proc_table["spawned"][0][1].endswith("- 間人間.flac")  # order kept, no shuffle
+    proc_table["alive"].discard(proc_table["spawned"][0][0])  # first song ends
+    for _ in range(200):
+        if len(proc_table["spawned"]) >= 2:
+            break
+        _t.sleep(0.01)
+    assert proc_table["spawned"][1][1].endswith("Get Lucky.flac")  # advanced to second
+    proc_table["alive"].discard(proc_table["spawned"][1][0])  # last song ends
+    # play-once provider: after the queue is drained the loop must stop cleanly
+    for _ in range(200):
+        if not mc._PLAYBEST.is_active():
+            break
+        _t.sleep(0.01)
+    assert not mc._PLAYBEST.is_active()
+    assert len(proc_table["spawned"]) == 2  # never loops back to the start
+
+
+def test_musicqueue_skips_unknown_names_and_reports_them(settings, proc_table, monkeypatch):
+    monkeypatch.setattr(mc, "_PLAYBEST_POLL_SECONDS", 0.01)
+    handler = mc.build_musicqueue_handler(settings)
+    reply = handler("Get Lucky\n沒有這首歌XYZ", "chat-1")
+    assert "開始依序連續播放" in reply
+    assert "找不到而跳過：沒有這首歌XYZ" in reply
+    import time as _t
+    for _ in range(200):
+        if proc_table["spawned"]:
+            break
+        _t.sleep(0.01)
+    assert proc_table["spawned"][0][1].endswith("Get Lucky.flac")
+    mc._PLAYBEST.stop()
+
+
+def test_musicqueue_all_names_missing_reports_without_starting(settings, proc_table):
+    handler = mc.build_musicqueue_handler(settings)
+    reply = handler("不存在A、不存在B", "chat-1")
+    assert "清單中找不到任何符合的本地歌曲" in reply
+    assert not mc._PLAYBEST.is_active()
+    assert not proc_table["spawned"]
+
+
+def test_musicqueue_empty_arg_shows_usage(settings, proc_table):
+    handler = mc.build_musicqueue_handler(settings)
+    reply = handler("", "chat-1")
+    assert "用法：/musicqueue" in reply
+    assert not proc_table["spawned"]
+
+
+def test_musicqueue_ambiguous_name_takes_top_candidate(settings, proc_table, monkeypatch):
+    monkeypatch.setattr(mc, "_PLAYBEST_POLL_SECONDS", 0.01)
+    handler = mc.build_musicqueue_handler(settings)
+    reply = handler("ずっと真夜中でいいのに", "chat-1")
+    assert "開始依序連續播放" in reply
+    import time as _t
+    for _ in range(200):
+        if proc_table["spawned"]:
+            break
+        _t.sleep(0.01)
+    assert proc_table["spawned"], "ambiguous name must still start the top match"
+    mc._PLAYBEST.stop()

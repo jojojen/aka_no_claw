@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import tempfile
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -93,6 +94,31 @@ _OPENCODE_RECOMMENDED_MODELS = (
 
 class ChatLlmPoolWriteError(RuntimeError):
     """Raised when persisting llm_pool.json fails."""
+
+
+class CloudPoolRotation:
+    """Rotates which cloud-pool provider a chain-walk starts from.
+
+    One goal-loop run shares a single instance across every LLM call it makes
+    (draft, each replan, the result judge, each llm_transform step). Without
+    rotation every call re-tries provider[0] first, so one long multi-step task
+    hammers a single provider's rate limit instead of spreading load across the
+    pool; the existing per-call fail-and-fall-through behavior is unchanged,
+    only the starting point advances between calls.
+    """
+
+    def __init__(self) -> None:
+        self._cursor = 0
+
+    def rotate(self, items: Sequence) -> list:
+        """Return ``items`` reordered to start at the current cursor (wrapping
+        around) and advance the cursor for the next call."""
+        size = len(items)
+        if size == 0:
+            return []
+        order = [items[(self._cursor + i) % size] for i in range(size)]
+        self._cursor = (self._cursor + 1) % size
+        return order
 
 
 @dataclass(frozen=True, slots=True)

@@ -39,6 +39,9 @@ COMMAND_SINK_DENYLIST: frozenset[str] = frozenset({
     "/backupclaw", "/backup", "/clawrecover", "/recoverclaw",
     # meta / recursive scheduling
     "/schedulehome", "/workflow",
+    # image-only commands are registered for Telegram dispatch but cannot run as
+    # text-only workflow sinks.
+    "/scan", "/image", "/photo",
     # monitoring config mutations (SNS write-side)
     "/snsadd", "/sns_add", "/snsdelete", "/sns_delete", "/snsclearfilter",
     # shell-like commands if ever registered
@@ -69,7 +72,7 @@ VARIABLE_TYPE_COMMAND_RESULT = "command_result"
 # raw command-result objects (e.g. JSON) to a voice synthesiser.
 COMMAND_SINK_INPUT_TYPES: dict[str, frozenset[str] | None] = {
     "/saynow": frozenset({VARIABLE_TYPE_PLAIN_TEXT, VARIABLE_TYPE_SPEECH_TEXT}),
-    "/say":    frozenset({VARIABLE_TYPE_PLAIN_TEXT, VARIABLE_TYPE_SPEECH_TEXT}),
+    "/generateaudio":    frozenset({VARIABLE_TYPE_PLAIN_TEXT, VARIABLE_TYPE_SPEECH_TEXT}),
 }
 
 # Maps slash-command string to a callable that takes the input text and returns
@@ -441,6 +444,15 @@ class LLMClient(Protocol):
 
 # ── Runner ────────────────────────────────────────────────────────────────────
 
+def describe_workflow_step(step: "WorkflowStep") -> str:
+    if step.kind == "tool_call":
+        return f"tool_call {step.tool} → {step.output}"
+    if step.kind == "command_sink":
+        arg = step.literal if step.literal is not None else f"${step.input}"
+        return f"{step.command} {arg or ''} → {step.output}".strip()
+    return f"llm_transform {step.inputs} → {step.output}"
+
+
 class WorkflowRunner:
     """Executes a Workflow sequentially, binding step outputs to Variables."""
 
@@ -449,10 +461,20 @@ class WorkflowRunner:
         executor: ToolCallExecutor,
         command_dispatcher: CommandDispatcher | None = None,
         llm_client: LLMClient | None = None,
+        step_observer: Callable[[str], None] | None = None,
     ) -> None:
         self.executor = executor
         self.command_dispatcher: CommandDispatcher = command_dispatcher or {}
         self.llm_client = llm_client
+        self.step_observer = step_observer
+
+    def _observe(self, line: str) -> None:
+        if self.step_observer is None:
+            return
+        try:
+            self.step_observer(line)
+        except Exception:  # noqa: BLE001
+            logger.exception("workflow runner step observer failed")
 
     def run(self, workflow: Workflow) -> WorkflowTrace:
         """Execute all steps and return the full trace."""
@@ -472,15 +494,21 @@ class WorkflowRunner:
         failed = False
         last_output_var: str | None = None
 
-        for step in workflow.steps:
+        total = len(workflow.steps)
+        for index, step in enumerate(workflow.steps, 1):
             if failed:
                 trace.steps.append(
                     StepTrace(step_id=step.id, kind=step.kind, status="skipped")
                 )
                 continue
 
+            self._observe(f"步驟 {index}/{total}：{describe_workflow_step(step)}")
             step_trace, produced_var = self._run_step(step, store)
             trace.steps.append(step_trace)
+            if step_trace.status == "failed":
+                self._observe(f"步驟 {index}/{total} 失敗：{step_trace.error or '（無詳情）'}")
+            else:
+                self._observe(f"步驟 {index}/{total} 完成")
 
             if step_trace.status == "failed":
                 if step_trace.budget_exhausted is not None:

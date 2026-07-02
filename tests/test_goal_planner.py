@@ -96,6 +96,45 @@ def test_goal_planner_draft_returns_valid_workflow():
     assert wf.validate_references(known_commands=frozenset({"/music", "/saynow"})) == []
 
 
+def test_goal_planner_pool_rotation_advances_start_provider_across_calls():
+    """A shared CloudPoolRotation on GoalPlanner rotates which client in the
+    list is tried first on each draft/replan call, instead of always retrying
+    client[0] first — so one long goal spreads load across the cloud pool.
+    """
+    from openclaw_adapter.llm_pool_settings import CloudPoolRotation
+
+    good_wf = json.dumps({"id": "wf-x", "goal": "g", "steps": []}, ensure_ascii=False)
+    first = _FakeLLM([good_wf, good_wf])
+    second = _FakeLLM([good_wf, good_wf])
+    planner = GoalPlanner(
+        catalog=None,
+        llm_client=[first, second],
+        pool_rotation=CloudPoolRotation(),
+    )
+
+    planner.draft("g")
+    assert len(first.prompts) == 1 and len(second.prompts) == 0
+
+    trace = SimpleNamespace(to_dict=lambda: {})
+    workflow = SimpleNamespace(to_dict=lambda: {})
+    planner.replan("g", workflow, trace)
+    assert len(first.prompts) == 1 and len(second.prompts) == 1
+
+
+def test_goal_planner_without_pool_rotation_always_tries_first_client():
+    good_wf = json.dumps({"id": "wf-x", "goal": "g", "steps": []}, ensure_ascii=False)
+    first = _FakeLLM([good_wf, good_wf])
+    second = _FakeLLM([good_wf, good_wf])
+    planner = GoalPlanner(catalog=None, llm_client=[first, second])
+
+    planner.draft("g")
+    trace = SimpleNamespace(to_dict=lambda: {})
+    workflow = SimpleNamespace(to_dict=lambda: {})
+    planner.replan("g", workflow, trace)
+
+    assert len(first.prompts) == 2 and len(second.prompts) == 0
+
+
 def test_generate_workflow_from_goal_repairs_invalid_references_once():
     broken = json.dumps({
         "id": "wf-broken",
@@ -146,6 +185,45 @@ def test_generate_workflow_from_goal_refuses_invalid_draft_after_one_repair():
     assert "工作流草稿驗證失敗" in err
     assert "not registered" in err
     assert len(llm.prompts) == 2
+
+
+def test_generate_workflow_from_goal_tries_next_client_after_invalid_repair():
+    bad = json.dumps({
+        "id": "wf-bad",
+        "goal": "壞草稿",
+        "steps": [
+            {"id": "s1", "kind": "command_sink", "command": "/missing", "literal": "x", "output": "r1"},
+        ],
+    }, ensure_ascii=False)
+    good = json.dumps({
+        "id": "wf-good",
+        "goal": "播放熱門歌曲",
+        "steps": [
+            {"id": "s1", "kind": "command_sink", "command": "/search", "literal": "熱門歌曲", "output": "search"},
+            {"id": "s2", "kind": "command_sink", "command": "/musiclistall", "literal": "", "output": "local"},
+            {"id": "s3", "kind": "llm_transform", "inputs": ["search", "local"], "instructions": "比對並輸出歌曲名", "output": "song"},
+            {"id": "s4", "kind": "command_sink", "command": "/music", "input": "song", "output": "played"},
+        ],
+    }, ensure_ascii=False)
+    first = _FakeLLM([bad, bad])
+    second = _FakeLLM(good)
+
+    wf, err, used_fallback = generate_workflow_from_goal(
+        "播放熱門歌曲",
+        [first, second],
+        catalog=None,
+        command_registry={
+            "/search": SimpleNamespace(usage="搜尋"),
+            "/musiclistall": SimpleNamespace(usage="列出音樂"),
+            "/music": SimpleNamespace(usage="播放音樂"),
+        },
+    )
+
+    assert err is None
+    assert used_fallback is True
+    assert wf.id == "wf-good"
+    assert len(first.prompts) == 2
+    assert len(second.prompts) == 1
 
 
 def test_generate_workflow_from_goal_tolerates_invalid_draft_when_not_strict():

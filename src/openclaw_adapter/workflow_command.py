@@ -38,6 +38,155 @@ logger = logging.getLogger(__name__)
 # and workflow drafting. Keep semantics in one table so the three surfaces
 # cannot drift.
 _COMMAND_METADATA: dict[str, dict[str, str]] = {
+    "/quiz": {
+        "usage": "JLPT 日文測驗；常用：random、wrong、stats、vocab、grammar、review。",
+    },
+    "/quizlikesong": {
+        "usage": "收藏 YouTube 歌曲並建立題庫；參數＝YouTube URL。",
+    },
+    "/voice": {
+        "usage": "語音合成預覽；參數＝要合成的日文文字。",
+    },
+    "/generateaudio": {
+        "usage": "產生音訊檔案；把文字轉成語音 WAV 並傳回 Telegram（參數＝要轉成語音的文字，通常用 input 變數帶入）",
+    },
+    "/saynow": {
+        "usage": "立即於 Mac mini 念出文字（參數＝要念的文字，通常用 input 變數帶入）",
+    },
+    "/new": {
+        "usage": "動態建立並執行新工具；高風險，不可作為自動 workflow sink。",
+    },
+    "/backupclaw": {
+        "usage": "備份 OpenClaw 資料庫與工具規格；可帶目的資料夾。",
+    },
+    "/backup": {
+        "usage": "同 /backupclaw；備份 OpenClaw 資料。",
+    },
+    "/clawrecover": {
+        "usage": "從備份還原 OpenClaw 資料；高風險，不可作為自動 workflow sink。",
+    },
+    "/recoverclaw": {
+        "usage": "同 /clawrecover；從備份還原 OpenClaw 資料。",
+    },
+    "/restartall": {
+        "usage": "重啟本機 OpenClaw 服務；高風險，不可作為自動 workflow sink。",
+    },
+    "/stats": {
+        "usage": "查看作答／系統統計（無參數）。",
+    },
+    "/scorecard": {
+        "usage": "同 /stats；查看統計（無參數）。",
+    },
+    "/knowledge": {
+        "usage": "查詢知識庫；常用參數：market、coding 或搜尋關鍵字。",
+    },
+    "/kb": {
+        "usage": "同 /knowledge；查詢知識庫。",
+    },
+    "/source": {
+        "usage": "查詢或管理知識來源；參數依 source 子命令。",
+    },
+    "/lookup": {
+        "usage": "查詢卡牌價格；格式同 /price，例如 pokemon | Pikachu ex | 132/106 | SAR | sv08。",
+    },
+    "/price": {
+        "usage": "查詢卡牌價格；參數＝遊戲與卡名／編號／稀有度／系列。",
+    },
+    "/trend": {
+        "usage": "查詢指定遊戲熱門／流動性榜；格式：<game> [數量]，例如 pokemon 5。",
+    },
+    "/trending": {
+        "usage": "同 /trend；格式：<game> [數量]。",
+    },
+    "/hot": {
+        "usage": "同 /trend；格式：<game> [數量]。",
+    },
+    "/heat": {
+        "usage": "同 /trend；格式：<game> [數量]。",
+    },
+    "/liquidity": {
+        "usage": "查詢指定遊戲流動性排名；格式：<game> [數量]。",
+    },
+    "/snapshot": {
+        "usage": "建立賣家／商品信譽快照；參數＝Mercari 商品或店鋪網址。",
+    },
+    "/proof": {
+        "usage": "同 /snapshot；參數＝Mercari 商品或店鋪網址。",
+    },
+    "/repcheck": {
+        "usage": "同 /snapshot；參數＝Mercari 商品或店鋪網址。",
+    },
+    "/reputation": {
+        "usage": "同 /snapshot；參數＝Mercari 商品或店鋪網址。",
+    },
+    "/search": {
+        "usage": (
+            "網路搜尋並回傳摘要與來源；參數＝搜尋查詢。"
+            "需要熱門、最新、排名或外部事實時先用這個。"
+        ),
+        "chat_tool_purpose": "當回答需要即時、最新、外部來源或不確定的事實資訊時使用",
+        "chat_tool_query_hint": "query 是適合搜尋引擎的完整查詢，不要包含 /search",
+        "chat_tool_display_name": "網路搜尋",
+    },
+    "/fetch": {
+        "usage": (
+            "讀取指定網頁並針對問題回答；格式：<網址> <問題>。"
+            "已有明確來源網址、需要讀頁面內容時使用；一般文章、公告、說明頁優先用這個。"
+        ),
+    },
+    "/read": {
+        "usage": "同 /fetch；格式：<網址> <問題>。",
+    },
+    "/web": {
+        "usage": "同 /search；參數＝搜尋查詢。",
+    },
+    "/research": {
+        "usage": (
+            "深度商品研究與投資判斷；參數＝商品網址或商品描述。"
+            "當使用者問商品能不能買、是否適合投資、估價、行情、流動性、賣家風險，"
+            "或提供 Mercari/拍賣/商品頁網址時用這個。"
+            "例：/research https://jp.mercari.com/item/m123456789 以投資為考量這個商品能買嗎？"
+        ),
+        "chat_tool_purpose": (
+            "當使用者要評估商品能否購買、是否值得投資、估價、行情、流動性、"
+            "賣家風險，或貼出 Mercari/拍賣/商品頁網址時使用"
+        ),
+        "chat_tool_query_hint": "query 保留商品 URL 或商品描述，並保留使用者的投資／購買判斷問題",
+        "chat_tool_display_name": "商品研究",
+    },
+    "/resaerch": {
+        "usage": "同 /research（歷史拼字相容別名）。",
+    },
+    "/scan": {
+        "usage": "圖片辨識命令；需搭配 Telegram 圖片，不適合作為純文字 workflow 步驟。",
+    },
+    "/image": {
+        "usage": "同 /scan；需搭配 Telegram 圖片。",
+    },
+    "/photo": {
+        "usage": "同 /scan；需搭配 Telegram 圖片。",
+    },
+    "/watch": {
+        "usage": "新增 marketplace 追蹤；格式：<關鍵字> on <價格> [markets:mercari,rakuma,yuyutei]。",
+    },
+    "/watchlist": {
+        "usage": "列出 marketplace 追蹤清單（無參數）。",
+    },
+    "/watches": {
+        "usage": "同 /watchlist（無參數）。",
+    },
+    "/unwatch": {
+        "usage": "移除 marketplace 追蹤；參數＝追蹤 ID。",
+    },
+    "/stopwatch": {
+        "usage": "同 /unwatch；參數＝追蹤 ID。",
+    },
+    "/setprice": {
+        "usage": "更新追蹤價格；格式：<追蹤 ID> <新價格>。",
+    },
+    "/updatewatch": {
+        "usage": "同 /setprice；格式：<追蹤 ID> <新價格>。",
+    },
     "/ir": {
         "usage": (
             "discover=掃描可用紅外線裝置；devices=列出已註冊裝置；"
@@ -48,43 +197,112 @@ _COMMAND_METADATA: dict[str, dict[str, str]] = {
             "query 只輸出 /ir 後面的參數，例如 discover、devices 或 "
             "send ceiling_light power"
         ),
+        "chat_tool_display_name": "紅外線控制",
     },
     "/music": {
         "usage": (
             "playbest=播放最愛清單；random=隨機播放；stop=停止；"
             "pause=暫停；resume=繼續；next/previous=切歌；"
-            "<關鍵字>=搜尋並播放該歌曲"
+            "<本地歌曲關鍵字>=搜尋並播放本地曲目。"
+            "一次只播一首，且呼叫時會停掉正在播放的歌；"
+            "要依序連播多首請改用 /musicqueue，不要連續呼叫 /music。"
+            "不負責判斷熱門／最新；需要外部判斷時先用 /search，"
+            "需要確認本地可播曲目時先用 /musiclistall，再用 llm_transform 比對。"
         ),
         "chat_tool_purpose": "當使用者要控制本機音樂播放時使用",
         "chat_tool_query_hint": (
             "query 只輸出 /music 後面的參數，例如 stop、pause、resume、"
             "next、previous、random、playbest 或歌曲關鍵字"
         ),
+        "chat_tool_display_name": "音樂控制",
+    },
+    "/musicqueue": {
+        "usage": (
+            "依序連續播放多首本地歌曲，每首播完自動接下一首；"
+            "參數＝歌名清單（以「、」或換行分隔）。"
+            "要一次播放多首指定歌曲時用這個。"
+        ),
+        "chat_tool_purpose": (
+            "當使用者要依序連續播放多首本地歌曲、且歌曲已可直接列出時使用；"
+            "若還需要先查資料或挑選才能決定歌單，屬於多步驟目標，改用 __goal__"
+        ),
+        "chat_tool_query_hint": (
+            "query 只輸出 /musicqueue 後面的參數：以「、」分隔的歌名清單"
+        ),
+        "chat_tool_display_name": "音樂連播",
     },
     "/musicmute": {"usage": "音樂靜音（無參數）"},
     "/musiclouder": {"usage": "調高音量（無參數）"},
     "/musiclower": {"usage": "調低音量（無參數）"},
     "/musicnowbest": {"usage": "把目前播放的歌曲加入最愛清單（無參數）"},
-    "/musiclistall": {"usage": "列出全部曲目清單（不播放，無參數）"},
+    "/musiclistall": {
+        "usage": (
+            "列出全部本地可播曲目清單（不播放，無參數）。"
+            "規劃需要從本機音樂庫挑歌時，先用這個取得候選清單。"
+        )
+    },
     "/musiclistbest": {
         "usage": "列出最愛曲目清單（不播放，無參數）；要『播放』最愛請改用 /music playbest",
-    },
-    "/saynow": {
-        "usage": "立即於 Mac mini 念出文字（參數＝要念的文字，通常用 input 變數帶入）",
-    },
-    "/say": {
-        "usage": "用語音念出文字（參數＝要念的文字，通常用 input 變數帶入）",
     },
     "/bluetooth": {
         "usage": "scan=掃描藍牙裝置；<裝置名>=連線／切換藍牙裝置",
         "chat_tool_purpose": "當使用者要掃描、查看、連線或切換藍牙裝置時使用",
         "chat_tool_query_hint": "query 只輸出 /bluetooth 後面的參數；掃描時輸出 scan，連線時輸出裝置名",
+        "chat_tool_display_name": "藍牙控制",
     },
     "/translateja": {
         "usage": "把文字翻成日文（參數＝原文，通常用 input 變數帶入）",
     },
+    "/ja": {
+        "usage": "同 /translateja；把文字翻成日文。",
+    },
+    "/jp": {
+        "usage": "同 /translateja；把文字翻成日文。",
+    },
     "/translatezh": {
         "usage": "把文字翻成繁體中文（參數＝原文，通常用 input 變數帶入）",
+    },
+    "/zh": {
+        "usage": "同 /translatezh；把文字翻成繁體中文。",
+    },
+    "/snsadd": {
+        "usage": "新增 X/Twitter 監控；格式：@帳號、keyword:<關鍵字> 或 trend:<分類>。",
+    },
+    "/sns_add": {
+        "usage": "同 /snsadd；新增 X/Twitter 監控。",
+    },
+    "/snslist": {
+        "usage": "列出 X/Twitter 監控規則（無參數）。",
+    },
+    "/sns_list": {
+        "usage": "同 /snslist；列出 X/Twitter 監控規則。",
+    },
+    "/snsdelete": {
+        "usage": "刪除 X/Twitter 監控規則；參數＝rule_id。",
+    },
+    "/sns_delete": {
+        "usage": "同 /snsdelete；刪除 X/Twitter 監控規則。",
+    },
+    "/snsbuzz": {
+        "usage": "查詢 4chan 收藏品／IP 熱度；參數＝關鍵字。",
+    },
+    "/sns_buzz": {
+        "usage": "同 /snsbuzz；查詢 4chan 收藏品／IP 熱度。",
+    },
+    "/snsclearfilter": {
+        "usage": "清除 SNS 監控規則的關鍵字過濾；參數＝rule_id。",
+    },
+    "/hunt": {
+        "usage": "Opportunity Agent 目標清單與操作；常用：status、remove <id>。",
+    },
+    "/opportunity": {
+        "usage": "同 /hunt；Opportunity Agent 操作入口。",
+    },
+    "/schedulehome": {
+        "usage": "建立居家排程，排程會重新派發既有 slash command；不作為 workflow sink。",
+    },
+    "/workflow": {
+        "usage": "管理 workflow；常用：list、show、run、create、edit、delete。",
     },
 }
 
@@ -97,6 +315,10 @@ _COMMAND_USAGE: dict[str, str] = {
 
 def command_metadata(command: str) -> dict[str, str]:
     return dict(_COMMAND_METADATA.get(command, {}))
+
+
+def iter_command_metadata() -> tuple[tuple[str, dict[str, str]], ...]:
+    return tuple((command, dict(meta)) for command, meta in sorted(_COMMAND_METADATA.items()))
 
 
 def _command_usage(command: str, command_registry=None) -> str:

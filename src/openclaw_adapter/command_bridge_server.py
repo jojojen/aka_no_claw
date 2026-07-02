@@ -61,6 +61,23 @@ def _build_handler(bridge: CommandBridge, *, lan_enabled: bool) -> type[BaseHTTP
         def _is_allowed(self) -> bool:
             return _is_allowed_client(self.client_address[0], lan_enabled=lan_enabled)
 
+        def _send_cors_headers(self) -> None:
+            origin = self.headers.get("Origin")
+            self.send_header("Access-Control-Allow-Origin", origin or "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Max-Age", "600")
+
+        def do_OPTIONS(self) -> None:  # noqa: N802
+            if not self._is_allowed():
+                self.send_error(HTTPStatus.FORBIDDEN, "Private access only")
+                return
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self._send_cors_headers()
+            self.send_header("Cache-Control", "no-store, max-age=0")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
         def _read_request(self):
             length = int(self.headers.get("Content-Length", 0) or 0)
             raw = self.rfile.read(length) if length else b""
@@ -269,7 +286,12 @@ def _build_handler(bridge: CommandBridge, *, lan_enabled: bool) -> type[BaseHTTP
             if callback_data:
                 self._write_json(bridge.run_workflow_action(callback_data))
                 return
-            self._write_json(bridge.run_workflow_command(str(data.get("input") or "")))
+            self._write_json(
+                bridge.run_workflow_command(
+                    str(data.get("input") or ""),
+                    chat_backend=str(data.get("chat_backend") or ""),
+                )
+            )
 
         def _handle_schedulehome(self) -> None:
             """Schedule surface (web#9). ``callback_data`` (``sh:…``) dispatches a
@@ -325,8 +347,10 @@ def _build_handler(bridge: CommandBridge, *, lan_enabled: bool) -> type[BaseHTTP
                 return
             request_id = uuid4().hex
             self.send_response(HTTPStatus.OK)
+            self._send_cors_headers()
             self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
             self.send_header("Cache-Control", "no-store, max-age=0")
+            self.send_header("X-Accel-Buffering", "no")
             self.send_header("Connection", "close")
             self.end_headers()
             stream = bridge.stream(req, request_id)
@@ -350,6 +374,7 @@ def _build_handler(bridge: CommandBridge, *, lan_enabled: bool) -> type[BaseHTTP
         def _write_json(self, payload: dict, *, status: int = 200) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
+            self._send_cors_headers()
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Cache-Control", "no-store, max-age=0")
             self.send_header("Content-Length", str(len(body)))

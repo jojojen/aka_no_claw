@@ -211,6 +211,75 @@ def test_fetch_page_text_encodes_non_ascii_url_before_urlopen(monkeypatch) -> No
     assert "本文" in text
 
 
+def test_fetch_page_text_keeps_static_only_default_for_compatibility() -> None:
+    calls: list[str] = []
+
+    def static_fetch(url, timeout, ua, ssl_context):
+        calls.append("static")
+        return "<html><body><div id='app'>Please enable JavaScript.</div></body></html>"
+
+    def browser_fetch(url, timeout, ua):
+        calls.append("browser")
+        return "<html><body><p>hydrated content</p></body></html>"
+
+    text = fetch_page_text(
+        "https://example.com/spa",
+        fetch_url=static_fetch,
+        browser_fetch_url=browser_fetch,
+    )
+
+    assert calls == ["static"]
+    assert "Please enable JavaScript" in text
+    assert "hydrated content" not in text
+
+
+def test_fetch_page_text_browser_fallback_hydrates_thin_static_page() -> None:
+    calls: list[str] = []
+
+    def static_fetch(url, timeout, ua, ssl_context):
+        calls.append(f"static:{url}")
+        return "<html><body><div id='app'>Please enable JavaScript.</div></body></html>"
+
+    def browser_fetch(url, timeout, ua):
+        calls.append(f"browser:{url}")
+        return """
+        <html><body>
+          <h1>PSA10 始まりの一歩 木之本桜 SSP サイン</h1>
+          <p>価格 ¥41,222</p>
+          <p>カテゴリー ヴァイスシュヴァルツ</p>
+          <p>商品の状態 目立った傷や汚れなし</p>
+        </body></html>
+        """
+
+    text = fetch_page_text(
+        "https://example.com/item",
+        fetch_url=static_fetch,
+        enable_browser_fallback=True,
+        browser_fetch_url=browser_fetch,
+    )
+
+    assert calls == ["static:https://example.com/item", "browser:https://example.com/item"]
+    assert "PSA10 始まりの一歩 木之本桜 SSP サイン" in text
+    assert "ヴァイスシュヴァルツ" in text
+
+
+def test_fetch_page_text_browser_fallback_skips_useful_static_text() -> None:
+    def static_fetch(url, timeout, ua, ssl_context):
+        return "<html><body>" + ("<p>article body text</p>" * 80) + "</body></html>"
+
+    def browser_fetch(url, timeout, ua):
+        raise AssertionError("browser fallback should not run")
+
+    text = fetch_page_text(
+        "https://example.com/article",
+        fetch_url=static_fetch,
+        enable_browser_fallback=True,
+        browser_fetch_url=browser_fetch,
+    )
+
+    assert "article body text" in text
+
+
 def test_build_web_research_answer_fetch_feeds_page_content_to_summarizer() -> None:
     seen: dict[str, object] = {}
 

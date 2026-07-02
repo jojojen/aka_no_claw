@@ -56,6 +56,20 @@ one-off complex request (the way `/research` had to be built by hand).
   `.github/workflows/tests.yml` provide a replayable regression slice for happy
   path, replan recovery, continuation, denylist, validation, type-mismatch, and
   search-hard-cap behaviors.
+- Command registry alignment landed: Telegram, web chat tool planning, `/help`,
+  and workflow drafting now read command usage from the same `RegisteredCommand`
+  metadata table in `workflow_command.py`. Price-monitor inherited commands
+  such as `/search`, `/web`, `/fetch`, `/read`, price/trend/snapshot/watch
+  aliases, and image aliases are explicitly registered in aka. Workflow command
+  sinks use the runtime registry minus `COMMAND_SINK_DENYLIST`; image-only and
+  destructive/meta commands remain denied.
+- Cloud-pool goal drafting now treats invalid-but-parseable workflow drafts as
+  a provider-level failure after one repair round. If Gemini returns a bad
+  reference, the planner can continue to Mistral/OpenCode instead of failing
+  the whole cloud pool.
+- Live probe (2026-07-02): cloud pool drafted 「播放米津玄師的熱門歌曲」
+  as `/search` → `/musiclistall` → `llm_transform` comparison → `/music`.
+  This confirms the desired dynamic workflow shape without hardcoding the case.
 - Remaining non-deterministic work vs. the original plan is operational:
   rerun the live-model classification checkpoint and do the live Telegram/web
   walkthroughs for budget-hit UX before calling the whole plan closed.
@@ -216,7 +230,7 @@ Status: **FAILED checkpoint; do not restart production to expose `__goal__` yet.
     picked unrelated existing tool slugs (`tsm_*`, `0050_*`, `qqq_btc_*`), so
     semantic quality is not acceptable.
   - `產生早安問候並唸出來` drafted a simple 2-step workflow
-    (`llm_transform` → `/say`), which is structurally plausible.
+    (`llm_transform` → `/generateaudio`), which is structurally plausible.
 
 Conclusion: the deterministic code path is in place, but the live-model
 checkpoint remains open. Fix prompt/model behavior first, then rerun this

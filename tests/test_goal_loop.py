@@ -109,6 +109,72 @@ def test_goal_loop_replans_after_failed_run():
     assert planner.replan_calls == [("修好任務", "wf-broken", "工作流在步驟 s1 失敗：boom")]
 
 
+def test_goal_loop_replans_when_result_judged_not_achieving_goal():
+    """A workflow whose steps all succeed but whose final result is e.g. a
+    follow-up question must not count as done: the result judge rejects it
+    and the loop replans (self-repair without user input)."""
+    asking = _workflow_with_tool("asking_tool", wf_id="wf-ask")
+    fixed = _workflow_with_tool("real_tool", wf_id="wf-fixed")
+    planner = _FakePlanner(
+        drafts=[(asking, None, False)],
+        replans=[(fixed, None, False)],
+    )
+    executor = _FakeExecutor({
+        "asking_tool": (True, "找到多個候選，請問您要哪一個？"),
+        "real_tool": (True, "已完成播放"),
+    })
+    judge_calls = []
+
+    def judge(goal: str, final_result: str):
+        judge_calls.append((goal, final_result))
+        achieved = len(judge_calls) > 1
+        return achieved, "" if achieved else "結果在反問使用者，未達成目標"
+
+    loop = GoalLoop(
+        goal="播放歌曲",
+        planner=planner,
+        executor=executor,
+        command_registry={},
+        replan_limit=1,
+        result_judge=judge,
+    )
+    report = loop.run()
+    assert report.done is True
+    assert report.replans_used == 1
+    assert report.workflow.id == "wf-fixed"
+    assert report.final_result == "已完成播放"
+    assert judge_calls == [
+        ("播放歌曲", "找到多個候選，請問您要哪一個？"),
+        ("播放歌曲", "已完成播放"),
+    ]
+    joined = "\n".join(report.narration)
+    assert "結果未達成目標：結果在反問使用者，未達成目標" in joined
+    # the rejected trace (with the judge's reason in narration) reaches replan
+    assert planner.replan_calls == [
+        ("播放歌曲", "wf-ask", "找到多個候選，請問您要哪一個？"),
+    ]
+
+
+def test_goal_loop_result_judge_failure_does_not_sink_success():
+    workflow = _workflow_with_tool("real_tool", wf_id="wf-ok")
+    planner = _FakePlanner(drafts=[(workflow, None, False)])
+    executor = _FakeExecutor({"real_tool": (True, "done")})
+
+    def broken_judge(goal: str, final_result: str):
+        raise RuntimeError("judge backend down")
+
+    loop = GoalLoop(
+        goal="完成任務",
+        planner=planner,
+        executor=executor,
+        command_registry={},
+        result_judge=broken_judge,
+    )
+    report = loop.run()
+    assert report.done is True
+    assert report.final_result == "done"
+
+
 def test_goal_loop_returns_continuation_when_step_budget_hits():
     workflow = _workflow_with_tool("real_tool", wf_id="wf-ok")
     planner = _FakePlanner(drafts=[(workflow, None, False)])

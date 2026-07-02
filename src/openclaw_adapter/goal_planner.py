@@ -26,16 +26,29 @@ class GoalPlanner:
     command_registry: object | None = None
     allowed_commands: list[str] | None = None
     command_usage_resolver: Callable[[str, object | None], str] | None = None
+    progress: Callable[[str], None] | None = None
+    # Shared by one goal-loop run across draft + every replan call so
+    # successive calls start the cloud-pool fail-over chain at a different
+    # provider instead of always retrying provider[0] first. Only rotates when
+    # ``llm_client`` is a list (the cloud-pool fallback chain); a single client
+    # is returned as-is.
+    pool_rotation: object | None = None
+
+    def _client_for_call(self):
+        if self.pool_rotation is not None and isinstance(self.llm_client, (list, tuple)):
+            return self.pool_rotation.rotate(list(self.llm_client))
+        return self.llm_client
 
     def draft(self, goal: str):
         return generate_workflow_from_goal(
             goal,
-            self.llm_client,
+            self._client_for_call(),
             self.catalog,
             command_registry=self.command_registry,
             allowed_commands=self.allowed_commands,
             command_usage_resolver=self.command_usage_resolver,
             fallback_client=self.fallback_client,
+            progress=self.progress,
         )
 
     def replan(self, goal: str, previous_workflow: Workflow, trace: WorkflowTrace):
@@ -43,12 +56,13 @@ class GoalPlanner:
             goal,
             previous_workflow,
             trace,
-            self.llm_client,
+            self._client_for_call(),
             self.catalog,
             command_registry=self.command_registry,
             allowed_commands=self.allowed_commands,
             command_usage_resolver=self.command_usage_resolver,
             fallback_client=self.fallback_client,
+            progress=self.progress,
         )
 
 
@@ -96,6 +110,14 @@ def resolve_goal_draft_client(settings, runner) -> tuple[object, object, str | N
     return local, None, warning, None
 
 
+def _client_label(client) -> str:
+    for attr in ("label", "model", "model_name"):
+        value = getattr(client, attr, None)
+        if isinstance(value, str) and value:
+            return value
+    return type(client).__name__
+
+
 def generate_workflow_from_goal(
     description: str,
     llm_client,
@@ -107,8 +129,18 @@ def generate_workflow_from_goal(
     fallback_client=None,
     prompt_override: str | None = None,
     strict: bool = True,
+    progress: Callable[[str], None] | None = None,
 ):
     """Ask the LLM to draft a Workflow from a one-line goal description."""
+
+    def _emit(line: str) -> None:
+        if progress is None:
+            return
+        try:
+            progress(line)
+        except Exception:  # noqa: BLE001
+            logger.exception("goal_planner: progress callback failed")
+
     prompt = prompt_override or build_goal_workflow_prompt(
         description,
         catalog,
@@ -116,21 +148,28 @@ def generate_workflow_from_goal(
         allowed_commands=allowed_commands,
         command_usage_resolver=command_usage_resolver,
     )
-    clients: list[tuple[object, bool]] = [(llm_client, False)]
+    raw_clients = list(llm_client) if isinstance(llm_client, (list, tuple)) else [llm_client]
+    clients: list[tuple[object, bool]] = [
+        (client, index > 0) for index, client in enumerate(raw_clients)
+    ]
     if fallback_client is not None and fallback_client is not llm_client:
         clients.append((fallback_client, True))
 
     last_err: object = "無可用的 LLM client"
+    last_workflow_error: str | None = None
     for client, is_fallback in clients:
         if client is None:
             continue
+        label = _client_label(client)
         last_parseable_wf: Workflow | None = None
         last_parseable_errors: list[str] = []
+        _emit(f"規劃中：請 {label} 起草…")
         try:
             raw = client.generate(prompt, temperature=0.2)
         except Exception as exc:  # noqa: BLE001
             logger.warning("goal_planner: draft via %s failed: %s",
                            type(client).__name__, exc)
+            _emit(f"{label} 規劃失敗（{exc}），改用下一個模型")
             last_err = exc
             continue
         wf, errors, parse_err = _workflow_from_llm_output(
@@ -154,11 +193,13 @@ def generate_workflow_from_goal(
             raw_output=raw,
             errors=errors,
         )
+        _emit(f"{label} 草稿有結構問題，要求它修正中…")
         try:
             repaired_raw = client.generate(repair_prompt, temperature=0.2)
         except Exception as exc:  # noqa: BLE001
             logger.warning("goal_planner: repair via %s failed: %s",
                            type(client).__name__, exc)
+            _emit(f"{label} 修正失敗（{exc}），改用下一個模型")
             last_err = exc
             continue
         repaired_wf, repaired_errors, repaired_parse_err = _workflow_from_llm_output(
@@ -183,11 +224,15 @@ def generate_workflow_from_goal(
                     last_parseable_wf,
                     "工作流草稿驗證失敗：\n" + "\n".join(warning_errors),
                     is_fallback,
-                )
+            )
             return last_parseable_wf, None, is_fallback
         if repaired_parse_err is not None:
-            return None, f"工作流草稿修正失敗：{repaired_parse_err}", is_fallback
-        return None, "工作流草稿驗證失敗：\n" + "\n".join(repaired_errors), is_fallback
+            last_workflow_error = f"工作流草稿修正失敗：{repaired_parse_err}"
+            continue
+        last_workflow_error = "工作流草稿驗證失敗：\n" + "\n".join(repaired_errors)
+        continue
+    if last_workflow_error is not None:
+        return None, last_workflow_error, False
     return None, f"LLM 生成失敗：{last_err}", False
 
 
@@ -202,6 +247,7 @@ def replan_workflow_from_trace(
     allowed_commands=None,
     command_usage_resolver: Callable[[str, object | None], str] | None = None,
     fallback_client=None,
+    progress: Callable[[str], None] | None = None,
 ):
     prompt = build_goal_replan_prompt(
         description,
@@ -222,6 +268,7 @@ def replan_workflow_from_trace(
         fallback_client=fallback_client,
         prompt_override=prompt,
         strict=True,
+        progress=progress,
     )
 
 
@@ -272,8 +319,11 @@ def build_goal_workflow_prompt(
         "2. 參數固定時一律用 command_sink 的 literal 直接填，**不要**為了產生固定參數而多插一個 llm_transform 步驟。\n"
         "3. 後面步驟的 inputs／input 只能引用前面步驟產生的 output 變數。\n"
         "4. command 只能用上面列出的指令，不可自行編造（如 /musiclistbest 不存在）。\n"
-        "5. id 用 kebab-case，並以 wf- 開頭（如 wf-morning-greeting）。\n"
-        "6. 只輸出 JSON，不要任何說明文字或 markdown 圍欄。\n\n"
+        "5. 若需求需要熱門、最新、排名、查證或其他外部事實，先用已登記的搜尋／讀取類指令取得根據，再做後續動作。\n"
+        "6. 若最後動作依賴本機資源（例如本機音樂庫、已登記裝置、既有清單），先用已登記的列出／查詢類指令取得候選，再比對後執行。\n"
+        "7. 需要從多個前置結果中選擇、比對、萃取參數時，用 llm_transform；不要把未查證的猜測直接塞進最終指令。\n"
+        "8. id 用 kebab-case，並以 wf- 開頭（如 wf-morning-greeting）。\n"
+        "9. 只輸出 JSON，不要任何說明文字或 markdown 圍欄。\n\n"
         "輸出格式：\n"
         '{"id":"wf-...","goal":"...","steps":[{"id":"s1","kind":"...","...":"..."}]}\n\n'
         f"使用者需求：{description}\n\n"
@@ -307,6 +357,9 @@ def build_goal_replan_prompt(
         + "\n1. 保留已成功步驟的成果，不要重複同一個失敗做法。"
         + "\n2. 優先修改失敗步驟及其之後需要調整的步驟。"
         + "\n3. 若原目標本身不可行，要輸出最接近且可執行的 workflow，而不是空白。"
+        + "\n4. 若上一版的執行結果是在反問、要求澄清、或列出多個候選，"
+        + "請由你依目標自行決定（多個候選都符合時任選其一或全部處理），"
+        + "不要規劃出需要使用者回覆才能繼續的流程。"
         + f"\n\n上一版 workflow:\n{previous_json}"
         + f"\n\n上一版執行 trace:\n{trace_json}"
         + "\n\n請只輸出修正版 JSON。"
