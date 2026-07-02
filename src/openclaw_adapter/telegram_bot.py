@@ -74,7 +74,11 @@ from .knowledge_command import (
     build_knowledge_item_deleters,
 )
 from .source_command import build_source_handler
-from .music_command import build_music_handler, build_musicnowbest_handler
+from .music_command import (
+    build_music_handler,
+    build_musicnowbest_handler,
+    build_musicqueue_handler,
+)
 from .music_browser import build_musiclistall_handler, build_music_callback_handler
 from .bluetooth_command import (
     build_bluetooth_handler,
@@ -93,8 +97,10 @@ from .home_schedule_command import (
     build_schedulehome_handler,
     render_list as render_home_schedule_list,
 )
-from .workflow_command import build_workflow_handler, command_metadata, _workflow_store
+from .workflow_command import build_workflow_handler, command_metadata, iter_command_metadata, _workflow_store
 from .workflow_editor import WorkflowEditor
+from .llm_pool_settings import default_chat_backend
+from .command_bridge_models import STATUS_OK, WebCommandResponse, parse_request
 from .music_favorites import (
     FavoritesStore,
     MUSIC_BEST_LIST_KIND,
@@ -121,7 +127,7 @@ from .quiz_command import (
     start_quiz_daily_scheduler,
 )
 from .voice_command import (
-    build_say_handler,
+    build_generateaudio_handler,
     build_saynow_handler,
     build_voice_callback_handler,
     build_voice_handler,
@@ -325,16 +331,19 @@ class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
         settings: AssistantSettings | None = None,
         allowed_chat_ids: frozenset[str] | None = None,
         workflow_editor=None,
+        goal_bridge=None,
         **kwargs,
     ) -> None:
         self._settings = settings
         self._workflow_editor = workflow_editor
+        self._goal_bridge = goal_bridge
         if allowed_chat_ids is None and settings is not None and settings.openclaw_telegram_chat_id:
             allowed_chat_ids = frozenset({settings.openclaw_telegram_chat_id})
         super().__init__(allowed_chat_ids=allowed_chat_ids, **kwargs)
+        self._callback_registry.setdefault("goal", self._handle_goal_callback)
 
     def _help_text(self) -> str:
-        return _build_openclaw_help_text()
+        return _build_openclaw_help_text(getattr(self, "_command_registry", None))
 
     def _build_youtube_like_song_plan(
         self,
@@ -541,6 +550,17 @@ class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
                 reply=None,
                 reply_factory=lambda t=target, cmd=command, c=cid: ir_spec.handler(f"send {t} {cmd}", c),
             )
+        if intent.intent == "execute_goal":
+            goal = (intent.workflow_description or "").strip()
+            if not goal:
+                return TelegramTextReplyPlan(ack=None, reply="我沒有抓到要執行的目標內容。")
+            logger.info("Telegram NL routed intent=execute_goal goal=%s", goal[:120])
+            return TelegramTextReplyPlan(
+                ack="收到，先幫你規劃工作流並請你確認…",
+                reply=None,
+                reply_factory=lambda g=goal, c=cid: self._execute_goal_bridge_reply(g, c),
+                run_in_background=True,
+            )
         return None
 
     def _route_natural_language(self, text: str) -> TelegramNaturalLanguageIntent | None:
@@ -555,6 +575,9 @@ class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
                 app_intent.confidence,
             )
             return app_intent
+        goal_intent = self._route_goal_loop_intent(text)
+        if goal_intent is not None:
+            return goal_intent
         return None
 
     def build_reply_plan(self, *, chat_id: str | int, text: str | None) -> TelegramTextReplyPlan:
@@ -571,6 +594,141 @@ class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
         if translate_plan is not None:
             return translate_plan
         return super().build_reply_plan(chat_id=chat_id, text=text)
+
+    def _get_goal_bridge(self):
+        if self._goal_bridge is None and self._settings is not None:
+            from .command_bridge import CommandBridge
+
+            self._goal_bridge = CommandBridge(settings=self._settings)
+        return self._goal_bridge
+
+    def _goal_chat_backend(self) -> str:
+        if self._settings is None:
+            return "local"
+        return default_chat_backend(self._settings)
+
+    @staticmethod
+    def _goal_conversation_id(chat_id: str | int) -> str:
+        return f"telegram:{chat_id}"
+
+    def _build_goal_bridge_request(self, text: str, chat_id: str | int):
+        return parse_request(
+            {
+                "mode": "chat",
+                "input": text,
+                "conversation_id": self._goal_conversation_id(chat_id),
+                "chat_backend": self._goal_chat_backend(),
+                "source": "telegram",
+            }
+        )
+
+    def _route_goal_loop_intent(self, text: str) -> TelegramNaturalLanguageIntent | None:
+        bridge = self._get_goal_bridge()
+        if bridge is None:
+            return None
+        try:
+            plan, _metadata = bridge._select_chat_tool_plan(self._build_goal_bridge_request(text, "router"))
+        except Exception:
+            logger.exception("Telegram goal-loop router failed text=%s", trim_for_log(text, limit=240))
+            return None
+        if plan is None or plan.tool != "__goal__":
+            return None
+        return TelegramNaturalLanguageIntent(
+            intent="execute_goal",
+            workflow_description=plan.query,
+            confidence=0.8,
+        )
+
+    def _execute_goal_bridge(self, text: str, chat_id: str | int) -> WebCommandResponse:
+        bridge = self._get_goal_bridge()
+        if bridge is None:
+            return WebCommandResponse(status="error", message="goal bridge 尚未啟用。")
+        return bridge.handle(self._build_goal_bridge_request(text, chat_id))
+
+    def _run_goal_bridge(self, goal: str, chat_id: str | int) -> WebCommandResponse:
+        bridge = self._get_goal_bridge()
+        if bridge is None:
+            return WebCommandResponse(status="error", message="goal bridge 尚未啟用。")
+        req = self._build_goal_bridge_request(goal, chat_id)
+        return bridge._run_goal_loop_blocking(req, goal, planner_metadata=None)
+
+    def _execute_goal_bridge_reply(
+        self,
+        text: str,
+        chat_id: str | int,
+    ) -> tuple[str, dict[str, object] | None]:
+        response = self._run_goal_bridge(text, chat_id)
+        return response.message, self._goal_reply_markup(response)
+
+    def _handle_goal_callback(
+        self,
+        payload: str,
+        original_text: str,
+        chat_id: str,
+    ) -> tuple[object, str | None, object]:
+        response = self._execute_goal_bridge(payload, chat_id)
+        if response.status != STATUS_OK:
+            return response.message, None, None
+        return None, response.message, self._goal_reply_markup(response)
+
+    def handle_callback_query_async(
+        self,
+        *,
+        client,
+        callback_id: str,
+        chat_id: str,
+        message_id: int,
+        prefix: str,
+        payload: str,
+        original_text: str,
+    ) -> bool:
+        if prefix != "goal":
+            return False
+        try:
+            client.answer_callback_query(
+                callback_query_id=callback_id,
+                text="收到，正在處理…",
+            )
+        except Exception:
+            logger.exception("answer_callback_query failed for async goal callback chat_id=%s", chat_id)
+
+        def _worker() -> None:
+            try:
+                response = self._execute_goal_bridge(payload, chat_id)
+                reply_markup = self._goal_reply_markup(response) if response.status == STATUS_OK else None
+                client.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=response.message,
+                    reply_markup=reply_markup,
+                )
+            except Exception:
+                logger.exception("async goal callback worker failed chat_id=%s payload=%s", chat_id, payload)
+                try:
+                    client.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=f"{original_text}\n\n⚠️ 目標執行失敗，請稍後再試。",
+                        reply_markup=None,
+                    )
+                except Exception:
+                    logger.exception("async goal callback fallback edit failed chat_id=%s", chat_id)
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return True
+
+    @staticmethod
+    def _goal_reply_markup(response: WebCommandResponse) -> dict[str, object] | None:
+        if not response.actions:
+            return None
+        rows = []
+        for action in response.actions:
+            if action.command != "chat" or not action.input:
+                continue
+            rows.append([{"text": action.label, "callback_data": f"goal:{action.input}"}])
+        if not rows:
+            return None
+        return {"inline_keyboard": rows}
 
 
 def default_lookup_renderer(settings: AssistantSettings) -> LookupRenderer:
@@ -873,7 +1031,11 @@ def default_web_fetch_renderer(settings: AssistantSettings) -> "Callable[[str, s
         answer = build_web_fetch_answer(
             url,
             prompt,
-            fetch_page_fn=lambda u: fetch_page_text(u, ssl_context=ssl_ctx),
+            fetch_page_fn=lambda u: fetch_page_text(
+                u,
+                ssl_context=ssl_ctx,
+                enable_browser_fallback=True,
+            ),
             answer_fn=lambda u, p, content: answer_page_with_ollama(
                 u,
                 p,
@@ -895,111 +1057,60 @@ def _select_text_generation_model(settings: AssistantSettings) -> str | None:
     return next((part.strip() for part in settings.openclaw_local_text_model.split(",") if part.strip()), None)
 
 
-def _build_openclaw_help_text() -> str:
+def _build_openclaw_help_text(command_registry: dict[str, RegisteredCommand] | None = None) -> str:
+    registry = command_registry or {}
+    command_lines = []
+    for command in sorted(registry):
+        usage = getattr(registry[command], "usage", None) or command_metadata(command).get("usage", "")
+        if usage:
+            command_lines.append(f"{command} — {usage}")
+        else:
+            command_lines.append(command)
+    if not command_lines:
+        for command, meta in sorted(_known_command_metadata_items()):
+            usage = meta.get("usage", "")
+            command_lines.append(f"{command} — {usage}" if usage else command)
+
+    examples = [
+        "/price pokemon | Pikachu ex | 132/106 | SAR | sv08",
+        "/trend pokemon 5",
+        "/snapshot https://jp.mercari.com/item/m123456789",
+        "/search 初音未來哪年發明的？",
+        "/fetch https://example.com 這篇文章的重點是什麼",
+        "/research https://jp.mercari.com/item/m123456789",
+        "傳圖片 + caption: /scan pokemon",
+        "/watch 想いが重なる場所で 初音ミク SSP on 300000",
+        "/snsadd @username",
+        "/quiz grammar",
+        "/translateja 你好，今天辛苦了",
+        "/translatezh お疲れさま、今日は大変だったね",
+        "/generateaudio こんにちは、今日もよろしくお願いします",
+        "/music playbest",
+        "/hunt status",
+    ]
     return "\n".join(
         [
             "OpenClaw — 指令一覧",
             "",
             "--- 系統 ---",
-            "/ping  /status  /tools",
+            "/ping  /status  /tools  /help",
             "",
-            "--- 價格查詢 ---",
-            "/price pokemon Pikachu ex",
-            "/price pokemon | Pikachu ex | 132/106 | SAR | sv08",
-            "/price ws | Hatsune Miku | PJS/S91-T51 | TD | pjs",
-            "/price ygo | 青眼の白龍 | QCCP-JP001 | UR",
-            "/price ua | 綾波レイ | UAPR/EVA-1-71",
+            "--- 常用範例 ---",
+            *examples,
             "",
-            "--- 市場熱度 ---",
-            "/trend pokemon          # 熱銷榜（預設 10）",
-            "/trend ws 5             # 指定數量",
-            "/hot pokemon            # 同 /trend",
-            "/liquidity ws 5         # 流動性排名",
-            "",
-            "--- 商品快照／信譽查詢 ---",
-            "/snapshot https://jp.mercari.com/item/m123456789",
-            "",
-            "--- 網路搜尋 / 深度研究 ---",
-            "/search 初音未來哪年發明的？",
-            "/research https://jp.mercari.com/item/m123456789",
-            "/research 初音ミク 15th フィギュア",
-            "/fetch https://example.com 這篇文章的重點是什麼",
-            "",
-            "--- 圖片辨識 ---",
-            "傳圖片 + caption: /scan pokemon",
-            "",
-            "--- Mercari / Rakuma / 遊々亭 追蹤 ---",
-            "/watch 想いが重なる場所で 初音ミク SSP on 300000",
-            "/watch アビスアイ box on 8000 markets:rakuma",
-            "/watchlist",
-            "/unwatch <ID>",
-            "/setprice <ID> <新價格>",
-            "",
-            "--- SNS (X/Twitter) 監控 ---",
-            "/snsadd @username",
-            '/snsadd @username ["buy", "sell"]   # 加關鍵字過濾',
-            "/snsadd keyword:搜詞",
-            "/snsadd trend:trending",
-            "/snslist",
-            "/snsdelete <rule_id>",
-            "/snsbuzz amd            # 4chan 收藏品 IP 熱度",
-            "",
-            "--- JLPT 日文測驗 (Miku 歌詞) ---",
-            "/quiz                   # 出題選單",
-            "/quiz random            # 隨機出一題",
-            "/quiz wrong             # 錯題本",
-            "/quiz stats             # 各考點正確率分析",
-            "/quiz vocab             # 單字卡",
-            "/quiz grammar           # 文法卡",
-            "/quiz review            # 查看近期作答",
-            "/quizlikesong <youtube_url>   # 收藏新歌並建立題庫",
-            "",
-            "--- 翻譯 ---",
-            "/translateja 你好，今天辛苦了",
-            "/ja 你好，今天辛苦了      # /translateja 短別名",
-            "/translatezh お疲れさま、今日は大変だったね",
-            "/zh お疲れさま、今日は大変だったね  # /translatezh 短別名",
-            "",
-            "--- 語音 ---",
-            "/voice <日文>            # 語音合成（AivisSpeech），預覽參數",
-            "/say <日文>              # 直接合成並傳送 WAV",
-            "",
-            "--- 音樂 ---",
-            "/music playbest          # 連續播放最愛",
-            "/music random            # 全部隨機播放",
-            "/music <歌曲名>          # 播放單曲",
-            "/music previous          # 上一首",
-            "/music pause             # 暫停",
-            "/music resume            # 繼續",
-            "/music next              # 下一首",
-            "/music stop              # 停止",
-            "（上一首／下一首僅適用於 /music playbest 或全部隨機播放）",
-            "",
-            "--- 知識庫 ---",
-            "/knowledge market       # 查詢市場知識（集換式卡牌）",
-            "/knowledge coding       # 查詢程式技術知識",
-            "",
-            "--- Opportunity Agent ---",
-            "/hunt                   # 目標清單",
-            "/hunt status            # 狀態 + 推薦紀錄",
-            "/hunt remove 2          # 移除目標 #2",
-            "/stats                  # 作答統計",
-            "",
-            "--- 動態自寫工具 ---",
-            "/new 幫我查0050今年以來到5月的年化報酬",
-            "",
-            "--- 資料備份／還原 ---",
-            "/backupclaw             # 備份到預設外接碟",
-            "/backupclaw /path/to/dir",
-            "/clawrecover            # 從預設外接碟還原",
-            "/clawrecover force      # 覆蓋現有資料庫",
+            "--- 已註冊指令 ---",
+            *command_lines,
             "",
             "--- 自然語言也可以 ---",
             "pokemon 熱門前 5",
             "幫我查 pokemon Pikachu ex 132/106",
-            "why are Pikachu Pokemon cards so popular?",
+            "播放米津玄師的熱門歌曲",
         ]
     )
+
+
+def _known_command_metadata_items():
+    return iter_command_metadata()
 
 
 def _call_local_text_model(
@@ -1220,6 +1331,11 @@ def _build_registries(
     sns_inbox=None,
     knowledge_inbox=None,
     opportunity_inbox=None,
+    watch_db=None,
+    watch_inbox=None,
+    lookup_renderer: LookupRenderer | None = None,
+    board_loader=None,
+    reputation_renderer: ReputationRenderer | None = None,
     research_notifier_factory: "Callable[[str], ResearchNotifier] | None" = None,
 ) -> "tuple[dict, dict, dict, dict]":
     """Build registries injected into the base dispatcher.
@@ -1277,19 +1393,69 @@ def _build_registries(
         text, markup, _ = _music_best_view_fn(page=0, mode=_MB_READ)
         return text, markup
 
+    _web_research_renderer = default_web_research_renderer(settings)
+    _web_fetch_renderer = default_web_fetch_renderer(settings)
+    _base_processor = _BaseTelegramCommandProcessor(
+        lookup_renderer=lookup_renderer or default_lookup_renderer(settings),
+        board_loader=board_loader or (lambda: default_board_loader(settings)),
+        catalog_renderer=lambda: "",
+        reputation_renderer=reputation_renderer or default_reputation_renderer(settings),
+        research_renderer=_web_research_renderer,
+        fetch_renderer=_web_fetch_renderer,
+        watch_db=watch_db,
+        watch_inbox=watch_inbox,
+    )
+
+    def _search_handler(remainder: str, chat_id: str):
+        return _base_processor._handle_web_research(remainder)
+
+    def _fetch_handler(remainder: str, chat_id: str):
+        return _base_processor._handle_web_fetch(remainder)
+
+    def _lookup_handler(remainder: str, chat_id: str):
+        return _base_processor._handle_lookup(remainder)
+
+    def _trend_handler(remainder: str, chat_id: str):
+        return _base_processor._handle_liquidity(remainder)
+
+    def _snapshot_handler(remainder: str, chat_id: str):
+        return _base_processor._handle_reputation_snapshot(remainder)
+
+    def _watch_handler(remainder: str, chat_id: str):
+        return _base_processor._handle_watch(remainder, chat_id)
+
+    def _watchlist_handler(remainder: str, chat_id: str):
+        return _base_processor.render_watchlist_view()
+
+    def _unwatch_handler(remainder: str, chat_id: str):
+        return _base_processor._handle_unwatch(remainder)
+
+    def _setprice_handler(remainder: str, chat_id: str):
+        return _base_processor._handle_set_price(remainder)
+
+    def _scan_help_handler(remainder: str, chat_id: str):
+        return "Send a card photo with the caption /scan pokemon or /scan ws, and I will parse it and then look up the price."
+
     command_handlers: dict[str, RegisteredCommand] = {
         "/quiz": RegisteredCommand(
             quiz_handler,
             ack="收到，正在出題（地端模型，可能要一點時間）…",
             background=True,
+            **command_metadata("/quiz"),
         ),
         "/quizlikesong": RegisteredCommand(
-            _quizlikesong_handler, ack="收到，正在收藏歌曲…", background=True
+            _quizlikesong_handler, ack="收到，正在收藏歌曲…", background=True,
+            **command_metadata("/quizlikesong"),
         ),
-        "/voice": RegisteredCommand(build_voice_handler(settings)),
-        "/say": RegisteredCommand(
-            build_say_handler(settings), ack="收到，正在合成語音…", background=True,
-            **command_metadata("/say"),
+        "/voice": RegisteredCommand(
+            build_voice_handler(settings),
+            **command_metadata("/voice"),
+        ),
+        "/generateaudio": RegisteredCommand(
+            build_generateaudio_handler(settings),
+            ack="收到，正在產生音訊檔案…",
+            background=True,
+            **command_metadata("/generateaudio"),
         ),
         "/saynow": RegisteredCommand(
             build_saynow_handler(settings),
@@ -1307,11 +1473,13 @@ def _build_registries(
             build_translate_handler(settings, target="ja"),
             ack="收到，正在翻譯成日文…",
             background=True,
+            **command_metadata("/ja"),
         ),
         "/jp": RegisteredCommand(
             build_translate_handler(settings, target="ja"),
             ack="收到，正在翻譯成日文…",
             background=True,
+            **command_metadata("/jp"),
         ),
         "/translatezh": RegisteredCommand(
             build_translate_handler(settings, target="zh"),
@@ -1323,45 +1491,162 @@ def _build_registries(
             build_translate_handler(settings, target="zh"),
             ack="收到，正在翻譯成繁體中文…",
             background=True,
+            **command_metadata("/zh"),
         ),
         "/new": RegisteredCommand(
             _new_handler,
             ack="收到，正在找/生成工具並執行（地端模型，可能要 1-2 分鐘）…",
             background=True,
+            **command_metadata("/new"),
         ),
         "/backupclaw": RegisteredCommand(
             lambda r, c: backup_handler(r),
             ack="收到，正在備份龍蝦的資料庫與自學工具規格…",
             background=True,
+            **command_metadata("/backupclaw"),
         ),
         "/backup": RegisteredCommand(
             lambda r, c: backup_handler(r),
             ack="收到，正在備份龍蝦的資料庫與自學工具規格…",
             background=True,
+            **command_metadata("/backup"),
         ),
         "/clawrecover": RegisteredCommand(
             lambda r, c: recover_handler(r),
             ack="收到，正在從備份還原龍蝦的資料庫…",
             background=True,
+            **command_metadata("/clawrecover"),
         ),
         "/recoverclaw": RegisteredCommand(
             lambda r, c: recover_handler(r),
             ack="收到，正在從備份還原龍蝦的資料庫…",
             background=True,
+            **command_metadata("/recoverclaw"),
         ),
-        "/restartall": RegisteredCommand(build_restart_all_handler(settings)),
-        "/stats": RegisteredCommand(lambda r, c: scorecard_handler(r)),
-        "/scorecard": RegisteredCommand(lambda r, c: scorecard_handler(r)),
+        "/restartall": RegisteredCommand(
+            build_restart_all_handler(settings),
+            **command_metadata("/restartall"),
+        ),
+        "/stats": RegisteredCommand(lambda r, c: scorecard_handler(r), **command_metadata("/stats")),
+        "/scorecard": RegisteredCommand(lambda r, c: scorecard_handler(r), **command_metadata("/scorecard")),
         "/knowledge": RegisteredCommand(
-            build_knowledge_handler(settings, knowledge_inbox=knowledge_inbox)
+            build_knowledge_handler(settings, knowledge_inbox=knowledge_inbox),
+            **command_metadata("/knowledge"),
         ),
         "/kb": RegisteredCommand(
-            build_knowledge_handler(settings, knowledge_inbox=knowledge_inbox)
+            build_knowledge_handler(settings, knowledge_inbox=knowledge_inbox),
+            **command_metadata("/kb"),
         ),
-        "/source": RegisteredCommand(build_source_handler(settings)),
+        "/source": RegisteredCommand(build_source_handler(settings), **command_metadata("/source")),
+        "/lookup": RegisteredCommand(
+            _lookup_handler,
+            ack="收到，正在查詢卡牌價格…",
+            background=True,
+            **command_metadata("/lookup"),
+        ),
+        "/price": RegisteredCommand(
+            _lookup_handler,
+            ack="收到，正在查詢卡牌價格…",
+            background=True,
+            **command_metadata("/price"),
+        ),
+        "/trend": RegisteredCommand(
+            _trend_handler,
+            ack="收到，正在整理榜單…",
+            background=True,
+            **command_metadata("/trend"),
+        ),
+        "/trending": RegisteredCommand(
+            _trend_handler,
+            ack="收到，正在整理榜單…",
+            background=True,
+            **command_metadata("/trending"),
+        ),
+        "/hot": RegisteredCommand(
+            _trend_handler,
+            ack="收到，正在整理榜單…",
+            background=True,
+            **command_metadata("/hot"),
+        ),
+        "/heat": RegisteredCommand(
+            _trend_handler,
+            ack="收到，正在整理榜單…",
+            background=True,
+            **command_metadata("/heat"),
+        ),
+        "/liquidity": RegisteredCommand(
+            _trend_handler,
+            ack="收到，正在整理流動性排名…",
+            background=True,
+            **command_metadata("/liquidity"),
+        ),
+        "/snapshot": RegisteredCommand(
+            _snapshot_handler,
+            ack="收到，正在建立信譽快照…",
+            background=True,
+            **command_metadata("/snapshot"),
+        ),
+        "/proof": RegisteredCommand(
+            _snapshot_handler,
+            ack="收到，正在建立信譽快照…",
+            background=True,
+            **command_metadata("/proof"),
+        ),
+        "/repcheck": RegisteredCommand(
+            _snapshot_handler,
+            ack="收到，正在建立信譽快照…",
+            background=True,
+            **command_metadata("/repcheck"),
+        ),
+        "/reputation": RegisteredCommand(
+            _snapshot_handler,
+            ack="收到，正在建立信譽快照…",
+            background=True,
+            **command_metadata("/reputation"),
+        ),
+        "/scan": RegisteredCommand(
+            _scan_help_handler,
+            **command_metadata("/scan"),
+        ),
+        "/image": RegisteredCommand(
+            _scan_help_handler,
+            **command_metadata("/image"),
+        ),
+        "/photo": RegisteredCommand(
+            _scan_help_handler,
+            **command_metadata("/photo"),
+        ),
+        "/search": RegisteredCommand(
+            _search_handler,
+            ack="收到，正在搜尋並整理網路來源…",
+            background=True,
+            **command_metadata("/search"),
+        ),
+        "/web": RegisteredCommand(
+            _search_handler,
+            ack="收到，正在搜尋並整理網路來源…",
+            background=True,
+            **command_metadata("/web"),
+        ),
+        "/fetch": RegisteredCommand(
+            _fetch_handler,
+            ack="收到，正在讀取網頁並回答…",
+            background=True,
+            **command_metadata("/fetch"),
+        ),
+        "/read": RegisteredCommand(
+            _fetch_handler,
+            ack="收到，正在讀取網頁並回答…",
+            background=True,
+            **command_metadata("/read"),
+        ),
         "/music": RegisteredCommand(
             build_music_handler(settings),
             **command_metadata("/music"),
+        ),
+        "/musicqueue": RegisteredCommand(
+            build_musicqueue_handler(settings),
+            **command_metadata("/musicqueue"),
         ),
         "/musiclistall": RegisteredCommand(
             build_musiclistall_handler(settings),
@@ -1396,42 +1681,87 @@ def _build_registries(
             research_handler,
             ack="收到，正在進行深度商品研究（會分階段回報進度）…",
             background=True,
+            **command_metadata("/research"),
         ),
         "/resaerch": RegisteredCommand(
             research_handler,
             ack="收到，正在進行深度商品研究（會分階段回報進度）…",
             background=True,
+            **command_metadata("/resaerch"),
+        ),
+        "/watch": RegisteredCommand(
+            _watch_handler,
+            ack="收到追蹤指令，正在設定…",
+            background=True,
+            **command_metadata("/watch"),
+        ),
+        "/watchlist": RegisteredCommand(
+            _watchlist_handler,
+            **command_metadata("/watchlist"),
+        ),
+        "/watches": RegisteredCommand(
+            _watchlist_handler,
+            **command_metadata("/watches"),
+        ),
+        "/unwatch": RegisteredCommand(
+            _unwatch_handler,
+            **command_metadata("/unwatch"),
+        ),
+        "/stopwatch": RegisteredCommand(
+            _unwatch_handler,
+            **command_metadata("/stopwatch"),
+        ),
+        "/setprice": RegisteredCommand(
+            _setprice_handler,
+            **command_metadata("/setprice"),
+        ),
+        "/updatewatch": RegisteredCommand(
+            _setprice_handler,
+            **command_metadata("/updatewatch"),
         ),
         "/snsadd": RegisteredCommand(
             build_sns_add_handler(sns_db, sns_inbox=sns_inbox),
             ack="收到 X 追蹤指令，正在設定…", background=True,
+            **command_metadata("/snsadd"),
         ),
         "/sns_add": RegisteredCommand(
             build_sns_add_handler(sns_db, sns_inbox=sns_inbox),
             ack="收到 X 追蹤指令，正在設定…", background=True,
+            **command_metadata("/sns_add"),
         ),
-        "/snslist": RegisteredCommand(build_snslist_handler(sns_db)),
-        "/sns_list": RegisteredCommand(build_snslist_handler(sns_db)),
-        "/snsdelete": RegisteredCommand(build_sns_delete_handler(sns_db, sns_inbox=sns_inbox)),
-        "/sns_delete": RegisteredCommand(build_sns_delete_handler(sns_db, sns_inbox=sns_inbox)),
+        "/snslist": RegisteredCommand(build_snslist_handler(sns_db), **command_metadata("/snslist")),
+        "/sns_list": RegisteredCommand(build_snslist_handler(sns_db), **command_metadata("/sns_list")),
+        "/snsdelete": RegisteredCommand(
+            build_sns_delete_handler(sns_db, sns_inbox=sns_inbox),
+            **command_metadata("/snsdelete"),
+        ),
+        "/sns_delete": RegisteredCommand(
+            build_sns_delete_handler(sns_db, sns_inbox=sns_inbox),
+            **command_metadata("/sns_delete"),
+        ),
         "/snsbuzz": RegisteredCommand(
             build_sns_buzz_handler(buzz_fn),
             ack="收到，正在掃描 4chan 收藏/IP 討論並交給 LLM 整理…",
             background=True,
+            **command_metadata("/snsbuzz"),
         ),
         "/sns_buzz": RegisteredCommand(
             build_sns_buzz_handler(buzz_fn),
             ack="收到，正在掃描 4chan 收藏/IP 討論並交給 LLM 整理…",
             background=True,
+            **command_metadata("/sns_buzz"),
         ),
         "/snsclearfilter": RegisteredCommand(
-            build_sns_clear_filter_handler(sns_db, sns_inbox=sns_inbox)
+            build_sns_clear_filter_handler(sns_db, sns_inbox=sns_inbox),
+            **command_metadata("/snsclearfilter"),
         ),
         "/hunt": RegisteredCommand(
-            build_hunt_handler(settings, opportunity_inbox=opportunity_inbox)
+            build_hunt_handler(settings, opportunity_inbox=opportunity_inbox),
+            **command_metadata("/hunt"),
         ),
         "/opportunity": RegisteredCommand(
-            build_hunt_handler(settings, opportunity_inbox=opportunity_inbox)
+            build_hunt_handler(settings, opportunity_inbox=opportunity_inbox),
+            **command_metadata("/opportunity"),
         ),
     }
 
@@ -1441,7 +1771,8 @@ def _build_registries(
     _home_schedule_store = get_home_schedule_store(settings.openclaw_home_schedules_path)
     _run_slash_command = make_run_slash_command(command_handlers)
     command_handlers["/schedulehome"] = RegisteredCommand(
-        build_schedulehome_handler(_home_schedule_store, _run_slash_command)
+        build_schedulehome_handler(_home_schedule_store, _run_slash_command),
+        **command_metadata("/schedulehome"),
     )
 
     if dynamic_tool_runner is not None:
@@ -1450,6 +1781,7 @@ def _build_registries(
                                    command_registry=command_handlers),
             ack="⚙️",
             background=True,
+            **command_metadata("/workflow"),
         )
 
     _rag_cb = _build_rag_callback_handler(settings, knowledge_inbox=knowledge_inbox)
@@ -1859,6 +2191,8 @@ def run_telegram_polling(
     drop_pending_updates: bool = True,
 ) -> int:
     token = require_telegram_token(settings)
+    from .command_bridge import CommandBridge
+
     _wire_kb_embedder(settings)
     watch_db = _bootstrap_watch_db(settings)
     # Price monitor now runs in local.openclaw.price_monitor (separate process).
@@ -1882,6 +2216,10 @@ def run_telegram_polling(
         _build_registries(settings, dynamic_tool_runner, sns_db=sns_db, buzz_fn=sns_buzz_fn,
                           sns_inbox=sns_inbox, knowledge_inbox=knowledge_inbox,
                           opportunity_inbox=opportunity_inbox,
+                          watch_db=watch_db, watch_inbox=watch_inbox,
+                          lookup_renderer=lookup_renderer,
+                          board_loader=board_loader,
+                          reputation_renderer=default_reputation_renderer(settings),
                           research_notifier_factory=_build_research_notifier_factory(settings))
     )
     home_schedule_scheduler = _start_home_schedule_scheduler(settings, command_handlers)
@@ -1909,9 +2247,10 @@ def run_telegram_polling(
             background=True,
         )
 
+    goal_bridge = CommandBridge(settings=settings)
     _price_bot_module.TelegramCommandProcessor = (
         lambda **kwargs: TelegramCommandProcessor(
-            settings=settings, workflow_editor=_wf_editor, **kwargs
+            settings=settings, workflow_editor=_wf_editor, goal_bridge=goal_bridge, **kwargs
         )
     )
     return _base_run_telegram_polling(
@@ -2009,7 +2348,7 @@ def _start_home_schedule_scheduler(settings, command_handlers) -> HomeScheduleSc
                     client.send_message(chat_id=cid, text=text, reply_markup=None)
 
         # Single-user/local: scheduled commands deliver to the first configured
-        # chat (e.g. /say sends its synthesized audio there).
+        # chat (e.g. /generateaudio sends its generated audio file there).
         scheduler_chat_id = chat_ids[0] if chat_ids else ""
         scheduler = HomeScheduleScheduler(
             store=store,
@@ -2331,7 +2670,7 @@ def _build_status_text(settings: AssistantSettings, dynamic_tool_runner=None) ->
     tesseract = settings.openclaw_tesseract_path or configured.get("OPENCLAW_TESSERACT_PATH") or "PATH lookup"
     tessdata = settings.openclaw_tessdata_dir or configured.get("OPENCLAW_TESSDATA_DIR") or "auto"
     text_backend = (settings.openclaw_local_text_backend or "").strip().lower() or "none"
-    text_model = _select_router_model_for_status(settings)
+    text_model = _select_router_model_for_status(settings) if text_backend != "none" else None
     configured_text_backend = configured.get("OPENCLAW_LOCAL_TEXT_BACKEND") or "none"
     configured_text_model = configured.get("OPENCLAW_LOCAL_TEXT_MODEL")
     configured_text_timeout = configured.get("OPENCLAW_LOCAL_TEXT_TIMEOUT_SECONDS") or str(settings.openclaw_local_text_timeout_seconds)

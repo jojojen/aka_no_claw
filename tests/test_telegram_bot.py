@@ -45,6 +45,13 @@ from openclaw_adapter.telegram_bot import (
     _chromium_launch_options,
 )
 from openclaw_adapter.research_command import ResearchReport, ResearchSectionResult, SellerReputationSnapshot
+from openclaw_adapter.command_bridge_models import (
+    Action,
+    CHAT_TOOL_GOAL,
+    ChatToolPlan,
+    STATUS_OK,
+    WebCommandResponse,
+)
 
 # Every call to handle_telegram_message now sends an immediate intake ack
 # before kicking off the real processing pipeline.
@@ -557,6 +564,188 @@ def test_route_natural_language_uses_openclaw_app_fallback() -> None:
     assert intent.music_query == "playbest"
 
 
+def test_route_natural_language_uses_goal_bridge_when_other_routes_miss(monkeypatch) -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+
+    class _Bridge:
+        def _select_chat_tool_plan(self, req):
+            return (
+                ChatToolPlan(
+                    tool=CHAT_TOOL_GOAL,
+                    query="先查天氣再播報",
+                    reason_summary="多步驟目標",
+                ),
+                None,
+            )
+
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        goal_bridge=_Bridge(),
+    )
+
+    intent = processor._route_natural_language("先查天氣再播報")
+
+    assert intent is not None
+    assert intent.intent == "execute_goal"
+    assert intent.workflow_description == "先查天氣再播報"
+
+
+def test_execute_goal_plan_uses_bridge_and_renders_buttons() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+
+    class _Bridge:
+        def _run_goal_loop_blocking(self, req, goal, planner_metadata=None):
+            return WebCommandResponse(
+                status=STATUS_OK,
+                message="run report text",
+                actions=(
+                    Action(label="繼續（再 6 步）", command="chat", input="__goal_continue__"),
+                    Action(label="停止並總結", command="chat", input="__goal_stop__"),
+                ),
+            )
+
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        goal_bridge=_Bridge(),
+    )
+
+    intent = TelegramNaturalLanguageIntent(
+        intent="execute_goal",
+        workflow_description="先查天氣再播報",
+    )
+    plan = processor._build_app_natural_language_reply_plan(intent, chat_id="123")
+
+    assert plan is not None
+    text, markup = plan._execute_unpacked()
+    assert text == "run report text"
+    assert markup == {
+        "inline_keyboard": [
+            [{"text": "繼續（再 6 步）", "callback_data": "goal:__goal_continue__"}],
+            [{"text": "停止並總結", "callback_data": "goal:__goal_stop__"}],
+        ]
+    }
+
+
+def test_goal_callback_routes_back_into_bridge() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    seen = {}
+
+    class _Bridge:
+        def handle(self, req):
+            seen["input"] = req.input
+            seen["conversation_id"] = req.conversation_id
+            return WebCommandResponse(status=STATUS_OK, message="continued")
+
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        goal_bridge=_Bridge(),
+    )
+
+    toast, new_text, markup = processor._callback_registry["goal"]("__goal_continue__", "", "123")
+
+    assert toast is None
+    assert new_text == "continued"
+    assert markup is None
+    assert seen == {
+        "input": "__goal_continue__",
+        "conversation_id": "telegram:123",
+    }
+
+
+def test_goal_free_text_runs_goal_loop_not_second_handle_call() -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    seen = {}
+
+    class _Bridge:
+        def _run_goal_loop_blocking(self, req, goal, planner_metadata=None):
+            seen["goal"] = goal
+            seen["conversation_id"] = req.conversation_id
+            return WebCommandResponse(status=STATUS_OK, message="run report only")
+
+        def handle(self, req):
+            raise AssertionError("should not re-route goal text through handle()")
+
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        goal_bridge=_Bridge(),
+    )
+
+    text, markup = processor._execute_goal_bridge_reply("先查天氣再播報", "123")
+
+    assert text == "run report only"
+    assert markup is None
+    assert seen == {
+        "goal": "先查天氣再播報",
+        "conversation_id": "telegram:123",
+    }
+
+
+def test_goal_callback_runs_async_and_answers_immediately(monkeypatch) -> None:
+    settings = AssistantSettings(openclaw_telegram_chat_id="123")
+    calls = []
+
+    class _Client:
+        def __init__(self):
+            self.answered = []
+            self.edited = []
+
+        def answer_callback_query(self, **kwargs):
+            self.answered.append(kwargs)
+
+        def edit_message_text(self, **kwargs):
+            self.edited.append(kwargs)
+
+    class _Bridge:
+        def handle(self, req):
+            calls.append(req.input)
+            return WebCommandResponse(status=STATUS_OK, message="done")
+
+    class _ImmediateThread:
+        def __init__(self, *, target, daemon):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    monkeypatch.setattr("openclaw_adapter.telegram_bot.threading.Thread", _ImmediateThread)
+
+    processor = TelegramCommandProcessor(
+        settings=settings,
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+        goal_bridge=_Bridge(),
+    )
+    client = _Client()
+
+    handled = processor.handle_callback_query_async(
+        client=client,
+        callback_id="cbq-1",
+        chat_id="123",
+        message_id=42,
+        prefix="goal",
+        payload="__goal_confirm__",
+        original_text="preview",
+    )
+
+    assert handled is True
+    assert calls == ["__goal_confirm__"]
+    assert client.answered[0]["text"] == "收到，正在處理…"
+    assert client.edited[0]["text"] == "done"
+
+
 def test_build_registries_passes_knowledge_db_path_to_research_handler(monkeypatch, tmp_path: Path) -> None:
     settings = AssistantSettings(
         openclaw_telegram_chat_id="123",
@@ -830,9 +1019,9 @@ def test_build_status_text_includes_feature_models_and_sizes(tmp_path, monkeypat
 
     text = _build_status_text(settings)
 
-    # Active router model = gemma3:12b (strongest across text+vision models).
-    # Configured text model = qwen3:4b (from .env.example) → shows active vs configured.
-    assert "text routing: active=ollama / gemma3:12b (12B) | configured=ollama / qwen3:4b (4B) | timeout=75s" in text
+    # Active router model follows the selected local text model, not the strongest
+    # vision candidate. Configured text model comes from .env.example.
+    assert "text routing: ollama / qwen3:4b (4B) | timeout=75s" in text
     assert "image scan vision: ollama / qwen2.5vl:7b (7B), gemma3:12b (12B) | timeout=180s" in text
     assert "image scan OCR: engine=tesseract | binary=/opt/homebrew/bin/tesseract" in text
     assert "price lookup / trend / watch: model=none" in text

@@ -18,12 +18,17 @@ registry the bot uses) so there is one source of truth.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
+import queue
 import re
+import secrets
 import threading
 import time
 from collections.abc import Iterator
+from typing import Callable
+from pathlib import Path
 from urllib.parse import quote
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -40,6 +45,7 @@ from .llm_pool_settings import (
     LLM_PROVIDER_LOCAL,
     LLM_PROVIDER_MISTRAL,
     ChatLlmPoolWriteError,
+    CloudPoolRotation,
     chat_backend_configured,
     chat_backend_enabled,
     chat_llm_pool_payload,
@@ -52,15 +58,19 @@ from .llm_pool_settings import (
     save_chat_llm_pool_settings,
 )
 from .command_bridge_models import (
+    Action,
     CHAT_BACKEND_CLOUD_MISTRAL,
     CHAT_BACKEND_CLOUD_PICKLE,
     CHAT_BACKEND_CLOUD_POOL,
     CHAT_BACKEND_GEMINI,
     CHAT_BACKEND_LOCAL,
     CHAT_TOOL_BLUETOOTH,
+    CHAT_TOOL_GOAL,
     CHAT_TOOL_IR,
     CHAT_TOOL_MUSIC,
+    CHAT_TOOL_MUSICQUEUE,
     CHAT_TOOL_NO_TOOL,
+    CHAT_TOOL_RESEARCH,
     CHAT_TOOL_SEARCH,
     MUSIC_ACTION_PLAN,
     ChatToolPlan,
@@ -89,9 +99,10 @@ from .command_bridge_models import (
     stream_done,
     stream_error,
     stream_heartbeat,
-    stream_redirect,
     stream_start,
 )
+from .goal_loop import GoalLoop, GoalLoopContinuation, GoalLoopReport
+from .goal_planner import GoalPlanner
 from .task_loop import (
     BoundedTaskLoop,
     ContinuationState,
@@ -112,20 +123,17 @@ _HEARTBEAT_SECONDS = 10.0
 # Finished jobs linger this long so a phone that reconnects after a screen-lock
 # can still fetch the final report, then they are garbage-collected.
 _JOB_TTL_SECONDS = 1800.0
+_GOAL_RESUME_TOKENS = frozenset({"繼續", "continue", "繼續執行", "再繼續", "resume"})
+_GOAL_PENDING_TTL_SECONDS = 600.0
+_GOAL_CONFIRM_INPUT = "__goal_confirm__"
+_GOAL_CONTINUE_INPUT = "__goal_continue__"
+_GOAL_CONTINUE_SEARCH_INPUT = "__goal_continue_search__"
+_GOAL_STOP_INPUT = "__goal_stop__"
+_GOAL_STEP_GRANT = 6
+_GOAL_REPLAN_LIMIT = 2
+_GOAL_SEARCH_GRANT = 5
 
 _SELLER_UNSUPPORTED_MSG = "賣家信譽快照目前尚未由本地 command bridge 支援。"
-
-# Bridge-specific catch for natural "工作流" phrases like
-# "幫我做一個先問候再開燈的工作流" that telegram_nl misclassifies
-# as play_music because "開燈" fires other detection before the workflow check.
-_WF_BRIDGE_VERB_RE = re.compile(r"做|建立?|弄|規劃|設計|create", re.IGNORECASE)
-
-# Bridge-specific catch for "排程 + creation verb" phrases like "幫我建立排程" or
-# "排程執行 greeting_workflow" that don't need the full embedding path.
-_SH_BRIDGE_RE = re.compile(
-    r"(新增|建立|設定|排定|幫我).{0,10}排程|排程.{0,5}(執行|跑)",
-    re.IGNORECASE,
-)
 
 # Match slug-like words (lowercase + digits + underscore) containing an underscore.
 # Used to extract a workflow_id from a free-text schedule phrase.
@@ -140,6 +148,46 @@ _CHAT_SYSTEM_PROMPT = (
     "請延續上下文回答使用者最新的訊息（例如代名詞「她／它／這個」指的是先前提到的主題），"
     "並以繁體中文自然作答。"
 )
+_CHAT_TOOL_SATISFACTION_PROMPT = """你要判斷「工具回覆」是否已真正完成「使用者原始需求」。
+
+規則：
+1. 只看是否已完成原始需求，不要看工具有沒有被成功呼叫。
+2. 如果工具回覆表示找不到、缺少必要資訊、只完成部分需求、或沒有回答到原始需求，請判定 satisfied=false。
+3. 如果工具回覆已直接完成需求，才判定 satisfied=true。
+4. 只能輸出 JSON，不要加任何其他文字。
+
+請輸出：
+{{"satisfied": true 或 false, "reason": "一句極短理由"}}
+
+使用者原始需求：
+{user_input}
+
+工具類型：
+{tool_name}
+
+工具查詢：
+{tool_query}
+
+工具回覆：
+{tool_answer}
+"""
+_GOAL_RESULT_SATISFACTION_PROMPT = """你要判斷「執行結果」是否已真正達成「任務目標」。
+
+規則：
+1. 只看目標是否已實際達成，不要看流程有沒有跑完。
+2. 如果執行結果表示找不到、反問使用者、要求更多資訊、只完成部分目標、或沒有回應目標本身，請判定 satisfied=false。
+3. 如果執行結果已直接達成目標，才判定 satisfied=true。
+4. 只能輸出 JSON，不要加任何其他文字。
+
+請輸出：
+{{"satisfied": true 或 false, "reason": "一句極短理由"}}
+
+任務目標：
+{goal}
+
+執行結果：
+{final_result}
+"""
 _CHAT_ROLE_LABELS = {"user": "使用者", "assistant": "助理", "system": "系統"}
 _MODEL_STATUS_OK = "ok"
 _MODEL_STATUS_ERROR = "error"
@@ -228,6 +276,49 @@ def _is_gemini_fallback_status(status: str) -> bool:
     return status in {_MODEL_STATUS_QUOTA_EXHAUSTED, _MODEL_STATUS_RATE_LIMITED}
 
 
+def _walk_cloud_pool_chain(
+    chain: list[tuple[str, str, object, object]],
+    prompt: str,
+    *,
+    temperature: float,
+) -> tuple[str | None, str | None, str | None, tuple[ModelAttempt, ...]]:
+    """Try each ``(provider, model, build_fn, configured_fn)`` entry in order,
+    first success wins. Shared by every cloud-pool call site (chat-tool plan,
+    result judge, blocking chat, llm_transform) so they fail over identically;
+    ``chain`` may already be rotated by a ``CloudPoolRotation`` before this
+    runs — rotation only changes the starting point, not this walk logic.
+
+    Returns ``(text, final_provider, final_model, attempts)``; ``text`` is
+    ``None`` if every entry in ``chain`` was skipped or failed.
+    """
+    attempts: list[ModelAttempt] = []
+    for provider, model_name, build_fn, configured_fn in chain:
+        if not configured_fn():
+            attempts.append(ModelAttempt(
+                provider, model_name, _MODEL_STATUS_NOT_CONFIGURED,
+                f"{provider} not configured",
+            ))
+            continue
+        client = build_fn(model_name) if provider == "gemini" else build_fn()
+        if client is None:
+            attempts.append(ModelAttempt(
+                provider, model_name, _MODEL_STATUS_NOT_CONFIGURED,
+                f"{provider} unavailable",
+            ))
+            continue
+        try:
+            text = client.generate(prompt, temperature=temperature)
+        except _GeminiRequestError as exc:
+            attempts.append(ModelAttempt(provider, model_name, exc.status, str(exc)))
+            continue
+        except Exception as exc:  # noqa: BLE001
+            attempts.append(ModelAttempt(provider, model_name, _MODEL_STATUS_ERROR, str(exc)))
+            continue
+        attempts.append(ModelAttempt(provider, model_name, _MODEL_STATUS_OK))
+        return text, provider, model_name, tuple(attempts)
+    return None, None, None, tuple(attempts)
+
+
 def _extract_gemini_text(data: object) -> str:
     if not isinstance(data, dict):
         return ""
@@ -258,8 +349,14 @@ _CHAT_TOOL_PLAN_PROMPT_TEMPLATE = (
     '{{"tool":"__no_tool__","answer":"...","reason_summary":"..."}}\n'
     "或\n"
     '{{"tool":"{tool_choices}","query":"...","reason_summary":"..."}}\n'
+    "例如：\n"
+    '- 問「米津玄師是誰」→ {{"tool":"__no_tool__","answer":"...","reason_summary":"一般知識"}}\n'
+    '- 問「今天東京天氣」→ {{"tool":"/search","query":"東京 今天天氣","reason_summary":"需要最新資訊"}}\n'
+    '- 問「幫我規劃一個先查天氣再播報的工作流」→ {{"tool":"__goal__","query":"先查天氣再播報的工作流","reason_summary":"多步驟目標"}}\n'
     "當 tool=__no_tool__ 時，answer 必須是給使用者看的最終答案，"
     "用繁體中文自然回答。\n"
+    "當 tool=__goal__ 時，query 必須是使用者想完成的多步驟目標描述，"
+    "不要回答成最終執行結果。\n"
     "當 tool 是真實工具時，query 必須是該工具可直接執行的參數；"
     "若使用者用代名詞（她／它／這個），請用對話紀錄把主詞補回 query。"
 )
@@ -278,12 +375,6 @@ _SEARCH_SYNTHESIS_PROMPT = (
 #    still evident after streaming completes. Both are always on (never gated by
 #    the debug flag) — only the synthesis-model label stays behind that flag.
 _TOOL_USED_PREFIX = "🔧 已使用工具："
-_TOOL_FRIENDLY_NAMES = {
-    CHAT_TOOL_SEARCH: "網路搜尋",
-    CHAT_TOOL_MUSIC: "音樂控制",
-    CHAT_TOOL_BLUETOOTH: "藍牙控制",
-    CHAT_TOOL_IR: "紅外線控制",
-}
 
 # Search snippets are external (search-engine) text fed into the final synthesis
 # LLM, so they are budgeted before entering the prompt: per-field caps bound any
@@ -305,7 +396,11 @@ _SEARCH_TOOL_POLICY = ChatToolPolicy(
     max_source_field_chars=_SOURCE_PACK_SNIPPET_CAP,
     max_source_pack_chars=_SOURCE_PACK_TOTAL_CAP,
 )
+_RESEARCH_TOOL_POLICY = ChatToolPolicy(display_name="商品研究", max_query_chars=512)
 _MUSIC_TOOL_POLICY = ChatToolPolicy(display_name="音樂控制", max_query_chars=128)
+# Queue queries carry several song names at once, so they get the full router
+# query budget instead of the single-song cap.
+_MUSICQUEUE_TOOL_POLICY = ChatToolPolicy(display_name="音樂連播", max_query_chars=256)
 _BLUETOOTH_TOOL_POLICY = ChatToolPolicy(display_name="藍牙控制", max_query_chars=128)
 _IR_TOOL_POLICY = ChatToolPolicy(display_name="紅外線控制", max_query_chars=128)
 
@@ -317,8 +412,7 @@ def _clip(text: str, cap: int) -> str:
     return text[:cap].rstrip() + "…"
 
 
-def _tool_calling_notice(tool: str) -> str:
-    name = _TOOL_FRIENDLY_NAMES.get(tool, tool)
+def _tool_calling_notice(tool: str, name: str) -> str:
     return f"🔧 正在調用「{name}（{tool}）」工具中…"
 
 
@@ -481,7 +575,10 @@ class _WorkflowShimRunner:
         self.tools_dir = _resolve_tools_dir()
         self.client = OllamaTextClient(
             endpoint=settings.openclaw_local_text_endpoint,
-            model=(settings.openclaw_local_text_model or "qwen3:14b").split(",")[0].strip(),
+            # Gear-settings LOCAL provider model, not the raw env default — the
+            # user can change this in the UI without redeploying, and previous
+            # code silently ignored that by hardcoding "qwen3:14b" here.
+            model=resolve_provider_model(settings, LLM_PROVIDER_LOCAL),
             timeout_seconds=settings.openclaw_local_text_timeout_seconds,
         )
         self._tool_runner = DynamicToolRunner(
@@ -522,17 +619,16 @@ class CommandBridge:
         # In-process only: a resume is a follow-up turn within the same bridge run.
         self._music_continuations: dict[str, dict] = {}
         self._music_cont_lock = threading.Lock()
+        self._goal_continuations: dict[str, dict] = {}
+        self._goal_cont_lock = threading.Lock()
+        self._goal_pending_confirms: dict[str, dict] = {}
+        self._goal_pending_lock = threading.Lock()
         # #53: workflow surface for web chat (NL draft + editable card buttons).
         # Built lazily — the shared editor must persist draft sessions across the
         # separate HTTP requests that a draft → reorder → save flow spans.
         self._workflow_handler: object | None = None
         self._workflow_editor: object | None = None
         self._workflow_lock = threading.Lock()
-        # Embedding intent fast-path for workflow creation redirect (#web8 B2).
-        # Built lazily on first chat message; None means disabled (no embedder).
-        self._intent_fp: object | None = None
-        self._intent_fp_built = False
-        self._intent_fp_lock = threading.Lock()
         # Schedule surface for web chat (web#9). Lazily built so the store
         # singleton is shared with any Telegram-side scheduler that also runs.
         self._sh_handler: object | None = None
@@ -563,15 +659,6 @@ class CommandBridge:
                     self._command_handlers = command_handlers
                     self._view_handlers = view_handlers
                     self._item_deleter_handlers = item_deleter_handlers
-
-    def _get_intent_fast_path(self):
-        if not self._intent_fp_built:
-            with self._intent_fp_lock:
-                if not self._intent_fp_built:
-                    from .intent_fast_path import build_intent_fast_path
-                    self._intent_fp = build_intent_fast_path(self.settings)
-                    self._intent_fp_built = True
-        return self._intent_fp
 
     def _handlers(self) -> dict:
         self._ensure_registries()
@@ -676,12 +763,18 @@ class CommandBridge:
             return WebCommandResponse(
                 status=STATUS_ERROR, message="請輸入訊息。", mode=MODE_CHAT
             )
+        goal_control = self._handle_goal_control_input(req, text)
+        if goal_control is not None:
+            return goal_control
         # #51 PR3: if this conversation has a paused music plan and the user's
         # message names one of the offered tracks, resume the loop (play that
         # track) instead of routing — the live resume client for the bounded loop.
         resumed = self._maybe_resume_music_plan(req, text)
         if resumed is not None:
             return resumed
+        resumed_goal = self._maybe_resume_goal_loop(req, text)
+        if resumed_goal is not None:
+            return resumed_goal
         if not chat_backend_enabled(self.settings, req.chat_backend):
             return WebCommandResponse(
                 status=STATUS_ERROR,
@@ -690,6 +783,8 @@ class CommandBridge:
             )
         prompt = build_chat_prompt(req.input, req.history)
         plan, metadata = self._select_chat_tool_plan(req)
+        if plan is not None and plan.tool == CHAT_TOOL_GOAL:
+            return self._run_goal_loop_blocking(req, plan.query, planner_metadata=metadata)
         if plan is not None and plan.tool != CHAT_TOOL_NO_TOOL:
             try:
                 tool_result = self._run_chat_tool(req, plan)
@@ -697,6 +792,14 @@ class CommandBridge:
                     "[chat-tool] tool=%s sources=%d summary=%r",
                     plan.tool, tool_result.source_count, tool_result.result_summary,
                 )
+                upgraded = self._maybe_upgrade_tool_result_to_goal_loop(
+                    req,
+                    plan,
+                    tool_result,
+                    planner_metadata=metadata,
+                )
+                if upgraded is not None:
+                    return upgraded
                 return WebCommandResponse(
                     status=STATUS_OK,
                     message=tool_result.answer,
@@ -723,52 +826,24 @@ class CommandBridge:
         if not text:
             yield stream_error("請輸入訊息。")
             return
-        # Workflow / schedule creation redirect (web#8 B2, web#9). Three layers so
-        # the feature works even when the bge-m3 embedder is unavailable:
-        #   1. Embedding fast-path (primary): bge-m3 cosine over phrasings JSON.
-        #   3a. Bridge "工作流 + verb" catch (before telegram_nl to avoid misclassification).
-        #   3b. Bridge "排程 + creation verb" catch for schedule creation.
-        #   4. NL-rule fallback (secondary): telegram_nl keyword rules (create workflow only).
-        # All layers emit stream_redirect and return before the LLM router runs.
-        fp = self._get_intent_fast_path()
-        if fp is not None:
-            wf_intent = fp.route(text)
-            if wf_intent is not None and wf_intent.intent == "create_workflow":
-                yield stream_redirect(
-                    "create_workflow",
-                    wf_intent.workflow_description or text,
-                )
-                return
-            if wf_intent is not None and wf_intent.intent == "create_schedule":
-                yield stream_redirect(
-                    "create_schedule", text,
-                    workflow_id=self._extract_wf_slug(text),
-                )
-                return
-        # Layer 3a: bridge "工作流 + verb" catch.
-        if "工作流" in text and _WF_BRIDGE_VERB_RE.search(text):
-            yield stream_redirect("create_workflow", text)
+        if self._is_goal_control_input(text):
+            yield from self._stream_goal_control_input(req, text)
             return
-        # Layer 3b: bridge "排程 + creation verb" catch.
-        if _SH_BRIDGE_RE.search(text):
-            yield stream_redirect(
-                "create_schedule", text,
-                workflow_id=self._extract_wf_slug(text),
-            )
+        if self._should_resume_goal_loop(req, text):
+            yield from self._stream_resume_goal_loop(req)
             return
-        from .natural_language import fallback_route_openclaw_natural_language
-        nl_intent = fallback_route_openclaw_natural_language(text)
-        if nl_intent is not None and nl_intent.intent == "create_workflow":
-            yield stream_redirect(
-                "create_workflow",
-                nl_intent.workflow_description or text,
-            )
-            return
+        # Intent fast-paths intentionally do not run here. Web Chat should let
+        # the selected model choose direct answer / registered tool / __goal__,
+        # so cloud-model capability can be evaluated without regex or embedding
+        # shortcuts masking the model's decision.
         if not chat_backend_enabled(self.settings, req.chat_backend):
             yield stream_error(self._chat_backend_disabled_message(req.chat_backend))
             return
         prompt = build_chat_prompt(req.input, req.history)
         plan, metadata = yield from self._stream_chat_tool_plan(req)
+        if plan is not None and plan.tool == CHAT_TOOL_GOAL:
+            yield from self._stream_goal_loop(req, plan.query, planner_metadata=metadata)
+            return
         if plan is not None and plan.tool != CHAT_TOOL_NO_TOOL:
             yield from self._stream_chat_tool(req, plan)
             return
@@ -777,6 +852,9 @@ class CommandBridge:
                 yield stream_delta(plan.answer)
             yield stream_done(plan.answer, model_metadata=metadata)
         else:
+            # plan is None only when the router failed or emitted untrusted
+            # output — say so, instead of silently degrading to plain chat.
+            yield stream_delta("（工具路由暫時不可用，改以一般模式直接回答）\n")
             yield from self._stream_chat_response(prompt, req.chat_backend)
 
     # --- bounded music plan (#50) --------------------------------------------
@@ -917,7 +995,7 @@ class CommandBridge:
             return StepOutcome(observation=f"{len(local_candidates)} local candidate(s)")
 
         def search(ctx: LoopContext) -> StepOutcome:
-            query = f"{artist} {qualifier} シングル"
+            query = " ".join(part for part in (artist, qualifier, "シングル") if part)
             trace.append(f"Task 2: search for {query!r}")
             try:
                 web_results = web_search(
@@ -1061,6 +1139,723 @@ class CommandBridge:
             mode=MODE_CHAT,
         )
 
+    def _store_goal_continuation(
+        self,
+        req: WebCommandRequest,
+        continuation: GoalLoopContinuation,
+        *,
+        chat_backend: str,
+        planner_metadata: ModelMetadata | None,
+    ) -> None:
+        with self._goal_cont_lock:
+            self._goal_continuations[self._conversation_key(req)] = {
+                "continuation": continuation.to_dict(),
+                "chat_backend": chat_backend,
+                "planner_metadata": planner_metadata.to_dict() if planner_metadata is not None else None,
+                "created_at": time.time(),
+            }
+
+    def _goal_pending_confirm_entry(self, req: WebCommandRequest) -> dict | None:
+        with self._goal_pending_lock:
+            entry = self._goal_pending_confirms.get(self._conversation_key(req))
+            if entry is None:
+                return None
+            if time.time() - float(entry.get("created_at") or 0.0) > _GOAL_PENDING_TTL_SECONDS:
+                self._goal_pending_confirms.pop(self._conversation_key(req), None)
+                return None
+            return entry
+
+    def _clear_goal_pending_confirm(self, req: WebCommandRequest) -> None:
+        with self._goal_pending_lock:
+            self._goal_pending_confirms.pop(self._conversation_key(req), None)
+
+    @staticmethod
+    def _is_goal_control_input(text: str) -> bool:
+        return text in {
+            _GOAL_CONFIRM_INPUT,
+            _GOAL_CONTINUE_INPUT,
+            _GOAL_CONTINUE_SEARCH_INPUT,
+            _GOAL_STOP_INPUT,
+        }
+
+    def _handle_goal_control_input(
+        self, req: WebCommandRequest, text: str
+    ) -> WebCommandResponse | None:
+        if text == _GOAL_CONFIRM_INPUT:
+            return self._confirm_goal_loop(req)
+        if text == _GOAL_CONTINUE_INPUT:
+            entry = self._goal_continuation_entry(req)
+            if entry is None:
+                return WebCommandResponse(
+                    status=STATUS_ERROR,
+                    message="目標續跑已逾時，請重新描述一次需求。",
+                    mode=MODE_CHAT,
+                )
+            return self._resume_goal_loop(req, entry)
+        if text == _GOAL_CONTINUE_SEARCH_INPUT:
+            return self._continue_goal_loop_with_search_extension(req)
+        if text == _GOAL_STOP_INPUT:
+            return self._stop_goal_loop(req)
+        return None
+
+    def _stream_goal_control_input(
+        self, req: WebCommandRequest, text: str
+    ) -> Iterator[dict]:
+        if text == _GOAL_CONFIRM_INPUT:
+            yield from self._stream_confirm_goal_loop(req)
+            return
+        if text == _GOAL_CONTINUE_INPUT:
+            yield from self._stream_resume_goal_loop(req)
+            return
+        if text == _GOAL_CONTINUE_SEARCH_INPUT:
+            yield from self._stream_continue_goal_loop_with_search_extension(req)
+            return
+        if text == _GOAL_STOP_INPUT:
+            response = self._stop_goal_loop(req)
+            if response.status == STATUS_ERROR:
+                yield stream_error(response.message)
+            else:
+                yield stream_done(
+                    response.message,
+                    model_metadata=response.model_metadata,
+                    actions=self._stream_actions(response),
+                )
+            return
+        yield stream_error("未知的目標控制指令。")
+
+    def _goal_continuation_entry(self, req: WebCommandRequest) -> dict | None:
+        with self._goal_cont_lock:
+            entry = self._goal_continuations.get(self._conversation_key(req))
+            if entry is None:
+                return None
+            if time.time() - float(entry.get("created_at") or 0.0) > _GOAL_PENDING_TTL_SECONDS:
+                self._goal_continuations.pop(self._conversation_key(req), None)
+                return None
+            return entry
+
+    def _should_resume_goal_loop(self, req: WebCommandRequest, text: str) -> bool:
+        return text.strip().lower() in _GOAL_RESUME_TOKENS and self._goal_continuation_entry(req) is not None
+
+    def _maybe_resume_goal_loop(
+        self, req: WebCommandRequest, text: str
+    ) -> WebCommandResponse | None:
+        entry = self._goal_continuation_entry(req) if text.strip().lower() in _GOAL_RESUME_TOKENS else None
+        if not entry:
+            return None
+        return self._resume_goal_loop(req, entry)
+
+    def _stream_resume_goal_loop(self, req: WebCommandRequest) -> Iterator[dict]:
+        result: dict[str, object] = {}
+        done = threading.Event()
+        entry = self._goal_continuation_entry(req)
+        if not entry:
+            yield stream_error("目標續跑已逾時，請重新描述一次需求。")
+            return
+
+        def _worker() -> None:
+            try:
+                result["response"] = self._resume_goal_loop(req, entry)
+            except Exception as exc:  # noqa: BLE001
+                result["error"] = str(exc)
+            finally:
+                done.set()
+
+        threading.Thread(target=_worker, daemon=True).start()
+        while not done.wait(timeout=_HEARTBEAT_SECONDS):
+            yield stream_heartbeat()
+        if "error" in result:
+            yield stream_error(f"目標續跑失敗：{result['error']}")
+            return
+        response = result.get("response")
+        if not isinstance(response, WebCommandResponse):
+            yield stream_error("目標續跑失敗：缺少結果。")
+            return
+        if response.status == STATUS_ERROR:
+            yield stream_error(response.message)
+            return
+        yield stream_done(
+            response.message,
+            model_metadata=response.model_metadata,
+            actions=self._stream_actions(response),
+        )
+
+    def _continue_goal_loop_with_search_extension(self, req: WebCommandRequest) -> WebCommandResponse:
+        entry = self._goal_continuation_entry(req)
+        if entry is None:
+            return WebCommandResponse(
+                status=STATUS_ERROR,
+                message="目標續跑已逾時，請重新描述一次需求。",
+                mode=MODE_CHAT,
+            )
+        continuation_data = entry.get("continuation")
+        if not isinstance(continuation_data, dict):
+            return WebCommandResponse(
+                status=STATUS_ERROR,
+                message="目標續跑狀態已損壞，請重新描述一次需求。",
+                mode=MODE_CHAT,
+            )
+        continuation = GoalLoopContinuation.from_dict(continuation_data)
+        budget = continuation.state.budget or {}
+        search_limit = int(budget.get("search_limit") or 0)
+        search_used = int(budget.get("search_used") or 0)
+        search_hard_limit = int(budget.get("search_hard_limit") or 0)
+        if search_hard_limit and search_used >= search_hard_limit:
+            return WebCommandResponse(
+                status=STATUS_OK,
+                message=f"今日搜尋硬上限已達 ({search_used}/{search_hard_limit})，明天重置。",
+                mode=MODE_CHAT,
+            )
+        granted = self._grant_goal_search_extension(_GOAL_SEARCH_GRANT)
+        if granted <= 0:
+            hard = search_hard_limit or search_limit
+            return WebCommandResponse(
+                status=STATUS_OK,
+                message=f"今日搜尋硬上限已達 ({search_used}/{hard})，明天重置。",
+                mode=MODE_CHAT,
+            )
+        return self._resume_goal_loop(req, entry)
+
+    def _stream_continue_goal_loop_with_search_extension(
+        self, req: WebCommandRequest
+    ) -> Iterator[dict]:
+        result: dict[str, object] = {}
+        done = threading.Event()
+
+        def _worker() -> None:
+            try:
+                result["response"] = self._continue_goal_loop_with_search_extension(req)
+            except Exception as exc:  # noqa: BLE001
+                result["error"] = str(exc)
+            finally:
+                done.set()
+
+        threading.Thread(target=_worker, daemon=True).start()
+        while not done.wait(timeout=_HEARTBEAT_SECONDS):
+            yield stream_heartbeat()
+        if "error" in result:
+            yield stream_error(f"目標續跑失敗：{result['error']}")
+            return
+        response = result.get("response")
+        if not isinstance(response, WebCommandResponse):
+            yield stream_error("目標續跑失敗：缺少結果。")
+            return
+        if response.status == STATUS_ERROR:
+            yield stream_error(response.message)
+            return
+        yield stream_done(
+            response.message,
+            model_metadata=response.model_metadata,
+            actions=self._stream_actions(response),
+        )
+
+    def _confirm_goal_loop(self, req: WebCommandRequest) -> WebCommandResponse:
+        entry = self._goal_pending_confirm_entry(req)
+        if entry is None:
+            return WebCommandResponse(
+                status=STATUS_ERROR,
+                message="目標確認已逾時，請重新描述一次需求。",
+                mode=MODE_CHAT,
+            )
+        self._clear_goal_pending_confirm(req)
+        continuation_data = entry.get("continuation")
+        if not isinstance(continuation_data, dict):
+            return WebCommandResponse(
+                status=STATUS_ERROR,
+                message="目標確認狀態已損壞，請重新描述一次需求。",
+                mode=MODE_CHAT,
+            )
+        chat_backend = str(entry.get("chat_backend") or req.chat_backend or CHAT_BACKEND_LOCAL)
+        try:
+            report = self._execute_goal_loop(
+                goal="",
+                chat_backend=chat_backend,
+                resume=GoalLoopContinuation.from_dict(continuation_data),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("goal loop confirm failed")
+            return WebCommandResponse(
+                status=STATUS_ERROR,
+                message=f"目標執行失敗：{exc}",
+                mode=MODE_CHAT,
+            )
+        if report.continuation is not None:
+            self._store_goal_continuation(
+                req,
+                report.continuation,
+                chat_backend=chat_backend,
+                planner_metadata=None,
+            )
+        else:
+            with self._goal_cont_lock:
+                self._goal_continuations.pop(self._conversation_key(req), None)
+        return WebCommandResponse(
+            status=STATUS_OK,
+            message=self._format_goal_loop_message(report),
+            mode=MODE_CHAT,
+            actions=self._goal_web_actions(req, report),
+        )
+
+    def _stream_confirm_goal_loop(self, req: WebCommandRequest) -> Iterator[dict]:
+        result: dict[str, object] = {}
+        done = threading.Event()
+
+        def _worker() -> None:
+            try:
+                result["response"] = self._confirm_goal_loop(req)
+            except Exception as exc:  # noqa: BLE001
+                result["error"] = str(exc)
+            finally:
+                done.set()
+
+        threading.Thread(target=_worker, daemon=True).start()
+        while not done.wait(timeout=_HEARTBEAT_SECONDS):
+            yield stream_heartbeat()
+        if "error" in result:
+            yield stream_error(f"目標執行失敗：{result['error']}")
+            return
+        response = result.get("response")
+        if not isinstance(response, WebCommandResponse):
+            yield stream_error("目標執行失敗：缺少結果。")
+            return
+        if response.status == STATUS_ERROR:
+            yield stream_error(response.message)
+            return
+        yield stream_done(
+            response.message,
+            model_metadata=response.model_metadata,
+            actions=self._stream_actions(response),
+        )
+
+    def _resume_goal_loop(self, req: WebCommandRequest, entry: dict) -> WebCommandResponse:
+        continuation_data = entry.get("continuation")
+        if not isinstance(continuation_data, dict):
+            return WebCommandResponse(
+                status=STATUS_ERROR,
+                message="目標續跑狀態已損壞，請重新描述一次需求。",
+                mode=MODE_CHAT,
+            )
+        chat_backend = str(entry.get("chat_backend") or req.chat_backend or CHAT_BACKEND_LOCAL)
+        try:
+            report = self._execute_goal_loop(
+                goal="",
+                chat_backend=chat_backend,
+                resume=GoalLoopContinuation.from_dict(continuation_data),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("goal loop resume failed")
+            return WebCommandResponse(
+                status=STATUS_ERROR,
+                message=f"目標續跑失敗：{exc}",
+                mode=MODE_CHAT,
+            )
+        with self._goal_cont_lock:
+            if report.continuation is None:
+                self._goal_continuations.pop(self._conversation_key(req), None)
+            else:
+                self._goal_continuations[self._conversation_key(req)] = {
+                    "continuation": report.continuation.to_dict(),
+                    "chat_backend": chat_backend,
+                    "planner_metadata": entry.get("planner_metadata"),
+                    "created_at": time.time(),
+                }
+        return WebCommandResponse(
+            status=STATUS_OK,
+            message=self._format_goal_loop_message(report),
+            mode=MODE_CHAT,
+            actions=self._goal_web_actions(req, report),
+        )
+
+    def _stop_goal_loop(self, req: WebCommandRequest) -> WebCommandResponse:
+        entry = self._goal_continuation_entry(req)
+        if entry is None:
+            entry = self._goal_pending_confirm_entry(req)
+            if entry is None:
+                return WebCommandResponse(
+                    status=STATUS_ERROR,
+                    message="沒有可停止的目標。",
+                    mode=MODE_CHAT,
+                )
+            self._clear_goal_pending_confirm(req)
+            continuation_data = entry.get("continuation")
+            if not isinstance(continuation_data, dict):
+                return WebCommandResponse(
+                    status=STATUS_ERROR,
+                    message="目標狀態已損壞，請重新描述一次需求。",
+                    mode=MODE_CHAT,
+                )
+            continuation = GoalLoopContinuation.from_dict(continuation_data)
+        else:
+            with self._goal_cont_lock:
+                self._goal_continuations.pop(self._conversation_key(req), None)
+            continuation_data = entry.get("continuation")
+            if not isinstance(continuation_data, dict):
+                return WebCommandResponse(
+                    status=STATUS_ERROR,
+                    message="目標狀態已損壞，請重新描述一次需求。",
+                    mode=MODE_CHAT,
+                )
+            continuation = GoalLoopContinuation.from_dict(continuation_data)
+        summary = self._format_goal_stop_summary(continuation)
+        return WebCommandResponse(
+            status=STATUS_OK,
+            message=summary,
+            mode=MODE_CHAT,
+        )
+
+    @staticmethod
+    def _format_goal_stop_summary(continuation: GoalLoopContinuation) -> str:
+        parts = [
+            "已停止目前目標。",
+            "\n".join(continuation.narration).strip(),
+        ]
+        if continuation.trace is not None and continuation.trace.final_result:
+            parts.append(f"目前最後結果：{continuation.trace.final_result}")
+        elif continuation.state.current_status:
+            parts.append(f"目前進度：{continuation.state.current_status}")
+        return "\n\n".join(part for part in parts if part)
+
+    def _run_goal_loop_blocking(
+        self,
+        req: WebCommandRequest,
+        goal: str,
+        *,
+        planner_metadata: ModelMetadata | None,
+        narrator: Callable[[str], None] | None = None,
+    ) -> WebCommandResponse:
+        try:
+            report = self._execute_goal_loop(
+                goal=goal,
+                chat_backend=req.chat_backend,
+                narrator=narrator,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("goal loop failed goal=%r", goal)
+            return WebCommandResponse(
+                status=STATUS_ERROR,
+                message=f"目標執行失敗：{exc}",
+                mode=MODE_CHAT,
+            )
+        self._sync_goal_continuation(req, report, planner_metadata=planner_metadata)
+        return WebCommandResponse(
+            status=STATUS_OK,
+            message=self._format_goal_loop_message(report),
+            mode=MODE_CHAT,
+            model_metadata=None,
+            actions=self._goal_web_actions(req, report),
+        )
+
+    def _sync_goal_continuation(
+        self,
+        req: WebCommandRequest,
+        report,
+        *,
+        planner_metadata: ModelMetadata | None,
+    ) -> None:
+        if report.continuation is not None:
+            self._store_goal_continuation(
+                req,
+                report.continuation,
+                chat_backend=req.chat_backend,
+                planner_metadata=planner_metadata,
+            )
+        else:
+            with self._goal_cont_lock:
+                self._goal_continuations.pop(self._conversation_key(req), None)
+
+    def _stream_goal_loop(
+        self,
+        req: WebCommandRequest,
+        goal: str,
+        *,
+        planner_metadata: ModelMetadata | None,
+    ) -> Iterator[dict]:
+        result: dict[str, object] = {}
+        done = threading.Event()
+        abandoned = threading.Event()
+        narration_queue: queue.Queue[str] = queue.Queue()
+
+        def _worker() -> None:
+            try:
+                result["report"] = self._execute_goal_loop(
+                    goal=goal,
+                    chat_backend=req.chat_backend,
+                    narrator=narration_queue.put,
+                )
+            except Exception as exc:  # noqa: BLE001
+                result["error"] = str(exc)
+            finally:
+                done.set()
+                # Client gone (page closed / phone locked): the run still
+                # finished, so persist the continuation and push the outcome
+                # into session memory for the next page load.
+                if abandoned.is_set():
+                    report = result.get("report")
+                    if isinstance(report, GoalLoopReport):
+                        try:
+                            self._sync_goal_continuation(
+                                req, report, planner_metadata=planner_metadata
+                            )
+                            self._push_orphaned_result(self._format_goal_loop_message(report))
+                        except Exception:  # noqa: BLE001
+                            logger.exception(
+                                "command bridge: failed to persist abandoned goal result"
+                            )
+
+        threading.Thread(target=_worker, daemon=True).start()
+        last_beat = time.time()
+        try:
+            while not done.is_set() or not narration_queue.empty():
+                try:
+                    line = narration_queue.get(timeout=0.5)
+                except queue.Empty:
+                    if time.time() - last_beat >= _HEARTBEAT_SECONDS:
+                        yield stream_heartbeat()
+                        last_beat = time.time()
+                    continue
+                yield stream_delta(f"{line}\n")
+                last_beat = time.time()
+        except GeneratorExit:
+            abandoned.set()
+            raise
+        if "error" in result:
+            yield stream_error(f"目標執行失敗：{result['error']}")
+            return
+        report = result.get("report")
+        if not isinstance(report, GoalLoopReport):
+            yield stream_error("目標執行失敗：缺少結果。")
+            return
+        self._sync_goal_continuation(req, report, planner_metadata=planner_metadata)
+        actions = [a.to_dict() for a in self._goal_web_actions(req, report)]
+        yield stream_done(
+            self._format_goal_loop_message(report),
+            model_metadata=None,
+            actions=actions or None,
+        )
+
+    def _execute_goal_loop(
+        self,
+        *,
+        goal: str,
+        chat_backend: str,
+        resume: GoalLoopContinuation | None = None,
+        narrator: Callable[[str], None] | None = None,
+    ):
+        runner = _WorkflowShimRunner(self.settings)
+        # One rotation cursor shared by every LLM call this run makes (draft,
+        # each replan, the result judge, each llm_transform step) so a long
+        # multi-step goal spreads load across the cloud pool instead of
+        # retrying provider[0] first on every single call.
+        pool_rotation = CloudPoolRotation()
+        loop = GoalLoop(
+            goal=resume.state.goal if resume is not None else goal,
+            planner=self._build_goal_planner(
+                chat_backend, runner, progress=narrator, pool_rotation=pool_rotation
+            ),
+            executor=runner,
+            command_registry=self._handlers(),
+            llm_client=self._goal_llm_transform_client(chat_backend, runner, pool_rotation),
+            trace_saver=self._goal_trace_saver(runner),
+            chat_id=_BRIDGE_CHAT_ID,
+            max_steps=_GOAL_STEP_GRANT,
+            replan_limit=_GOAL_REPLAN_LIMIT,
+            narrator=narrator,
+            result_judge=self._goal_result_judge(chat_backend, pool_rotation=pool_rotation),
+        )
+        report = loop.run(resume=resume)
+        logger.info(
+            "[chat-goal-plan] done=%s replans=%s final=%r",
+            report.done,
+            report.replans_used,
+            report.final_result,
+        )
+        return report
+
+    def _build_goal_planner(
+        self,
+        chat_backend: str,
+        runner: _WorkflowShimRunner,
+        progress: Callable[[str], None] | None = None,
+        pool_rotation: "CloudPoolRotation | None" = None,
+    ) -> GoalPlanner:
+        return GoalPlanner(
+            catalog=runner.catalog,
+            llm_client=self._goal_planner_client(chat_backend),
+            command_registry=self._handlers(),
+            command_usage_resolver=lambda command, _registry: self._registered_command_usage(command),
+            progress=progress,
+            pool_rotation=pool_rotation,
+        )
+
+    def _goal_llm_transform_client(
+        self,
+        chat_backend: str,
+        runner: "_WorkflowShimRunner",
+        pool_rotation: "CloudPoolRotation | None",
+    ):
+        """Adapter for ``WorkflowRunner``'s llm_transform steps.
+
+        Previously this always used ``runner.client`` (local Ollama), no
+        matter which backend the user picked for the goal loop — the cause of
+        llm_transform hallucinating with a weak local model even when cloud
+        was selected. Routes through the selected backend instead, sharing
+        ``pool_rotation`` with draft/replan/judge for the cloud pool; local
+        Ollama stays as the last-resort fallback so a transform step never
+        hard-fails just because the cloud is unreachable.
+        """
+        bridge = self
+
+        class _GoalTransformClient:
+            def generate(self, prompt: str, *, temperature: float = 0.7) -> str:
+                if chat_backend == CHAT_BACKEND_LOCAL:
+                    return runner.client.generate(prompt, temperature=temperature)
+                if chat_backend == CHAT_BACKEND_CLOUD_POOL:
+                    chain = bridge._cloud_pool_chain()
+                    if pool_rotation is not None:
+                        chain = pool_rotation.rotate(chain)
+                    text, _provider, _model, _attempts = _walk_cloud_pool_chain(
+                        chain, prompt, temperature=temperature
+                    )
+                    if text is not None:
+                        return text
+                    logger.warning(
+                        "[goal-loop] llm_transform: cloud pool exhausted, falling back to local"
+                    )
+                    return runner.client.generate(prompt, temperature=temperature)
+                single_backend = {
+                    CHAT_BACKEND_GEMINI: (
+                        lambda: bridge._build_gemini_chat_client(bridge._gemini_primary_model())
+                    ),
+                    CHAT_BACKEND_CLOUD_MISTRAL: bridge._build_mistral_chat_client,
+                    CHAT_BACKEND_CLOUD_PICKLE: bridge._build_cloud_chat_client,
+                }.get(chat_backend)
+                if single_backend is not None:
+                    client = single_backend()
+                    if client is not None:
+                        try:
+                            return client.generate(prompt, temperature=temperature)
+                        except Exception:  # noqa: BLE001
+                            logger.warning(
+                                "[goal-loop] llm_transform: backend=%s failed, falling back to local",
+                                chat_backend,
+                                exc_info=True,
+                            )
+                return runner.client.generate(prompt, temperature=temperature)
+
+        return _GoalTransformClient()
+
+    def _grant_goal_search_extension(self, extra_queries: int) -> int:
+        runner = _WorkflowShimRunner(self.settings)
+        before = runner._tool_runner._current_search_limit()
+        granted_extra = runner._tool_runner.grant_search_extension(extra_queries)
+        after = runner._tool_runner._current_search_limit()
+        logger.info(
+            "[chat-goal-plan] granted search extension extra=%s granted_extra=%s limit=%s->%s",
+            extra_queries,
+            granted_extra,
+            before,
+            after,
+        )
+        return max(0, after - before)
+
+    def _goal_planner_client(self, chat_backend: str):
+        bridge = self
+
+        class _PlannerClient:
+            def __init__(self, backend: str) -> None:
+                self.backend = backend
+                self.last_metadata: ModelMetadata | None = None
+
+            def generate(self, prompt: str, *, temperature: float = 0.0) -> str:
+                text, metadata = bridge._generate_chat_tool_plan_with_chat_backend(
+                    self.backend,
+                    prompt,
+                )
+                self.last_metadata = metadata
+                return text
+
+        if chat_backend == CHAT_BACKEND_CLOUD_POOL:
+            provider_backend = {
+                LLM_PROVIDER_GEMINI: CHAT_BACKEND_GEMINI,
+                LLM_PROVIDER_MISTRAL: CHAT_BACKEND_CLOUD_MISTRAL,
+                LLM_PROVIDER_BIG_PICKLE: CHAT_BACKEND_CLOUD_PICKLE,
+                LLM_PROVIDER_LOCAL: CHAT_BACKEND_LOCAL,
+            }
+            return [
+                _PlannerClient(provider_backend[provider])
+                for provider in enabled_cloud_pool_providers(self.settings)
+                if provider in provider_backend
+            ]
+
+        return _PlannerClient(chat_backend)
+
+    @staticmethod
+    def _format_goal_loop_message(report) -> str:
+        parts = ["\n".join(report.narration).strip()]
+        if report.final_result:
+            parts.append(report.final_result.strip())
+        if report.continuation is not None:
+            parts.append(CommandBridge._format_goal_budget_status(report.continuation))
+        return "\n\n".join(part for part in parts if part)
+
+    @staticmethod
+    def _format_goal_budget_status(continuation: GoalLoopContinuation) -> str:
+        budget = continuation.state.budget or {}
+        bits = []
+        if "steps_used" in budget and "steps_limit" in budget:
+            bits.append(f"steps {budget.get('steps_used')}/{budget.get('steps_limit')}")
+        if "replans_used" in budget and "replans_limit" in budget:
+            bits.append(f"replans {budget.get('replans_used')}/{budget.get('replans_limit')}")
+        if "search_used" in budget and "search_limit" in budget:
+            search_text = f"search {budget.get('search_used')}/{budget.get('search_limit')}"
+            if budget.get("search_hard_limit"):
+                search_text += f"（今日硬上限 {budget.get('search_hard_limit')}）"
+            bits.append(search_text)
+        return (
+            "⏸ 已達執行上限\n"
+            f"目標：{continuation.state.goal}\n"
+            f"已完成：{len(continuation.state.completed)} 步；"
+            f"已重試 {len(continuation.state.attempted_fixes)} 次\n"
+            f"額度：{' · '.join(bits) if bits else 'n/a'}\n"
+            f"下一步（若繼續）：{continuation.state.next_action or '（無）'}"
+        )
+
+    @staticmethod
+    def _goal_web_actions(req: WebCommandRequest, report: GoalLoopReport) -> tuple[Action, ...]:
+        if report.continuation is None:
+            return ()
+        budget = report.continuation.state.budget or {}
+        search_used = int(budget.get("search_used") or 0)
+        search_hard_limit = int(budget.get("search_hard_limit") or 0)
+        if "search" in (report.continuation.state.stop_condition or ""):
+            actions = []
+            if not search_hard_limit or search_used < search_hard_limit:
+                actions.append(
+                    Action(
+                        label=f"繼續（再 {_GOAL_SEARCH_GRANT} 次搜尋）",
+                        command="chat",
+                        input=_GOAL_CONTINUE_SEARCH_INPUT,
+                    )
+                )
+            actions.append(Action(label="停止並總結", command="chat", input=_GOAL_STOP_INPUT))
+            return tuple(actions)
+        return (
+            Action(label=f"繼續（再 {_GOAL_STEP_GRANT} 步）", command="chat", input=_GOAL_CONTINUE_INPUT),
+            Action(label="停止並總結", command="chat", input=_GOAL_STOP_INPUT),
+        )
+
+    @staticmethod
+    def _stream_actions(response: WebCommandResponse) -> list[dict] | None:
+        if not response.actions:
+            return None
+        return [action.to_dict() for action in response.actions]
+
+    @staticmethod
+    def _goal_trace_saver(runner: _WorkflowShimRunner):
+        from .task_workspace import WorkflowStore
+
+        store = WorkflowStore(Path(runner.tools_dir).parent / "workflow_store")
+        return store.save_trace
+
     @staticmethod
     def _rank_local_by_web_mentions(
         local_candidates: list[dict], web_results: list
@@ -1161,18 +1956,24 @@ class CommandBridge:
         return "\n".join(lines)
 
     def _chat_tool_plan_system_prompt(self) -> str:
-        tools = [CHAT_TOOL_SEARCH]
+        tools = []
         tool_lines = [
-            "- /search：當回答需要即時、最新或你不確定的事實資訊時使用；query 是適合搜尋引擎的完整查詢。",
+            "- __goal__：當使用者其實是在描述一個多步驟目標、想建立流程或持續完成任務時使用；query 是精簡後的目標描述。",
         ]
-        for tool in (CHAT_TOOL_MUSIC, CHAT_TOOL_BLUETOOTH, CHAT_TOOL_IR):
+        for tool in (
+            CHAT_TOOL_SEARCH,
+            CHAT_TOOL_RESEARCH,
+            CHAT_TOOL_MUSIC,
+            CHAT_TOOL_MUSICQUEUE,
+            CHAT_TOOL_BLUETOOTH,
+            CHAT_TOOL_IR,
+        ):
             line = self._registered_chat_tool_prompt_line(tool)
             if not line:
                 continue
             tools.append(tool)
             tool_lines.append(line)
-        tool_choices = "|".join(t.split("/", 1)[-1] for t in tools)
-        tool_choices = "/" + "|/".join(tool_choices.split("|"))
+        tool_choices = "__goal__|" + "|".join(tools)
         return _CHAT_TOOL_PLAN_PROMPT_TEMPLATE.format(
             tool_lines="\n".join(tool_lines),
             tool_choices=tool_choices,
@@ -1208,6 +2009,19 @@ class CommandBridge:
             parts.append(f"query 只輸出 {command} 後面的參數")
         return "。".join(parts)
 
+    def _tool_display_name(self, command: str) -> str:
+        """Human-facing tool name from the command registry (single source of
+        truth on the RegisteredCommand row); falls back to the command token."""
+        try:
+            registered = self._handlers().get(command)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "tool display name: command registry unavailable for %s", command, exc_info=True
+            )
+            registered = None
+        name = str(getattr(registered, "chat_tool_display_name", "") or "").strip()
+        return name or command
+
     def _generate_local_chat_tool_plan(self, prompt: str) -> tuple[str, ModelMetadata]:
         from .dynamic_tools import OllamaTextClient
 
@@ -1230,7 +2044,11 @@ class CommandBridge:
         return text, metadata
 
     def _generate_chat_tool_plan_with_chat_backend(
-        self, chat_backend: str, prompt: str
+        self,
+        chat_backend: str,
+        prompt: str,
+        *,
+        pool_rotation: "CloudPoolRotation | None" = None,
     ) -> tuple[str, ModelMetadata]:
         if chat_backend == CHAT_BACKEND_LOCAL:
             return self._generate_local_chat_tool_plan(prompt)
@@ -1261,7 +2079,9 @@ class CommandBridge:
             )
             return text, metadata
         if chat_backend == CHAT_BACKEND_CLOUD_POOL:
-            return self._generate_cloud_pool_chat_tool_plan(prompt)
+            return self._generate_cloud_pool_chat_tool_plan(
+                prompt, pool_rotation=pool_rotation
+            )
         return self._generate_local_chat_tool_plan(prompt)
 
     def _generate_gemini_chat_tool_plan(self, prompt: str) -> tuple[str, ModelMetadata]:
@@ -1296,52 +2116,43 @@ class CommandBridge:
             )
         raise RuntimeError("Gemini planner unavailable")
 
-    def _generate_cloud_pool_chat_tool_plan(self, prompt: str) -> tuple[str, ModelMetadata]:
-        attempts: list[ModelAttempt] = []
+    def _generate_cloud_pool_chat_tool_plan(
+        self, prompt: str, *, pool_rotation: "CloudPoolRotation | None" = None
+    ) -> tuple[str, ModelMetadata]:
         chain = self._cloud_pool_chain()
-        for provider, model_name, build_fn, configured_fn in chain:
-            if not configured_fn():
-                attempts.append(ModelAttempt(
-                    provider, model_name, _MODEL_STATUS_NOT_CONFIGURED,
-                    f"{provider} not configured",
-                ))
-                continue
-            client = build_fn(model_name) if provider == "gemini" else build_fn()
-            if client is None:
-                attempts.append(ModelAttempt(
-                    provider, model_name, _MODEL_STATUS_NOT_CONFIGURED,
-                    f"{provider} unavailable",
-                ))
-                continue
-            try:
-                text = client.generate(prompt, temperature=0.2)
-            except _GeminiRequestError as exc:
-                attempts.append(ModelAttempt(provider, model_name, exc.status, str(exc)))
-                continue
-            except Exception as exc:
-                attempts.append(ModelAttempt(provider, model_name, _MODEL_STATUS_ERROR, str(exc)))
-                continue
-            attempts.append(ModelAttempt(provider, model_name, _MODEL_STATUS_OK))
-            fb = len(attempts) > 1
-            first_provider, first_model = self._cloud_pool_preview()
-            metadata = ModelMetadata(
-                requested_provider=first_provider,
-                requested_model=first_model,
-                attempted_models=tuple(attempts),
-                final_provider=provider,
-                final_model=model_name,
-                fallback_reason=None if not fb else f"Fell back from {attempts[0].provider}",
-                fallback_occurred=fb,
-                requested_tab=CHAT_BACKEND_CLOUD_POOL,
-            )
-            return text, metadata
-        raise RuntimeError("cloud-pool planner unavailable")
+        if pool_rotation is not None:
+            chain = pool_rotation.rotate(chain)
+        text, provider, model_name, attempts = _walk_cloud_pool_chain(
+            chain, prompt, temperature=0.2
+        )
+        if text is None:
+            raise RuntimeError("cloud-pool planner unavailable")
+        fb = len(attempts) > 1
+        first_provider, first_model = (
+            (chain[0][0], chain[0][1]) if chain else self._cloud_pool_preview()
+        )
+        metadata = ModelMetadata(
+            requested_provider=first_provider,
+            requested_model=first_model,
+            attempted_models=attempts,
+            final_provider=provider,
+            final_model=model_name,
+            fallback_reason=None if not fb else f"Fell back from {attempts[0].provider}",
+            fallback_occurred=fb,
+            requested_tab=CHAT_BACKEND_CLOUD_POOL,
+        )
+        return text, metadata
 
     def _run_chat_tool(self, req: WebCommandRequest, plan: ChatToolPlan) -> ChatToolResult:
         """Dispatch a trusted plan to the appropriate tool executor via the registry."""
         policy_map: dict[str, tuple[ChatToolPolicy, object]] = {
             CHAT_TOOL_SEARCH: (_SEARCH_TOOL_POLICY, self._exec_grounded_search),
+            CHAT_TOOL_RESEARCH: (_RESEARCH_TOOL_POLICY, self._exec_registered_command_chat_tool),
             CHAT_TOOL_MUSIC: (_MUSIC_TOOL_POLICY, self._exec_registered_command_chat_tool),
+            CHAT_TOOL_MUSICQUEUE: (
+                _MUSICQUEUE_TOOL_POLICY,
+                self._exec_registered_command_chat_tool,
+            ),
             CHAT_TOOL_BLUETOOTH: (
                 _BLUETOOTH_TOOL_POLICY,
                 self._exec_registered_command_chat_tool,
@@ -1352,6 +2163,9 @@ class CommandBridge:
         if entry is None:
             raise ValueError(f"unknown chat tool: {plan.tool!r}")
         policy, executor = entry
+        display_name = self._tool_display_name(plan.tool)
+        if display_name != plan.tool:
+            policy = dataclasses.replace(policy, display_name=display_name)
         tool_req = make_chat_tool_request(
             tool=plan.tool,
             raw_query=plan.query,
@@ -1372,40 +2186,78 @@ class CommandBridge:
         If the client disconnects (GeneratorExit) before the worker finishes,
         the completed result is pushed into server-side session memory so it
         appears automatically when the user reconnects."""
-        yield stream_delta(_tool_calling_notice(plan.tool))
+        yield stream_delta(_tool_calling_notice(plan.tool, self._tool_display_name(plan.tool)))
         result: dict[str, object] = {}
         done = threading.Event()
         abandoned = threading.Event()
+        narration_queue: queue.Queue[str] = queue.Queue()
 
         def _worker() -> None:
             try:
                 tool_result: ChatToolResult = self._run_chat_tool(req, plan)
-                result["text"] = tool_result.answer
-                result["model_metadata"] = tool_result.model_metadata
                 logger.info(
                     "[chat-tool] tool=%s sources=%d summary=%r",
                     plan.tool, tool_result.source_count, tool_result.result_summary,
                 )
+                upgraded = self._maybe_upgrade_tool_result_to_goal_loop(
+                    req,
+                    plan,
+                    tool_result,
+                    planner_metadata=None,
+                    narrator=narration_queue.put,
+                )
+                if upgraded is not None:
+                    result["response"] = upgraded
+                    return
+                result["text"] = tool_result.answer
+                result["model_metadata"] = tool_result.model_metadata
             except Exception as exc:  # noqa: BLE001
                 logger.exception("chat tool failed tool=%s", plan.tool)
                 result["error"] = str(exc)
             finally:
                 done.set()
-                if abandoned.is_set() and "text" in result:
-                    try:
-                        self._push_orphaned_result(str(result["text"]))
-                    except Exception:  # noqa: BLE001
-                        logger.exception("command bridge: failed to push orphaned tool result")
+                if abandoned.is_set():
+                    orphan = result.get("text")
+                    response = result.get("response")
+                    if orphan is None and isinstance(response, WebCommandResponse):
+                        orphan = response.message
+                    if orphan is not None:
+                        try:
+                            self._push_orphaned_result(str(orphan))
+                        except Exception:  # noqa: BLE001
+                            logger.exception("command bridge: failed to push orphaned tool result")
 
         threading.Thread(target=_worker, daemon=True).start()
+        # Drain goal-loop narration live (an unsatisfied tool result upgrades
+        # to a goal loop mid-worker); heartbeat only while nothing arrives.
+        last_beat = time.time()
         try:
-            while not done.wait(timeout=_HEARTBEAT_SECONDS):
-                yield stream_heartbeat()
+            while not done.is_set() or not narration_queue.empty():
+                try:
+                    line = narration_queue.get(timeout=0.5)
+                except queue.Empty:
+                    if time.time() - last_beat >= _HEARTBEAT_SECONDS:
+                        yield stream_heartbeat()
+                        last_beat = time.time()
+                    continue
+                yield stream_delta(f"{line}\n")
+                last_beat = time.time()
         except GeneratorExit:
             abandoned.set()
             raise
         if "error" in result:
             yield stream_error(f"工具執行失敗：{result['error']}")
+            return
+        response = result.get("response")
+        if isinstance(response, WebCommandResponse):
+            if response.status == STATUS_ERROR:
+                yield stream_error(response.message)
+                return
+            yield stream_done(
+                response.message,
+                model_metadata=response.model_metadata,
+                actions=self._stream_actions(response),
+            )
             return
         metadata = result.get("model_metadata")
         yield stream_done(
@@ -1495,11 +2347,22 @@ class CommandBridge:
         query = tool_req.query
         runner_map = {
             CHAT_TOOL_MUSIC: ("CommandBridge.run_music_command", self.run_music_command),
+            CHAT_TOOL_MUSICQUEUE: (
+                "CommandBridge.run_musicqueue_command",
+                self.run_musicqueue_command,
+            ),
             CHAT_TOOL_BLUETOOTH: (
                 "CommandBridge.run_bluetooth_command",
                 self.run_bluetooth_command,
             ),
             CHAT_TOOL_IR: ("CommandBridge.run_ir_command", self.run_ir_command),
+            CHAT_TOOL_RESEARCH: (
+                "CommandBridge._run_command(/research)",
+                lambda text: {
+                    "status": STATUS_OK,
+                    "message": self._run_command("/research", text),
+                },
+            ),
         }
         entry = runner_map.get(tool_req.tool)
         if entry is None:
@@ -1517,6 +2380,147 @@ class CommandBridge:
             source_count=0,
             result_summary=f"query={query!r} status={status}",
         )
+
+    def _maybe_upgrade_tool_result_to_goal_loop(
+        self,
+        req: WebCommandRequest,
+        plan: ChatToolPlan,
+        tool_result: ChatToolResult,
+        *,
+        planner_metadata: ModelMetadata | None,
+        narrator: Callable[[str], None] | None = None,
+    ) -> WebCommandResponse | None:
+        user_input = (req.input or "").strip()
+        if not user_input:
+            return None
+        try:
+            satisfied = self._chat_tool_result_satisfies_intent(req, plan, tool_result)
+        except Exception:  # noqa: BLE001
+            logger.exception("chat tool satisfaction check failed tool=%s", plan.tool)
+            return None
+        if satisfied:
+            return None
+        logger.info("[chat-tool] tool=%s unsatisfied -> goal loop", plan.tool)
+        if narrator is not None:
+            try:
+                narrator("直接指令沒有完成，我改規劃成多步驟流程並直接執行：")
+            except Exception:  # noqa: BLE001
+                logger.exception("chat tool upgrade narrator failed")
+        response = self._run_goal_loop_blocking(
+            req, user_input, planner_metadata=planner_metadata, narrator=narrator
+        )
+        if response.status == STATUS_ERROR:
+            logger.warning("goal loop upgrade failed after unsatisfied tool tool=%s", plan.tool)
+            return None
+        return WebCommandResponse(
+            status=response.status,
+            message=(
+                "直接指令沒有完成，我改規劃成多步驟流程並直接執行：\n\n"
+                f"{response.message}"
+            ),
+            mode=response.mode,
+            model_metadata=response.model_metadata,
+            actions=response.actions,
+        )
+
+    def _goal_result_judge(
+        self,
+        chat_backend: str,
+        *,
+        pool_rotation: "CloudPoolRotation | None" = None,
+    ) -> Callable[[str, str], tuple[bool, str]]:
+        """LLM judge for GoalLoop: does the workflow's final result actually
+        achieve the goal? Reuses the chat-tool satisfaction backend chain
+        (chosen backend → local fallback)."""
+
+        def judge(goal: str, final_result: str) -> tuple[bool, str]:
+            prompt = _GOAL_RESULT_SATISFACTION_PROMPT.format(
+                goal=json.dumps(goal, ensure_ascii=False),
+                final_result=json.dumps(final_result.strip(), ensure_ascii=False),
+            )
+            raw = self._generate_chat_tool_satisfaction_text(
+                chat_backend, prompt, pool_rotation=pool_rotation
+            ).strip()
+            parsed = self._parse_chat_tool_satisfaction(raw)
+            logger.info(
+                "[goal-loop] result judge satisfied=%s reason=%r",
+                parsed.get("satisfied"),
+                parsed.get("reason"),
+            )
+            return bool(parsed.get("satisfied")), str(parsed.get("reason") or "")
+
+        return judge
+
+    def _chat_tool_result_satisfies_intent(
+        self,
+        req: WebCommandRequest,
+        plan: ChatToolPlan,
+        tool_result: ChatToolResult,
+    ) -> bool:
+        prompt = _CHAT_TOOL_SATISFACTION_PROMPT.format(
+            user_input=json.dumps((req.input or "").strip(), ensure_ascii=False),
+            tool_name=json.dumps(plan.tool, ensure_ascii=False),
+            tool_query=json.dumps(plan.query, ensure_ascii=False),
+            tool_answer=json.dumps(tool_result.answer.strip(), ensure_ascii=False),
+        )
+        raw = self._generate_chat_tool_satisfaction_text(req.chat_backend, prompt).strip()
+        parsed = self._parse_chat_tool_satisfaction(raw)
+        logger.info(
+            "[chat-tool] satisfaction tool=%s satisfied=%s reason=%r",
+            plan.tool,
+            parsed.get("satisfied"),
+            parsed.get("reason"),
+        )
+        return bool(parsed.get("satisfied"))
+
+    def _generate_chat_tool_satisfaction_text(
+        self,
+        chat_backend: str,
+        prompt: str,
+        *,
+        pool_rotation: "CloudPoolRotation | None" = None,
+    ) -> str:
+        backends = [chat_backend]
+        if chat_backend != CHAT_BACKEND_LOCAL:
+            backends.append(CHAT_BACKEND_LOCAL)
+        last_exc: Exception | None = None
+        for backend in backends:
+            try:
+                text, _metadata = self._generate_chat_tool_plan_with_chat_backend(
+                    backend, prompt, pool_rotation=pool_rotation
+                )
+                logger.info("[chat-tool] satisfaction backend=%s ok", backend)
+                return text
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[chat-tool] satisfaction backend=%s failed: %s",
+                    backend,
+                    exc,
+                )
+                last_exc = exc
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("no available backend for chat tool satisfaction check")
+
+    @staticmethod
+    def _parse_chat_tool_satisfaction(raw: str) -> dict[str, object]:
+        text = (raw or "").strip()
+        if not text:
+            raise ValueError("empty chat tool satisfaction response")
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", text, re.DOTALL)
+            if not match:
+                raise
+            data = json.loads(match.group(0))
+        if not isinstance(data, dict):
+            raise ValueError("chat tool satisfaction response must be a JSON object")
+        satisfied = data.get("satisfied")
+        if not isinstance(satisfied, bool):
+            raise ValueError("chat tool satisfaction response missing boolean satisfied")
+        reason = str(data.get("reason", "")).strip()
+        return {"satisfied": satisfied, "reason": reason}
 
     @staticmethod
     def _format_search_source_pack(results, policy: ChatToolPolicy) -> str:
@@ -1786,6 +2790,16 @@ class CommandBridge:
             "actions": self._markup_to_actions(markup),
         }
 
+    def run_musicqueue_command(self, text: str) -> dict:
+        """Run the ``/musicqueue`` handler (ordered multi-song play-once queue)
+        — the same registered handler the Telegram bot uses."""
+        message, markup = self._run_command_raw("/musicqueue", (text or "").strip())
+        return {
+            "status": STATUS_OK,
+            "message": message,
+            "actions": self._markup_to_actions(markup),
+        }
+
     def run_music_action(self, callback_data: str) -> dict:
         """Re-invoke a music callback button for the web 生活 mode. Handles the
         ``music:`` family (browse / play / favorite / volume) plus the generic
@@ -1858,7 +2872,7 @@ class CommandBridge:
                     )
         return self._workflow_handler, self._workflow_editor  # type: ignore[return-value]
 
-    def run_workflow_command(self, text: str) -> dict:
+    def run_workflow_command(self, text: str, *, chat_backend: str | None = None) -> dict:
         """Run the ``/workflow`` handler for the web console. ``text`` is the
         remainder after the command (e.g. ``create 先查天氣再念出來…``); a
         natural-language ``create`` drafts a workflow via the cloud-preferred LLM
@@ -1893,6 +2907,12 @@ class CommandBridge:
         remainder = raw
         if remainder.startswith("/workflow"):
             remainder = remainder[len("/workflow"):].strip()
+        create_arg = self._workflow_create_arg(remainder)
+        if chat_backend and create_arg is not None and not create_arg.lstrip().startswith("{"):
+            return self._run_workflow_create_with_chat_backend(
+                create_arg,
+                chat_backend=chat_backend,
+            )
         try:
             result = handler(remainder, _WF_WEB_CHAT_ID)
         except Exception as exc:  # noqa: BLE001
@@ -1908,6 +2928,115 @@ class CommandBridge:
             "message": str(message) if message is not None else "",
             "actions": self._markup_to_actions(markup),
         }
+
+    @staticmethod
+    def _workflow_create_arg(remainder: str) -> str | None:
+        parts = (remainder or "").strip().split(maxsplit=1)
+        if not parts or parts[0].lower() != "create":
+            return None
+        return parts[1].strip() if len(parts) > 1 else ""
+
+    def _run_workflow_create_with_chat_backend(
+        self,
+        description: str,
+        *,
+        chat_backend: str | None,
+    ) -> dict:
+        if not description.strip():
+            handler, _editor = self._workflow_surface()
+            result = handler("create", _WF_WEB_CHAT_ID)
+            if isinstance(result, tuple):
+                message = result[0]
+                markup = result[1] if len(result) > 1 else None
+            else:
+                message, markup = result, None
+            return {
+                "status": STATUS_OK,
+                "message": str(message) if message is not None else "",
+                "actions": self._markup_to_actions(markup),
+            }
+
+        _handler, editor = self._workflow_surface()
+        backend = (chat_backend or default_chat_backend(self.settings) or CHAT_BACKEND_LOCAL).strip().lower()
+        if backend not in {
+            CHAT_BACKEND_LOCAL,
+            CHAT_BACKEND_GEMINI,
+            CHAT_BACKEND_CLOUD_MISTRAL,
+            CHAT_BACKEND_CLOUD_PICKLE,
+            CHAT_BACKEND_CLOUD_POOL,
+        }:
+            backend = default_chat_backend(self.settings)
+        if not chat_backend_enabled(self.settings, backend):
+            return {
+                "status": STATUS_ERROR,
+                "message": self._chat_backend_disabled_message(backend),
+                "actions": [],
+            }
+
+        runner = _WorkflowShimRunner(self.settings)
+        planner = self._build_goal_planner(backend, runner)
+        workflow, err, used_fallback = planner.draft(description.strip())
+        if workflow is None:
+            return {
+                "status": STATUS_ERROR,
+                "message": f"❌ 無法生成草稿：{err}\n可改用 /workflow new 手動建立。",
+                "actions": [],
+            }
+        text, markup = editor.start_from_draft(_WF_WEB_CHAT_ID, workflow)
+        prefix = self._workflow_draft_model_prefix(
+            backend,
+            used_fallback=used_fallback,
+            metadata=self._goal_planner_metadata(planner),
+        )
+        if err:
+            text = "⚠️ 草稿已開啟，但仍有待修正：\n" f"{err}\n\n{text}"
+        if prefix:
+            text = prefix + text
+        return {
+            "status": STATUS_OK,
+            "message": str(text) if text is not None else "",
+            "actions": self._markup_to_actions(markup),
+        }
+
+    @staticmethod
+    def _goal_planner_metadata(planner: GoalPlanner) -> ModelMetadata | None:
+        llm_client = getattr(planner, "llm_client", None)
+        clients = llm_client if isinstance(llm_client, list) else [llm_client]
+        for client in clients:
+            metadata = getattr(client, "last_metadata", None)
+            if metadata is not None:
+                return metadata
+        return None
+
+    def _workflow_draft_model_prefix(
+        self,
+        chat_backend: str,
+        *,
+        used_fallback: bool,
+        metadata: ModelMetadata | None,
+    ) -> str:
+        requested_provider, requested_model = self._requested_model_for_backend(chat_backend)
+        final_provider = metadata.final_provider if metadata is not None else requested_provider
+        final_model = metadata.final_model if metadata is not None else requested_model
+        provider_label = {
+            "gemini": "Gemini",
+            "mistral": "Mistral",
+            "opencode": "OpenCode",
+            "local": "本地模型",
+        }.get(final_provider, final_provider)
+        requested_label = {
+            "gemini": "Gemini",
+            "mistral": "Mistral",
+            "opencode": "OpenCode",
+            "local": "本地模型",
+        }.get(requested_provider, requested_provider)
+        if used_fallback or (metadata is not None and metadata.fallback_reason):
+            return (
+                f"⚠️ 已從 {requested_label}（{requested_model}）改用 "
+                f"{provider_label}（{final_model}）生成草稿。"
+                f"{'原因：' + metadata.fallback_reason if metadata and metadata.fallback_reason else ''}\n\n"
+            )
+        return f"🤖 已使用 {provider_label}（{final_model}）生成草稿。\n\n"
 
     def run_workflow_action(self, callback_data: str) -> dict:
         """Re-invoke a ``wfe:`` workflow-editor button for the web console
@@ -2745,41 +3874,23 @@ class CommandBridge:
         return "local", self._local_model()
 
     def _handle_cloud_pool_blocking(
-        self, prompt: str
+        self, prompt: str, *, pool_rotation: "CloudPoolRotation | None" = None
     ) -> tuple[str, ModelMetadata]:
         """Try Gemini → Mistral → Big Pickle → local; return (text, metadata)."""
-        attempts: list[ModelAttempt] = []
-
-        for provider, model_name, build_fn, configured_fn in self._cloud_pool_chain():
-            if not configured_fn():
-                attempts.append(ModelAttempt(
-                    provider, model_name, _MODEL_STATUS_NOT_CONFIGURED,
-                    f"{provider} not configured",
-                ))
-                continue
-            client = build_fn(model_name) if provider == "gemini" else build_fn()
-            if client is None:
-                attempts.append(ModelAttempt(
-                    provider, model_name, _MODEL_STATUS_NOT_CONFIGURED,
-                    f"{provider} unavailable",
-                ))
-                continue
-            try:
-                text = client.generate(prompt, temperature=0.7)
-            except _GeminiRequestError as exc:
-                attempts.append(ModelAttempt(provider, model_name, exc.status, str(exc)))
-                continue
-            except Exception as exc:
-                attempts.append(ModelAttempt(provider, model_name, _MODEL_STATUS_ERROR, str(exc)))
-                continue
-            attempts.append(ModelAttempt(provider, model_name, _MODEL_STATUS_OK))
+        chain = self._cloud_pool_chain()
+        rotated = pool_rotation.rotate(chain) if pool_rotation is not None else chain
+        text, provider, model_name, attempts = _walk_cloud_pool_chain(
+            rotated, prompt, temperature=0.7
+        )
+        if text is not None:
             fb = len(attempts) > 1
-            first_provider = self._cloud_pool_chain()[0][0]
-            first_model = self._cloud_pool_chain()[0][1]
+            first_provider, first_model = (
+                (rotated[0][0], rotated[0][1]) if rotated else self._cloud_pool_preview()
+            )
             return text, ModelMetadata(
                 requested_provider=first_provider,
                 requested_model=first_model,
-                attempted_models=tuple(attempts),
+                attempted_models=attempts,
                 final_provider=provider,
                 final_model=model_name,
                 fallback_reason=None if not fb else f"Fell back from {attempts[0].provider}",
@@ -2789,13 +3900,13 @@ class CommandBridge:
 
         if provider_enabled(self.settings, LLM_PROVIDER_LOCAL):
             local_model = self._local_model()
-            text = self._ollama_generate_blocking(prompt)
-            attempts.append(ModelAttempt("local", local_model, _MODEL_STATUS_OK))
+            local_text = self._ollama_generate_blocking(prompt)
+            attempts = attempts + (ModelAttempt("local", local_model, _MODEL_STATUS_OK),)
             first_provider, first_model = self._cloud_pool_preview()
-            return text, ModelMetadata(
+            return local_text, ModelMetadata(
                 requested_provider=first_provider,
                 requested_model=first_model,
-                attempted_models=tuple(attempts),
+                attempted_models=attempts,
                 final_provider="local",
                 final_model=local_model,
                 fallback_reason="All cloud providers unavailable",

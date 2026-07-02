@@ -20,6 +20,7 @@ from openclaw_adapter.dynamic_tools import (
     DynamicToolResult,
     DynamicToolRunner,
     ReusePlan,
+    SearchGroundingBudgetExhausted,
     MistralTextClient,
     OllamaTextClient,
     OpenCodeCliTextClient,
@@ -172,12 +173,13 @@ class FakeClient:
         return self._meta + "===CODE===\n" + self._code.pop(0)
 
 
-def _make_runner(tmp_path: Path, client: FakeClient, db=None) -> DynamicToolRunner:
+def _make_runner(tmp_path: Path, client: FakeClient, db=None, **kwargs) -> DynamicToolRunner:
     runner = DynamicToolRunner(
         client=client,
         tools_dir=tmp_path / "generated_tools",
         knowledge_db=db,
         exec_timeout_seconds=30,
+        **kwargs,
     )
     # Use the test interpreter directly — skip building a real venv.
     runner._ensure_venv = lambda: Path(sys.executable)  # type: ignore[assignment]
@@ -1069,7 +1071,7 @@ def test_search_grounding_budget_exhausted_skips(tmp_path):
     state_path = tmp_path / "generated_tools" / "search_state.json"
     state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text(json.dumps({
-        "date": date.today().isoformat(), "count": 4, "cache": {}}), encoding="utf-8")
+        "date": date.today().isoformat(), "count": 10, "cache": {}}), encoding="utf-8")
     client = FakeClient(code_responses=[GOOD_SCRIPT],
                         needs_search_response="YES（缺現行政策金利）")
     runner = _make_runner(tmp_path, client)
@@ -1080,7 +1082,91 @@ def test_search_grounding_budget_exhausted_skips(tmp_path):
     assert searched == []
     assert client.calls["searchq"] == 0
     assert "參考資料" not in client.code_prompts[0]
-    assert json.loads(state_path.read_text(encoding="utf-8"))["count"] == 4
+    assert json.loads(state_path.read_text(encoding="utf-8"))["count"] == 10
+
+
+def test_search_grounding_budget_state_clamps_and_resets_daily(tmp_path):
+    state_path = tmp_path / "generated_tools" / "search_state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps({
+        "date": "1999-12-31",
+        "count": "999",
+        "granted_extra": "bad",
+        "cache": ["nope"],
+    }), encoding="utf-8")
+    runner = _make_runner(tmp_path, FakeClient(code_responses=[]))
+    state = runner._load_search_state()
+    assert state == {
+        "date": date.today().isoformat(),
+        "count": 0,
+        "granted_extra": 0,
+        "cache": {},
+    }
+
+
+def test_search_grounding_budget_uses_granted_extra_until_hard_cap(tmp_path):
+    request = "需要新知識的需求"
+    state_path = tmp_path / "generated_tools" / "search_state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps({
+        "date": date.today().isoformat(),
+        "count": 11,
+        "granted_extra": 2,
+        "cache": {},
+    }), encoding="utf-8")
+    client = FakeClient(
+        code_responses=[GOOD_SCRIPT],
+        needs_search_response="YES（缺現行政策金利）",
+        searchq_response="日銀 政策金利 現在",
+    )
+    runner = _make_runner(
+        tmp_path,
+        client,
+        search_daily_soft_cap=10,
+        search_daily_hard_cap=12,
+    )
+    searched: list[tuple[str, int]] = []
+    runner.search_fn = lambda q, n: searched.append((q, n)) or []
+    result = runner._search_ground(request)
+    assert result.query_burned is True
+    assert result.budget_exhausted is None
+    assert searched == [("日銀 政策金利 現在", 4)]
+    assert json.loads(state_path.read_text(encoding="utf-8"))["count"] == 12
+
+    exhausted = runner._search_ground("第二次應該超額")
+    assert exhausted.block is None
+    assert exhausted.query_burned is False
+    assert isinstance(exhausted.budget_exhausted, SearchGroundingBudgetExhausted)
+    assert exhausted.budget_exhausted.effective_limit == 12
+    assert exhausted.budget_exhausted.soft_cap == 10
+    assert exhausted.budget_exhausted.hard_cap == 12
+    assert exhausted.budget_exhausted.granted_extra == 2
+    assert searched == [("日銀 政策金利 現在", 4)]
+
+
+def test_grant_search_extension_clamps_to_hard_cap_and_resets_by_day(tmp_path):
+    runner = _make_runner(
+        tmp_path,
+        FakeClient(code_responses=[]),
+        search_daily_soft_cap=10,
+        search_daily_hard_cap=12,
+    )
+    assert runner.grant_search_extension(1) == 1
+    assert runner.grant_search_extension(99) == 2
+    state_path = tmp_path / "generated_tools" / "search_state.json"
+    assert json.loads(state_path.read_text(encoding="utf-8"))["granted_extra"] == 2
+
+    state_path.write_text(json.dumps({
+        "date": "1999-12-31",
+        "count": 7,
+        "granted_extra": 2,
+        "cache": {},
+    }), encoding="utf-8")
+    assert runner.grant_search_extension(1) == 1
+    reset_state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert reset_state["date"] == date.today().isoformat()
+    assert reset_state["count"] == 0
+    assert reset_state["granted_extra"] == 1
 
 
 def test_search_grounding_failure_fails_open_but_burns_budget(tmp_path):

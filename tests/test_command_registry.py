@@ -7,7 +7,17 @@ No network, no Ollama, no Telegram — just the registry construction."""
 from __future__ import annotations
 
 from assistant_runtime import AssistantSettings
-from openclaw_adapter.telegram_bot import _build_registries
+from openclaw_adapter.goal_planner import build_goal_workflow_prompt
+from openclaw_adapter.task_workspace import COMMAND_SINK_DENYLIST
+from openclaw_adapter.telegram_bot import (
+    PHOTO_SCAN_COMMANDS,
+    PRICE_LOOKUP_COMMANDS,
+    REPUTATION_SNAPSHOT_COMMANDS,
+    TREND_BOARD_COMMANDS,
+    _build_openclaw_help_text,
+    _build_registries,
+)
+from openclaw_adapter.workflow_command import command_metadata
 from price_monitor_bot.bot import RegisteredCommand
 
 
@@ -29,7 +39,7 @@ def test_command_registry_has_expected_keys(tmp_path):
         "/quiz",
         "/quizlikesong",
         "/voice",
-        "/say",
+        "/generateaudio",
         "/new",
         "/backupclaw",
         "/backup",
@@ -53,9 +63,98 @@ def test_command_registry_has_expected_keys(tmp_path):
         "/musicmute",
         "/musiclouder",
         "/musiclower",
+        "/lookup",
+        "/price",
+        "/trend",
+        "/trending",
+        "/hot",
+        "/heat",
+        "/liquidity",
+        "/snapshot",
+        "/proof",
+        "/repcheck",
+        "/reputation",
+        "/search",
+        "/web",
+        "/fetch",
+        "/read",
+        "/watch",
+        "/watchlist",
+        "/watches",
+        "/unwatch",
+        "/stopwatch",
+        "/setprice",
+        "/updatewatch",
+        "/scan",
+        "/image",
+        "/photo",
     }
     assert expected <= set(command_handlers)
     assert all(isinstance(v, RegisteredCommand) for v in command_handlers.values())
+
+
+def test_price_monitor_base_command_sets_are_registered(tmp_path):
+    command_handlers, _, _, _ = _registries(tmp_path)
+    base_commands = (
+        PRICE_LOOKUP_COMMANDS
+        | TREND_BOARD_COMMANDS
+        | PHOTO_SCAN_COMMANDS
+        | REPUTATION_SNAPSHOT_COMMANDS
+        | {
+            "/search",
+            "/research",
+            "/web",
+            "/fetch",
+            "/read",
+            "/watch",
+            "/watchlist",
+            "/watches",
+            "/unwatch",
+            "/stopwatch",
+            "/setprice",
+            "/updatewatch",
+        }
+    )
+    assert base_commands <= set(command_handlers)
+
+
+def test_registered_commands_all_share_metadata_usage(tmp_path):
+    command_handlers, _, _, _ = _registries(tmp_path)
+    assert [c for c in sorted(command_handlers) if not command_metadata(c)] == []
+    assert [c for c in sorted(command_handlers) if not command_handlers[c].usage] == []
+
+
+def test_workflow_prompt_uses_registry_and_filters_text_unsafe_commands(tmp_path):
+    command_handlers, _, _, _ = _registries(tmp_path)
+    prompt = build_goal_workflow_prompt(
+        "播放米津玄師的熱門歌曲",
+        catalog=None,
+        command_registry=command_handlers,
+    )
+    assert "/search" in prompt
+    assert "/fetch" in prompt
+    assert "/research" in prompt
+    assert "商品能不能買" in prompt
+    assert "Mercari" in prompt
+    assert "/musiclistall" in prompt
+    assert "/music" in prompt
+    assert "/scan" not in prompt
+    assert PHOTO_SCAN_COMMANDS <= COMMAND_SINK_DENYLIST
+
+
+def test_help_text_is_generated_from_registered_command_usage(tmp_path):
+    command_handlers, _, _, _ = _registries(tmp_path)
+    help_reply = _build_openclaw_help_text(command_handlers)
+    assert "/search" in help_reply
+    assert "/fetch https://example.com 這篇文章的重點是什麼" in help_reply
+    assert "/read — 同 /fetch" in help_reply
+    assert "/research" in help_reply
+    assert "投資判斷" in help_reply
+    assert "Mercari" in help_reply
+    assert "/generateaudio こんにちは" in help_reply
+    assert "/generateaudio — 產生音訊檔案" in help_reply
+    assert "/price pokemon | Pikachu ex | 132/106 | SAR | sv08" in help_reply
+    assert "/scan pokemon" in help_reply
 
 
 def test_callback_registry_has_expected_keys(tmp_path):

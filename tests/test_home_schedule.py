@@ -96,7 +96,7 @@ def test_run_schedule_commands_runs_in_order(store):
 
 
 def test_run_schedule_commands_threads_chat_id(store):
-    entry = store.add(time="07:00", days=["mon"], commands=["/say hi"])
+    entry = store.add(time="07:00", days=["mon"], commands=["/generateaudio hi"])
     seen: list[str] = []
 
     def run(cmd: str, chat_id: str) -> str:
@@ -128,12 +128,12 @@ def _fake_handlers(seen_chat: list | None = None):
         return f"music:{remainder}"
 
     def say(remainder, chat_id):
-        # Mirrors the real /say: delivers audio out-of-band, returns None.
+        # Mirrors the real /generateaudio: sends a generated audio file out-of-band, returns None.
         return None
 
     return {
         "/music": SimpleNamespace(handler=music),
-        "/say": SimpleNamespace(handler=say),
+        "/generateaudio": SimpleNamespace(handler=say),
     }
 
 
@@ -150,9 +150,9 @@ def test_make_run_slash_command_passes_chat_id():
 
 
 def test_make_run_slash_command_none_result_becomes_done_marker():
-    # /say returns None on success (audio sent out-of-band) → no "None" leak.
+    # /generateaudio returns None on success (audio file sent out-of-band) → no "None" leak.
     run = hs.make_run_slash_command(_fake_handlers())
-    assert run("/say 早安", "chat1") == "/say 完成"
+    assert run("/generateaudio 早安", "chat1") == "/generateaudio 完成"
 
 
 def test_make_run_slash_command_unknown_and_non_slash():
@@ -438,14 +438,14 @@ def test_callback_edit_seeds_recurrence_from_existing_days(store):
 
 
 def test_callback_edit_updates_in_place_keeps_commands(store):
-    store.add(label="x", time="08:30", days=["mon"], commands=["/music a", "/say hi"])
+    store.add(label="x", time="08:30", days=["mon"], commands=["/music a", "/generateaudio hi"])
     cb = hc.build_schedulehome_callback_handler(store, lambda c, cid: "ok")
     cb("edittime:sch_001", "", "chat1")
     toast, text, markup = cb("r:09:15:1111100:ok", "", "chat1")
     assert toast == "已更新排程"
     entry = store.get("sch_001")
     assert entry["schedule"] == {"time": "09:15", "days": hs.WEEKDAY_KEYS}
-    assert entry["commands"] == ["/music a", "/say hi"]  # commands untouched
+    assert entry["commands"] == ["/music a", "/generateaudio hi"]  # commands untouched
     assert store.edit_target("chat1") is None  # edit session ended
     assert store.capture_target("chat1") is None  # not put into capture mode
     # No new schedule was created.

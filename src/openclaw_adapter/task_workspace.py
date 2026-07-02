@@ -39,6 +39,9 @@ COMMAND_SINK_DENYLIST: frozenset[str] = frozenset({
     "/backupclaw", "/backup", "/clawrecover", "/recoverclaw",
     # meta / recursive scheduling
     "/schedulehome", "/workflow",
+    # image-only commands are registered for Telegram dispatch but cannot run as
+    # text-only workflow sinks.
+    "/scan", "/image", "/photo",
     # monitoring config mutations (SNS write-side)
     "/snsadd", "/sns_add", "/snsdelete", "/sns_delete", "/snsclearfilter",
     # shell-like commands if ever registered
@@ -69,12 +72,43 @@ VARIABLE_TYPE_COMMAND_RESULT = "command_result"
 # raw command-result objects (e.g. JSON) to a voice synthesiser.
 COMMAND_SINK_INPUT_TYPES: dict[str, frozenset[str] | None] = {
     "/saynow": frozenset({VARIABLE_TYPE_PLAIN_TEXT, VARIABLE_TYPE_SPEECH_TEXT}),
-    "/say":    frozenset({VARIABLE_TYPE_PLAIN_TEXT, VARIABLE_TYPE_SPEECH_TEXT}),
+    "/generateaudio":    frozenset({VARIABLE_TYPE_PLAIN_TEXT, VARIABLE_TYPE_SPEECH_TEXT}),
 }
 
 # Maps slash-command string to a callable that takes the input text and returns
 # the result string. Callers inject this into WorkflowRunner.
 CommandDispatcher = dict[str, Callable[[str], str]]
+
+
+@dataclass(frozen=True)
+class WorkflowBudgetExhausted:
+    kind: str
+    used: int
+    limit: int
+    hard_limit: int | None = None
+    granted_extra: int = 0
+
+    def to_dict(self) -> dict:
+        out = {
+            "kind": self.kind,
+            "used": self.used,
+            "limit": self.limit,
+            "granted_extra": self.granted_extra,
+        }
+        if self.hard_limit is not None:
+            out["hard_limit"] = self.hard_limit
+        return out
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "WorkflowBudgetExhausted":
+        hard_limit = data.get("hard_limit")
+        return cls(
+            kind=str(data.get("kind") or ""),
+            used=int(data.get("used") or 0),
+            limit=int(data.get("limit") or 0),
+            hard_limit=int(hard_limit) if hard_limit is not None else None,
+            granted_extra=int(data.get("granted_extra") or 0),
+        )
 
 
 def _command_sink_failure_reason(command: str | None, result_text: str) -> str | None:
@@ -289,6 +323,7 @@ class StepTrace:
     output_var: str | None = None
     error: str | None = None
     provenance: str | None = None
+    budget_exhausted: WorkflowBudgetExhausted | None = None
 
     def to_dict(self) -> dict:
         d: dict = {
@@ -302,6 +337,8 @@ class StepTrace:
             d["error"] = self.error
         if self.provenance is not None:
             d["provenance"] = self.provenance
+        if self.budget_exhausted is not None:
+            d["budget_exhausted"] = self.budget_exhausted.to_dict()
         return d
 
 
@@ -311,10 +348,12 @@ class WorkflowTrace:
     goal: str
     variables: dict[str, Variable] = field(default_factory=dict)
     steps: list[StepTrace] = field(default_factory=list)
+    narration: list[str] = field(default_factory=list)
     final_result: str | None = None
     # Set when the workflow fails structural validation before any step runs.
     # An empty step list alone does not mean failure; this field makes it explicit.
     validation_error: str | None = None
+    budget_exhausted: WorkflowBudgetExhausted | None = None
 
     @property
     def ok(self) -> bool:
@@ -338,10 +377,13 @@ class WorkflowTrace:
                 for k, v in self.variables.items()
             },
             "steps": [s.to_dict() for s in self.steps],
+            "narration": list(self.narration),
             "final_result": self.final_result,
         }
         if self.validation_error is not None:
             d["validation_error"] = self.validation_error
+        if self.budget_exhausted is not None:
+            d["budget_exhausted"] = self.budget_exhausted.to_dict()
         return d
 
     @classmethod
@@ -358,6 +400,11 @@ class WorkflowTrace:
                 step_id=s["step_id"], kind=s["kind"], status=s["status"],
                 output_var=s.get("output_var"), error=s.get("error"),
                 provenance=s.get("provenance"),
+                budget_exhausted=(
+                    WorkflowBudgetExhausted.from_dict(s["budget_exhausted"])
+                    if isinstance(s.get("budget_exhausted"), dict)
+                    else None
+                ),
             )
             for s in d.get("steps", [])
         ]
@@ -366,8 +413,14 @@ class WorkflowTrace:
             goal=d["goal"],
             variables=variables,
             steps=steps,
+            narration=[str(x) for x in (d.get("narration") or [])],
             final_result=d.get("final_result"),
             validation_error=d.get("validation_error"),
+            budget_exhausted=(
+                WorkflowBudgetExhausted.from_dict(d["budget_exhausted"])
+                if isinstance(d.get("budget_exhausted"), dict)
+                else None
+            ),
         )
 
 
@@ -391,6 +444,15 @@ class LLMClient(Protocol):
 
 # ── Runner ────────────────────────────────────────────────────────────────────
 
+def describe_workflow_step(step: "WorkflowStep") -> str:
+    if step.kind == "tool_call":
+        return f"tool_call {step.tool} → {step.output}"
+    if step.kind == "command_sink":
+        arg = step.literal if step.literal is not None else f"${step.input}"
+        return f"{step.command} {arg or ''} → {step.output}".strip()
+    return f"llm_transform {step.inputs} → {step.output}"
+
+
 class WorkflowRunner:
     """Executes a Workflow sequentially, binding step outputs to Variables."""
 
@@ -399,10 +461,20 @@ class WorkflowRunner:
         executor: ToolCallExecutor,
         command_dispatcher: CommandDispatcher | None = None,
         llm_client: LLMClient | None = None,
+        step_observer: Callable[[str], None] | None = None,
     ) -> None:
         self.executor = executor
         self.command_dispatcher: CommandDispatcher = command_dispatcher or {}
         self.llm_client = llm_client
+        self.step_observer = step_observer
+
+    def _observe(self, line: str) -> None:
+        if self.step_observer is None:
+            return
+        try:
+            self.step_observer(line)
+        except Exception:  # noqa: BLE001
+            logger.exception("workflow runner step observer failed")
 
     def run(self, workflow: Workflow) -> WorkflowTrace:
         """Execute all steps and return the full trace."""
@@ -422,24 +494,39 @@ class WorkflowRunner:
         failed = False
         last_output_var: str | None = None
 
-        for step in workflow.steps:
+        total = len(workflow.steps)
+        for index, step in enumerate(workflow.steps, 1):
             if failed:
                 trace.steps.append(
                     StepTrace(step_id=step.id, kind=step.kind, status="skipped")
                 )
                 continue
 
+            self._observe(f"步驟 {index}/{total}：{describe_workflow_step(step)}")
             step_trace, produced_var = self._run_step(step, store)
             trace.steps.append(step_trace)
+            if step_trace.status == "failed":
+                self._observe(f"步驟 {index}/{total} 失敗：{step_trace.error or '（無詳情）'}")
+            else:
+                self._observe(f"步驟 {index}/{total} 完成")
 
             if step_trace.status == "failed":
+                if step_trace.budget_exhausted is not None:
+                    trace.budget_exhausted = step_trace.budget_exhausted
+                    trace.final_result = (
+                        f"工作流在步驟 {step.id} 暫停："
+                        f"{step_trace.error or 'budget exhausted'}"
+                    )
+                    break
                 failed = True
             elif produced_var:
                 last_output_var = produced_var
 
         trace.variables = store.snapshot()
 
-        if not failed and last_output_var:
+        if trace.budget_exhausted is not None:
+            pass
+        elif not failed and last_output_var:
             trace.final_result = store.resolve(last_output_var)
         elif failed:
             for st in trace.steps:
@@ -489,6 +576,7 @@ class WorkflowRunner:
 
         slug = step.tool or ""
         ok, result_text = self.executor.run_tool_step(slug, resolved_args)
+        exhausted = getattr(self.executor, "last_budget_exhausted", None)
 
         if ok:
             provenance = f"{slug}({resolved_args})"
@@ -509,7 +597,35 @@ class WorkflowRunner:
         return (
             StepTrace(
                 step_id=step.id, kind=step.kind, status="failed",
-                output_var=step.output, error=result_text,
+                output_var=step.output,
+                error=result_text,
+                budget_exhausted=(
+                    WorkflowBudgetExhausted(
+                        kind="search",
+                        used=int(
+                            getattr(exhausted, "count", getattr(exhausted, "used", 0)) or 0
+                        ),
+                        limit=int(
+                            getattr(
+                                exhausted,
+                                "effective_limit",
+                                getattr(exhausted, "limit", 0),
+                            )
+                            or 0
+                        ),
+                        hard_limit=int(
+                            getattr(
+                                exhausted,
+                                "hard_cap",
+                                getattr(exhausted, "hard_limit", 0),
+                            )
+                            or 0
+                        ),
+                        granted_extra=int(getattr(exhausted, "granted_extra", 0) or 0),
+                    )
+                    if exhausted is not None
+                    else None
+                ),
             ),
             None,
         )

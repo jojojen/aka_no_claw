@@ -267,7 +267,7 @@ class FallbackSynthesizer:
         raise QuizVocabAudioError(" ; ".join(errors) or "no synthesizer available")
 
     def synthesize_text(self, *, text: str, cache_dir: Path) -> SynthesizedVocabAudio:
-        """Synthesize arbitrary text (the /say preview). Cache key is derived from
+        """Synthesize arbitrary text (the /generateaudio preview). Cache key is derived from
         the text so repeats reuse the WAV; per-synth voice params still vary the
         filename via the param_tag inside synthesize_to_cache."""
         cleaned = (text or "").strip()

@@ -20,13 +20,17 @@ import pytest
 
 from openclaw_adapter.command_bridge import CommandBridge, _WorkflowShimRunner, build_chat_prompt
 from openclaw_adapter.command_bridge_models import (
+    CHAT_BACKEND_GEMINI,
     CHAT_BACKEND_CLOUD_PICKLE,
     CHAT_BACKEND_CLOUD_POOL,
     CHAT_BACKEND_LOCAL,
     CHAT_TOOL_BLUETOOTH,
+    CHAT_TOOL_GOAL,
     CHAT_TOOL_IR,
     CHAT_TOOL_MUSIC,
+    CHAT_TOOL_MUSICQUEUE,
     CHAT_TOOL_NO_TOOL,
+    CHAT_TOOL_RESEARCH,
     CHAT_TOOL_SEARCH,
     MAX_HISTORY_TURNS,
     MAX_ROUTER_QUERY_LEN,
@@ -48,10 +52,14 @@ from openclaw_adapter.command_bridge_models import (
     SUBMODE_SELLER_REPUTATION_SNAPSHOT,
     SUBMODE_TEXT_TRANSLATION,
     RequestValidationError,
+    WebCommandResponse,
     make_chat_tool_request,
     parse_chat_tool_plan,
     parse_request,
 )
+from openclaw_adapter.goal_loop import GoalLoopContinuation, GoalLoopReport
+from openclaw_adapter.task_loop import ContinuationState
+from openclaw_adapter.task_workspace import Workflow
 
 
 class _FakeRegistered:
@@ -624,6 +632,17 @@ def test_parse_chat_tool_plan_search_tool():
     )
 
 
+def test_parse_chat_tool_plan_research_tool():
+    plan = parse_chat_tool_plan(
+        '{"tool":"/research","query":"https://jp.mercari.com/item/m123 以投資為考量這個商品能買嗎？","reason_summary":"商品投資判斷"}'
+    )
+    assert plan == ChatToolPlan(
+        tool=CHAT_TOOL_RESEARCH,
+        query="https://jp.mercari.com/item/m123 以投資為考量這個商品能買嗎？",
+        reason_summary="商品投資判斷",
+    )
+
+
 def test_parse_chat_tool_plan_music_tool():
     plan = parse_chat_tool_plan(
         '{"tool":"/music","query":"stop","reason_summary":"音樂控制"}'
@@ -632,6 +651,20 @@ def test_parse_chat_tool_plan_music_tool():
         tool=CHAT_TOOL_MUSIC,
         query="stop",
         reason_summary="音樂控制",
+    )
+
+
+def test_parse_chat_tool_plan_musicqueue_tool():
+    # Live regression (2026-07-02): the router chose /musicqueue for a
+    # multi-song request but the allowlist rejected it as untrusted, silently
+    # degrading to a plain chat answer. /musicqueue must parse as a real tool.
+    plan = parse_chat_tool_plan(
+        '{"tool":"/musicqueue","query":"ヨルシカ 熱門歌曲","reason_summary":"連續播放多首"}'
+    )
+    assert plan == ChatToolPlan(
+        tool=CHAT_TOOL_MUSICQUEUE,
+        query="ヨルシカ 熱門歌曲",
+        reason_summary="連續播放多首",
     )
 
 
@@ -657,6 +690,17 @@ def test_parse_chat_tool_plan_ir_tool():
     )
 
 
+def test_parse_chat_tool_plan_goal_tool():
+    plan = parse_chat_tool_plan(
+        '{"tool":"__goal__","query":"先查天氣再播報的工作流","reason_summary":"多步驟目標"}'
+    )
+    assert plan == ChatToolPlan(
+        tool=CHAT_TOOL_GOAL,
+        query="先查天氣再播報的工作流",
+        reason_summary="多步驟目標",
+    )
+
+
 def test_parse_chat_tool_plan_extracts_json_from_noise():
     raw = '<think>嗯</think> 好的：\n```json\n{"tool":"/search","query":"q"}\n```'
     plan = parse_chat_tool_plan(raw)
@@ -670,6 +714,7 @@ def test_parse_chat_tool_plan_extracts_json_from_noise():
     '{"tool":"/rm-rf","query":"x"}',
     '{"tool":"/search","query":"   "}',
     '{"tool":"/search"}',
+    '{"tool":"__goal__","query":"   "}',
     '{"tool":"__no_tool__","answer":"   "}',
     '{"tool":"teleport"}',
 ])
@@ -803,12 +848,134 @@ def test_chat_tool_search_triggers_grounded_answer(monkeypatch):
     assert "https://miku.example/news" in resp.message
 
 
+def test_chat_tool_unsatisfied_upgrades_to_goal_loop_run(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        b,
+        "_select_chat_tool_plan",
+        lambda req: (
+            ChatToolPlan(tool=CHAT_TOOL_MUSIC, query="米津玄師 熱門歌曲", reason_summary="先試單步工具"),
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        b,
+        "_run_chat_tool",
+        lambda req, plan: ChatToolResult(
+            answer="🔧 已使用工具：音樂控制（/music）｜指令：米津玄師 熱門歌曲\n\n找不到符合歌曲。",
+            source_count=0,
+            result_summary="miss",
+        ),
+    )
+    monkeypatch.setattr(b, "_chat_tool_result_satisfies_intent", lambda req, plan, tool_result: False)
+    seen_goals: list[str] = []
+
+    def _fake_run(req, goal, planner_metadata=None, narrator=None):
+        seen_goals.append(goal)
+        return WebCommandResponse(
+            status=STATUS_OK,
+            mode=MODE_CHAT,
+            message=(
+                "已理解目標為：播放米津玄師的熱門歌曲\n"
+                "草稿完成：wf-play-yonezu（3 步）\n"
+                "子任務：\n"
+                "1. /search 米津玄師 熱門歌曲 → search_hits\n"
+                "2. /musiclistall → local_tracks\n"
+                "3. /music $matched_track → play_result\n"
+                "工作流完成：播放中"
+            ),
+        )
+
+    monkeypatch.setattr(b, "_run_goal_loop_blocking", _fake_run)
+
+    resp = b.handle(parse_request({"mode": "chat", "input": "播放米津玄師的熱門歌曲"}))
+
+    assert resp.status == STATUS_OK
+    assert seen_goals == ["播放米津玄師的熱門歌曲"]
+    assert "直接指令沒有完成，我改規劃成多步驟流程並直接執行" in resp.message
+    assert "1. /search 米津玄師 熱門歌曲" in resp.message
+    assert "工作流完成：播放中" in resp.message
+    assert "確認" not in resp.message
+
+
+def test_stream_chat_tool_unsatisfied_upgrades_to_goal_loop_run(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+
+    def _plan(req):
+        if False:
+            yield {}
+        return ChatToolPlan(tool=CHAT_TOOL_MUSIC, query="米津玄師 熱門歌曲"), None
+
+    monkeypatch.setattr(b, "_stream_chat_tool_plan", _plan)
+    monkeypatch.setattr(
+        b,
+        "_run_chat_tool",
+        lambda req, plan: ChatToolResult(
+            answer="🔧 已使用工具：音樂控制（/music）｜指令：米津玄師 熱門歌曲\n\n找不到符合歌曲。",
+            source_count=0,
+            result_summary="miss",
+        ),
+    )
+    monkeypatch.setattr(b, "_chat_tool_result_satisfies_intent", lambda req, plan, tool_result: False)
+
+    def _fake_run(req, goal, planner_metadata=None, narrator=None):
+        # the real goal loop pushes narration through this callback live
+        for line in (
+            "已理解目標為：播放米津玄師的熱門歌曲",
+            "草稿完成：wf-play-yonezu（3 步）",
+            "步驟 1/3：/search 米津玄師 熱門歌曲 → search_hits",
+        ):
+            narrator(line)
+        return WebCommandResponse(
+            status=STATUS_OK,
+            mode=MODE_CHAT,
+            message=(
+                "已理解目標為：播放米津玄師的熱門歌曲\n"
+                "草稿完成：wf-play-yonezu（3 步）\n"
+                "工作流完成：播放中"
+            ),
+        )
+
+    monkeypatch.setattr(b, "_run_goal_loop_blocking", _fake_run)
+
+    events = list(b.stream(parse_request({"mode": "chat", "input": "播放米津玄師的熱門歌曲"}), "rid-goal-upgrade"))
+
+    assert events[0]["type"] == "start"
+    deltas = [e["text"] for e in events if e["type"] == "delta"]
+    assert deltas and "正在調用" in deltas[0]
+    joined_deltas = "".join(deltas)
+    # narration must reach the client live, as deltas — not only in the done event
+    assert "直接指令沒有完成，我改規劃成多步驟流程並直接執行" in joined_deltas
+    assert "已理解目標為：播放米津玄師的熱門歌曲" in joined_deltas
+    assert "步驟 1/3：/search 米津玄師 熱門歌曲 → search_hits" in joined_deltas
+    assert events[-1]["type"] == "done"
+    assert "直接指令沒有完成，我改規劃成多步驟流程並直接執行" in events[-1]["message"]
+    assert "工作流完成：播放中" in events[-1]["message"]
+
+
+def test_chat_tool_satisfaction_parser_accepts_wrapped_json():
+    parsed = CommandBridge._parse_chat_tool_satisfaction(
+        '```json\n{"satisfied": false, "reason": "只完成部分"}\n```'
+    )
+    assert parsed == {"satisfied": False, "reason": "只完成部分"}
+
+
 def test_router_prompt_includes_registered_control_tool_usage(monkeypatch):
     b = CommandBridge(settings=_tool_settings())
     monkeypatch.setattr(
         b,
         "_handlers",
         lambda: {
+            "/search": SimpleNamespace(
+                usage="網路搜尋並回傳摘要與來源",
+                chat_tool_purpose="當回答需要即時資訊時使用",
+                chat_tool_query_hint="query 是搜尋查詢",
+            ),
+            "/research": SimpleNamespace(
+                usage="深度商品研究與投資判斷；參數＝商品網址或商品描述。",
+                chat_tool_purpose="當使用者問商品能不能買、估價、行情、流動性或賣家風險時使用",
+                chat_tool_query_hint="query 保留商品 URL 與投資判斷問題",
+            ),
             "/music": SimpleNamespace(
                 usage="stop=停止；playbest=播放最愛",
                 chat_tool_purpose="當使用者要控制本機音樂播放時使用",
@@ -829,10 +996,17 @@ def test_router_prompt_includes_registered_control_tool_usage(monkeypatch):
 
     prompt = b._build_chat_tool_plan_prompt(parse_request({"mode": "chat", "input": "停止播放音樂"}))
 
+    assert "/search" in prompt
+    assert "網路搜尋並回傳摘要與來源" in prompt
+    assert "/research" in prompt
+    assert "深度商品研究與投資判斷" in prompt
+    assert "商品能不能買" in prompt
     assert "/music" in prompt
     assert "stop=停止" in prompt
     assert "playbest=播放最愛" in prompt
     assert "當使用者要控制本機音樂播放時使用" in prompt
+    assert "__goal__" in prompt
+    assert "多步驟目標" in prompt
     assert "/bluetooth" in prompt
     assert "scan=掃描" in prompt
     assert "當使用者要掃描藍牙裝置時使用" in prompt
@@ -865,6 +1039,46 @@ def test_chat_tool_music_dispatches_registered_music_command(monkeypatch):
     assert "已使用工具" in resp.message
     assert "音樂控制" in resp.message
     assert "已停止目前由龍蝦播放的音樂" in resp.message
+
+
+def test_chat_tool_research_dispatches_registered_research_handler(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        b,
+        "_select_chat_tool_plan",
+        lambda req: (
+            ChatToolPlan(
+                tool=CHAT_TOOL_RESEARCH,
+                query="https://jp.mercari.com/item/m123 以投資為考量這個商品能買嗎？",
+                reason_summary="商品投資判斷",
+            ),
+            None,
+        ),
+    )
+    calls: list[tuple[str, str]] = []
+
+    def _mock_run_command(command, text, chat_id="web-bridge"):
+        calls.append((command, text))
+        return f"[research]{text}"
+
+    monkeypatch.setattr(b, "_run_command", _mock_run_command)
+    resp = b.handle(
+        parse_request({
+            "mode": "chat",
+            "input": "以投資為考量 這個商品能買嗎？ https://jp.mercari.com/item/m123",
+        })
+    )
+
+    assert resp.status == STATUS_OK
+    assert calls == [
+        (
+            "/research",
+            "https://jp.mercari.com/item/m123 以投資為考量這個商品能買嗎？",
+        )
+    ]
+    assert "已使用工具" in resp.message
+    assert "商品研究" in resp.message
+    assert "[research]https://jp.mercari.com/item/m123" in resp.message
 
 
 def test_chat_tool_bluetooth_dispatches_registered_bluetooth_command(monkeypatch):
@@ -1231,6 +1445,240 @@ def test_select_chat_tool_plan_gemini_failure_does_not_fallback_to_local(monkeyp
     assert metadata is None
 
 
+def test_chat_goal_plan_runs_goal_loop_directly(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        b,
+        "_select_chat_tool_plan",
+        lambda req: (
+            ChatToolPlan(
+                tool=CHAT_TOOL_GOAL,
+                query="先查天氣再播報的工作流",
+                reason_summary="多步驟目標",
+            ),
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        b,
+        "_run_goal_loop_blocking",
+        lambda req, goal, planner_metadata=None: SimpleNamespace(
+            status=STATUS_OK,
+            message=f"run:{goal}",
+            mode=MODE_CHAT,
+            model_metadata=None,
+        ),
+    )
+    resp = b.handle(parse_request({"mode": "chat", "input": "幫我規劃先查天氣再播報"}))
+    assert resp.status == STATUS_OK
+    assert resp.message == "run:先查天氣再播報的工作流"
+
+
+def test_stream_goal_plan_runs_goal_loop_directly(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+
+    def _plan(req):
+        if False:
+            yield {}
+        return ChatToolPlan(
+            tool=CHAT_TOOL_GOAL,
+            query="先查天氣再播報的工作流",
+            reason_summary="多步驟目標",
+        ), None
+
+    monkeypatch.setattr(b, "_stream_chat_tool_plan", _plan)
+
+    def _stream_goal(req, goal, planner_metadata=None):
+        yield {"type": "done", "message": f"run:{goal}"}
+
+    monkeypatch.setattr(b, "_stream_goal_loop", _stream_goal)
+    events = list(b.stream(parse_request({"mode": "chat", "input": "幫我規劃先查天氣再播報"}), "rid-goal"))
+    assert [e["type"] for e in events] == ["start", "done"]
+    assert events[-1]["message"] == "run:先查天氣再播報的工作流"
+
+
+def test_chat_goal_resume_uses_saved_continuation(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    continuation = GoalLoopContinuation(
+        state=ContinuationState(
+            goal="先查天氣再播報",
+            next_action="run_workflow",
+            stop_condition="step budget reached",
+        ),
+        workflow=Workflow(id="wf-weather", goal="先查天氣再播報", steps=[]),
+        replans_used=0,
+        narration=("已理解目標為：先查天氣再播報",),
+    )
+    req = parse_request({"mode": "chat", "input": "幫我規劃先查天氣再播報", "conversation_id": "g1"})
+    b._store_goal_continuation(req, continuation, chat_backend=CHAT_BACKEND_LOCAL, planner_metadata=None)
+
+    monkeypatch.setattr(
+        b,
+        "_execute_goal_loop",
+        lambda **kwargs: GoalLoopReport(
+            done=True,
+            final_result="完成了",
+            workflow=kwargs["resume"].workflow,
+            trace=None,
+            continuation=None,
+            replans_used=0,
+            narration=("續跑中",),
+        ),
+    )
+    resumed = b.handle(parse_request({"mode": "chat", "input": "繼續", "conversation_id": "g1"}))
+    assert resumed.status == STATUS_OK
+    assert "續跑中" in resumed.message
+    assert "完成了" in resumed.message
+    assert "g1" not in b._goal_continuations
+
+
+def test_stream_goal_resume_emits_heartbeat_then_done(monkeypatch):
+    from openclaw_adapter import command_bridge as bridge_mod
+
+    b = CommandBridge(settings=_tool_settings())
+    continuation = GoalLoopContinuation(
+        state=ContinuationState(goal="先查天氣再播報", next_action="run_workflow"),
+        workflow=Workflow(id="wf-weather", goal="先查天氣再播報", steps=[]),
+    )
+    req = parse_request({"mode": "chat", "input": "x", "conversation_id": "g2"})
+    b._store_goal_continuation(req, continuation, chat_backend=CHAT_BACKEND_LOCAL, planner_metadata=None)
+    monkeypatch.setattr(bridge_mod, "_HEARTBEAT_SECONDS", 0.01)
+
+    def _resume(_req, entry):
+        time.sleep(0.03)
+        return WebCommandResponse(status=STATUS_OK, message="resumed", mode=MODE_CHAT)
+
+    monkeypatch.setattr(b, "_resume_goal_loop", _resume)
+    events = list(b.stream(parse_request({"mode": "chat", "input": "繼續", "conversation_id": "g2"}), "rid-resume"))
+    assert events[0]["type"] == "start"
+    assert any(event["type"] == "heartbeat" for event in events)
+    assert events[-1]["type"] == "done"
+    assert events[-1]["message"] == "resumed"
+
+
+def test_stream_goal_resume_error_emits_stream_error(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    continuation = GoalLoopContinuation(
+        state=ContinuationState(goal="先查天氣再播報", next_action="run_workflow"),
+        workflow=Workflow(id="wf-weather", goal="先查天氣再播報", steps=[]),
+    )
+    req = parse_request({"mode": "chat", "input": "x", "conversation_id": "g3"})
+    b._store_goal_continuation(req, continuation, chat_backend=CHAT_BACKEND_LOCAL, planner_metadata=None)
+    monkeypatch.setattr(
+        b,
+        "_resume_goal_loop",
+        lambda _req, entry: WebCommandResponse(status=STATUS_ERROR, message="resume failed", mode=MODE_CHAT),
+    )
+    events = list(b.stream(parse_request({"mode": "chat", "input": "繼續", "conversation_id": "g3"}), "rid-resume-err"))
+    assert events[0]["type"] == "start"
+    assert events[-1]["type"] == "error"
+    assert events[-1]["message"] == "resume failed"
+
+
+def test_goal_budget_message_and_actions_for_step_pause():
+    b = CommandBridge(settings=_tool_settings())
+    cont = GoalLoopContinuation(
+        state=ContinuationState(
+            goal="先查天氣再播報",
+            completed=["draft: drafted wf-weather with 2 step(s)"],
+            attempted_fixes=["run_workflow: timeout"],
+            budget={"steps_used": 6, "steps_limit": 6, "replans_used": 1, "replans_limit": 2},
+            next_action="run_workflow",
+            stop_condition="step budget reached",
+        ),
+        workflow=Workflow(id="wf-weather", goal="先查天氣再播報", steps=[]),
+    )
+    text = b._format_goal_budget_status(cont)
+    actions = b._goal_web_actions(
+        parse_request({"mode": "chat", "input": "x"}),
+        GoalLoopReport(done=False, final_result="partial", continuation=cont),
+    )
+    assert "目標：先查天氣再播報" in text
+    assert "steps 6/6" in text
+    assert actions[0].label == "繼續（再 6 步）"
+    assert actions[0].input == "__goal_continue__"
+
+
+def test_goal_actions_use_search_continue_until_hard_cap():
+    b = CommandBridge(settings=_tool_settings())
+    cont = GoalLoopContinuation(
+        state=ContinuationState(
+            goal="查資料",
+            budget={
+                "steps_used": 2,
+                "steps_limit": 6,
+                "search_used": 10,
+                "search_limit": 10,
+                "search_hard_limit": 20,
+            },
+            next_action="run_workflow",
+            stop_condition="search soft cap reached (10/10)",
+        ),
+    )
+    actions = b._goal_web_actions(
+        parse_request({"mode": "chat", "input": "x"}),
+        GoalLoopReport(done=False, final_result="partial", continuation=cont),
+    )
+    assert actions[0].label == "繼續（再 5 次搜尋）"
+    assert actions[0].input == "__goal_continue_search__"
+
+    hard_cap_cont = GoalLoopContinuation(
+        state=ContinuationState(
+            goal="查資料",
+            budget={"search_used": 20, "search_limit": 20, "search_hard_limit": 20},
+            next_action="run_workflow",
+            stop_condition="search hard cap reached (20/20)",
+        ),
+    )
+    hard_actions = b._goal_web_actions(
+        parse_request({"mode": "chat", "input": "x"}),
+        GoalLoopReport(done=False, final_result="partial", continuation=hard_cap_cont),
+    )
+    assert [a.label for a in hard_actions] == ["停止並總結"]
+
+
+def test_goal_continue_control_expires_after_ttl():
+    b = CommandBridge(settings=_tool_settings())
+    continuation = GoalLoopContinuation(
+        state=ContinuationState(goal="先查天氣再播報", next_action="run_workflow"),
+        workflow=Workflow(id="wf-weather", goal="先查天氣再播報", steps=[]),
+    )
+    req = parse_request({"mode": "chat", "input": "x", "conversation_id": "g-expire"})
+    b._store_goal_continuation(req, continuation, chat_backend=CHAT_BACKEND_LOCAL, planner_metadata=None)
+    b._goal_continuations["g-expire"]["created_at"] = 0
+
+    response = b.handle(parse_request({"mode": "chat", "input": "__goal_continue__", "conversation_id": "g-expire"}))
+
+    assert response.status == STATUS_ERROR
+    assert "已逾時" in response.message
+
+
+def test_continue_goal_loop_with_search_extension_grants_then_resumes(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    continuation = GoalLoopContinuation(
+        state=ContinuationState(
+            goal="查資料",
+            budget={"search_used": 10, "search_limit": 10, "search_hard_limit": 20},
+            next_action="run_workflow",
+            stop_condition="search soft cap reached (10/10)",
+        ),
+        workflow=Workflow(id="wf-search", goal="查資料", steps=[]),
+    )
+    req = parse_request({"mode": "chat", "input": "x", "conversation_id": "g-search"})
+    b._store_goal_continuation(req, continuation, chat_backend=CHAT_BACKEND_LOCAL, planner_metadata=None)
+    monkeypatch.setattr(b, "_grant_goal_search_extension", lambda n: 5)
+    monkeypatch.setattr(
+        b,
+        "_resume_goal_loop",
+        lambda _req, _entry: WebCommandResponse(status=STATUS_OK, message="resumed", mode=MODE_CHAT),
+    )
+
+    response = b.handle(parse_request({"mode": "chat", "input": "__goal_continue_search__", "conversation_id": "g-search"}))
+
+    assert response.status == STATUS_OK
+    assert response.message == "resumed"
+
+
 def test_non_chat_modes_do_not_plan_chat_tools(bridge, monkeypatch):
     def _no_plan(req):
         raise AssertionError("non-chat modes must not invoke the chat tool planner")
@@ -1339,7 +1787,10 @@ def test_stream_chat_local_emits_start_delta_done(bridge, monkeypatch):
     req = parse_request({"mode": "chat", "input": "hi", "chat_backend": "local"})
     events = list(bridge.stream(req, "rid-1"))
     assert events[0] == {"type": "start", "request_id": "rid-1"}
-    assert events[1] == {"type": "delta", "text": "par"}
+    # The router is unreachable in this test, so the visible degradation notice
+    # streams first instead of a silent fallback.
+    assert events[1] == {"type": "delta", "text": "（工具路由暫時不可用，改以一般模式直接回答）\n"}
+    assert events[2] == {"type": "delta", "text": "par"}
     assert events[-1] == {"type": "done", "message": "partial"}
 
 
@@ -1583,6 +2034,60 @@ def test_handle_stream_closes_generator_on_client_disconnect(monkeypatch):
     assert closed["v"], "generator was not closed on client disconnect"
 
 
+def test_stream_route_sends_cors_and_no_buffering_headers():
+    from http.server import BaseHTTPRequestHandler
+
+    from openclaw_adapter import command_bridge_server as srv
+
+    class _FakeBridge:
+        def stream(self, req, request_id):
+            yield {"type": "done", "message": "ok"}
+
+    handler_cls = srv._build_handler(_FakeBridge(), lan_enabled=False)
+    h = handler_cls.__new__(handler_cls)
+    body = b'{"mode":"chat","input":"hi"}'
+    h.headers = {
+        "Content-Length": str(len(body)),
+        "Origin": "http://127.0.0.1:5173",
+    }
+    h.rfile = io.BytesIO(body)
+    h.wfile = io.BytesIO()
+    h.request_version = "HTTP/1.1"
+    h.protocol_version = "HTTP/1.0"
+    h.requestline = "POST /api/command/stream HTTP/1.1"
+    h.responses = BaseHTTPRequestHandler.responses
+    h.client_address = ("127.0.0.1", 12345)
+
+    h._handle_stream()
+    raw = h.wfile.getvalue().decode("utf-8")
+    assert "Access-Control-Allow-Origin: http://127.0.0.1:5173" in raw
+    assert "X-Accel-Buffering: no" in raw
+    assert '{"type": "done", "message": "ok"}' in raw
+
+
+def test_options_preflight_allows_direct_bridge_streaming():
+    from http.server import BaseHTTPRequestHandler
+
+    from openclaw_adapter import command_bridge_server as srv
+
+    handler_cls = srv._build_handler(object(), lan_enabled=False)
+    h = handler_cls.__new__(handler_cls)
+    h.headers = {"Origin": "http://127.0.0.1:5173"}
+    h.rfile = io.BytesIO()
+    h.wfile = io.BytesIO()
+    h.request_version = "HTTP/1.1"
+    h.protocol_version = "HTTP/1.0"
+    h.requestline = "OPTIONS /api/command/stream HTTP/1.1"
+    h.responses = BaseHTTPRequestHandler.responses
+    h.client_address = ("127.0.0.1", 12345)
+
+    h.do_OPTIONS()
+    raw = h.wfile.getvalue().decode("utf-8")
+    assert " 204 " in raw
+    assert "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS" in raw
+    assert "Access-Control-Allow-Headers: Content-Type" in raw
+
+
 # --- 生活 mode: music control surface (aka_no_claw_web#3 / #4) -------------
 def test_music_command_runs_music_handler(bridge, monkeypatch):
     markup = {"inline_keyboard": [[{"text": "🔇 靜音", "callback_data": "music:mute"}]]}
@@ -1671,6 +2176,11 @@ class _FakeWfEditor:
     def is_capturing(self, chat_id: str) -> bool:
         return False
 
+    def start_from_draft(self, chat_id: str, workflow: Workflow):
+        self.calls.append(("draft", chat_id, workflow.id))
+        markup = {"inline_keyboard": [[{"text": "💾 儲存", "callback_data": "wfe:save"}]]}
+        return (f"Workflow 草稿：{workflow.id}", markup)
+
     def handle_text_capture(self, text: str, chat_id: str):
         return None
 
@@ -1708,6 +2218,46 @@ def test_run_workflow_command_strips_prefix_and_keys_web_chat(bridge):
     assert seen["chat_id"] == "web-workflow"                  # fixed web chat id
     assert res["message"] == "🤖 草稿"
     assert res["actions"][0]["callback_data"] == "wfe:save"
+
+
+def test_run_workflow_create_uses_selected_chat_backend(monkeypatch):
+    import openclaw_adapter.command_bridge as bridge_module
+
+    b = CommandBridge(settings=_tool_settings(gemini_key="gemini-key"))
+    editor = _FakeWfEditor()
+    _seed_wf_surface(b, lambda _remainder, _chat_id: (_ for _ in ()).throw(AssertionError("old handler used")), editor)
+    monkeypatch.setattr(
+        bridge_module,
+        "_WorkflowShimRunner",
+        lambda _settings: SimpleNamespace(catalog=None),
+    )
+    seen: dict[str, str] = {}
+
+    class _Planner:
+        def draft(self, goal):
+            seen["goal"] = goal
+            return (
+                Workflow.from_dict({"id": "wf-gemini", "goal": goal, "steps": []}),
+                None,
+                False,
+            )
+
+    monkeypatch.setattr(
+        b,
+        "_build_goal_planner",
+        lambda backend, runner: seen.setdefault("backend", backend) and _Planner(),
+    )
+
+    res = b.run_workflow_command(
+        "/workflow create 每天早上查天氣",
+        chat_backend=CHAT_BACKEND_GEMINI,
+    )
+
+    assert seen == {"backend": CHAT_BACKEND_GEMINI, "goal": "每天早上查天氣"}
+    assert res["status"] == STATUS_OK
+    assert "已使用 Gemini" in res["message"]
+    assert "big-pickle" not in res["message"]
+    assert editor.calls == [("draft", "web-workflow", "wf-gemini")]
 
 
 def test_run_workflow_command_accepts_bare_remainder(bridge):
@@ -2113,6 +2663,8 @@ def test_exec_grounded_search_source_count(monkeypatch):
 # --- /music chat tool routing -----------------------------------------------
 
 def test_stream_chat_music_tool_emits_done(monkeypatch):
+    from types import SimpleNamespace
+
     b = CommandBridge(settings=_tool_settings())
 
     def _plan(req):
@@ -2121,6 +2673,11 @@ def test_stream_chat_music_tool_emits_done(monkeypatch):
         return ChatToolPlan(tool=CHAT_TOOL_MUSIC, query="stop"), None
 
     monkeypatch.setattr(b, "_stream_chat_tool_plan", _plan)
+    # Display names come from the command registry row (no hardcoded map).
+    monkeypatch.setattr(
+        b, "_handlers",
+        lambda: {"/music": SimpleNamespace(chat_tool_display_name="音樂控制")},
+    )
     monkeypatch.setattr(b, "run_music_command",
                         lambda t: {"status": STATUS_OK, "message": "已停止", "actions": []})
     events = list(b.stream(parse_request({"mode": "chat", "input": "停止播放音樂"}), "rid-m"))
@@ -2129,6 +2686,61 @@ def test_stream_chat_music_tool_emits_done(monkeypatch):
     assert "音樂控制" in events[1]["text"]
     assert events[-1]["type"] == "done"
     assert "已停止" in events[-1]["message"]
+
+
+def test_stream_chat_musicqueue_tool_dispatches_registered_handler(monkeypatch):
+    from types import SimpleNamespace
+
+    b = CommandBridge(settings=_tool_settings())
+
+    def _plan(req):
+        if False:
+            yield {}
+        return ChatToolPlan(tool=CHAT_TOOL_MUSICQUEUE, query="春泥棒、晴る"), None
+
+    monkeypatch.setattr(b, "_stream_chat_tool_plan", _plan)
+    monkeypatch.setattr(
+        b, "_handlers",
+        lambda: {"/musicqueue": SimpleNamespace(chat_tool_display_name="音樂連播")},
+    )
+    called = {}
+
+    def _queue(text):
+        called["query"] = text
+        return {
+            "status": STATUS_OK,
+            "message": "開始依序連續播放：\n1. 春泥棒\n2. 晴る",
+            "actions": [],
+        }
+
+    monkeypatch.setattr(b, "run_musicqueue_command", _queue)
+    events = list(
+        b.stream(parse_request({"mode": "chat", "input": "連續播放春泥棒和晴る"}), "rid-q")
+    )
+    assert "音樂連播" in events[1]["text"]  # live notice, name from registry
+    assert called["query"] == "春泥棒、晴る"
+    assert events[-1]["type"] == "done"
+    assert "開始依序連續播放" in events[-1]["message"]
+    assert "音樂連播" in events[-1]["message"]  # banner display name from registry
+
+
+def test_chat_tool_plan_prompt_lists_musicqueue(monkeypatch):
+    from types import SimpleNamespace
+
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        b, "_handlers",
+        lambda: {
+            "/musicqueue": SimpleNamespace(
+                usage="依序連續播放多首本地歌曲",
+                chat_tool_purpose="當使用者要依序連續播放多首本地歌曲時使用",
+                chat_tool_query_hint="query 只輸出以「、」分隔的歌名清單",
+            ),
+        },
+    )
+    prompt = b._chat_tool_plan_system_prompt()
+    assert "- /musicqueue：依序連續播放多首本地歌曲" in prompt
+    assert "|/musicqueue" in prompt  # offered as a tool_choices option
 
 
 # --- Issue #50: bounded multi-tool music plan ----------------------------
@@ -2507,89 +3119,77 @@ def test_workflow_shim_runner_delegates_run_tool_step(monkeypatch, tmp_path):
     assert fake_runner_box["runner"].calls == [("city_weather", {"q": "tokyo"})]
 
 
-# --- stream_redirect for create_workflow (web#8 Blocker 2) -------------------
-# CommandBridge._stream_chat must emit { type:"redirect", intent:"create_workflow",
-# description:<user text> } when the embedding fast-path detects a workflow
-# creation request, and must NOT fall through to the LLM router or music path.
+# --- Web chat must route through the selected model --------------------------
+# Web chat intentionally does not use regex / embedding fast-path redirects.
+# Workflow, schedule, and product-research-like natural language must all go
+# through the shared chat tool planner so the selected model's capability is
+# visible and testable.
 
-class _FakeWorkflowRouter:
-    """Stub for EmbeddingIntentRouter: always returns create_workflow for any text."""
-    ready = True
-
-    def route(self, text: str):
-        from telegram_nl.natural_language import TelegramNaturalLanguageIntent
-        return TelegramNaturalLanguageIntent(
-            intent="create_workflow",
-            workflow_description=text,
-            confidence=0.92,
-        )
+def _assert_router_answer(events: list, expected: str = "模型回答") -> None:
+    assert events[0]["type"] == "start"
+    assert not any(e.get("type") == "redirect" for e in events), events
+    assert events[-1]["type"] == "done"
+    assert events[-1]["message"] == expected
 
 
-class _FakeMissRouter:
-    """Stub that never matches — simulates embedding fast-path miss."""
-    ready = True
+def test_stream_chat_workflow_text_uses_model_router_not_fast_path(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
 
-    def route(self, _text: str):
-        return None
+    seen: list[str] = []
 
+    def _plan(req):
+        seen.append(req.input)
+        return ChatToolPlan(tool=CHAT_TOOL_NO_TOOL, answer="模型回答"), None
 
-def _assert_single_redirect(events: list, description_contains: str) -> None:
-    redirect_events = [e for e in events if e.get("type") == "redirect"]
-    assert len(redirect_events) == 1, f"expected exactly one redirect event, got: {events}"
-    ev = redirect_events[0]
-    assert ev["intent"] == "create_workflow"
-    assert description_contains in ev["description"], (
-        f"expected {description_contains!r} in description, got {ev['description']!r}"
-    )
-    assert not any(e.get("type") in {"delta", "done", "error"} for e in events), (
-        f"LLM output leaked into stream: {events}"
-    )
-
-
-def test_stream_chat_emits_redirect_for_create_workflow(monkeypatch):
-    """Embedding fast-path hit → stream emits redirect, planner not called."""
-    b = CommandBridge(settings=object())
-    monkeypatch.setattr(b, "_get_intent_fast_path", lambda: _FakeWorkflowRouter())
-
-    def _boom(_req):
-        raise AssertionError("chat tool planner should not be called for create_workflow")
-    monkeypatch.setattr(b, "_select_chat_tool_plan", _boom)
+    monkeypatch.setattr(b, "_select_chat_tool_plan", _plan)
 
     req = parse_request({"mode": "chat", "input": "幫我建一個先問候再開燈的工作流"})
-    _assert_single_redirect(list(b.stream(req, "test-rid")), "工作流")
+    _assert_router_answer(list(b.stream(req, "test-rid")))
+    assert seen == ["幫我建一個先問候再開燈的工作流"]
 
 
-def test_stream_chat_nl_fallback_when_fast_path_disabled(monkeypatch):
-    """When fast-path is None (no embedder), bridge Layer 3 catches natural '工作流 + verb' phrase."""
-    b = CommandBridge(settings=object())
-    monkeypatch.setattr(b, "_get_intent_fast_path", lambda: None)
+def test_stream_chat_does_not_use_embedding_fast_path_before_model_router(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
 
-    def _boom(_req):
-        raise AssertionError("chat tool planner should not be called for create_workflow")
-    monkeypatch.setattr(b, "_select_chat_tool_plan", _boom)
+    monkeypatch.setattr(
+        b,
+        "_select_chat_tool_plan",
+        lambda _req: (ChatToolPlan(tool=CHAT_TOOL_NO_TOOL, answer="模型回答"), None),
+    )
+    text = "以投資為考量 這個商品能買嗎？ https://jp.mercari.com/item/m123"
+    events = list(b.stream(parse_request({"mode": "chat", "input": text}), "rid-product-research"))
 
-    # Natural phrase: "工作流" noun + "做" creation verb; no time/frequency.
+    assert events[0]["type"] == "start"
+    assert events[-1]["type"] == "done"
+    assert events[-1]["message"] == "模型回答"
+
+
+def test_stream_chat_workflow_text_uses_router_when_fast_path_disabled(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        b,
+        "_select_chat_tool_plan",
+        lambda _req: (ChatToolPlan(tool=CHAT_TOOL_NO_TOOL, answer="模型回答"), None),
+    )
+
     req = parse_request({"mode": "chat", "input": "幫我做一個先問候再開燈的工作流"})
-    _assert_single_redirect(list(b.stream(req, "test-rid2")), "工作流")
+    _assert_router_answer(list(b.stream(req, "test-rid2")))
 
 
-def test_stream_chat_nl_fallback_when_fast_path_misses(monkeypatch):
-    """When fast-path router returns None (miss), bridge Layer 3 catches natural '工作流 + verb' phrase."""
-    b = CommandBridge(settings=object())
-    monkeypatch.setattr(b, "_get_intent_fast_path", lambda: _FakeMissRouter())
-
-    def _boom(_req):
-        raise AssertionError("chat tool planner should not be called for create_workflow")
-    monkeypatch.setattr(b, "_select_chat_tool_plan", _boom)
+def test_stream_chat_workflow_text_uses_router_even_if_fast_path_would_miss(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        b,
+        "_select_chat_tool_plan",
+        lambda _req: (ChatToolPlan(tool=CHAT_TOOL_NO_TOOL, answer="模型回答"), None),
+    )
 
     req = parse_request({"mode": "chat", "input": "幫我建一個問候然後開燈的工作流"})
-    _assert_single_redirect(list(b.stream(req, "test-rid3")), "工作流")
+    _assert_router_answer(list(b.stream(req, "test-rid3")))
 
 
-def test_stream_chat_workflow_redirect_beats_music_tool_route(monkeypatch):
-    """A workflow-authoring request mentioning music must redirect, not play."""
-    b = CommandBridge(settings=object())
-    monkeypatch.setattr(b, "_get_intent_fast_path", lambda: None)
+def test_stream_chat_workflow_text_with_music_still_waits_for_model_plan(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
 
     music_calls: list[str] = []
 
@@ -2597,21 +3197,21 @@ def test_stream_chat_workflow_redirect_beats_music_tool_route(monkeypatch):
         music_calls.append(intent.action)
         raise AssertionError("music playback should not run for workflow authoring")
 
-    def _boom(_req):
-        raise AssertionError("chat tool planner should not be called for create_workflow")
-
     monkeypatch.setattr(b, "_exec_music_intent", _fake_music)
-    monkeypatch.setattr(b, "_select_chat_tool_plan", _boom)
+    monkeypatch.setattr(
+        b,
+        "_select_chat_tool_plan",
+        lambda _req: (ChatToolPlan(tool=CHAT_TOOL_NO_TOOL, answer="模型回答"), None),
+    )
 
     req = parse_request({"mode": "chat", "input": "建立工作流：播放最愛音樂清單 然後 開燈"})
-    _assert_single_redirect(list(b.stream(req, "test-rid-music")), "工作流")
+    _assert_router_answer(list(b.stream(req, "test-rid-music")))
     assert music_calls == []
 
 
 def test_stream_chat_music_uses_shared_tool_plan_path(monkeypatch):
     """Web chat music control should go through the shared tool-plan path."""
     b = CommandBridge(settings=object())
-    monkeypatch.setattr(b, "_get_intent_fast_path", lambda: None)
 
     def _plan(req):
         if False:
@@ -2638,18 +3238,10 @@ def test_stream_chat_music_uses_shared_tool_plan_path(monkeypatch):
 
 # --- /schedulehome bridge route (web#9) ------------------------------------
 # Tests assert the bridge's schedulehome contract: command and action methods
-# proxy to the existing handler/callback chain; the stream emits redirect for
-# create_schedule NL phrases; the E2E run path reaches the workflow executor.
-
-class _FakeScheduleRouter:
-    """Stub EmbeddingIntentRouter: always returns create_schedule for any text."""
-    ready = True
-
-    def route(self, text: str):
-        from telegram_nl.natural_language import TelegramNaturalLanguageIntent
-        return TelegramNaturalLanguageIntent(
-            intent="create_schedule", workflow_description=text, confidence=0.91
-        )
+# proxy to the existing handler/callback chain. Natural-language schedule
+# requests are intentionally routed through the shared model planner instead of
+# a bridge regex/embedding shortcut; the E2E run path reaches the workflow
+# executor.
 
 
 def _make_sh_bridge(tmp_path):
@@ -2759,39 +3351,38 @@ def test_run_schedulehome_action_cancel_clears_state(tmp_path):
     assert "取消" in result["message"] or "排程" in result["message"]
 
 
-def test_stream_chat_emits_redirect_for_create_schedule(monkeypatch, tmp_path):
-    """Embedding fast-path create_schedule → stream_redirect with intent + workflow_id."""
+def test_stream_chat_schedule_text_uses_model_router_not_fast_path(monkeypatch, tmp_path):
     b = _make_sh_bridge(tmp_path)
-    monkeypatch.setattr(b, "_get_intent_fast_path", lambda: _FakeScheduleRouter())
+    b.settings.openclaw_local_text_endpoint = "http://127.0.0.1:11434"
+    b.settings.openclaw_local_text_model = "qwen3:14b"
 
-    def _boom(_req):
-        raise AssertionError("chat tool planner must not be called for create_schedule")
-    monkeypatch.setattr(b, "_select_chat_tool_plan", _boom)
+    seen: list[str] = []
+
+    def _plan(req):
+        seen.append(req.input)
+        return ChatToolPlan(tool=CHAT_TOOL_NO_TOOL, answer="模型回答"), None
+
+    monkeypatch.setattr(b, "_select_chat_tool_plan", _plan)
 
     req = parse_request({"mode": "chat", "input": "幫我排程執行 greeting_workflow"})
     events = list(b.stream(req, "test-sh-rid"))
-    redirect_events = [e for e in events if e.get("type") == "redirect"]
-    assert len(redirect_events) == 1
-    ev = redirect_events[0]
-    assert ev["intent"] == "create_schedule"
-    assert "greeting_workflow" in ev["description"]
-    assert ev.get("workflow_id") == "greeting_workflow"
+    _assert_router_answer(events)
+    assert seen == ["幫我排程執行 greeting_workflow"]
 
 
-def test_stream_chat_bridge_re_catches_schedule_phrase(monkeypatch, tmp_path):
-    """Bridge Layer 3b catches '幫我建立排程' when fast-path disabled."""
+def test_stream_chat_schedule_phrase_uses_model_router(monkeypatch, tmp_path):
     b = _make_sh_bridge(tmp_path)
-    monkeypatch.setattr(b, "_get_intent_fast_path", lambda: None)
-
-    def _boom(_req):
-        raise AssertionError("chat tool planner must not be called for create_schedule")
-    monkeypatch.setattr(b, "_select_chat_tool_plan", _boom)
+    b.settings.openclaw_local_text_endpoint = "http://127.0.0.1:11434"
+    b.settings.openclaw_local_text_model = "qwen3:14b"
+    monkeypatch.setattr(
+        b,
+        "_select_chat_tool_plan",
+        lambda _req: (ChatToolPlan(tool=CHAT_TOOL_NO_TOOL, answer="模型回答"), None),
+    )
 
     req = parse_request({"mode": "chat", "input": "幫我建立排程"})
     events = list(b.stream(req, "test-sh-rid2"))
-    redirect_events = [e for e in events if e.get("type") == "redirect"]
-    assert len(redirect_events) == 1
-    assert redirect_events[0]["intent"] == "create_schedule"
+    _assert_router_answer(events)
 
 
 def test_run_schedule_manual_run_reaches_workflow_executor(tmp_path):
@@ -2860,22 +3451,20 @@ def test_extract_wf_slug_no_match():
     assert CommandBridge._extract_wf_slug("幫我建立排程") == ""
 
 
-def test_stream_chat_emits_redirect_for_kebab_workflow(monkeypatch, tmp_path):
-    """create_schedule redirect with wf- kebab id populates workflow_id correctly."""
+def test_stream_chat_kebab_workflow_schedule_text_uses_model_router(monkeypatch, tmp_path):
     b = _make_sh_bridge(tmp_path)
-    monkeypatch.setattr(b, "_get_intent_fast_path", lambda: _FakeScheduleRouter())
+    b.settings.openclaw_local_text_endpoint = "http://127.0.0.1:11434"
+    b.settings.openclaw_local_text_model = "qwen3:14b"
 
-    def _boom(_req):
-        raise AssertionError("chat tool planner must not be called")
-    monkeypatch.setattr(b, "_select_chat_tool_plan", _boom)
+    monkeypatch.setattr(
+        b,
+        "_select_chat_tool_plan",
+        lambda _req: (ChatToolPlan(tool=CHAT_TOOL_NO_TOOL, answer="模型回答"), None),
+    )
 
     req = parse_request({"mode": "chat", "input": "幫我排程執行 wf-morning-greeting"})
     events = list(b.stream(req, "test-kebab-rid"))
-    redirect_events = [e for e in events if e.get("type") == "redirect"]
-    assert len(redirect_events) == 1
-    ev = redirect_events[0]
-    assert ev["intent"] == "create_schedule"
-    assert ev.get("workflow_id") == "wf-morning-greeting"
+    _assert_router_answer(events)
 
 
 def test_run_schedulehome_command_add_for_wf_kebab(tmp_path):
@@ -3037,6 +3626,140 @@ def test_cloud_pool_stream_all_fail_fallback_local(monkeypatch):
     meta = done[0].get("model_metadata", {})
     assert meta["final_provider"] == "local"
     assert meta["fallback_occurred"] is True
+
+
+# --- CloudPoolRotation wiring (chat-goal loop follow-up) -------------------
+
+def test_generate_cloud_pool_chat_tool_plan_rotates_start_provider(monkeypatch):
+    """A shared CloudPoolRotation passed into two successive calls starts each
+    call at a different provider instead of always retrying gemini first."""
+    from openclaw_adapter.llm_pool_settings import CloudPoolRotation
+
+    b = CommandBridge(settings=_tool_settings(
+        gemini_key="fake-key", mistral_key="fake-mistral",
+    ))
+    monkeypatch.setattr(b, "_build_gemini_chat_client",
+                        lambda model: _FakeCloudClient("gemini"))
+    monkeypatch.setattr(b, "_build_mistral_chat_client",
+                        lambda: _FakeCloudClient("mistral"))
+    monkeypatch.setattr(b, "_build_cloud_chat_client", lambda: _FakeCloudClient("bigpickle"))
+
+    rotation = CloudPoolRotation()
+    _text1, meta1 = b._generate_cloud_pool_chat_tool_plan("p", pool_rotation=rotation)
+    _text2, meta2 = b._generate_cloud_pool_chat_tool_plan("p", pool_rotation=rotation)
+    _text3, meta3 = b._generate_cloud_pool_chat_tool_plan("p", pool_rotation=rotation)
+
+    assert meta1.final_provider == "gemini"
+    assert meta2.final_provider == "mistral"
+    assert meta3.final_provider == "opencode"
+
+
+def test_generate_cloud_pool_chat_tool_plan_without_rotation_always_starts_first(monkeypatch):
+    b = CommandBridge(settings=_tool_settings(
+        gemini_key="fake-key", mistral_key="fake-mistral",
+    ))
+    monkeypatch.setattr(b, "_build_gemini_chat_client",
+                        lambda model: _FakeCloudClient("gemini"))
+    monkeypatch.setattr(b, "_build_mistral_chat_client",
+                        lambda: _FakeCloudClient("mistral"))
+
+    _text1, meta1 = b._generate_cloud_pool_chat_tool_plan("p")
+    _text2, meta2 = b._generate_cloud_pool_chat_tool_plan("p")
+    assert meta1.final_provider == "gemini"
+    assert meta2.final_provider == "gemini"
+
+
+def test_handle_cloud_pool_blocking_rotates_start_provider(monkeypatch):
+    from openclaw_adapter.llm_pool_settings import CloudPoolRotation
+
+    b = CommandBridge(settings=_tool_settings(
+        gemini_key="fake-key", mistral_key="fake-mistral",
+    ))
+    monkeypatch.setattr(b, "_build_gemini_chat_client",
+                        lambda model: _FakeCloudClient("gemini"))
+    monkeypatch.setattr(b, "_build_mistral_chat_client",
+                        lambda: _FakeCloudClient("mistral"))
+    monkeypatch.setattr(b, "_build_cloud_chat_client", lambda: _FakeCloudClient("bigpickle"))
+
+    rotation = CloudPoolRotation()
+    _text1, meta1 = b._handle_cloud_pool_blocking("p", pool_rotation=rotation)
+    _text2, meta2 = b._handle_cloud_pool_blocking("p", pool_rotation=rotation)
+
+    assert meta1.final_provider == "gemini"
+    assert meta2.final_provider == "mistral"
+
+
+def test_goal_llm_transform_client_cloud_pool_uses_rotation(monkeypatch):
+    from openclaw_adapter.command_bridge import _WorkflowShimRunner
+    from openclaw_adapter.llm_pool_settings import CloudPoolRotation
+
+    b = CommandBridge(settings=_tool_settings(
+        gemini_key="fake-key", mistral_key="fake-mistral",
+    ))
+    monkeypatch.setattr(b, "_build_gemini_chat_client",
+                        lambda model: _FakeCloudClient("gemini"))
+    monkeypatch.setattr(b, "_build_mistral_chat_client",
+                        lambda: _FakeCloudClient("mistral"))
+    monkeypatch.setattr(b, "_build_cloud_chat_client", lambda: _FakeCloudClient("bigpickle"))
+    runner = SimpleNamespace(client=_FakeCloudClient("local"))
+
+    rotation = CloudPoolRotation()
+    client = b._goal_llm_transform_client(CHAT_BACKEND_CLOUD_POOL, runner, rotation)
+    assert client.generate("p", temperature=0.7) == "gemini:p"
+    assert client.generate("p", temperature=0.7) == "mistral:p"
+
+
+def test_goal_llm_transform_client_cloud_pool_exhausted_falls_back_to_local(monkeypatch):
+    from openclaw_adapter.llm_pool_settings import CloudPoolRotation
+
+    b = CommandBridge(settings=_tool_settings(gemini_key=None, mistral_key=None))
+    monkeypatch.setattr(b, "_build_cloud_chat_client", lambda: None)
+    runner = SimpleNamespace(client=_FakeCloudClient("local"))
+
+    client = b._goal_llm_transform_client(CHAT_BACKEND_CLOUD_POOL, runner, CloudPoolRotation())
+    assert client.generate("p", temperature=0.7) == "local:p"
+
+
+def test_goal_llm_transform_client_single_backend_falls_back_to_local_on_failure(monkeypatch):
+    b = CommandBridge(settings=_tool_settings(gemini_key="fake-key"))
+    monkeypatch.setattr(b, "_build_gemini_chat_client",
+                        lambda model: _FakeCloudClient("gemini", fail=True))
+    runner = SimpleNamespace(client=_FakeCloudClient("local"))
+
+    client = b._goal_llm_transform_client(CHAT_BACKEND_GEMINI, runner, None)
+    assert client.generate("p", temperature=0.7) == "local:p"
+
+
+def test_goal_llm_transform_client_local_backend_uses_runner_client_directly(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    runner = SimpleNamespace(client=_FakeCloudClient("local"))
+
+    client = b._goal_llm_transform_client(CHAT_BACKEND_LOCAL, runner, None)
+    assert client.generate("p", temperature=0.7) == "local:p"
+
+
+def test_workflow_shim_runner_uses_gear_configured_local_model_not_hardcoded(monkeypatch, tmp_path):
+    """#54 follow-up: the goal-loop's local fallback client must read the
+    model the user picked in the llm-pool gear settings, not a hardcoded
+    "qwen3:14b" — the settings' own env-level default can legitimately differ
+    from the gear-configured pool model."""
+    import openclaw_adapter.dynamic_tools as dt
+
+    monkeypatch.setattr(dt, "_resolve_tools_dir", lambda: tmp_path / "generated_tools")
+    monkeypatch.setattr(dt, "DynamicToolRunner", lambda **kwargs: _FakeDynamicToolRunner(**kwargs))
+
+    pool_config = tmp_path / "llm_pool.json"
+    pool_config.write_text(json.dumps({
+        "providers": {"local": {"enabled": True, "model": "gemma3:4b"}},
+    }), encoding="utf-8")
+    settings = SimpleNamespace(
+        openclaw_local_text_endpoint="http://127.0.0.1:11434",
+        openclaw_local_text_model="qwen3:14b",
+        openclaw_local_text_timeout_seconds=75,
+        openclaw_llm_pool_config_path=str(pool_config),
+    )
+    shim = _WorkflowShimRunner(settings)
+    assert shim.client.model == "gemma3:4b"
 
 
 def test_model_routes_includes_cloud_pool():

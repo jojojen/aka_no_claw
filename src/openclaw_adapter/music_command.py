@@ -40,6 +40,7 @@ import json
 import logging
 import os
 import random
+import re
 import shutil
 import signal
 import subprocess
@@ -953,7 +954,7 @@ class PlaybestController:
 
     def start(
         self, entries_provider, state_path: str, on_play=None, is_playable=None,
-        mode: str = "playbest",
+        mode: str = "playbest", shuffler=None,
     ) -> None:
         self.stop()
         # Claim the shared session: this token is what the loop checks each tick.
@@ -969,7 +970,7 @@ class PlaybestController:
             self._active = True
             thread = threading.Thread(
                 target=self._loop,
-                args=(entries_provider, state_path, on_play, is_playable, token, mode),
+                args=(entries_provider, state_path, on_play, is_playable, token, mode, shuffler),
                 daemon=True,
                 name="music-playbest",
             )
@@ -993,8 +994,8 @@ class PlaybestController:
             thread.join(timeout=2.0)
         return was_active
 
-    def _loop(self, entries_provider, state_path: str, on_play, is_playable=None, token=None, mode: str = "playbest") -> None:
-        scheduler = PlaybestScheduler(entries_provider, exists_fn=is_playable)
+    def _loop(self, entries_provider, state_path: str, on_play, is_playable=None, token=None, mode: str = "playbest", shuffler=None) -> None:
+        scheduler = PlaybestScheduler(entries_provider, exists_fn=is_playable, shuffler=shuffler)
         consecutive_failures = 0
 
         def _live() -> bool:
@@ -1365,8 +1366,83 @@ def build_music_handler(
         if result.kind in ("exact", "single"):
             return _play(result.entry, state_path)
         if result.kind == "ambiguous":
-            return _candidates_text(arg, result.candidates)
+            # Several close matches: playing the best-ranked one immediately is
+            # better UX than asking the user to disambiguate (they can always
+            # re-specify). Mention the alternatives so the choice is visible.
+            played = _play(result.candidates[0], state_path)
+            others = "、".join(str(e.get("name", "?")) for e in result.candidates[1:])
+            return f"{played}\n（也找到相似歌曲：{others}；想換播請再指定完整曲名）"
         return f"找不到符合「{arg}」的歌曲。"
+
+    return handler
+
+
+_QUEUE_SPLIT_PATTERN = re.compile(r"[\n,;、｜|]+")
+
+
+def _play_queue(music_dir: str, index_path: str, state_path: str, raw: str) -> str:
+    """Play an explicit list of local songs IN ORDER, one after another, then
+    stop — the continuous controller with a play-once provider and a no-op
+    shuffler. Unmatched names are skipped and reported, so one bad name never
+    sinks the whole queue."""
+    names = [n.strip() for n in _QUEUE_SPLIT_PATTERN.split(raw or "") if n.strip()]
+    if not names:
+        return "用法：/musicqueue <歌名1>、<歌名2>…（也可一行一首）"
+    try:
+        index = load_or_build_index(music_dir, index_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("musicqueue: index build failed dir=%s", music_dir)
+        return f"音樂索引建立失敗：{exc}"
+    entries: list[dict] = []
+    missing: list[str] = []
+    for name in names:
+        result = _search(index.entries, name)
+        if result.kind in ("exact", "single"):
+            entries.append(result.entry)
+        elif result.kind == "ambiguous":
+            entries.append(result.candidates[0])
+        else:
+            missing.append(name)
+    if not entries:
+        return "清單中找不到任何符合的本地歌曲：" + "、".join(missing)
+
+    served = threading.Event()
+
+    def provider() -> list[dict]:
+        # one round only: after the queue is handed out once, the controller
+        # sees an empty provider and stops cleanly instead of looping forever
+        if served.is_set():
+            return []
+        served.set()
+        return list(entries)
+
+    def is_playable(path: str) -> bool:
+        return validate_song_path(path, music_dir)
+
+    _PLAYBEST.start(
+        entries_provider=provider,
+        state_path=state_path,
+        is_playable=is_playable,
+        mode="queue",
+        shuffler=lambda seq: None,
+    )
+    lines = ["開始依序連續播放："]
+    lines.extend(f"{i}. {e['name']}" for i, e in enumerate(entries, 1))
+    if missing:
+        lines.append("找不到而跳過：" + "、".join(missing))
+    return "\n".join(lines)
+
+
+def build_musicqueue_handler(settings: AssistantSettings) -> Callable[[str, str], str]:
+    music_dir = settings.openclaw_music_dir
+    index_path = settings.openclaw_music_index_path
+    state_path = settings.openclaw_music_player_state_path
+
+    def handler(raw: str, chat_id: str) -> str:
+        problem = _music_dir_problem(music_dir)
+        if problem:
+            return problem
+        return _play_queue(music_dir, index_path, state_path, raw)
 
     return handler
 
@@ -1425,12 +1501,6 @@ def build_musicdiag_handler(settings: AssistantSettings) -> Callable[[str, str],
         return _musicdiag_text(settings)
 
     return handler
-
-
-def _candidates_text(query: str, candidates: tuple[dict, ...]) -> str:
-    lines = [f"找到多首符合「{query}」的歌曲，請輸入更精確的名稱："]
-    lines.extend(f"{i}. {e['name']}" for i, e in enumerate(candidates, 1))
-    return "\n".join(lines)
 
 
 def _menu_text() -> str:

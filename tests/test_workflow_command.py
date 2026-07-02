@@ -1,6 +1,7 @@
 """Tests for workflow_command.py — /workflow subcommands (#53, Phase B)."""
 
 import json
+from types import SimpleNamespace
 import pytest
 
 from openclaw_adapter.task_workspace import Workflow, WorkflowStep, WorkflowStore
@@ -295,6 +296,28 @@ def test_cmd_create_nl_surfaces_local_fallback_warning(tmp_path):
     )
     assert text.startswith("⚠️")
     assert "本地模型" in text
+
+
+def test_cmd_create_nl_invalid_references_still_opens_editor(tmp_path):
+    store = _make_store(tmp_path)
+    bad = json.dumps({
+        "id": "wf-bad",
+        "goal": "壞草稿",
+        "steps": [
+            {"id": "s1", "kind": "command_sink", "command": "/missing", "literal": "x", "output": "r1"},
+        ],
+    }, ensure_ascii=False)
+    llm = _FakeLLM(bad)
+    editor = _FakeEditorDraft()
+    text, _ = _cmd_create(
+        "做一個壞草稿",
+        store, "c", llm_client=llm, catalog=None, editor=editor,
+        command_registry={"/saynow": SimpleNamespace(usage="把文字念出來")},
+    )
+    assert editor.drafts, "expected invalid but parseable draft to still open in editor"
+    assert editor.drafts[0][1].id == "wf-bad"
+    assert "草稿已開啟" in text
+    assert "not registered" in text
 
 
 def test_generate_workflow_falls_back_when_cloud_request_drops():

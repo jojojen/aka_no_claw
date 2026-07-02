@@ -8,7 +8,7 @@ weekdays. The flow is:
 2. ➕ → a ➖HH➕ / ➖MM➕ / ✅下一步 time picker.
 3. ✅下一步 → a weekday picker (個別星期多選 + 每天 / 平日 / 週末) and ✅完成.
 4. ✅完成 creates the schedule and enters *capture mode*: the user then sends the
-   slash commands to run (e.g. ``/music playbest``, ``/say 早安``) one per
+   slash commands to run (e.g. ``/music playbest``, ``/generateaudio 早安``) one per
    message, finishing with 「完成」. Capture is wired in telegram_bot.py's
    build_reply_plan so plain ``/`` messages append to the schedule.
 
@@ -199,7 +199,7 @@ def _capture_hint(entry: dict) -> str:
         f"✅ 已建立排程「{entry.get('label') or entry.get('id')}」"
         f"（{sched.get('time')} {days_label(sched.get('days') or [])}）。\n"
         "現在請直接傳要在該時間執行的指令，一則一則傳，例如：\n"
-        "/music playbest\n/say 早安\n"
+        "/music playbest\n/generateaudio 早安\n"
         "全部傳完後輸入「完成」即可。"
     )
 

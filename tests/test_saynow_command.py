@@ -1,6 +1,6 @@
 """Tests for /saynow — speak via AivisSpeech out the Mac mini speakers (#39).
 
-Unlike /say (which sends a Telegram voice file), /saynow plays the synthesized
+Unlike /generateaudio (which sends a generated audio file), /saynow plays the synthesized
 WAV locally through afplay. These tests mock the synthesizer and the player so
 no audio device or network is touched.
 """

@@ -18,6 +18,12 @@ import logging
 from pathlib import Path
 from typing import Callable
 
+from .goal_planner import (
+    build_goal_workflow_prompt as _shared_build_goal_workflow_prompt,
+    extract_json_object as _shared_extract_json_object,
+    generate_workflow_from_goal as _shared_generate_workflow_from_goal,
+    resolve_goal_draft_client as _shared_resolve_goal_draft_client,
+)
 from .task_workspace import (
     is_command_sink_allowed,
     Workflow,
@@ -32,6 +38,155 @@ logger = logging.getLogger(__name__)
 # and workflow drafting. Keep semantics in one table so the three surfaces
 # cannot drift.
 _COMMAND_METADATA: dict[str, dict[str, str]] = {
+    "/quiz": {
+        "usage": "JLPT 日文測驗；常用：random、wrong、stats、vocab、grammar、review。",
+    },
+    "/quizlikesong": {
+        "usage": "收藏 YouTube 歌曲並建立題庫；參數＝YouTube URL。",
+    },
+    "/voice": {
+        "usage": "語音合成預覽；參數＝要合成的日文文字。",
+    },
+    "/generateaudio": {
+        "usage": "產生音訊檔案；把文字轉成語音 WAV 並傳回 Telegram（參數＝要轉成語音的文字，通常用 input 變數帶入）",
+    },
+    "/saynow": {
+        "usage": "立即於 Mac mini 念出文字（參數＝要念的文字，通常用 input 變數帶入）",
+    },
+    "/new": {
+        "usage": "動態建立並執行新工具；高風險，不可作為自動 workflow sink。",
+    },
+    "/backupclaw": {
+        "usage": "備份 OpenClaw 資料庫與工具規格；可帶目的資料夾。",
+    },
+    "/backup": {
+        "usage": "同 /backupclaw；備份 OpenClaw 資料。",
+    },
+    "/clawrecover": {
+        "usage": "從備份還原 OpenClaw 資料；高風險，不可作為自動 workflow sink。",
+    },
+    "/recoverclaw": {
+        "usage": "同 /clawrecover；從備份還原 OpenClaw 資料。",
+    },
+    "/restartall": {
+        "usage": "重啟本機 OpenClaw 服務；高風險，不可作為自動 workflow sink。",
+    },
+    "/stats": {
+        "usage": "查看作答／系統統計（無參數）。",
+    },
+    "/scorecard": {
+        "usage": "同 /stats；查看統計（無參數）。",
+    },
+    "/knowledge": {
+        "usage": "查詢知識庫；常用參數：market、coding 或搜尋關鍵字。",
+    },
+    "/kb": {
+        "usage": "同 /knowledge；查詢知識庫。",
+    },
+    "/source": {
+        "usage": "查詢或管理知識來源；參數依 source 子命令。",
+    },
+    "/lookup": {
+        "usage": "查詢卡牌價格；格式同 /price，例如 pokemon | Pikachu ex | 132/106 | SAR | sv08。",
+    },
+    "/price": {
+        "usage": "查詢卡牌價格；參數＝遊戲與卡名／編號／稀有度／系列。",
+    },
+    "/trend": {
+        "usage": "查詢指定遊戲熱門／流動性榜；格式：<game> [數量]，例如 pokemon 5。",
+    },
+    "/trending": {
+        "usage": "同 /trend；格式：<game> [數量]。",
+    },
+    "/hot": {
+        "usage": "同 /trend；格式：<game> [數量]。",
+    },
+    "/heat": {
+        "usage": "同 /trend；格式：<game> [數量]。",
+    },
+    "/liquidity": {
+        "usage": "查詢指定遊戲流動性排名；格式：<game> [數量]。",
+    },
+    "/snapshot": {
+        "usage": "建立賣家／商品信譽快照；參數＝Mercari 商品或店鋪網址。",
+    },
+    "/proof": {
+        "usage": "同 /snapshot；參數＝Mercari 商品或店鋪網址。",
+    },
+    "/repcheck": {
+        "usage": "同 /snapshot；參數＝Mercari 商品或店鋪網址。",
+    },
+    "/reputation": {
+        "usage": "同 /snapshot；參數＝Mercari 商品或店鋪網址。",
+    },
+    "/search": {
+        "usage": (
+            "網路搜尋並回傳摘要與來源；參數＝搜尋查詢。"
+            "需要熱門、最新、排名或外部事實時先用這個。"
+        ),
+        "chat_tool_purpose": "當回答需要即時、最新、外部來源或不確定的事實資訊時使用",
+        "chat_tool_query_hint": "query 是適合搜尋引擎的完整查詢，不要包含 /search",
+        "chat_tool_display_name": "網路搜尋",
+    },
+    "/fetch": {
+        "usage": (
+            "讀取指定網頁並針對問題回答；格式：<網址> <問題>。"
+            "已有明確來源網址、需要讀頁面內容時使用；一般文章、公告、說明頁優先用這個。"
+        ),
+    },
+    "/read": {
+        "usage": "同 /fetch；格式：<網址> <問題>。",
+    },
+    "/web": {
+        "usage": "同 /search；參數＝搜尋查詢。",
+    },
+    "/research": {
+        "usage": (
+            "深度商品研究與投資判斷；參數＝商品網址或商品描述。"
+            "當使用者問商品能不能買、是否適合投資、估價、行情、流動性、賣家風險，"
+            "或提供 Mercari/拍賣/商品頁網址時用這個。"
+            "例：/research https://jp.mercari.com/item/m123456789 以投資為考量這個商品能買嗎？"
+        ),
+        "chat_tool_purpose": (
+            "當使用者要評估商品能否購買、是否值得投資、估價、行情、流動性、"
+            "賣家風險，或貼出 Mercari/拍賣/商品頁網址時使用"
+        ),
+        "chat_tool_query_hint": "query 保留商品 URL 或商品描述，並保留使用者的投資／購買判斷問題",
+        "chat_tool_display_name": "商品研究",
+    },
+    "/resaerch": {
+        "usage": "同 /research（歷史拼字相容別名）。",
+    },
+    "/scan": {
+        "usage": "圖片辨識命令；需搭配 Telegram 圖片，不適合作為純文字 workflow 步驟。",
+    },
+    "/image": {
+        "usage": "同 /scan；需搭配 Telegram 圖片。",
+    },
+    "/photo": {
+        "usage": "同 /scan；需搭配 Telegram 圖片。",
+    },
+    "/watch": {
+        "usage": "新增 marketplace 追蹤；格式：<關鍵字> on <價格> [markets:mercari,rakuma,yuyutei]。",
+    },
+    "/watchlist": {
+        "usage": "列出 marketplace 追蹤清單（無參數）。",
+    },
+    "/watches": {
+        "usage": "同 /watchlist（無參數）。",
+    },
+    "/unwatch": {
+        "usage": "移除 marketplace 追蹤；參數＝追蹤 ID。",
+    },
+    "/stopwatch": {
+        "usage": "同 /unwatch；參數＝追蹤 ID。",
+    },
+    "/setprice": {
+        "usage": "更新追蹤價格；格式：<追蹤 ID> <新價格>。",
+    },
+    "/updatewatch": {
+        "usage": "同 /setprice；格式：<追蹤 ID> <新價格>。",
+    },
     "/ir": {
         "usage": (
             "discover=掃描可用紅外線裝置；devices=列出已註冊裝置；"
@@ -42,43 +197,112 @@ _COMMAND_METADATA: dict[str, dict[str, str]] = {
             "query 只輸出 /ir 後面的參數，例如 discover、devices 或 "
             "send ceiling_light power"
         ),
+        "chat_tool_display_name": "紅外線控制",
     },
     "/music": {
         "usage": (
             "playbest=播放最愛清單；random=隨機播放；stop=停止；"
             "pause=暫停；resume=繼續；next/previous=切歌；"
-            "<關鍵字>=搜尋並播放該歌曲"
+            "<本地歌曲關鍵字>=搜尋並播放本地曲目。"
+            "一次只播一首，且呼叫時會停掉正在播放的歌；"
+            "要依序連播多首請改用 /musicqueue，不要連續呼叫 /music。"
+            "不負責判斷熱門／最新；需要外部判斷時先用 /search，"
+            "需要確認本地可播曲目時先用 /musiclistall，再用 llm_transform 比對。"
         ),
         "chat_tool_purpose": "當使用者要控制本機音樂播放時使用",
         "chat_tool_query_hint": (
             "query 只輸出 /music 後面的參數，例如 stop、pause、resume、"
             "next、previous、random、playbest 或歌曲關鍵字"
         ),
+        "chat_tool_display_name": "音樂控制",
+    },
+    "/musicqueue": {
+        "usage": (
+            "依序連續播放多首本地歌曲，每首播完自動接下一首；"
+            "參數＝歌名清單（以「、」或換行分隔）。"
+            "要一次播放多首指定歌曲時用這個。"
+        ),
+        "chat_tool_purpose": (
+            "當使用者要依序連續播放多首本地歌曲、且歌曲已可直接列出時使用；"
+            "若還需要先查資料或挑選才能決定歌單，屬於多步驟目標，改用 __goal__"
+        ),
+        "chat_tool_query_hint": (
+            "query 只輸出 /musicqueue 後面的參數：以「、」分隔的歌名清單"
+        ),
+        "chat_tool_display_name": "音樂連播",
     },
     "/musicmute": {"usage": "音樂靜音（無參數）"},
     "/musiclouder": {"usage": "調高音量（無參數）"},
     "/musiclower": {"usage": "調低音量（無參數）"},
     "/musicnowbest": {"usage": "把目前播放的歌曲加入最愛清單（無參數）"},
-    "/musiclistall": {"usage": "列出全部曲目清單（不播放，無參數）"},
+    "/musiclistall": {
+        "usage": (
+            "列出全部本地可播曲目清單（不播放，無參數）。"
+            "規劃需要從本機音樂庫挑歌時，先用這個取得候選清單。"
+        )
+    },
     "/musiclistbest": {
         "usage": "列出最愛曲目清單（不播放，無參數）；要『播放』最愛請改用 /music playbest",
-    },
-    "/saynow": {
-        "usage": "立即於 Mac mini 念出文字（參數＝要念的文字，通常用 input 變數帶入）",
-    },
-    "/say": {
-        "usage": "用語音念出文字（參數＝要念的文字，通常用 input 變數帶入）",
     },
     "/bluetooth": {
         "usage": "scan=掃描藍牙裝置；<裝置名>=連線／切換藍牙裝置",
         "chat_tool_purpose": "當使用者要掃描、查看、連線或切換藍牙裝置時使用",
         "chat_tool_query_hint": "query 只輸出 /bluetooth 後面的參數；掃描時輸出 scan，連線時輸出裝置名",
+        "chat_tool_display_name": "藍牙控制",
     },
     "/translateja": {
         "usage": "把文字翻成日文（參數＝原文，通常用 input 變數帶入）",
     },
+    "/ja": {
+        "usage": "同 /translateja；把文字翻成日文。",
+    },
+    "/jp": {
+        "usage": "同 /translateja；把文字翻成日文。",
+    },
     "/translatezh": {
         "usage": "把文字翻成繁體中文（參數＝原文，通常用 input 變數帶入）",
+    },
+    "/zh": {
+        "usage": "同 /translatezh；把文字翻成繁體中文。",
+    },
+    "/snsadd": {
+        "usage": "新增 X/Twitter 監控；格式：@帳號、keyword:<關鍵字> 或 trend:<分類>。",
+    },
+    "/sns_add": {
+        "usage": "同 /snsadd；新增 X/Twitter 監控。",
+    },
+    "/snslist": {
+        "usage": "列出 X/Twitter 監控規則（無參數）。",
+    },
+    "/sns_list": {
+        "usage": "同 /snslist；列出 X/Twitter 監控規則。",
+    },
+    "/snsdelete": {
+        "usage": "刪除 X/Twitter 監控規則；參數＝rule_id。",
+    },
+    "/sns_delete": {
+        "usage": "同 /snsdelete；刪除 X/Twitter 監控規則。",
+    },
+    "/snsbuzz": {
+        "usage": "查詢 4chan 收藏品／IP 熱度；參數＝關鍵字。",
+    },
+    "/sns_buzz": {
+        "usage": "同 /snsbuzz；查詢 4chan 收藏品／IP 熱度。",
+    },
+    "/snsclearfilter": {
+        "usage": "清除 SNS 監控規則的關鍵字過濾；參數＝rule_id。",
+    },
+    "/hunt": {
+        "usage": "Opportunity Agent 目標清單與操作；常用：status、remove <id>。",
+    },
+    "/opportunity": {
+        "usage": "同 /hunt；Opportunity Agent 操作入口。",
+    },
+    "/schedulehome": {
+        "usage": "建立居家排程，排程會重新派發既有 slash command；不作為 workflow sink。",
+    },
+    "/workflow": {
+        "usage": "管理 workflow；常用：list、show、run、create、edit、delete。",
     },
 }
 
@@ -91,6 +315,10 @@ _COMMAND_USAGE: dict[str, str] = {
 
 def command_metadata(command: str) -> dict[str, str]:
     return dict(_COMMAND_METADATA.get(command, {}))
+
+
+def iter_command_metadata() -> tuple[tuple[str, dict[str, str]], ...]:
+    return tuple((command, dict(meta)) for command, meta in sorted(_COMMAND_METADATA.items()))
 
 
 def _command_usage(command: str, command_registry=None) -> str:
@@ -282,6 +510,11 @@ def _cmd_create(
     if wf is None:
         return f"❌ 無法生成草稿：{err}\n可改用 /workflow new 手動建立。"
     text, markup = editor.start_from_draft(chat_id, wf)
+    if err:
+        text = (
+            "⚠️ 草稿已開啟，但仍有待修正：\n"
+            f"{err}\n\n{text}"
+        )
     if client_warning:
         text = client_warning + text
     elif used_fallback and fallback_warning:
@@ -307,182 +540,37 @@ def _cmd_create_json(arg: str, store: WorkflowStore, *, command_registry=None) -
 
 
 def _resolve_draft_client(settings, runner) -> tuple[object, object, str | None, str | None]:
-    """Pick the LLM client(s) for natural-language workflow drafting.
-
-    Drafting a whole workflow from one sentence is abstract reasoning, so we
-    prefer the cloud big-pickle model and fall back to the runner's local Ollama
-    client. The fallback is never silent — a warning string is returned so the
-    user is told it happened.
-
-    The cloud big-pickle endpoint (free, no-auth) is flaky: its HTTP probe can
-    pass while the heavier generation request gets dropped mid-flight
-    (``RemoteDisconnected``). So we hand back BOTH a primary and a request-time
-    fallback, and let the caller retry locally when the cloud request itself
-    fails — not only when the probe fails.
-
-    Returns ``(primary, fallback, primary_warning, fallback_warning)``:
-      - ``primary_warning`` is prepended unconditionally (set when we already had
-        to downgrade to local at probe time).
-      - ``fallback_warning`` is prepended only if the fallback is actually used."""
-    local = getattr(runner, "client", None)
-    reason = ""
-    try:
-        from .dynamic_tools import OpenCodeTextClient, probe_opencode
-
-        base_url = (
-            getattr(settings, "openclaw_opencode_base_url", None)
-            or "https://opencode.ai/zen/v1"
-        ).strip()
-        raw_model = (getattr(settings, "openclaw_opencode_model", None) or "big-pickle").strip()
-        model = raw_model.split("/")[-1] if "/" in raw_model else raw_model
-        if probe_opencode(base_url, model=model, timeout=10.0):
-            cloud = OpenCodeTextClient(
-                base_url=base_url,
-                model=model,
-                api_key=getattr(settings, "openclaw_opencode_api_key", None),
-                timeout_seconds=180,
-            )
-            fb_warning = None
-            if local is not None:
-                fb_warning = (
-                    "⚠️ 雲端模型（big-pickle）連線中斷，已改用本地模型"
-                    f"（{type(local).__name__}）生成草稿，品質可能較低。\n\n"
-                )
-            return cloud, local, None, fb_warning
-        reason = "雲端端點 HTTP 探測失敗"
-    except Exception as exc:  # noqa: BLE001 — any cloud-setup failure → local fallback
-        logger.warning("workflow_command: cloud draft client setup failed, using local",
-                       exc_info=True)
-        reason = f"雲端模型設定失敗（{exc}）"
-
-    if local is None:
-        return None, None, None, None
-    local_label = type(local).__name__
-    logger.warning("workflow_command: cloud draft client unavailable (%s); using local %s",
-                   reason, local_label)
-    warning = (
-        f"⚠️ 雲端模型（big-pickle）目前無法使用（{reason}），"
-        f"已改用本地模型（{local_label}）生成草稿，品質可能較低。\n\n"
-    )
-    return local, None, warning, None
+    return _shared_resolve_goal_draft_client(settings, runner)
 
 
 def _generate_workflow_from_nl(
     description: str, llm_client, catalog, *,
     command_registry=None, fallback_client=None,
 ):
-    """Ask the LLM to draft a Workflow from a one-line description.
-
-    Returns ``(Workflow, None, used_fallback)`` on success or
-    ``(None, error_message, used_fallback)`` on failure. Tool steps are grounded
-    on the live generated-tool catalog so the draft references real slugs.
-
-    Tries ``llm_client`` first; if its request itself fails (the cloud endpoint
-    drops the connection — ``RemoteDisconnected`` — even though the earlier probe
-    passed), retries once with ``fallback_client``. ``used_fallback`` tells the
-    caller whether to surface the local-fallback warning."""
-    prompt = _build_nl_workflow_prompt(description, catalog, command_registry=command_registry)
-    clients: list[tuple[object, bool]] = [(llm_client, False)]
-    if fallback_client is not None and fallback_client is not llm_client:
-        clients.append((fallback_client, True))
-
-    last_err: object = "無可用的 LLM client"
-    for client, is_fallback in clients:
-        if client is None:
-            continue
-        try:
-            raw = client.generate(prompt, temperature=0.2)
-        except Exception as exc:  # noqa: BLE001 — transport failure → try next client
-            logger.warning("workflow_command: draft via %s failed: %s",
-                           type(client).__name__, exc)
-            last_err = exc
-            continue
-        data = _extract_json_object(raw)
-        if data is None:
-            last_err = "LLM 未回傳有效的 JSON"
-            continue
-        # Backfill required top-level keys so a slightly-incomplete draft still
-        # opens in the editor (the user can fix it there) rather than hard-failing.
-        if not data.get("id"):
-            data["id"] = "wf-draft"
-        if not data.get("goal"):
-            data["goal"] = description
-        try:
-            wf = Workflow.from_dict(data)
-        except (KeyError, TypeError) as exc:
-            return None, f"草稿結構錯誤：{exc}", is_fallback
-        return wf, None, is_fallback
-    return None, f"LLM 生成失敗：{last_err}", False
+    return _shared_generate_workflow_from_goal(
+        description,
+        llm_client,
+        catalog,
+        command_registry=command_registry,
+        allowed_commands=sorted(_COMMAND_USAGE),
+        command_usage_resolver=_command_usage,
+        fallback_client=fallback_client,
+        strict=False,
+    )
 
 
 def _build_nl_workflow_prompt(description: str, catalog, *, command_registry=None) -> str:
-    tool_lines = []
-    if catalog is not None:
-        try:
-            for entry in catalog.entries()[:40]:
-                desc = (entry.description or "").strip().replace("\n", " ")[:80]
-                tool_lines.append(f"- {entry.slug}: {desc}")
-        except Exception:  # noqa: BLE001 — catalog is best-effort grounding
-            tool_lines = []
-    tool_block = "\n".join(tool_lines) if tool_lines else "（目前沒有已生成的工具可參考）"
-
-    # Render each allowlisted command WITH its usage so the LLM knows the real
-    # argument shape (e.g. /music playbest, /ir send ceiling_light power) and fills
-    # `literal` correctly instead of inventing commands or fabricating
-    # llm_transform steps to produce fixed parameters.
-    if command_registry is not None:
-        allowed_cmds = sorted(c for c in command_registry if is_command_sink_allowed(c))
-    else:
-        allowed_cmds = sorted(_COMMAND_USAGE)
-    cmd_lines = []
-    for c in allowed_cmds:
-        usage = _command_usage(c, command_registry)
-        cmd_lines.append(f"- {c}：{usage}" if usage else f"- {c}")
-    command_block = "\n".join(cmd_lines) if cmd_lines else "（目前沒有可用的指令）"
-
-    return (
-        "你是工作流草稿生成器。把使用者的一句話需求轉成結構化的 workflow JSON。\n\n"
-        "步驟種類（kind）：\n"
-        "- tool_call：呼叫一個已生成的工具。欄位：tool（slug）、args（物件）、output（變數名）。\n"
-        "- llm_transform：用 LLM 把輸入變數轉換成文字。欄位：inputs（變數名陣列）、"
-        "instructions（指示）、output（變數名）。\n"
-        "- command_sink：呼叫一個 slash 指令。欄位：command、output（變數名），參數二選一：\n"
-        "    • literal（固定字串參數）：當參數是固定的、不依賴前面步驟時用這個，直接填指令後面要帶的字串。\n"
-        "      例：開最愛音樂清單 → {\"kind\":\"command_sink\",\"command\":\"/music\",\"literal\":\"playbest\",\"output\":\"r1\"}\n"
-        "      例：切換天花板燈電源 → {\"kind\":\"command_sink\",\"command\":\"/ir\",\"literal\":\"send ceiling_light power\",\"output\":\"r2\"}\n"
-        "    • input（變數名）：只有當參數需要引用前面步驟產生的 output 變數時才用。\n"
-        f"  command 只能是下列已登記的指令（請依其用法填 literal）：\n{command_block}\n\n"
-        "可用的工具（tool_call 只能使用下列已存在的 slug；若沒有合適的，改用 llm_transform 或 command_sink，不可自行編造 slug）：\n"
-        f"{tool_block}\n\n"
-        "規則：\n"
-        "1. 每個步驟都要有唯一的 output 變數名（英文小寫，如 weather、greeting）。\n"
-        "2. 參數固定時一律用 command_sink 的 literal 直接填，**不要**為了產生固定參數而多插一個 llm_transform 步驟。\n"
-        "3. 後面步驟的 inputs／input 只能引用前面步驟產生的 output 變數。\n"
-        "4. command 只能用上面列出的指令，不可自行編造（如 /musiclistbest 不存在）。\n"
-        "5. id 用 kebab-case，並以 wf- 開頭（如 wf-morning-greeting）。\n"
-        "6. 只輸出 JSON，不要任何說明文字或 markdown 圍欄。\n\n"
-        "輸出格式：\n"
-        '{"id":"wf-...","goal":"...","steps":[{"id":"s1","kind":"...","...":"..."}]}\n\n'
-        f"使用者需求：{description}\n\n"
-        "JSON："
+    return _shared_build_goal_workflow_prompt(
+        description,
+        catalog,
+        command_registry=command_registry,
+        allowed_commands=sorted(_COMMAND_USAGE),
+        command_usage_resolver=_command_usage,
     )
 
 
 def _extract_json_object(text: str) -> dict | None:
-    """Pull the first top-level JSON object out of an LLM response.
-
-    Tolerates ```json fences and surrounding prose."""
-    if not text:
-        return None
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None
-    try:
-        data = json.loads(text[start : end + 1])
-    except json.JSONDecodeError:
-        return None
-    return data if isinstance(data, dict) else None
+    return _shared_extract_json_object(text)
 
 
 def _cmd_run(

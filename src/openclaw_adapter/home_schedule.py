@@ -1,7 +1,7 @@
 """Local timed home scheduler for the ``/schedulehome`` command (issue #39).
 
 A single-user, local-only scheduler that runs existing OpenClaw slash commands
-(``/music``, ``/say``, ``/bluetooth`` …) at predefined times. Schedules persist
+(``/music``, ``/generateaudio``, ``/bluetooth`` …) at predefined times. Schedules persist
 to a gitignored runtime JSON file so they survive bot restarts, and each entry
 stores the slash commands verbatim — execution simply re-dispatches them through
 the *same* command registry the Telegram bot already uses, so there is no second
@@ -122,7 +122,7 @@ def run_schedule_commands(
     """Run an entry's commands sequentially, returning one result line each.
 
     ``run_command(command, chat_id)`` is dispatched with a *real* chat id so
-    commands that deliver to Telegram (e.g. ``/say`` sends synthesized audio to
+    commands that deliver to Telegram (e.g. ``/generateaudio`` sends a generated audio file to
     that chat) reach the right destination. A failing command never aborts the
     rest — its error becomes a result line so the user sees exactly which step
     failed (Rule C4: no silent substitution)."""
@@ -340,10 +340,10 @@ def make_run_slash_command(
     Telegram dispatcher uses, so scheduled actions reuse existing handlers.
 
     ``run(command, chat_id)`` dispatches with a real chat id, so commands that
-    deliver to Telegram (e.g. ``/say``) reach that chat. Background-flagged
+    deliver to Telegram (e.g. ``/generateaudio``) reach that chat. Background-flagged
     commands run synchronously here (the scheduler/manual run is already off the
     poll loop), a tuple ``(text, markup)`` result is reduced to its text, and a
-    ``None`` result (handlers that deliver out-of-band, like ``/say``) becomes a
+    ``None`` result (handlers that deliver out-of-band, like ``/generateaudio``) becomes a
     short done marker — schedules report a text summary, not buttons.
     """
 

@@ -43,6 +43,7 @@ FetchUrl = Callable[[str, int, str, ssl.SSLContext | None], str]
 SearchFn = Callable[[str, int], tuple["WebSearchResult", ...]]
 SummarizeFn = Callable[[str, tuple["WebSearchResult", ...]], str]
 FetchPageFn = Callable[[str], str]
+BrowserFetchUrl = Callable[[str, int, str], str]
 ReformulateFn = Callable[[str], Sequence[str]]
 RelevanceFn = Callable[[str, tuple["WebSearchResult", ...]], tuple["WebSearchResult", ...]]
 PageAnswerFn = Callable[[str, str, str], str]
@@ -794,6 +795,59 @@ def _fetch_url(
         raise RuntimeError(f"DuckDuckGo search failed: {exc.reason}") from exc
 
 
+def _fetch_url_with_browser(
+    url: str,
+    timeout_seconds: int,
+    user_agent: str,
+) -> str:
+    """Render a page in Chromium and return the hydrated HTML.
+
+    This is intentionally generic: no site-specific selectors or marketplace
+    parsing. It is used by /fetch only as a fallback when static HTML extraction
+    looks too thin for JS-heavy pages.
+    """
+    from playwright.sync_api import TimeoutError as PlaywrightTimeout
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        browser = bs.launch_stealth_chromium(playwright, headless=True, logger=logger)
+        try:
+            context = bs.new_stealth_context(browser)
+            page = context.new_page()
+            page.set_extra_http_headers({"User-Agent": user_agent})
+            try:
+                page.goto(_ascii_safe_url(url), wait_until="domcontentloaded", timeout=timeout_seconds * 1000)
+            except PlaywrightTimeout:
+                logger.warning("browser fetch goto timeout; reading current DOM url=%s", url)
+            page.wait_for_selector("body", timeout=min(timeout_seconds * 1000, 15_000))
+            try:
+                page.wait_for_load_state("networkidle", timeout=8_000)
+            except Exception:
+                pass
+            page.wait_for_timeout(1200)
+            bs.humanize(page)
+            return page.content()
+        finally:
+            browser.close()
+
+
+def _looks_like_low_value_page_text(text: str, *, min_chars: int) -> bool:
+    cleaned = _compact_lines(text)
+    if len(cleaned) < min_chars:
+        return True
+    lowered = cleaned.lower()
+    js_markers = (
+        "enable javascript",
+        "requires javascript",
+        "please enable javascript",
+        "javascriptを有効",
+        "javascript が無効",
+        "unsupported browser",
+        "お使いのブラウザ",
+    )
+    return any(marker in lowered for marker in js_markers)
+
+
 def _build_summary_prompt(query: str, sources: tuple[WebSearchResult, ...]) -> str:
     source_lines: list[str] = []
     for index, source in enumerate(sources, start=1):
@@ -839,6 +893,9 @@ def fetch_page_text(
     user_agent: str = bs.MAC_CHROME_UA,
     ssl_context: ssl.SSLContext | None = None,
     fetch_url: FetchUrl | None = None,
+    enable_browser_fallback: bool = False,
+    browser_fetch_url: BrowserFetchUrl | None = None,
+    browser_fallback_min_chars: int = 700,
 ) -> str:
     """Fetch ``url`` and return its readable text, truncated to ``max_chars``.
 
@@ -852,8 +909,19 @@ def fetch_page_text(
         html = fetch(url, timeout_seconds, user_agent, ssl_context)
     except Exception:
         logger.exception("fetch_page_text download failed url=%s", url)
-        return ""
+        html = ""
     text = extract_readable_text(html)
+    if enable_browser_fallback and _looks_like_low_value_page_text(
+        text, min_chars=browser_fallback_min_chars
+    ):
+        browser_fetch = browser_fetch_url or _fetch_url_with_browser
+        try:
+            rendered_html = browser_fetch(url, timeout_seconds, user_agent)
+            rendered_text = extract_readable_text(rendered_html)
+            if len(rendered_text) > len(text):
+                text = rendered_text
+        except Exception:
+            logger.exception("fetch_page_text browser fallback failed url=%s", url)
     return _truncate(text, max_chars)
 
 
