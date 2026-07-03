@@ -32,6 +32,8 @@ data/*.db-shm
 data/*.db-wal
 data/*.log
 data/quiz_song_packs/
+# contains notify_chat_id (personal data) — never commit
+data/vpn_rotation.json
 !data/.gitkeep
 logs/
 run/

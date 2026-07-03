@@ -157,6 +157,21 @@ _COMMAND_METADATA: dict[str, dict[str, str]] = {
     "/resaerch": {
         "usage": "同 /research（歷史拼字相容別名）。",
     },
+    "/fix": {
+        "usage": (
+            "benchmark 自我修復迴圈；無參數＝列出可修復的 benchmark，"
+            "參數＝benchmark 名稱（如 price_reference_sources）開始修復。"
+            "只修 docs/fix_benchmarks/ 內的 benchmark parser，不碰 production 程式碼；"
+            "高風險，不可作為自動 workflow sink。"
+        ),
+    },
+    "/vpn": {
+        "usage": (
+            "NordVPN 出口控制；無參數＝狀態，switch [國家]＝換伺服器（換 IP），"
+            "auto on [小時]/auto off＝定期自動輪替，pool 國家,國家＝設定輪替池。"
+            "會改變全機網路出口；高風險，不可作為自動 workflow sink。"
+        ),
+    },
     "/scan": {
         "usage": "圖片辨識命令；需搭配 Telegram 圖片，不適合作為純文字 workflow 步驟。",
     },
