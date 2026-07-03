@@ -24,7 +24,16 @@ def test_restart_script_covers_core_services() -> None:
     )
 
     # Non-launchd services: restarted via kill+nohup.
-    assert "command-bridge --lan --port 8781" in script
+    # The bridge launches via its respawn wrapper (it is the rescue path when
+    # the poller dies, so a crash must not close the pane permanently).
+    assert "exec /bin/sh '$CLAW/scripts/run_command_bridge.sh'" in script
+    # …but the inline python start must be gone (stop_pattern lines still
+    # mention the command string — that's the kill pattern, not a start).
+    assert ".venv/bin/python' -m openclaw_adapter command-bridge" not in script
+    bridge_wrapper = (
+        Path(__file__).resolve().parents[1] / "scripts" / "run_command_bridge.sh"
+    ).read_text(encoding="utf-8")
+    assert "command-bridge --lan --port 8781" in bridge_wrapper
     assert "reputation_snapshot/.venv/bin/python" in script
     assert "npm run dev -- --host 0.0.0.0" in script
     assert "openclaw_adapter.scrape_worker" in script
@@ -50,7 +59,17 @@ def test_launchd_services_use_kickstart_not_nohup_except_telegram() -> None:
     assert 'launchctl remove "local.openclaw.telegram"' in script
     assert 'stop_pattern "telegram" "openclaw_adapter telegram-poll"' in script
     assert 'start_tmux_service "telegram"' in script
-    assert "-m openclaw_adapter telegram-poll" in script
+    # The poller launches via the respawn wrapper, NOT inline: telegram left
+    # launchd, so a crash (or the poll-watchdog's os._exit) must be respawned
+    # by the wrapper loop instead of silently closing the tmux pane
+    # (2026-07-03: /vpn switch killed the poller with no respawner).
+    assert "run_telegram_poll.sh" in script
+    assert "-m openclaw_adapter telegram-poll" not in script
+    wrapper = (
+        Path(__file__).resolve().parents[1] / "scripts" / "run_telegram_poll.sh"
+    ).read_text(encoding="utf-8")
+    assert "-m openclaw_adapter telegram-poll" in wrapper
+    assert "sleep 30" in wrapper  # > Telegram's ~20s getUpdates slot hold (409 guard)
 
     # These must NOT be nohup-started (that was the duplicate source).
     assert "-m openclaw_adapter price-monitor-service" not in script

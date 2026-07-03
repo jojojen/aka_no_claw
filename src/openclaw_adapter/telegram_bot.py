@@ -139,6 +139,12 @@ from .voice_command import (
     build_voice_callback_handler,
     build_voice_handler,
 )
+from .fix_command import (
+    FixPendingApplyCache,
+    build_fix_callback_handler,
+    build_fix_handler,
+)
+from .vpn_command import VpnConfigStore, VpnRotationScheduler, build_vpn_handler
 from .research_command import (
     MercariItemAdapter,
     ResearchNotifier,
@@ -1450,6 +1456,7 @@ def _build_registries(
     board_loader=None,
     reputation_renderer: ReputationRenderer | None = None,
     research_notifier_factory: "Callable[[str], ResearchNotifier] | None" = None,
+    start_schedulers: bool = True,
 ) -> "tuple[dict, dict, dict, dict]":
     """Build registries injected into the base dispatcher.
 
@@ -1464,6 +1471,19 @@ def _build_registries(
     recover_handler = build_recover_handler(settings)
     scorecard_handler = build_scorecard_handler(settings)
     research_cache = _ResearchReplyCache()
+    fix_pending_cache = FixPendingApplyCache()
+    fix_handler = build_fix_handler(
+        settings, fix_pending_cache, notifier_factory=research_notifier_factory
+    )
+    vpn_store = VpnConfigStore(
+        Path(settings.monitor_db_path).resolve().parent / "vpn_rotation.json"
+    )
+    vpn_handler = build_vpn_handler(settings, vpn_store)
+    if start_schedulers:
+        # 只在 poller 行程跑輪替排程；bridge 也會建 registries，兩邊都跑會雙倍輪替
+        VpnRotationScheduler(
+            vpn_store, notifier_factory=research_notifier_factory
+        ).start()
     research_search_fn = lambda q, limit: _run_research_worker_call(
         lambda: web_search(q, max_results=limit, reuse_browser=False)
     )
@@ -1796,11 +1816,23 @@ def _build_registries(
             background=True,
             **command_metadata("/research"),
         ),
+        "/fix": RegisteredCommand(
+            fix_handler,
+            ack="收到，開始 benchmark 修復迴圈（會分階段回報進度）…",
+            background=True,
+            **command_metadata("/fix"),
+        ),
         "/resaerch": RegisteredCommand(
             research_handler,
             ack="收到，正在進行深度商品研究（會分階段回報進度）…",
             background=True,
             **command_metadata("/resaerch"),
+        ),
+        "/vpn": RegisteredCommand(
+            vpn_handler,
+            ack="收到，VPN 指令處理中…",
+            background=True,
+            **command_metadata("/vpn"),
         ),
         "/watch": RegisteredCommand(
             _watch_handler,
@@ -1948,6 +1980,7 @@ def _build_registries(
         "snsfb": build_snsfb_callback_handler(sns_db, sns_inbox=sns_inbox),
         "oppfb": build_hunt_callback_handler(settings, opportunity_inbox=opportunity_inbox),
         "rs": _build_research_callback_handler(research_cache),
+        "fix": build_fix_callback_handler(fix_pending_cache),
         "imgtr": _build_image_translate_callback_handler(_IMAGE_TRANSLATE_ORIGINAL_CACHE),
         "music": build_music_callback_handler(settings),
         "bt": build_bluetooth_callback_handler(settings),

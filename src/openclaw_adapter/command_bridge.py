@@ -654,6 +654,8 @@ class CommandBridge:
                         research_notifier_factory=lambda chat_id: _JobNotifier(
                             self._jobs, str(chat_id), self._get_job_store()
                         ),
+                        # poller 已經跑 VpnRotationScheduler；bridge 只要 handlers
+                        start_schedulers=False,
                     )
                     self._callback_handlers = callback_handlers
                     self._command_handlers = command_handlers

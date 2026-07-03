@@ -352,8 +352,12 @@ broadlink_preflight
 
 # Genuinely non-launchd services: (re)start detached with nohup.
 start_service "reputation_snapshot" "$REPUTATION" "$LOG_DIR/reputation_snapshot.log" "$REPUTATION/.venv/bin/python" app.py
-start_tmux_service "telegram" "telegram" "$CLAW" "source '$CLAW/run/mac-mini-stack.env' 2>/dev/null || true; export PYTHONPATH='.:src'; exec '$CLAW/.venv/bin/python' -m openclaw_adapter telegram-poll --with-reputation-agent --no-dashboard"
-start_tmux_service "bridge" "command bridge" "$CLAW" "source '$CLAW/run/mac-mini-stack.env' 2>/dev/null || true; export PYTHONPATH='.:src'; exec '$CLAW/.venv/bin/python' -m openclaw_adapter command-bridge --lan --port 8781"
+# telegram runs under a respawn wrapper: the poller has no launchd KeepAlive
+# anymore, so a crash or the poll-watchdog's os._exit(1) must not end the pane.
+start_tmux_service "telegram" "telegram" "$CLAW" "source '$CLAW/run/mac-mini-stack.env' 2>/dev/null || true; export PYTHONPATH='.:src'; exec /bin/sh '$CLAW/scripts/run_telegram_poll.sh'"
+# bridge gets the same respawn wrapper: the Web UI is the rescue path when the
+# poller dies, so it must not stay down after a crash either.
+start_tmux_service "bridge" "command bridge" "$CLAW" "source '$CLAW/run/mac-mini-stack.env' 2>/dev/null || true; export PYTHONPATH='.:src'; exec /bin/sh '$CLAW/scripts/run_command_bridge.sh'"
 start_service "web frontend" "$WEB" "$LOG_DIR/openclaw_web_vite.log" npm run dev -- --host 0.0.0.0
 
 sleep 2

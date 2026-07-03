@@ -89,6 +89,30 @@ python3 docs/fix_benchmarks/price_reference_sources/verify.py \
   --parser docs/fix_benchmarks/price_reference_sources/reference/parser.py
 ```
 
-The reference parser should pass. A future `/fix` implementation should produce
+The reference parser should pass. A `/fix` implementation should produce
 a patch that reaches the same verifier result without hardcoding fixture file
 names or complete fixture outputs.
+
+## The `/fix` Command
+
+The Telegram `/fix` command (`src/openclaw_adapter/fix_command.py`) runs the
+repair loop against these benchmarks:
+
+- `/fix` — list benchmarks discovered here (any directory holding `verify.py`
+  plus `broken/` with a single `parser.py` or `classifier.py`).
+- `/fix <benchmark_name>` — reproduce the failure, ask the repair LLM
+  (OpenCode big-pickle, falling back to local Ollama with an explicit warning)
+  for a replacement module, run the verifier, and iterate up to 4 attempts.
+- On PASS the bot sends a unified diff with an apply button. Applying persists
+  the candidate to the benchmark's `attempts/` directory; `broken/` is never
+  modified, so the benchmark keeps reproducing the original failure.
+
+v1 scope is benchmark parsers only — `/fix` does not touch production code.
+
+### Known limitation: verifier output leaks expected values
+
+Verifier failure lines include the expected values ("expected 'X', got None"),
+so a degenerate patch could in principle hardcode per-fixture outputs.
+Mitigations in v1: fixtures span multiple structural revisions (hardcoding one
+selector or one output does not generalize), and a human reviews the diff
+before apply. A hidden holdout fixture is a possible follow-up.
