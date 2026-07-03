@@ -1,7 +1,7 @@
 # Issue #66 Phase 2 Progress
 
-Last reviewed: 2026-07-02
-Status: Current
+Last reviewed: 2026-07-03
+Status: Historical
 Owner area: agent-maintenance
 
 Updated: 2026-07-02
@@ -71,3 +71,8 @@ Completed notes:
 
 - `config/llm_pool.json` is treated as local runtime config and gitignored.
 - Cloud preview / route display must not probe provider APIs just to render UI.
+
+## Archive Note
+
+Issue #66 phase 2 shipped and no longer needs a living progress file. Keep this
+document only as implementation history.

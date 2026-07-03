@@ -1,7 +1,7 @@
 # Bluetooth / XGIMI Z8X Debug Record
 
-Last reviewed: 2026-07-01
-Status: Current
+Last reviewed: 2026-07-03
+Status: Historical
 Owner area: operations
 
 Date: 2026-07-01 12:03 JST
@@ -125,6 +125,11 @@ correct power query is:
 ```bash
 blueutil --power
 ```
+
+## Archive Note
+
+This incident is resolved and preserved only as a sanitized historical debug
+record for similar macOS Bluetooth permission failures.
 
 ## Audio Output Check
 

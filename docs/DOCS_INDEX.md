@@ -33,7 +33,6 @@ Full inventory with recommended actions is in [DOC_AUDIT.md](DOC_AUDIT.md).
 | [LIQUIDITY_METHODOLOGY.md](LIQUIDITY_METHODOLOGY.md) | Current | price/liquidity | Scoring approach for liquidity and market support. |
 | [RESEARCH_COMMAND_PLAN.md](RESEARCH_COMMAND_PLAN.md) | Current | research | `/research` implementation status, offload, and stage parallelization. |
 | [BROWSER_UI_VALIDATION_PLAYBOOK.md](BROWSER_UI_VALIDATION_PLAYBOOK.md) | Current | verification | Browser smoke-test playbook for local web console validation. |
-| [ISSUE_66_PHASE2_PROGRESS.md](ISSUE_66_PHASE2_PROGRESS.md) | Current | agent-maintenance | Living implementation/progress record for issue #66 phase 2 chat llm-pool and Web Chat routing alignment. |
 | [NEW_DYNAMIC_TOOLS_PROGRESS.md](NEW_DYNAMIC_TOOLS_PROGRESS.md) | Current (canonical: dynamic-tools) | dynamic-tools | `/new` implementation notes and benchmark history. |
 | [NEW_E2E_DISCRIMINATING_TESTS.md](NEW_E2E_DISCRIMINATING_TESTS.md) | Current | dynamic-tools | Companion: discriminating tests for generated tools. |
 | [NEW_OPENCODE_DECOUPLING_PLAN.md](NEW_OPENCODE_DECOUPLING_PLAN.md) | Planned | dynamic-tools | Companion: plan to move `/new` + Chat off OpenCode CLI to direct HTTP; add Mistral switch (issues #51/#59). |
@@ -64,7 +63,6 @@ Full inventory with recommended actions is in [DOC_AUDIT.md](DOC_AUDIT.md).
 | [LOGGING.md](LOGGING.md) | Current | operations | Logging conventions. |
 | [AUTO_LOGIN_SETUP.md](AUTO_LOGIN_SETUP.md) | Needs review | operations | Local login/setup notes. |
 | [MAC_MINI_M4.md](MAC_MINI_M4.md) | Current | operations | Machine-specific operational notes; avoid copying paths into code. |
-| [BLUETOOTH_XGIMI_DEBUG_2026-07-01.md](BLUETOOTH_XGIMI_DEBUG_2026-07-01.md) | Current | operations | Sanitized incident/debug record for XGIMI Bluetooth reconnect and macOS Bluetooth permission behavior. |
 | [BROADLINK_RESTART_RECOVERY_PLAYBOOK.md](BROADLINK_RESTART_RECOVERY_PLAYBOOK.md) | Current | operations | BroadLink instability playbook: distinguish device/network failures from startup-context failures; documents the restart preflight approach. |
 | [BROADLINK_LOCAL_NETWORK_TROUBLESHOOTING.html](BROADLINK_LOCAL_NETWORK_TROUBLESHOOTING.html) | Current | operations | Sanitized, public-shareable standalone HTML version of the BroadLink LAN troubleshooting guide (no internal paths/IPs/ports); linked from MUSIC_PLAYBACK_TROUBLESHOOTING.md. Exempt from internal metadata headers by design (see DOCUMENTATION_GOVERNANCE.md). |
 | [MUSIC_PLAYBACK_TROUBLESHOOTING.md](MUSIC_PLAYBACK_TROUBLESHOOTING.md) | Current | music | afplay/CoreAudio -66681 wedge: coreaudiod-restart self-heal + one-time NOPASSWD sudo setup. |
@@ -91,6 +89,8 @@ Frozen, superseded context only — do not rely on for current truth. See
 | [archive/TEST_RECORD_2026-04-17.md](archive/TEST_RECORD_2026-04-17.md) | testing | Dated test snapshot. |
 | [archive/SNS_INTEGRATION_TEST_REPORT.md](archive/SNS_INTEGRATION_TEST_REPORT.md) | sns | One-time integration report. |
 | [archive/ISSUE_53_WORKFLOW_REVIEW_HANDOFF.md](archive/ISSUE_53_WORKFLOW_REVIEW_HANDOFF.md) | telegram | Archived pre-resolution review handoff after issue #53 shipped. |
+| [archive/ISSUE_66_PHASE2_PROGRESS.md](archive/ISSUE_66_PHASE2_PROGRESS.md) | agent-maintenance | Shipped issue #66 phase-2 implementation/progress record, kept only as history. |
+| [archive/BLUETOOTH_XGIMI_DEBUG_2026-07-01.md](archive/BLUETOOTH_XGIMI_DEBUG_2026-07-01.md) | operations | Resolved Bluetooth/XGIMI incident record kept as sanitized historical context. |
 | [archive/comp_filter_bm25_discussion.md](archive/comp_filter_bm25_discussion.md) | price/research | Superseded design discussion. |
 | [archive/search_ddg_block_investigation.md](archive/search_ddg_block_investigation.md) | search | One-time investigation. |
 | [archive/COMMISSION_SYSTEM_PLAN.md](archive/COMMISSION_SYSTEM_PLAN.md) | commissions | Business shelved. |

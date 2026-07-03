@@ -40,7 +40,6 @@ for which question each one answers.
 | `LIQUIDITY_METHODOLOGY.md` | Current | price/liquidity | Keep; update with scoring changes. |
 | `RESEARCH_COMMAND_PLAN.md` | Current | research | Keep; living `/research` status. |
 | `BROWSER_UI_VALIDATION_PLAYBOOK.md` | Current | verification | Keep; browser smoke-test playbook for local web console validation. |
-| `ISSUE_66_PHASE2_PROGRESS.md` | Current | agent-maintenance | Keep; living phase-2 implementation record for llm-pool settings and Web Chat routing alignment. |
 | `NEW_DYNAMIC_TOOLS_PROGRESS.md` | Current | dynamic-tools | Keep; canonical `/new` doc. |
 | `NEW_E2E_DISCRIMINATING_TESTS.md` | Current | dynamic-tools | Keep; cross-link from dynamic-tools canonical. |
 | `NEW_OPENCODE_DECOUPLING_PLAN.md` | Planned | dynamic-tools | Keep until shipped; then fold into canonical and archive. Cross-linked from canonical. |
@@ -61,7 +60,6 @@ for which question each one answers.
 | `SNS_MONITOR_TROUBLESHOOTING.md` | Current | sns | Keep as ops companion; cross-link to usage. |
 | `LOGGING.md` | Current | operations | Keep. |
 | `MAC_MINI_M4.md` | Current | operations | Keep; machine-specific, never copy paths into code. |
-| `BLUETOOTH_XGIMI_DEBUG_2026-07-01.md` | Current | operations | Keep as sanitized incident/debug record for the XGIMI Bluetooth permission and reconnect issue. |
 | `BROADLINK_RESTART_RECOVERY_PLAYBOOK.md` | Current | operations | Keep; incident-derived BroadLink recovery/runbook for restart-context failures. |
 | `BROADLINK_LOCAL_NETWORK_TROUBLESHOOTING.html` | Current | operations | Keep; sanitized public-shareable HTML companion to the recovery playbook, linked from MUSIC_PLAYBACK_TROUBLESHOOTING.md. Explicitly named (not glob-matched) in check_docs_health.py so fix_benchmarks/ HTML test fixtures aren't swept into doc governance. |
 | `AUTO_LOGIN_SETUP.md` | Needs review | operations | Re-verify setup steps. |
@@ -87,6 +85,8 @@ Moved under `docs/archive/`; see [archive/README.md](archive/README.md).
 | `archive/TEST_RECORD_2026-04-17.md` | Historical | testing | Dated test snapshot. |
 | `archive/SNS_INTEGRATION_TEST_REPORT.md` | Historical | sns | One-time integration report. |
 | `archive/ISSUE_53_WORKFLOW_REVIEW_HANDOFF.md` | Historical | telegram | Pre-resolution workflow review handoff; archived after issue #53 shipped. |
+| `archive/ISSUE_66_PHASE2_PROGRESS.md` | Historical | agent-maintenance | Shipped phase-2 implementation record for issue #66; retained for implementation history only. |
+| `archive/BLUETOOTH_XGIMI_DEBUG_2026-07-01.md` | Historical | operations | Resolved Bluetooth/XGIMI incident debug record kept as sanitized historical context. |
 | `archive/comp_filter_bm25_discussion.md` | Historical | price/research | Superseded design discussion. |
 | `archive/search_ddg_block_investigation.md` | Historical | search | One-time investigation. |
 | `archive/COMMISSION_SYSTEM_PLAN.md` | Historical | commissions | Business shelved. |
