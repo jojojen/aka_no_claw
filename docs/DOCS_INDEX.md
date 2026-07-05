@@ -1,6 +1,6 @@
 # Docs Index
 
-Last reviewed: 2026-07-03
+Last reviewed: 2026-07-05
 
 Governance for this index lives in [DOCUMENTATION_GOVERNANCE.md](DOCUMENTATION_GOVERNANCE.md).
 Full inventory with recommended actions is in [DOC_AUDIT.md](DOC_AUDIT.md).
@@ -39,6 +39,7 @@ Full inventory with recommended actions is in [DOC_AUDIT.md](DOC_AUDIT.md).
 | [CHAT_GOAL_LOOP_PLAN.md](CHAT_GOAL_LOOP_PLAN.md) | Planned | dynamic-tools | Companion: chat goal loop — plan-then-execute multi-tool runs with replan, budget-continue UX, narrated trace, eval harness (issues #50–#54). |
 | [CHAT_REWORK_DEBUG_TRACE.md](CHAT_REWORK_DEBUG_TRACE.md) | Current | dynamic-tools | Debug record: why one chat turn ran /research ×3 (rework); root causes + seed-variables/tool-ledger fix rationale. |
 | [WEB_CHAT_MULTIMODAL_PLAN.md](WEB_CHAT_MULTIMODAL_PLAN.md) | Planned | dynamic-tools | Web chat multimodal: image upload, text/vision cloud pool split with rotation, vision-as-a-tool orchestration, image-translation A/B replacement (issue #71). |
+| [RESEARCH_CHAT_SUMMARY_DATA_DROP_FIX_PLAN.md](RESEARCH_CHAT_SUMMARY_DATA_DROP_FIX_PLAN.md) | Planned | research | Lightweight fix: chat's compact `/research` reply drops seller reputation stats (`_compact_seller_summary` keeps only the risk verdict); before/after diff, tests, and explicit out-of-scope notes for the job/button and comp-recall issues found alongside it. |
 | [TELEGRAM_NL_OWNERSHIP_REFACTOR_ISSUE.md](TELEGRAM_NL_OWNERSHIP_REFACTOR_ISSUE.md) | Planned | telegram | Draft issue for moving aka-specific Telegram NL workflow routing out of `price_monitor_bot`. |
 | [TELEGRAM_CORE_EXTRACTION_PLAN.md](TELEGRAM_CORE_EXTRACTION_PLAN.md) | Current | telegram | Shared `telegram_core` package (transport, dispatcher contract, polling, list_view) extracted from `price_monitor_bot`, P0–P4 shipped; kept as the implementation record and hook/registry contract reference. |
 | [KB_EMBEDDING_PLAN.md](KB_EMBEDDING_PLAN.md) | Needs review | knowledge | Embedding/RAG plan and status may need fresh verification. |

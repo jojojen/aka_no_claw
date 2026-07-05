@@ -1982,6 +1982,74 @@ def test_compact_price_summary_includes_yuyu_note() -> None:
     assert "遊々亭" in compact
 
 
+def test_compact_seller_summary_includes_meta_and_seller_stats() -> None:
+    """_compact_seller_summary should surface stats, not just the verdict."""
+    from openclaw_adapter.research_command import _compact_seller_summary, ResearchSectionResult
+
+    result = ResearchSectionResult(
+        section_name="賣家風險分析",
+        status="ok",
+        confidence=0.8,
+        sample_count=353,
+        evidence_count=1,
+        summary=(
+            "快照顯示賣家風險偏低；賣家 abc123 / 總評價 358 / 刊登 12；"
+            "身為賣家：好評 350 / 差評 3 / 好評率 99.2%；快照時間 2026-07-05T10:00:00"
+        ),
+        evidence_urls=(),
+        warnings=(),
+    )
+
+    compact = _compact_seller_summary(result)
+    assert "快照顯示賣家風險偏低" in compact
+    assert "總評價 358" in compact
+    assert "好評率 99.2%" in compact
+    assert "快照時間" not in compact
+
+
+def test_compact_seller_summary_falls_back_to_verdict_only_when_no_stats() -> None:
+    """No meta/seller stats available (e.g. snapshot fetch failed) -> unchanged verdict-only behavior."""
+    from openclaw_adapter.research_command import _compact_seller_summary, ResearchSectionResult
+
+    result = ResearchSectionResult(
+        section_name="賣家風險分析",
+        status="partial",
+        confidence=0.35,
+        sample_count=0,
+        evidence_count=0,
+        summary="快照資料不足，需人工檢查 proof。",
+        evidence_urls=(),
+        warnings=(),
+    )
+
+    compact = _compact_seller_summary(result)
+    assert compact == "快照資料不足，需人工檢查 proof。"
+
+
+def test_compact_seller_summary_truncates_long_combined_stats() -> None:
+    """Combined verdict+meta+seller-bits stays bounded by the widened truncation limit."""
+    from openclaw_adapter.research_command import _compact_seller_summary, ResearchSectionResult
+
+    long_name = "a" * 100
+    result = ResearchSectionResult(
+        section_name="賣家風險分析",
+        status="ok",
+        confidence=0.8,
+        sample_count=353,
+        evidence_count=1,
+        summary=(
+            f"快照顯示賣家風險偏低；賣家 {long_name} / 總評價 358 / 刊登 12；"
+            "身為賣家：好評 350 / 差評 3 / 好評率 99.2%"
+        ),
+        evidence_urls=(),
+        warnings=(),
+    )
+
+    compact = _compact_seller_summary(result)
+    assert compact.endswith("…")
+    assert len(compact) <= 140
+
+
 def test_compact_warning_label_recognizes_shop_failure() -> None:
     from openclaw_adapter.research_command import _compact_warning_label
 

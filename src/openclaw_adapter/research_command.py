@@ -1896,12 +1896,21 @@ def _compact_liquidity_summary(result: ResearchSectionResult) -> str:
 
 def _compact_seller_summary(result: ResearchSectionResult) -> str:
     parts = [_compact_whitespace(part) for part in result.summary.split("；") if part]
+    selected: list[str] = []
     for part in parts:
         if "快照顯示" in part or "快照資料不足" in part or "snapshot 失敗" in part:
-            return _truncate_research_text(part, 76)
-    if parts:
-        return _truncate_research_text(parts[0], 76)  # verdict is always first
-    return _truncate_research_text(result.summary, 68)
+            selected.append(part)
+            break
+    if not selected and parts:
+        selected.append(parts[0])  # verdict is always first when present
+    for part in parts:
+        if part in selected:
+            continue
+        if part.startswith("身為賣家：") or "總評價" in part or "刊登" in part:
+            selected.append(part)
+    if not selected:
+        return _truncate_research_text(result.summary, 68)
+    return _truncate_research_text("；".join(selected), 140)
 
 
 def _compact_appreciation_summary(result: ResearchSectionResult) -> str:
