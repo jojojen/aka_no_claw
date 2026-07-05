@@ -37,3 +37,38 @@ def test_cloud_pool_rotation_tolerates_changing_list_size():
     rotation = CloudPoolRotation()
     rotation.rotate(["a", "b", "c"])  # cursor -> 1
     assert rotation.rotate(["x", "y"]) == ["y", "x"]
+
+
+def test_vision_pool_never_offers_big_pickle(tmp_path):
+    """big_pickle is text-only (opencode gateway rejects image payloads with
+    HTTP 400, verified live 2026-07-05): a config that lists it in vision_pool
+    must be filtered out, and the settings payload must not offer it as a
+    vision provider/model option."""
+    import json
+    from types import SimpleNamespace
+
+    from openclaw_adapter.llm_pool_settings import (
+        LLM_PROVIDER_BIG_PICKLE,
+        chat_llm_pool_payload,
+        load_chat_llm_pool_settings,
+    )
+
+    config = tmp_path / "llm_pool.json"
+    config.write_text(json.dumps({
+        "default_chat_provider": "cloud_pool",
+        "cloud_pool": ["gemini", "big_pickle"],
+        "vision_pool": ["gemini", "big_pickle", "local"],
+        "vision_providers": {"big_pickle": {"enabled": True, "model": "big-pickle"}},
+    }), encoding="utf-8")
+    settings = SimpleNamespace(openclaw_llm_pool_config_path=str(config))
+
+    loaded = load_chat_llm_pool_settings(settings)
+    assert LLM_PROVIDER_BIG_PICKLE not in loaded.vision_pool
+    assert LLM_PROVIDER_BIG_PICKLE not in (loaded.vision_providers or {})
+    # text pool is unaffected
+    assert LLM_PROVIDER_BIG_PICKLE in loaded.cloud_pool
+
+    payload = chat_llm_pool_payload(settings)
+    assert LLM_PROVIDER_BIG_PICKLE not in payload["vision_pool"]
+    assert LLM_PROVIDER_BIG_PICKLE not in payload["vision_providers"]
+    assert LLM_PROVIDER_BIG_PICKLE not in payload["vision_model_options"]

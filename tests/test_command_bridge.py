@@ -870,7 +870,7 @@ def test_chat_tool_unsatisfied_upgrades_to_goal_loop_run(monkeypatch):
     monkeypatch.setattr(b, "_chat_tool_result_satisfies_intent", lambda req, plan, tool_result: False)
     seen_goals: list[str] = []
 
-    def _fake_run(req, goal, planner_metadata=None, narrator=None):
+    def _fake_run(req, goal, planner_metadata=None, narrator=None, seed_variables=None):
         seen_goals.append(goal)
         return WebCommandResponse(
             status=STATUS_OK,
@@ -918,7 +918,7 @@ def test_stream_chat_tool_unsatisfied_upgrades_to_goal_loop_run(monkeypatch):
     )
     monkeypatch.setattr(b, "_chat_tool_result_satisfies_intent", lambda req, plan, tool_result: False)
 
-    def _fake_run(req, goal, planner_metadata=None, narrator=None):
+    def _fake_run(req, goal, planner_metadata=None, narrator=None, seed_variables=None):
         # the real goal loop pushes narration through this callback live
         for line in (
             "已理解目標為：播放米津玄師的熱門歌曲",
@@ -1462,7 +1462,7 @@ def test_chat_goal_plan_runs_goal_loop_directly(monkeypatch):
     monkeypatch.setattr(
         b,
         "_run_goal_loop_blocking",
-        lambda req, goal, planner_metadata=None: SimpleNamespace(
+        lambda req, goal, planner_metadata=None, seed_variables=None: SimpleNamespace(
             status=STATUS_OK,
             message=f"run:{goal}",
             mode=MODE_CHAT,
@@ -1488,7 +1488,7 @@ def test_stream_goal_plan_runs_goal_loop_directly(monkeypatch):
 
     monkeypatch.setattr(b, "_stream_chat_tool_plan", _plan)
 
-    def _stream_goal(req, goal, planner_metadata=None):
+    def _stream_goal(req, goal, planner_metadata=None, seed_variables=None):
         yield {"type": "done", "message": f"run:{goal}"}
 
     monkeypatch.setattr(b, "_stream_goal_loop", _stream_goal)
@@ -1544,7 +1544,7 @@ def test_stream_goal_resume_emits_heartbeat_then_done(monkeypatch):
     b._store_goal_continuation(req, continuation, chat_backend=CHAT_BACKEND_LOCAL, planner_metadata=None)
     monkeypatch.setattr(bridge_mod, "_HEARTBEAT_SECONDS", 0.01)
 
-    def _resume(_req, entry):
+    def _resume(_req, entry, narrator=None):
         time.sleep(0.03)
         return WebCommandResponse(status=STATUS_OK, message="resumed", mode=MODE_CHAT)
 
@@ -1567,7 +1567,7 @@ def test_stream_goal_resume_error_emits_stream_error(monkeypatch):
     monkeypatch.setattr(
         b,
         "_resume_goal_loop",
-        lambda _req, entry: WebCommandResponse(status=STATUS_ERROR, message="resume failed", mode=MODE_CHAT),
+        lambda _req, entry, narrator=None: WebCommandResponse(status=STATUS_ERROR, message="resume failed", mode=MODE_CHAT),
     )
     events = list(b.stream(parse_request({"mode": "chat", "input": "繼續", "conversation_id": "g3"}), "rid-resume-err"))
     assert events[0]["type"] == "start"
@@ -1670,7 +1670,7 @@ def test_continue_goal_loop_with_search_extension_grants_then_resumes(monkeypatc
     monkeypatch.setattr(
         b,
         "_resume_goal_loop",
-        lambda _req, _entry: WebCommandResponse(status=STATUS_OK, message="resumed", mode=MODE_CHAT),
+        lambda _req, _entry, narrator=None: WebCommandResponse(status=STATUS_OK, message="resumed", mode=MODE_CHAT),
     )
 
     response = b.handle(parse_request({"mode": "chat", "input": "__goal_continue_search__", "conversation_id": "g-search"}))
@@ -3971,3 +3971,233 @@ def test_load_chat_settings_migrates_legacy_opencode_auto(tmp_path):
     ))
     loaded = b.load_chat_settings()
     assert loaded["settings"]["providers"]["big_pickle"]["model"] == "deepseek-v4-flash-free"
+
+
+# ── chat rework fix (#live 2026-07): tool ledger + goal-loop seed variables ──
+
+def test_seed_variable_name_for_tool_is_mechanical_slug():
+    from openclaw_adapter.command_bridge import _seed_variable_name_for_tool
+
+    assert _seed_variable_name_for_tool("/research") == "prior_research_result"
+    assert _seed_variable_name_for_tool("/visionlook") == "prior_visionlook_result"
+    assert _seed_variable_name_for_tool("") == "prior_tool_result"
+
+
+def test_run_chat_tool_records_success_and_failure_in_ledger(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    req = parse_request(
+        {"mode": "chat", "input": "分析這個商品", "conversation_id": "c-ledger"}
+    )
+    plan = ChatToolPlan(tool=CHAT_TOOL_RESEARCH, query="https://x.example/item 分析")
+
+    monkeypatch.setattr(
+        b,
+        "_exec_registered_command_chat_tool",
+        lambda req_, tool_req: ChatToolResult(answer="研究結果"),
+    )
+    b._run_chat_tool(req, plan)
+
+    def _boom(req_, tool_req):
+        raise RuntimeError("research backend down")
+
+    monkeypatch.setattr(b, "_exec_registered_command_chat_tool", _boom)
+    with pytest.raises(RuntimeError):
+        b._run_chat_tool(req, plan)
+
+    entries = b._chat_tool_ledger_entries(req)
+    assert [e["status"] for e in entries] == ["ok", "error"]
+    assert entries[0]["summary"] == "研究結果"
+    assert "research backend down" in entries[1]["summary"]
+
+
+def test_router_prompt_includes_prior_tool_ledger_per_conversation(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        b,
+        "_handlers",
+        lambda: {
+            "/research": SimpleNamespace(
+                usage="深度商品研究與投資判斷",
+                chat_tool_purpose="當使用者問商品能不能買時使用",
+                chat_tool_query_hint="query 保留商品 URL",
+            ),
+        },
+    )
+    req_c1 = parse_request(
+        {"mode": "chat", "input": "你剛才做了什麼？", "conversation_id": "c1"}
+    )
+    req_c2 = parse_request(
+        {"mode": "chat", "input": "你剛才做了什麼？", "conversation_id": "c2"}
+    )
+
+    b._record_chat_tool_run(
+        req_c1, "/visionlook", "https://x.example/photo", status="ok", summary="卡面外觀中上"
+    )
+    b._record_chat_tool_run(
+        req_c1, "/research", "https://x.example/item", status="error", summary="research 執行失敗"
+    )
+
+    prompt = b._build_chat_tool_plan_prompt(req_c1)
+    assert "先前已執行過的工具紀錄" in prompt
+    assert "/visionlook" in prompt
+    assert "卡面外觀中上" in prompt
+    assert "失敗" in prompt
+    assert "research 執行失敗" in prompt
+    assert "不要為同樣的需求重複執行同一個工具" in prompt
+
+    other = b._build_chat_tool_plan_prompt(req_c2)
+    assert "先前已執行過的工具紀錄" not in other
+
+
+def test_unsatisfied_upgrade_passes_tool_answer_as_seed(monkeypatch):
+    from openclaw_adapter.command_bridge import _seed_variable_name_for_tool
+
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        b,
+        "_select_chat_tool_plan",
+        lambda req: (
+            ChatToolPlan(tool=CHAT_TOOL_RESEARCH, query="https://x.example/item"),
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        b,
+        "_run_chat_tool",
+        lambda req, plan: ChatToolResult(answer="部分研究結果"),
+    )
+    monkeypatch.setattr(
+        b, "_chat_tool_result_satisfies_intent", lambda req, plan, tool_result: False
+    )
+    seen: dict = {}
+
+    def _fake_run(req, goal, planner_metadata=None, narrator=None, seed_variables=None):
+        seen["seeds"] = seed_variables
+        return WebCommandResponse(status=STATUS_OK, mode=MODE_CHAT, message="工作流完成：ok")
+
+    monkeypatch.setattr(b, "_run_goal_loop_blocking", _fake_run)
+    resp = b.handle(parse_request({"mode": "chat", "input": "這張卡值得買嗎？"}))
+    assert resp.status == STATUS_OK
+    assert seen["seeds"] == {
+        _seed_variable_name_for_tool(CHAT_TOOL_RESEARCH): "部分研究結果"
+    }
+
+def test_research_notifier_uses_live_callback_when_registered(monkeypatch):
+    from openclaw_adapter.command_bridge import (
+        _BRIDGE_CHAT_ID,
+        _CallbackNotifier,
+        _JobNotifier,
+    )
+
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(b, "_get_job_store", lambda: SimpleNamespace(save=lambda *_: None))
+
+    lines: list[str] = []
+    outer: list[str] = []
+    # No registration -> job-backed notifier (async job + poll path unchanged).
+    assert isinstance(b._research_notifier(_BRIDGE_CHAT_ID), _JobNotifier)
+
+    with b._live_progress(outer.append):
+        with b._live_progress(lines.append):
+            notifier = b._research_notifier(_BRIDGE_CHAT_ID)
+            assert isinstance(notifier, _CallbackNotifier)
+            notifier.send("⏳ [1/6] 抓商品頁…")
+        # Inner scope closed -> outer registration restored, not dropped.
+        b._research_notifier(_BRIDGE_CHAT_ID).send("✅ 外層進度")
+    assert lines == ["⏳ [1/6] 抓商品頁…"]
+    assert outer == ["✅ 外層進度"]
+    # All scopes closed -> back to the job-backed notifier.
+    assert isinstance(b._research_notifier(_BRIDGE_CHAT_ID), _JobNotifier)
+
+
+def test_stream_chat_tool_surfaces_staged_research_progress(monkeypatch):
+    from openclaw_adapter.command_bridge import _BRIDGE_CHAT_ID
+
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(b, "_tool_display_name", lambda cmd: cmd)
+    monkeypatch.setattr(
+        b, "_maybe_upgrade_tool_result_to_goal_loop",
+        lambda *a, **k: None,
+    )
+
+    def _fake_run(req, plan):
+        # Simulates the /research handler sending a staged milestone through
+        # the notifier factory while the stream is open.
+        b._research_notifier(_BRIDGE_CHAT_ID).send("⏳ [1/6] 商品頁擷取：已完成")
+        return ChatToolResult(answer="研究完成的答案")
+
+    monkeypatch.setattr(b, "_run_chat_tool", _fake_run)
+    req = parse_request(
+        {"mode": "chat", "input": "這個商品值得買嗎？", "conversation_id": "c-progress"}
+    )
+    plan = ChatToolPlan(tool=CHAT_TOOL_RESEARCH, query="https://x.example/item")
+
+    events = list(b._stream_chat_tool(req, plan))
+    deltas = [e.get("text", "") for e in events if e.get("type") == "delta"]
+    assert any("⏳ [1/6] 商品頁擷取：已完成" in d for d in deltas)
+    done = [e for e in events if e.get("type") == "done"]
+    assert len(done) == 1 and "研究完成的答案" in done[0]["message"]
+
+def test_satisfaction_prompt_includes_conversation_context(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    req = parse_request({
+        "mode": "chat",
+        "input": "加上從卡況分析呢",
+        "conversation_id": "c-ctx",
+        "history": [
+            {"role": "user", "content": "這張卡投資角度值得買嗎？"},
+            {"role": "assistant", "content": "從投資角度看：市場樣本不足，建議謹慎。"},
+        ],
+    })
+    b._record_chat_tool_run(
+        req, "/research", "https://x.example/item", status="ok", summary="投資研究部分結果"
+    )
+    plan = ChatToolPlan(tool="/visionlook", query="https://x.example/item 卡況")
+    captured: dict = {}
+
+    def _fake_generate(backend, prompt, **_kw):
+        captured["prompt"] = prompt
+        return '{"satisfied": false, "reason": "只有新資訊沒有整合結論"}'
+
+    monkeypatch.setattr(b, "_generate_chat_tool_satisfaction_text", _fake_generate)
+    satisfied = b._chat_tool_result_satisfies_intent(
+        req, plan, ChatToolResult(answer="卡面外觀：邊角完好，置中良好。")
+    )
+    assert satisfied is False
+    prompt = captured["prompt"]
+    assert "對話脈絡" in prompt
+    assert "這張卡投資角度值得買嗎？" in prompt
+    assert "投資研究部分結果" in prompt
+    assert "還原完整意圖" in prompt
+
+
+def test_unsatisfied_upgrade_seeds_conversation_context(monkeypatch):
+    from openclaw_adapter.command_bridge import _seed_variable_name_for_tool
+
+    b = CommandBridge(settings=_tool_settings())
+    req = parse_request({
+        "mode": "chat",
+        "input": "加上從卡況分析呢",
+        "conversation_id": "c-ctx-seed",
+        "history": [
+            {"role": "user", "content": "這張卡投資角度值得買嗎？"},
+            {"role": "assistant", "content": "市場樣本不足，建議謹慎。"},
+        ],
+    })
+    plan = ChatToolPlan(tool="/visionlook", query="https://x.example/item 卡況")
+    monkeypatch.setattr(
+        b, "_chat_tool_result_satisfies_intent", lambda *_a, **_k: False
+    )
+    seen: dict = {}
+
+    def _fake_run(req_, goal, planner_metadata=None, narrator=None, seed_variables=None):
+        seen["seeds"] = seed_variables
+        return WebCommandResponse(status=STATUS_OK, mode=MODE_CHAT, message="工作流完成：ok")
+
+    monkeypatch.setattr(b, "_run_goal_loop_blocking", _fake_run)
+    b._maybe_upgrade_tool_result_to_goal_loop(
+        req, plan, ChatToolResult(answer="卡況觀察內容"), planner_metadata=None
+    )
+    seeds = seen["seeds"]
+    assert seeds[_seed_variable_name_for_tool("/visionlook")] == "卡況觀察內容"
+    assert "這張卡投資角度值得買嗎？" in seeds["conversation_context"]

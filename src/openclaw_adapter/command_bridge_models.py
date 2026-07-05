@@ -351,6 +351,7 @@ CHAT_TOOL_MUSIC = "/music"
 CHAT_TOOL_MUSICQUEUE = "/musicqueue"
 CHAT_TOOL_BLUETOOTH = "/bluetooth"
 CHAT_TOOL_IR = "/ir"
+CHAT_TOOL_VISION = "/visionlook"
 CHAT_TOOL_GOAL = "__goal__"
 CHAT_TOOL_NO_TOOL = "__no_tool__"
 # Hardcoding the tool whitelist is deliberate (a closed protocol allowlist, not
@@ -362,6 +363,7 @@ CHAT_TOOLS = {
     CHAT_TOOL_MUSICQUEUE,
     CHAT_TOOL_BLUETOOTH,
     CHAT_TOOL_IR,
+    CHAT_TOOL_VISION,
 }
 
 # The router ``query`` is untrusted LLM output that flows into logs, the visible

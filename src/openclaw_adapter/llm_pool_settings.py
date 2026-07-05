@@ -31,10 +31,23 @@ _DEFAULT_CLOUD_POOL = (
     LLM_PROVIDER_MISTRAL,
     LLM_PROVIDER_BIG_PICKLE,
 )
+_DEFAULT_VISION_POOL = (
+    LLM_PROVIDER_GEMINI,
+    LLM_PROVIDER_MISTRAL,
+    LLM_PROVIDER_LOCAL,
+)
 _ALL_PROVIDERS = (
     LLM_PROVIDER_GEMINI,
     LLM_PROVIDER_MISTRAL,
     LLM_PROVIDER_BIG_PICKLE,
+    LLM_PROVIDER_LOCAL,
+)
+# big_pickle is text-only: the opencode zen gateway rejects image payloads
+# outright (HTTP 400, verified 2026-07-05), so it must never be offered as a
+# vision-pool option.
+_ALL_VISION_PROVIDERS = (
+    LLM_PROVIDER_GEMINI,
+    LLM_PROVIDER_MISTRAL,
     LLM_PROVIDER_LOCAL,
 )
 _KNOWN_CHAT_BACKENDS = frozenset(
@@ -90,6 +103,21 @@ _OPENCODE_RECOMMENDED_MODELS = (
     "north-mini-code-free",
     "nemotron-3-ultra-free",
 )
+_GEMINI_VISION_RECOMMENDED_MODELS = (
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
+    "gemini-3.5-flash",
+)
+_MISTRAL_VISION_RECOMMENDED_MODELS = (
+    "pixtral-12b-latest",
+    "pixtral-large-2503",
+)
+_LOCAL_VISION_RECOMMENDED_MODELS = (
+    "qwen2.5vl",
+    "qwen2.5vl:7b",
+    "qwen2.5vl:3b",
+    "gemma3:12b",
+)
 
 
 class ChatLlmPoolWriteError(RuntimeError):
@@ -132,14 +160,22 @@ class ChatLlmPoolSettings:
     default_chat_provider: str
     cloud_pool: tuple[str, ...]
     providers: dict[str, ProviderSettings]
+    vision_pool: tuple[str, ...] = _DEFAULT_VISION_POOL
+    vision_providers: dict[str, ProviderSettings] | None = None
 
     def to_dict(self) -> dict[str, object]:
+        vp = self.vision_providers or {}
         return {
             "default_chat_provider": self.default_chat_provider,
             "cloud_pool": list(self.cloud_pool),
             "providers": {
                 provider: {"enabled": cfg.enabled, "model": cfg.model}
                 for provider, cfg in self.providers.items()
+            },
+            "vision_pool": list(self.vision_pool),
+            "vision_providers": {
+                provider: {"enabled": cfg.enabled, "model": cfg.model}
+                for provider, cfg in vp.items()
             },
         }
 
@@ -195,7 +231,7 @@ def normalize_chat_llm_pool_settings(
         if isinstance(raw_default, str) and raw_default in _KNOWN_CHAT_BACKENDS
         else defaults.default_chat_provider
     )
-    cloud_pool = _normalize_cloud_pool(data.get("cloud_pool"), defaults.cloud_pool)
+    cloud_pool = _normalize_cloud_pool(data.get("cloud_pool"), defaults.cloud_pool, _DEFAULT_CLOUD_POOL)
     raw_providers = data.get("providers") if isinstance(data.get("providers"), dict) else {}
     providers: dict[str, ProviderSettings] = {}
     for provider in _ALL_PROVIDERS:
@@ -220,11 +256,44 @@ def normalize_chat_llm_pool_settings(
             enabled=True,
             model=providers[default_provider].model,
         )
+
+    vision_pool = _normalize_cloud_pool(data.get("vision_pool"), defaults.vision_pool, _ALL_VISION_PROVIDERS)
+    raw_vp = data.get("vision_providers") if isinstance(data.get("vision_providers"), dict) else {}
+    vision_providers: dict[str, ProviderSettings] = {}
+    for provider in _ALL_VISION_PROVIDERS:
+        base = defaults.vision_providers.get(provider) or ProviderSettings(enabled=False, model="")
+        raw_cfg = raw_vp.get(provider) if isinstance(raw_vp, dict) else None
+        enabled = base.enabled
+        model = base.model
+        if isinstance(raw_cfg, dict):
+            raw_enabled = raw_cfg.get("enabled")
+            if isinstance(raw_enabled, bool):
+                enabled = raw_enabled
+            raw_model = raw_cfg.get("model")
+            if isinstance(raw_model, str) and raw_model.strip():
+                model = _normalize_model_choice(provider, raw_model)
+        vision_providers[provider] = ProviderSettings(enabled=enabled, model=model)
+
     return ChatLlmPoolSettings(
         default_chat_provider=default_chat_provider,
         cloud_pool=cloud_pool,
         providers=providers,
+        vision_pool=vision_pool,
+        vision_providers=vision_providers,
     )
+
+
+def _default_vision_providers(settings: AssistantSettings) -> dict[str, ProviderSettings]:
+    gemini_model = (
+        getattr(settings, "openclaw_gemini_primary_model", None) or "gemini-2.5-flash"
+    ).strip()
+    mistral_model = "pixtral-12b-latest"
+    local_model = _first_model(getattr(settings, "openclaw_local_vision_model", None)) or "qwen2.5vl"
+    return {
+        LLM_PROVIDER_GEMINI: ProviderSettings(enabled=True, model=gemini_model),
+        LLM_PROVIDER_MISTRAL: ProviderSettings(enabled=True, model=mistral_model),
+        LLM_PROVIDER_LOCAL: ProviderSettings(enabled=True, model=local_model),
+    }
 
 
 def default_chat_llm_pool_settings(settings: AssistantSettings) -> ChatLlmPoolSettings:
@@ -244,11 +313,14 @@ def default_chat_llm_pool_settings(settings: AssistantSettings) -> ChatLlmPoolSe
             LLM_PROVIDER_BIG_PICKLE: ProviderSettings(enabled=True, model=_default_opencode_model(settings)),
             LLM_PROVIDER_LOCAL: ProviderSettings(enabled=True, model=local_model),
         },
+        vision_pool=_DEFAULT_VISION_POOL,
+        vision_providers=_default_vision_providers(settings),
     )
 
 
 def chat_llm_pool_payload(settings: AssistantSettings) -> dict[str, object]:
     effective = load_chat_llm_pool_settings(settings)
+    vp = effective.vision_providers or {}
     return {
         "default_chat_provider": effective.default_chat_provider,
         "cloud_pool": list(effective.cloud_pool),
@@ -265,6 +337,20 @@ def chat_llm_pool_payload(settings: AssistantSettings) -> dict[str, object]:
         "model_options": {
             provider: list(model_options_for_provider(settings, provider, effective.providers[provider].model))
             for provider in _ALL_PROVIDERS
+        },
+        "vision_pool": list(effective.vision_pool),
+        "vision_providers": {
+            provider: {
+                "label": _PROVIDER_LABELS[provider],
+                "enabled": cfg.enabled,
+                "model": cfg.model,
+                "configured": provider_is_configured(settings, provider),
+            }
+            for provider, cfg in vp.items()
+        },
+        "vision_model_options": {
+            provider: list(vision_model_options_for_provider(settings, provider, vp.get(provider)))
+            for provider in _ALL_VISION_PROVIDERS
         },
     }
 
@@ -301,6 +387,27 @@ def cloud_pool_order(settings: AssistantSettings) -> tuple[str, ...]:
 def enabled_cloud_pool_providers(settings: AssistantSettings) -> tuple[str, ...]:
     cfg = load_chat_llm_pool_settings(settings)
     return tuple(provider for provider in cfg.cloud_pool if cfg.providers[provider].enabled)
+
+
+def vision_pool_order(settings: AssistantSettings) -> tuple[str, ...]:
+    return load_chat_llm_pool_settings(settings).vision_pool
+
+
+def enabled_vision_pool_providers(settings: AssistantSettings) -> tuple[str, ...]:
+    cfg = load_chat_llm_pool_settings(settings)
+    vp = cfg.vision_providers or {}
+    return tuple(provider for provider in cfg.vision_pool if vp.get(provider, ProviderSettings(enabled=False, model="")).enabled)
+
+
+def resolve_vision_provider_model(settings: AssistantSettings, provider: str) -> str:
+    cfg = load_chat_llm_pool_settings(settings)
+    vp = cfg.vision_providers or {}
+    entry = vp.get(provider)
+    if entry is None:
+        return ""
+    if provider == LLM_PROVIDER_LOCAL:
+        return _first_model(entry.model) or "qwen2.5vl"
+    return entry.model.strip()
 
 
 def default_chat_backend(settings: AssistantSettings) -> str:
@@ -360,6 +467,42 @@ def model_options_for_provider(
     return tuple(out)
 
 
+def vision_model_options_for_provider(
+    settings: AssistantSettings,
+    provider: str,
+    current_cfg: ProviderSettings | None,
+) -> tuple[str, ...]:
+    options: list[str] = []
+    current_model = current_cfg.model if current_cfg else ""
+    if provider == LLM_PROVIDER_GEMINI:
+        options.extend([
+            current_model,
+            getattr(settings, "openclaw_gemini_primary_model", None) or "",
+            getattr(settings, "openclaw_gemini_flash_model", None) or "",
+            *_GEMINI_VISION_RECOMMENDED_MODELS,
+        ])
+    elif provider == LLM_PROVIDER_MISTRAL:
+        options.extend([
+            current_model,
+            *_MISTRAL_VISION_RECOMMENDED_MODELS,
+        ])
+    elif provider == LLM_PROVIDER_LOCAL:
+        options.extend([
+            current_model,
+            _first_model(getattr(settings, "openclaw_local_vision_model", None)) or "",
+            *_LOCAL_VISION_RECOMMENDED_MODELS,
+        ])
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in options:
+        value = _normalize_model_choice(provider, raw)
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return tuple(out)
+
+
 def chat_backend_enabled(settings: AssistantSettings, chat_backend: str) -> bool:
     if chat_backend == CHAT_BACKEND_CLOUD_POOL:
         pool = enabled_cloud_pool_providers(settings)
@@ -392,7 +535,11 @@ def backend_for_provider(provider: str) -> str:
     return _PROVIDER_TO_BACKEND[provider]
 
 
-def _normalize_cloud_pool(raw: object, default_order: tuple[str, ...]) -> tuple[str, ...]:
+def _normalize_cloud_pool(
+    raw: object,
+    default_order: tuple[str, ...],
+    allowed_providers: tuple[str, ...] = _DEFAULT_CLOUD_POOL,
+) -> tuple[str, ...]:
     if not isinstance(raw, list):
         return default_order
     seen: set[str] = set()
@@ -401,7 +548,7 @@ def _normalize_cloud_pool(raw: object, default_order: tuple[str, ...]) -> tuple[
         if not isinstance(item, str):
             continue
         provider = item.strip().lower()
-        if provider not in _DEFAULT_CLOUD_POOL or provider in seen:
+        if provider not in allowed_providers or provider in seen:
             continue
         seen.add(provider)
         out.append(provider)

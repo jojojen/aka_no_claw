@@ -1810,6 +1810,10 @@ def _build_registries(
             build_ir_handler(settings),
             **command_metadata("/ir"),
         ),
+        "/visionlook": RegisteredCommand(
+            lambda r, c: "此功能僅支援網頁聊天中上傳圖片使用。",
+            **command_metadata("/visionlook"),
+        ),
         "/research": RegisteredCommand(
             research_handler,
             ack="收到，正在進行深度商品研究（會分階段回報進度）…",

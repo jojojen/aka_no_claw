@@ -37,12 +37,12 @@ class _ScriptedPlanner:
             return None, str(data.get("error") or "no workflow"), False
         return Workflow.from_dict(data["workflow"]), data.get("error"), False
 
-    def draft(self, goal: str):
+    def draft(self, goal: str, seed_variables=None):
         self._counters["draft_calls"] += 1
         self._events.append({"kind": "planner", "name": "draft", "goal": goal})
         return self._drafts.pop(0)
 
-    def replan(self, goal: str, previous_workflow: Workflow, trace):
+    def replan(self, goal: str, previous_workflow: Workflow, trace, seed_variables=None):
         self._counters["replan_calls"] += 1
         self._events.append(
             {

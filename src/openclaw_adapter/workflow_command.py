@@ -319,6 +319,12 @@ _COMMAND_METADATA: dict[str, dict[str, str]] = {
     "/workflow": {
         "usage": "管理 workflow；常用：list、show、run、create、edit、delete。",
     },
+    "/visionlook": {
+        "usage": "查看圖片並回答相關問題；參數＝要查看的目標（URL或描述）。當使用者需要看商品照片評估品況、或圖片在網頁上需要進一步檢視時使用。",
+        "chat_tool_purpose": "當需要實際查看圖片或商品照片來回答問題時使用",
+        "chat_tool_query_hint": "query 保留要查看的目標與想確認的重點；若圖片在網頁上，附上網址",
+        "chat_tool_display_name": "圖片查看",
+    },
 }
 
 # Backward-compatible usage view for tests/callers that only care about the

@@ -1029,3 +1029,41 @@ def test_runner_run_empty_dispatcher_skips_registry_check():
     ])
     trace = runner.run(wf)
     assert trace.ok
+
+
+# ── seed variables (chat rework fix: carry prior results forward) ────────────
+
+def test_validate_references_accepts_seed_variables():
+    wf = Workflow(id="wf", goal="g", steps=[
+        WorkflowStep(
+            id="s1", kind="llm_transform",
+            inputs=["prior_research_result"], instructions="統整結論",
+            output="answer",
+        ),
+    ])
+    errors = wf.validate_references()
+    assert any("prior_research_result" in e for e in errors)
+    assert wf.validate_references(seed_variables=["prior_research_result"]) == []
+
+
+def test_runner_prebinds_seed_variables():
+    llm = FakeLLMClient("統整後的結論")
+    ex = FakeExecutor()
+    runner = WorkflowRunner(
+        executor=ex,
+        seed_variables={"prior_research_result": "部分研究資料"},
+    )
+    runner.llm_client = llm
+    wf = Workflow(id="wf", goal="g", steps=[
+        WorkflowStep(
+            id="s1", kind="llm_transform",
+            inputs=["prior_research_result"], instructions="統整結論",
+            output="answer",
+        ),
+    ])
+    trace = runner.run(wf)
+    assert trace.ok
+    assert trace.final_result == "統整後的結論"
+    assert "prior_research_result" in trace.variables
+    assert any("部分研究資料" in p for p in llm.prompts)
+    assert ex.calls == []  # no tool re-execution: the seed satisfied the input

@@ -284,3 +284,55 @@ def test_generate_workflow_from_goal_refuses_unknown_tool_slug():
     wf, err, _ = generate_workflow_from_goal("工具", llm, _Catalog())
     assert wf is None
     assert "does not exist in the generated-tool catalog" in err
+
+
+# ── seed variables (chat rework fix: planner sees prior results) ─────────────
+
+def test_goal_workflow_prompt_lists_seed_variables():
+    long_value = "研" * 600
+    prompt = build_goal_workflow_prompt(
+        "統整這張卡的投資結論",
+        catalog=None,
+        command_registry={"/saynow": SimpleNamespace(usage="把文字念出來")},
+        seed_variables={
+            "prior_research_result": long_value,
+            "image_observation": "卡面外觀：中上品相",
+        },
+    )
+    assert "已完成的前置結果" in prompt
+    assert "prior_research_result" in prompt
+    assert "image_observation" in prompt
+    assert "已截斷" in prompt  # 600-char value gets a 500-char preview
+    assert "不要為了重新取得它們而再執行指令" in prompt
+
+
+def test_goal_workflow_prompt_omits_seed_block_without_seeds():
+    prompt = build_goal_workflow_prompt(
+        "統整這張卡的投資結論",
+        catalog=None,
+        command_registry={"/saynow": SimpleNamespace(usage="把文字念出來")},
+    )
+    assert "已完成的前置結果" not in prompt
+
+
+def test_generate_workflow_accepts_seed_variable_references():
+    llm = _FakeLLM(json.dumps({
+        "id": "wf-reuse",
+        "goal": "統整結論",
+        "steps": [
+            {
+                "id": "s1", "kind": "llm_transform",
+                "inputs": ["prior_research_result"],
+                "instructions": "根據既有研究統整投資結論",
+                "output": "answer",
+            },
+        ],
+    }, ensure_ascii=False))
+    wf, err, _ = generate_workflow_from_goal(
+        "統整結論",
+        llm,
+        catalog=None,
+        seed_variables={"prior_research_result": "部分研究資料"},
+    )
+    assert err is None
+    assert wf.steps[0].inputs == ["prior_research_result"]

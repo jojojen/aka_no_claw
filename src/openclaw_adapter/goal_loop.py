@@ -87,6 +87,7 @@ class GoalLoop:
         replan_limit: int = 2,
         narrator: Callable[[str], None] | None = None,
         result_judge: Callable[[str, str], tuple[bool, str]] | None = None,
+        seed_variables: dict[str, str] | None = None,
     ) -> None:
         self.goal = goal
         self.planner = planner
@@ -99,6 +100,11 @@ class GoalLoop:
         self.replan_limit = replan_limit
         self.narrator = narrator
         self.result_judge = result_judge
+        # Results that already exist before this run (e.g. a chat tool that just
+        # completed, or succeeded steps from a previous workflow attempt). They
+        # are pre-bound in the runner and shown to the planner so plans consume
+        # them instead of re-executing expensive steps.
+        self.seed_variables = dict(seed_variables or {})
 
     def run(self, resume: GoalLoopContinuation | None = None) -> GoalLoopReport:
         scratch = {
@@ -109,7 +115,14 @@ class GoalLoop:
             "pause_reason": None,
             "abort": None,
             "narration": list(resume.narration) if resume is not None else [],
+            "seeds": dict(self.seed_variables),
         }
+        if resume is not None and resume.trace is not None:
+            # A resumed run may go straight to replan; make the previous
+            # attempt's bound variables reusable there too.
+            scratch["seeds"].update(
+                {name: var.value for name, var in resume.trace.variables.items()}
+            )
         for line in scratch["narration"]:
             logger.info("[goal-loop] %s", line)
         if not scratch["narration"]:
@@ -281,7 +294,7 @@ class GoalLoop:
     def _steps(self, scratch: dict) -> dict[str, Callable[[LoopContext], StepOutcome]]:
         def draft(ctx: LoopContext) -> StepOutcome:
             self._narrate(scratch, "規劃任務工作流草稿…")
-            workflow, error, _used_fallback = self.planner.draft(self.goal)
+            workflow, error, _used_fallback = self._planner_draft(scratch)
             if workflow is None:
                 scratch["abort"] = error or "無法產生工作流草稿"
                 self._narrate(scratch, f"草稿失敗：{scratch['abort']}")
@@ -298,9 +311,15 @@ class GoalLoop:
                 return StepOutcome(observation="no workflow", failed=True, reflection=scratch["abort"])
             self._narrate(scratch, f"開始執行工作流：{workflow.id}")
             trace = self._build_runner(
-                step_observer=lambda line: self._narrate(scratch, line)
+                step_observer=lambda line: self._narrate(scratch, line),
+                seed_variables=scratch["seeds"],
             ).run(workflow)
             scratch["trace"] = trace
+            # Carry every bound variable (succeeded steps + prior seeds) forward
+            # so a replan can consume them instead of re-running those steps.
+            scratch["seeds"].update(
+                {name: var.value for name, var in trace.variables.items()}
+            )
             scratch["needs_replan"] = False
             scratch["pause_reason"] = None
             if trace.ok:
@@ -367,7 +386,7 @@ class GoalLoop:
                 scratch["abort"] = "缺少重規劃所需的 workflow 或 trace"
                 return StepOutcome(observation="replan unavailable", failed=True, reflection=scratch["abort"])
             self._narrate(scratch, f"進入重規劃（{scratch['replans_used'] + 1}/{self.replan_limit}）")
-            revised, error, _used_fallback = self.planner.replan(self.goal, workflow, trace)
+            revised, error, _used_fallback = self._planner_replan(scratch, workflow, trace)
             if revised is None:
                 scratch["abort"] = error or "重規劃失敗"
                 self._narrate(scratch, f"重規劃失敗：{scratch['abort']}")
@@ -413,8 +432,18 @@ class GoalLoop:
             return "run_workflow"
         return decide
 
+    def _planner_draft(self, scratch: dict):
+        seeds = dict(scratch.get("seeds") or {})
+        return self.planner.draft(self.goal, seed_variables=seeds)
+
+    def _planner_replan(self, scratch: dict, workflow: Workflow, trace: WorkflowTrace):
+        seeds = dict(scratch.get("seeds") or {})
+        return self.planner.replan(self.goal, workflow, trace, seed_variables=seeds)
+
     def _build_runner(
-        self, step_observer: Callable[[str], None] | None = None
+        self,
+        step_observer: Callable[[str], None] | None = None,
+        seed_variables: dict[str, str] | None = None,
     ) -> WorkflowRunner:
         return WorkflowRunner(
             executor=self.executor,
@@ -424,6 +453,7 @@ class GoalLoop:
             ),
             llm_client=self.llm_client,
             step_observer=step_observer,
+            seed_variables=seed_variables,
         )
 
     def _judge_result(self, scratch: dict, final_result: str) -> tuple[bool, str]:

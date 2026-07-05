@@ -39,7 +39,7 @@ class GoalPlanner:
             return self.pool_rotation.rotate(list(self.llm_client))
         return self.llm_client
 
-    def draft(self, goal: str):
+    def draft(self, goal: str, seed_variables: dict[str, str] | None = None):
         return generate_workflow_from_goal(
             goal,
             self._client_for_call(),
@@ -49,9 +49,16 @@ class GoalPlanner:
             command_usage_resolver=self.command_usage_resolver,
             fallback_client=self.fallback_client,
             progress=self.progress,
+            seed_variables=seed_variables,
         )
 
-    def replan(self, goal: str, previous_workflow: Workflow, trace: WorkflowTrace):
+    def replan(
+        self,
+        goal: str,
+        previous_workflow: Workflow,
+        trace: WorkflowTrace,
+        seed_variables: dict[str, str] | None = None,
+    ):
         return replan_workflow_from_trace(
             goal,
             previous_workflow,
@@ -63,6 +70,7 @@ class GoalPlanner:
             command_usage_resolver=self.command_usage_resolver,
             fallback_client=self.fallback_client,
             progress=self.progress,
+            seed_variables=seed_variables,
         )
 
 
@@ -130,6 +138,7 @@ def generate_workflow_from_goal(
     prompt_override: str | None = None,
     strict: bool = True,
     progress: Callable[[str], None] | None = None,
+    seed_variables: dict[str, str] | None = None,
 ):
     """Ask the LLM to draft a Workflow from a one-line goal description."""
 
@@ -147,6 +156,7 @@ def generate_workflow_from_goal(
         command_registry=command_registry,
         allowed_commands=allowed_commands,
         command_usage_resolver=command_usage_resolver,
+        seed_variables=seed_variables,
     )
     raw_clients = list(llm_client) if isinstance(llm_client, (list, tuple)) else [llm_client]
     clients: list[tuple[object, bool]] = [
@@ -177,6 +187,7 @@ def generate_workflow_from_goal(
             description,
             catalog,
             command_registry=command_registry,
+            seed_variables=seed_variables,
         )
         if wf is not None:
             last_parseable_wf = wf
@@ -207,6 +218,7 @@ def generate_workflow_from_goal(
             description,
             catalog,
             command_registry=command_registry,
+            seed_variables=seed_variables,
         )
         if repaired_wf is not None:
             last_parseable_wf = repaired_wf
@@ -248,6 +260,7 @@ def replan_workflow_from_trace(
     command_usage_resolver: Callable[[str, object | None], str] | None = None,
     fallback_client=None,
     progress: Callable[[str], None] | None = None,
+    seed_variables: dict[str, str] | None = None,
 ):
     prompt = build_goal_replan_prompt(
         description,
@@ -257,6 +270,7 @@ def replan_workflow_from_trace(
         command_registry=command_registry,
         allowed_commands=allowed_commands,
         command_usage_resolver=command_usage_resolver,
+        seed_variables=seed_variables,
     )
     return generate_workflow_from_goal(
         description,
@@ -269,7 +283,24 @@ def replan_workflow_from_trace(
         prompt_override=prompt,
         strict=True,
         progress=progress,
+        seed_variables=seed_variables,
     )
+
+
+def _seed_variable_block(seed_variables: dict[str, str] | None) -> str:
+    if not seed_variables:
+        return ""
+    lines = ["已完成的前置結果（下列變數在執行前就已有完整內容，可直接被 llm_transform 的 inputs 或 command_sink 的 input 引用）："]
+    for name, value in seed_variables.items():
+        preview = " ".join(str(value).split())
+        if len(preview) > 500:
+            preview = preview[:500] + "…（已截斷，實際變數含完整內容）"
+        lines.append(f"- {name}：{preview}")
+    lines.append(
+        "這些內容已經取得，不要為了重新取得它們而再執行指令；"
+        "只規劃仍然缺少的步驟，並直接引用這些變數。"
+    )
+    return "\n".join(lines) + "\n\n"
 
 
 def build_goal_workflow_prompt(
@@ -279,6 +310,7 @@ def build_goal_workflow_prompt(
     command_registry=None,
     allowed_commands=None,
     command_usage_resolver: Callable[[str, object | None], str] | None = None,
+    seed_variables: dict[str, str] | None = None,
 ) -> str:
     tool_lines = []
     if catalog is not None:
@@ -314,10 +346,11 @@ def build_goal_workflow_prompt(
         f"  command 只能是下列已登記的指令（請依其用法填 literal）：\n{command_block}\n\n"
         "可用的工具（tool_call 只能使用下列已存在的 slug；若沒有合適的，改用 llm_transform 或 command_sink，不可自行編造 slug）：\n"
         f"{tool_block}\n\n"
-        "規則：\n"
+        + _seed_variable_block(seed_variables)
+        + "規則：\n"
         "1. 每個步驟都要有唯一的 output 變數名（英文小寫，如 weather、greeting）。\n"
         "2. 參數固定時一律用 command_sink 的 literal 直接填，**不要**為了產生固定參數而多插一個 llm_transform 步驟。\n"
-        "3. 後面步驟的 inputs／input 只能引用前面步驟產生的 output 變數。\n"
+        "3. 後面步驟的 inputs／input 只能引用前面步驟產生的 output 變數，或已完成前置結果的變數（若有列出）。\n"
         "4. command 只能用上面列出的指令，不可自行編造（如 /musiclistbest 不存在）。\n"
         "5. 若需求需要熱門、最新、排名、查證或其他外部事實，先用已登記的搜尋／讀取類指令取得根據，再做後續動作。\n"
         "6. 若最後動作依賴本機資源（例如本機音樂庫、已登記裝置、既有清單），先用已登記的列出／查詢類指令取得候選，再比對後執行。\n"
@@ -340,6 +373,7 @@ def build_goal_replan_prompt(
     command_registry=None,
     allowed_commands=None,
     command_usage_resolver: Callable[[str, object | None], str] | None = None,
+    seed_variables: dict[str, str] | None = None,
 ) -> str:
     base = build_goal_workflow_prompt(
         description,
@@ -347,6 +381,7 @@ def build_goal_replan_prompt(
         command_registry=command_registry,
         allowed_commands=allowed_commands,
         command_usage_resolver=command_usage_resolver,
+        seed_variables=seed_variables,
     )
     previous_json = json.dumps(previous_workflow.to_dict(), ensure_ascii=False)
     trace_json = json.dumps(trace.to_dict(), ensure_ascii=False)
@@ -354,7 +389,8 @@ def build_goal_replan_prompt(
         base
         + "\n\n你現在是在修正一份已執行失敗的工作流。"
         + "\n規則補充："
-        + "\n1. 保留已成功步驟的成果，不要重複同一個失敗做法。"
+        + "\n1. 保留已成功步驟的成果，不要重複同一個失敗做法；"
+        + "已成功步驟的輸出已列為前置結果變數，直接引用即可，不要重新執行那些步驟。"
         + "\n2. 優先修改失敗步驟及其之後需要調整的步驟。"
         + "\n3. 若原目標本身不可行，要輸出最接近且可執行的 workflow，而不是空白。"
         + "\n4. 若上一版的執行結果是在反問、要求澄清、或列出多個候選，"
@@ -387,6 +423,7 @@ def _workflow_from_llm_output(
     catalog,
     *,
     command_registry=None,
+    seed_variables: dict[str, str] | None = None,
 ) -> tuple[Workflow | None, list[str], str | None]:
     data = extract_json_object(raw)
     if data is None:
@@ -403,6 +440,7 @@ def _workflow_from_llm_output(
         wf,
         catalog,
         command_registry=command_registry,
+        seed_variables=seed_variables,
     ), None
 
 
@@ -411,11 +449,15 @@ def _validate_goal_workflow(
     catalog,
     *,
     command_registry=None,
+    seed_variables: dict[str, str] | None = None,
 ) -> list[str]:
     known_commands = None
     if command_registry is not None:
         known_commands = frozenset(command_registry.keys())
-    errors = workflow.validate_references(known_commands=known_commands)
+    errors = workflow.validate_references(
+        known_commands=known_commands,
+        seed_variables=(seed_variables or {}).keys(),
+    )
     known_tools = _catalog_tool_slugs(catalog)
     if known_tools is not None:
         for step in workflow.steps:

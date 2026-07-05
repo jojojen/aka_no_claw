@@ -37,6 +37,8 @@ Full inventory with recommended actions is in [DOC_AUDIT.md](DOC_AUDIT.md).
 | [NEW_E2E_DISCRIMINATING_TESTS.md](NEW_E2E_DISCRIMINATING_TESTS.md) | Current | dynamic-tools | Companion: discriminating tests for generated tools. |
 | [NEW_OPENCODE_DECOUPLING_PLAN.md](NEW_OPENCODE_DECOUPLING_PLAN.md) | Planned | dynamic-tools | Companion: plan to move `/new` + Chat off OpenCode CLI to direct HTTP; add Mistral switch (issues #51/#59). |
 | [CHAT_GOAL_LOOP_PLAN.md](CHAT_GOAL_LOOP_PLAN.md) | Planned | dynamic-tools | Companion: chat goal loop — plan-then-execute multi-tool runs with replan, budget-continue UX, narrated trace, eval harness (issues #50–#54). |
+| [CHAT_REWORK_DEBUG_TRACE.md](CHAT_REWORK_DEBUG_TRACE.md) | Current | dynamic-tools | Debug record: why one chat turn ran /research ×3 (rework); root causes + seed-variables/tool-ledger fix rationale. |
+| [WEB_CHAT_MULTIMODAL_PLAN.md](WEB_CHAT_MULTIMODAL_PLAN.md) | Planned | dynamic-tools | Web chat multimodal: image upload, text/vision cloud pool split with rotation, vision-as-a-tool orchestration, image-translation A/B replacement (issue #71). |
 | [TELEGRAM_NL_OWNERSHIP_REFACTOR_ISSUE.md](TELEGRAM_NL_OWNERSHIP_REFACTOR_ISSUE.md) | Planned | telegram | Draft issue for moving aka-specific Telegram NL workflow routing out of `price_monitor_bot`. |
 | [TELEGRAM_CORE_EXTRACTION_PLAN.md](TELEGRAM_CORE_EXTRACTION_PLAN.md) | Current | telegram | Shared `telegram_core` package (transport, dispatcher contract, polling, list_view) extracted from `price_monitor_bot`, P0–P4 shipped; kept as the implementation record and hook/registry contract reference. |
 | [KB_EMBEDDING_PLAN.md](KB_EMBEDDING_PLAN.md) | Needs review | knowledge | Embedding/RAG plan and status may need fresh verification. |

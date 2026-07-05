@@ -21,7 +21,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Literal, Protocol
+from typing import Callable, Iterable, Literal, Protocol
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +195,7 @@ class Workflow:
     def validate_references(
         self,
         known_commands: frozenset[str] | None = None,
+        seed_variables: Iterable[str] | None = None,
     ) -> list[str]:
         """Return a list of structural errors (forward refs, unlisted commands).
         An empty list means the workflow is structurally sound.
@@ -202,9 +203,13 @@ class Workflow:
         Pass ``known_commands`` (the keys of the live command dispatcher) to also
         flag commands that pass the denylist check but have no registered handler.
         When ``None`` (default) the registry check is skipped — used at save-time
-        when no dispatcher is available."""
+        when no dispatcher is available.
+
+        ``seed_variables`` are variable names that exist before the first step
+        runs (results carried over from earlier work); steps may reference them
+        without a producing step."""
         errors: list[str] = []
-        defined: set[str] = set()
+        defined: set[str] = set(seed_variables or ())
         for step in self.steps:
             if step.kind == "tool_call":
                 if not step.tool:
@@ -462,11 +467,13 @@ class WorkflowRunner:
         command_dispatcher: CommandDispatcher | None = None,
         llm_client: LLMClient | None = None,
         step_observer: Callable[[str], None] | None = None,
+        seed_variables: dict[str, str] | None = None,
     ) -> None:
         self.executor = executor
         self.command_dispatcher: CommandDispatcher = command_dispatcher or {}
         self.llm_client = llm_client
         self.step_observer = step_observer
+        self.seed_variables = dict(seed_variables or {})
 
     def _observe(self, line: str) -> None:
         if self.step_observer is None:
@@ -479,7 +486,9 @@ class WorkflowRunner:
     def run(self, workflow: Workflow) -> WorkflowTrace:
         """Execute all steps and return the full trace."""
         known = frozenset(self.command_dispatcher.keys()) if self.command_dispatcher else None
-        errors = workflow.validate_references(known_commands=known)
+        errors = workflow.validate_references(
+            known_commands=known, seed_variables=self.seed_variables.keys()
+        )
         if errors:
             joined = "\n".join(errors)
             return WorkflowTrace(
@@ -490,6 +499,8 @@ class WorkflowRunner:
             )
 
         store = VariableStore()
+        for name, value in self.seed_variables.items():
+            store.bind(name, str(value), source_step="seed", provenance="carried over from earlier result")
         trace = WorkflowTrace(workflow_id=workflow.id, goal=workflow.goal)
         failed = False
         last_output_var: str | None = None
