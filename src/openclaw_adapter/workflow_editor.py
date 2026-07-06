@@ -204,6 +204,19 @@ class WorkflowEditor:
         text, markup = _render_editor_card(session)
         return text, markup
 
+    def start_rename(self, chat_id: str, workflow_id: str) -> tuple[str, dict]:
+        """Begin a rename-only capture session: the next plain-text message
+        replaces the workflow's goal (its display name) and saves immediately,
+        without opening the full step editor."""
+        wf = self._store.get(workflow_id)
+        if wf is None:
+            return f"找不到 workflow '{workflow_id}'", {}
+        session = _EditorSession(
+            chat_id=str(chat_id), workflow=_clone_workflow(wf), collecting="rename"
+        )
+        self._sessions[str(chat_id)] = session
+        return f"✏️ 為 *{wf.id}* 輸入新名稱（目前：{wf.goal}）：", _cancel_markup()
+
     def start_from_draft(self, chat_id: str, workflow: Workflow) -> tuple[str, dict]:
         """Open the editor card pre-populated with an LLM-generated draft.
 
@@ -247,6 +260,8 @@ class WorkflowEditor:
         # Top-level goal collection
         if session.collecting == "goal":
             return self._collect_goal(text, session)
+        if session.collecting == "rename":
+            return self._collect_rename(text, session)
         # Step-level field collection
         if session.adding is not None and session.adding.collecting is not None:
             return self._advance_add(text, session)
@@ -268,6 +283,24 @@ class WorkflowEditor:
         session.workflow.goal = goal
         session.collecting = None
         return _render_editor_card(session)
+
+    def _collect_rename(
+        self, text: str, session: _EditorSession
+    ) -> tuple[str, dict]:
+        new_name = text.strip()
+        if not new_name:
+            return "名稱不能為空，請重新輸入：", _cancel_markup()
+        session.workflow.goal = new_name
+        session.collecting = None
+        # Save immediately -- renaming is a complete action on its own, not
+        # contingent on the user also pressing the editor's 💾 儲存 button.
+        # The session stays open on the full editor card (same landing spot
+        # _collect_goal uses) so the response carries real wfe: actions and
+        # slots into the existing capture-mode contract without inventing a
+        # new one-shot completion signal on the frontend.
+        self._store.save(session.workflow)
+        card_text, markup = _render_editor_card(session)
+        return f"✅ 已改名為：{new_name}\n\n{card_text}", markup
 
     def _advance_add(
         self, text: str, session: _EditorSession

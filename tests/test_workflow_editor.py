@@ -377,6 +377,55 @@ def test_start_edit_unknown_id(tmp_path):
     assert not editor.has_session("chat-1")
 
 
+# ── start_rename / rename capture ──────────────────────────────────────────────
+
+def test_start_rename_prompts_and_starts_capturing(tmp_path):
+    store = WorkflowStore(tmp_path / "workflows")
+    store.save(Workflow(id="wf-existing", goal="舊名稱"))
+    editor = WorkflowEditor(store)
+    text, markup = editor.start_rename("chat-1", "wf-existing")
+    assert "wf-existing" in text
+    assert "舊名稱" in text
+    assert "wfe:cancel" in _callback_data(markup)
+    assert editor.is_capturing("chat-1")
+
+
+def test_start_rename_unknown_id(tmp_path):
+    editor = _make_editor(tmp_path)
+    text, _ = editor.start_rename("chat-1", "nonexistent")
+    assert "找不到" in text
+    assert not editor.has_session("chat-1")
+
+
+def test_collect_rename_saves_new_goal_and_persists(tmp_path):
+    store = WorkflowStore(tmp_path / "workflows")
+    store.save(Workflow(id="wf-existing", goal="舊名稱", steps=[
+        WorkflowStep(id="s1", kind="tool_call", tool="t", output="data"),
+    ]))
+    editor = WorkflowEditor(store)
+    editor.start_rename("chat-1", "wf-existing")
+    text, markup = editor.handle_text_capture("新名稱", "chat-1")
+    assert "新名稱" in text
+    assert "wfe:save" in _callback_data(markup)
+    # Persisted immediately, not contingent on pressing wfe:save.
+    reloaded = store.get("wf-existing")
+    assert reloaded is not None
+    assert reloaded.goal == "新名稱"
+    # Steps are untouched by a rename.
+    assert len(reloaded.steps) == 1
+
+
+def test_collect_rename_empty_name_prompts_retry(tmp_path):
+    store = WorkflowStore(tmp_path / "workflows")
+    store.save(Workflow(id="wf-existing", goal="舊名稱"))
+    editor = WorkflowEditor(store)
+    editor.start_rename("chat-1", "wf-existing")
+    text, _ = editor.handle_text_capture("  ", "chat-1")
+    assert "空" in text
+    assert editor.is_capturing("chat-1")
+    assert store.get("wf-existing").goal == "舊名稱"
+
+
 # ── start_from_draft (AI-generated draft → editable card) ─────────────────────
 
 def _morning_draft() -> Workflow:

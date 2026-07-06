@@ -196,6 +196,7 @@ class Workflow:
         self,
         known_commands: frozenset[str] | None = None,
         seed_variables: Iterable[str] | None = None,
+        check_types: bool = False,
     ) -> list[str]:
         """Return a list of structural errors (forward refs, unlisted commands).
         An empty list means the workflow is structurally sound.
@@ -207,9 +208,22 @@ class Workflow:
 
         ``seed_variables`` are variable names that exist before the first step
         runs (results carried over from earlier work); steps may reference them
-        without a producing step."""
+        without a producing step.
+
+        ``check_types`` additionally flags command_sink steps whose input variable's
+        statically-known type (see var_types below) isn't accepted by the sink
+        (COMMAND_SINK_INPUT_TYPES) -- e.g. feeding a raw command_result into /saynow.
+        Defaults to False so WorkflowRunner.run() keeps its existing runtime-only
+        behavior (a real safety net independent of how the workflow was produced);
+        the goal/plan drafting path opts in via check_types=True so the LLM gets a
+        chance to self-repair before anything executes."""
         errors: list[str] = []
         defined: set[str] = set(seed_variables or ())
+        # Statically-known output type per step kind, only tracked when
+        # check_types is on. Seed variables carry no static type info at this
+        # layer, so they're deliberately left out of var_types (treated as
+        # unknown -- never flagged as a mismatch).
+        var_types: dict[str, str] = {}
         for step in self.steps:
             if step.kind == "tool_call":
                 if not step.tool:
@@ -239,6 +253,16 @@ class Workflow:
                         f"Step {step.id}: input '{step.input}' is not yet produced "
                         f"by a prior step"
                     )
+                elif check_types and step.input and step.command:
+                    accepted = COMMAND_SINK_INPUT_TYPES.get(step.command)
+                    actual = var_types.get(step.input)
+                    if accepted is not None and actual is not None and actual not in accepted:
+                        errors.append(
+                            f"Step {step.id}: type mismatch: '{step.command}' accepts "
+                            f"{sorted(accepted)} but variable '{step.input}' has type "
+                            f"'{actual}' (produce it with an llm_transform step instead, "
+                            f"so it's converted to plain_text/speech_text first)"
+                        )
                 if step.input is None and step.literal is None:
                     errors.append(
                         f"Step {step.id}: command_sink must have 'input' (variable name) "
@@ -252,6 +276,11 @@ class Workflow:
                             f"by a prior step"
                         )
             defined.add(step.output)
+            var_types[step.output] = {
+                "tool_call": VARIABLE_TYPE_PLAIN_TEXT,
+                "command_sink": VARIABLE_TYPE_COMMAND_RESULT,
+                "llm_transform": VARIABLE_TYPE_SPEECH_TEXT,
+            }.get(step.kind, VARIABLE_TYPE_PLAIN_TEXT)
         return errors
 
     def to_dict(self) -> dict:
@@ -468,12 +497,20 @@ class WorkflowRunner:
         llm_client: LLMClient | None = None,
         step_observer: Callable[[str], None] | None = None,
         seed_variables: dict[str, str] | None = None,
+        seed_variable_types: dict[str, str] | None = None,
     ) -> None:
         self.executor = executor
         self.command_dispatcher: CommandDispatcher = command_dispatcher or {}
         self.llm_client = llm_client
         self.step_observer = step_observer
         self.seed_variables = dict(seed_variables or {})
+        # Types (plain_text/speech_text/command_result/...) that seed variables
+        # had when they were first produced. Without these every seed defaults
+        # to VariableStore.bind's generic "text", which satisfies no
+        # type-restricted command_sink -- carrying a speech_text result forward
+        # across a replan would otherwise silently degrade it and make the
+        # very next /saynow-style step fail.
+        self.seed_variable_types = dict(seed_variable_types or {})
 
     def _observe(self, line: str) -> None:
         if self.step_observer is None:
@@ -500,7 +537,13 @@ class WorkflowRunner:
 
         store = VariableStore()
         for name, value in self.seed_variables.items():
-            store.bind(name, str(value), source_step="seed", provenance="carried over from earlier result")
+            store.bind(
+                name,
+                str(value),
+                source_step="seed",
+                provenance="carried over from earlier result",
+                type_=self.seed_variable_types.get(name, "text"),
+            )
         trace = WorkflowTrace(workflow_id=workflow.id, goal=workflow.goal)
         failed = False
         last_output_var: str | None = None

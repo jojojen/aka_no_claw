@@ -109,6 +109,32 @@ def test_validate_references_clean_workflow():
     assert wf.validate_references() == []
 
 
+def test_validate_references_command_sink_output_fed_to_type_restricted_sink():
+    # Regression: a command_sink step's output is command_result, which
+    # /saynow does not accept. With check_types=True (the goal-planner draft
+    # path), this is caught before execution instead of only at runtime (see
+    # COMMAND_SINK_INPUT_TYPES). check_types defaults to False so
+    # WorkflowRunner.run()'s own runtime safety net is unaffected (see
+    # test_command_sink_type_mismatch_trace_records_error).
+    wf = Workflow(id="wf", goal="g", steps=[
+        WorkflowStep(id="s1", kind="command_sink", command="/musiclistall", literal="all", output="raw"),
+        WorkflowStep(id="s2", kind="command_sink", command="/saynow", input="raw", output="out"),
+    ])
+    assert wf.validate_references() == []
+    errors = wf.validate_references(check_types=True)
+    assert any("type mismatch" in e and "command_result" in e for e in errors)
+
+
+def test_validate_references_llm_transform_output_satisfies_type_restricted_sink():
+    wf = Workflow(id="wf", goal="g", steps=[
+        WorkflowStep(id="s1", kind="command_sink", command="/musiclistall", literal="all", output="raw"),
+        WorkflowStep(id="s2", kind="llm_transform", inputs=["raw"],
+                     instructions="summarize", output="summary"),
+        WorkflowStep(id="s3", kind="command_sink", command="/saynow", input="summary", output="out"),
+    ])
+    assert wf.validate_references(check_types=True) == []
+
+
 def test_validate_references_missing_command_sink_input():
     wf = Workflow(id="wf", goal="g", steps=[
         # s1 produces "weather", but s2 references "greeting" which doesn't exist

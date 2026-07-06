@@ -115,6 +115,15 @@ Use this litmus test: could the repository be published publicly right now witho
 - Shared-core changes require stronger verification than isolated docs or copy changes.
 - Run targeted verification after edits; run broader verification when touching shared paths.
 - If verification is skipped or blocked, say so explicitly in the final report.
+- After root-causing and fixing any bug (in any part of the codebase, not just
+  generated tools), distill the generalizable lesson — the debugging
+  discipline or code-contract habit, not the specific fix or domain fact —
+  and add it as a new entry to `CODEGEN_SEED` in
+  `src/openclaw_adapter/knowledge_db.py`. Mark it always-on (`"*"` in
+  `keywords`) when it is a general engineering technique. Never record a
+  domain-specific formula there; those stay as `參考: <url>` references per
+  the no-hardcode rule. Verify the new entry seeds and retrieves before
+  calling the task done.
 
 Current repo defaults:
 
@@ -162,7 +171,10 @@ Before finishing a task:
 1. Re-read the changed files for consistency.
 2. Run the chosen verification.
 3. Check that no secrets or local artifacts were introduced.
-4. Summarize assumptions, outcomes, and any remaining risk clearly.
+4. If the task involved diagnosing and fixing a bug, add the generalized
+   lesson to `knowledge_db.py`'s `CODEGEN_SEED` (see Section 8) before
+   considering the task done.
+5. Summarize assumptions, outcomes, and any remaining risk clearly.
 
 ## 12. External Style References
 

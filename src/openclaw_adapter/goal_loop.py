@@ -116,12 +116,19 @@ class GoalLoop:
             "abort": None,
             "narration": list(resume.narration) if resume is not None else [],
             "seeds": dict(self.seed_variables),
+            # Static type (plain_text/speech_text/command_result/...) each seed
+            # had when it was first produced, so a replan carrying it forward
+            # doesn't lose that information (see WorkflowRunner.run()).
+            "seed_types": {},
         }
         if resume is not None and resume.trace is not None:
             # A resumed run may go straight to replan; make the previous
             # attempt's bound variables reusable there too.
             scratch["seeds"].update(
                 {name: var.value for name, var in resume.trace.variables.items()}
+            )
+            scratch["seed_types"].update(
+                {name: var.type for name, var in resume.trace.variables.items()}
             )
         for line in scratch["narration"]:
             logger.info("[goal-loop] %s", line)
@@ -313,12 +320,16 @@ class GoalLoop:
             trace = self._build_runner(
                 step_observer=lambda line: self._narrate(scratch, line),
                 seed_variables=scratch["seeds"],
+                seed_variable_types=scratch["seed_types"],
             ).run(workflow)
             scratch["trace"] = trace
             # Carry every bound variable (succeeded steps + prior seeds) forward
             # so a replan can consume them instead of re-running those steps.
             scratch["seeds"].update(
                 {name: var.value for name, var in trace.variables.items()}
+            )
+            scratch["seed_types"].update(
+                {name: var.type for name, var in trace.variables.items()}
             )
             scratch["needs_replan"] = False
             scratch["pause_reason"] = None
@@ -444,6 +455,7 @@ class GoalLoop:
         self,
         step_observer: Callable[[str], None] | None = None,
         seed_variables: dict[str, str] | None = None,
+        seed_variable_types: dict[str, str] | None = None,
     ) -> WorkflowRunner:
         return WorkflowRunner(
             executor=self.executor,
@@ -454,6 +466,7 @@ class GoalLoop:
             llm_client=self.llm_client,
             step_observer=step_observer,
             seed_variables=seed_variables,
+            seed_variable_types=seed_variable_types,
         )
 
     def _judge_result(self, scratch: dict, final_result: str) -> tuple[bool, str]:

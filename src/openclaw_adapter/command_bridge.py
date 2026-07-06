@@ -70,6 +70,7 @@ from .command_bridge_models import (
     CHAT_BACKEND_GEMINI,
     CHAT_BACKEND_LOCAL,
     CHAT_TOOL_BLUETOOTH,
+    CHAT_TOOL_CREATE_WORKFLOW,
     CHAT_TOOL_GOAL,
     CHAT_TOOL_IR,
     CHAT_TOOL_MUSIC,
@@ -105,6 +106,7 @@ from .command_bridge_models import (
     stream_done,
     stream_error,
     stream_heartbeat,
+    stream_redirect,
     stream_start,
 )
 from .goal_loop import GoalLoop, GoalLoopContinuation, GoalLoopReport
@@ -147,6 +149,7 @@ _GOAL_CONFIRM_INPUT = "__goal_confirm__"
 _GOAL_CONTINUE_INPUT = "__goal_continue__"
 _GOAL_CONTINUE_SEARCH_INPUT = "__goal_continue_search__"
 _GOAL_STOP_INPUT = "__goal_stop__"
+_GOAL_SAVE_WORKFLOW_INPUT = "__goal_save_workflow__"
 _GOAL_STEP_GRANT = 6
 _GOAL_REPLAN_LIMIT = 2
 _GOAL_SEARCH_GRANT = 5
@@ -346,6 +349,22 @@ def _walk_cloud_pool_chain(
     return None, None, None, tuple(attempts)
 
 
+def _pin_provider_chain(
+    chain: list[tuple[str, str, object, object]],
+    pinned: str | None,
+) -> list[tuple[str, str, object, object]]:
+    """Reorder ``chain`` so the entry whose provider label matches ``pinned``
+    is first, preserving the relative order of everything else. No-op if
+    ``pinned`` is None or not present in ``chain`` (e.g. the operator removed
+    that provider from the pool since the pin was recorded)."""
+    if pinned is None:
+        return chain
+    for i, entry in enumerate(chain):
+        if entry[0] == pinned:
+            return [entry, *chain[:i], *chain[i + 1:]]
+    return chain
+
+
 def _extract_gemini_text(data: object) -> str:
     if not isinstance(data, dict):
         return ""
@@ -379,11 +398,18 @@ _CHAT_TOOL_PLAN_PROMPT_TEMPLATE = (
     "例如：\n"
     '- 問「米津玄師是誰」→ {{"tool":"__no_tool__","answer":"...","reason_summary":"一般知識"}}\n'
     '- 問「今天東京天氣」→ {{"tool":"/search","query":"東京 今天天氣","reason_summary":"需要最新資訊"}}\n'
-    '- 問「幫我規劃一個先查天氣再播報的工作流」→ {{"tool":"__goal__","query":"先查天氣再播報的工作流","reason_summary":"多步驟目標"}}\n'
+    '- 問「先幫我查一下東京天氣，再用日文念出來」→ {{"tool":"__goal__","query":"查東京天氣後用日文念出來","reason_summary":"想現在就完成的多步驟任務"}}\n'
+    '- 問「建立工作流：查東京天氣，用女僕口吻以日文報告」→ '
+    '{{"tool":"__create_workflow__","query":"查東京天氣，用女僕口吻以日文報告","reason_summary":"要求建立可重複使用的工作流程"}}\n'
     "當 tool=__no_tool__ 時，answer 必須是給使用者看的最終答案，"
     "用繁體中文自然回答。\n"
-    "當 tool=__goal__ 時，query 必須是使用者想完成的多步驟目標描述，"
-    "不要回答成最終執行結果。\n"
+    "當使用者是明確要求「建立/新增/設定一個工作流程」這件事本身（例如訊息以"
+    "「建立工作流：」、「幫我建立一個工作流」開頭），要用 __create_workflow__，"
+    "不要用 __goal__——工作流是要保存起來、之後可以重複執行的流程定義，"
+    "不是現在就執行一次的任務；query 必須是工作流的完整內容描述。\n"
+    "當 tool=__goal__ 時，代表使用者是在描述一個想要『現在就完成』的多步驟"
+    "任務或目標（不是要求建立一個之後可重複執行的工作流程本身），"
+    "query 必須是使用者想完成的多步驟目標描述，不要回答成最終執行結果。\n"
     "當 tool 是真實工具時，query 必須是該工具可直接執行的參數；"
     "若使用者用代名詞（她／它／這個），請用對話紀錄把主詞補回 query。"
 )
@@ -679,8 +705,17 @@ class CommandBridge:
         self._music_cont_lock = threading.Lock()
         self._goal_continuations: dict[str, dict] = {}
         self._goal_cont_lock = threading.Lock()
+        self._chat_pool_pins: dict[str, str] = {}
+        self._chat_pool_pins_lock = threading.Lock()
         self._goal_pending_confirms: dict[str, dict] = {}
         self._goal_pending_lock = threading.Lock()
+        # A goal run that finished successfully offers a "💾 存為工作流" button
+        # instead of auto-saving -- most completed goals are one-off asks, not
+        # something the user wants cluttering the workflow list. This holds the
+        # most recent completed-but-not-yet-saved workflow per conversation so
+        # that button click has something to persist.
+        self._goal_completed_workflows: dict[str, Workflow] = {}
+        self._goal_completed_lock = threading.Lock()
         # Per-conversation record of every chat tool / goal-loop execution
         # (success AND failure). Shown to the tool-plan router so it stops
         # re-running tools whose results (or failures) this conversation
@@ -878,6 +913,18 @@ class CommandBridge:
             )
         prompt = build_chat_prompt(req.input, req.history)
         plan, metadata = self._select_chat_tool_plan(req)
+        if plan is not None and plan.tool == CHAT_TOOL_CREATE_WORKFLOW:
+            # No streaming connection to carry a "redirect" event here, so run
+            # the same dedicated workflow-creation entrypoint the frontend
+            # hits after a streamed redirect (run_workflow_command) directly.
+            result = self.run_workflow_command(
+                f"create {plan.query}", chat_backend=req.chat_backend
+            )
+            return WebCommandResponse(
+                status=str(result.get("status") or STATUS_OK),
+                message=str(result.get("message") or ""),
+                mode=MODE_CHAT,
+            )
         if plan is not None and plan.tool == CHAT_TOOL_GOAL:
             return self._run_goal_loop_blocking(req, plan.query, planner_metadata=metadata)
         if plan is not None and plan.tool != CHAT_TOOL_NO_TOOL:
@@ -911,7 +958,9 @@ class CommandBridge:
         if plan is not None and plan.tool == CHAT_TOOL_NO_TOOL:
             message = plan.answer
         else:
-            message, metadata = self._generate_chat_response_blocking(prompt, req.chat_backend)
+            message, metadata = self._generate_chat_response_blocking(
+                prompt, req.chat_backend, conversation_key=self._conversation_key(req)
+            )
         return WebCommandResponse(
             status=STATUS_OK, message=message, mode=MODE_CHAT, model_metadata=metadata
         )
@@ -953,6 +1002,9 @@ class CommandBridge:
             plan, metadata = yield from self._stream_chat_tool_plan(req, observation)
         else:
             plan, metadata = yield from self._stream_chat_tool_plan(req)
+        if plan is not None and plan.tool == CHAT_TOOL_CREATE_WORKFLOW:
+            yield stream_redirect("create_workflow", plan.query)
+            return
         if plan is not None and plan.tool == CHAT_TOOL_GOAL:
             goal_seeds = {"image_observation": observation} if observation else None
             yield from self._stream_goal_loop(
@@ -970,7 +1022,9 @@ class CommandBridge:
             # plan is None only when the router failed or emitted untrusted
             # output — say so, instead of silently degrading to plain chat.
             yield stream_delta("（工具路由暫時不可用，改以一般模式直接回答）\n")
-            yield from self._stream_chat_response(prompt, req.chat_backend)
+            yield from self._stream_chat_response(
+                prompt, req.chat_backend, conversation_key=self._conversation_key(req)
+            )
 
     # --- bounded music plan (#50) --------------------------------------------
     def _exec_music_intent(
@@ -1339,7 +1393,28 @@ class CommandBridge:
             _GOAL_CONTINUE_INPUT,
             _GOAL_CONTINUE_SEARCH_INPUT,
             _GOAL_STOP_INPUT,
+            _GOAL_SAVE_WORKFLOW_INPUT,
         }
+
+    def _save_goal_workflow(self, req: WebCommandRequest) -> WebCommandResponse:
+        with self._goal_completed_lock:
+            workflow = self._goal_completed_workflows.pop(self._conversation_key(req), None)
+        if workflow is None:
+            return WebCommandResponse(
+                status=STATUS_ERROR,
+                message="沒有可儲存的工作流，請重新執行一次目標。",
+                mode=MODE_CHAT,
+            )
+        from .task_workspace import WorkflowStore
+
+        runner = _WorkflowShimRunner(self.settings)
+        store = WorkflowStore(Path(runner.tools_dir).parent / "workflow_store")
+        store.save(workflow)
+        return WebCommandResponse(
+            status=STATUS_OK,
+            message=f"✅ 已存為工作流：{workflow.id}，可在「📋 工作流列表」找到。",
+            mode=MODE_CHAT,
+        )
 
     def _handle_goal_control_input(
         self, req: WebCommandRequest, text: str
@@ -1359,6 +1434,8 @@ class CommandBridge:
             return self._continue_goal_loop_with_search_extension(req)
         if text == _GOAL_STOP_INPUT:
             return self._stop_goal_loop(req)
+        if text == _GOAL_SAVE_WORKFLOW_INPUT:
+            return self._save_goal_workflow(req)
         return None
 
     def _stream_goal_control_input(
@@ -1375,6 +1452,17 @@ class CommandBridge:
             return
         if text == _GOAL_STOP_INPUT:
             response = self._stop_goal_loop(req)
+            if response.status == STATUS_ERROR:
+                yield stream_error(response.message)
+            else:
+                yield stream_done(
+                    response.message,
+                    model_metadata=response.model_metadata,
+                    actions=self._stream_actions(response),
+                )
+            return
+        if text == _GOAL_SAVE_WORKFLOW_INPUT:
+            response = self._save_goal_workflow(req)
             if response.status == STATUS_ERROR:
                 yield stream_error(response.message)
             else:
@@ -1542,7 +1630,11 @@ class CommandBridge:
             actions=self._stream_actions(response),
         )
 
-    def _confirm_goal_loop(self, req: WebCommandRequest) -> WebCommandResponse:
+    def _confirm_goal_loop(
+        self,
+        req: WebCommandRequest,
+        narrator: Callable[[str], None] | None = None,
+    ) -> WebCommandResponse:
         entry = self._goal_pending_confirm_entry(req)
         if entry is None:
             return WebCommandResponse(
@@ -1564,6 +1656,7 @@ class CommandBridge:
                 goal="",
                 chat_backend=chat_backend,
                 resume=GoalLoopContinuation.from_dict(continuation_data),
+                narrator=narrator,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("goal loop confirm failed")
@@ -1592,18 +1685,31 @@ class CommandBridge:
     def _stream_confirm_goal_loop(self, req: WebCommandRequest) -> Iterator[dict]:
         result: dict[str, object] = {}
         done = threading.Event()
+        narration_queue: queue.Queue[str] = queue.Queue()
 
         def _worker() -> None:
             try:
-                result["response"] = self._confirm_goal_loop(req)
+                with self._live_progress(narration_queue.put):
+                    result["response"] = self._confirm_goal_loop(
+                        req, narrator=narration_queue.put
+                    )
             except Exception as exc:  # noqa: BLE001
                 result["error"] = str(exc)
             finally:
                 done.set()
 
         threading.Thread(target=_worker, daemon=True).start()
-        while not done.wait(timeout=_HEARTBEAT_SECONDS):
-            yield stream_heartbeat()
+        last_beat = time.time()
+        while not done.is_set() or not narration_queue.empty():
+            try:
+                line = narration_queue.get(timeout=0.5)
+            except queue.Empty:
+                if time.time() - last_beat >= _HEARTBEAT_SECONDS:
+                    yield stream_heartbeat()
+                    last_beat = time.time()
+                continue
+            yield stream_delta(f"{line}\n")
+            last_beat = time.time()
         if "error" in result:
             yield stream_error(f"目標執行失敗：{result['error']}")
             return
@@ -2037,9 +2143,14 @@ class CommandBridge:
             f"下一步（若繼續）：{continuation.state.next_action or '（無）'}"
         )
 
-    @staticmethod
-    def _goal_web_actions(req: WebCommandRequest, report: GoalLoopReport) -> tuple[Action, ...]:
+    def _goal_web_actions(self, req: WebCommandRequest, report: GoalLoopReport) -> tuple[Action, ...]:
         if report.continuation is None:
+            if report.done and report.workflow is not None:
+                with self._goal_completed_lock:
+                    self._goal_completed_workflows[self._conversation_key(req)] = report.workflow
+                return (
+                    Action(label="💾 存為工作流", command="chat", input=_GOAL_SAVE_WORKFLOW_INPUT),
+                )
             return ()
         budget = report.continuation.state.budget or {}
         search_used = int(budget.get("search_used") or 0)
@@ -2110,6 +2221,7 @@ class CommandBridge:
             raw, metadata = self._generate_chat_tool_plan_with_chat_backend(
                 req.chat_backend,
                 self._build_chat_tool_plan_prompt(req, observation),
+                conversation_key=self._conversation_key(req),
             )
         except Exception:  # noqa: BLE001
             logger.warning(
@@ -2253,7 +2365,12 @@ class CommandBridge:
     def _chat_tool_plan_system_prompt(self) -> str:
         tools = []
         tool_lines = [
-            "- __goal__：當使用者其實是在描述一個多步驟目標、想建立流程或持續完成任務時使用；query 是精簡後的目標描述。",
+            "- __goal__：當使用者是在描述一個想現在就完成的多步驟目標或任務時使用"
+            "（不是要求建立一個之後可重複執行的工作流程本身）；"
+            "query 是精簡後的目標描述。",
+            "- __create_workflow__：當使用者明確要求「建立/新增/設定一個工作流程」"
+            "這件事本身時使用（例如訊息以「建立工作流：」開頭）；"
+            "query 是工作流的完整內容描述。",
         ]
         for tool in (
             CHAT_TOOL_SEARCH,
@@ -2269,7 +2386,7 @@ class CommandBridge:
                 continue
             tools.append(tool)
             tool_lines.append(line)
-        tool_choices = "__goal__|" + "|".join(tools)
+        tool_choices = "__goal__|__create_workflow__|" + "|".join(tools)
         return _CHAT_TOOL_PLAN_PROMPT_TEMPLATE.format(
             tool_lines="\n".join(tool_lines),
             tool_choices=tool_choices,
@@ -2345,6 +2462,7 @@ class CommandBridge:
         prompt: str,
         *,
         pool_rotation: "CloudPoolRotation | None" = None,
+        conversation_key: str | None = None,
     ) -> tuple[str, ModelMetadata]:
         if chat_backend == CHAT_BACKEND_LOCAL:
             return self._generate_local_chat_tool_plan(prompt)
@@ -2376,7 +2494,7 @@ class CommandBridge:
             return text, metadata
         if chat_backend == CHAT_BACKEND_CLOUD_POOL:
             return self._generate_cloud_pool_chat_tool_plan(
-                prompt, pool_rotation=pool_rotation
+                prompt, pool_rotation=pool_rotation, conversation_key=conversation_key
             )
         return self._generate_local_chat_tool_plan(prompt)
 
@@ -2413,16 +2531,29 @@ class CommandBridge:
         raise RuntimeError("Gemini planner unavailable")
 
     def _generate_cloud_pool_chat_tool_plan(
-        self, prompt: str, *, pool_rotation: "CloudPoolRotation | None" = None
+        self,
+        prompt: str,
+        *,
+        pool_rotation: "CloudPoolRotation | None" = None,
+        conversation_key: str | None = None,
     ) -> tuple[str, ModelMetadata]:
         chain = self._cloud_pool_chain()
-        if pool_rotation is not None:
+        pinned: str | None = None
+        if conversation_key:
+            with self._chat_pool_pins_lock:
+                pinned = self._chat_pool_pins.get(conversation_key)
+        if pinned is not None and any(entry[0] == pinned for entry in chain):
+            chain = _pin_provider_chain(chain, pinned)
+        elif pool_rotation is not None:
             chain = pool_rotation.rotate(chain)
         text, provider, model_name, attempts = _walk_cloud_pool_chain(
             chain, prompt, temperature=0.2
         )
         if text is None:
             raise RuntimeError("cloud-pool planner unavailable")
+        if conversation_key:
+            with self._chat_pool_pins_lock:
+                self._chat_pool_pins[conversation_key] = provider
         fb = len(attempts) > 1
         first_provider, first_model = (
             (chain[0][0], chain[0][1]) if chain else self._cloud_pool_preview()
@@ -3940,7 +4071,7 @@ class CommandBridge:
         )
 
     def _generate_chat_response_blocking(
-        self, prompt: str, chat_backend: str
+        self, prompt: str, chat_backend: str, *, conversation_key: str | None = None
     ) -> tuple[str, ModelMetadata]:
         if chat_backend == CHAT_BACKEND_CLOUD_PICKLE:
             client = self._build_cloud_chat_client()
@@ -3969,7 +4100,7 @@ class CommandBridge:
         if chat_backend == CHAT_BACKEND_GEMINI:
             return self._generate_gemini_with_fallback(prompt, temperature=0.7)
         if chat_backend == CHAT_BACKEND_CLOUD_POOL:
-            return self._handle_cloud_pool_blocking(prompt)
+            return self._handle_cloud_pool_blocking(prompt, conversation_key=conversation_key)
         message = self._ollama_generate_blocking(prompt)
         metadata = self._model_metadata_for_backend(
             CHAT_BACKEND_LOCAL,
@@ -3979,7 +4110,9 @@ class CommandBridge:
         )
         return message, metadata
 
-    def _stream_chat_response(self, prompt: str, chat_backend: str) -> Iterator[dict]:
+    def _stream_chat_response(
+        self, prompt: str, chat_backend: str, *, conversation_key: str | None = None
+    ) -> Iterator[dict]:
         if chat_backend == CHAT_BACKEND_CLOUD_PICKLE:
             yield from self._stream_cloud_chat(prompt)
             return
@@ -3990,7 +4123,7 @@ class CommandBridge:
             yield from self._stream_gemini_chat(prompt)
             return
         if chat_backend == CHAT_BACKEND_CLOUD_POOL:
-            yield from self._stream_cloud_pool_chat(prompt)
+            yield from self._stream_cloud_pool_chat(prompt, conversation_key=conversation_key)
             return
         yield from self._stream_ollama_chat(prompt)
 
@@ -4376,15 +4509,31 @@ class CommandBridge:
         return "local", self._local_model()
 
     def _handle_cloud_pool_blocking(
-        self, prompt: str, *, pool_rotation: "CloudPoolRotation | None" = None
+        self,
+        prompt: str,
+        *,
+        pool_rotation: "CloudPoolRotation | None" = None,
+        conversation_key: str | None = None,
     ) -> tuple[str, ModelMetadata]:
         """Try Gemini → Mistral → Big Pickle → local; return (text, metadata)."""
         chain = self._cloud_pool_chain()
-        rotated = pool_rotation.rotate(chain) if pool_rotation is not None else chain
+        pinned: str | None = None
+        if conversation_key:
+            with self._chat_pool_pins_lock:
+                pinned = self._chat_pool_pins.get(conversation_key)
+        if pinned is not None and any(entry[0] == pinned for entry in chain):
+            rotated = _pin_provider_chain(chain, pinned)
+        elif pool_rotation is not None:
+            rotated = pool_rotation.rotate(chain)
+        else:
+            rotated = chain
         text, provider, model_name, attempts = _walk_cloud_pool_chain(
             rotated, prompt, temperature=0.7
         )
         if text is not None:
+            if conversation_key:
+                with self._chat_pool_pins_lock:
+                    self._chat_pool_pins[conversation_key] = provider
             fb = len(attempts) > 1
             first_provider, first_model = (
                 (rotated[0][0], rotated[0][1]) if rotated else self._cloud_pool_preview()
@@ -4417,11 +4566,23 @@ class CommandBridge:
             )
         raise RuntimeError("雲端池目前沒有可用模型。")
 
-    def _stream_cloud_pool_chat(self, prompt: str) -> Iterator[dict]:
+    def _stream_cloud_pool_chat(
+        self, prompt: str, *, conversation_key: str | None = None
+    ) -> Iterator[dict]:
         """Try Gemini → Mistral → Big Pickle → local for streaming."""
         attempts: list[ModelAttempt] = []
 
-        for provider, model_name, build_fn, configured_fn in self._cloud_pool_chain():
+        pinned: str | None = None
+        if conversation_key:
+            with self._chat_pool_pins_lock:
+                pinned = self._chat_pool_pins.get(conversation_key)
+        chain = (
+            _pin_provider_chain(self._cloud_pool_chain(), pinned)
+            if pinned is not None
+            else self._cloud_pool_chain()
+        )
+
+        for provider, model_name, build_fn, configured_fn in chain:
             if not configured_fn():
                 attempts.append(ModelAttempt(
                     provider, model_name, _MODEL_STATUS_NOT_CONFIGURED,
@@ -4471,12 +4632,15 @@ class CommandBridge:
                 continue
 
             attempts.append(ModelAttempt(provider, model_name, _MODEL_STATUS_OK))
+            if conversation_key:
+                with self._chat_pool_pins_lock:
+                    self._chat_pool_pins[conversation_key] = provider
             text = str(result.get("text") or "").strip()
             if text:
                 yield stream_delta(text)
             fb = len(attempts) > 1
-            first_provider = self._cloud_pool_chain()[0][0]
-            first_model = self._cloud_pool_chain()[0][1]
+            first_provider = chain[0][0]
+            first_model = chain[0][1]
             metadata = ModelMetadata(
                 requested_provider=first_provider,
                 requested_model=first_model,

@@ -13,7 +13,12 @@ import logging
 from dataclasses import dataclass
 from typing import Callable
 
-from .task_workspace import Workflow, WorkflowTrace, is_command_sink_allowed
+from .task_workspace import (
+    COMMAND_SINK_INPUT_TYPES,
+    Workflow,
+    WorkflowTrace,
+    is_command_sink_allowed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -329,7 +334,11 @@ def build_goal_workflow_prompt(
     cmd_lines = []
     for command in allowed_cmds:
         usage = _command_usage(command, command_registry, command_usage_resolver)
-        cmd_lines.append(f"- {command}：{usage}" if usage else f"- {command}")
+        line = f"- {command}：{usage}" if usage else f"- {command}"
+        accepted_types = COMMAND_SINK_INPUT_TYPES.get(command)
+        if accepted_types is not None:
+            line += f"（input 變數類型必須是 {sorted(accepted_types)} 之一）"
+        cmd_lines.append(line)
     command_block = "\n".join(cmd_lines) if cmd_lines else "（目前沒有可用的指令）"
 
     return (
@@ -355,6 +364,16 @@ def build_goal_workflow_prompt(
         "5. 若需求需要熱門、最新、排名、查證或其他外部事實，先用已登記的搜尋／讀取類指令取得根據，再做後續動作。\n"
         "6. 若最後動作依賴本機資源（例如本機音樂庫、已登記裝置、既有清單），先用已登記的列出／查詢類指令取得候選，再比對後執行。\n"
         "7. 需要從多個前置結果中選擇、比對、萃取參數時，用 llm_transform；不要把未查證的猜測直接塞進最終指令。\n"
+        "7b. 變數型別是依產生它的步驟種類決定的：tool_call 產生 plain_text；"
+        "command_sink 產生 command_result（原始/未加工的指令回傳值）；"
+        "llm_transform 產生 plain_text/speech_text。若某個 command_sink 標註了"
+        "「input 變數類型必須是 [...] 之一」，就不能直接餵 command_result 進去——"
+        "先用 llm_transform 把它轉成文字（例如改寫語氣、摘要、翻譯），再把 llm_transform"
+        "的 output 接到該指令。\n"
+        "7c. 若同一份內容有兩個以上指令都能達成需求（例如都能把同一段文字輸出成語音，"
+        "但傳遞方式不同），那些指令是互斥的替代方案，只能依使用者字面意思挑一個放進工作流，"
+        "不要為了保險把每個都加進去——每個指令自己的用法說明會標明它跟哪個指令互斥、"
+        "各自適用什麼情境，據此判斷。\n"
         "8. id 用 kebab-case，並以 wf- 開頭（如 wf-morning-greeting）。\n"
         "9. 只輸出 JSON，不要任何說明文字或 markdown 圍欄。\n\n"
         "輸出格式：\n"
@@ -457,6 +476,7 @@ def _validate_goal_workflow(
     errors = workflow.validate_references(
         known_commands=known_commands,
         seed_variables=(seed_variables or {}).keys(),
+        check_types=True,
     )
     known_tools = _catalog_tool_slugs(catalog)
     if known_tools is not None:

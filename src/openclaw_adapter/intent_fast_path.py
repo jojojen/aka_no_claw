@@ -37,8 +37,13 @@ URL_SLOT_INTENTS = frozenset({"product_research", "reputation_snapshot"})
 
 # Intents where the full user utterance IS the slot value. The fast-path
 # fires on a confident match and sets workflow_description=text so the caller
-# (command_bridge._stream_chat) can emit a stream_redirect event and skip the
-# slow LLM router entirely.
+# (telegram_bot.py, the only caller of this module — see _build_intent_fast_path)
+# can route straight to create_workflow/create_schedule and skip the slow LLM
+# router entirely. Web Chat does NOT use this module at all: it intentionally
+# lets the selected chat-tool-plan model choose __create_workflow__ vs __goal__
+# itself (command_bridge.py's CHAT_TOOL_CREATE_WORKFLOW), so cloud-model
+# capability stays visible/testable instead of being masked by an embedding
+# shortcut.
 FULL_TEXT_INTENTS = frozenset({"create_workflow", "create_schedule"})
 
 _MERCARI_URL_RE = re.compile(

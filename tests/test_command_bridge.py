@@ -25,6 +25,7 @@ from openclaw_adapter.command_bridge_models import (
     CHAT_BACKEND_CLOUD_POOL,
     CHAT_BACKEND_LOCAL,
     CHAT_TOOL_BLUETOOTH,
+    CHAT_TOOL_CREATE_WORKFLOW,
     CHAT_TOOL_GOAL,
     CHAT_TOOL_IR,
     CHAT_TOOL_MUSIC,
@@ -701,6 +702,19 @@ def test_parse_chat_tool_plan_goal_tool():
     )
 
 
+def test_parse_chat_tool_plan_create_workflow_tool():
+    plan = parse_chat_tool_plan(
+        '{"tool":"__create_workflow__",'
+        '"query":"查東京天氣，用女僕口吻以日文報告",'
+        '"reason_summary":"要求建立可重複使用的工作流程"}'
+    )
+    assert plan == ChatToolPlan(
+        tool=CHAT_TOOL_CREATE_WORKFLOW,
+        query="查東京天氣，用女僕口吻以日文報告",
+        reason_summary="要求建立可重複使用的工作流程",
+    )
+
+
 def test_parse_chat_tool_plan_extracts_json_from_noise():
     raw = '<think>嗯</think> 好的：\n```json\n{"tool":"/search","query":"q"}\n```'
     plan = parse_chat_tool_plan(raw)
@@ -715,6 +729,7 @@ def test_parse_chat_tool_plan_extracts_json_from_noise():
     '{"tool":"/search","query":"   "}',
     '{"tool":"/search"}',
     '{"tool":"__goal__","query":"   "}',
+    '{"tool":"__create_workflow__","query":"   "}',
     '{"tool":"__no_tool__","answer":"   "}',
     '{"tool":"teleport"}',
 ])
@@ -1141,7 +1156,7 @@ def test_chat_tool_plan_prompt_includes_history_for_rewrite(monkeypatch):
     b = CommandBridge(settings=_tool_settings())
     seen = {}
 
-    def _planner(_backend, prompt):
+    def _planner(_backend, prompt, **_kwargs):
         seen["prompt"] = prompt
         return ('{"tool":"__no_tool__","answer":"ok"}', None)
 
@@ -1329,7 +1344,7 @@ def test_chat_tool_plan_unavailable_falls_back_to_direct(monkeypatch):
     monkeypatch.setattr(
         b,
         "_generate_chat_response_blocking",
-        lambda prompt, backend: ("direct-answer", None),
+        lambda prompt, backend, **kw: ("direct-answer", None),
     )
     monkeypatch.setattr(
         "openclaw_adapter.web_search.web_search",
@@ -1350,7 +1365,7 @@ def test_invalid_chat_tool_plan_json_falls_back_to_direct(monkeypatch):
     monkeypatch.setattr(
         b,
         "_generate_chat_response_blocking",
-        lambda prompt, backend: ("direct-answer", None),
+        lambda prompt, backend, **kw: ("direct-answer", None),
     )
     monkeypatch.setattr(
         "openclaw_adapter.web_search.web_search",
@@ -1370,7 +1385,7 @@ def test_non_whitelisted_tool_falls_back_to_direct(monkeypatch):
     monkeypatch.setattr(
         b,
         "_generate_chat_response_blocking",
-        lambda prompt, backend: ("direct-answer", None),
+        lambda prompt, backend, **kw: ("direct-answer", None),
     )
     monkeypatch.setattr(
         "openclaw_adapter.web_search.web_search",
@@ -1635,6 +1650,48 @@ def test_goal_actions_use_search_continue_until_hard_cap():
         GoalLoopReport(done=False, final_result="partial", continuation=hard_cap_cont),
     )
     assert [a.label for a in hard_actions] == ["停止並總結"]
+
+
+def test_goal_actions_offer_save_button_on_success_without_auto_saving(tmp_path, monkeypatch):
+    """A completed goal must NOT be auto-persisted to the workflow list --
+    most one-off asks would clutter it. Instead a "存為工作流" button appears,
+    and nothing is written to disk until that button is actually clicked."""
+    import openclaw_adapter.dynamic_tools as dt
+
+    monkeypatch.setattr(dt, "_resolve_tools_dir", lambda: tmp_path / "generated_tools")
+    b = CommandBridge(settings=_tool_settings())
+    workflow = Workflow(id="wf-weather-maid", goal="查天氣", steps=[])
+    req = parse_request({"mode": "chat", "input": "x", "conversation_id": "g-save"})
+
+    actions = b._goal_web_actions(
+        req, GoalLoopReport(done=True, final_result="done", workflow=workflow)
+    )
+
+    assert [a.label for a in actions] == ["💾 存為工作流"]
+    assert actions[0].input == "__goal_save_workflow__"
+    assert not (tmp_path / "workflow_store" / "wf-weather-maid.json").exists()
+
+
+def test_goal_save_workflow_button_persists_then_clears_stash(tmp_path, monkeypatch):
+    import openclaw_adapter.dynamic_tools as dt
+    from openclaw_adapter.task_workspace import WorkflowStore
+
+    monkeypatch.setattr(dt, "_resolve_tools_dir", lambda: tmp_path / "generated_tools")
+    b = CommandBridge(settings=_tool_settings())
+    workflow = Workflow(id="wf-weather-maid", goal="查天氣", steps=[])
+    req = parse_request({"mode": "chat", "input": "x", "conversation_id": "g-save"})
+    b._goal_web_actions(req, GoalLoopReport(done=True, final_result="done", workflow=workflow))
+
+    response = b.handle(parse_request({"mode": "chat", "input": "__goal_save_workflow__", "conversation_id": "g-save"}))
+
+    assert response.status == STATUS_OK
+    assert "wf-weather-maid" in response.message
+    store = WorkflowStore(tmp_path / "workflow_store")
+    assert store.get("wf-weather-maid") is not None
+
+    # Clicking again with nothing pending should fail cleanly, not re-save.
+    again = b.handle(parse_request({"mode": "chat", "input": "__goal_save_workflow__", "conversation_id": "g-save"}))
+    assert again.status == STATUS_ERROR
 
 
 def test_goal_continue_control_expires_after_ttl():
@@ -3236,6 +3293,70 @@ def test_stream_chat_music_uses_shared_tool_plan_path(monkeypatch):
     assert "開始連續" in events[-1]["message"]
 
 
+def test_stream_chat_create_workflow_plan_emits_redirect_not_goal_loop(monkeypatch):
+    """Creating a workflow is a distinct feature from a __goal__ run (issue
+
+    "建立工作流跟 goal 是分開來 不同的"): a goal replans/discards nothing of
+    already-successful step results because it is a one-shot run, whereas a
+    workflow is a reusable definition meant to be re-run in full every time.
+    When the model's own tool plan picks __create_workflow__, the bridge must
+    redirect to the dedicated workflow-creation flow instead of ever entering
+    GoalLoop."""
+    b = CommandBridge(settings=_tool_settings())
+
+    def _plan(req):
+        if False:
+            yield {}
+        return (
+            ChatToolPlan(
+                tool=CHAT_TOOL_CREATE_WORKFLOW,
+                query="查東京天氣，用女僕口吻以日文報告",
+                reason_summary="要求建立可重複使用的工作流程",
+            ),
+            None,
+        )
+
+    monkeypatch.setattr(b, "_stream_chat_tool_plan", _plan)
+    monkeypatch.setattr(
+        b, "_stream_goal_loop", lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("must not enter GoalLoop for a create_workflow plan")
+        )
+    )
+
+    req = parse_request({"mode": "chat", "input": "建立工作流：查詢東京今日天氣，用女僕口吻以日文報告"})
+    events = list(b.stream(req, "test-rid-create-wf"))
+
+    assert events[0]["type"] == "start"
+    redirect = next(e for e in events if e.get("type") == "redirect")
+    assert redirect["intent"] == "create_workflow"
+    assert redirect["description"] == "查東京天氣，用女僕口吻以日文報告"
+
+
+def test_handle_chat_create_workflow_plan_runs_workflow_command_blocking(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        b,
+        "_select_chat_tool_plan",
+        lambda req: (
+            ChatToolPlan(tool=CHAT_TOOL_CREATE_WORKFLOW, query="查東京天氣，用女僕口吻以日文報告"),
+            None,
+        ),
+    )
+    seen: list[tuple[str, str | None]] = []
+
+    def _fake_run_workflow_command(text, *, chat_backend=None):
+        seen.append((text, chat_backend))
+        return {"status": "ok", "message": "工作流草稿已建立", "actions": []}
+
+    monkeypatch.setattr(b, "run_workflow_command", _fake_run_workflow_command)
+
+    resp = b.handle(parse_request({"mode": "chat", "input": "建立工作流：查東京天氣，用女僕口吻以日文報告"}))
+
+    assert resp.status == STATUS_OK
+    assert resp.message == "工作流草稿已建立"
+    assert seen == [("create 查東京天氣，用女僕口吻以日文報告", "local")]
+
+
 # --- /schedulehome bridge route (web#9) ------------------------------------
 # Tests assert the bridge's schedulehome contract: command and action methods
 # proxy to the existing handler/callback chain. Natural-language schedule
@@ -3492,6 +3613,65 @@ class _FakeCloudClient:
         return f"{self.name}:{prompt}"
 
 
+# --- _pin_provider_chain (sticky provider) ---------------------------------
+
+def test_pin_provider_chain_moves_matching_entry_to_front():
+    from openclaw_adapter.command_bridge import _pin_provider_chain
+
+    chain = [
+        ("gemini", "g-model", object(), object()),
+        ("mistral", "m-model", object(), object()),
+        ("opencode", "bp-model", object(), object()),
+    ]
+    result = _pin_provider_chain(chain, "mistral")
+    assert result[0][0] == "mistral"
+    assert result[1][0] == "gemini"
+    assert result[2][0] == "opencode"
+
+
+def test_pin_provider_chain_preserves_relative_order_of_non_pinned():
+    from openclaw_adapter.command_bridge import _pin_provider_chain
+
+    chain = [
+        ("gemini", "g-model", object(), object()),
+        ("mistral", "m-model", object(), object()),
+        ("opencode", "bp-model", object(), object()),
+    ]
+    result = _pin_provider_chain(chain, "opencode")
+    assert result[0][0] == "opencode"
+    assert result[1][0] == "gemini"
+    assert result[2][0] == "mistral"
+
+
+def test_pin_provider_chain_none_is_noop():
+    from openclaw_adapter.command_bridge import _pin_provider_chain
+
+    chain = [
+        ("gemini", "g-model", object(), object()),
+        ("mistral", "m-model", object(), object()),
+    ]
+    result = _pin_provider_chain(chain, None)
+    assert result is chain
+
+
+def test_pin_provider_chain_unknown_pinned_is_noop():
+    from openclaw_adapter.command_bridge import _pin_provider_chain
+
+    chain = [
+        ("gemini", "g-model", object(), object()),
+        ("mistral", "m-model", object(), object()),
+    ]
+    result = _pin_provider_chain(chain, "nonexistent")
+    assert result is chain
+
+
+def test_pin_provider_chain_empty_chain():
+    from openclaw_adapter.command_bridge import _pin_provider_chain
+
+    result = _pin_provider_chain([], "gemini")
+    assert result == []
+
+
 def test_cloud_pool_success_with_gemini(monkeypatch):
     """cloud_pool uses Gemini when it is configured and succeeds (no fallback)."""
     b = CommandBridge(settings=_tool_settings(gemini_key="fake-key"))
@@ -3517,6 +3697,12 @@ def test_cloud_pool_gemini_fails_mistral_succeeds(monkeypatch):
     monkeypatch.setattr(b, "_build_mistral_chat_client",
                         lambda: _FakeCloudClient("mistral"))
     monkeypatch.setattr(b, "_build_cloud_chat_client", lambda: None)
+    # Isolate the fallback answer-generation path from the hidden chat-tool
+    # planner's own cloud_pool call: the planner call would otherwise reach
+    # the same fakes first and (correctly) pre-pin the conversation, which
+    # is a real and desirable effect (see the sticky-provider pin tests
+    # below) but is not what this test targets.
+    monkeypatch.setattr(b, "_select_chat_tool_plan", lambda req, observation=None: (None, None))
 
     req = parse_request({"mode": "chat", "input": "hello", "chat_backend": "cloud_pool"})
     resp = b.handle(req)
@@ -3544,6 +3730,7 @@ def test_cloud_pool_gemini_mistral_fail_big_pickle_succeeds(monkeypatch):
                         lambda: _FakeCloudClient("mistral", fail=True))
     monkeypatch.setattr(b, "_build_cloud_chat_client",
                         lambda: _FakeCloudClient("bigpickle"))
+    monkeypatch.setattr(b, "_select_chat_tool_plan", lambda req, observation=None: (None, None))
 
     req = parse_request({"mode": "chat", "input": "hello", "chat_backend": "cloud_pool"})
     resp = b.handle(req)
@@ -3578,6 +3765,7 @@ def test_cloud_pool_gemini_not_configured_mistral_succeeds(monkeypatch):
     monkeypatch.setattr(b, "_build_mistral_chat_client",
                         lambda: _FakeCloudClient("mistral"))
     monkeypatch.setattr(b, "_build_cloud_chat_client", lambda: None)
+    monkeypatch.setattr(b, "_select_chat_tool_plan", lambda req, observation=None: (None, None))
 
     req = parse_request({"mode": "chat", "input": "hello", "chat_backend": "cloud_pool"})
     resp = b.handle(req)
@@ -3687,6 +3875,190 @@ def test_handle_cloud_pool_blocking_rotates_start_provider(monkeypatch):
 
     assert meta1.final_provider == "gemini"
     assert meta2.final_provider == "mistral"
+
+
+# --- Sticky provider (chat cloud pool) -------------------------------------
+
+def test_cloud_pool_blocking_pin_persists_across_turns(monkeypatch):
+    """Same conversation_id: first turn fails gemini → lands on mistral; second
+    turn goes straight to mistral (no re-attempt of gemini)."""
+    b = CommandBridge(settings=_tool_settings(
+        gemini_key="fake-key", mistral_key="fake-mistral",
+    ))
+    monkeypatch.setattr(b, "_build_gemini_chat_client",
+                        lambda model: _FakeCloudClient("gemini", fail=True))
+    monkeypatch.setattr(b, "_build_mistral_chat_client",
+                        lambda: _FakeCloudClient("mistral"))
+    monkeypatch.setattr(b, "_build_cloud_chat_client", lambda: None)
+    monkeypatch.setattr(b, "_select_chat_tool_plan", lambda req, observation=None: (None, None))
+
+    req1 = parse_request({
+        "mode": "chat", "input": "ping", "chat_backend": "cloud_pool",
+        "conversation_id": "conv-a",
+    })
+    resp1 = b.handle(req1)
+    assert resp1.message == "mistral:ping"
+    meta1 = resp1.to_dict()["model_metadata"]
+    assert meta1["final_provider"] == "mistral"
+    assert len(meta1["attempted_models"]) == 2  # gemini failed first
+
+    req2 = parse_request({
+        "mode": "chat", "input": "pong", "chat_backend": "cloud_pool",
+        "conversation_id": "conv-a",
+    })
+    resp2 = b.handle(req2)
+    assert resp2.message == "mistral:pong"
+    meta2 = resp2.to_dict()["model_metadata"]
+    assert meta2["final_provider"] == "mistral"
+    assert len(meta2["attempted_models"]) == 1  # pinned to mistral, no fallback
+
+
+def test_cloud_pool_blocking_pin_is_per_conversation(monkeypatch):
+    """Different conversation_ids on the same bridge do NOT share a pin."""
+    b = CommandBridge(settings=_tool_settings(
+        gemini_key="fake-key", mistral_key="fake-mistral",
+    ))
+    monkeypatch.setattr(b, "_build_gemini_chat_client",
+                        lambda model: _FakeCloudClient("gemini", fail=True))
+    monkeypatch.setattr(b, "_build_mistral_chat_client",
+                        lambda: _FakeCloudClient("mistral"))
+    monkeypatch.setattr(b, "_build_cloud_chat_client", lambda: None)
+    monkeypatch.setattr(b, "_select_chat_tool_plan", lambda req, observation=None: (None, None))
+
+    req_a = parse_request({
+        "mode": "chat", "input": "hi", "chat_backend": "cloud_pool",
+        "conversation_id": "conv-a",
+    })
+    resp_a = b.handle(req_a)
+    assert resp_a.message == "mistral:hi"
+
+    req_b = parse_request({
+        "mode": "chat", "input": "ho", "chat_backend": "cloud_pool",
+        "conversation_id": "conv-b",
+    })
+    resp_b = b.handle(req_b)
+    meta_b = resp_b.to_dict()["model_metadata"]
+    # conv-b has no pin, so it must still re-attempt gemini first
+    assert len(meta_b["attempted_models"]) == 2
+
+
+def test_cloud_pool_blocking_pin_updates_on_pinned_failure(monkeypatch):
+    """Pinned provider fails on a later turn → fallthrough works and pin
+    updates to the new winner."""
+    b = CommandBridge(settings=_tool_settings(
+        gemini_key="fake-key", mistral_key="fake-mistral",
+    ))
+    monkeypatch.setattr(b, "_build_gemini_chat_client",
+                        lambda model: _FakeCloudClient("gemini", fail=True))
+    monkeypatch.setattr(b, "_build_mistral_chat_client",
+                        lambda: _FakeCloudClient("mistral"))
+    monkeypatch.setattr(b, "_build_cloud_chat_client", lambda: None)
+    monkeypatch.setattr(b, "_select_chat_tool_plan", lambda req, observation=None: (None, None))
+
+    req1 = parse_request({
+        "mode": "chat", "input": "t1", "chat_backend": "cloud_pool",
+        "conversation_id": "conv-c",
+    })
+    resp1 = b.handle(req1)
+    # Gemini always fails → falls to Mistral → pin = mistral
+    assert resp1.message == "mistral:t1"
+
+    req2 = parse_request({
+        "mode": "chat", "input": "t2", "chat_backend": "cloud_pool",
+        "conversation_id": "conv-c",
+    })
+    resp2 = b.handle(req2)
+    # Pin = mistral, now make Mistral fail on this turn
+    monkeypatch.setattr(b, "_build_mistral_chat_client",
+                        lambda: _FakeCloudClient("mistral", fail=True))
+    monkeypatch.setattr(b, "_build_cloud_chat_client",
+                        lambda: _FakeCloudClient("bigpickle"))
+
+    req3 = parse_request({
+        "mode": "chat", "input": "t3", "chat_backend": "cloud_pool",
+        "conversation_id": "conv-c",
+    })
+    resp3 = b.handle(req3)
+    # Mistral pinned but now fails → falls to bigpickle, pin updates to opencode
+    assert resp3.message == "bigpickle:t3"
+    meta3 = resp3.to_dict()["model_metadata"]
+    assert meta3["final_provider"] == "opencode"
+    assert meta3["fallback_occurred"] is True
+
+    req4 = parse_request({
+        "mode": "chat", "input": "t4", "chat_backend": "cloud_pool",
+        "conversation_id": "conv-c",
+    })
+    resp4 = b.handle(req4)
+    # Pin should now be opencode (bigpickle), so goes straight to it
+    meta4 = resp4.to_dict()["model_metadata"]
+    assert meta4["final_provider"] == "opencode"
+    assert len(meta4["attempted_models"]) == 1
+
+
+def test_cloud_pool_stream_pin_persists_across_turns(monkeypatch):
+    """Streaming: same conversation_id pins provider after first successful turn."""
+    b = CommandBridge(settings=_tool_settings(
+        gemini_key="fake-key", mistral_key="fake-mistral",
+    ))
+    monkeypatch.setattr(b, "_build_gemini_chat_client",
+                        lambda model: _FakeCloudClient("gemini", fail=True))
+    monkeypatch.setattr(b, "_build_mistral_chat_client",
+                        lambda: _FakeCloudClient("mistral"))
+    monkeypatch.setattr(b, "_build_cloud_chat_client", lambda: None)
+    monkeypatch.setattr(b, "_select_chat_tool_plan", lambda req, observation=None: (None, None))
+
+    req1 = parse_request({
+        "mode": "chat", "input": "s1", "chat_backend": "cloud_pool",
+        "conversation_id": "stream-conv",
+    })
+    events1 = list(b.stream(req1, "test-rid"))
+    done1 = [e for e in events1 if e.get("type") == "done"]
+    assert len(done1) == 1
+    assert done1[0]["message"] == "mistral:s1"
+    meta1 = done1[0].get("model_metadata", {})
+    assert meta1["final_provider"] == "mistral"
+    assert len(meta1["attempted_models"]) == 2
+
+    req2 = parse_request({
+        "mode": "chat", "input": "s2", "chat_backend": "cloud_pool",
+        "conversation_id": "stream-conv",
+    })
+    events2 = list(b.stream(req2, "test-rid"))
+    done2 = [e for e in events2 if e.get("type") == "done"]
+    assert len(done2) == 1
+    assert done2[0]["message"] == "mistral:s2"
+    meta2 = done2[0].get("model_metadata", {})
+    assert meta2["final_provider"] == "mistral"
+    assert len(meta2["attempted_models"]) == 1  # pinned, no fallback
+
+
+def test_cloud_pool_stream_pin_is_per_conversation(monkeypatch):
+    """Streaming: different conversation_ids do NOT share a pin."""
+    b = CommandBridge(settings=_tool_settings(
+        gemini_key="fake-key", mistral_key="fake-mistral",
+    ))
+    monkeypatch.setattr(b, "_build_gemini_chat_client",
+                        lambda model: _FakeCloudClient("gemini", fail=True))
+    monkeypatch.setattr(b, "_build_mistral_chat_client",
+                        lambda: _FakeCloudClient("mistral"))
+    monkeypatch.setattr(b, "_build_cloud_chat_client", lambda: None)
+    monkeypatch.setattr(b, "_select_chat_tool_plan", lambda req, observation=None: (None, None))
+
+    req_a = parse_request({
+        "mode": "chat", "input": "sa", "chat_backend": "cloud_pool",
+        "conversation_id": "stream-a",
+    })
+    list(b.stream(req_a, "test-rid"))
+
+    req_b = parse_request({
+        "mode": "chat", "input": "sb", "chat_backend": "cloud_pool",
+        "conversation_id": "stream-b",
+    })
+    events_b = list(b.stream(req_b, "test-rid"))
+    done_b = [e for e in events_b if e.get("type") == "done"]
+    meta_b = done_b[0].get("model_metadata", {})
+    assert len(meta_b["attempted_models"]) == 2  # no pin for conv-b
 
 
 def test_goal_llm_transform_client_cloud_pool_uses_rotation(monkeypatch):

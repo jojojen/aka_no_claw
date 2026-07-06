@@ -382,3 +382,72 @@ def test_goal_loop_resume_carries_trace_variables_as_seeds():
     assert report.final_result == "done"
     assert planner.draft_calls == []  # no redraft on resume
     assert planner.replan_seeds and planner.replan_seeds[0].get("r1") == "先前結果"
+
+
+def test_goal_loop_replan_seed_keeps_speech_text_type_for_saynow():
+    """Regression for the live incident: a replan that carries a speech_text
+    llm_transform output (e.g. a maid-voice report) forward as a seed must
+    preserve that type, not silently degrade it to the generic default —
+    otherwise the very next /saynow-style command_sink step rejects it with
+    a type mismatch even though the value itself is perfectly valid speech
+    text. Straight-line workflows (no replan) never exercised this path,
+    which is why they always worked while replan-heavy goals broke."""
+    from openclaw_adapter.task_workspace import StepTrace, Variable
+
+    broken = _workflow_with_tool("broken_tool", wf_id="wf-broken")
+    fixed = Workflow(
+        id="wf-fixed",
+        goal="goal",
+        steps=[
+            WorkflowStep(
+                id="s1", kind="command_sink", command="/saynow",
+                input="maid_report", output="r2",
+            ),
+        ],
+    )
+    old_trace = WorkflowTrace(
+        workflow_id="wf-broken",
+        goal="完成任務",
+        final_result="工作流在步驟 s2 失敗：boom",
+    )
+    old_trace.steps = [
+        StepTrace(step_id="s1", kind="llm_transform", status="ok"),
+        StepTrace(step_id="s2", kind="tool_call", status="failed"),
+    ]
+    old_trace.variables = {
+        "maid_report": Variable(
+            name="maid_report", type="speech_text",
+            value="おやすみなさいませ、ご主人様", source_step="s1", provenance="p",
+        ),
+    }
+    cont = GoalLoopContinuation(
+        state=ContinuationState(
+            goal="完成任務",
+            completed=["draft: drafted wf-broken with 2 step(s)"],
+            budget={"steps_used": 2, "steps_limit": 6},
+            next_action="run_workflow",
+            stop_condition="paused",
+        ),
+        workflow=broken,
+        trace=old_trace,
+        replans_used=0,
+        narration=(),
+    )
+    planner = _FakePlanner(drafts=[], replans=[(fixed, None, False)])
+    executor = _FakeExecutor({"broken_tool": (False, "boom")})
+    saynow_calls = []
+
+    def saynow_handler(text: str, chat_id: str) -> str:
+        saynow_calls.append(text)
+        return "已朗讀"
+
+    loop = GoalLoop(
+        goal="完成任務",
+        planner=planner,
+        executor=executor,
+        command_registry={"/saynow": _FakeRegistered(handler=saynow_handler)},
+        replan_limit=1,
+    )
+    report = loop.run(resume=cont)
+    assert report.done is True
+    assert saynow_calls == ["おやすみなさいませ、ご主人様"]

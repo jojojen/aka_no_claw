@@ -9,6 +9,7 @@ Subcommands:
   /workflow create <JSON>     — create a workflow from a JSON definition (power-user)
   /workflow new               — open card editor to create a new workflow
   /workflow edit <id>         — open card editor to edit an existing workflow
+  /workflow rename <id>       — rename a stored workflow (prompts for new name)
 """
 
 from __future__ import annotations
@@ -48,10 +49,15 @@ _COMMAND_METADATA: dict[str, dict[str, str]] = {
         "usage": "語音合成預覽；參數＝要合成的日文文字。",
     },
     "/generateaudio": {
-        "usage": "產生音訊檔案；把文字轉成語音 WAV 並傳回 Telegram（參數＝要轉成語音的文字，通常用 input 變數帶入）",
+        "usage": "產生音訊檔案；把文字轉成語音 WAV 並傳回目前 Telegram 對話（參數＝要轉成語音的文字，"
+        "通常用 input 變數帶入）。與 /saynow 是同一需求的兩種互斥實作方式，只能擇一："
+        "使用者要的是「傳一個音檔給我」時才用這個；若只是想「念出來/說出來/播放語音」，"
+        "改用 /saynow。此指令依賴目前的 Telegram 對話，排程或非對話情境下會失敗。",
     },
     "/saynow": {
-        "usage": "立即於 Mac mini 念出文字（參數＝要念的文字，通常用 input 變數帶入）",
+        "usage": "立即於 Mac mini 喇叭念出文字（參數＝要念的文字，通常用 input 變數帶入）。"
+        "與 /generateaudio 是同一需求的兩種互斥實作方式，只能擇一："
+        "使用者要「念出來/說出來/播放語音」時用這個；不依賴 Telegram 對話，排程或無對話情境也能執行。",
     },
     "/new": {
         "usage": "動態建立並執行新工具；高風險，不可作為自動 workflow sink。",
@@ -406,6 +412,13 @@ def build_workflow_handler(
                 return "用法：/workflow edit <id>"
             text, markup = workflow_editor.start_edit(chat_id, arg)
             return text, markup or None
+        if subcmd == "rename":
+            if workflow_editor is None:
+                return "Workflow 編輯器未啟用"
+            if not arg:
+                return "用法：/workflow rename <id>"
+            text, markup = workflow_editor.start_rename(chat_id, arg)
+            return text, markup or None
         if subcmd == "list":
             return _cmd_list(store)
         if subcmd == "show":
@@ -449,6 +462,7 @@ def _cmd_list(store: WorkflowStore) -> str | tuple:
             {"text": f"📅 排程執行 {wf.id}", "callback_data": f"wf:schedule:{wf.id}"},
         ])
         rows.append([
+            {"text": f"✏️ 改名 {wf.id}", "callback_data": f"wf:rename:{wf.id}"},
             {"text": f"🗑 刪除 {wf.id}", "callback_data": f"wf:delete:{wf.id}"},
         ])
     return text, {"inline_keyboard": rows}

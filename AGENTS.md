@@ -19,3 +19,7 @@ This repository keeps its Codex-facing workflow in version control on purpose.
 - Keep `openclaw_adapter` assistant-specific
 - Move reusable pricing or capture logic to the sibling repos that own it
 - Run targeted pytest checks before finishing
+- After debugging and fixing any error, distill the generalizable lesson and
+  add it as a new entry to `CODEGEN_SEED` in
+  `src/openclaw_adapter/knowledge_db.py` (generic technique only, never a
+  domain-specific formula) — see `Constitution.md` §8/§11

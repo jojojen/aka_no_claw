@@ -58,6 +58,30 @@ def test_build_goal_workflow_prompt_includes_registered_command_usage():
     assert "/workflow" not in prompt
 
 
+def test_build_goal_workflow_prompt_warns_against_duplicate_alternative_sinks():
+    """Regression: drafts previously included BOTH /generateaudio and /saynow
+    for a request that only wanted spoken output; /generateaudio hard-fails
+    outside a real Telegram chat, aborting the whole workflow before /saynow
+    (a later step) could run. Rule 7c + the real usage strings (from
+    _COMMAND_METADATA) should now tell the LLM these are mutually exclusive."""
+    from openclaw_adapter.workflow_command import _COMMAND_METADATA
+
+    registry = {
+        "/saynow": SimpleNamespace(usage=_COMMAND_METADATA["/saynow"]["usage"]),
+        "/generateaudio": SimpleNamespace(
+            usage=_COMMAND_METADATA["/generateaudio"]["usage"]
+        ),
+    }
+
+    prompt = build_goal_workflow_prompt(
+        "查東京天氣後用女僕口吻念出來", catalog=None, command_registry=registry
+    )
+
+    assert "互斥" in prompt  # rule 7c
+    assert "與 /saynow 是同一需求的兩種互斥實作方式" in prompt
+    assert "與 /generateaudio 是同一需求的兩種互斥實作方式" in prompt
+
+
 def test_generate_workflow_from_goal_uses_fallback_and_backfills():
     fallback = _FakeLLM(json.dumps({"steps": []}, ensure_ascii=False))
     wf, err, used_fallback = generate_workflow_from_goal(

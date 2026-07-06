@@ -353,6 +353,14 @@ CHAT_TOOL_BLUETOOTH = "/bluetooth"
 CHAT_TOOL_IR = "/ir"
 CHAT_TOOL_VISION = "/visionlook"
 CHAT_TOOL_GOAL = "__goal__"
+# Creating a reusable workflow definition is a distinct feature from __goal__
+# (an ad-hoc, one-shot multi-step task): __goal__ runs steps now and may
+# replan/carry forward partial results, while a workflow is a template meant to
+# be re-run in full every time. Telegram already routes "建立工作流：..." style
+# requests to this separate flow (natural_language.py's create_workflow
+# intent); Web Chat needs its own way to reach it since it intentionally does
+# not run the embedding intent fast-path (see _stream_chat).
+CHAT_TOOL_CREATE_WORKFLOW = "__create_workflow__"
 CHAT_TOOL_NO_TOOL = "__no_tool__"
 # Hardcoding the tool whitelist is deliberate (a closed protocol allowlist, not
 # open-ended recognition): only these exact tools may ever be dispatched.
@@ -417,6 +425,7 @@ def parse_chat_tool_plan(raw: object) -> ChatToolPlan | None:
 
     - ``{"tool":"__no_tool__","answer":"..."}`` for the hidden direct-answer path
     - ``{"tool":"__goal__","query":"..."}`` for a multi-step goal classification
+    - ``{"tool":"__create_workflow__","query":"..."}`` to create a reusable workflow
     - ``{"tool":"/search|/research|/music|/musicqueue|/bluetooth|/ir","query":"..."}`` for explicit tools
 
     Any malformed / untrusted payload returns ``None`` so the caller can fall
@@ -434,14 +443,14 @@ def parse_chat_tool_plan(raw: object) -> ChatToolPlan | None:
         if not answer:
             return None
         return ChatToolPlan(tool=CHAT_TOOL_NO_TOOL, answer=answer, reason_summary=reason)
-    if tool == CHAT_TOOL_GOAL:
+    if tool in (CHAT_TOOL_GOAL, CHAT_TOOL_CREATE_WORKFLOW):
         query = data.get("query")
         if not isinstance(query, str):
             return None
         query = _normalize_router_query(query)
         if not query:
             return None
-        return ChatToolPlan(tool=CHAT_TOOL_GOAL, query=query, reason_summary=reason)
+        return ChatToolPlan(tool=tool, query=query, reason_summary=reason)
     if tool not in CHAT_TOOLS:
         return None
     query = data.get("query")

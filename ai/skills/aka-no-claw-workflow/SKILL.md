@@ -60,6 +60,11 @@ Use these file groupings as the default starting point:
 4. Add or update tests for behavior changes and bug fixes.
 5. Run targeted verification before finishing.
 6. Call out any cross-repo follow-up explicitly instead of quietly duplicating logic.
+7. After root-causing and fixing any bug, distill the generalizable lesson
+   (the debugging discipline or code-contract habit, not the specific fix or
+   a domain fact) and add it as a new entry to `CODEGEN_SEED` in
+   `src/openclaw_adapter/knowledge_db.py`. Verify it seeds and retrieves
+   before calling the task done.
 
 ## Verification
 
