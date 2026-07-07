@@ -764,6 +764,7 @@ def _tool_settings(
     debug: bool = False,
     gemini_key: str | None = None,
     mistral_key: str | None = None,
+    nvidia_key: str | None = None,
     gemini_primary_model: str = "gemini-2.5-pro",
     gemini_flash_model: str = "gemini-2.5-flash",
     opencode_model: str = "big-pickle",
@@ -778,6 +779,8 @@ def _tool_settings(
         openclaw_opencode_base_url="http://localhost:8080",
         openclaw_mistral_api_key=mistral_key,
         openclaw_mistral_model="mistral-large-latest",
+        openclaw_nvidia_api_key=nvidia_key,
+        openclaw_nvidia_model="meta/llama-3.1-70b-instruct",
         openclaw_gemini_api_key=gemini_key,
         openclaw_gemini_primary_model=gemini_primary_model,
         openclaw_gemini_flash_model=gemini_flash_model,
@@ -3718,6 +3721,67 @@ def test_cloud_pool_gemini_fails_mistral_succeeds(monkeypatch):
     assert meta["attempted_models"][1]["status"] == "ok"
 
 
+def test_cloud_pool_chain_includes_nvidia_as_fourth_provider(monkeypatch):
+    """gemini/mistral/big_pickle all fail → nvidia (last in default pool) succeeds."""
+    b = CommandBridge(settings=_tool_settings(
+        gemini_key="fake-key", mistral_key="fake-mistral", nvidia_key="fake-nvidia",
+    ))
+    monkeypatch.setattr(b, "_build_gemini_chat_client",
+                        lambda model: _FakeCloudClient("gemini", fail=True, fail_status="quota_exhausted"))
+    monkeypatch.setattr(b, "_build_mistral_chat_client",
+                        lambda: _FakeCloudClient("mistral", fail=True, fail_status="quota_exhausted"))
+    monkeypatch.setattr(b, "_build_cloud_chat_client", lambda: None)
+    monkeypatch.setattr(b, "_build_nvidia_chat_client",
+                        lambda: _FakeCloudClient("nvidia"))
+    monkeypatch.setattr(b, "_select_chat_tool_plan", lambda req, observation=None: (None, None))
+
+    req = parse_request({"mode": "chat", "input": "hello", "chat_backend": "cloud_pool"})
+    resp = b.handle(req)
+    assert resp.status == STATUS_OK
+    assert resp.message == "nvidia:hello"
+    meta = resp.to_dict()["model_metadata"]
+    assert meta["final_provider"] == "nvidia"
+    assert meta["final_model"] == "meta/llama-3.1-70b-instruct"
+    assert meta["fallback_occurred"] is True
+
+
+def test_build_nvidia_chat_client_none_without_key():
+    b = CommandBridge(settings=_tool_settings())
+    assert b._build_nvidia_chat_client() is None
+
+
+def test_build_nvidia_chat_client_present_with_key():
+    from openclaw_adapter.dynamic_tools import NvidiaTextClient
+
+    b = CommandBridge(settings=_tool_settings(nvidia_key="fake-nvidia"))
+    client = b._build_nvidia_chat_client()
+    assert isinstance(client, NvidiaTextClient)
+    assert client.model == "meta/llama-3.1-70b-instruct"
+
+
+def test_build_nvidia_vision_client_none_without_key():
+    b = CommandBridge(settings=_tool_settings())
+    assert b._build_nvidia_vision_client("meta/llama-3.2-11b-vision-instruct") is None
+
+
+def test_build_nvidia_vision_client_present_with_key():
+    from openclaw_adapter.vision_pool import NvidiaVisionClient
+
+    b = CommandBridge(settings=_tool_settings(nvidia_key="fake-nvidia"))
+    client = b._build_nvidia_vision_client("meta/llama-3.2-11b-vision-instruct")
+    assert isinstance(client, NvidiaVisionClient)
+    assert client.model == "meta/llama-3.2-11b-vision-instruct"
+
+
+def test_vision_pool_chain_includes_nvidia():
+    from openclaw_adapter.llm_pool_settings import LLM_PROVIDER_NVIDIA
+
+    b = CommandBridge(settings=_tool_settings(nvidia_key="fake-nvidia"))
+    chain = b._vision_pool_chain()
+    providers = [entry[0] for entry in chain]
+    assert LLM_PROVIDER_NVIDIA in providers
+
+
 def test_cloud_pool_gemini_mistral_fail_big_pickle_succeeds(monkeypatch):
     """Gemini + Mistral both fail → Big Pickle succeeds."""
     b = CommandBridge(settings=_tool_settings(
@@ -4141,7 +4205,7 @@ def test_model_routes_includes_cloud_pool():
     pool = next(r for r in routes["routes"] if r["backend"] == "cloud_pool")
     assert pool["configured"] is True
     assert pool["label"] == "雲端池"
-    assert len(pool["chain"]) == 3  # gemini, mistral, big pickle
+    assert len(pool["chain"]) == 4  # gemini, mistral, big pickle, nvidia
     assert routes["routes"][0]["backend"] == "cloud_pool"  # first in list
 
 
@@ -4232,7 +4296,7 @@ def test_save_chat_settings_persists_order_and_disable(tmp_path):
     })
     assert res["status"] == STATUS_OK
     loaded = b.load_chat_settings()
-    assert loaded["settings"]["cloud_pool"] == ["mistral", "gemini", "big_pickle"]
+    assert loaded["settings"]["cloud_pool"] == ["mistral", "gemini", "big_pickle", "nvidia"]
     assert loaded["settings"]["providers"]["mistral"]["enabled"] is False
 
 

@@ -789,6 +789,94 @@ class MistralTextClient:
         return _THINK_RE.sub("", text).strip()
 
 
+_NVIDIA_API_BASE = "https://integrate.api.nvidia.com/v1"
+_NVIDIA_DEFAULT_MODEL = "meta/llama-3.1-70b-instruct"
+
+
+class NvidiaTextClient:
+    """NVIDIA NIM cloud chat client (integrate.api.nvidia.com/v1/chat/completions)."""
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str = _NVIDIA_DEFAULT_MODEL,
+        timeout_seconds: int = 120,
+    ) -> None:
+        self.api_key = api_key
+        self.model = model
+        self.timeout_seconds = max(1, timeout_seconds)
+        self.num_ctx: int | None = None
+        self.num_predict: int | None = None
+        self._cancel = threading.Event()
+        self._abort_lock = threading.Lock()
+        self._response: object | None = None
+
+    def abort(self) -> None:
+        self._cancel.set()
+        with self._abort_lock:
+            resp = self._response
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def generate(self, prompt: str, *, temperature: float = 0.7, think: bool = False) -> str:
+        payload: dict[str, object] = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": temperature,
+            "stream": False,
+        }
+        if self.num_predict is not None:
+            payload["max_tokens"] = int(self.num_predict)
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+        url = f"{_NVIDIA_API_BASE}/chat/completions"
+        request = Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        if self._cancel.is_set():
+            raise RuntimeError("NVIDIA request aborted by caller")
+        try:
+            response = urlopen(request, timeout=self.timeout_seconds)
+            with self._abort_lock:
+                self._response = response
+            try:
+                body = response.read().decode("utf-8", errors="replace")
+            finally:
+                with self._abort_lock:
+                    self._response = None
+                response.close()
+        except HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")[:400]
+            except Exception:
+                detail = ""
+            raise RuntimeError(f"NVIDIA HTTP {exc.code}: {detail}") from exc
+        except URLError as exc:
+            raise RuntimeError(f"NVIDIA request failed: {exc.reason}") from exc
+        if self._cancel.is_set():
+            raise RuntimeError("NVIDIA request aborted by caller")
+        parsed = json.loads(body)
+        choices = parsed.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise RuntimeError("NVIDIA response missing choices")
+        first = choices[0]
+        text = (first.get("message") or {}).get("content") or ""
+        if not isinstance(text, str):
+            raise RuntimeError(f"NVIDIA response text type was {type(text).__name__}")
+        return _THINK_RE.sub("", text).strip()
+
+
 class DynamicToolRunner:
     def __init__(
         self,

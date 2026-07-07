@@ -40,12 +40,14 @@ CHAT_BACKEND_CLOUD_PICKLE = "cloud_pickle"
 CHAT_BACKEND_CLOUD_MISTRAL = "cloud_mistral"
 CHAT_BACKEND_GEMINI = "gemini"
 CHAT_BACKEND_CLOUD_POOL = "cloud_pool"
+CHAT_BACKEND_CLOUD_NVIDIA = "cloud_nvidia"
 _CHAT_BACKENDS = {
     CHAT_BACKEND_LOCAL,
     CHAT_BACKEND_CLOUD_PICKLE,
     CHAT_BACKEND_CLOUD_MISTRAL,
     CHAT_BACKEND_GEMINI,
     CHAT_BACKEND_CLOUD_POOL,
+    CHAT_BACKEND_CLOUD_NVIDIA,
 }
 
 # --- Response statuses ----------------------------------------------------

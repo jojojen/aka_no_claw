@@ -12,6 +12,7 @@ from assistant_runtime import AssistantSettings
 
 from .command_bridge_models import (
     CHAT_BACKEND_CLOUD_MISTRAL,
+    CHAT_BACKEND_CLOUD_NVIDIA,
     CHAT_BACKEND_CLOUD_PICKLE,
     CHAT_BACKEND_CLOUD_POOL,
     CHAT_BACKEND_GEMINI,
@@ -24,16 +25,19 @@ LLM_PROVIDER_GEMINI = "gemini"
 LLM_PROVIDER_MISTRAL = "mistral"
 LLM_PROVIDER_BIG_PICKLE = "big_pickle"
 LLM_PROVIDER_LOCAL = "local"
+LLM_PROVIDER_NVIDIA = "nvidia"
 
 _DEFAULT_CHAT_BACKEND = CHAT_BACKEND_CLOUD_POOL
 _DEFAULT_CLOUD_POOL = (
     LLM_PROVIDER_GEMINI,
     LLM_PROVIDER_MISTRAL,
     LLM_PROVIDER_BIG_PICKLE,
+    LLM_PROVIDER_NVIDIA,
 )
 _DEFAULT_VISION_POOL = (
     LLM_PROVIDER_GEMINI,
     LLM_PROVIDER_MISTRAL,
+    LLM_PROVIDER_NVIDIA,
     LLM_PROVIDER_LOCAL,
 )
 _ALL_PROVIDERS = (
@@ -41,13 +45,16 @@ _ALL_PROVIDERS = (
     LLM_PROVIDER_MISTRAL,
     LLM_PROVIDER_BIG_PICKLE,
     LLM_PROVIDER_LOCAL,
+    LLM_PROVIDER_NVIDIA,
 )
 # big_pickle is text-only: the opencode zen gateway rejects image payloads
 # outright (HTTP 400, verified 2026-07-05), so it must never be offered as a
-# vision-pool option.
+# vision-pool option. nvidia vision models (meta/llama-3.2-11b/90b-vision-instruct)
+# were live-verified against this account's own NVIDIA_KEY on 2026-07-07.
 _ALL_VISION_PROVIDERS = (
     LLM_PROVIDER_GEMINI,
     LLM_PROVIDER_MISTRAL,
+    LLM_PROVIDER_NVIDIA,
     LLM_PROVIDER_LOCAL,
 )
 _KNOWN_CHAT_BACKENDS = frozenset(
@@ -57,6 +64,7 @@ _KNOWN_CHAT_BACKENDS = frozenset(
         CHAT_BACKEND_CLOUD_MISTRAL,
         CHAT_BACKEND_GEMINI,
         CHAT_BACKEND_CLOUD_PICKLE,
+        CHAT_BACKEND_CLOUD_NVIDIA,
     }
 )
 _BACKEND_TO_PROVIDER = {
@@ -64,24 +72,28 @@ _BACKEND_TO_PROVIDER = {
     CHAT_BACKEND_CLOUD_MISTRAL: LLM_PROVIDER_MISTRAL,
     CHAT_BACKEND_GEMINI: LLM_PROVIDER_GEMINI,
     CHAT_BACKEND_CLOUD_PICKLE: LLM_PROVIDER_BIG_PICKLE,
+    CHAT_BACKEND_CLOUD_NVIDIA: LLM_PROVIDER_NVIDIA,
 }
 _PROVIDER_TO_BACKEND = {
     LLM_PROVIDER_LOCAL: CHAT_BACKEND_LOCAL,
     LLM_PROVIDER_MISTRAL: CHAT_BACKEND_CLOUD_MISTRAL,
     LLM_PROVIDER_GEMINI: CHAT_BACKEND_GEMINI,
     LLM_PROVIDER_BIG_PICKLE: CHAT_BACKEND_CLOUD_PICKLE,
+    LLM_PROVIDER_NVIDIA: CHAT_BACKEND_CLOUD_NVIDIA,
 }
 _PROVIDER_LABELS = {
     LLM_PROVIDER_GEMINI: "Gemini",
     LLM_PROVIDER_MISTRAL: "Mistral",
     LLM_PROVIDER_BIG_PICKLE: "OpenCode",
     LLM_PROVIDER_LOCAL: "本地",
+    LLM_PROVIDER_NVIDIA: "NVIDIA",
 }
 _DEFAULT_PROVIDER_OPTIONS = (
     {"value": CHAT_BACKEND_CLOUD_POOL, "label": "雲端池"},
     {"value": CHAT_BACKEND_GEMINI, "label": "Gemini"},
     {"value": CHAT_BACKEND_CLOUD_MISTRAL, "label": "Mistral"},
     {"value": CHAT_BACKEND_CLOUD_PICKLE, "label": "OpenCode"},
+    {"value": CHAT_BACKEND_CLOUD_NVIDIA, "label": "NVIDIA"},
     {"value": CHAT_BACKEND_LOCAL, "label": "本地"},
 )
 _GEMINI_RECOMMENDED_MODELS = (
@@ -103,6 +115,19 @@ _OPENCODE_RECOMMENDED_MODELS = (
     "north-mini-code-free",
     "nemotron-3-ultra-free",
 )
+# Live-verified against integrate.api.nvidia.com/v1/chat/completions with this
+# account's own NVIDIA_KEY (2026-07-07) — not taken from the model catalog page,
+# since availability is account-scoped (e.g. nvidia/llama-3.1-nemotron-70b-instruct
+# 404s here despite being listed in /v1/models).
+_NVIDIA_RECOMMENDED_MODELS = (
+    "meta/llama-3.1-70b-instruct",
+    "meta/llama-3.3-70b-instruct",
+    "meta/llama-3.1-8b-instruct",
+    "meta/llama-4-maverick-17b-128e-instruct",
+    "mistralai/mistral-nemotron",
+    "qwen/qwen3-next-80b-a3b-instruct",
+    "deepseek-ai/deepseek-v4-flash",
+)
 _GEMINI_VISION_RECOMMENDED_MODELS = (
     "gemini-2.5-flash",
     "gemini-2.5-pro",
@@ -117,6 +142,14 @@ _LOCAL_VISION_RECOMMENDED_MODELS = (
     "qwen2.5vl:7b",
     "qwen2.5vl:3b",
     "gemma3:12b",
+)
+# Live-verified against integrate.api.nvidia.com/v1/chat/completions with a
+# real image payload and this account's own NVIDIA_KEY (2026-07-07); other
+# candidates (microsoft/phi-3.5-vision-instruct, nvidia/vila, google/paligemma)
+# all 404'd for this account.
+_NVIDIA_VISION_RECOMMENDED_MODELS = (
+    "meta/llama-3.2-11b-vision-instruct",
+    "meta/llama-3.2-90b-vision-instruct",
 )
 
 
@@ -289,9 +322,11 @@ def _default_vision_providers(settings: AssistantSettings) -> dict[str, Provider
     ).strip()
     mistral_model = "pixtral-12b-latest"
     local_model = _first_model(getattr(settings, "openclaw_local_vision_model", None)) or "qwen2.5vl"
+    nvidia_model = "meta/llama-3.2-11b-vision-instruct"
     return {
         LLM_PROVIDER_GEMINI: ProviderSettings(enabled=True, model=gemini_model),
         LLM_PROVIDER_MISTRAL: ProviderSettings(enabled=True, model=mistral_model),
+        LLM_PROVIDER_NVIDIA: ProviderSettings(enabled=True, model=nvidia_model),
         LLM_PROVIDER_LOCAL: ProviderSettings(enabled=True, model=local_model),
     }
 
@@ -304,6 +339,9 @@ def default_chat_llm_pool_settings(settings: AssistantSettings) -> ChatLlmPoolSe
     mistral_model = (
         getattr(settings, "openclaw_mistral_model", None) or "mistral-large-latest"
     ).strip()
+    nvidia_model = (
+        getattr(settings, "openclaw_nvidia_model", None) or "meta/llama-3.1-70b-instruct"
+    ).strip()
     return ChatLlmPoolSettings(
         default_chat_provider=_DEFAULT_CHAT_BACKEND,
         cloud_pool=_DEFAULT_CLOUD_POOL,
@@ -312,6 +350,7 @@ def default_chat_llm_pool_settings(settings: AssistantSettings) -> ChatLlmPoolSe
             LLM_PROVIDER_MISTRAL: ProviderSettings(enabled=True, model=mistral_model),
             LLM_PROVIDER_BIG_PICKLE: ProviderSettings(enabled=True, model=_default_opencode_model(settings)),
             LLM_PROVIDER_LOCAL: ProviderSettings(enabled=True, model=local_model),
+            LLM_PROVIDER_NVIDIA: ProviderSettings(enabled=True, model=nvidia_model),
         },
         vision_pool=_DEFAULT_VISION_POOL,
         vision_providers=_default_vision_providers(settings),
@@ -368,6 +407,8 @@ def provider_is_configured(settings: AssistantSettings, provider: str) -> bool:
         return bool(getattr(settings, "openclaw_gemini_api_key", None))
     if provider == LLM_PROVIDER_MISTRAL:
         return bool(getattr(settings, "openclaw_mistral_api_key", None))
+    if provider == LLM_PROVIDER_NVIDIA:
+        return bool(getattr(settings, "openclaw_nvidia_api_key", None))
     return True
 
 
@@ -456,6 +497,14 @@ def model_options_for_provider(
                 "gemma3:4b",
             ]
         )
+    elif provider == LLM_PROVIDER_NVIDIA:
+        options.extend(
+            [
+                current_model,
+                getattr(settings, "openclaw_nvidia_model", None) or "",
+                *_NVIDIA_RECOMMENDED_MODELS,
+            ]
+        )
     seen: set[str] = set()
     out: list[str] = []
     for raw in options:
@@ -485,6 +534,11 @@ def vision_model_options_for_provider(
         options.extend([
             current_model,
             *_MISTRAL_VISION_RECOMMENDED_MODELS,
+        ])
+    elif provider == LLM_PROVIDER_NVIDIA:
+        options.extend([
+            current_model,
+            *_NVIDIA_VISION_RECOMMENDED_MODELS,
         ])
     elif provider == LLM_PROVIDER_LOCAL:
         options.extend([

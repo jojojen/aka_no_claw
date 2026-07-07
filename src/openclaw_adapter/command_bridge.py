@@ -46,6 +46,7 @@ from .llm_pool_settings import (
     LLM_PROVIDER_GEMINI,
     LLM_PROVIDER_LOCAL,
     LLM_PROVIDER_MISTRAL,
+    LLM_PROVIDER_NVIDIA,
     ChatLlmPoolWriteError,
     CloudPoolRotation,
     chat_backend_configured,
@@ -65,6 +66,7 @@ from .llm_pool_settings import (
 from .command_bridge_models import (
     Action,
     CHAT_BACKEND_CLOUD_MISTRAL,
+    CHAT_BACKEND_CLOUD_NVIDIA,
     CHAT_BACKEND_CLOUD_PICKLE,
     CHAT_BACKEND_CLOUD_POOL,
     CHAT_BACKEND_GEMINI,
@@ -2051,6 +2053,7 @@ class CommandBridge:
                     ),
                     CHAT_BACKEND_CLOUD_MISTRAL: bridge._build_mistral_chat_client,
                     CHAT_BACKEND_CLOUD_PICKLE: bridge._build_cloud_chat_client,
+                    CHAT_BACKEND_CLOUD_NVIDIA: bridge._build_nvidia_chat_client,
                 }.get(chat_backend)
                 if single_backend is not None:
                     client = single_backend()
@@ -2103,6 +2106,7 @@ class CommandBridge:
                 LLM_PROVIDER_MISTRAL: CHAT_BACKEND_CLOUD_MISTRAL,
                 LLM_PROVIDER_BIG_PICKLE: CHAT_BACKEND_CLOUD_PICKLE,
                 LLM_PROVIDER_LOCAL: CHAT_BACKEND_LOCAL,
+                LLM_PROVIDER_NVIDIA: CHAT_BACKEND_CLOUD_NVIDIA,
             }
             return [
                 _PlannerClient(provider_backend[provider])
@@ -2490,6 +2494,18 @@ class CommandBridge:
                 (ModelAttempt("opencode", self._big_pickle_model(), _MODEL_STATUS_OK),),
                 "opencode",
                 self._big_pickle_model(),
+            )
+            return text, metadata
+        if chat_backend == CHAT_BACKEND_CLOUD_NVIDIA:
+            client = self._build_nvidia_chat_client()
+            if client is None:
+                raise RuntimeError("NVIDIA planner unavailable")
+            text = client.generate(prompt, temperature=0.2)
+            metadata = self._model_metadata_for_backend(
+                chat_backend,
+                (ModelAttempt("nvidia", self._nvidia_model(), _MODEL_STATUS_OK),),
+                "nvidia",
+                self._nvidia_model(),
             )
             return text, metadata
         if chat_backend == CHAT_BACKEND_CLOUD_POOL:
@@ -3162,6 +3178,35 @@ class CommandBridge:
                 model,
             )
             return text, f"Mistral {model}", metadata
+        if chat_backend == CHAT_BACKEND_CLOUD_NVIDIA:
+            client = self._build_nvidia_chat_client()
+            if client is None:
+                text = self._ollama_generate_blocking(prompt)
+                metadata = self._model_metadata_for_backend(
+                    chat_backend,
+                    (
+                        ModelAttempt(
+                            "nvidia",
+                            self._nvidia_model(),
+                            _MODEL_STATUS_NOT_CONFIGURED,
+                            "NVIDIA API key missing",
+                        ),
+                        ModelAttempt("local", self._local_model(), _MODEL_STATUS_OK),
+                    ),
+                    "local",
+                    self._local_model(),
+                    fallback_reason="NVIDIA API key missing",
+                )
+                return text, f"本地 {self._local_model()}（Nvidia 不可用，已改用本地）", metadata
+            text = client.generate(prompt, temperature=0.3)
+            model = self._nvidia_model()
+            metadata = self._model_metadata_for_backend(
+                chat_backend,
+                (ModelAttempt("nvidia", model, _MODEL_STATUS_OK),),
+                "nvidia",
+                model,
+            )
+            return text, f"NVIDIA {model}", metadata
         if chat_backend == CHAT_BACKEND_GEMINI:
             text, metadata = self._generate_gemini_with_fallback(prompt, temperature=0.3)
             return text, f"{metadata.final_provider} {metadata.final_model}", metadata
@@ -3515,6 +3560,7 @@ class CommandBridge:
             CHAT_BACKEND_GEMINI,
             CHAT_BACKEND_CLOUD_MISTRAL,
             CHAT_BACKEND_CLOUD_PICKLE,
+            CHAT_BACKEND_CLOUD_NVIDIA,
             CHAT_BACKEND_CLOUD_POOL,
         }:
             backend = default_chat_backend(self.settings)
@@ -3969,6 +4015,7 @@ class CommandBridge:
             LLM_PROVIDER_GEMINI: ("gemini", self._gemini_primary_model()),
             LLM_PROVIDER_MISTRAL: ("mistral", self._mistral_model()),
             LLM_PROVIDER_BIG_PICKLE: ("opencode", self._big_pickle_model()),
+            LLM_PROVIDER_NVIDIA: ("nvidia", self._nvidia_model()),
         }
         cp_providers = [
             {"provider": provider_map[provider][0], "model": provider_map[provider][1]}
@@ -4019,6 +4066,14 @@ class CommandBridge:
                     "chain": [{"provider": "opencode", "model": self._big_pickle_model()}],
                     "configured": chat_backend_configured(self.settings, CHAT_BACKEND_CLOUD_PICKLE),
                 },
+                {
+                    "backend": CHAT_BACKEND_CLOUD_NVIDIA,
+                    "label": "NVIDIA",
+                    "requested_provider": "nvidia",
+                    "requested_model": self._nvidia_model(),
+                    "chain": [{"provider": "nvidia", "model": self._nvidia_model()}],
+                    "configured": chat_backend_configured(self.settings, CHAT_BACKEND_CLOUD_NVIDIA),
+                },
             ],
             "vision": self._vision_pool_route(),
         }
@@ -4045,6 +4100,8 @@ class CommandBridge:
             return "opencode", self._big_pickle_model()
         if chat_backend == CHAT_BACKEND_CLOUD_MISTRAL:
             return "mistral", self._mistral_model()
+        if chat_backend == CHAT_BACKEND_CLOUD_NVIDIA:
+            return "nvidia", self._nvidia_model()
         if chat_backend == CHAT_BACKEND_GEMINI:
             return "gemini", self._gemini_primary_model()
         if chat_backend == CHAT_BACKEND_CLOUD_POOL:
@@ -4097,6 +4154,18 @@ class CommandBridge:
                 self._mistral_model(),
             )
             return message, metadata
+        if chat_backend == CHAT_BACKEND_CLOUD_NVIDIA:
+            client = self._build_nvidia_chat_client()
+            if client is None:
+                raise RuntimeError("NVIDIA 後端目前無法使用（未設定 NVIDIA_KEY）。")
+            message = client.generate(prompt, temperature=0.7)
+            metadata = self._model_metadata_for_backend(
+                chat_backend,
+                (ModelAttempt("nvidia", self._nvidia_model(), _MODEL_STATUS_OK),),
+                "nvidia",
+                self._nvidia_model(),
+            )
+            return message, metadata
         if chat_backend == CHAT_BACKEND_GEMINI:
             return self._generate_gemini_with_fallback(prompt, temperature=0.7)
         if chat_backend == CHAT_BACKEND_CLOUD_POOL:
@@ -4118,6 +4187,9 @@ class CommandBridge:
             return
         if chat_backend == CHAT_BACKEND_CLOUD_MISTRAL:
             yield from self._stream_mistral_chat(prompt)
+            return
+        if chat_backend == CHAT_BACKEND_CLOUD_NVIDIA:
+            yield from self._stream_nvidia_chat(prompt)
             return
         if chat_backend == CHAT_BACKEND_GEMINI:
             yield from self._stream_gemini_chat(prompt)
@@ -4258,6 +4330,16 @@ class CommandBridge:
         model = self._mistral_model()
         return MistralTextClient(api_key=key, model=model, timeout_seconds=180)
 
+    def _build_nvidia_chat_client(self):
+        """NVIDIA NIM cloud chat client; returns None when NVIDIA_KEY not set."""
+        from .dynamic_tools import NvidiaTextClient
+
+        key = getattr(self.settings, "openclaw_nvidia_api_key", None)
+        if not key:
+            return None
+        model = self._nvidia_model()
+        return NvidiaTextClient(api_key=key, model=model, timeout_seconds=180)
+
     def _build_gemini_chat_client(self, model: str):
         """Gemini cloud chat client; returns None when no Google API key is configured."""
         key = getattr(self.settings, "openclaw_gemini_api_key", None)
@@ -4285,6 +4367,13 @@ class CommandBridge:
         if not key:
             return None
         return MistralVisionClient(api_key=key, model=model, timeout_seconds=180)
+
+    def _build_nvidia_vision_client(self, model: str):
+        from .vision_pool import NvidiaVisionClient
+        key = getattr(self.settings, "openclaw_nvidia_api_key", None)
+        if not key:
+            return None
+        return NvidiaVisionClient(api_key=key, model=model, timeout_seconds=180)
 
     def _build_local_vision_client(self, model: str):
         from .vision_pool import LocalVisionClient
@@ -4335,6 +4424,46 @@ class CommandBridge:
             (ModelAttempt("mistral", self._mistral_model(), _MODEL_STATUS_OK),),
             "mistral",
             self._mistral_model(),
+        )
+        yield stream_done(text, model_metadata=metadata)
+
+    def _stream_nvidia_chat(self, prompt: str) -> "Iterator[dict]":
+        client = self._build_nvidia_chat_client()
+        if client is None:
+            yield stream_error("NVIDIA 後端目前無法使用（未設定 NVIDIA_KEY）。")
+            return
+        result: dict[str, object] = {}
+        done = threading.Event()
+
+        def _worker() -> None:
+            try:
+                result["text"] = client.generate(prompt, temperature=0.7)
+            except Exception as exc:  # noqa: BLE001
+                result["error"] = str(exc)
+            finally:
+                done.set()
+
+        worker = threading.Thread(target=_worker, daemon=True)
+        worker.start()
+        try:
+            while not done.wait(timeout=_HEARTBEAT_SECONDS):
+                yield stream_heartbeat()
+        except GeneratorExit:
+            abort = getattr(client, "abort", None)
+            if callable(abort):
+                abort()
+            raise
+        if "error" in result:
+            yield stream_error(f"NVIDIA 後端失敗：{result['error']}")
+            return
+        text = str(result.get("text") or "").strip()
+        if text:
+            yield stream_delta(text)
+        metadata = self._model_metadata_for_backend(
+            CHAT_BACKEND_CLOUD_NVIDIA,
+            (ModelAttempt("nvidia", self._nvidia_model(), _MODEL_STATUS_OK),),
+            "nvidia",
+            self._nvidia_model(),
         )
         yield stream_done(text, model_metadata=metadata)
 
@@ -4455,6 +4584,12 @@ class CommandBridge:
                 self._build_cloud_chat_client,
                 lambda: chat_backend_configured(self.settings, CHAT_BACKEND_CLOUD_PICKLE),
             ),
+            LLM_PROVIDER_NVIDIA: (
+                "nvidia",
+                self._nvidia_model(),
+                self._build_nvidia_chat_client,
+                lambda: chat_backend_configured(self.settings, CHAT_BACKEND_CLOUD_NVIDIA),
+            ),
         }
         return [raw_entries[provider] for provider in enabled_cloud_pool_providers(self.settings)]
 
@@ -4476,6 +4611,14 @@ class CommandBridge:
                     resolve_vision_provider_model(self.settings, LLM_PROVIDER_MISTRAL)
                 ),
                 lambda: bool(getattr(self.settings, "openclaw_mistral_api_key", None)),
+            ),
+            LLM_PROVIDER_NVIDIA: (
+                "nvidia",
+                resolve_vision_provider_model(self.settings, LLM_PROVIDER_NVIDIA),
+                lambda: self._build_nvidia_vision_client(
+                    resolve_vision_provider_model(self.settings, LLM_PROVIDER_NVIDIA)
+                ),
+                lambda: bool(getattr(self.settings, "openclaw_nvidia_api_key", None)),
             ),
             LLM_PROVIDER_LOCAL: (
                 "local",
@@ -4684,6 +4827,9 @@ class CommandBridge:
     def _mistral_model(self) -> str:
         return resolve_provider_model(self.settings, LLM_PROVIDER_MISTRAL)
 
+    def _nvidia_model(self) -> str:
+        return resolve_provider_model(self.settings, LLM_PROVIDER_NVIDIA)
+
     def _gemini_primary_model(self) -> str:
         return resolve_provider_model(self.settings, LLM_PROVIDER_GEMINI)
 
@@ -4720,6 +4866,7 @@ class CommandBridge:
             CHAT_BACKEND_GEMINI: "Gemini",
             CHAT_BACKEND_CLOUD_MISTRAL: "Mistral",
             CHAT_BACKEND_CLOUD_PICKLE: "OpenCode",
+            CHAT_BACKEND_CLOUD_NVIDIA: "NVIDIA",
         }
         return f"{labels.get(chat_backend, '此模型')}目前已停用，請先到設定中重新啟用。"
 
@@ -4811,6 +4958,18 @@ class CommandBridge:
                 (ModelAttempt("mistral", self._mistral_model(), _MODEL_STATUS_OK),),
                 "mistral",
                 self._mistral_model(),
+            )
+            return message, metadata
+        if chat_backend == CHAT_BACKEND_CLOUD_NVIDIA:
+            client = self._build_nvidia_chat_client()
+            if client is None:
+                raise RuntimeError("NVIDIA 後端目前無法使用（未設定 NVIDIA_KEY）。")
+            message = client.generate(prompt, temperature=0.2)
+            metadata = self._model_metadata_for_backend(
+                chat_backend,
+                (ModelAttempt("nvidia", self._nvidia_model(), _MODEL_STATUS_OK),),
+                "nvidia",
+                self._nvidia_model(),
             )
             return message, metadata
         if chat_backend == CHAT_BACKEND_GEMINI:

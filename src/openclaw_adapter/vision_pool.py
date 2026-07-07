@@ -26,6 +26,7 @@ _MAX_VISION_IMAGES = 3
 _VISION_TEMPERATURE = 0.2
 _GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 _MISTRAL_API_BASE = "https://api.mistral.ai/v1"
+_NVIDIA_API_BASE = "https://integrate.api.nvidia.com/v1"
 
 _OBSERVE_PROMPT = (
     "請客觀描述這張圖片中可見的內容與狀態，包括任何可見的瑕疵、損傷、文字。"
@@ -201,6 +202,69 @@ class MistralVisionClient:
         text = (choices[0].get("message") or {}).get("content") or ""
         if not isinstance(text, str):
             raise _VisionRequestError("Mistral vision response content is not text", status=_MODEL_STATUS_ERROR)
+        return text.strip()
+
+
+class NvidiaVisionClient:
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        timeout_seconds: int = 180,
+    ) -> None:
+        self.api_key = api_key
+        self.model = model
+        self.timeout_seconds = max(1, timeout_seconds)
+
+    def generate(self, prompt: str, images_b64: list[str], *, temperature: float = _VISION_TEMPERATURE) -> str:
+        content: list[dict[str, object]] = [{"type": "text", "text": prompt}]
+        for b64 in images_b64:
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+            })
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": content}],
+            "temperature": temperature,
+            "stream": False,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+        url = f"{_NVIDIA_API_BASE}/chat/completions"
+        request = Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=self.timeout_seconds) as response:
+                body = response.read().decode("utf-8", errors="replace")
+        except HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")[:400]
+            except Exception:
+                detail = ""
+            raise _VisionRequestError(
+                f"NVIDIA vision HTTP {exc.code}: {detail}", status=_MODEL_STATUS_ERROR,
+            ) from exc
+        except URLError as exc:
+            raise _VisionRequestError(
+                f"NVIDIA vision request failed: {exc.reason}", status=_MODEL_STATUS_ERROR,
+            ) from exc
+        parsed = json.loads(body)
+        choices = parsed.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise _VisionRequestError("NVIDIA vision response missing choices", status=_MODEL_STATUS_ERROR)
+        text = (choices[0].get("message") or {}).get("content") or ""
+        if not isinstance(text, str):
+            raise _VisionRequestError("NVIDIA vision response content is not text", status=_MODEL_STATUS_ERROR)
         return text.strip()
 
 

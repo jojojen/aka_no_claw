@@ -44,6 +44,8 @@ class AssistantSettings:
     openclaw_opencode_timeout_seconds: int = 900
     openclaw_mistral_api_key: str | None = None
     openclaw_mistral_model: str = "mistral-large-latest"
+    openclaw_nvidia_api_key: str | None = None
+    openclaw_nvidia_model: str = "meta/llama-3.1-70b-instruct"
     openclaw_gemini_api_key: str | None = None
     openclaw_gemini_primary_model: str = "gemini-2.5-flash"
     openclaw_gemini_flash_model: str = "gemini-2.5-flash"
@@ -269,6 +271,12 @@ def get_settings() -> AssistantSettings:
             _getenv_any("MISTRAL_API_KEY", "MISTRAL_KEY")
         ),
         openclaw_mistral_model=os.getenv("OPENCLAW_MISTRAL_MODEL", "mistral-large-latest"),
+        openclaw_nvidia_api_key=_none_if_empty(
+            _getenv_any("NVIDIA_KEY", "NVIDIA_API_KEY")
+        ),
+        openclaw_nvidia_model=os.getenv(
+            "OPENCLAW_NVIDIA_MODEL", "meta/llama-3.1-70b-instruct"
+        ),
         openclaw_gemini_api_key=_none_if_empty(
             _getenv_any("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GEMINI_API_KEY")
         ),
