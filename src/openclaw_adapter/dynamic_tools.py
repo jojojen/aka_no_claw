@@ -1248,7 +1248,7 @@ class DynamicToolRunner:
             self._record_catalog_outcome(slug, True, None)
             return True, result.answer
         self._record_catalog_outcome(slug, False, "workspace tool step failed")
-        return False, result.answer or "工具執行失敗"
+        return False, result.error or result.answer or "工具執行失敗"
 
     def _catalog_tool_type(self, slug: str | None) -> str | None:
         """tool_type of a generated tool, for the user-visible reuse trace.

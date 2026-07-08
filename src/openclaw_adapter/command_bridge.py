@@ -763,6 +763,27 @@ class CommandBridge:
                     self._view_handlers = view_handlers
                     self._item_deleter_handlers = item_deleter_handlers
 
+                    # _build_registries was called with dynamic_tool_runner=None
+                    # above (the bridge avoids a full codegen runner — see
+                    # _WorkflowShimRunner), so it never wired up "/workflow".
+                    # Without this, any home schedule containing a stored
+                    # "/workflow run <id>" command fails with 找不到指令：/workflow
+                    # when dispatched through the bridge's schedule surface
+                    # (_schedulehome_surface, which runs commands through this
+                    # same self._command_handlers dict). Wire in the same
+                    # shim-backed handler _workflow_surface() already builds for
+                    # the web console, so schedule dispatch can find it too.
+                    from telegram_core.contracts import RegisteredCommand
+                    from .workflow_command import command_metadata
+
+                    workflow_handler, _ = self._workflow_surface()
+                    command_handlers["/workflow"] = RegisteredCommand(
+                        workflow_handler,
+                        ack="⚙️",
+                        background=True,
+                        **command_metadata("/workflow"),
+                    )
+
     def _research_notifier(self, chat_id: str):
         """Notifier for a /research run: a live stream callback when one is
         registered for this chat_id (web chat NDJSON stream open), otherwise
