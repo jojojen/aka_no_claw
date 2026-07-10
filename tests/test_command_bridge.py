@@ -4037,18 +4037,52 @@ def test_build_nvidia_chat_client_present_with_key():
     assert client.model == "meta/llama-3.1-70b-instruct"
 
 
-def test_build_nvidia_vision_client_none_without_key():
-    b = CommandBridge(settings=_tool_settings())
-    assert b._build_nvidia_vision_client("meta/llama-3.2-11b-vision-instruct") is None
+def test_build_nvidia_vision_client_none_without_key(monkeypatch):
+    from openclaw_adapter.vision_pool import build_vision_pool_chain
+    from openclaw_adapter.llm_pool_settings import enabled_vision_pool_providers
+
+    # Mock enabled_vision_pool_providers to return nvidia
+    # but without the API key, it should not be configured
+    monkeypatch.setattr(
+        "openclaw_adapter.llm_pool_settings.enabled_vision_pool_providers",
+        lambda s: ("nvidia",),
+    )
+    chain = build_vision_pool_chain(_tool_settings())
+    # Should have an nvidia entry
+    assert len(chain) == 1
+    provider, model, build_fn, configured_fn = chain[0]
+    assert provider == "nvidia"
+    # Without API key, it should not be configured
+    assert not configured_fn()
+    # And build_fn should return None
+    assert build_fn() is None
 
 
-def test_build_nvidia_vision_client_present_with_key():
-    from openclaw_adapter.vision_pool import NvidiaVisionClient
+def test_build_nvidia_vision_client_present_with_key(monkeypatch):
+    from openclaw_adapter.vision_pool import NvidiaVisionClient, build_vision_pool_chain
 
-    b = CommandBridge(settings=_tool_settings(nvidia_key="fake-nvidia"))
-    client = b._build_nvidia_vision_client("meta/llama-3.2-11b-vision-instruct")
+    # Mock enabled_vision_pool_providers to return nvidia
+    monkeypatch.setattr(
+        "openclaw_adapter.llm_pool_settings.enabled_vision_pool_providers",
+        lambda s: ("nvidia",),
+    )
+    # Mock resolve_vision_provider_model to return a model
+    monkeypatch.setattr(
+        "openclaw_adapter.llm_pool_settings.resolve_vision_provider_model",
+        lambda s, p: "meta/llama-3.2-11b-vision-instruct",
+    )
+
+    settings = _tool_settings(nvidia_key="fake-nvidia")
+    chain = build_vision_pool_chain(settings)
+    assert len(chain) == 1
+    provider, model, build_fn, configured_fn = chain[0]
+    assert provider == "nvidia"
+    assert model == "meta/llama-3.2-11b-vision-instruct"
+    # With API key, it should be configured
+    assert configured_fn()
+    client = build_fn()
     assert isinstance(client, NvidiaVisionClient)
-    assert client.model == "meta/llama-3.2-11b-vision-instruct"
+    assert client.model == model
 
 
 def test_vision_pool_chain_includes_nvidia():

@@ -4413,39 +4413,6 @@ class CommandBridge:
             ssl_context=ssl_ctx,
         )
 
-    def _build_gemini_vision_client(self, model: str):
-        from .vision_pool import GeminiVisionClient
-        key = getattr(self.settings, "openclaw_gemini_api_key", None)
-        if not key:
-            return None
-        ssl_ctx = build_ssl_context(self.settings)
-        return GeminiVisionClient(api_key=key, model=model, timeout_seconds=180, ssl_context=ssl_ctx)
-
-    def _build_mistral_vision_client(self, model: str):
-        from .vision_pool import MistralVisionClient
-        key = getattr(self.settings, "openclaw_mistral_api_key", None)
-        if not key:
-            return None
-        return MistralVisionClient(api_key=key, model=model, timeout_seconds=180)
-
-    def _build_nvidia_vision_client(self, model: str):
-        from .vision_pool import NvidiaVisionClient
-        key = getattr(self.settings, "openclaw_nvidia_api_key", None)
-        if not key:
-            return None
-        return NvidiaVisionClient(api_key=key, model=model, timeout_seconds=180)
-
-    def _build_local_vision_client(self, model: str):
-        from .vision_pool import LocalVisionClient
-        backend = (getattr(self.settings, "openclaw_local_vision_backend", None) or "").strip().lower()
-        if backend != "ollama":
-            return None
-        endpoint = getattr(self.settings, "openclaw_local_vision_endpoint", None)
-        if not endpoint:
-            return None
-        ssl_ctx = build_ssl_context(self.settings) if endpoint.startswith("https://") else None
-        timeout = max(1, getattr(self.settings, "openclaw_local_vision_timeout_seconds", 180))
-        return LocalVisionClient(endpoint=endpoint, model=model, timeout_seconds=timeout, ssl_context=ssl_ctx)
 
     def _stream_mistral_chat(self, prompt: str) -> "Iterator[dict]":
         client = self._build_mistral_chat_client()
@@ -4654,48 +4621,8 @@ class CommandBridge:
         return [raw_entries[provider] for provider in enabled_cloud_pool_providers(self.settings)]
 
     def _vision_pool_chain(self) -> list[tuple[str, str, Callable[[], object], Callable[[], bool]]]:
-        from .vision_pool import GeminiVisionClient, MistralVisionClient, LocalVisionClient
-        raw_entries: dict[str, tuple[str, str, Callable[[], object], Callable[[], bool]]] = {
-            LLM_PROVIDER_GEMINI: (
-                "gemini",
-                resolve_vision_provider_model(self.settings, LLM_PROVIDER_GEMINI),
-                lambda: self._build_gemini_vision_client(
-                    resolve_vision_provider_model(self.settings, LLM_PROVIDER_GEMINI)
-                ),
-                lambda: bool(getattr(self.settings, "openclaw_gemini_api_key", None)),
-            ),
-            LLM_PROVIDER_MISTRAL: (
-                "mistral",
-                resolve_vision_provider_model(self.settings, LLM_PROVIDER_MISTRAL),
-                lambda: self._build_mistral_vision_client(
-                    resolve_vision_provider_model(self.settings, LLM_PROVIDER_MISTRAL)
-                ),
-                lambda: bool(getattr(self.settings, "openclaw_mistral_api_key", None)),
-            ),
-            LLM_PROVIDER_NVIDIA: (
-                "nvidia",
-                resolve_vision_provider_model(self.settings, LLM_PROVIDER_NVIDIA),
-                lambda: self._build_nvidia_vision_client(
-                    resolve_vision_provider_model(self.settings, LLM_PROVIDER_NVIDIA)
-                ),
-                lambda: bool(getattr(self.settings, "openclaw_nvidia_api_key", None)),
-            ),
-            LLM_PROVIDER_LOCAL: (
-                "local",
-                resolve_vision_provider_model(self.settings, LLM_PROVIDER_LOCAL),
-                lambda: self._build_local_vision_client(
-                    resolve_vision_provider_model(self.settings, LLM_PROVIDER_LOCAL)
-                ),
-                lambda: (getattr(self.settings, "openclaw_local_vision_backend", None) or "").strip().lower() == "ollama",
-            ),
-        }
-        # Settings may enable providers with no vision client (e.g. big_pickle);
-        # skip them instead of crashing the whole chat stream with a KeyError.
-        return [
-            raw_entries[provider]
-            for provider in enabled_vision_pool_providers(self.settings)
-            if provider in raw_entries
-        ]
+        from .vision_pool import build_vision_pool_chain
+        return build_vision_pool_chain(self.settings)
 
     def _cloud_pool_preview(self) -> tuple[str, str]:
         """First actually usable (provider, model) for the cloud_pool tab preview.

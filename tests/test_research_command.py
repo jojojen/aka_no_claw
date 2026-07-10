@@ -654,6 +654,7 @@ def test_research_handler_reports_progress_heartbeat_and_final_reply() -> None:
             _parse_stage,
             heartbeat_stage,
             _placeholder("M1 骨架：已保留實體辨識與知識庫接點"),
+            _placeholder("M1 骨架：已保留商品狀況分析階段"),
             _placeholder("M1 骨架：已保留增值潛力分析階段"),
             _placeholder("M1 骨架：已保留合理市價分析階段"),
             _placeholder("M1 骨架：已保留流動性分析階段"),
@@ -668,7 +669,7 @@ def test_research_handler_reports_progress_heartbeat_and_final_reply() -> None:
     reply = handler("https://jp.mercari.com/item/m65806654179?afid=foo", "chat-1")
 
     assert notifier.messages[0] == "⏳ /research 已開始，先抓商品頁與市場資料…"
-    assert "⏳ [1/6] 取得商品資料：還在整理資料源配置" in notifier.messages
+    assert "⏳ [1/7] 取得商品資料：還在整理資料源配置" in notifier.messages
     assert "✅ 已抓到商品頁：M1 骨架：已保留商品抓取接點" in notifier.messages
     assert "✅ 已完成市場比價：M1 骨架：已保留合理市價分析階段" in notifier.messages
     assert "龍蝦 /research 已完成目前可用流程。" in reply
@@ -689,6 +690,7 @@ def test_research_handler_supports_custom_final_formatter() -> None:
             _parse_stage,
             _placeholder("M1 骨架：已保留商品抓取接點"),
             _placeholder("M1 骨架：已保留實體辨識與知識庫接點"),
+            _placeholder("M1 骨架：已保留商品狀況分析階段"),
             _placeholder("M1 骨架：已保留增值潛力分析階段"),
             _placeholder("M1 骨架：已保留合理市價分析階段"),
             _placeholder("M1 骨架：已保留流動性分析階段"),
@@ -725,6 +727,7 @@ def test_research_handler_rejects_overlapping_jobs_in_same_chat() -> None:
             _parse_stage,
             blocking_stage,
             _placeholder("M1 骨架：已保留實體辨識與知識庫接點"),
+            _placeholder("M1 骨架：已保留商品狀況分析階段"),
             _placeholder("M1 骨架：已保留增值潛力分析階段"),
             _placeholder("M1 骨架：已保留合理市價分析階段"),
             _placeholder("M1 骨架：已保留流動性分析階段"),
@@ -2057,6 +2060,61 @@ def test_compact_warning_label_recognizes_shop_failure() -> None:
     assert label == "遊々亭：無法取得店舗參考"
 
 
+def test_compact_warning_label_recognizes_condition_mismatch() -> None:
+    from openclaw_adapter.research_command import _compact_warning_label
+
+    label = _compact_warning_label("圖片狀況與賣家標示（未使用に近い）可能不符，下單前請確認。")
+    assert label == "圖片狀況與賣家標示可能不符"
+
+
+def test_compact_report_bullets_include_condition_section() -> None:
+    from openclaw_adapter.research_command import (
+        ResearchReport,
+        ResearchSectionResult,
+        _build_compact_report_bullets,
+    )
+
+    condition = ResearchSectionResult(
+        section_name="商品狀況分析",
+        status="ok",
+        confidence=0.7,
+        sample_count=3,
+        evidence_count=3,
+        summary="卡面整體乾淨，僅左下角有輕微白邊；可見瑕疵：左下角白邊",
+        evidence_urls=(),
+        warnings=(),
+    )
+    unavailable = ResearchSectionResult(
+        section_name="商品狀況分析",
+        status="unavailable",
+        confidence=0.0,
+        sample_count=0,
+        evidence_count=0,
+        summary="無商品圖片可供狀況分析。",
+        evidence_urls=(),
+        warnings=(),
+    )
+
+    def _report(section: ResearchSectionResult) -> ResearchReport:
+        return ResearchReport(
+            chat_id="1",
+            mode_label="Mercari 商品網址",
+            target_display_text="x",
+            budget_used=0,
+            budget_max=5,
+            item_data=None,
+            seller_snapshot=None,
+            section_results=(section,),
+            warnings=(),
+        )
+
+    bullets = _build_compact_report_bullets(_report(condition))
+    assert any(b.startswith("狀況：") and "白邊" in b for b in bullets)
+    # unavailable condition sections stay out of the compact view
+    bullets = _build_compact_report_bullets(_report(unavailable))
+    assert not any(b.startswith("狀況：") for b in bullets)
+
+
 # ---------------------------------------------------------------------------
 # PR3 — semantic rerank gate (spec Test 1-5). Gate is dependency-injected so
 # unit tests never touch a real Ollama. ``_keep_all_gate`` / ``_drop_card_gate``
@@ -2230,7 +2288,7 @@ def _section_stage(section_name: str, *, delay: float = 0.0, order_box: list | N
 
 
 def test_research_parallel_stages_preserve_report_order() -> None:
-    # Stage 6 (賣家風險) finishes first while 3/4 sleep, so section_results is
+    # Stage 7 (賣家風險) finishes first while 4/5 sleep, so section_results is
     # appended out of canonical order — the report must still be reordered.
     finish_order: list[str] = []
     handler = build_research_handler(
@@ -2239,6 +2297,7 @@ def test_research_parallel_stages_preserve_report_order() -> None:
             _parse_stage,
             _placeholder("item"),
             _placeholder("entity"),
+            _placeholder("condition"),
             _section_stage("增值潛力分析", delay=0.25, order_box=finish_order),
             _section_stage("合理市價分析", delay=0.25, order_box=finish_order),
             _placeholder("liquidity"),
@@ -2258,7 +2317,7 @@ def test_research_parallel_stages_preserve_report_order() -> None:
 
 
 def test_research_parallel_stages_run_concurrently() -> None:
-    # Three independent stages each sleep 0.3s. Serial would be ~0.9s; running
+    # Four independent stages each sleep 0.3s. Serial would be ~1.2s; running
     # them on the thread pool overlaps the sleeps to ~0.3s wall-clock.
     handler = build_research_handler(
         notifier_factory=lambda chat_id: FakeNotifier(),
@@ -2266,6 +2325,7 @@ def test_research_parallel_stages_run_concurrently() -> None:
             _parse_stage,
             _placeholder("item"),
             _placeholder("entity"),
+            _placeholder("condition"),
             _section_stage("增值潛力分析", delay=0.3),
             _section_stage("合理市價分析", delay=0.3),
             _placeholder("liquidity"),
@@ -2371,7 +2431,7 @@ def test_research_handler_no_followup_fn_degrades_gracefully_on_still_pending(tm
 
 
 def test_marketplace_upfront_notice_is_sent() -> None:
-    # Before stages 3/4/6 start, a "市場搜尋中" notice must be visible so the
+    # Before stages 3/4/5/7 start, a "市場搜尋中" notice must be visible so the
     # user knows Dragon is working even before the first heartbeat fires.
     notifier = FakeNotifier()
     handler = build_research_handler(
@@ -2380,6 +2440,7 @@ def test_marketplace_upfront_notice_is_sent() -> None:
             _parse_stage,
             _placeholder("item"),
             _placeholder("entity"),
+            _placeholder("condition"),
             _placeholder("appreciation"),
             _placeholder("price"),
             _placeholder("liquidity"),
@@ -2411,6 +2472,7 @@ def test_marketplace_budget_exhaustion_marks_partial_and_warns() -> None:
                 _parse_stage,
                 _placeholder("item"),
                 _placeholder("entity"),
+                _placeholder("condition"),
                 _section_stage("增值潛力分析", delay=0.3),
                 _section_stage("合理市價分析", delay=0.3),
                 _placeholder("liquidity"),
@@ -2440,6 +2502,7 @@ def test_marketplace_full_completion_does_not_set_timed_out() -> None:
             _parse_stage,
             _placeholder("item"),
             _placeholder("entity"),
+            _placeholder("condition"),
             _section_stage("增值潛力分析", delay=0.0),
             _section_stage("合理市價分析", delay=0.0),
             _placeholder("liquidity"),

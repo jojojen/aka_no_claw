@@ -335,6 +335,103 @@ def encode_image_bytes_for_vision(data: bytes, *, max_side: int = 1280) -> str:
         return base64.b64encode(data).decode("ascii")
 
 
+def build_vision_pool_chain(
+    settings,
+) -> list[tuple[str, str, Callable[[], VisionClient | None], Callable[[], bool]]]:
+    """Build vision provider chain from settings.
+
+    Returns ordered list of (provider_label, model_name, build_fn, is_configured_fn)
+    tuples. Each build_fn returns a VisionClient or None; is_configured_fn checks
+    if the provider is available (credentials + settings).
+
+    Providers are filtered to enabled_vision_pool_providers(settings) and skipped
+    if they have no vision client (e.g. big_pickle is text-only).
+    """
+    from assistant_runtime import build_ssl_context
+
+    from .llm_pool_settings import (
+        LLM_PROVIDER_GEMINI,
+        LLM_PROVIDER_LOCAL,
+        LLM_PROVIDER_MISTRAL,
+        LLM_PROVIDER_NVIDIA,
+        enabled_vision_pool_providers,
+        resolve_vision_provider_model,
+    )
+
+    def _build_gemini_vision_client(model: str) -> GeminiVisionClient | None:
+        key = getattr(settings, "openclaw_gemini_api_key", None)
+        if not key:
+            return None
+        ssl_ctx = build_ssl_context(settings)
+        return GeminiVisionClient(api_key=key, model=model, timeout_seconds=180, ssl_context=ssl_ctx)
+
+    def _build_mistral_vision_client(model: str) -> MistralVisionClient | None:
+        key = getattr(settings, "openclaw_mistral_api_key", None)
+        if not key:
+            return None
+        return MistralVisionClient(api_key=key, model=model, timeout_seconds=180)
+
+    def _build_nvidia_vision_client(model: str) -> NvidiaVisionClient | None:
+        key = getattr(settings, "openclaw_nvidia_api_key", None)
+        if not key:
+            return None
+        return NvidiaVisionClient(api_key=key, model=model, timeout_seconds=180)
+
+    def _build_local_vision_client(model: str) -> LocalVisionClient | None:
+        backend = (getattr(settings, "openclaw_local_vision_backend", None) or "").strip().lower()
+        if backend != "ollama":
+            return None
+        endpoint = getattr(settings, "openclaw_local_vision_endpoint", None)
+        if not endpoint:
+            return None
+        ssl_ctx = build_ssl_context(settings) if endpoint.startswith("https://") else None
+        timeout = max(1, getattr(settings, "openclaw_local_vision_timeout_seconds", 180))
+        return LocalVisionClient(endpoint=endpoint, model=model, timeout_seconds=timeout, ssl_context=ssl_ctx)
+
+    raw_entries: dict[str, tuple[str, str, Callable[[], VisionClient | None], Callable[[], bool]]] = {
+        LLM_PROVIDER_GEMINI: (
+            "gemini",
+            resolve_vision_provider_model(settings, LLM_PROVIDER_GEMINI),
+            lambda: _build_gemini_vision_client(
+                resolve_vision_provider_model(settings, LLM_PROVIDER_GEMINI)
+            ),
+            lambda: bool(getattr(settings, "openclaw_gemini_api_key", None)),
+        ),
+        LLM_PROVIDER_MISTRAL: (
+            "mistral",
+            resolve_vision_provider_model(settings, LLM_PROVIDER_MISTRAL),
+            lambda: _build_mistral_vision_client(
+                resolve_vision_provider_model(settings, LLM_PROVIDER_MISTRAL)
+            ),
+            lambda: bool(getattr(settings, "openclaw_mistral_api_key", None)),
+        ),
+        LLM_PROVIDER_NVIDIA: (
+            "nvidia",
+            resolve_vision_provider_model(settings, LLM_PROVIDER_NVIDIA),
+            lambda: _build_nvidia_vision_client(
+                resolve_vision_provider_model(settings, LLM_PROVIDER_NVIDIA)
+            ),
+            lambda: bool(getattr(settings, "openclaw_nvidia_api_key", None)),
+        ),
+        LLM_PROVIDER_LOCAL: (
+            "local",
+            resolve_vision_provider_model(settings, LLM_PROVIDER_LOCAL),
+            lambda: _build_local_vision_client(
+                resolve_vision_provider_model(settings, LLM_PROVIDER_LOCAL)
+            ),
+            lambda: (getattr(settings, "openclaw_local_vision_backend", None) or "").strip().lower()
+            == "ollama",
+        ),
+    }
+    # Settings may enable providers with no vision client (e.g. big_pickle);
+    # skip them instead of crashing the whole chain with a KeyError.
+    return [
+        raw_entries[provider]
+        for provider in enabled_vision_pool_providers(settings)
+        if provider in raw_entries
+    ]
+
+
 def walk_vision_pool_chain(
     chain: list[tuple[str, str, Callable[[], VisionClient | None], Callable[[], bool]]],
     prompt: str,

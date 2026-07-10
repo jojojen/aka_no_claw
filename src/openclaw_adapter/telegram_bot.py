@@ -168,6 +168,7 @@ from .research_command import (
     format_research_detail_report,
     _build_seller_snapshot_section_result,
 )
+from .item_condition import build_item_condition_assessor
 from .natural_language import build_telegram_natural_language_router_from_settings
 from .natural_language import fallback_route_openclaw_natural_language
 from telegram_nl.natural_language import TelegramNaturalLanguageIntent
@@ -1599,6 +1600,7 @@ def _build_registries(
             endpoint=settings.openclaw_local_text_endpoint,
             model=settings.openclaw_local_text_model or "qwen3:14b",
         ),
+        condition_assessor_fn=build_item_condition_assessor(settings),
         final_formatter=_build_research_reply_formatter(research_cache),
     )
 

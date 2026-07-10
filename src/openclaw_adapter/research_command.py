@@ -20,6 +20,7 @@ from urllib.request import Request, urlopen
 from bs4 import BeautifulSoup, NavigableString, Tag
 from market_monitor import browser_stealth as bs
 
+from .item_condition import ConditionAssessment
 from .knowledge_db import KnowledgeDatabase, KnowledgeEntry, is_source_id
 from .market_title_corpus import record_titles as _record_market_titles
 from .reputation_snapshot import SnapshotStillPending
@@ -37,7 +38,7 @@ _SOLD_AVG_SCRAPE_TIMEOUT = 75.0
 _SHOP_REF_SCRAPE_TIMEOUT = 75.0
 _ITEM_HTML_SCRAPE_TIMEOUT = 90.0
 
-# Overall cap on how long we wait for the parallel marketplace stages (3/4/6)
+# Overall cap on how long we wait for the parallel marketplace stages (3/4/5/7)
 # to ALL complete.  Each stage has its own per-scrape timeout (above), but on a
 # slow query those can stack to > 5 min total.  After this budget the futures
 # we've already collected are used for the report; stages still running are
@@ -96,6 +97,7 @@ AppreciationEnricherFn = Callable[[str, tuple[WebSearchResult, ...]], "str | Non
 SemanticGateFn = Callable[
     [str, "int | None", "list[CandidateForSemanticRerank]"], "set[int] | None"
 ]
+ConditionAssessorFn = Callable[[str, "str | None", "Sequence[str]"], "ConditionAssessment | None"]
 ResearchStageRunner = Callable[["ResearchJobContext"], str]
 
 _MERCARI_ITEM_PATH_RE = re.compile(r"^/item/(m\d+)/?$", re.IGNORECASE)
@@ -141,7 +143,7 @@ class BudgetExhaustedError(RuntimeError):
 class ResearchBudget:
     max_searches: int = 5
     searches_used: int = 0
-    # Guards searches_used so stages 3/4/6 running on parallel threads can't
+    # Guards searches_used so stages 3/4/5/7 running on parallel threads can't
     # race the counter (Phase 2 parallelisation).
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
@@ -295,16 +297,17 @@ class ResearchJobContext:
     appreciation_search_results: tuple[WebSearchResult, ...] = ()
     appreciation_enrichment: str | None = None
     seller_snapshot: SellerReputationSnapshot | None = None
+    condition_assessment: "ConditionAssessment | None" = None
     current_stage: int = 0
     current_label: str = ""
     heartbeat_interval_seconds: float = 15.0
     stage_started_monotonic: float = 0.0
     last_heartbeat_monotonic: float = 0.0
     # Set to True when the overall marketplace budget is exhausted before all
-    # parallel stages (3/4/6) return.  build_research_report appends a note so
+    # parallel stages (3/4/5/7) return.  build_research_report appends a note so
     # the user knows the answer is based on partial market data.
     marketplace_timed_out: bool = False
-    # Serialises section_results/warnings appends across stages 3/4/6 when they
+    # Serialises section_results/warnings appends across stages 3/4/5/7 when they
     # run on parallel threads (Phase 2 parallelisation).
     _section_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
@@ -316,7 +319,7 @@ class ResearchJobContext:
             if self.last_heartbeat_monotonic and now - self.last_heartbeat_monotonic < self.heartbeat_interval_seconds:
                 return
         self.last_heartbeat_monotonic = now
-        self.notifier.send(f"⏳ [{self.current_stage}/6] {self.current_label}：{note}")
+        self.notifier.send(f"⏳ [{self.current_stage}/7] {self.current_label}：{note}")
 
     def add_section_result(self, result: ResearchSectionResult) -> None:
         with self._section_lock:
@@ -985,14 +988,15 @@ class ResearchCommandService:
         (0, "解析輸入"),
         (1, "取得商品資料"),
         (2, "實體辨識"),
-        (3, "增值潛力分析"),
-        (4, "合理市價分析"),
-        (5, "流動性分析"),
-        (6, "賣家風險分析"),
+        (3, "商品狀況分析"),
+        (4, "增值潛力分析"),
+        (5, "合理市價分析"),
+        (6, "流動性分析"),
+        (7, "賣家風險分析"),
     )
     _MILESTONE_STAGES: dict[int, str] = {
         1: "已抓到商品頁",
-        4: "已完成市場比價",
+        5: "已完成市場比價",
     }
 
     def __init__(
@@ -1016,6 +1020,7 @@ class ResearchCommandService:
         entity_recognizer_fn: EntityRecognizerFn | None = None,
         appreciation_enricher_fn: AppreciationEnricherFn | None = None,
         semantic_gate_fn: "SemanticGateFn | None" = None,
+        condition_assessor_fn: "ConditionAssessorFn | None" = None,
         final_formatter: Callable[[ResearchReport], object] | None = None,
         heartbeat_interval_seconds: float = 15.0,
     ) -> None:
@@ -1036,6 +1041,7 @@ class ResearchCommandService:
         self._entity_recognizer_fn = entity_recognizer_fn
         self._appreciation_enricher_fn = appreciation_enricher_fn
         self._semantic_gate_fn = semantic_gate_fn
+        self._condition_assessor_fn = condition_assessor_fn
         self._final_formatter = final_formatter or format_research_full_report
         self._heartbeat_interval_seconds = max(0.0, heartbeat_interval_seconds)
         self._lock = threading.Lock()
@@ -1086,15 +1092,15 @@ class ResearchCommandService:
                 return note
 
             # Stages 0-2 are a true chain: parse → fetch item → entity profile,
-            # and stages 3/4/6 all read their outputs. Run them in order first.
+            # and stages 3/4/5/7 all read their outputs. Run them in order first.
             for stage_no in (0, 1, 2):
                 _run_tracked(stage_no)
 
-            # Stages 3 (增值潛力), 4 (合理市價) and 6 (賣家風險) are mutually
+            # Stages 3 (商品狀況), 4 (增值潛力), 5 (合理市價) and 7 (賣家風險) are mutually
             # independent — each reads only stage 0-2 outputs and writes disjoint
             # ctx fields. Run them concurrently so a cloud-offloaded appreciation
             # enricher overlaps the local price gate instead of queueing behind it.
-            notifier.send("🔍 [3-6/6] 市場搜尋中…（可能需要 1-3 分鐘）")
+            notifier.send("🔍 [3-7/7] 市場搜尋中…（可能需要 1-3 分鐘）")
             marketplace_start = time.monotonic()
 
             # Background heartbeat: stage threads can block on I/O for 90s+ each
@@ -1118,11 +1124,11 @@ class ResearchCommandService:
             parallel_notes: dict[int, str] = {}
             try:
                 with ThreadPoolExecutor(
-                    max_workers=3, thread_name_prefix="research-stage"
+                    max_workers=4, thread_name_prefix="research-stage"
                 ) as pool:
                     futures = {
                         pool.submit(stage_by_no[stage_no][1], ctx): stage_no
-                        for stage_no in (3, 4, 6)
+                        for stage_no in (3, 4, 5, 7)
                     }
                     try:
                         for future in as_completed(
@@ -1150,13 +1156,13 @@ class ResearchCommandService:
                 elapsed_marketplace,
                 ctx.marketplace_timed_out,
             )
-            milestone = self._MILESTONE_STAGES.get(4)
+            milestone = self._MILESTONE_STAGES.get(5)
             if milestone and not ctx.marketplace_timed_out:
-                notifier.send(f"✅ {milestone}：{parallel_notes.get(4, '')}")
+                notifier.send(f"✅ {milestone}：{parallel_notes.get(5, '')}")
 
-            # Stage 5 (流動性) consumes stage 4's price evidence, so it must run
+            # Stage 6 (流動性) consumes stage 5's price evidence, so it must run
             # after the parallel batch completes.
-            _run_tracked(5)
+            _run_tracked(6)
 
             report = build_research_report(ctx)
             return self._final_formatter(report)
@@ -1179,6 +1185,7 @@ class ResearchCommandService:
             self._stage_parse_input,
             self._stage_fetch_item_data,
             self._stage_identify_entities,
+            self._stage_condition_assessment,
             self._stage_appreciation_placeholder,
             self._stage_price_placeholder,
             self._stage_liquidity_placeholder,
@@ -1303,6 +1310,91 @@ class ResearchCommandService:
         )
         ctx.add_section_result(result)
         return warning
+
+    def _stage_condition_assessment(self, ctx: ResearchJobContext) -> str:
+        """Assess physical condition via vision LLM."""
+        if ctx.item_data is None or not ctx.item_data.image_urls:
+            result = ResearchSectionResult(
+                section_name="商品狀況分析",
+                status="unavailable",
+                confidence=0.0,
+                sample_count=0,
+                evidence_count=0,
+                summary="無商品圖片可供狀況分析。",
+            )
+            ctx.add_section_result(result)
+            return result.summary
+
+        if self._condition_assessor_fn is None:
+            result = ResearchSectionResult(
+                section_name="商品狀況分析",
+                status="unavailable",
+                confidence=0.0,
+                sample_count=0,
+                evidence_count=0,
+                summary="未設定影像狀況分析後端。",
+            )
+            ctx.add_section_result(result)
+            return result.summary
+
+        try:
+            assessment = self._condition_assessor_fn(
+                ctx.item_data.title,
+                ctx.item_data.condition_label,
+                ctx.item_data.image_urls,
+            )
+        except Exception as exc:
+            logger.warning("condition assessment failed for %s: %s", ctx.item_data.item_url, exc, exc_info=True)
+            result = ResearchSectionResult(
+                section_name="商品狀況分析",
+                status="unavailable",
+                confidence=0.0,
+                sample_count=0,
+                evidence_count=0,
+                summary=f"商品狀況分析失敗：{exc}",
+            )
+            ctx.add_section_result(result)
+            return result.summary
+
+        if assessment is None:
+            result = ResearchSectionResult(
+                section_name="商品狀況分析",
+                status="unavailable",
+                confidence=0.0,
+                sample_count=0,
+                evidence_count=0,
+                summary="商品圖片無法取得或影像模型無回應。",
+            )
+            ctx.add_section_result(result)
+            return result.summary
+
+        # Success: store assessment and build section result
+        ctx.condition_assessment = assessment
+        summary = assessment.summary
+        if assessment.flaws:
+            summary = f"{summary.rstrip('。；')}；可見瑕疵：{'、'.join(assessment.flaws)}"
+
+        warnings: list[str] = []
+        if assessment.consistency == "mismatch":
+            claimed = ctx.item_data.condition_label or "未提供"
+            warnings.append(
+                f"圖片狀況與賣家標示（{claimed}）可能不符，下單前請確認。"
+            )
+        if assessment.flaws:
+            warnings.append(f"圖片可見瑕疵：{'、'.join(assessment.flaws)}，估價時已列入考量。")
+
+        result = ResearchSectionResult(
+            section_name="商品狀況分析",
+            status="ok",
+            confidence=0.7,
+            sample_count=assessment.image_count,
+            evidence_count=assessment.image_count,
+            summary=summary,
+            evidence_urls=tuple(ctx.item_data.image_urls[:3]),
+            warnings=tuple(warnings),
+        )
+        ctx.add_section_result(result)
+        return summary
 
     def _persist_item_knowledge(self, item: ItemData) -> None:
         if not self._knowledge_db_path:
@@ -1682,6 +1774,7 @@ def build_research_handler(
     entity_recognizer_fn: EntityRecognizerFn | None = None,
     appreciation_enricher_fn: AppreciationEnricherFn | None = None,
     semantic_gate_fn: "SemanticGateFn | None" = None,
+    condition_assessor_fn: "ConditionAssessorFn | None" = None,
     final_formatter: Callable[[ResearchReport], object] | None = None,
     heartbeat_interval_seconds: float = 15.0,
 ) -> Callable[[str, str], object]:
@@ -1704,23 +1797,25 @@ def build_research_handler(
         entity_recognizer_fn=entity_recognizer_fn,
         appreciation_enricher_fn=appreciation_enricher_fn,
         semantic_gate_fn=semantic_gate_fn,
+        condition_assessor_fn=condition_assessor_fn,
         final_formatter=final_formatter,
         heartbeat_interval_seconds=heartbeat_interval_seconds,
     )
     return service.run
 
 
-# Canonical report ordering. Stages 3/4/6 may complete out of order under Phase 2
+# Canonical report ordering. Stages 3/4/5/7 may complete out of order under Phase 2
 # parallelisation, so section_results is sorted by this map before formatting to
 # keep the report deterministic regardless of thread finish order. Unknown names
 # sort to the end, preserving their relative insertion order (stable sort).
 _SECTION_ORDER: dict[str, int] = {
     "取得商品資料": 1,
     "實體辨識": 2,
-    "增值潛力分析": 3,
-    "合理市價分析": 4,
-    "流動性分析": 5,
-    "賣家風險分析": 6,
+    "商品狀況分析": 3,
+    "增值潛力分析": 4,
+    "合理市價分析": 5,
+    "流動性分析": 6,
+    "賣家風險分析": 7,
 }
 
 
@@ -1833,8 +1928,11 @@ def _build_compact_report_bullets(report: ResearchReport) -> tuple[str, ...]:
     liquidity = _find_section_result(report, "流動性分析")
     seller = _find_section_result(report, "賣家風險分析")
     appreciation = _find_section_result(report, "增值潛力分析")
+    condition = _find_section_result(report, "商品狀況分析")
     if price is not None:
         bullets.append("市價：" + _compact_price_summary(price))
+    if condition is not None and condition.status == "ok":
+        bullets.append("狀況：" + _compact_condition_summary(condition))
     if liquidity is not None:
         bullets.append("流動性：" + _compact_liquidity_summary(liquidity))
     if seller is not None:
@@ -1846,7 +1944,7 @@ def _build_compact_report_bullets(report: ResearchReport) -> tuple[str, ...]:
         bullets.append("注意：" + " / ".join(focus_warnings))
     if not bullets:
         bullets.append("目前只取得基礎商品資料，尚無更多研究結論。")
-    return tuple(bullets[:5])
+    return tuple(bullets[:6])
 
 
 def _select_compact_warnings(warnings: Sequence[str]) -> tuple[str, ...]:
@@ -1872,6 +1970,8 @@ def _compact_warning_label(warning: str) -> str | None:
         return "賣家評價樣本偏少"
     if "店舗參考價" in normalized:
         return "遊々亭：無法取得店舗參考"
+    if "圖片狀況與賣家標示" in normalized:
+        return "圖片狀況與賣家標示可能不符"
     return None
 
 
@@ -1891,6 +1991,13 @@ def _compact_price_summary(result: ResearchSectionResult) -> str:
     if not selected:
         selected = [_truncate_research_text(result.summary, 68)]
     return _truncate_research_text("；".join(selected), 76)
+
+
+def _compact_condition_summary(result: ResearchSectionResult) -> str:
+    parts = [_compact_whitespace(part) for part in result.summary.split("；") if part]
+    if not parts:
+        return _truncate_research_text(result.summary, 76)
+    return _truncate_research_text("；".join(parts[:2]), 96)
 
 
 def _compact_liquidity_summary(result: ResearchSectionResult) -> str:
