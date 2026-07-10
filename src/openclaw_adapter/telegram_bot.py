@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import mimetypes
 import os
 import json
 import shutil
@@ -102,6 +103,14 @@ from .home_schedule_command import (
 from .workflow_command import build_workflow_handler, command_metadata, iter_command_metadata, _workflow_store
 from .workflow_editor import WorkflowEditor
 from .llm_pool_settings import default_chat_backend
+from .local_stt import (
+    LocalWhisperTranscriber,
+    SttPayloadTooLarge,
+    SttRequestError,
+    SttRuntimeError,
+    build_audio_request,
+    validate_audio_mime_type,
+)
 from .command_bridge_models import STATUS_OK, WebCommandResponse, parse_request
 from .music_favorites import (
     FavoritesStore,
@@ -345,17 +354,99 @@ class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
         allowed_chat_ids: frozenset[str] | None = None,
         workflow_editor=None,
         goal_bridge=None,
+        stt_transcriber: LocalWhisperTranscriber | None = None,
         **kwargs,
     ) -> None:
         self._settings = settings
         self._workflow_editor = workflow_editor
         self._goal_bridge = goal_bridge
+        self._stt_transcriber = stt_transcriber
+        if self._stt_transcriber is None and settings is not None:
+            self._stt_transcriber = LocalWhisperTranscriber.from_settings(settings)
         if allowed_chat_ids is None and settings is not None and settings.openclaw_telegram_chat_id:
             allowed_chat_ids = frozenset({settings.openclaw_telegram_chat_id})
         super().__init__(allowed_chat_ids=allowed_chat_ids, **kwargs)
         self._callback_registry.setdefault("goal", self._handle_goal_callback)
         self._pending_sns_bulk_updates: dict[str, PendingTelegramSnsBulkUpdate] = {}
         self._callback_registry.setdefault("bulk", self._bulk_callback)
+
+    def build_audio_intake_ack_text(self) -> str:
+        return "已收到語音，正在本機轉成文字。"
+
+    def handle_audio_message(
+        self,
+        *,
+        client,
+        chat_id: str | int,
+        message: dict[str, object],
+    ) -> tuple[str | None, str | None] | None:
+        """Transcribe Telegram voice/audio, then let telegram_core redispatch it.
+
+        Returning the transcript (instead of routing here) preserves the exact
+        pending-reply, pre-dispatch, and natural-language path used by text.
+        """
+        voice = message.get("voice")
+        audio = message.get("audio")
+        attachment = voice if isinstance(voice, dict) else audio
+        if not isinstance(attachment, dict):
+            return None
+        if self._stt_transcriber is None:
+            return None, "語音轉文字失敗：本機語音模型尚未設定。"
+
+        file_id = attachment.get("file_id")
+        if not isinstance(file_id, str) or not file_id.strip():
+            return None, "語音轉文字失敗：Telegram 音訊缺少 file_id。"
+        file_size = attachment.get("file_size")
+        # Telegram marks file_size as optional. Use it as an early rejection
+        # hint when present; download_file(max_bytes=...) remains the hard cap.
+        if file_size is not None:
+            if not isinstance(file_size, int) or isinstance(file_size, bool) or file_size <= 0:
+                return None, "語音轉文字失敗：Telegram 音訊的 file_size 無效。"
+            if file_size > self._stt_transcriber.max_audio_bytes:
+                return None, (
+                    "語音轉文字失敗："
+                    f"音訊超過 {self._stt_transcriber.max_audio_bytes} bytes 上限。"
+                )
+        duration = attachment.get("duration")
+        if not isinstance(duration, (int, float)) or isinstance(duration, bool) or duration < 0:
+            return None, "語音轉文字失敗：Telegram 音訊缺少有效的 duration。"
+        if duration > self._stt_transcriber.max_duration_seconds:
+            return None, (
+                "語音轉文字失敗："
+                f"音訊長度超過 {self._stt_transcriber.max_duration_seconds} 秒上限。"
+            )
+
+        mime_type = attachment.get("mime_type")
+        if not isinstance(mime_type, str) or not mime_type.strip():
+            mime_type = "audio/ogg" if isinstance(voice, dict) else ""
+        try:
+            if mime_type:
+                validate_audio_mime_type(mime_type)
+            file_info = client.get_file(file_id=file_id)
+            file_path = file_info.get("file_path") if isinstance(file_info, dict) else None
+            if not isinstance(file_path, str) or not file_path:
+                raise SttRequestError("Telegram 沒有回傳可下載的音訊路徑。")
+            if not mime_type:
+                file_name = attachment.get("file_name")
+                guess_from = file_name if isinstance(file_name, str) and file_name else file_path
+                mime_type = mimetypes.guess_type(guess_from)[0] or ""
+                validate_audio_mime_type(mime_type)
+            audio_bytes = client.download_file(
+                file_path=file_path,
+                max_bytes=self._stt_transcriber.max_audio_bytes,
+            )
+            request = build_audio_request(
+                audio_bytes,
+                mime_type=mime_type,
+                max_audio_bytes=self._stt_transcriber.max_audio_bytes,
+            )
+            result = self._stt_transcriber.transcribe(request)
+        except (SttPayloadTooLarge, SttRequestError, SttRuntimeError) as exc:
+            return None, f"語音轉文字失敗：{exc}"
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.warning("Telegram audio transcription failed: %s", exc)
+            return None, "語音轉文字失敗：無法下載或處理 Telegram 音訊。"
+        return result.transcript, None
 
     def get_pending_sns_bulk_update(self, chat_id: str | int) -> PendingTelegramSnsBulkUpdate | None:
         key = str(chat_id)

@@ -8,6 +8,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO_ROOT / "scripts"
 
 sys.path.insert(0, str(SCRIPTS))
+import _docs_yaml  # noqa: E402
 from _docs_yaml import loads  # noqa: E402
 
 
@@ -35,7 +36,11 @@ def test_check_doc_drift_passes_on_repo() -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_minimal_yaml_loader_parses_mappings_lists_and_seq_of_maps() -> None:
+def test_minimal_yaml_loader_parses_mappings_lists_and_seq_of_maps(monkeypatch) -> None:
+    # Force the dependency-free fallback: installed PyYAML (pulled in via
+    # faster-whisper -> huggingface-hub) would otherwise shadow the code under
+    # test and coerce `issue: 3` to int.
+    monkeypatch.setattr(_docs_yaml, "_pyyaml", None)
     text = """
 top:
   status_vocabulary:

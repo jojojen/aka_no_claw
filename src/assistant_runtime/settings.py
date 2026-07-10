@@ -29,6 +29,15 @@ class AssistantSettings:
     openclaw_local_tts_endpoint: str = "http://127.0.0.1:10101"
     openclaw_local_tts_timeout_seconds: int = 20
     openclaw_local_tts_speaker_id: int | None = None
+    # Local speech-to-text for Web and Telegram. faster-whisper loads lazily on
+    # the first recording and keeps the model in-process; audio never leaves
+    # this machine.
+    openclaw_stt_model: str = "base"
+    openclaw_stt_device: str = "auto"
+    openclaw_stt_compute_type: str = "default"
+    openclaw_stt_download_root: str = ".openclaw_tmp/whisper"
+    openclaw_stt_max_audio_bytes: int = 15 * 1024 * 1024
+    openclaw_stt_max_duration_seconds: int = 120
     # Fast, code-specialized tier-1 model for /new codegen. Escalates to the
     # (larger) openclaw_local_text_model only when this tier exhausts repairs.
     openclaw_codegen_fast_model: str | None = "qwen2.5-coder:7b"
@@ -251,6 +260,20 @@ def get_settings() -> AssistantSettings:
             default=20,
         ),
         openclaw_local_tts_speaker_id=_as_optional_int(os.getenv("OPENCLAW_LOCAL_TTS_SPEAKER_ID")),
+        openclaw_stt_model=os.getenv("OPENCLAW_STT_MODEL", "base"),
+        openclaw_stt_device=os.getenv("OPENCLAW_STT_DEVICE", "auto"),
+        openclaw_stt_compute_type=os.getenv("OPENCLAW_STT_COMPUTE_TYPE", "default"),
+        openclaw_stt_download_root=_resolve_runtime_path(
+            os.getenv("OPENCLAW_STT_DOWNLOAD_ROOT", ".openclaw_tmp/whisper")
+        ),
+        openclaw_stt_max_audio_bytes=_as_int(
+            os.getenv("OPENCLAW_STT_MAX_AUDIO_BYTES"),
+            default=15 * 1024 * 1024,
+        ),
+        openclaw_stt_max_duration_seconds=_as_int(
+            os.getenv("OPENCLAW_STT_MAX_DURATION_SECONDS"),
+            default=120,
+        ),
         openclaw_codegen_fast_model=_none_if_empty(
             os.getenv("OPENCLAW_CODEGEN_FAST_MODEL", "qwen2.5-coder:7b")
         ),

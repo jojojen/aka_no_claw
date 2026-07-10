@@ -114,6 +114,53 @@ OPENCLAW_TLS_INSECURE_SKIP_VERIFY=0
 - 如果 Telegram API 在你的網路環境下出現 TLS / 憑證錯誤，可以先嘗試 `OPENCLAW_CA_BUNDLE_PATH`。
 - 只有在本機測試被公司憑證或代理擋住時，才最後手動改用 `OPENCLAW_TLS_INSECURE_SKIP_VERIFY=1`。
 
+### Web Console 本機語音轉文字
+
+Command bridge 提供 `POST /api/command/transcribe`，供 `aka_no_claw_web`
+把瀏覽器錄音轉為文字。請求使用一般的 `multipart/form-data`，檔案欄位
+名稱固定為 `file`；瀏覽器使用 `FormData` 時不要自行指定 `Content-Type`，
+讓瀏覽器自動附上 boundary。
+
+```javascript
+const form = new FormData();
+form.append("file", audioBlob, "recording.webm");
+await fetch("http://127.0.0.1:8781/api/command/transcribe", {
+  method: "POST",
+  body: form,
+});
+```
+
+等價的 command-line smoke test：
+
+```bash
+curl -F "file=@recording.webm;type=audio/webm" \
+  http://127.0.0.1:8781/api/command/transcribe
+```
+
+成功時回傳 `{"status":"ok","transcript":"..."}`；前端會把
+`transcript` 放回原本的文字輸入流程，因此後續仍走既有的自然語言處理。
+後端使用免費開源的 `faster-whisper`，音訊只寫入短暫本機檔案並在請求後刪除，
+不會送到雲端。第一次使用會下載所選模型到 gitignored 的本機 cache，之後
+lazy load 並在同一個 bridge process 內重用。
+
+```dotenv
+OPENCLAW_STT_MODEL=base
+OPENCLAW_STT_DEVICE=auto
+OPENCLAW_STT_COMPUTE_TYPE=default
+OPENCLAW_STT_DOWNLOAD_ROOT=.openclaw_tmp/whisper
+OPENCLAW_STT_MAX_AUDIO_BYTES=15728640
+OPENCLAW_STT_MAX_DURATION_SECONDS=120
+```
+
+`base` 是兼顧速度與準確度的預設；較準確但較慢可改成 `small`。語言預設
+自動偵測。總請求大小、multipart part 數量/header/單一 part、解碼後音訊大小
+與音訊長度都有上限，超限會收到 HTTP `413`；格式錯誤為 `400`，本機
+runtime 或模型不可用為 `503`。
+
+Telegram 的 voice message 與 audio file 也共用這組本機 STT 設定與限制。
+辨識成功後，transcript 會當成一般 Telegram 文字訊息交給既有 dispatcher，
+所以 slash command、自然語言 router、pending reply 與其他處理順序都不變。
+
 ## Assistant Tools
 
 列出目前所有已註冊工具：

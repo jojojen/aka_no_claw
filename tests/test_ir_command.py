@@ -129,6 +129,81 @@ def test_send_code_replays_persisted_payload(tmp_path, monkeypatch):
     assert fake.sent == [b"play"]
 
 
+def _patch_resolver_llm(monkeypatch, reply: str):
+    calls = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def generate(self, prompt, *, temperature=0.0, think=False):
+            calls.append(prompt)
+            return reply
+
+    from openclaw_adapter import dynamic_tools, llm_pool_settings
+
+    monkeypatch.setattr(dynamic_tools, "OllamaTextClient", FakeClient)
+    monkeypatch.setattr(llm_pool_settings, "resolve_provider_model", lambda s, p: "fake-model")
+    return calls
+
+
+def _resolver_settings(tmp_path):
+    settings = _settings(tmp_path)
+    settings.openclaw_local_text_endpoint = "http://127.0.0.1:11434"
+    settings.openclaw_local_text_timeout_seconds = 5
+    return settings
+
+
+def test_send_code_resolves_spoken_name_via_grounded_llm(tmp_path, monkeypatch):
+    settings = _resolver_settings(tmp_path)
+    fake = FakeRm()
+    ir.IrStore(settings.openclaw_ir_devices_path).put("fan", "power", "cGxheQ==")
+    monkeypatch.setattr(ir, "discover_rm", lambda settings: (fake, "fake rm"))
+    calls = _patch_resolver_llm(monkeypatch, "fan power")
+    msg = ir.send_code(settings, "電風扇", "on")
+    assert "已送出" in msg
+    assert "fan / power" in msg
+    assert fake.sent == [b"play"]
+    assert len(calls) == 1
+    assert "fan power" in calls[0] and "電風扇" in calls[0]
+
+
+def test_send_code_exact_match_skips_resolver(tmp_path, monkeypatch):
+    settings = _resolver_settings(tmp_path)
+    fake = FakeRm()
+    ir.IrStore(settings.openclaw_ir_devices_path).put("fan", "power", "cGxheQ==")
+    monkeypatch.setattr(ir, "discover_rm", lambda settings: (fake, "fake rm"))
+    calls = _patch_resolver_llm(monkeypatch, "fan power")
+    msg = ir.send_code(settings, "fan", "power")
+    assert "已送出" in msg
+    assert calls == []
+
+
+def test_send_code_keeps_error_when_resolver_declines(tmp_path, monkeypatch):
+    settings = _resolver_settings(tmp_path)
+    ir.IrStore(settings.openclaw_ir_devices_path).put("fan", "power", "cGxheQ==")
+    _patch_resolver_llm(monkeypatch, "none")
+    msg = ir.send_code(settings, "冷氣", "on")
+    assert "找不到 IR：冷氣 / on" in msg
+
+
+def test_send_code_rejects_llm_invented_pair(tmp_path, monkeypatch):
+    settings = _resolver_settings(tmp_path)
+    ir.IrStore(settings.openclaw_ir_devices_path).put("fan", "power", "cGxheQ==")
+    _patch_resolver_llm(monkeypatch, "aircon power")
+    msg = ir.send_code(settings, "冷氣", "on")
+    assert "找不到 IR：冷氣 / on" in msg
+
+
+def test_handler_send_joins_multiword_device(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    calls = []
+    monkeypatch.setattr(ir, "send_code", lambda s, d, b: calls.append((d, b)) or "sent")
+    handler = ir.build_ir_handler(settings)
+    assert handler("send all lights on", "chat") == "sent"
+    assert calls == [("all lights", "on")]
+
+
 def test_render_devices_uses_opaque_tokens(tmp_path):
     settings = _settings(tmp_path)
     ir.IrStore(settings.openclaw_ir_devices_path).put("ceiling_light", "night", "abc")

@@ -56,6 +56,7 @@ from typing import Callable
 from assistant_runtime import AssistantSettings
 
 from .music_favorites import FavoritesStore
+from .music_volume import louder_music, lower_music, mute_music
 
 logger = logging.getLogger(__name__)
 
@@ -1348,6 +1349,12 @@ def build_music_handler(
             return _format_health_text(playback_health(settings))
         if low == "playbest":
             return _play_best(store, state_path, music_dir)
+        if low == "louder":
+            return louder_music(settings)
+        if low == "lower":
+            return lower_music(settings)
+        if low == "mute":
+            return mute_music(settings)
 
         problem = _music_dir_problem(music_dir)
         if problem:

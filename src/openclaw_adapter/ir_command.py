@@ -362,9 +362,70 @@ def _learn_code_inline(settings: AssistantSettings, device_name: str, button_nam
 
 
 def send_code(settings: AssistantSettings, device_name: str, button_name: str) -> str:
+    resolved = _resolve_send_target(settings, device_name, button_name)
+    if resolved is not None:
+        device_name, button_name = resolved
     if _use_worker(settings):
         return _run_worker("send", device_name, button_name)
     return _send_code_inline(settings, device_name, button_name)
+
+
+def _resolve_send_target(
+    settings: AssistantSettings, device_name: str, button_name: str
+) -> tuple[str, str] | None:
+    """Ground a natural-language device/button request in the learned IR store.
+
+    Voice/NL routes hand over spoken names (e.g. 電風扇 / on) that rarely match
+    the learned store keys (fan / power). Exact keys pass through untouched;
+    otherwise the local LLM picks the matching learned pair — or nothing, in
+    which case the caller keeps the original names and the exact-miss error.
+    """
+    store = IrStore(settings.openclaw_ir_devices_path)
+    if store.get(device_name, button_name):
+        return device_name, button_name
+    buttons = store.list_buttons()
+    if not buttons:
+        return None
+    pairs = sorted({f"{item.device} {item.button}" for item in buttons})
+    prompt = (
+        "你是紅外線遙控解析器。以下是已學習的按鍵清單，每行格式為「裝置 按鍵」：\n"
+        + "\n".join(pairs)
+        + f"\n\n使用者的要求：裝置「{device_name}」、動作「{button_name}」。\n"
+        "從清單中選出語意最符合的一行，原樣輸出（裝置 按鍵）。"
+        "選擇時考慮按鍵語意，例如切換電源的按鍵可同時對應開或關的要求。"
+        "若清單中沒有合理的對應，輸出 none。只輸出一行，不要解釋。"
+    )
+    try:
+        from .dynamic_tools import OllamaTextClient
+        from .llm_pool_settings import resolve_provider_model
+
+        model = (resolve_provider_model(settings, "local") or "").strip()
+        if not model:
+            return None
+        client = OllamaTextClient(
+            endpoint=settings.openclaw_local_text_endpoint,
+            model=model,
+            timeout_seconds=max(1, settings.openclaw_local_text_timeout_seconds),
+        )
+        raw = client.generate(prompt, temperature=0.0)
+    except Exception:  # noqa: BLE001
+        logger.warning("ir: local resolver unavailable", exc_info=True)
+        return None
+    choice = raw.strip().splitlines()[0].strip() if raw.strip() else ""
+    if not choice or choice.lower() in {"none", "null"}:
+        return None
+    parts = choice.split()
+    if len(parts) < 2:
+        return None
+    candidate = (" ".join(parts[:-1]), parts[-1])
+    # Only send pairs that exist in the store — never an LLM-invented one.
+    if store.get(*candidate):
+        logger.info(
+            "ir: resolved %s/%s -> %s/%s",
+            device_name, button_name, candidate[0], candidate[1],
+        )
+        return candidate
+    return None
 
 
 def _send_code_inline(settings: AssistantSettings, device_name: str, button_name: str) -> str:
@@ -421,7 +482,9 @@ def build_ir_handler(settings: AssistantSettings):
         if action == "learn" and len(parts) >= 3:
             return learn_code(settings, parts[1], parts[2])
         if action == "send" and len(parts) >= 3:
-            return send_code(settings, parts[1], parts[2])
+            # NL routes may hand over multi-word device names; the last token
+            # is always the button.
+            return send_code(settings, " ".join(parts[1:-1]), parts[-1])
         return _help_text()
 
     return handler

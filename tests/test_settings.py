@@ -113,6 +113,25 @@ def test_get_settings_reads_local_text_router_environment_keys(monkeypatch) -> N
     assert settings.openclaw_local_text_timeout_seconds == 30
 
 
+def test_get_settings_reads_local_stt_environment_keys(monkeypatch, tmp_path) -> None:
+    model_dir = tmp_path / "whisper"
+    monkeypatch.setenv("OPENCLAW_STT_MODEL", "small")
+    monkeypatch.setenv("OPENCLAW_STT_DEVICE", "cpu")
+    monkeypatch.setenv("OPENCLAW_STT_COMPUTE_TYPE", "int8")
+    monkeypatch.setenv("OPENCLAW_STT_DOWNLOAD_ROOT", str(model_dir))
+    monkeypatch.setenv("OPENCLAW_STT_MAX_AUDIO_BYTES", "123456")
+    monkeypatch.setenv("OPENCLAW_STT_MAX_DURATION_SECONDS", "45")
+
+    settings = get_settings()
+
+    assert settings.openclaw_stt_model == "small"
+    assert settings.openclaw_stt_device == "cpu"
+    assert settings.openclaw_stt_compute_type == "int8"
+    assert settings.openclaw_stt_download_root == str(model_dir)
+    assert settings.openclaw_stt_max_audio_bytes == 123456
+    assert settings.openclaw_stt_max_duration_seconds == 45
+
+
 def test_get_settings_reads_opencode_codegen_environment_keys(monkeypatch) -> None:
     monkeypatch.setenv("OPENCLAW_CODEGEN_BACKEND", "opencode")
     monkeypatch.setenv("OPENCLAW_OPENCODE_BASE_URL", "https://example.test/v1")

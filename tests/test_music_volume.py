@@ -55,14 +55,18 @@ def test_mute_persists_and_pushes_muted(settings, mixer):
 
 # --- louder / lower one step ----------------------------------------------
 def test_louder_raises_one_step(settings, mixer):
-    mv.louder_music(settings)
+    # Reply must name the action + change, not just the end state, so the
+    # satisfaction judge can see the request was fulfilled from it alone.
+    msg = mv.louder_music(settings)
+    assert "調高" in msg and "70 → 80" in msg
     assert _state(settings)["volume"] == 80
     assert mixer["volume"][-1] == 80
     assert mixer["muted"][-1] is False
 
 
 def test_lower_drops_one_step(settings, mixer):
-    mv.lower_music(settings)
+    msg = mv.lower_music(settings)
+    assert "調低" in msg and "70 → 60" in msg
     assert _state(settings)["volume"] == 60
 
 
@@ -71,16 +75,18 @@ def test_louder_clamps_at_max(settings, mixer):
     mv.VolumeStore(settings.openclaw_music_volume_state_path).save(volume=95, muted=False)
     mv.louder_music(settings)
     assert _state(settings)["volume"] == 100
-    mv.louder_music(settings)
+    msg = mv.louder_music(settings)
     assert _state(settings)["volume"] == 100  # stays clamped
+    assert "最大" in msg and "無法再調高" in msg
 
 
 def test_lower_clamps_at_min(settings, mixer):
     mv.VolumeStore(settings.openclaw_music_volume_state_path).save(volume=5, muted=False)
     mv.lower_music(settings)
     assert _state(settings)["volume"] == 0
-    mv.lower_music(settings)
+    msg = mv.lower_music(settings)
     assert _state(settings)["volume"] == 0
+    assert "最小" in msg and "無法再調低" in msg
 
 
 # --- auto-unmute on adjust -------------------------------------------------
@@ -90,7 +96,7 @@ def test_louder_unmutes_first(settings, mixer):
     msg = mv.louder_music(settings)
     assert _state(settings) == {"volume": 80, "muted": False}
     assert mixer["muted"][-1] is False
-    assert "靜音" not in msg
+    assert "已取消靜音" in msg and "調高" in msg
 
 
 def test_lower_unmutes_first(settings, mixer):

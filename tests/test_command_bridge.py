@@ -2148,6 +2148,284 @@ def test_options_preflight_allows_direct_bridge_streaming():
     assert "Access-Control-Allow-Headers: Content-Type" in raw
 
 
+def _multipart_body(parts, *, boundary="----BrowserFormBoundary"):
+    body = bytearray()
+    for part in parts:
+        name, value, filename, content_type, *extra_headers = part
+        body.extend(f"--{boundary}\r\n".encode("ascii"))
+        disposition = f'Content-Disposition: form-data; name="{name}"'
+        if filename is not None:
+            disposition += f'; filename="{filename}"'
+        body.extend(f"{disposition}\r\n".encode("utf-8"))
+        if content_type is not None:
+            body.extend(f"Content-Type: {content_type}\r\n".encode("ascii"))
+        for header_name, header_value in extra_headers:
+            body.extend(f"{header_name}: {header_value}\r\n".encode("ascii"))
+        body.extend(b"\r\n")
+        body.extend(value)
+        body.extend(b"\r\n")
+    body.extend(f"--{boundary}--\r\n".encode("ascii"))
+    return bytes(body), f"multipart/form-data; boundary={boundary}"
+
+
+def _invoke_transcribe_route(body, content_type, transcriber, *, content_length=None):
+    from http.server import BaseHTTPRequestHandler
+
+    from openclaw_adapter import command_bridge_server as srv
+
+    handler_cls = srv._build_handler(
+        object(),
+        lan_enabled=False,
+        transcriber=transcriber,
+    )
+    h = handler_cls.__new__(handler_cls)
+    h.headers = {
+        "Content-Length": str(len(body) if content_length is None else content_length),
+        "Content-Type": content_type,
+    }
+    h.rfile = io.BytesIO(body)
+    h.wfile = io.BytesIO()
+    h.request_version = "HTTP/1.1"
+    h.protocol_version = "HTTP/1.0"
+    h.requestline = "POST /api/command/transcribe HTTP/1.1"
+    h.path = "/api/command/transcribe"
+    h.responses = BaseHTTPRequestHandler.responses
+    h.client_address = ("127.0.0.1", 12345)
+
+    h.do_POST()
+
+    raw = h.wfile.getvalue()
+    payload = json.loads(raw.split(b"\r\n\r\n", 1)[1])
+    return raw, payload
+
+
+def test_server_transcribe_route_accepts_browser_multipart_contract():
+    from openclaw_adapter.local_stt import TranscriptionResult
+
+    seen = {}
+
+    class _FakeTranscriber:
+        max_audio_bytes = 1024
+        max_request_bytes = 2048
+
+        def transcribe(self, request):
+            seen["request"] = request
+            return TranscriptionResult(
+                transcript="打開音樂",
+                language="zh",
+                language_probability=0.97,
+                duration_seconds=1.2,
+            )
+
+    body, content_type = _multipart_body(
+        [("file", b"webm audio", "recording.webm", "audio/webm")]
+    )
+    raw, payload = _invoke_transcribe_route(
+        body,
+        content_type,
+        _FakeTranscriber(),
+    )
+
+    assert b" 200 " in raw
+    assert payload == {
+        "status": "ok",
+        "transcript": "打開音樂",
+        "language": "zh",
+        "language_probability": 0.97,
+        "duration_seconds": 1.2,
+    }
+    assert seen["request"].data == b"webm audio"
+    assert seen["request"].mime_type == "audio/webm"
+
+
+@pytest.mark.parametrize(
+    ("parts", "message_fragment"),
+    [
+        ([("language", b"zh", None, None)], "file"),
+        ([("file", b"not audio", "bad.txt", "text/plain")], "不支援"),
+        ([("file", b"audio", None, "audio/webm")], "file"),
+    ],
+)
+def test_server_transcribe_route_rejects_invalid_multipart(parts, message_fragment):
+    class _FakeTranscriber:
+        max_audio_bytes = 1024
+        max_request_bytes = 2048
+
+        def transcribe(self, request):
+            raise AssertionError("invalid audio must not reach the model")
+
+    body, content_type = _multipart_body(parts)
+    raw, payload = _invoke_transcribe_route(
+        body,
+        content_type,
+        _FakeTranscriber(),
+    )
+
+    assert b" 400 " in raw
+    assert payload["status"] == "error"
+    assert message_fragment in payload["message"]
+
+
+@pytest.mark.parametrize(
+    "limit_kind",
+    ["part_size", "part_count", "header_count", "header_size"],
+)
+def test_server_transcribe_route_enforces_multipart_parser_limits(limit_kind):
+    class _FakeTranscriber:
+        max_audio_bytes = 4 if limit_kind == "part_size" else 1024
+        max_request_bytes = 4096
+
+        def transcribe(self, request):
+            raise AssertionError("limited multipart must not reach the model")
+
+    if limit_kind == "part_size":
+        parts = [("file", b"12345", "recording.webm", "audio/webm")]
+    elif limit_kind == "part_count":
+        parts = [
+            ("file", b"a", "recording.webm", "audio/webm"),
+            ("language", b"zh", None, None),
+            ("extra", b"x", None, None),
+        ]
+    elif limit_kind == "header_count":
+        parts = [
+            (
+                "file",
+                b"a",
+                "recording.webm",
+                "audio/webm",
+                ("X-One", "1"),
+                ("X-Two", "2"),
+                ("X-Three", "3"),
+            )
+        ]
+    else:
+        parts = [("file", b"a", "x" * 2100 + ".webm", "audio/webm")]
+    body, content_type = _multipart_body(parts)
+
+    raw, payload = _invoke_transcribe_route(
+        body,
+        content_type,
+        _FakeTranscriber(),
+    )
+
+    assert b" 413 " in raw
+    assert payload["status"] == "error"
+    assert "multipart" in payload["message"]
+
+
+def test_server_transcribe_route_rejects_malformed_multipart_body():
+    class _FakeTranscriber:
+        max_audio_bytes = 1024
+        max_request_bytes = 2048
+
+        def transcribe(self, request):
+            raise AssertionError("malformed multipart must not reach the model")
+
+    boundary = "broken-boundary"
+    body = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="file"; filename="voice.webm"\r\n'
+        "Content-Type: audio/webm\r\n\r\n"
+    ).encode("ascii") + b"unterminated audio"
+    raw, payload = _invoke_transcribe_route(
+        body,
+        f"multipart/form-data; boundary={boundary}",
+        _FakeTranscriber(),
+    )
+
+    assert b" 400 " in raw
+    assert payload["status"] == "error"
+    assert "multipart" in payload["message"]
+
+
+def test_server_transcribe_route_rejects_old_json_contract():
+    class _FakeTranscriber:
+        max_audio_bytes = 1024
+        max_request_bytes = 2048
+
+        def transcribe(self, request):
+            raise AssertionError("JSON request must not reach the model")
+
+    raw, payload = _invoke_transcribe_route(
+        b'{"file":"not-a-multipart-upload"}',
+        "application/json",
+        _FakeTranscriber(),
+    )
+
+    assert b" 400 " in raw
+    assert payload["status"] == "error"
+    assert "multipart/form-data" in payload["message"]
+
+
+def test_server_transcribe_route_rejects_oversized_request_before_reading_body():
+    from http.server import BaseHTTPRequestHandler
+
+    from openclaw_adapter import command_bridge_server as srv
+
+    class _FakeTranscriber:
+        max_audio_bytes = 4
+        max_request_bytes = 10
+
+    handler_cls = srv._build_handler(
+        object(),
+        lan_enabled=False,
+        transcriber=_FakeTranscriber(),
+    )
+    h = handler_cls.__new__(handler_cls)
+    h.headers = {
+        "Content-Length": "11",
+        "Content-Type": "multipart/form-data; boundary=x",
+    }
+    h.rfile = io.BytesIO(b"")
+    h.wfile = io.BytesIO()
+    h.request_version = "HTTP/1.1"
+    h.protocol_version = "HTTP/1.0"
+    h.requestline = "POST /api/command/transcribe HTTP/1.1"
+    h.path = "/api/command/transcribe"
+    h.responses = BaseHTTPRequestHandler.responses
+    h.client_address = ("127.0.0.1", 12345)
+
+    h.do_POST()
+
+    raw = h.wfile.getvalue()
+    assert b" 413 " in raw
+    payload = json.loads(raw.split(b"\r\n\r\n", 1)[1])
+    assert payload["status"] == "error"
+
+
+@pytest.mark.parametrize("content_length", [None, "0", "-1", "not-a-number"])
+def test_server_transcribe_route_rejects_missing_or_invalid_content_length(content_length):
+    from http.server import BaseHTTPRequestHandler
+
+    from openclaw_adapter import command_bridge_server as srv
+
+    class _FakeTranscriber:
+        max_audio_bytes = 1024
+        max_request_bytes = 2048
+
+    handler_cls = srv._build_handler(
+        object(),
+        lan_enabled=False,
+        transcriber=_FakeTranscriber(),
+    )
+    h = handler_cls.__new__(handler_cls)
+    h.headers = {} if content_length is None else {"Content-Length": content_length}
+    h.rfile = io.BytesIO(b"must not be read")
+    h.wfile = io.BytesIO()
+    h.request_version = "HTTP/1.1"
+    h.protocol_version = "HTTP/1.0"
+    h.requestline = "POST /api/command/transcribe HTTP/1.1"
+    h.responses = BaseHTTPRequestHandler.responses
+    h.client_address = ("127.0.0.1", 12345)
+
+    h._handle_transcribe()
+
+    raw = h.wfile.getvalue()
+    assert b" 400 " in raw
+    payload = json.loads(raw.split(b"\r\n\r\n", 1)[1])
+    assert payload["status"] == "error"
+
+
 # --- 生活 mode: music control surface (aka_no_claw_web#3 / #4) -------------
 def test_music_command_runs_music_handler(bridge, monkeypatch):
     markup = {"inline_keyboard": [[{"text": "🔇 靜音", "callback_data": "music:mute"}]]}

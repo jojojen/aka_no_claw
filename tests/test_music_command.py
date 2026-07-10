@@ -173,6 +173,18 @@ def test_search_ambiguous_returns_candidates(settings):
     }
 
 
+def test_music_volume_verbs_route_to_volume_module(settings, monkeypatch):
+    calls = []
+    monkeypatch.setattr(mc, "louder_music", lambda s: calls.append("louder") or "音量已調高")
+    monkeypatch.setattr(mc, "lower_music", lambda s: calls.append("lower") or "音量已調低")
+    monkeypatch.setattr(mc, "mute_music", lambda s: calls.append("mute") or "已靜音")
+    handler = mc.build_music_handler(settings)
+    assert handler("louder", "chat-1") == "音量已調高"
+    assert handler("lower", "chat-1") == "音量已調低"
+    assert handler("mute", "chat-1") == "已靜音"
+    assert calls == ["louder", "lower", "mute"]
+
+
 # --- playback --------------------------------------------------------------
 def test_music_random_starts_continuous_playback(settings, proc_table, monkeypatch):
     monkeypatch.setattr(mc, "_PLAYBEST_POLL_SECONDS", 0.01)

@@ -1,11 +1,13 @@
 """Local HTTP server for the aka_no_claw_web command bridge (issue #30).
 
-Exposes two endpoints over a stdlib ``ThreadingHTTPServer`` (no new dependency):
+Exposes command and local speech-to-text endpoints over a stdlib
+``ThreadingHTTPServer``:
 
 * ``POST /api/command``        — blocking JSON, for short non-chat commands.
 * ``POST /api/command/stream`` — newline-delimited JSON (NDJSON) events for the
                                  chat path (start / delta / heartbeat / done /
                                  error), so long chat output streams.
+* ``POST /api/command/transcribe`` — multipart audio to local faster-whisper.
 
 Default bind is ``127.0.0.1``. LAN access (phone on the same Wi-Fi) is opt-in via
 ``--lan``; even then a client-IP allowlist (loopback + private LAN + mesh CGNAT)
@@ -23,9 +25,17 @@ from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 from assistant_runtime import AssistantSettings
+from multipart import MultipartError, ParserLimitReached, parse_form_data
 
 from .command_bridge import CommandBridge
 from .command_bridge_models import RequestValidationError, parse_request
+from .local_stt import (
+    LocalWhisperTranscriber,
+    SttPayloadTooLarge,
+    SttRequestError,
+    SttRuntimeError,
+    build_audio_request,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +47,73 @@ _PRIVATE_LAN = (
     ipaddress.ip_network("172.16.0.0/12"),
     ipaddress.ip_network("192.168.0.0/16"),
 )
+
+_STT_MULTIPART_HEADER_LIMIT = 4
+_STT_MULTIPART_HEADER_SIZE_LIMIT = 2048
+_STT_MULTIPART_PART_LIMIT = 2  # required file + optional language
+_STT_MULTIPART_SPOOL_LIMIT = 256 * 1024
+
+
+def _parse_stt_multipart(
+    stream,
+    *,
+    content_type: str,
+    content_length: int,
+    max_audio_bytes: int,
+):
+    if content_type.split(";", 1)[0].strip().lower() != "multipart/form-data":
+        raise SttRequestError("Content-Type 必須是 multipart/form-data。")
+
+    forms = files = None
+    file_parts = []
+    try:
+        forms, files = parse_form_data(
+            {
+                "wsgi.input": stream,
+                "CONTENT_TYPE": content_type,
+                "CONTENT_LENGTH": str(content_length),
+            },
+            strict=True,
+            ignore_errors=False,
+            header_limit=_STT_MULTIPART_HEADER_LIMIT,
+            headersize_limit=_STT_MULTIPART_HEADER_SIZE_LIMIT,
+            part_limit=_STT_MULTIPART_PART_LIMIT,
+            partsize_limit=max_audio_bytes,
+            spool_limit=min(max_audio_bytes, _STT_MULTIPART_SPOOL_LIMIT),
+            memory_limit=_STT_MULTIPART_SPOOL_LIMIT * 2,
+            disk_limit=max_audio_bytes,
+        )
+        file_parts = list(files.iterallitems())
+        uploads = files.getall("file")
+        if len(uploads) != 1 or len(file_parts) != 1:
+            raise SttRequestError("multipart 請求必須且只能包含一個 file 檔案欄位。")
+        upload = uploads[0]
+        if not upload.filename:
+            raise SttRequestError("file 欄位必須提供 filename。")
+
+        unknown_fields = set(forms.keys()) - {"language"}
+        if unknown_fields:
+            raise SttRequestError("multipart 含有不支援的欄位。")
+        languages = forms.getall("language")
+        if len(languages) > 1:
+            raise SttRequestError("language 欄位只能出現一次。")
+        language = languages[0].strip() if languages else None
+        if language and (
+            not 2 <= len(language) <= 3
+            or not language.isascii()
+            or not language.isalpha()
+        ):
+            raise SttRequestError("language 必須是 2 到 3 碼語言代碼。")
+
+        return build_audio_request(
+            upload.raw,
+            mime_type=upload.content_type,
+            max_audio_bytes=max_audio_bytes,
+            language=language,
+        )
+    finally:
+        for _, part in file_parts:
+            part.close()
 
 
 def _is_allowed_client(client_host: str, *, lan_enabled: bool) -> bool:
@@ -56,7 +133,12 @@ def _is_allowed_client(client_host: str, *, lan_enabled: bool) -> bool:
     return False
 
 
-def _build_handler(bridge: CommandBridge, *, lan_enabled: bool) -> type[BaseHTTPRequestHandler]:
+def _build_handler(
+    bridge: CommandBridge,
+    *,
+    lan_enabled: bool,
+    transcriber: LocalWhisperTranscriber | None = None,
+) -> type[BaseHTTPRequestHandler]:
     class CommandBridgeHandler(BaseHTTPRequestHandler):
         def _is_allowed(self) -> bool:
             return _is_allowed_client(self.client_address[0], lan_enabled=lan_enabled)
@@ -111,6 +193,8 @@ def _build_handler(bridge: CommandBridge, *, lan_enabled: bool) -> type[BaseHTTP
                 self._handle_session_save()
             elif path == "/api/command/chat-settings":
                 self._handle_chat_settings_save()
+            elif path == "/api/command/transcribe":
+                self._handle_transcribe()
             elif path == "/api/command/restartall":
                 self._write_json(bridge.restart_all())
             else:
@@ -264,6 +348,87 @@ def _build_handler(bridge: CommandBridge, *, lan_enabled: bool) -> type[BaseHTTP
             status = HTTPStatus.OK if result.get("status") != "error" else HTTPStatus.BAD_REQUEST
             self._write_json(result, status=status)
 
+        def _handle_transcribe(self) -> None:
+            if transcriber is None:
+                self._write_json(
+                    {"status": "error", "message": "本機語音轉文字尚未設定。"},
+                    status=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+            except (TypeError, ValueError):
+                self.close_connection = True
+                self._write_json(
+                    {"status": "error", "message": "無效的 Content-Length。"},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+            if length <= 0:
+                self.close_connection = True
+                self._write_json(
+                    {"status": "error", "message": "缺少有效的 Content-Length。"},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+            if length > transcriber.max_request_bytes:
+                self.close_connection = True
+                self._write_json(
+                    {"status": "error", "message": "錄音請求超過大小上限。"},
+                    status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                )
+                return
+            try:
+                request = _parse_stt_multipart(
+                    self.rfile,
+                    content_type=self.headers.get("Content-Type", ""),
+                    content_length=length,
+                    max_audio_bytes=transcriber.max_audio_bytes,
+                )
+                result = transcriber.transcribe(request)
+            except ParserLimitReached as exc:
+                self._write_json(
+                    {"status": "error", "message": f"multipart 超過限制：{exc}"},
+                    status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                )
+                return
+            except (MultipartError, UnicodeDecodeError) as exc:
+                self._write_json(
+                    {"status": "error", "message": f"無效的 multipart：{exc}"},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+            except SttPayloadTooLarge as exc:
+                self._write_json(
+                    {"status": "error", "message": str(exc)},
+                    status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                )
+                return
+            except SttRequestError as exc:
+                self._write_json(
+                    {"status": "error", "message": str(exc)},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
+            except SttRuntimeError as exc:
+                self._write_json(
+                    {"status": "error", "message": str(exc)},
+                    status=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                return
+
+            response: dict[str, object] = {
+                "status": "ok",
+                "transcript": result.transcript,
+            }
+            if result.language is not None:
+                response["language"] = result.language
+            if result.language_probability is not None:
+                response["language_probability"] = result.language_probability
+            if result.duration_seconds is not None:
+                response["duration_seconds"] = result.duration_seconds
+            self._write_json(response)
+
         def _handle_workflow(self) -> None:
             """Workflow surface (#53). ``callback_data`` (``wfe:…``) replays an
             editor button on the current draft (reorder / delete / save / cancel);
@@ -393,7 +558,11 @@ def serve_command_bridge(
 ) -> int:
     bind_host = host or ("0.0.0.0" if lan else "127.0.0.1")
     bridge = CommandBridge(settings)
-    server = ThreadingHTTPServer((bind_host, port), _build_handler(bridge, lan_enabled=lan))
+    transcriber = LocalWhisperTranscriber.from_settings(settings)
+    server = ThreadingHTTPServer(
+        (bind_host, port),
+        _build_handler(bridge, lan_enabled=lan, transcriber=transcriber),
+    )
     logger.info("command-bridge server starting host=%s port=%s lan=%s", bind_host, port, lan)
     print(f"OpenClaw command bridge running on http://{bind_host}:{port} (lan={lan})")
     try:

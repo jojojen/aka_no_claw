@@ -52,6 +52,7 @@ from openclaw_adapter.command_bridge_models import (
     STATUS_OK,
     WebCommandResponse,
 )
+from openclaw_adapter.local_stt import TranscriptionResult
 
 # Every call to handle_telegram_message now sends an immediate intake ack
 # before kicking off the real processing pipeline.
@@ -124,10 +125,13 @@ class FakeTelegramClient:
         assert self.sample_path is not None
         return {"file_path": self.sample_path.name, "file_id": file_id}
 
-    def download_file(self, *, file_path: str) -> bytes:
+    def download_file(self, *, file_path: str, max_bytes: int | None = None) -> bytes:
         assert self.sample_path is not None
         assert file_path == self.sample_path.name
-        return self.sample_path.read_bytes()
+        data = self.sample_path.read_bytes()
+        if max_bytes is not None and len(data) > max_bytes:
+            raise RuntimeError("Telegram file exceeds download limit")
+        return data
 
 
 class StubNaturalLanguageRouter:
@@ -1427,6 +1431,232 @@ def test_handle_telegram_message_sends_ack_then_text_result() -> None:
         "pokemon:Pikachu ex",
     )
     assert client.sent_messages == list(replies)
+
+
+def test_telegram_audio_hook_transcribes_voice_for_existing_text_dispatch(tmp_path) -> None:
+    audio_path = tmp_path / "voice.ogg"
+    audio_path.write_bytes(b"telegram voice bytes")
+    client = FakeTelegramClient(sample_path=audio_path)
+    seen = {}
+
+    class FakeTranscriber:
+        max_audio_bytes = 1024
+        max_duration_seconds = 30
+
+        def transcribe(self, request):
+            seen["request"] = request
+            return TranscriptionResult(
+                transcript="播放我最愛的音樂",
+                language="zh",
+                language_probability=0.99,
+                duration_seconds=2.0,
+            )
+
+    processor = TelegramCommandProcessor(
+        settings=AssistantSettings(openclaw_telegram_chat_id="123"),
+        stt_transcriber=FakeTranscriber(),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+    )
+
+    result = processor.handle_audio_message(
+        client=client,
+        chat_id="123",
+        message={
+            "chat": {"id": "123"},
+            "voice": {
+                "file_id": "voice-1",
+                "duration": 2,
+                "mime_type": "audio/ogg",
+            },
+        },
+    )
+
+    assert processor.build_audio_intake_ack_text() == "已收到語音，正在本機轉成文字。"
+    assert result == ("播放我最愛的音樂", None)
+    assert seen["request"].data == b"telegram voice bytes"
+    assert seen["request"].mime_type == "audio/ogg"
+
+
+def test_handle_telegram_voice_reuses_existing_natural_language_dispatch(tmp_path) -> None:
+    audio_path = tmp_path / "voice.ogg"
+    audio_path.write_bytes(b"telegram voice bytes")
+    client = FakeTelegramClient(sample_path=audio_path)
+    router = StubNaturalLanguageRouter(
+        TelegramNaturalLanguageIntent(
+            intent="trend_board",
+            game="ws",
+            limit=5,
+            confidence=0.94,
+        )
+    )
+
+    class FakeTranscriber:
+        max_audio_bytes = 1024
+        max_duration_seconds = 30
+
+        def transcribe(self, request):
+            return TranscriptionResult(
+                transcript="ws 熱門前 5",
+                language="zh",
+                language_probability=0.99,
+                duration_seconds=2.0,
+            )
+
+    processor = TelegramCommandProcessor(
+        settings=AssistantSettings(openclaw_telegram_chat_id="123"),
+        stt_transcriber=FakeTranscriber(),
+        lookup_renderer=lambda query: f"{query.game}:{query.name}",
+        board_loader=lambda: (
+            HotCardBoard(
+                game="ws",
+                label="WS Liquidity Board",
+                methodology="stub methodology",
+                generated_at=datetime.now(timezone.utc),
+                items=_stub_board().items,
+            ),
+        ),
+        catalog_renderer=lambda: "catalog",
+        natural_language_router=router,
+    )
+
+    replies = handle_telegram_message(
+        client=client,
+        processor=processor,
+        photo_renderer=lambda query: "unused",
+        message={
+            "chat": {"id": "123"},
+            "voice": {
+                "file_id": "voice-1",
+                "file_size": len(b"telegram voice bytes"),
+                "duration": 2,
+                "mime_type": "audio/ogg",
+            },
+        },
+    )
+
+    assert router.seen_texts == ["ws 熱門前 5"]
+    assert replies[0] == "已收到語音，正在本機轉成文字。"
+    assert replies[1] == "已理解查詢內容，相當於 /trend ws 5，開始整理資料。"
+    assert "WS Liquidity Board" in replies[2]
+    assert client.sent_messages == list(replies)
+
+
+def test_telegram_audio_hook_infers_optional_mime_from_download_path(tmp_path) -> None:
+    audio_path = tmp_path / "song.mp3"
+    audio_path.write_bytes(b"telegram audio bytes")
+    client = FakeTelegramClient(sample_path=audio_path)
+    seen = {}
+
+    class FakeTranscriber:
+        max_audio_bytes = 1024
+        max_duration_seconds = 30
+
+        def transcribe(self, request):
+            seen["mime_type"] = request.mime_type
+            return TranscriptionResult(
+                transcript="播放這首歌",
+                language="zh",
+                language_probability=0.99,
+                duration_seconds=2.0,
+            )
+
+    processor = TelegramCommandProcessor(
+        settings=AssistantSettings(openclaw_telegram_chat_id="123"),
+        stt_transcriber=FakeTranscriber(),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+    )
+
+    result = processor.handle_audio_message(
+        client=client,
+        chat_id="123",
+        message={
+            "audio": {
+                "file_id": "audio-1",
+                "duration": 2,
+            },
+        },
+    )
+
+    assert result == ("播放這首歌", None)
+    assert seen["mime_type"] == "audio/mpeg"
+
+
+def test_telegram_audio_hook_rejects_limits_before_download(tmp_path) -> None:
+    audio_path = tmp_path / "voice.ogg"
+    audio_path.write_bytes(b"must not download")
+
+    class NoDownloadClient(FakeTelegramClient):
+        def get_file(self, *, file_id: str):
+            raise AssertionError("oversized metadata must fail before getFile")
+
+    class FakeTranscriber:
+        max_audio_bytes = 4
+        max_duration_seconds = 30
+
+    processor = TelegramCommandProcessor(
+        settings=AssistantSettings(openclaw_telegram_chat_id="123"),
+        stt_transcriber=FakeTranscriber(),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+    )
+
+    transcript, error = processor.handle_audio_message(
+        client=NoDownloadClient(sample_path=audio_path),
+        chat_id="123",
+        message={
+            "voice": {
+                "file_id": "voice-1",
+                "file_size": 5,
+                "duration": 2,
+                "mime_type": "audio/ogg",
+            }
+        },
+    )
+
+    assert transcript is None
+    assert "bytes 上限" in error
+
+
+def test_telegram_audio_hook_rejects_unsupported_mime_before_download(tmp_path) -> None:
+    audio_path = tmp_path / "voice.bin"
+    audio_path.write_bytes(b"must not download")
+
+    class NoDownloadClient(FakeTelegramClient):
+        def get_file(self, *, file_id: str):
+            raise AssertionError("unsupported MIME must fail before getFile")
+
+    class FakeTranscriber:
+        max_audio_bytes = 1024
+        max_duration_seconds = 30
+
+    processor = TelegramCommandProcessor(
+        settings=AssistantSettings(openclaw_telegram_chat_id="123"),
+        stt_transcriber=FakeTranscriber(),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+    )
+
+    transcript, error = processor.handle_audio_message(
+        client=NoDownloadClient(sample_path=audio_path),
+        chat_id="123",
+        message={
+            "audio": {
+                "file_id": "audio-1",
+                "file_size": 12,
+                "duration": 2,
+                "mime_type": "application/octet-stream",
+            }
+        },
+    )
+
+    assert transcript is None
+    assert "不支援的音訊格式" in error
 
 
 def test_handle_telegram_message_clarifies_image_without_caption() -> None:

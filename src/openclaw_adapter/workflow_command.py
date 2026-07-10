@@ -211,12 +211,15 @@ _COMMAND_METADATA: dict[str, dict[str, str]] = {
     "/ir": {
         "usage": (
             "discover=掃描可用紅外線裝置；devices=列出已註冊裝置；"
-            "send <裝置> <按鍵名>=發送紅外線指令，如 `send ceiling_light power`"
+            "send <裝置> <按鍵名>=發送紅外線指令，如 `send ceiling_light power`。"
+            "send 的裝置與按鍵可直接用使用者說的自然語言名稱"
+            "（如 `send 電風扇 on`），指令內部會自動對應到已學習的按鍵，"
+            "不需要先查 devices。"
         ),
         "chat_tool_purpose": "當使用者要控制紅外線家電時使用",
         "chat_tool_query_hint": (
             "query 只輸出 /ir 後面的參數，例如 discover、devices 或 "
-            "send ceiling_light power"
+            "send <使用者說的裝置> <動作>（一步完成，免先查 devices）"
         ),
         "chat_tool_display_name": "紅外線控制",
     },
@@ -224,6 +227,7 @@ _COMMAND_METADATA: dict[str, dict[str, str]] = {
         "usage": (
             "playbest=播放最愛清單；random=隨機播放；stop=停止；"
             "pause=暫停；resume=繼續；next/previous=切歌；"
+            "louder=調高音量；lower=調低音量；mute=靜音；"
             "<本地歌曲關鍵字>=搜尋並播放本地曲目。"
             "一次只播一首，且呼叫時會停掉正在播放的歌；"
             "要依序連播多首請改用 /musicqueue，不要連續呼叫 /music。"
@@ -233,7 +237,7 @@ _COMMAND_METADATA: dict[str, dict[str, str]] = {
         "chat_tool_purpose": "當使用者要控制本機音樂播放時使用",
         "chat_tool_query_hint": (
             "query 只輸出 /music 後面的參數，例如 stop、pause、resume、"
-            "next、previous、random、playbest 或歌曲關鍵字"
+            "next、previous、louder、lower、mute、random、playbest 或歌曲關鍵字"
         ),
         "chat_tool_display_name": "音樂控制",
     },

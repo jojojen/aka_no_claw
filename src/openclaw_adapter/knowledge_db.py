@@ -1120,6 +1120,18 @@ CODEGEN_SEED: tuple[dict, ...] = (
     },
     {
         "category": "validation",
+        "title": "可選 metadata 只做快篩，硬限制留在資料邊界",
+        "technique": (
+            "外部 API 標示 optional 的 size、duration、MIME 等 metadata 不可當成必填；"
+            "欄位存在時先驗型別與上限，已知無效值應在網路或磁碟 I/O 前拒絕。"
+            "欄位缺少時則繼續走真正的資料邊界，使用 bounded read、解碼後大小與時長檢查"
+            "作為不可繞過的硬限制。如此同時保留相容性、early rejection 與資源安全。"
+        ),
+        "keywords": ["*", "optional", "metadata", "bounded read", "size limit", "mime", "validation"],
+        "confidence": 0.95,
+    },
+    {
+        "category": "validation",
         "title": "不得生成假 API token / placeholder 憑證",
         "technique": (
             "生成的程式碼絕對不能用假的、佔位用的 API key 或 token（如 \"1234567890abcdef\"、"

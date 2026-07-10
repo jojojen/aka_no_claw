@@ -141,14 +141,24 @@ def _adjust(settings: AssistantSettings, delta: int) -> str:
     # straight to a surprising loud volume.
     store = VolumeStore(settings.openclaw_music_volume_state_path)
     state = store.load()
-    new_volume = _clamp(state["volume"] + delta)
+    old_volume = state["volume"]
+    was_muted = state["muted"]
+    new_volume = _clamp(old_volume + delta)
     try:
         _apply(new_volume, False)
     except VolumeControlError as exc:
         logger.warning("music volume: adjust failed: %s", exc)
         return f"調整音量失敗：{exc}"
     saved = store.save(volume=new_volume, muted=False)
-    return _status_text(saved["volume"], False)
+    # Name the action and the change, not just the end state: downstream
+    # LLM judges (and the user) must be able to see the request was fulfilled
+    # from this reply alone.
+    direction = "調高" if delta > 0 else "調低"
+    unmuted_prefix = "已取消靜音，" if was_muted else ""
+    if saved["volume"] == old_volume and not was_muted:
+        limit = "最大" if delta > 0 else "最小"
+        return f"音量已在{limit}值（{old_volume}/100），無法再{direction}。"
+    return f"{unmuted_prefix}音量已{direction}：{old_volume} → {saved['volume']}/100。"
 
 
 def louder_music(settings: AssistantSettings) -> str:
