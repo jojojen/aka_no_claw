@@ -1779,7 +1779,14 @@ def format_research_full_report(report: ResearchReport) -> str:
         lines.append("")
         lines.append("Warnings：")
         lines.extend(f"- {warning}" for warning in report.warnings)
-    return "\n".join(lines)
+    full_text = "\n".join(lines)
+    from .outbound_guards import looks_like_meta_scaffolding
+    _meta_reason = looks_like_meta_scaffolding(full_text)
+    if _meta_reason:
+        import logging as _logging
+        _logging.getLogger(__name__).warning("outbound guard (research): %s", _meta_reason)
+        full_text = full_text + f"\n⚠️ 品質閘門: {_meta_reason}"
+    return full_text
 
 
 def format_research_compact_report(report: ResearchReport) -> str:

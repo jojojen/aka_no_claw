@@ -108,6 +108,7 @@ from .command_bridge_models import (
     stream_done,
     stream_error,
     stream_heartbeat,
+    stream_process,
     stream_redirect,
     stream_start,
 )
@@ -263,7 +264,11 @@ class _GeminiTextClient:
         request = Request(
             url,
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json, application/rss+xml, application/xml, text/html, text/plain, */*",
+                "User-Agent": "aka_no_claw/1.0 (+https://github.com/jojojen/aka_no_claw; personal-use bot)",
+            },
             method="POST",
         )
         try:
@@ -770,15 +775,26 @@ class CommandBridge:
                     # "/workflow run <id>" command fails with 找不到指令：/workflow
                     # when dispatched through the bridge's schedule surface
                     # (_schedulehome_surface, which runs commands through this
-                    # same self._command_handlers dict). Wire in the same
-                    # shim-backed handler _workflow_surface() already builds for
-                    # the web console, so schedule dispatch can find it too.
+                    # same self._command_handlers dict).
+                    #
+                    # DEADLOCK GUARD: never call _workflow_surface() here.
+                    # _workflow_surface() itself calls _handlers() →
+                    # _ensure_registries(); when a workflow request is the FIRST
+                    # request on a fresh bridge, that thread holds _workflow_lock
+                    # while building registries, and an eager _workflow_surface()
+                    # call from this line would re-enter the non-reentrant
+                    # _workflow_lock → self-deadlock (every later /workflow call
+                    # then hangs forever). Wire a lazy proxy instead: the surface
+                    # is resolved at dispatch time, outside _registry_lock.
                     from telegram_core.contracts import RegisteredCommand
                     from .workflow_command import command_metadata
 
-                    workflow_handler, _ = self._workflow_surface()
+                    def _lazy_workflow_handler(remainder: str, chat_id: str):
+                        workflow_handler, _ = self._workflow_surface()
+                        return workflow_handler(remainder, chat_id)
+
                     command_handlers["/workflow"] = RegisteredCommand(
-                        workflow_handler,
+                        _lazy_workflow_handler,
                         ack="⚙️",
                         background=True,
                         **command_metadata("/workflow"),
@@ -1014,7 +1030,7 @@ class CommandBridge:
             obs_result = yield from self._stream_vision_observe(req)
             if obs_result is not None:
                 observation = obs_result
-                yield stream_delta(f"🔍 圖片觀察：{observation}\n\n")
+                yield stream_process(f"🔍 圖片觀察：{observation}")
 
         prompt = build_chat_prompt(req.input, req.history)
         # The observation also reaches the router-failed fallback prompt below.
@@ -2314,13 +2330,13 @@ class CommandBridge:
         b64 = _encode_image_attachment(image)
         if b64 is None:
             logger.warning("vision observe: failed to encode attachment")
-            yield stream_delta("（圖片編碼失敗，略過圖片觀察）\n")
+            yield stream_process("（圖片編碼失敗，略過圖片觀察）")
             return None
 
         chain = self._vision_pool_chain()
         if not chain:
             logger.warning("vision observe: no vision pool members available")
-            yield stream_delta("（無可用視覺模型，略過圖片觀察）\n")
+            yield stream_process("（無可用視覺模型，略過圖片觀察）")
             return None
 
         from .vision_pool import _OBSERVE_PROMPT, walk_vision_pool_chain
@@ -2345,11 +2361,11 @@ class CommandBridge:
             yield stream_heartbeat()
         if "error" in result:
             logger.warning("vision observe failed: %s", result["error"])
-            yield stream_delta("（圖片觀察失敗，繼續以文字模式回答）\n")
+            yield stream_process("（圖片觀察失敗，繼續以文字模式回答）")
             return None
         text = result.get("text")
         if not isinstance(text, str) or not text.strip():
-            yield stream_delta("（圖片觀察未回傳有效內容，繼續以文字模式回答）\n")
+            yield stream_process("（圖片觀察未回傳有效內容，繼續以文字模式回答）")
             return None
         return text.strip()
 
@@ -3478,10 +3494,27 @@ class CommandBridge:
                     # lists every allowed registered command and _cmd_run can
                     # dispatch any registered handler (not just the fallbacks).
                     command_registry = self._handlers()
+
+                    def _bridge_on_id_renamed(old_id: str, new_id: str) -> None:
+                        sh_store = self._sh_store
+                        if sh_store is None:
+                            return
+                        old_cmd = f"/workflow run {old_id}"
+                        new_cmd = f"/workflow run {new_id}"
+                        for entry in sh_store.list():
+                            sid = entry.get("id")
+                            cmds = entry.get("commands") or []
+                            if not any(c == old_cmd for c in cmds):
+                                continue
+                            sh_store.clear_commands(sid)
+                            for cmd in cmds:
+                                sh_store.add_command(sid, new_cmd if cmd == old_cmd else cmd)
+
                     editor = WorkflowEditor(
                         _workflow_store(runner),
                         command_registry=command_registry,
                         catalog=runner.catalog,
+                        on_id_renamed=_bridge_on_id_renamed,
                     )
                     self._workflow_editor = editor
                     self._workflow_handler = build_workflow_handler(

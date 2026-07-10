@@ -3782,6 +3782,50 @@ def test_vision_pool_chain_includes_nvidia():
     assert LLM_PROVIDER_NVIDIA in providers
 
 
+def test_stream_chat_image_emits_process_event_not_delta(monkeypatch):
+    """Image-attachment chat must emit a 'process' event for the observation,
+    not a 'delta', and the observation text must not appear in any delta/done."""
+    import base64
+    from openclaw_adapter.command_bridge_models import stream_done
+
+    b = CommandBridge(settings=_tool_settings())
+
+    fake_obs = "畫面上有一張收據，合計 3,000 円"
+
+    def _fake_vision_observe(req):
+        yield {}  # ensure generator is recognised; will be ignored
+        return fake_obs
+
+    # Patch vision observe to return the fake observation without real vision calls.
+    monkeypatch.setattr(b, "_stream_vision_observe", _fake_vision_observe)
+    # Patch the tool planner to return no-tool so we reach stream_done quickly.
+    monkeypatch.setattr(b, "_select_chat_tool_plan", lambda req, observation=None: (None, None))
+    # Patch the fallback chat response to emit a simple done.
+    def _fake_chat_resp(prompt, backend, conversation_key=None):
+        yield stream_done("答案")
+    monkeypatch.setattr(b, "_stream_chat_response", _fake_chat_resp)
+
+    raw_img = base64.b64encode(b"\x89PNG fake").decode()
+    req = parse_request({
+        "mode": "chat",
+        "input": "加總金額",
+        "chat_backend": "local",
+        "attachments": [{"type": "image", "filename": "r.png", "content_type": "image/png",
+                         "data_base64": raw_img}],
+    })
+
+    events = list(b._stream_chat(req))
+    types = [e["type"] for e in events if e]
+    texts_delta = [e.get("text", "") for e in events if e.get("type") == "delta"]
+    process_events = [e for e in events if e.get("type") == "process"]
+
+    assert "process" in types, "expected a process event"
+    assert any(fake_obs in (e.get("text") or "") for e in process_events), \
+        "process event should carry the observation text"
+    assert all(fake_obs not in t for t in texts_delta), \
+        "observation text must not appear in delta events"
+
+
 def test_cloud_pool_gemini_mistral_fail_big_pickle_succeeds(monkeypatch):
     """Gemini + Mistral both fail → Big Pickle succeeds."""
     b = CommandBridge(settings=_tool_settings(
@@ -4637,3 +4681,61 @@ def test_unsatisfied_upgrade_seeds_conversation_context(monkeypatch):
     seeds = seen["seeds"]
     assert seeds[_seed_variable_name_for_tool("/visionlook")] == "卡況觀察內容"
     assert "這張卡投資角度值得買嗎？" in seeds["conversation_context"]
+
+
+# ---------------------------------------------------------------------------
+# Registry/workflow-surface deadlock regression
+# ---------------------------------------------------------------------------
+
+def test_first_workflow_request_on_fresh_bridge_does_not_deadlock(monkeypatch, tmp_path):
+    """Regression: _ensure_registries used to eagerly call _workflow_surface()
+    to wire /workflow into the registry. When a workflow request was the FIRST
+    request on a fresh bridge, that thread already held the non-reentrant
+    _workflow_lock while building registries, so the eager call re-entered the
+    lock → self-deadlock (every subsequent /workflow call hung forever). The
+    registry entry must be a lazy proxy resolved at dispatch time instead."""
+    import threading
+
+    from openclaw_adapter import command_bridge as cb_module
+    from openclaw_adapter import telegram_bot as tb_module
+    from openclaw_adapter import workflow_command as wc_module
+
+    b = cb_module.CommandBridge(settings=object())
+
+    monkeypatch.setattr(tb_module, "_build_registries", lambda *a, **k: ({}, {}, {}, {}))
+
+    class _FakeShim:
+        def __init__(self, settings):
+            tools = tmp_path / "generated_tools"
+            tools.mkdir(parents=True, exist_ok=True)
+            self.tools_dir = str(tools)
+            self.catalog = None
+            self.client = None
+
+        def run_tool_step(self, slug, params):
+            return True, "ok"
+
+    monkeypatch.setattr(cb_module, "_WorkflowShimRunner", _FakeShim)
+    monkeypatch.setattr(
+        wc_module,
+        "build_workflow_handler",
+        lambda settings, runner, **kw: (lambda remainder, chat_id: f"[wf]{remainder}"),
+    )
+
+    result: dict = {}
+
+    def _first_request():
+        result["res"] = b.run_workflow_command("list")
+
+    t = threading.Thread(target=_first_request, daemon=True)
+    t.start()
+    t.join(timeout=10)
+    assert not t.is_alive(), "run_workflow_command deadlocked on a fresh bridge"
+    assert result["res"]["status"] == "ok"
+    assert result["res"]["message"] == "[wf]list"
+
+    # The /workflow registry entry (used by the schedule surface) must dispatch
+    # through the same lazy surface.
+    handlers = b._handlers()
+    assert "/workflow" in handlers
+    assert handlers["/workflow"].handler("list", "wf-web") == "[wf]list"

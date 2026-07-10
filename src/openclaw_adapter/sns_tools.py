@@ -500,6 +500,13 @@ def _start_sns_monitor(
         ) -> None:
             """Notify via Telegram. ``reply_markup`` is optional — the SNS
             monitor passes a 👍/👎/💰 inline keyboard for per-tweet posts."""
+            if not text or not text.strip():
+                return
+            from .outbound_guards import guard_outbound
+            reason = guard_outbound(text, proactive=True)
+            if reason:
+                logger.warning("outbound guard blocked push: %s", reason)
+                return
             try:
                 client = SnsTelegramClient(token, ssl_context=ssl_context)
                 client.send_message(

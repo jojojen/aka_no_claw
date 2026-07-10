@@ -43,6 +43,7 @@ from .opportunity_store import OpportunityStore, _normalize_legacy_reason
 from .web_search import (
     WebSearchResult,
     filter_relevant_sources_with_ollama,
+    search_need_gate,
     web_search,
 )
 
@@ -514,9 +515,20 @@ class WebOpportunityResearcher:
         self._timeout_seconds = timeout_seconds
         self._max_results = max(1, min(5, max_results))
         self._ssl_context = ssl_context
-        self._search_fn = search_fn or (
-            lambda query, limit: web_search(query, max_results=limit)
-        )
+        if search_fn is not None:
+            self._search_fn = search_fn
+        else:
+            def _gated_search(query, limit, _self=self):
+                if not search_need_gate(
+                    query, "",
+                    endpoint=_self._endpoint,
+                    model=_self._model,
+                    timeout_seconds=_self._timeout_seconds,
+                    ssl_context=_self._ssl_context,
+                ):
+                    return ()
+                return web_search(query, max_results=limit)
+            self._search_fn = _gated_search
         self._json_call_fn = json_call_fn or _call_ollama_json
         self._relevance_fn = relevance_fn
 
@@ -1317,7 +1329,19 @@ def build_opportunity_agent(settings: AssistantSettings | None = None) -> Opport
         max_per_hour=settings.opportunity_web_search_hourly_budget,
     )
 
-    def _budgeted_ddg_search(query, *, max_results: int = 5):
+    def _budgeted_ddg_search(query, *, max_results: int = 5, _seed: str = ""):
+        # Gate before the budget check: a gate-skipped query must not burn a
+        # search-budget slot (the gate is a free local Ollama call).
+        _gate_model = (settings.openclaw_local_text_model or "").split(",")[0].strip()
+        if _gate_model and not search_need_gate(
+            query,
+            _seed,
+            endpoint=settings.openclaw_local_text_endpoint,
+            model=_gate_model,
+            timeout_seconds=settings.opportunity_llm_timeout_seconds,
+            ssl_context=ssl_context if settings.openclaw_local_text_endpoint.startswith("https://") else None,
+        ):
+            return ()
         if not _ddg_budget.allow():
             logger.info(
                 "Opportunity agent: web-search budget reached (%d/hour, %d/day); skipping query=%s",

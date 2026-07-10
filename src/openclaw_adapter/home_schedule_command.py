@@ -21,6 +21,8 @@ from __future__ import annotations
 import logging
 from typing import Callable
 
+from datetime import datetime
+
 from .home_schedule import (
     DAY_KEYS,
     DAY_LABELS,
@@ -28,6 +30,7 @@ from .home_schedule import (
     WEEKDAY_KEYS,
     WEEKEND_KEYS,
     days_label,
+    next_fire_times,
     run_schedule_commands,
 )
 
@@ -39,6 +42,16 @@ _MINUTE_STEP = 5
 def _short(text: str, limit: int = 16) -> str:
     text = text or ""
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _format_next_fire_times(times: list[datetime]) -> str:
+    if not times:
+        return ""
+    parts = []
+    for t in times:
+        weekday_char = DAY_LABELS[DAY_KEYS[t.weekday()]]
+        parts.append(f"{t.month:02d}/{t.day:02d} ({weekday_char}) {t.strftime('%H:%M')}")
+    return "⏭ 接下來：" + "、".join(parts)
 
 
 def _mask_to_days(mask: str) -> list[str]:
@@ -84,6 +97,13 @@ def render_list(store: HomeScheduleStore) -> tuple[str, dict]:
                 f"{state} {label} — {sched.get('time') or '--:--'} "
                 f"{days_label(sched.get('days') or [])}（{n} 個指令）"
             )
+            if e.get("enabled", True):
+                times = next_fire_times(e, datetime.now())
+                fire_line = _format_next_fire_times(times)
+                if fire_line:
+                    lines.append(f"  {fire_line}")
+            else:
+                lines.append("  ⏭ 已停用")
         text = "\n".join(lines)
 
     rows: list[list[dict]] = []
@@ -166,8 +186,15 @@ def render_edit_menu(entry: dict) -> tuple[str, dict]:
         f"✏️ 編輯排程「{label}」\n"
         f"目前：{sched.get('time') or '--:--'} "
         f"{days_label(sched.get('days') or [])}\n"
-        "要改什麼？"
     )
+    if entry.get("enabled", True):
+        times = next_fire_times(entry, datetime.now())
+        fire_line = _format_next_fire_times(times)
+        if fire_line:
+            text += fire_line + "\n"
+    else:
+        text += "⏭ 已停用\n"
+    text += "要改什麼？"
     markup = {
         "inline_keyboard": [
             [{"text": "🕐 改時間／星期", "callback_data": f"sh:edittime:{sid}"}],
@@ -195,13 +222,20 @@ def _format_run(entry: dict, results: list[str]) -> str:
 
 def _capture_hint(entry: dict) -> str:
     sched = entry.get("schedule") or {}
-    return (
+    times = next_fire_times(entry, datetime.now())
+    fire_line = _format_next_fire_times(times)
+    hint = (
         f"✅ 已建立排程「{entry.get('label') or entry.get('id')}」"
         f"（{sched.get('time')} {days_label(sched.get('days') or [])}）。\n"
+    )
+    if fire_line:
+        hint += fire_line + "\n"
+    hint += (
         "現在請直接傳要在該時間執行的指令，一則一則傳，例如：\n"
         "/music playbest\n/generateaudio 早安\n"
         "全部傳完後輸入「完成」即可。"
     )
+    return hint
 
 
 # --- command handler -------------------------------------------------------

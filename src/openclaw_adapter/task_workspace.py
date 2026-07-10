@@ -891,6 +891,31 @@ class WorkflowStore:
             return True
         return False
 
+    def rename(self, old_id: str, new_id: str) -> bool:
+        """Rename a workflow's ID (slug). Returns False if old_id does not
+        exist or new_id is already taken; True on success.
+
+        The traces directory is moved atomically via shutil.move when present."""
+        import shutil
+        old_path = self._dir / f"{old_id}.json"
+        new_path = self._dir / f"{new_id}.json"
+        if not old_path.exists() or new_path.exists():
+            return False
+        wf = self.get(old_id)
+        if wf is None:
+            return False
+        wf.id = new_id
+        new_path.write_text(
+            json.dumps(wf.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        old_traces = self._dir / "traces" / old_id
+        if old_traces.exists():
+            new_traces = self._dir / "traces" / new_id
+            shutil.move(str(old_traces), str(new_traces))
+        old_path.unlink()
+        return True
+
     # ── Execution traces ──────────────────────────────────────────────────────
 
     def save_trace(self, trace: WorkflowTrace) -> None:

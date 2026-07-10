@@ -600,3 +600,106 @@ def test_add_field_prompt_has_cancel_add_button(tmp_path):
     # next prompt (args) is reached via captured text and also carries the button
     _, markup2 = editor.handle_text_capture("my-tool", "chat-1")
     assert "wfe:add_cancel" in _callback_data(markup2)
+
+
+# ── start_renameid / renameid capture ─────────────────────────────────────────
+
+def test_start_renameid_prompts_and_starts_capturing(tmp_path):
+    store = WorkflowStore(tmp_path / "workflows")
+    store.save(Workflow(id="wf-alpha", goal="テスト"))
+    editor = WorkflowEditor(store)
+    text, markup = editor.start_renameid("chat-1", "wf-alpha")
+    assert "wf-alpha" in text
+    assert "wfe:cancel" in _callback_data(markup)
+    assert editor.is_capturing("chat-1")
+
+
+def test_start_renameid_unknown_id(tmp_path):
+    editor = _make_editor(tmp_path)
+    text, _ = editor.start_renameid("chat-1", "no-such-wf")
+    assert "找不到" in text
+    assert not editor.has_session("chat-1")
+
+
+def test_collect_renameid_renames_and_reports(tmp_path):
+    store = WorkflowStore(tmp_path / "workflows")
+    store.save(Workflow(id="wf-alpha", goal="テスト", steps=[
+        WorkflowStep(id="s1", kind="tool_call", tool="t", output="out"),
+    ]))
+    editor = WorkflowEditor(store)
+    editor.start_renameid("chat-1", "wf-alpha")
+    text, markup = editor.handle_text_capture("wf-beta", "chat-1")
+    assert "wf-beta" in text
+    assert "wfe:save" in _callback_data(markup)
+    assert store.get("wf-alpha") is None
+    loaded = store.get("wf-beta")
+    assert loaded is not None
+    assert loaded.id == "wf-beta"
+    assert loaded.goal == "テスト"
+
+
+def test_collect_renameid_empty_reprompts(tmp_path):
+    store = WorkflowStore(tmp_path / "workflows")
+    store.save(Workflow(id="wf-alpha", goal="テスト"))
+    editor = WorkflowEditor(store)
+    editor.start_renameid("chat-1", "wf-alpha")
+    text, _ = editor.handle_text_capture("  ", "chat-1")
+    assert editor.is_capturing("chat-1")
+    assert "空" in text or "不能" in text
+
+
+def test_collect_renameid_invalid_chars_reprompts(tmp_path):
+    store = WorkflowStore(tmp_path / "workflows")
+    store.save(Workflow(id="wf-alpha", goal="テスト"))
+    editor = WorkflowEditor(store)
+    editor.start_renameid("chat-1", "wf-alpha")
+    text, _ = editor.handle_text_capture("wf ALPHA!!", "chat-1")
+    assert editor.is_capturing("chat-1")
+    assert store.get("wf-alpha") is not None
+
+
+def test_collect_renameid_collision_reprompts(tmp_path):
+    store = WorkflowStore(tmp_path / "workflows")
+    store.save(Workflow(id="wf-alpha", goal="A"))
+    store.save(Workflow(id="wf-beta", goal="B"))
+    editor = WorkflowEditor(store)
+    editor.start_renameid("chat-1", "wf-alpha")
+    text, _ = editor.handle_text_capture("wf-beta", "chat-1")
+    assert editor.is_capturing("chat-1")
+    assert "失敗" in text or "已存在" in text
+
+
+def test_collect_renameid_rewrites_schedule_commands(tmp_path):
+    from openclaw_adapter.home_schedule import HomeScheduleStore
+    store = WorkflowStore(tmp_path / "workflows")
+    store.save(Workflow(id="wf-alpha", goal="テスト"))
+    sh_store = HomeScheduleStore(str(tmp_path / "schedules.json"))
+    entry = sh_store.add(label="朝", time="07:00", days=["mon"],
+                         commands=["/workflow run wf-alpha", "/music playbest"])
+
+    renamed_calls: list[tuple[str, str]] = []
+
+    def _on_id_renamed(old_id: str, new_id: str) -> None:
+        renamed_calls.append((old_id, new_id))
+        old_cmd = f"/workflow run {old_id}"
+        new_cmd = f"/workflow run {new_id}"
+        for e in sh_store.list():
+            sid = e.get("id")
+            cmds = e.get("commands") or []
+            if not any(c == old_cmd for c in cmds):
+                continue
+            sh_store.clear_commands(sid)
+            for cmd in cmds:
+                sh_store.add_command(sid, new_cmd if cmd == old_cmd else cmd)
+
+    editor = WorkflowEditor(store, on_id_renamed=_on_id_renamed)
+    editor.start_renameid("chat-1", "wf-alpha")
+    editor.handle_text_capture("wf-beta", "chat-1")
+
+    assert renamed_calls == [("wf-alpha", "wf-beta")]
+    updated = sh_store.get(entry["id"])
+    assert updated is not None
+    cmds = updated.get("commands") or []
+    assert "/workflow run wf-beta" in cmds
+    assert "/music playbest" in cmds
+    assert "/workflow run wf-alpha" not in cmds

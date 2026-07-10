@@ -54,6 +54,8 @@ _OLLAMA_MAX_RETRIES = 3       # transient-error retries in generate()
 _OLLAMA_RETRY_BASE_SEC = 1.0  # first backoff; doubles each attempt (1, 2, 4 s)
 _OPENCODE_MAX_RETRIES = 3
 _OPENCODE_RETRY_BASE_SEC = 1.0
+# Injected at module level so tests can monkeypatch without touching time.sleep globally.
+_RETRY_SLEEP = time.sleep
 # zen blocks the default Python-urllib UA with Cloudflare 1010
 # (browser_signature_banned). A browser UA passes. See
 # docs/NEW_OPENCODE_DECOUPLING_PLAN.md §Phase 0.
@@ -1057,7 +1059,13 @@ class DynamicToolRunner:
                 prefix = "🛠 新生成工具（已加入可重用工具庫）\n"
                 reuse_note = ""
             footer = f"\n—\n🤖 codegen：{self.backend_label}{reuse_note}"
-            return prefix + result.answer + footer
+            answer = result.answer
+            from .outbound_guards import guard_outbound
+            _guard_reason = guard_outbound(answer, proactive=False)
+            if _guard_reason:
+                logger.warning("outbound guard blocked /new answer: %s | answer=%r", _guard_reason, answer[:200])
+                return f"生成內容未通過品質閘門（{_guard_reason}），請重試或改寫需求"
+            return prefix + answer + footer
         if result.generations == 0:
             return f"⚠️ 無法完成\n{result.error}\n—\n🤖 codegen：{self.backend_label}"
         return (f"⚠️ 無法完成（生成 {result.generations} 次仍失敗）\n{result.error}"
@@ -1231,7 +1239,11 @@ class DynamicToolRunner:
         """Execute a catalog tool by slug with caller-supplied params (task workspace
         step). Writes params.json directly — no LLM param extraction. Returns
         ``(ok, result_text)``; result_text is the answer on success or an error
-        description on failure."""
+        description on failure.
+
+        Retries _install_and_execute up to 2 extra times on failure (unconditional —
+        a code bug wastes two retries, which is acceptable). Sleep delays are
+        injected via _RETRY_SLEEP so tests can monkeypatch without side effects."""
         entry = self.catalog.get(slug)
         if entry is None:
             return False, f"工具 '{slug}' 不在 catalog 中"
@@ -1243,12 +1255,31 @@ class DynamicToolRunner:
                 json.dumps(explicit_params, ensure_ascii=False), encoding="utf-8"
             )
         code = tool_path.read_text(encoding="utf-8")
+        _retry_delays = (5, 10)
         result = self._install_and_execute(slug, tool_path, code)
+        for attempt, delay in enumerate(_retry_delays, start=1):
+            if result.ok:
+                break
+            logger.warning(
+                "dynamic_tools: run_tool_step slug=%s attempt=%d failed, retrying in %ds",
+                slug, attempt, delay,
+            )
+            _RETRY_SLEEP(delay)
+            result = self._install_and_execute(slug, tool_path, code)
         if result.ok:
             self._record_catalog_outcome(slug, True, None)
             return True, result.answer
         self._record_catalog_outcome(slug, False, "workspace tool step failed")
-        return False, result.error or result.answer or "工具執行失敗"
+        raw_error = result.error or result.answer or "工具執行失敗"
+        if "Traceback (most recent call last)" in raw_error:
+            logger.warning("dynamic_tools: run_tool_step slug=%s full error:\n%s", slug, raw_error)
+            last_line = next(
+                (ln for ln in reversed(raw_error.splitlines()) if ln.strip()),
+                raw_error,
+            )
+            n_retries = len(_retry_delays)
+            return False, f"工具執行失敗（已重試 {n_retries} 次）：{last_line}"
+        return False, raw_error
 
     def _catalog_tool_type(self, slug: str | None) -> str | None:
         """tool_type of a generated tool, for the user-visible reuse trace.

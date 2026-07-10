@@ -419,6 +419,13 @@ def build_workflow_handler(
                 return "用法：/workflow rename <id>"
             text, markup = workflow_editor.start_rename(chat_id, arg)
             return text, markup or None
+        if subcmd == "renameid":
+            if workflow_editor is None:
+                return "Workflow 編輯器未啟用"
+            if not arg:
+                return "用法：/workflow renameid <id>"
+            text, markup = workflow_editor.start_renameid(chat_id, arg)
+            return text, markup or None
         if subcmd == "list":
             return _cmd_list(store)
         if subcmd == "show":
@@ -463,6 +470,7 @@ def _cmd_list(store: WorkflowStore) -> str | tuple:
         ])
         rows.append([
             {"text": f"✏️ 改名 {wf.id}", "callback_data": f"wf:rename:{wf.id}"},
+            {"text": f"✏️ 改代號 {wf.id}", "callback_data": f"wf:renameid:{wf.id}"},
             {"text": f"🗑 刪除 {wf.id}", "callback_data": f"wf:delete:{wf.id}"},
         ])
     return text, {"inline_keyboard": rows}
@@ -716,6 +724,8 @@ def _help() -> str:
         "  /workflow run <id>          — 執行 workflow\n"
         "  /workflow traces <id>       — 顯示執行記錄\n"
         "  /workflow delete <id>       — 刪除 workflow\n"
+        "  /workflow rename <id>       — 改名稱（顯示用）\n"
+        "  /workflow renameid <id>     — 改代號（slug）\n"
         "  /workflow create <一句話>   — AI 生成可編輯草稿\n"
         "  /workflow create <JSON>     — 從 JSON 建立 workflow（進階）"
     )

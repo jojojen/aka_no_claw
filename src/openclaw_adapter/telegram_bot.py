@@ -1972,6 +1972,22 @@ def _build_registries(
             if isinstance(result, tuple):
                 return None, result[0], result[1] if len(result) > 1 else None
             return None, result, None
+        if action == "rename":
+            wf_spec = command_handlers.get("/workflow")
+            if wf_spec is None:
+                return None, "/workflow 指令尚未啟用。", None
+            result = wf_spec.handler(f"rename {wf_id}", str(chat_id))
+            if isinstance(result, tuple):
+                return None, result[0], result[1] if len(result) > 1 else None
+            return None, result, None
+        if action == "renameid":
+            wf_spec = command_handlers.get("/workflow")
+            if wf_spec is None:
+                return None, "/workflow 指令尚未啟用。", None
+            result = wf_spec.handler(f"renameid {wf_id}", str(chat_id))
+            if isinstance(result, tuple):
+                return None, result[0], result[1] if len(result) > 1 else None
+            return None, result, None
         return None, f"未知的 workflow 動作：{action}", None
 
     callback_handlers: dict[str, Callable[[str, str, str], tuple[object, str, object]]] = {
@@ -2386,9 +2402,15 @@ def run_telegram_polling(
     # Re-register /workflow to include the editor for `new`/`edit` subcommands.
     _wf_editor: WorkflowEditor | None = None
     if dynamic_tool_runner is not None:
+        _tg_sh_store = get_home_schedule_store(settings.openclaw_home_schedules_path)
+
+        def _tg_on_id_renamed(old_id: str, new_id: str) -> None:
+            _rewrite_schedule_commands(_tg_sh_store, old_id, new_id)
+
         _wf_editor = WorkflowEditor(_workflow_store(dynamic_tool_runner),
                                       command_registry=command_handlers,
-                                      catalog=dynamic_tool_runner.catalog)
+                                      catalog=dynamic_tool_runner.catalog,
+                                      on_id_renamed=_tg_on_id_renamed)
         callback_handlers.update(_wf_editor.callback_handlers())
         command_handlers["/workflow"] = RegisteredCommand(
             build_workflow_handler(settings, dynamic_tool_runner, workflow_editor=_wf_editor,
@@ -2439,6 +2461,21 @@ def run_telegram_polling(
         notify_startup=notify_startup,
         drop_pending_updates=drop_pending_updates,
     )
+
+
+def _rewrite_schedule_commands(store, old_id: str, new_id: str) -> None:
+    """Replace `/workflow run <old_id>` with `/workflow run <new_id>` in every
+    home-schedule entry that references the renamed workflow ID."""
+    old_cmd = f"/workflow run {old_id}"
+    new_cmd = f"/workflow run {new_id}"
+    for entry in store.list():
+        sid = entry.get("id")
+        cmds = entry.get("commands") or []
+        if not any(c == old_cmd for c in cmds):
+            continue
+        store.clear_commands(sid)
+        for cmd in cmds:
+            store.add_command(sid, new_cmd if cmd == old_cmd else cmd)
 
 
 def _build_feedback_service(watch_db: MonitorDatabase):
@@ -2728,6 +2765,13 @@ def _start_watch_monitor(
         if not resolved_chat:
             logger.warning("Mercari watch notify: no chat_id, dropping message")
             return
+        if not text or not text.strip():
+            return
+        from .outbound_guards import guard_outbound
+        reason = guard_outbound(text, proactive=True)
+        if reason:
+            logger.warning("outbound guard blocked push: %s", reason)
+            return
         client = TelegramBotClient(token, ssl_context=ssl_ctx)
         client.send_message(chat_id=resolved_chat, text=text)
 
@@ -2761,18 +2805,23 @@ def _start_watch_monitor(
                         settings=settings, result=result
                     )
                     summary = format_reputation_snapshot_delivery_text(result, proof_document)
-                    c = TelegramBotClient(token, ssl_context=ssl_ctx)
-                    c.send_message(chat_id=resolved_chat, text=summary)
-                    c.send_document(
-                        chat_id=resolved_chat,
-                        document_path=pdf_path,
-                        caption="信譽快照 PDF",
-                    )
-                    c.send_photo(
-                        chat_id=resolved_chat,
-                        photo_path=preview_path,
-                        caption="信譽快照預覽",
-                    )
+                    from .outbound_guards import guard_outbound
+                    _snap_reason = guard_outbound(summary, proactive=True)
+                    if _snap_reason:
+                        logger.warning("outbound guard blocked push: %s", _snap_reason)
+                    else:
+                        c = TelegramBotClient(token, ssl_context=ssl_ctx)
+                        c.send_message(chat_id=resolved_chat, text=summary)
+                        c.send_document(
+                            chat_id=resolved_chat,
+                            document_path=pdf_path,
+                            caption="信譽快照 PDF",
+                        )
+                        c.send_photo(
+                            chat_id=resolved_chat,
+                            photo_path=preview_path,
+                            caption="信譽快照預覽",
+                        )
                     for p in (pdf_path, preview_path):
                         try:
                             p.unlink()

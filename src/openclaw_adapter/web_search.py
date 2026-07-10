@@ -1245,3 +1245,71 @@ def _canonical_url_key(url: str) -> str:
 
 def _compact_whitespace(value: str) -> str:
     return " ".join(unescape(value).split()).strip()
+
+
+_GATE_PROMPT_TMPL = (
+    "You decide whether a task requires a live web search.\n"
+    "Task: {task}\n"
+    "Seed material already in hand (may be empty):\n{seed}\n\n"
+    'Reply with STRICT JSON only: {{"search_needed": true or false, "reason": "one sentence"}}.\n'
+    "Output ONLY the JSON object, no other text."
+)
+_GATE_SEED_CAP = 1500
+
+
+def search_need_gate(
+    task: str,
+    seed_summary: str,
+    *,
+    endpoint: str,
+    model: str,
+    timeout_seconds: int,
+    ssl_context: ssl.SSLContext | None = None,
+) -> bool:
+    """Return True if the LLM judges a web search is needed; fail-open on any error."""
+    seed = _truncate(seed_summary.strip(), _GATE_SEED_CAP)
+    prompt = _GATE_PROMPT_TMPL.format(task=task.strip(), seed=seed or "(none)")
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "format": "json",
+        "think": False,
+        "options": {"temperature": 0.0, "num_predict": 120},
+    }
+    request = Request(
+        _resolve_ollama_generate_url(endpoint),
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+
+    def _parse(raw: str) -> bool | None:
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            return None
+        val = obj.get("search_needed")
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, str):
+            return val.lower() == "true"
+        return None
+
+    for attempt in range(2):
+        try:
+            with urlopen(request, timeout=timeout_seconds, context=ssl_context) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+            response_text = json.loads(body).get("response", "")
+            result = _parse(str(response_text))
+            if result is None:
+                logger.warning("search_need_gate: unparseable response attempt=%d raw=%r", attempt, response_text)
+                continue
+            if not result:
+                logger.info("search gate: skipped (reason=%s)", json.loads(str(response_text)).get("reason", ""))
+            return result
+        except Exception as exc:
+            logger.warning("search_need_gate: LLM unreachable attempt=%d exc=%s; fail-open", attempt, exc)
+            return True
+    logger.warning("search_need_gate: both parse attempts failed; fail-open")
+    return True

@@ -234,7 +234,11 @@ class _GeminiRouterClient:
         request = Request(
             url,
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json, application/rss+xml, application/xml, text/html, text/plain, */*",
+                "User-Agent": "aka_no_claw/1.0 (+https://github.com/jojojen/aka_no_claw; personal-use bot)",
+            },
             method="POST",
         )
         ssl_context = (

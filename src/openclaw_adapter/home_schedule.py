@@ -28,7 +28,7 @@ import os
 import re
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
@@ -114,6 +114,41 @@ def schedule_due(entry: dict, now: datetime) -> bool:
     if _weekday_key(now) not in days:
         return False
     return now.strftime("%H:%M") == (sched.get("time") or "")
+
+
+def next_fire_times(entry: dict, now: datetime, count: int = 3) -> list[datetime]:
+    """Return the next *count* datetimes at which *entry* would fire.
+
+    Scans forward day by day (up to 15 days max). Returns times in local time
+    with the same tzinfo as *now*. If *now*'s time already passed today's
+    configured time, starts searching from tomorrow. Returns [] if time is
+    invalid, disabled, or days is empty.
+    """
+    sched = entry.get("schedule") or {}
+    time_str = sched.get("time") or ""
+    if not is_valid_time(time_str):
+        return []
+    if not entry.get("enabled", True):
+        return []
+    days = normalize_days(sched.get("days"))
+    if not days:
+        return []
+
+    hh, mm = int(time_str[:2]), int(time_str[3:5])
+    fires: list[datetime] = []
+    candidate = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if candidate <= now:
+        candidate += timedelta(days=1)
+
+    max_scans = 15
+    for _ in range(max_scans):
+        if _weekday_key(candidate) in days:
+            fires.append(candidate)
+            if len(fires) >= count:
+                return fires
+        candidate += timedelta(days=1)
+
+    return fires
 
 
 def run_schedule_commands(

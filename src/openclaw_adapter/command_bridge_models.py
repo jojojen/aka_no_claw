@@ -63,6 +63,7 @@ EVENT_HEARTBEAT = "heartbeat"
 EVENT_DONE = "done"
 EVENT_ERROR = "error"
 EVENT_REDIRECT = "redirect"
+EVENT_PROCESS = "process"
 
 DEFAULT_SOURCE = "aka_no_claw_web"
 
@@ -493,6 +494,10 @@ def stream_done(
 
 def stream_error(message: str) -> dict[str, object]:
     return {"type": EVENT_ERROR, "message": message}
+
+
+def stream_process(text: str) -> dict[str, object]:
+    return {"type": EVENT_PROCESS, "text": text}
 
 
 def stream_redirect(

@@ -1478,6 +1478,60 @@ CODEGEN_SEED: tuple[dict, ...] = (
         ],
         "confidence": 0.85,
     },
+    {
+        "category": "data_fetch",
+        "title": "網路請求必須設 timeout 並包重試迴圈",
+        "technique": (
+            "所有 urllib.request.urlopen / requests.get 呼叫都必須傳入明確的 timeout（秒），"
+            "不可依賴系統預設（系統預設常常是無限等待）。\n"
+            "  urllib 寫法：urllib.request.urlopen(req, timeout=20)\n"
+            "  requests 寫法：requests.get(url, timeout=20)\n"
+            "此外，短暫的連線重置（Connection reset by peer）是正常的暫態網路錯誤，"
+            "不代表端點本身壞掉。正確做法是在 urlopen/get 外包一個小型重試迴圈（2–3 次），"
+            "每次失敗後等幾秒（3–5 秒）再試，只有重試全部耗盡才向上拋例外：\n"
+            "  for _attempt in range(3):\n"
+            "      try:\n"
+            "          with urllib.request.urlopen(req, timeout=20) as r:\n"
+            "              data = r.read()\n"
+            "          break\n"
+            "      except Exception:\n"
+            "          if _attempt < 2:\n"
+            "              time.sleep(3)\n"
+            "          else:\n"
+            "              raise\n"
+            "不要忽略 timeout 或省略重試——產生的工具在排程/自動化情境下執行時，"
+            "一次暫態錯誤就足以讓整個工作流步驟失敗。"
+        ),
+        "keywords": [
+            "*", "urlopen", "requests", "http", "fetch", "timeout", "connection reset",
+            "retry", "重試", "network", "網路", "transient", "暫態", "urllib", "error",
+        ],
+        "confidence": 0.95,
+    },
+    {
+        "category": "concurrency",
+        "title": "延遲初始化的單例互相呼叫時，非重入鎖會自我死鎖",
+        "technique": (
+            "兩個（或多個）lazy-init 單例各自用 threading.Lock() 保護，"
+            "而其中一個的初始化流程又會呼叫到另一個時，同一條執行緒可能"
+            "重新進入自己已持有的鎖——threading.Lock 不可重入，於是永遠卡死，"
+            "而且外觀上行程還活著、其他功能照常運作，只有踩到那條路徑的請求全部懸掛。\n"
+            "判斷徵兆：某類請求（尤其是『服務啟動後的第一個』該類請求）無限懸掛，"
+            "其他請求正常；執行緒傾印顯示多條執行緒等同一把鎖但找不到持有者在做事。\n"
+            "修法（擇一）：\n"
+            "  1) 打破環：初始化時不要急切（eager）解析對方，改註冊一個"
+            "     lazy proxy / 閉包，等真正被呼叫（dispatch 時、已離開鎖）才解析；\n"
+            "  2) 用 threading.RLock() —— 但這只治標，環仍在，之後改動容易再爆；\n"
+            "  3) 重排初始化順序，讓依賴單向化。\n"
+            "通則：持有鎖的區段內，不要呼叫任何『可能反過來呼叫自己模組』的函式。"
+        ),
+        "keywords": [
+            "*", "deadlock", "死鎖", "lock", "threading", "lazy", "singleton",
+            "初始化", "init", "hang", "懸掛", "卡住", "re-entrant", "RLock",
+            "concurrency", "併發",
+        ],
+        "confidence": 0.9,
+    },
 )
 
 

@@ -2115,3 +2115,125 @@ def test_format_result_failure_string(tmp_path):
     out = runner._format_result(DynamicToolResult(ok=False, error="boom", generations=0))
     assert "⚠️ 無法完成" in out
     assert "boom" in out
+
+
+# ---------------------------------------------------------------------------
+# run_tool_step: retry, traceback compression, knowledge_db seed
+# ---------------------------------------------------------------------------
+
+def _setup_tool_step(runner, slug: str, tool_code: str = GOOD_SCRIPT) -> None:
+    """Write manifest entry + tool.py so run_tool_step can find the tool."""
+    tools_dir = runner.tools_dir
+    tools_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = tools_dir / "manifest.json"
+    existing = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else []
+    existing.append({
+        "slug": slug,
+        "request": slug,
+        "tool_type": "query",
+        "param_schema": [{"name": "q", "type": "str"}],
+        "path": f"{slug}/tool.py",
+    })
+    manifest_path.write_text(json.dumps(existing, ensure_ascii=False), encoding="utf-8")
+    tool_dir = tools_dir / slug
+    tool_dir.mkdir(parents=True, exist_ok=True)
+    (tool_dir / "tool.py").write_text(tool_code, encoding="utf-8")
+
+
+def test_run_tool_step_retries_on_transient_failure(tmp_path, monkeypatch):
+    """_install_and_execute fails once then succeeds → ok result; sleep called once."""
+    import openclaw_adapter.dynamic_tools as dt_module
+
+    sleep_calls = []
+    monkeypatch.setattr(dt_module, "_RETRY_SLEEP", lambda s: sleep_calls.append(s))
+
+    runner = _make_runner(tmp_path, FakeClient(code_responses=[]))
+    slug = "weather_step"
+    _setup_tool_step(runner, slug)
+
+    results = [
+        DynamicToolResult(ok=False, slug=slug, error="Connection reset"),
+        DynamicToolResult(ok=True, slug=slug, answer="東京 20°C"),
+    ]
+
+    def fake_install(s, tp, code):
+        return results.pop(0)
+
+    runner._install_and_execute = fake_install
+
+    ok, text = runner.run_tool_step(slug, {})
+    assert ok
+    assert "東京 20°C" in text
+    assert len(sleep_calls) == 1
+    assert sleep_calls[0] == 5
+
+
+def test_run_tool_step_exhausted_retries_traceback_compressed(tmp_path, monkeypatch):
+    """All 3 attempts fail with a traceback-bearing error → terse last line returned;
+    raw traceback body must NOT appear in the returned text."""
+    import openclaw_adapter.dynamic_tools as dt_module
+
+    monkeypatch.setattr(dt_module, "_RETRY_SLEEP", lambda s: None)
+
+    runner = _make_runner(tmp_path, FakeClient(code_responses=[]))
+    slug = "weather_step"
+    _setup_tool_step(runner, slug)
+
+    tb_error = (
+        "Traceback (most recent call last):\n"
+        '  File "tool.py", line 15, in <module>\n'
+        "    with urllib.request.urlopen(req) as response:\n"
+        "  File \"/usr/lib/python3/urllib/request.py\", line 216, in urlopen\n"
+        "    return opener.open(url, data, timeout)\n"
+        "urllib.error.URLError: <urlopen error [Errno 54] Connection reset by peer>"
+    )
+
+    def fake_install(s, tp, code):
+        return DynamicToolResult(ok=False, slug=s, error=tb_error)
+
+    runner._install_and_execute = fake_install
+
+    ok, text = runner.run_tool_step(slug, {})
+    assert not ok
+    assert "Traceback (most recent call last)" not in text
+    assert "urllib.error.URLError" in text
+    assert "Connection reset by peer" in text
+    assert "已重試" in text
+
+
+def test_run_tool_step_non_traceback_error_passes_through(tmp_path, monkeypatch):
+    """A plain error (no traceback) is returned unchanged after retries."""
+    import openclaw_adapter.dynamic_tools as dt_module
+
+    monkeypatch.setattr(dt_module, "_RETRY_SLEEP", lambda s: None)
+
+    runner = _make_runner(tmp_path, FakeClient(code_responses=[]))
+    slug = "weather_step"
+    _setup_tool_step(runner, slug)
+
+    plain_error = "工具 'weather_step' 的 catalog 存在但執行失敗: some plain error"
+
+    def fake_install(s, tp, code):
+        return DynamicToolResult(ok=False, slug=s, error=plain_error)
+
+    runner._install_and_execute = fake_install
+
+    ok, text = runner.run_tool_step(slug, {})
+    assert not ok
+    assert plain_error in text
+
+
+def test_knowledge_db_codegen_seed_imports_and_network_entry_present():
+    """knowledge_db imports cleanly and contains the network-fetch retry seed entry."""
+    from openclaw_adapter.knowledge_db import CODEGEN_SEED
+
+    assert isinstance(CODEGEN_SEED, tuple)
+    assert len(CODEGEN_SEED) > 0
+    titles = [entry["title"] for entry in CODEGEN_SEED]
+    assert "網路請求必須設 timeout 並包重試迴圈" in titles
+
+    entry = next(e for e in CODEGEN_SEED if e["title"] == "網路請求必須設 timeout 並包重試迴圈")
+    assert entry["category"] == "data_fetch"
+    assert entry["confidence"] >= 0.9
+    assert "timeout" in entry["technique"]
+    assert "retry" in " ".join(entry["keywords"]) or "重試" in " ".join(entry["keywords"])

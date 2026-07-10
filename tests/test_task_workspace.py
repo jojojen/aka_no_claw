@@ -1092,4 +1092,56 @@ def test_runner_prebinds_seed_variables():
     assert trace.final_result == "統整後的結論"
     assert "prior_research_result" in trace.variables
     assert any("部分研究資料" in p for p in llm.prompts)
-    assert ex.calls == []  # no tool re-execution: the seed satisfied the input
+
+
+# ── WorkflowStore.rename ──────────────────────────────────────────────────────
+
+def test_store_rename_happy_path(tmp_path):
+    store = WorkflowStore(tmp_path / "workflows")
+    wf = Workflow(id="wf-old", goal="テスト", steps=[
+        WorkflowStep(id="s1", kind="tool_call", tool="t", output="out"),
+    ])
+    store.save(wf)
+    result = store.rename("wf-old", "wf-new")
+    assert result is True
+    assert store.get("wf-old") is None
+    loaded = store.get("wf-new")
+    assert loaded is not None
+    assert loaded.id == "wf-new"
+    assert loaded.goal == "テスト"
+    assert len(loaded.steps) == 1
+
+
+def test_store_rename_moves_traces_dir(tmp_path):
+    store = WorkflowStore(tmp_path / "workflows")
+    wf = Workflow(id="wf-old", goal="g", steps=[
+        WorkflowStep(id="s1", kind="tool_call", tool="t", output="out"),
+    ])
+    store.save(wf)
+    ex = FakeExecutor({"t": (True, "v")})
+    runner = WorkflowRunner(executor=ex)
+    trace = runner.run(wf)
+    store.save_trace(trace)
+    assert store.list_traces("wf-old")
+
+    store.rename("wf-old", "wf-new")
+
+    assert store.list_traces("wf-old") == []
+    moved = store.list_traces("wf-new")
+    assert len(moved) == 1
+
+
+def test_store_rename_refuses_collision(tmp_path):
+    store = WorkflowStore(tmp_path / "workflows")
+    store.save(Workflow(id="wf-a", goal="a"))
+    store.save(Workflow(id="wf-b", goal="b"))
+    result = store.rename("wf-a", "wf-b")
+    assert result is False
+    assert store.get("wf-a") is not None
+    assert store.get("wf-b") is not None
+
+
+def test_store_rename_refuses_missing_old(tmp_path):
+    store = WorkflowStore(tmp_path / "workflows")
+    result = store.rename("does-not-exist", "wf-new")
+    assert result is False

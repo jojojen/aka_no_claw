@@ -170,11 +170,18 @@ def _render_command_picker(command_registry=None) -> tuple[str, dict]:
 class WorkflowEditor:
     """Per-chat card editor for building and modifying Workflows."""
 
-    def __init__(self, store: WorkflowStore, command_registry=None, catalog=None) -> None:
+    def __init__(
+        self,
+        store: WorkflowStore,
+        command_registry=None,
+        catalog=None,
+        on_id_renamed: Callable[[str, str], None] | None = None,
+    ) -> None:
         self._store = store
         self._sessions: dict[str, _EditorSession] = {}
         self._command_registry = command_registry
         self._catalog = catalog
+        self._on_id_renamed = on_id_renamed
 
     # ── Public entry points ───────────────────────────────────────────────────
 
@@ -216,6 +223,18 @@ class WorkflowEditor:
         )
         self._sessions[str(chat_id)] = session
         return f"✏️ 為 *{wf.id}* 輸入新名稱（目前：{wf.goal}）：", _cancel_markup()
+
+    def start_renameid(self, chat_id: str, workflow_id: str) -> tuple[str, dict]:
+        """Begin a capture session for renaming the workflow's slug (ID field).
+        The next plain-text message becomes the new ID; validated then saved."""
+        wf = self._store.get(workflow_id)
+        if wf is None:
+            return f"找不到 workflow '{workflow_id}'", {}
+        session = _EditorSession(
+            chat_id=str(chat_id), workflow=_clone_workflow(wf), collecting="renameid"
+        )
+        self._sessions[str(chat_id)] = session
+        return f"✏️ 為 *{wf.id}* 輸入新代號（目前：{wf.id}）：", _cancel_markup()
 
     def start_from_draft(self, chat_id: str, workflow: Workflow) -> tuple[str, dict]:
         """Open the editor card pre-populated with an LLM-generated draft.
@@ -262,6 +281,8 @@ class WorkflowEditor:
             return self._collect_goal(text, session)
         if session.collecting == "rename":
             return self._collect_rename(text, session)
+        if session.collecting == "renameid":
+            return self._collect_renameid(text, session)
         # Step-level field collection
         if session.adding is not None and session.adding.collecting is not None:
             return self._advance_add(text, session)
@@ -301,6 +322,36 @@ class WorkflowEditor:
         self._store.save(session.workflow)
         card_text, markup = _render_editor_card(session)
         return f"✅ 已改名為：{new_name}\n\n{card_text}", markup
+
+    def _collect_renameid(
+        self, text: str, session: _EditorSession
+    ) -> tuple[str, dict]:
+        import re
+        raw = text.strip()
+        if not raw:
+            return "代號不能為空，請重新輸入：", _cancel_markup()
+        new_id = raw.replace(" ", "-").lower()
+        if not re.fullmatch(r"[a-z0-9_\-]+", new_id):
+            return (
+                f"代號格式錯誤（只允許小寫英數字、`-`、`_`，不可含空格）：",
+                _cancel_markup(),
+            )
+        old_id = session.workflow.id
+        ok = self._store.rename(old_id, new_id)
+        if not ok:
+            return (
+                f"⚠️ 改代號失敗（'{new_id}' 已存在或 '{old_id}' 找不到），請輸入其他代號：",
+                _cancel_markup(),
+            )
+        session.workflow.id = new_id
+        session.collecting = None
+        if self._on_id_renamed is not None:
+            try:
+                self._on_id_renamed(old_id, new_id)
+            except Exception:
+                logger.warning("workflow_editor: on_id_renamed callback failed")
+        card_text, markup = _render_editor_card(session)
+        return f"✅ 已將代號改為：{new_id}\n\n{card_text}", markup
 
     def _advance_add(
         self, text: str, session: _EditorSession

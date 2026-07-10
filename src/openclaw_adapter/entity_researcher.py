@@ -34,7 +34,7 @@ from .knowledge_db import (
     NO_DATA_SUMMARY,
     _normalize_canonical,
 )
-from .web_search import WebSearchResult, web_search
+from .web_search import WebSearchResult, search_need_gate, web_search
 
 logger = logging.getLogger(__name__)
 
@@ -197,9 +197,20 @@ class EntityResearcher:
         self._timeout_seconds = timeout_seconds
         self._ssl_context = ssl_context
         self._max_search_results = max(1, min(8, max_search_results))
-        self._search_fn = search_fn or (
-            lambda query, limit: web_search(query, max_results=limit)
-        )
+        if search_fn is not None:
+            self._search_fn = search_fn
+        else:
+            def _gated_search(query, limit, _self=self):
+                if not search_need_gate(
+                    query, "",
+                    endpoint=_self._endpoint,
+                    model=_self._model,
+                    timeout_seconds=_self._timeout_seconds,
+                    ssl_context=_self._ssl_context,
+                ):
+                    return ()
+                return web_search(query, max_results=limit)
+            self._search_fn = _gated_search
         # Lazy import to avoid circular dependency with opportunity_agent
         # (which already houses the canonical _call_ollama_json helper).
         if json_call_fn is not None:
