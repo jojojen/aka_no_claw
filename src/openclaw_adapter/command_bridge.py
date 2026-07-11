@@ -2487,10 +2487,19 @@ class CommandBridge:
         name = str(getattr(registered, "chat_tool_display_name", "") or "").strip()
         return name or command
 
+    def _local_judgment_model(self) -> str:
+        """Hidden judgment calls (tool plan / satisfaction / goal drafts) run
+        on the dedicated local text model, NOT the chat-pool model: the pool
+        choice tunes user-visible answers (speed/style) and may be a small
+        code model, which live-probed 6/12 on planning vs 12/12 for the text
+        model — including truncating multi-step requests to a single step."""
+        raw = (self.settings.openclaw_local_text_model or "").split(",")[0].strip()
+        return raw or self._local_model()
+
     def _generate_local_chat_tool_plan(self, prompt: str) -> tuple[str, ModelMetadata]:
         from .dynamic_tools import OllamaTextClient
 
-        model = self._local_model()
+        model = self._local_judgment_model()
         client = OllamaTextClient(
             endpoint=self.settings.openclaw_local_text_endpoint,
             model=model,

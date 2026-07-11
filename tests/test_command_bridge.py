@@ -1034,6 +1034,35 @@ def test_chat_tool_satisfaction_parser_accepts_wrapped_json():
     }
 
 
+def test_local_chat_tool_plan_uses_judgment_model_not_pool_override(monkeypatch, tmp_path):
+    # The web-UI chat pool may pin the local CHAT model to a small code model;
+    # hidden judgment calls (tool plan / satisfaction / goal drafts) must keep
+    # using the dedicated local text model (live-probed 12/12 vs 6/12, the
+    # small model even truncated multi-step requests to a single step).
+    pool_path = tmp_path / "llm_pool.json"
+    pool_path.write_text(
+        '{"providers": {"local": {"enabled": true, "model": "tiny-coder:1b"}}}',
+        encoding="utf-8",
+    )
+    b = CommandBridge(settings=_tool_settings(llm_pool_config_path=str(pool_path)))
+    assert b._local_model() == "tiny-coder:1b"
+    assert b._local_judgment_model() == "qwen3:14b"
+
+    seen = {}
+
+    class _Client:
+        def __init__(self, *, endpoint, model, timeout_seconds, keep_alive=None):
+            seen["model"] = model
+
+        def generate(self, prompt, *, temperature=0.0):
+            return '{"tool":"__no_tool__","answer":"ok","reason_summary":"r"}'
+
+    monkeypatch.setattr("openclaw_adapter.dynamic_tools.OllamaTextClient", _Client)
+    text, metadata = b._generate_local_chat_tool_plan("prompt")
+    assert seen["model"] == "qwen3:14b"
+    assert metadata.to_dict()["final_model"] == "qwen3:14b"
+
+
 def test_chat_tool_satisfaction_parser_reads_environment_blocked():
     parsed = CommandBridge._parse_chat_tool_satisfaction(
         '{"satisfied": false, "environment_blocked": true, "reason": "裝置無法連線"}'
