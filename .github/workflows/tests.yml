@@ -51,27 +51,34 @@ jobs:
       # index (price-monitor-bot/telegram-core/telegram-nl/sns-monitor-bot
       # are declared as bare names in pyproject.toml precisely because they
       # only resolve via local editable installs), so sys.path injection via
-      # PYTHONPATH below is the substitute until #73 lands a pinned-revision
-      # install path.
+      # PYTHONPATH below is the substitute. Revisions are NOT floating: the
+      # step below detaches each checkout to the full SHA pinned in
+      # config/workspace-lock.toml (#73), which is the single source of
+      # truth for CI/deploy resolution. fetch-depth: 0 is required so the
+      # pinned SHA is reachable even when the default branch has moved on.
       - uses: actions/checkout@v4
         with:
           repository: jojojen/price_monitor_bot
           path: _deps/price_monitor_bot
+          fetch-depth: 0
 
       - uses: actions/checkout@v4
         with:
           repository: jojojen/telegram_nl
           path: _deps/telegram_nl
+          fetch-depth: 0
 
       - uses: actions/checkout@v4
         with:
           repository: jojojen/telegram_core
           path: _deps/telegram_core
+          fetch-depth: 0
 
       - uses: actions/checkout@v4
         with:
           repository: jojojen/sns_monitor_bot
           path: _deps/sns_monitor_bot
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -86,6 +93,41 @@ jobs:
             imagehash pillow \
             twikit python-dotenv \
             SudachiPy SudachiDict-full
+
+      - name: Resolve siblings to workspace-lock revisions (#73)
+        run: |
+          python - <<'RESOLVE'
+          import subprocess, sys, tomllib
+          from pathlib import Path
+
+          with open("config/workspace-lock.toml", "rb") as f:
+              lock = tomllib.load(f)
+
+          for name, pkg in lock["packages"].items():
+              repo_dir = pkg["repository"].rstrip("/").removesuffix(".git").rsplit("/", 1)[-1]
+              path = Path("_deps") / repo_dir
+              if not path.is_dir():
+                  sys.exit(f"FATAL: sibling checkout missing for {name}: {path}")
+              rev = pkg["revision"]
+              subprocess.run(
+                  ["git", "-C", str(path), "checkout", "--detach", rev],
+                  check=True,
+              )
+              head = subprocess.run(
+                  ["git", "-C", str(path), "rev-parse", "HEAD"],
+                  capture_output=True, text=True, check=True,
+              ).stdout.strip()
+              if head != rev:
+                  sys.exit(f"FATAL: {name} HEAD {head} != pinned {rev}")
+              print(f"{name}: pinned to {rev}")
+          RESOLVE
+
+      - name: Validate workspace against lock manifest (strict)
+        run: |
+          PYTHONPATH=src python -m openclaw_adapter.workspace_validator \
+            --lock-file config/workspace-lock.toml \
+            --workspace-root _deps \
+            --strict
 
       - name: Print resolved sibling revisions
         run: |
