@@ -112,6 +112,11 @@ from .command_bridge_models import (
     stream_redirect,
     stream_start,
 )
+from .continuation_policy import (
+    ContinuationAction,
+    classify_outcome,
+    decide_continuation,
+)
 from .goal_loop import GoalLoop, GoalLoopContinuation, GoalLoopReport
 from .goal_planner import GoalPlanner
 from .task_loop import (
@@ -228,6 +233,24 @@ _GOAL_RESULT_SATISFACTION_PROMPT = """你要判斷「執行結果」是否已真
 
 執行結果：
 {final_result}
+"""
+_GOAL_CONSERVATIVE_SYNTHESIS_PROMPT = """已經盡力但沒能完全達成目標。請根據「目前已取得的證據」，
+給使用者一個誠實、保守、可用的最終回答。
+
+規則：
+1. 只根據下方證據作答，不要編造沒有出現的數字或事實。
+2. 先給出在現有證據下能給的最佳結論或建議（即使只是暫時、有條件的）。
+3. 明確指出仍然缺少、無法確認、或需要進一步查證的部分（參考下方「未達成原因」）。
+4. 用使用者的語言，自然地回答，不要輸出 JSON，也不要描述你的內部流程。
+
+任務目標：
+{goal}
+
+未達成原因（最後一次判斷）：
+{last_reason}
+
+目前已取得的證據：
+{evidence}
 """
 _CHAT_ROLE_LABELS = {"user": "使用者", "assistant": "助理", "system": "系統"}
 # Conversation-context budget for the satisfaction judge / goal-loop seeds.
@@ -2034,6 +2057,9 @@ class CommandBridge:
             narrator=narrator,
             result_judge=self._goal_result_judge(chat_backend, pool_rotation=pool_rotation),
             seed_variables=seed_variables,
+            conservative_synthesizer=self._goal_conservative_synthesizer(
+                chat_backend, pool_rotation=pool_rotation
+            ),
         )
         report = loop.run(resume=resume)
         logger.info(
@@ -2984,19 +3010,31 @@ class CommandBridge:
         except Exception:  # noqa: BLE001
             logger.exception("chat tool satisfaction check failed tool=%s", plan.tool)
             return None
-        if bool(verdict.get("satisfied")):
+        outcome = classify_outcome(
+            verdict,
+            tool=plan.tool,
+            query=plan.query,
+            answer=tool_result.answer,
+            source_count=tool_result.source_count,
+        )
+        action = decide_continuation(outcome)
+        if action is ContinuationAction.ANSWER:
             return None
-        if bool(verdict.get("environment_blocked")):
+        if action is ContinuationAction.SURFACE_FAILURE:
             # Replanning cannot route around an unreachable device / blocked
             # network: surface the tool's own failure reply (it carries the
             # recovery hint) instead of drafting a doomed workflow.
             logger.info(
-                "[chat-tool] tool=%s unsatisfied but environment-blocked -> "
-                "report failure, skip goal loop",
+                "[chat-tool] tool=%s blocked (%s) -> report failure, skip goal loop",
                 plan.tool,
+                outcome.missing_evidence,
             )
             return None
-        logger.info("[chat-tool] tool=%s unsatisfied -> goal loop", plan.tool)
+        logger.info(
+            "[chat-tool] tool=%s partial -> goal loop (missing=%r)",
+            plan.tool,
+            outcome.missing_evidence,
+        )
         if narrator is not None:
             try:
                 narrator("直接指令沒有完成，我改規劃成多步驟流程並直接執行：")
@@ -3012,6 +3050,11 @@ class CommandBridge:
         context = self._conversation_context_block(req)
         if context:
             seeds["conversation_context"] = context
+        # The judge's own reason for "not yet complete" — passed forward so a
+        # replan targets only what's missing, and so conservative synthesis on
+        # exhaustion can state plainly what stayed unknown (no keyword rules).
+        if outcome.missing_evidence:
+            seeds["missing_evidence"] = outcome.missing_evidence
         response = self._run_goal_loop_blocking(
             req,
             user_input,
@@ -3060,6 +3103,39 @@ class CommandBridge:
             return bool(parsed.get("satisfied")), str(parsed.get("reason") or "")
 
         return judge
+
+    def _goal_conservative_synthesizer(
+        self,
+        chat_backend: str,
+        *,
+        pool_rotation: "CloudPoolRotation | None" = None,
+    ) -> Callable[[str, dict[str, str], str], str]:
+        """Best-effort answer builder for a goal loop that exhausted its replan
+        budget. Reuses the satisfaction backend chain (chosen → local fallback).
+        Generic: it only relays goal + gathered evidence + last judge reason to
+        the LLM; no domain rules about what "complete" means."""
+
+        def synthesize(goal: str, seeds: dict[str, str], last_reason: str) -> str:
+            evidence_lines = [
+                f"- {name}：{_clip(str(value), 1200)}"
+                for name, value in seeds.items()
+                if str(value).strip()
+            ]
+            evidence = "\n".join(evidence_lines) or "（無）"
+            prompt = _GOAL_CONSERVATIVE_SYNTHESIS_PROMPT.format(
+                goal=goal.strip(),
+                last_reason=(last_reason or "（無說明）").strip(),
+                evidence=evidence,
+            )
+            text = self._generate_chat_tool_satisfaction_text(
+                chat_backend, prompt, pool_rotation=pool_rotation
+            ).strip()
+            logger.info(
+                "[goal-loop] conservative synthesis produced %d chars", len(text)
+            )
+            return text
+
+        return synthesize
 
     def _conversation_context_block(self, req: WebCommandRequest) -> str:
         """Compact conversational context (recent visible turns + the tool

@@ -88,6 +88,7 @@ class GoalLoop:
         narrator: Callable[[str], None] | None = None,
         result_judge: Callable[[str, str], tuple[bool, str]] | None = None,
         seed_variables: dict[str, str] | None = None,
+        conservative_synthesizer: Callable[[str, dict[str, str], str], str] | None = None,
     ) -> None:
         self.goal = goal
         self.planner = planner
@@ -100,6 +101,13 @@ class GoalLoop:
         self.replan_limit = replan_limit
         self.narrator = narrator
         self.result_judge = result_judge
+        # Optional best-effort answer builder used ONLY when the loop exhausts
+        # its replan budget with the goal still unmet. Given the goal, the
+        # evidence gathered so far, and the last judge reason, it returns a
+        # hedged answer that states what stayed unknown. When absent, the loop
+        # keeps its previous behaviour (abort with the raw failure), so no
+        # existing multi-step flow changes.
+        self.conservative_synthesizer = conservative_synthesizer
         # Results that already exist before this run (e.g. a chat tool that just
         # completed, or succeeded steps from a previous workflow attempt). They
         # are pre-bound in the runner and shown to the planner so plans consume
@@ -114,6 +122,13 @@ class GoalLoop:
             "needs_replan": False,
             "pause_reason": None,
             "abort": None,
+            # Set when the replan budget is spent with the goal still unmet;
+            # distinguishes that terminal case from other aborts so only it
+            # gets conservative synthesis.
+            "exhausted": False,
+            # Last judge reason for "goal not achieved", forwarded to the
+            # conservative synthesizer so it can name what stayed unknown.
+            "last_reason": "",
             "narration": list(resume.narration) if resume is not None else [],
             "seeds": dict(self.seed_variables),
             # Static type (plain_text/speech_text/command_result/...) each seed
@@ -149,6 +164,21 @@ class GoalLoop:
         narration = tuple(scratch["narration"])
 
         if scratch["abort"]:
+            if scratch.get("exhausted") and self.conservative_synthesizer is not None:
+                synthesized = self._synthesize_conservative(scratch)
+                if synthesized:
+                    self._narrate(
+                        scratch,
+                        "已用盡重規劃額度，改以現有證據給出保守結論（明示仍缺的部分）。",
+                    )
+                    return GoalLoopReport(
+                        done=True,
+                        final_result=synthesized,
+                        workflow=workflow,
+                        trace=trace,
+                        replans_used=int(scratch["replans_used"]),
+                        narration=tuple(scratch["narration"]),
+                    )
             return GoalLoopReport(
                 done=False,
                 final_result=str(scratch["abort"]),
@@ -341,6 +371,7 @@ class GoalLoop:
                 achieved, reason = self._judge_result(scratch, trace.final_result or "")
                 if not achieved:
                     scratch["needs_replan"] = True
+                    scratch["last_reason"] = reason or scratch.get("last_reason") or ""
                     self._narrate(
                         scratch,
                         f"結果未達成目標：{reason or '（無說明）'}，準備重新規劃",
@@ -435,6 +466,7 @@ class GoalLoop:
             # judge rejected the result), so it must be checked first.
             if scratch["needs_replan"] and scratch["replans_used"] >= self.replan_limit:
                 scratch["abort"] = trace.final_result or "replan limit reached"
+                scratch["exhausted"] = True
                 return ""
             if scratch["needs_replan"]:
                 return "replan"
@@ -484,6 +516,30 @@ class GoalLoop:
             self._narrate(scratch, f"結果檢查不可用（{exc}），視為完成")
             return True, ""
         return bool(achieved), str(reason or "")
+
+    def _synthesize_conservative(self, scratch: dict) -> str:
+        """Best-effort answer when the replan budget is spent and the goal is
+        still unmet. Hands the gathered evidence + last judge reason to the
+        injected synthesizer; a failure here just falls back to the raw abort."""
+        if self.conservative_synthesizer is None:
+            return ""
+        seeds = {
+            name: str(value)
+            for name, value in (scratch.get("seeds") or {}).items()
+            if str(value).strip()
+        }
+        if not seeds:
+            return ""
+        self._narrate(scratch, "以現有證據合成保守結論…")
+        try:
+            answer = self.conservative_synthesizer(
+                self.goal, seeds, str(scratch.get("last_reason") or "")
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("goal_loop: conservative synthesizer failed")
+            self._narrate(scratch, f"保守合成不可用（{exc}）")
+            return ""
+        return str(answer or "").strip()
 
     def _narrate(self, scratch: dict, line: str) -> None:
         scratch["narration"].append(line)

@@ -451,3 +451,63 @@ def test_goal_loop_replan_seed_keeps_speech_text_type_for_saynow():
     report = loop.run(resume=cont)
     assert report.done is True
     assert saynow_calls == ["おやすみなさいませ、ご主人様"]
+
+
+def test_goal_loop_conservative_synthesis_on_replan_exhaustion():
+    """When the replan budget is spent with the goal still unmet, an injected
+    conservative synthesizer turns gathered evidence + the last judge reason
+    into a best-effort answer instead of aborting with a raw failure string."""
+    workflow = _workflow_with_tool("partial_tool", wf_id="wf-partial")
+    planner = _FakePlanner(drafts=[(workflow, None, False)])
+    executor = _FakeExecutor({"partial_tool": (True, "市價約 ¥16000")})
+
+    def judge(goal: str, final_result: str):
+        return False, "只給了市價，未計算獲利"
+
+    captured: dict = {}
+
+    def synth(goal: str, seeds: dict, last_reason: str) -> str:
+        captured["goal"] = goal
+        captured["seeds"] = dict(seeds)
+        captured["last_reason"] = last_reason
+        return "保守結論：市價約¥16000，但尚未計入鑑定費，無法確認淨利。"
+
+    loop = GoalLoop(
+        goal="這張卡送鑑定轉賣會賺嗎",
+        planner=planner,
+        executor=executor,
+        command_registry={},
+        replan_limit=0,
+        result_judge=judge,
+        seed_variables={"prior_research_result": "查到成交紀錄若干"},
+        conservative_synthesizer=synth,
+    )
+    report = loop.run()
+    assert report.done is True
+    assert "保守結論" in report.final_result
+    assert captured["goal"] == "這張卡送鑑定轉賣會賺嗎"
+    assert captured["last_reason"] == "只給了市價，未計算獲利"
+    assert "prior_research_result" in captured["seeds"]
+
+
+def test_goal_loop_exhaustion_without_synthesizer_keeps_raw_abort():
+    """Without a synthesizer, the terminal-exhaustion path is byte-for-byte the
+    old behaviour: done=False with the raw failure result (no regression)."""
+    workflow = _workflow_with_tool("partial_tool", wf_id="wf-partial")
+    planner = _FakePlanner(drafts=[(workflow, None, False)])
+    executor = _FakeExecutor({"partial_tool": (True, "市價約 ¥16000")})
+
+    def judge(goal: str, final_result: str):
+        return False, "只給了市價"
+
+    loop = GoalLoop(
+        goal="會賺嗎",
+        planner=planner,
+        executor=executor,
+        command_registry={},
+        replan_limit=0,
+        result_judge=judge,
+    )
+    report = loop.run()
+    assert report.done is False
+    assert report.final_result == "市價約 ¥16000"
