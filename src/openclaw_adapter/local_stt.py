@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import tempfile
 import threading
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,6 +53,7 @@ class AudioRequest:
     mime_type: str
     suffix: str
     language: str | None = None
+    trusted_duration_seconds: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +70,7 @@ def build_audio_request(
     mime_type: str,
     max_audio_bytes: int,
     language: object = None,
+    trusted_duration_seconds: float | None = None,
 ) -> AudioRequest:
     """Validate already-downloaded audio (used by Telegram voice/audio)."""
     normalized_mime, suffix = validate_audio_mime_type(mime_type)
@@ -76,11 +79,19 @@ def build_audio_request(
     if len(audio) > max_audio_bytes:
         raise SttPayloadTooLarge(f"音訊超過 {max_audio_bytes} bytes 上限。")
     normalized_language = str(language).strip() if language is not None else None
+    if trusted_duration_seconds is not None:
+        if (
+            not isinstance(trusted_duration_seconds, (int, float))
+            or isinstance(trusted_duration_seconds, bool)
+            or trusted_duration_seconds <= 0
+        ):
+            raise SttRequestError("信任的音訊時長必須是正數。")
     return AudioRequest(
         data=audio,
         mime_type=normalized_mime,
         suffix=suffix,
         language=normalized_language or None,
+        trusted_duration_seconds=trusted_duration_seconds,
     )
 
 
@@ -105,6 +116,7 @@ class LocalWhisperTranscriber:
         download_root: str | None = None,
         max_audio_bytes: int = 15 * 1024 * 1024,
         max_duration_seconds: int = 120,
+        beam_size: int = 5,
         model_factory: Callable[..., Any] | None = None,
         duration_probe: Callable[[str, int], float | None] | None = None,
     ) -> None:
@@ -114,6 +126,7 @@ class LocalWhisperTranscriber:
         self.download_root = download_root
         self.max_audio_bytes = max(1, max_audio_bytes)
         self.max_duration_seconds = max(1, max_duration_seconds)
+        self.beam_size = max(1, beam_size)
         # Multipart adds only headers and boundaries; reserve bounded overhead
         # without accepting the 33% base64 expansion of the old JSON contract.
         self.max_request_bytes = self.max_audio_bytes + 256 * 1024
@@ -134,7 +147,15 @@ class LocalWhisperTranscriber:
             download_root=settings.openclaw_stt_download_root,
             max_audio_bytes=settings.openclaw_stt_max_audio_bytes,
             max_duration_seconds=settings.openclaw_stt_max_duration_seconds,
+            beam_size=settings.openclaw_stt_beam_size,
         )
+
+    def prewarm(self) -> None:
+        """Pre-load model to avoid latency on first transcription."""
+        try:
+            self._get_model()
+        except Exception as exc:
+            logger.warning("Model prewarm failed: %s", exc)
 
     def _get_model(self) -> Any:
         if self._model is not None:
@@ -166,26 +187,41 @@ class LocalWhisperTranscriber:
 
     def transcribe(self, request: AudioRequest) -> TranscriptionResult:
         temp_path: str | None = None
+        model_load_ms = 0
+        transcribe_ms = 0
         try:
             with tempfile.NamedTemporaryFile(suffix=request.suffix, delete=False) as temp_file:
                 temp_file.write(request.data)
                 temp_path = temp_file.name
 
-            duration = self._duration_probe(temp_path, self.max_duration_seconds)
-            if duration is not None and duration > self.max_duration_seconds:
-                raise SttPayloadTooLarge(
-                    f"音訊長度超過 {self.max_duration_seconds} 秒上限。"
-                )
+            # Skip duration probe if caller provided trusted_duration_seconds
+            if request.trusted_duration_seconds is not None:
+                duration = request.trusted_duration_seconds
+                if duration > self.max_duration_seconds:
+                    raise SttPayloadTooLarge(
+                        f"音訊長度超過 {self.max_duration_seconds} 秒上限。"
+                    )
+            else:
+                duration = self._duration_probe(temp_path, self.max_duration_seconds)
+                if duration is not None and duration > self.max_duration_seconds:
+                    raise SttPayloadTooLarge(
+                        f"音訊長度超過 {self.max_duration_seconds} 秒上限。"
+                    )
 
+            model_start_ms = time.perf_counter() * 1000
             model = self._get_model()
+            model_load_ms = int(time.perf_counter() * 1000 - model_start_ms)
+
+            transcribe_start_ms = time.perf_counter() * 1000
             with self._transcribe_lock:
                 segments, info = model.transcribe(
                     temp_path,
                     language=request.language,
-                    beam_size=5,
+                    beam_size=self.beam_size,
                     vad_filter=True,
                 )
                 transcript = _join_segments(segments)
+            transcribe_ms = int(time.perf_counter() * 1000 - transcribe_start_ms)
 
             detected_duration = _optional_float(getattr(info, "duration", None))
             if detected_duration is None:
@@ -196,6 +232,17 @@ class LocalWhisperTranscriber:
                 )
             if not transcript:
                 raise SttRequestError("未辨識到可轉換的語音。")
+
+            audio_s = detected_duration or 0.0
+            logger.info(
+                "[voice-latency] stage=stt model_load_ms=%d transcribe_ms=%d audio_s=%.1f model=%s beam=%d",
+                model_load_ms,
+                transcribe_ms,
+                audio_s,
+                self.model_name,
+                self.beam_size,
+            )
+
             return TranscriptionResult(
                 transcript=transcript,
                 language=_optional_str(getattr(info, "language", request.language)),

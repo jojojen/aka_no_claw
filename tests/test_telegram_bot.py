@@ -1477,6 +1477,8 @@ def test_telegram_audio_hook_transcribes_voice_for_existing_text_dispatch(tmp_pa
     assert result == ("播放我最愛的音樂", None)
     assert seen["request"].data == b"telegram voice bytes"
     assert seen["request"].mime_type == "audio/ogg"
+    # Telegram already validated duration; the probe's second decode is skipped.
+    assert seen["request"].trusted_duration_seconds == 2.0
 
 
 def test_handle_telegram_voice_reuses_existing_natural_language_dispatch(tmp_path) -> None:
@@ -2319,3 +2321,45 @@ def test_research_enricher_none_when_no_backend(monkeypatch) -> None:
     )
     settings = AssistantSettings(openclaw_telegram_chat_id="123")
     assert _build_research_appreciation_enricher(settings) is None
+
+
+def test_prewarm_stt_runs_transcriber_prewarm_in_background() -> None:
+    import threading as _threading
+
+    warmed = _threading.Event()
+
+    class FakeTranscriber:
+        max_audio_bytes = 1024
+        max_duration_seconds = 30
+
+        def prewarm(self):
+            warmed.set()
+
+    processor = TelegramCommandProcessor(
+        settings=AssistantSettings(openclaw_telegram_chat_id="123"),
+        stt_transcriber=FakeTranscriber(),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+    )
+
+    processor.prewarm_stt()
+
+    assert warmed.wait(timeout=2.0)
+
+
+def test_constructor_does_not_prewarm_stt() -> None:
+    class FakeTranscriber:
+        max_audio_bytes = 1024
+        max_duration_seconds = 30
+
+        def prewarm(self):
+            raise AssertionError("constructor must not trigger prewarm")
+
+    TelegramCommandProcessor(
+        settings=AssistantSettings(openclaw_telegram_chat_id="123"),
+        stt_transcriber=FakeTranscriber(),
+        lookup_renderer=lambda query: query.name,
+        board_loader=lambda: (_stub_board(),),
+        catalog_renderer=lambda: "catalog",
+    )

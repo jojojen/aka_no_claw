@@ -1565,6 +1565,41 @@ CODEGEN_SEED: tuple[dict, ...] = (
         ],
         "confidence": 0.9,
     },
+    {
+        "category": "validation",
+        "title": "語意相似度快取要加結構性守衛，且只能 fail-open 回慢路徑",
+        "technique": (
+            "用 embedding 相似度做快取/比對時，餘弦分數對三種結構差異「高得騙人」："
+            "（1）只差數字的參數（調到50 vs 調到70）；（2）一文包含另一文"
+            "（『開燈然後放歌』包含已快取的『開燈』→ 命中會把多步驟需求截斷成單步）；"
+            "（3）反義改寫（調高 vs 調低 仍可到 ~0.87）。\n"
+            "對策：門檻之外再加結構性守衛——數字序列必須完全相等、互為嚴格子字串者"
+            "一律拒絕語意命中；守衛擋下的查詢 fail-open 回原本的慢路徑（LLM/完整計算），"
+            "絕不猜。守衛是結構檢查（regex 數字、子字串關係），不是關鍵字表。"
+            "門檻與守衛都要用真實 embedding 模型實測邊際，不可只憑文獻預設值。"
+        ),
+        "keywords": [
+            "embedding", "相似度", "similarity", "cosine", "快取", "cache",
+            "semantic", "語意", "門檻", "threshold", "guard", "守衛",
+        ],
+        "confidence": 0.9,
+    },
+    {
+        "category": "validation",
+        "title": "資料結構經 JSON 往返後型別會退化，重建時要還原",
+        "technique": (
+            "dataclass/物件序列化成 JSON 再讀回來時，tuple 變 list、set 變 list、"
+            "datetime 變 str、int key 變 str——直接 **dict 重建物件會得到"
+            "「欄位值型別跟新鮮物件不一致」的隱性 bug（等值比較、hash、isinstance 都會出錯）。\n"
+            "對策：從快取/檔案/DB 重建物件時，逐欄把 list 還原成宣告的容器型別"
+            "（或用有型別驗證的重建函式），並寫一個「快取重建結果 == 新鮮結果」的等值測試。"
+        ),
+        "keywords": [
+            "json", "serialize", "序列化", "roundtrip", "tuple", "list",
+            "dataclass", "asdict", "快取", "cache", "型別", "type",
+        ],
+        "confidence": 0.9,
+    },
 )
 
 

@@ -2493,6 +2493,7 @@ class CommandBridge:
                 self.settings.openclaw_local_text_timeout_seconds,
                 _ROUTER_TIMEOUT_CAP_SECONDS,
             ),
+            keep_alive="30m",
         )
         text = client.generate(prompt, temperature=0.2)
         metadata = self._model_metadata_for_backend(

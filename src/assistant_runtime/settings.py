@@ -47,6 +47,13 @@ class AssistantSettings:
     # /new codegen backend override. Empty/ollama preserves the local-only
     # behavior; opencode uses the OpenCode Zen OpenAI-compatible endpoint.
     openclaw_codegen_backend: str | None = None
+    # Voice-command semantic intent cache for low-latency routing.
+    openclaw_intent_cache_enabled: bool = True
+    openclaw_intent_cache_threshold: float = 0.93
+    openclaw_intent_cache_ttl_seconds: int = 604800
+    openclaw_intent_cache_path: str = "data/intent_cache.sqlite3"
+    openclaw_local_embed_model: str = "bge-m3"
+    openclaw_stt_beam_size: int = 5
     openclaw_opencode_base_url: str = "https://opencode.ai/zen/v1"
     openclaw_opencode_model: str = "big-pickle"
     openclaw_opencode_api_key: str | None = None
@@ -281,6 +288,25 @@ def get_settings() -> AssistantSettings:
             os.getenv("OPENCLAW_CODEGEN_VALIDATOR_MODEL", "qwen2.5-coder:7b")
         ),
         openclaw_codegen_backend=_none_if_empty(os.getenv("OPENCLAW_CODEGEN_BACKEND")),
+        openclaw_intent_cache_enabled=_as_bool(
+            os.getenv("OPENCLAW_INTENT_CACHE_ENABLED", "true")
+        ),
+        openclaw_intent_cache_threshold=_as_float(
+            os.getenv("OPENCLAW_INTENT_CACHE_THRESHOLD"),
+            default=0.93,
+        ),
+        openclaw_intent_cache_ttl_seconds=_as_int(
+            os.getenv("OPENCLAW_INTENT_CACHE_TTL_SECONDS"),
+            default=604800,
+        ),
+        openclaw_intent_cache_path=_resolve_runtime_path(
+            os.getenv("OPENCLAW_INTENT_CACHE_PATH", "data/intent_cache.sqlite3")
+        ),
+        openclaw_local_embed_model=os.getenv("OPENCLAW_LOCAL_EMBED_MODEL", "bge-m3"),
+        openclaw_stt_beam_size=_as_int(
+            os.getenv("OPENCLAW_STT_BEAM_SIZE"),
+            default=5,
+        ),
         openclaw_opencode_base_url=os.getenv(
             "OPENCLAW_OPENCODE_BASE_URL", "https://opencode.ai/zen/v1"
         ),

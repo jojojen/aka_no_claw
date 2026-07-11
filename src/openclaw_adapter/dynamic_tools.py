@@ -412,12 +412,14 @@ class OllamaTextClient:
     """Minimal stdlib POST to Ollama /api/generate (non-streaming)."""
 
     def __init__(self, *, endpoint: str, model: str, timeout_seconds: int,
-                 num_ctx: int | None = None, num_predict: int | None = None) -> None:
+                 num_ctx: int | None = None, num_predict: int | None = None,
+                 keep_alive: str | None = None) -> None:
         self.endpoint = endpoint.rstrip("/")
         self.model = model
         self.timeout_seconds = max(1, timeout_seconds)
         self.num_ctx = num_ctx
         self.num_predict = num_predict
+        self.keep_alive = keep_alive
 
     def _url(self) -> str:
         path = self.endpoint
@@ -439,6 +441,8 @@ class OllamaTextClient:
             "stream": False,
             "options": options,
         }
+        if self.keep_alive is not None:
+            payload["keep_alive"] = self.keep_alive
         # qwen3 (hybrid reasoning) honors the API-level `think` flag; the older
         # `/no_think` prompt prefix is silently ignored, so the model burns the
         # whole num_predict budget on a <think> block and leaves no answer

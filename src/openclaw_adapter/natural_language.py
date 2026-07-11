@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
@@ -79,6 +82,12 @@ _OPENCLAW_PROMPT_SUFFIX = (
 )
 
 
+def _cache_namespace(tool_spec: str, suffix: str, intents: frozenset[str]) -> str:
+    """Deterministic cache namespace: hash of tool_spec + suffix + sorted intents."""
+    combined = tool_spec + "\x00" + suffix + "\x00" + ",".join(sorted(intents))
+    return hashlib.sha256(combined.encode("utf-8")).hexdigest()[:16]
+
+
 class _PoolAwareRouter:
     """Settings-driven NL router shared with the web chat llm pool."""
 
@@ -86,6 +95,9 @@ class _PoolAwareRouter:
 
     def __init__(self, settings: AssistantSettings) -> None:
         self._settings = settings
+        self._intent_cache = None
+        self._intent_cache_ready = False
+        self._namespace = None
 
     @property
     def descriptor(self) -> str:
@@ -108,8 +120,62 @@ class _PoolAwareRouter:
         content = text.strip()
         if not content:
             return None
+
+        start_ms = time.perf_counter() * 1000
+
+        # Lazy-build cache on first call
+        if not self._intent_cache_ready:
+            self._intent_cache_ready = True
+            try:
+                from .intent_cache import build_intent_cache_from_settings
+
+                self._intent_cache = build_intent_cache_from_settings(self._settings)
+                if self._intent_cache is not None:
+                    self._namespace = _cache_namespace(
+                        self.tool_spec,
+                        _OPENCLAW_PROMPT_SUFFIX,
+                        self._extra_allowed_intents,
+                    )
+            except Exception as exc:
+                logger.warning("[voice-latency] cache init failed: %s", exc)
+                self._intent_cache = None
+
+        # Try cache lookup
+        if self._intent_cache is not None and self._namespace is not None:
+            try:
+                hit = self._intent_cache.lookup(self._namespace, content)
+                if hit is not None:
+                    intent_dict, hit_kind = hit
+                    try:
+                        # JSON round-trip turns tuple fields into lists;
+                        # restore tuples so cached intents match fresh ones.
+                        restored = {
+                            key: tuple(value) if isinstance(value, list) else value
+                            for key, value in intent_dict.items()
+                        }
+                        intent = TelegramNaturalLanguageIntent(**restored)
+                        elapsed_ms = int(time.perf_counter() * 1000 - start_ms)
+                        logger.info(
+                            "[voice-latency] stage=router elapsed_ms=%d cache=hit-%s intent=%s",
+                            elapsed_ms,
+                            hit_kind,
+                            intent.intent,
+                        )
+                        return intent
+                    except (TypeError, ValueError) as exc:
+                        logger.warning("[voice-latency] cache reconstruction failed: %s", exc)
+            except Exception as exc:
+                logger.warning("[voice-latency] cache lookup failed: %s", exc)
+
+        # Cache miss: use LLM routing
         local_router = _build_local_router(self._settings)
         cloud_client = _build_router_cloud_client(self._settings)
+        backend_used = None
+        result = None
+        # A completed cloud call is final even when it normalizes to None;
+        # only a raised cloud failure may fall back to the local router.
+        cloud_completed = False
+
         if cloud_client is not None and local_router is not None:
             try:
                 prompt = local_router._build_prompt(content)
@@ -119,15 +185,45 @@ class _PoolAwareRouter:
                     raise RuntimeError(
                         f"Cloud router returned non-dict: {type(parsed).__name__}"
                     )
-                return _normalize_intent(
+                result = _normalize_intent(
                     parsed,
                     extra_allowed_intents=local_router._extra_allowed_intents,
                 )
+                backend_used = "cloud"
+                cloud_completed = True
             except Exception as exc:
                 logger.warning("Cloud NL router failed, falling back to local: %s", exc)
-        if local_router is None or not provider_enabled(self._settings, "local"):
-            return None
-        return local_router.route(text)
+
+        if result is None and not cloud_completed:
+            if local_router is None or not provider_enabled(self._settings, "local"):
+                elapsed_ms = int(time.perf_counter() * 1000 - start_ms)
+                logger.info(
+                    "[voice-latency] stage=router elapsed_ms=%d cache=miss backend=none intent=none",
+                    elapsed_ms,
+                )
+                return None
+            result = local_router.route(text)
+            backend_used = "local"
+
+        # Store cache on success
+        if result is not None and result.intent != "unknown":
+            if self._intent_cache is not None and self._namespace is not None:
+                try:
+                    self._intent_cache.store(
+                        self._namespace, content, dataclasses.asdict(result)
+                    )
+                except Exception as exc:
+                    logger.warning("[voice-latency] cache store failed: %s", exc)
+
+        elapsed_ms = int(time.perf_counter() * 1000 - start_ms)
+        intent_name = result.intent if result is not None else "none"
+        logger.info(
+            "[voice-latency] stage=router elapsed_ms=%d cache=miss backend=%s intent=%s",
+            elapsed_ms,
+            backend_used or "none",
+            intent_name,
+        )
+        return result
 
 
 def build_telegram_natural_language_router_from_settings(

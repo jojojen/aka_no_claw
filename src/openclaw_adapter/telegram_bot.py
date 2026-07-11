@@ -371,6 +371,15 @@ class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
         self._pending_sns_bulk_updates: dict[str, PendingTelegramSnsBulkUpdate] = {}
         self._callback_registry.setdefault("bulk", self._bulk_callback)
 
+    def prewarm_stt(self) -> None:
+        """Load the whisper model in the background so the first voice message
+        doesn't pay the multi-second model-load cost. Call from the polling
+        entrypoint only — tests construct this processor directly and must not
+        spawn real model loads."""
+        if self._stt_transcriber is None:
+            return
+        threading.Thread(target=self._stt_transcriber.prewarm, daemon=True).start()
+
     def build_audio_intake_ack_text(self) -> str:
         return "已收到語音，正在本機轉成文字。"
 
@@ -440,6 +449,7 @@ class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
                 audio_bytes,
                 mime_type=mime_type,
                 max_audio_bytes=self._stt_transcriber.max_audio_bytes,
+                trusted_duration_seconds=float(duration),
             )
             result = self._stt_transcriber.transcribe(request)
         except (SttPayloadTooLarge, SttRequestError, SttRuntimeError) as exc:
@@ -2544,6 +2554,7 @@ def run_telegram_polling(
         sns_buzz_fn=sns_buzz_fn,
         feedback_service=feedback_service,
     )
+    processor.prewarm_stt()
     return _core_run_telegram_polling(
         token=token,
         processor=processor,

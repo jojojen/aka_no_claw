@@ -175,3 +175,115 @@ def test_transcriber_serializes_concurrent_inference() -> None:
         thread.join()
 
     assert max_active == 1
+
+
+# ── trusted duration / beam_size / prewarm ───────────────────────────────────
+
+def _fake_model_factory_ok(expected_beam):
+    class FakeModel:
+        def transcribe(self, path, **kwargs):
+            assert kwargs["beam_size"] == expected_beam
+            return (
+                [SimpleNamespace(text="測試")],
+                SimpleNamespace(language="zh", language_probability=0.9, duration=1.0),
+            )
+
+    return lambda *args, **kwargs: FakeModel()
+
+
+def test_trusted_duration_skips_probe() -> None:
+    def _probe_must_not_run(_path, _limit):
+        raise AssertionError("duration probe must be skipped for trusted duration")
+
+    transcriber = LocalWhisperTranscriber(
+        model_factory=_fake_model_factory_ok(5),
+        duration_probe=_probe_must_not_run,
+    )
+    request = build_audio_request(
+        b"audio",
+        mime_type="audio/webm",
+        max_audio_bytes=1024,
+        trusted_duration_seconds=2.0,
+    )
+
+    result = transcriber.transcribe(request)
+
+    assert result.transcript == "測試"
+
+
+def test_trusted_duration_over_limit_rejected_before_model_load() -> None:
+    loaded = []
+
+    def factory(*args, **kwargs):
+        loaded.append(True)
+        return object()
+
+    transcriber = LocalWhisperTranscriber(
+        max_duration_seconds=10,
+        model_factory=factory,
+        duration_probe=lambda _path, _limit: pytest.fail("probe must not run"),
+    )
+    request = build_audio_request(
+        b"audio",
+        mime_type="audio/webm",
+        max_audio_bytes=1024,
+        trusted_duration_seconds=10.5,
+    )
+
+    with pytest.raises(SttPayloadTooLarge, match="10 秒"):
+        transcriber.transcribe(request)
+    assert not loaded
+
+
+@pytest.mark.parametrize("bad", [0, -1.5, True])
+def test_build_audio_request_rejects_invalid_trusted_duration(bad) -> None:
+    with pytest.raises(SttRequestError):
+        build_audio_request(
+            b"audio",
+            mime_type="audio/webm",
+            max_audio_bytes=1024,
+            trusted_duration_seconds=bad,
+        )
+
+
+def test_beam_size_flows_from_constructor_into_transcribe() -> None:
+    transcriber = LocalWhisperTranscriber(
+        beam_size=1,
+        model_factory=_fake_model_factory_ok(1),
+        duration_probe=lambda _path, _limit: 1.0,
+    )
+    request = build_audio_request(
+        b"audio",
+        mime_type="audio/webm",
+        max_audio_bytes=1024,
+    )
+
+    assert transcriber.transcribe(request).transcript == "測試"
+
+
+def test_from_settings_passes_beam_size() -> None:
+    from assistant_runtime.settings import AssistantSettings
+
+    settings = AssistantSettings(openclaw_stt_beam_size=2)
+    transcriber = LocalWhisperTranscriber.from_settings(settings)
+
+    assert transcriber.beam_size == 2
+
+
+def test_prewarm_loads_model_once_and_swallows_errors() -> None:
+    loads = []
+
+    def factory(*args, **kwargs):
+        loads.append(True)
+        return object()
+
+    transcriber = LocalWhisperTranscriber(model_factory=factory)
+    transcriber.prewarm()
+    transcriber.prewarm()
+    assert len(loads) == 1
+
+    def broken_factory(*args, **kwargs):
+        raise RuntimeError("no model")
+
+    broken = LocalWhisperTranscriber(model_factory=broken_factory)
+    broken.prewarm()  # must not raise

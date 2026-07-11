@@ -887,3 +887,209 @@ def test_fallback_returns_none_for_empty_message() -> None:
     result = fallback_route_telegram_natural_language("")
 
     assert result is None
+
+
+# ── _PoolAwareRouter semantic intent cache ────────────────────────────────────
+
+from openclaw_adapter.natural_language import _PoolAwareRouter
+from telegram_nl.natural_language import TelegramNaturalLanguageIntent as _Intent
+
+
+class _FakeIntentCache:
+    def __init__(self, hit=None, lookup_error=None):
+        self.hit = hit
+        self.lookup_error = lookup_error
+        self.lookup_calls: list[tuple[str, str]] = []
+        self.store_calls: list[tuple[str, str, dict]] = []
+
+    def lookup(self, namespace, text):
+        self.lookup_calls.append((namespace, text))
+        if self.lookup_error is not None:
+            raise self.lookup_error
+        return self.hit
+
+    def store(self, namespace, text, intent):
+        self.store_calls.append((namespace, text, intent))
+
+
+def _cache_router(settings, cache):
+    router = _PoolAwareRouter(settings)
+    router._intent_cache_ready = True
+    router._intent_cache = cache
+    router._namespace = "test-ns"
+    return router
+
+
+class _StubLocalRouter:
+    _extra_allowed_intents = frozenset()
+
+    def _build_prompt(self, content):
+        return f"prompt:{content}"
+
+    def route(self, text):
+        raise AssertionError("local router must not run in this test")
+
+
+class _StubCloudClient:
+    def __init__(self, raw):
+        self.raw = raw
+        self.calls = 0
+
+    def generate(self, prompt, *, temperature=0.0):
+        self.calls += 1
+        return self.raw
+
+
+def _pool_settings():
+    return AssistantSettings(
+        openclaw_local_text_backend="ollama",
+        openclaw_local_text_model="qwen3:4b",
+    )
+
+
+def test_pool_router_cache_hit_skips_llm(monkeypatch) -> None:
+    cache = _FakeIntentCache(hit=({"intent": "help", "confidence": 0.9}, "exact"))
+    router = _cache_router(_pool_settings(), cache)
+
+    def _fail(*args, **kwargs):
+        raise AssertionError("LLM router must not be built on cache hit")
+
+    monkeypatch.setattr("openclaw_adapter.natural_language._build_local_router", _fail)
+    monkeypatch.setattr("openclaw_adapter.natural_language._build_router_cloud_client", _fail)
+
+    intent = router.route("怎麼使用")
+
+    assert intent is not None
+    assert intent.intent == "help"
+    assert intent.confidence == 0.9
+    assert cache.lookup_calls == [("test-ns", "怎麼使用")]
+    assert cache.store_calls == []
+
+
+def test_pool_router_cache_hit_restores_tuple_fields(monkeypatch) -> None:
+    cache = _FakeIntentCache(
+        hit=({"intent": "help", "watch_markets": ["mercari", "yahoo"]}, "exact")
+    )
+    router = _cache_router(_pool_settings(), cache)
+
+    def _fail(*args, **kwargs):
+        raise AssertionError("LLM router must not be built on cache hit")
+
+    monkeypatch.setattr("openclaw_adapter.natural_language._build_local_router", _fail)
+    monkeypatch.setattr("openclaw_adapter.natural_language._build_router_cloud_client", _fail)
+
+    intent = router.route("怎麼使用")
+
+    assert intent is not None
+    assert intent.watch_markets == ("mercari", "yahoo")
+    assert isinstance(intent.watch_markets, tuple)
+
+
+def test_pool_router_cache_miss_routes_and_stores(monkeypatch) -> None:
+    cache = _FakeIntentCache(hit=None)
+    router = _cache_router(_pool_settings(), cache)
+    cloud = _StubCloudClient('{"intent": "help", "confidence": 0.8}')
+
+    monkeypatch.setattr(
+        "openclaw_adapter.natural_language._build_local_router",
+        lambda settings: _StubLocalRouter(),
+    )
+    monkeypatch.setattr(
+        "openclaw_adapter.natural_language._build_router_cloud_client",
+        lambda settings: cloud,
+    )
+
+    intent = router.route("怎麼使用")
+
+    assert intent is not None
+    assert intent.intent == "help"
+    assert cloud.calls == 1
+    assert len(cache.store_calls) == 1
+    namespace, text, stored = cache.store_calls[0]
+    assert namespace == "test-ns"
+    assert text == "怎麼使用"
+    assert stored["intent"] == "help"
+
+
+def test_pool_router_does_not_store_unknown_intent(monkeypatch) -> None:
+    cache = _FakeIntentCache(hit=None)
+    router = _cache_router(_pool_settings(), cache)
+    cloud = _StubCloudClient('{"intent": "totally_not_allowed"}')
+
+    monkeypatch.setattr(
+        "openclaw_adapter.natural_language._build_local_router",
+        lambda settings: _StubLocalRouter(),
+    )
+    monkeypatch.setattr(
+        "openclaw_adapter.natural_language._build_router_cloud_client",
+        lambda settings: cloud,
+    )
+
+    intent = router.route("嗯嗯嗯")
+
+    assert intent is not None
+    assert intent.intent == "unknown"
+    assert cache.store_calls == []
+
+
+def test_pool_router_completed_cloud_call_is_final_no_local_fallback(monkeypatch) -> None:
+    # _StubLocalRouter.route raises AssertionError if the local fallback runs.
+    cache = _FakeIntentCache(hit=None)
+    router = _cache_router(_pool_settings(), cache)
+    cloud = _StubCloudClient('{"intent": "totally_not_allowed"}')
+
+    monkeypatch.setattr(
+        "openclaw_adapter.natural_language._build_local_router",
+        lambda settings: _StubLocalRouter(),
+    )
+    monkeypatch.setattr(
+        "openclaw_adapter.natural_language._build_router_cloud_client",
+        lambda settings: cloud,
+    )
+
+    intent = router.route("嗯嗯嗯")
+
+    assert intent is not None
+    assert intent.intent == "unknown"
+
+
+def test_pool_router_cache_lookup_failure_degrades_to_llm(monkeypatch) -> None:
+    cache = _FakeIntentCache(lookup_error=RuntimeError("cache exploded"))
+    router = _cache_router(_pool_settings(), cache)
+    cloud = _StubCloudClient('{"intent": "help", "confidence": 0.7}')
+
+    monkeypatch.setattr(
+        "openclaw_adapter.natural_language._build_local_router",
+        lambda settings: _StubLocalRouter(),
+    )
+    monkeypatch.setattr(
+        "openclaw_adapter.natural_language._build_router_cloud_client",
+        lambda settings: cloud,
+    )
+
+    intent = router.route("怎麼使用")
+
+    assert intent is not None
+    assert intent.intent == "help"
+    assert cloud.calls == 1
+
+
+def test_pool_router_cache_reconstruction_failure_degrades_to_llm(monkeypatch) -> None:
+    cache = _FakeIntentCache(hit=({"intent": "help", "no_such_field": 1}, "exact"))
+    router = _cache_router(_pool_settings(), cache)
+    cloud = _StubCloudClient('{"intent": "help", "confidence": 0.7}')
+
+    monkeypatch.setattr(
+        "openclaw_adapter.natural_language._build_local_router",
+        lambda settings: _StubLocalRouter(),
+    )
+    monkeypatch.setattr(
+        "openclaw_adapter.natural_language._build_router_cloud_client",
+        lambda settings: cloud,
+    )
+
+    intent = router.route("怎麼使用")
+
+    assert intent is not None
+    assert intent.intent == "help"
+    assert cloud.calls == 1

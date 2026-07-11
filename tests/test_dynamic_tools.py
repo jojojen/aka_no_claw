@@ -2237,3 +2237,58 @@ def test_knowledge_db_codegen_seed_imports_and_network_entry_present():
     assert entry["confidence"] >= 0.9
     assert "timeout" in entry["technique"]
     assert "retry" in " ".join(entry["keywords"]) or "重試" in " ".join(entry["keywords"])
+
+
+def test_ollama_generate_includes_keep_alive_when_set() -> None:
+    import json as _json
+    import unittest.mock as mock
+
+    captured = {}
+
+    class _FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"response": "ok"}'
+
+    def _fake_urlopen(request, timeout=None):
+        captured["payload"] = _json.loads(request.data.decode("utf-8"))
+        return _FakeResponse()
+
+    client = OllamaTextClient(
+        endpoint="http://localhost:11434", model="q", timeout_seconds=5,
+        keep_alive="30m",
+    )
+    with mock.patch("openclaw_adapter.dynamic_tools.urlopen", _fake_urlopen):
+        assert client.generate("hi") == "ok"
+    assert captured["payload"]["keep_alive"] == "30m"
+
+
+def test_ollama_generate_omits_keep_alive_by_default() -> None:
+    import json as _json
+    import unittest.mock as mock
+
+    captured = {}
+
+    class _FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"response": "ok"}'
+
+    def _fake_urlopen(request, timeout=None):
+        captured["payload"] = _json.loads(request.data.decode("utf-8"))
+        return _FakeResponse()
+
+    client = OllamaTextClient(endpoint="http://localhost:11434", model="q", timeout_seconds=5)
+    with mock.patch("openclaw_adapter.dynamic_tools.urlopen", _fake_urlopen):
+        assert client.generate("hi") == "ok"
+    assert "keep_alive" not in captured["payload"]
