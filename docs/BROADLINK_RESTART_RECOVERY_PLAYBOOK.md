@@ -1,4 +1,4 @@
-Last reviewed: 2026-06-30
+Last reviewed: 2026-07-11
 Status: Current
 Owner area: operations
 
@@ -125,6 +125,35 @@ Do not stop at unit tests. Verify all three:
 3. after restart, the bridge `/ir` path can successfully send an IR command
 
 For this incident, that final bridge-path verification was the acceptance gate.
+
+## Case: every third-party process fails, Apple binaries succeed (2026-07-11)
+
+One incident matched the "fresh worker also fails" branch and turned out to be
+**macOS Local Network privacy (TCC)**, not the device and not the VPN:
+
+- `ping` and `nc` (Apple-signed system binaries) reached the RM4 fine.
+- Every Python process — fresh worker included — got `[Errno 65] No route to
+  host` on any UDP/TCP flow to ANY LAN host (router included), while UDP to the
+  internet worked.
+- Trigger: a macOS update reset/tightened the Local Network permission store
+  (`/Library/Preferences/com.apple.networkextension.plist`), silently
+  default-denying apps without a recorded grant.
+
+Diagnosis recipe:
+
+1. Differential-test with an Apple-signed binary (`nc -u -w 2 <router> 80`)
+   vs the same probe in Python. Apple platform binaries bypass the check, so
+   "system tools pass / our code fails" is the fingerprint.
+2. Find who actually owns the permission: the check is charged to the
+   *responsible process* (usually the GUI app the launch lineage traces to),
+   not the binary. `responsibility_get_pid_responsible_for_pid()` via ctypes
+   answers this definitively — do not guess from tmux socket names; the
+   `openclaw_codex` socket name caused a wrong "it's Codex" call when the real
+   responsible app was Terminal.
+3. Fix = System Settings → Privacy & Security → Local Network → enable the
+   responsible app. No code change can bypass a missing grant (verified:
+   `posix_spawn` responsibility-disclaim still gets denied without its own
+   grant).
 
 ## When to suspect a different problem
 

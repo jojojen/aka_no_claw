@@ -129,7 +129,7 @@ packaging precedent), [SYSTEM_MAP.md](SYSTEM_MAP.md), [TASK_ROUTING.md](TASK_ROU
     主上's request so a rate-limit cooldown mid-task auto-resumes work.
     **Caveat surfaced to 主上**: this session runs directly in Apple Terminal
     (`TERM_PROGRAM=Apple_Terminal`), not inside a tmux pane on the default
-    socket — only the bot's `openclaw_codex` tmux socket exists. The watcher's
+    socket — only the bot's `openclaw_stack` tmux socket exists. The watcher's
     resume mechanism is `tmux send-keys continue` to an auto-detected pane on
     the DEFAULT socket; with no such server running, it will correctly detect
     a rate-limit and wait out the cooldown, but has no pane to type into. If
@@ -225,7 +225,7 @@ packaging precedent), [SYSTEM_MAP.md](SYSTEM_MAP.md), [TASK_ROUTING.md](TASK_ROU
     - **Phase 2 code + tests are DONE, all three suites green.**
   - **★ CHECKPOINT — PASSED (2026-07-02).** 主上 restarted via 「重啟龍蝦」and
     delegated the verification judgment call ("妳自己測一下 覺得沒問題就繼續往下
-    開發"). Verified: `tmux -L openclaw_codex list-panes` shows both `telegram`
+    開發"). Verified: `tmux -L openclaw_stack list-panes` shows both `telegram`
     and `bridge` sessions up; `telegram` pane log shows a clean startup with
     zero tracebacks through the FULL real production object graph (aka's
     `TelegramCommandProcessor(settings=..., workflow_editor=..., goal_bridge=...)`
@@ -544,7 +544,7 @@ packaging precedent), [SYSTEM_MAP.md](SYSTEM_MAP.md), [TASK_ROUTING.md](TASK_ROU
     `codex/telegram-goal-callback-async`; `aka_no_claw` `c1bfec7` on
     `issue-54-chat-goal-loop-foundation`.
   - 主上 restarted the bot (`/restartall`); live smoke confirmed: tmux
-    `openclaw_codex` has both `telegram`/`bridge` sessions up, `lsof` shows an
+    `openclaw_stack` has both `telegram`/`bridge` sessions up, `lsof` shows an
     ESTABLISHED connection to a Telegram `149.154.x.x:443` IP, and a
     `telegram_core.transport` test-send round-tripped successfully.
   - PRs: marked price_monitor_bot's existing draft PR #2 ready-for-review
@@ -948,7 +948,7 @@ CLAUDE.md）。**嚴禁**動到 8781 的手動 command-bridge；橋接改動一�
 臨時埠驗證。重啟後先驗：
 
 ```text
-tmux -L openclaw_codex list-panes -a -F "#{session_name} pid=#{pane_pid}"
+tmux -L openclaw_stack list-panes -a -F "#{session_name} pid=#{pane_pid}"
 lsof -nP -p <telegram-pid> | grep ESTABLISHED   # 149.154.x.x:443 恰一條
 ```
 

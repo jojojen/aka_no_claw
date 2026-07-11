@@ -34,10 +34,10 @@ The telegram bot is **no longer launchd-managed**; the old
 `launchctl kickstart -k gui/$(id -u)/local.openclaw.telegram` label does not
 exist anymore and will fail. Current topology:
 
-- **tmux socket `openclaw_codex`** holds the two manually-launched workers:
+- **tmux socket `openclaw_stack`** holds the two manually-launched workers:
   session `telegram` → `openclaw_adapter telegram-poll …`, and session `bridge`
   → `openclaw_adapter command-bridge --lan --port 8781`. `/restartall` does
-  `tmux -L openclaw_codex kill-server` then recreates BOTH sessions, so it (and
+  `tmux -L openclaw_stack kill-server` then recreates BOTH sessions, so it (and
   only it) is the safe way to restart the bridge too.
 - **launchd-managed siblings** (restarted via `kickstart -k` inside the script):
   `local.openclaw.{price_monitor,sns_monitor,opportunity}` (+ `aivis`, `ollama`).
@@ -54,7 +54,7 @@ the process *alive*, so it looks healthy while `/new` is dead.
 **Verify polling is live (don't trust process-alive alone):**
 
 ```
-tmux -L openclaw_codex list-panes -a -F "#{session_name} pid=#{pane_pid}"  # telegram + bridge sessions present
+tmux -L openclaw_stack list-panes -a -F "#{session_name} pid=#{pane_pid}"  # telegram + bridge sessions present
 lsof -nP -p <telegram-pid> | grep ESTABLISHED   # expect a conn to a Telegram IP 149.154.x.x:443
 ```
 

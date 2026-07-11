@@ -1600,6 +1600,24 @@ CODEGEN_SEED: tuple[dict, ...] = (
         ],
         "confidence": 0.9,
     },
+    {
+        "category": "validation",
+        "title": "區網連線被拒先做「系統工具 vs 自家程序」差分，權限算在 responsible app 頭上",
+        "technique": (
+            "macOS 上對區網主機的連線拿到 EHOSTUNREACH（No route to host）但 ping/ARP 正常時，"
+            "先做差分測試：用 Apple 簽名的系統工具（nc、ping）打同一目標，再用自己的程序打——"
+            "「系統工具通、自家程序不通」是作業系統權限層（Local Network privacy）攔截的指紋，"
+            "不是路由、防火牆或裝置故障；OS 更新後權限庫被重設是常見觸發點。\n"
+            "而且權限不是算在 binary 或啟動指令上，是算在 launch 血統回溯到的 responsible app 上——"
+            "不要用 socket/session 名稱猜血統，用 responsibility_get_pid_responsible_for_pid() 實測。"
+            "缺授權時程式層繞不過（disclaim 自立門戶也照樣被拒），修法只能在系統設定授權。"
+        ),
+        "keywords": [
+            "EHOSTUNREACH", "no route to host", "區網", "LAN", "local network",
+            "TCC", "權限", "permission", "responsible", "macos", "差分", "differential",
+        ],
+        "confidence": 0.9,
+    },
 )
 
 

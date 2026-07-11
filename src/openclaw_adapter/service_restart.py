@@ -73,7 +73,7 @@ REPUTATION={_sh(reputation_dir)}
 SOURCE={_sh(source)}
 LOG_DIR="$CLAW/logs"
 UID_NUM="$(id -u)"
-TMUX_SOCKET="openclaw_codex"
+TMUX_SOCKET="openclaw_stack"
 BROADLINK_PREFLIGHT_ATTEMPTS="${{BROADLINK_PREFLIGHT_ATTEMPTS:-3}}"
 BROADLINK_PREFLIGHT_SLEEP_SECONDS="${{BROADLINK_PREFLIGHT_SLEEP_SECONDS:-2}}"
 
@@ -340,13 +340,19 @@ reap_orphans "chat_web" "openclaw_adapter chat-web"
 # EADDRINUSE (so the web 生活 mode keeps serving the OLD code).
 free_port "command bridge" 8781
 
-# BroadLink RM4 Mini UDP auth is sensitive to the macOS app/launch context.
-# The verified-good path is a fresh, Codex-launched tmux server on a dedicated
-# socket. Kill any stale dedicated server before recreating bridge/telegram so
-# /restartall never falls back to the old Terminal/default-tmux identity.
+# LAN access (BroadLink RM4 UDP) is gated by macOS Local Network privacy on
+# the tmux server's *responsible app* (whichever GUI app the lineage traces
+# to), so the stack runs on its own dedicated socket to keep that lineage
+# stable and observable. Kill any stale dedicated server before recreating
+# bridge/telegram so /restartall never falls back to the default-tmux identity.
 if [ -n "$TMUX_BIN" ]; then
   echo "[$(date '+%H:%M:%S')] reset dedicated tmux socket=$TMUX_SOCKET"
   "$TMUX_BIN" -L "$TMUX_SOCKET" kill-server 2>/dev/null || true
+  # Transitional: the socket was renamed from openclaw_codex (misleading name
+  # caused a wrong root-cause call). Kill the legacy server too or its respawn
+  # wrappers resurrect the old poller -> Telegram 409 storm. Drop this line
+  # once no legacy server can exist anymore.
+  "$TMUX_BIN" -L "openclaw_codex" kill-server 2>/dev/null || true
 fi
 broadlink_preflight
 

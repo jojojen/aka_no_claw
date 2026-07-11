@@ -93,7 +93,7 @@ def test_broadlink_sensitive_services_start_in_dedicated_tmux_socket() -> None:
         source="test",
     )
 
-    assert 'TMUX_SOCKET="openclaw_codex"' in script
+    assert 'TMUX_SOCKET="openclaw_stack"' in script
     assert "TMUX_BIN=\"$(command -v tmux || true)\"" in script
     assert "/opt/homebrew/bin/brew shellenv" in script
     assert "/usr/local/bin/brew shellenv" in script
@@ -185,7 +185,7 @@ def test_orphan_launchd_workers_are_reaped() -> None:
 
 
 def test_count_service_excludes_tmux_launcher(tmp_path) -> None:
-    # aka_no_claw#40: telegram/bridge launch via `tmux -L openclaw_codex
+    # aka_no_claw#40: telegram/bridge launch via `tmux -L openclaw_stack
     # new-session … python -m openclaw_adapter telegram-poll …`, so the tmux
     # server's OWN argv contains the worker pattern. A bare pgrep then matches
     # both the tmux launcher and the real worker → final count 2 for one worker.
@@ -203,7 +203,7 @@ def test_count_service_excludes_tmux_launcher(tmp_path) -> None:
     fakebin.mkdir()
     (fakebin / "ps").write_text(
         "#!/bin/bash\n"
-        'echo "  111 tmux -L openclaw_codex new-session -d -s telegram '
+        'echo "  111 tmux -L openclaw_stack new-session -d -s telegram '
         'cd /x && exec /x/.venv/bin/python -m openclaw_adapter telegram-poll"\n'
         'echo "  222 /x/.venv/bin/python -m openclaw_adapter telegram-poll '
         '--with-reputation-agent --no-dashboard"\n'
@@ -212,7 +212,7 @@ def test_count_service_excludes_tmux_launcher(tmp_path) -> None:
     p.chmod(p.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
     harness = (
-        'TMUX_SOCKET="openclaw_codex"\n'
+        'TMUX_SOCKET="openclaw_stack"\n'
         + count_func
         + '\ncount_service "telegram" "python.*openclaw_adapter telegram-poll"\n'
     )
