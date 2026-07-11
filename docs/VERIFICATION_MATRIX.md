@@ -3,7 +3,7 @@
 Status: Current
 Owner area: verification
 
-Last reviewed: 2026-06-25
+Last reviewed: 2026-07-11
 
 ## Verification By Change Type
 
@@ -50,6 +50,36 @@ Use the repo-local `.venv` when present:
 ```bash
 .venv/bin/python -m pytest
 .venv/bin/python -m openclaw_adapter list-tools
+```
+
+## CI Lanes (Workstream C, issue #72)
+
+Standard lanes per repo, source of truth is each repo's own
+`.github/workflows/tests.yml` — this table just points at them and gives the
+equivalent local command.
+
+| Repo | Lane | CI trigger | Local equivalent |
+|---|---|---|---|
+| `aka_no_claw` | Fast PR (syntax + build + non-blocking Ruff) | every push/PR | `python -m compileall -q src tests && python -m build` |
+| `aka_no_claw` | Full offline suite | every push/PR | see below (needs 4 sibling repos on `PYTHONPATH`) |
+| `aka_no_claw_web` | Frontend (test + typecheck + build) | every push/PR | `cd frontend && npm ci && npm test && npm run build` |
+
+Reproducing `aka_no_claw`'s full-offline lane locally (siblings as true
+directory siblings, matching local multi-repo dev layout — CI instead nests
+them under `_deps/` since `actions/checkout` can't place a `path` outside
+`$GITHUB_WORKSPACE`):
+
+```bash
+cd aka_no_claw
+PYTHONPATH=.:src:../price_monitor_bot/src:../telegram_nl/src:../telegram_core/src:../sns_monitor_bot/src \
+  .venv/bin/python -m pytest -q -rs
+```
+
+Ruff baseline (non-blocking in CI for now — see C4 note in `pyproject.toml`'s
+`[tool.ruff]` section):
+
+```bash
+.venv/bin/ruff check src tests
 ```
 
 ## Verification Boundaries

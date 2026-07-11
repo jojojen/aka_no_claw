@@ -535,6 +535,31 @@ contract tests using explicitly reported SHAs.
   candidate paths (sibling-dev layout, then `_deps/` layout) before raising.
   Verified against a simulated CI directory layout locally (92/92 pass) in
   addition to the full local suite (2501 passed / 7 skipped, unchanged).
+- 2026-07-11 — C1 items 1 and 4, plus C2 step 5:
+  - `aka_no_claw_web` frontend lane added (`npm ci` / `npm test` / `tsc
+    --noEmit && vite build`). First run failed for a real, pre-existing
+    reason unrelated to the new workflow: `package-lock.json` was missing
+    `esbuild@0.28.x` entries for every platform, so `npm ci` fails
+    deterministically — reproduced in a clean Node 22 Docker container
+    (matching the Actions runner) before touching anything, so this wasn't
+    assumed to be CI-only flakiness. Fixed by regenerating the lock via
+    `npm install` in that same container, then re-verified `npm ci` + test +
+    build clean from the regenerated lock. Confirmed green on Actions.
+  - Ruff added as a **non-blocking** baseline step in `aka_no_claw`'s
+    fast-pr lane (`continue-on-error: true`) per C4's explicit instruction
+    not to make an existing lint backlog a required gate in the same PR
+    that introduces the tool — repo currently has 141 pre-existing findings,
+    left as follow-up cleanup rather than fixed in bulk here.
+  - Standard lanes/commands documented in `docs/VERIFICATION_MATRIX.md`
+    under "CI Lanes (Workstream C, issue #72)", including the local
+    reproduction command for each lane.
+  - Still open: C3's pinned producer→consumer matrix (hard-blocked on #73's
+    SHA-manifest — there is no pinning mechanism to build it on top of),
+    CI for `telegram_core`/`telegram_nl`/`sns_monitor_bot`/`price_monitor_bot`/
+    `reputation_snapshot` (their own per-repo workflows, not just being
+    checked out as siblings for aka_no_claw's suite), C5 branch-protection
+    rule changes (a GitHub repo-settings change affecting what blocks merges
+    for everyone — deliberately not flipped without explicit sign-off).
 
 ## 9. Workstream R1 — Command Bridge Decomposition
 
