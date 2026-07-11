@@ -1660,6 +1660,29 @@ CODEGEN_SEED: tuple[dict, ...] = (
         ],
         "confidence": 0.9,
     },
+    {
+        "category": "testing",
+        "title": "測試 fixture 不可硬編絕對日期去對滾動時間窗（time-bomb test）",
+        "technique": (
+            "被測邏輯若含滾動時間窗（『近 N 天』聚合、expires_at = 建立時間 + N 天之類），"
+            "fixture 裡硬編的絕對時間戳（如 '2026-04-18T09:00:00+09:00'）寫下當下會過，"
+            "但真實時間一走出窗外，測試就整批無聲翻紅——症狀看起來像邏輯壞了"
+            "（聚合數變 0、驗證回 expired），實際上程式完全正確，是 fixture 過期。"
+            "同一天在兩個不同 repo 撞到同一類問題（30 天回饋窗聚合、30 天證明效期驗證）。\n"
+            "根治法：fixture 時間戳一律相對於 now 產生"
+            "（datetime.now(tz) - timedelta(days=1) 這種），要測『過期』分支就用"
+            "負向偏移或把效期參數設成負值，絕不硬編絕對日期。"
+            "另一個變體：epoch 秒（0.0）不可拿去跟 time.monotonic() 比——"
+            "monotonic 的原點是行程啟動不是 epoch，要用 time.monotonic() ± 偏移。\n"
+            "定位這類問題時，先看失敗訊息是否含 expired/窗外/計數歸零，"
+            "再查 fixture 是否硬編日期，不要先懷疑業務邏輯。"
+        ),
+        "keywords": [
+            "*", "fixture", "timestamp", "時間窗", "expired", "過期", "time-bomb",
+            "timedelta", "rolling window", "monotonic", "epoch", "測試翻紅",
+        ],
+        "confidence": 0.9,
+    },
 )
 
 
