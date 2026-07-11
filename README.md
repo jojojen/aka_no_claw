@@ -300,6 +300,11 @@ Web console: restart button
 HTTP bridge: POST http://127.0.0.1:8781/api/command/restartall
 ```
 
+`/restartall` 會先檢查 Web frontend 的平台原生依賴是否真的能載入；若本機
+`node_modules` 已損壞或來自不同平台，會依既有 `package-lock.json` 重建後再
+啟動，並確認 `5173` 已開始監聽。若仍失敗，重啟日誌會指出
+`logs/openclaw_web_vite.log`。
+
 Windows cold-start launcher（只用於尚未啟動 bot 時）：
 
 ```powershell

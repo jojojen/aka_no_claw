@@ -987,6 +987,18 @@ DEPRECATED_CODEGEN_SEED: tuple[tuple[str, str], ...] = (
 
 CODEGEN_SEED: tuple[dict, ...] = (
     {
+        "category": "validation",
+        "title": "重啟後驗證相依性與對外服務真的可用",
+        "technique": (
+            "不要把「程序已被啟動」當成服務已恢復。先做能載入平台原生相依性的最小探針；"
+            "探針失敗時，僅依既有 lockfile 重建本機相依性，再重新驗證。啟動後還要在固定"
+            "port 或健康端點等待成功訊號，逾時時明確寫入可查的錯誤與日誌位置，避免讓使用者"
+            "只看到表面成功卻沒有可連的服務。"
+        ),
+        "keywords": ["*", "restart", "health check", "dependency", "lockfile", "port"],
+        "confidence": 0.95,
+    },
+    {
         "category": "numeric_method",
         "title": "年化報酬要分簡單與複利",
         "technique": (

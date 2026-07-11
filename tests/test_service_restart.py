@@ -147,6 +147,30 @@ def test_bridge_port_reclaimed_before_relaunch() -> None:
     )
 
 
+def test_restart_repairs_broken_web_frontend_dependencies_and_checks_port() -> None:
+    # A node_modules directory can survive a platform change while its optional
+    # native Rollup package is wrong. /restartall must validate the actual
+    # runtime, rebuild from the existing lockfile only when it is broken, and
+    # report a failed Vite start instead of silently leaving phone users down.
+    script = _build_restart_script(
+        workspace_dir=Path("/tmp/workspace"),
+        claw_dir=Path("/tmp/workspace/aka_no_claw"),
+        source="test",
+    )
+
+    assert "web_frontend_dependencies_ready() {" in script
+    assert 'node -e "require(\'rollup\')"' in script
+    assert "ensure_web_frontend_dependencies() {" in script
+    assert "npm ci" in script
+    assert "wait_for_tcp_listener() {" in script
+    assert 'free_port "web frontend" 5173' in script
+    assert 'npm run dev -- --host 0.0.0.0 --port 5173 --strictPort' in script
+    assert 'wait_for_tcp_listener "web frontend" 5173' in script
+    assert script.index('free_port "web frontend" 5173') < script.index(
+        'start_service "web frontend"'
+    )
+
+
 def test_orphan_launchd_workers_are_reaped() -> None:
     # aka_no_claw#40: kickstart -k only replaces launchd's OWN instance, so a
     # hand-started duplicate of a managed worker (e.g. price-monitor-service,

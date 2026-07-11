@@ -197,6 +197,68 @@ start_tmux_service() {{
     "cd '$cwd' && $*"
 }}
 
+web_frontend_dependencies_ready() {{
+  if [ ! -d "$WEB/node_modules" ]; then
+    return 1
+  fi
+  (
+    cd "$WEB" || exit 1
+    # Requiring Rollup exercises its platform-specific optional package. A
+    # copied Linux node_modules tree can exist on macOS yet fail here.
+    node -e "require('rollup')"
+  )
+}}
+
+ensure_web_frontend_dependencies() {{
+  if [ ! -d "$WEB" ]; then
+    echo "[$(date '+%H:%M:%S')] web frontend skipped: missing $WEB"
+    return 1
+  fi
+  if ! command -v npm >/dev/null 2>&1; then
+    echo "[$(date '+%H:%M:%S')] web frontend skipped: npm not found"
+    return 1
+  fi
+  if web_frontend_dependencies_ready; then
+    echo "[$(date '+%H:%M:%S')] web frontend dependencies ready"
+    return 0
+  fi
+  if [ ! -f "$WEB/package-lock.json" ]; then
+    echo "[$(date '+%H:%M:%S')] web frontend failed: missing package-lock.json for dependency repair"
+    return 1
+  fi
+  # /restartall normally only restarts processes. The lockfile is already
+  # authoritative, so repair only a missing/broken local dependency tree.
+  echo "[$(date '+%H:%M:%S')] web frontend dependencies invalid; rebuilding from package-lock.json"
+  (
+    cd "$WEB" || exit 1
+    npm ci
+  ) || {{
+    echo "[$(date '+%H:%M:%S')] web frontend dependency repair failed"
+    return 1
+  }}
+  if ! web_frontend_dependencies_ready; then
+    echo "[$(date '+%H:%M:%S')] web frontend dependency repair produced an unusable Rollup runtime"
+    return 1
+  fi
+  echo "[$(date '+%H:%M:%S')] web frontend dependencies repaired"
+}}
+
+wait_for_tcp_listener() {{
+  local label="$1"
+  local port="$2"
+  local attempts="${{3:-8}}"
+  local attempt
+  for attempt in $(seq 1 "$attempts"); do
+    if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+      echo "[$(date '+%H:%M:%S')] $label ready on :$port"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "[$(date '+%H:%M:%S')] $label failed: no listener on :$port; see $LOG_DIR/openclaw_web_vite.log"
+  return 1
+}}
+
 broadlink_preflight() {{
   local attempts="$BROADLINK_PREFLIGHT_ATTEMPTS"
   local sleep_seconds="$BROADLINK_PREFLIGHT_SLEEP_SECONDS"
@@ -364,7 +426,14 @@ start_tmux_service "telegram" "telegram" "$CLAW" "source '$CLAW/run/mac-mini-sta
 # bridge gets the same respawn wrapper: the Web UI is the rescue path when the
 # poller dies, so it must not stay down after a crash either.
 start_tmux_service "bridge" "command bridge" "$CLAW" "source '$CLAW/run/mac-mini-stack.env' 2>/dev/null || true; export PYTHONPATH='.:src'; exec /bin/sh '$CLAW/scripts/run_command_bridge.sh'"
-start_service "web frontend" "$WEB" "$LOG_DIR/openclaw_web_vite.log" npm run dev -- --host 0.0.0.0
+if ensure_web_frontend_dependencies; then
+  # The process-pattern stop can miss a Vite process with different argv. A
+  # strict port is deliberate: using a fallback port would strand phone users
+  # on the normal :5173 URL without making the restart failure visible.
+  free_port "web frontend" 5173
+  start_service "web frontend" "$WEB" "$LOG_DIR/openclaw_web_vite.log" npm run dev -- --host 0.0.0.0 --port 5173 --strictPort
+  wait_for_tcp_listener "web frontend" 5173
+fi
 
 sleep 2
 snapshot "after"
