@@ -199,7 +199,6 @@ from .web_search import (
     summarize_web_sources_with_ollama,
     web_search,
 )
-from telegram_core.contracts import TelegramTextReplyPlan
 
 logger = logging.getLogger(__name__)
 
@@ -1558,6 +1557,7 @@ def _build_registries(
     board_loader=None,
     reputation_renderer: ReputationRenderer | None = None,
     research_notifier_factory: "Callable[[str], ResearchNotifier] | None" = None,
+    research_cancel_probe_factory: "Callable[[str], Callable[[], bool]] | None" = None,
     start_schedulers: bool = True,
 ) -> "tuple[dict, dict, dict, dict]":
     """Build registries injected into the base dispatcher.
@@ -1586,12 +1586,14 @@ def _build_registries(
         VpnRotationScheduler(
             vpn_store, notifier_factory=research_notifier_factory
         ).start()
-    research_search_fn = lambda q, limit: _run_research_worker_call(
-        lambda: web_search(q, max_results=limit, reuse_browser=False)
-    )
+    def research_search_fn(q, limit):
+        return _run_research_worker_call(
+            lambda: web_search(q, max_results=limit, reuse_browser=False)
+        )
     _yuyutei_resolver = _build_yuyutei_code_resolver(settings, research_search_fn)
     research_handler = build_research_handler(
         notifier_factory=research_notifier_factory,
+        cancel_probe_factory=research_cancel_probe_factory,
         search_fn=research_search_fn,
         item_fetcher=MercariItemAdapter(fetch_html_fn=build_research_item_fetch_html()),
         knowledge_db_path=settings.knowledge_db_path,
@@ -2478,8 +2480,8 @@ def run_telegram_polling(
     feedback_service = _build_feedback_service(watch_db)
     _start_backup_scheduler(settings)
     _start_title_corpus_rebuilder(settings)
-    rag_digest_scheduler = _start_rag_daily_digest(settings)
-    quiz_daily_scheduler = start_quiz_daily_scheduler(settings)
+    _start_rag_daily_digest(settings)
+    start_quiz_daily_scheduler(settings)
     dynamic_tool_runner = build_dynamic_tool_runner_from_settings(settings)
     command_handlers, callback_handlers, view_handlers, item_deleter_handlers = (
         _build_registries(settings, dynamic_tool_runner, sns_db=sns_db, buzz_fn=sns_buzz_fn,
@@ -2491,7 +2493,7 @@ def run_telegram_polling(
                           reputation_renderer=default_reputation_renderer(settings),
                           research_notifier_factory=_build_research_notifier_factory(settings))
     )
-    home_schedule_scheduler = _start_home_schedule_scheduler(settings, command_handlers)
+    _start_home_schedule_scheduler(settings, command_handlers)
 
     # Live Chat/planner integration (#52): a free-text message that matched no
     # built-in intent gets a shot at the growing generated-tool catalog. The

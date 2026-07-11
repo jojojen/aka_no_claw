@@ -2283,6 +2283,28 @@ def test_cancel_async_research_worker_observes_cancel(bridge, monkeypatch):
     assert persisted["status"] == "interrupted"
 
 
+def test_cancel_probe_scope_then_job_fallback():
+    """_cancel_probe is the seam the research pipeline consults mid-step (#81):
+    a scope registered for the dispatch chat_id (streaming goal-loop runs) wins;
+    otherwise the probe falls back to the job whose id IS the chat_id (async
+    /research path); unknown chat_ids are never 'cancelled'."""
+    b = CommandBridge(settings=_tool_settings())
+
+    probe = b._cancel_probe("web-bridge")
+    assert probe() is False
+    with b._cancel_scope(lambda: True, "web-bridge"):
+        assert probe() is True
+    assert probe() is False  # scope restored on exit
+
+    job = b._jobs.create()
+    job_probe = b._cancel_probe(job.id)
+    assert job_probe() is False
+    b.cancel_job(job.id)
+    assert job_probe() is True
+
+    assert b._cancel_probe("no-such-chat")() is False
+
+
 def test_cancel_async_research_error_after_cancel_is_interrupted(bridge, monkeypatch):
     """If cancellation makes the underlying run raise (e.g. an aborted HTTP
     call), the terminal state is still 'interrupted', not 'error'."""

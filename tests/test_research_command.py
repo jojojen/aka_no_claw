@@ -12,12 +12,11 @@ from openclaw_adapter.research_command import (
     ItemData,
     MercariItemAdapter,
     ResearchBudget,
+    ResearchCancelledError,
     ResearchReport,
     ResearchSectionResult,
     SellerReputationSnapshot,
     ShopReference,
-    _MARKETPLACE_HEARTBEAT_INTERVAL_SECONDS,
-    _MARKETPLACE_TOTAL_BUDGET_SECONDS,
     build_budgeted_search_fn,
     build_research_handler,
     format_research_compact_report,
@@ -645,6 +644,126 @@ def test_budgeted_search_fn_stops_after_budget_exhausted() -> None:
         wrapped("c", 3)
 
     assert calls == [("a", 1), ("b", 2)]
+
+
+def test_budgeted_search_fn_checks_cancel_before_each_search() -> None:
+    """Every budgeted search is a cooperative cancel checkpoint (#81), so a
+    cancel that lands during a multi-search stage stops at the NEXT search —
+    without consuming budget or hitting the network."""
+    calls: list[str] = []
+    budget = ResearchBudget(max_searches=5)
+    cancelled = {"flag": False}
+
+    def backend(query: str, limit: int) -> tuple[object, ...]:
+        calls.append(query)
+        return ("ok",)
+
+    wrapped = build_budgeted_search_fn(
+        backend, budget, cancel_check=lambda: cancelled["flag"]
+    )
+    assert wrapped("a", 1) == ("ok",)
+    cancelled["flag"] = True
+    with pytest.raises(ResearchCancelledError):
+        wrapped("b", 1)
+    assert calls == ["a"]
+    assert budget.searches_used == 1
+
+
+def _cancel_test_handler(cancelled: dict, ran: list[str], long_stage) -> object:
+    def _recording(name: str):
+        def stage(ctx) -> str:
+            ran.append(name)
+            return name
+        return stage
+
+    return build_research_handler(
+        notifier_factory=lambda chat_id: FakeNotifier(),
+        cancel_probe_factory=lambda chat_id: (lambda: cancelled["flag"]),
+        stage_runners=(
+            _parse_stage,
+            long_stage,
+            _recording("s2"),
+            _recording("s3"),
+            _recording("s4"),
+            _recording("s5"),
+            _recording("s6"),
+            _recording("s7"),
+        ),
+        heartbeat_interval_seconds=0.0,
+    )
+
+
+def test_cancel_mid_stage_observed_at_heartbeat_stops_run() -> None:
+    """A cancel that lands while a stage is INSIDE its long-running work is
+    observed at the stage's next heartbeat call — the run stops there and no
+    later stage (sequential or parallel) ever executes."""
+    cancelled = {"flag": False}
+    ran: list[str] = []
+
+    def long_stage(ctx) -> str:
+        ran.append("s1")
+        cancelled["flag"] = True  # cancel arrives mid-step
+        ctx.heartbeat("還在抓商品頁…")  # next in-stage checkpoint sees it
+        return "unreachable"
+
+    handler = _cancel_test_handler(cancelled, ran, long_stage)
+    with pytest.raises(ResearchCancelledError):
+        handler("https://jp.mercari.com/item/m65806654179", "chat-1")
+    assert ran == ["s1"]
+
+
+def test_cancel_before_parallel_batch_skips_marketplace_stages() -> None:
+    """A cancel set by the end of the sequential chain stops the parallel
+    marketplace stages (3/4/5/7) at their thread-start checkpoint."""
+    cancelled = {"flag": False}
+    ran: list[str] = []
+
+    def flip_stage(ctx) -> str:
+        ran.append("s1")
+        cancelled["flag"] = True
+        return "ok"
+
+    handler = _cancel_test_handler(cancelled, ran, flip_stage)
+    with pytest.raises(ResearchCancelledError):
+        handler("https://jp.mercari.com/item/m65806654179", "chat-2")
+    # s1 ran (it set the flag); stage 2 is next in the chain and is stopped at
+    # _run_tracked's checkpoint; parallel stages 3/4/5/7 never execute.
+    assert ran == ["s1"]
+
+
+def test_no_cancel_probe_means_run_is_unchanged() -> None:
+    """Telegram builds the handler without a cancel probe factory — the run
+    must behave exactly as before (probe absent, never raises)."""
+    ran: list[str] = []
+
+    def long_stage(ctx) -> str:
+        ran.append("s1")
+        ctx.heartbeat("處理中")
+        return "ok"
+
+    def _recording(name: str):
+        def stage(ctx) -> str:
+            ran.append(name)
+            return name
+        return stage
+
+    handler = build_research_handler(
+        notifier_factory=lambda chat_id: FakeNotifier(),
+        stage_runners=(
+            _parse_stage,
+            long_stage,
+            _recording("s2"),
+            _recording("s3"),
+            _recording("s4"),
+            _recording("s5"),
+            _recording("s6"),
+            _recording("s7"),
+        ),
+        heartbeat_interval_seconds=0.0,
+    )
+    reply = handler("https://jp.mercari.com/item/m65806654179", "chat-3")
+    assert "龍蝦 /research 已完成目前可用流程。" in str(reply)
+    assert set(ran) == {"s1", "s2", "s3", "s4", "s5", "s6", "s7"}
 
 
 def test_research_handler_reports_progress_heartbeat_and_final_reply() -> None:

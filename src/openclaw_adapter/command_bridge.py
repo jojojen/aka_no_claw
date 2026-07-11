@@ -751,6 +751,12 @@ class CommandBridge:
         # forwarded to the stream instead of being dropped (no job exists for
         # the chat path, so _JobNotifier alone would swallow them).
         self._live_notifiers: dict[str, Callable[[str], None]] = {}
+        # chat_id → cancel probe for the duration of a run whose commands are
+        # dispatched under that chat_id (streaming goal-loop runs use
+        # _BRIDGE_CHAT_ID). Same shape as _live_notifiers; consulted by
+        # long-command pipelines at their cooperative checkpoints (#81).
+        self._cancel_probes: dict[str, Callable[[], bool]] = {}
+        self._cancel_probe_lock = threading.Lock()
         self._live_notifier_lock = threading.Lock()
         self._session_store: SessionMemoryStore | None = None
         self._session_lock = threading.Lock()
@@ -812,6 +818,9 @@ class CommandBridge:
                         research_notifier_factory=lambda chat_id: self._research_notifier(
                             str(chat_id)
                         ),
+                        research_cancel_probe_factory=lambda chat_id: self._cancel_probe(
+                            str(chat_id)
+                        ),
                         # poller 已經跑 VpnRotationScheduler；bridge 只要 handlers
                         start_schedulers=False,
                     )
@@ -861,6 +870,42 @@ class CommandBridge:
         if callback is not None:
             return _CallbackNotifier(callback)
         return _JobNotifier(self._jobs, chat_id, self._get_job_store())
+
+    def _cancel_probe(self, chat_id: str) -> Callable[[], bool]:
+        """Cancel probe for a long command run keyed by ``chat_id`` (#81).
+
+        Prefers a scope probe registered via :meth:`_cancel_scope` (streaming
+        goal-loop runs dispatch commands under ``_BRIDGE_CHAT_ID``); otherwise
+        falls back to the job whose id IS the chat_id (the async job path,
+        where ``start_async`` runs /research with ``chat_id=job.id``)."""
+
+        def _probe() -> bool:
+            with self._cancel_probe_lock:
+                registered = self._cancel_probes.get(chat_id)
+            if registered is not None:
+                return bool(registered())
+            job = self._jobs.get(chat_id)
+            return job.cancel_event.is_set() if job is not None else False
+
+        return _probe
+
+    @contextmanager
+    def _cancel_scope(
+        self, probe: Callable[[], bool], chat_id: str = _BRIDGE_CHAT_ID
+    ):
+        """Register a cancel probe for ``chat_id`` for the duration of a run,
+        saving/restoring any previous registration (mirrors _live_progress)."""
+        with self._cancel_probe_lock:
+            previous = self._cancel_probes.get(chat_id)
+            self._cancel_probes[chat_id] = probe
+        try:
+            yield
+        finally:
+            with self._cancel_probe_lock:
+                if previous is None:
+                    self._cancel_probes.pop(chat_id, None)
+                else:
+                    self._cancel_probes[chat_id] = previous
 
     @contextmanager
     def _live_progress(
@@ -2024,7 +2069,11 @@ class CommandBridge:
             try:
                 # Workflow steps that run registered commands (e.g. /research)
                 # emit staged milestones; surface them on this stream live.
-                with self._live_progress(_emit):
+                # The cancel scope lets those commands' own pipelines observe
+                # this job's cancel flag MID-step (they dispatch under
+                # _BRIDGE_CHAT_ID), not just the loop's stage boundaries.
+                with self._live_progress(_emit), \
+                        self._cancel_scope(job.cancel_event.is_set):
                     result["report"] = self._execute_goal_loop(
                         goal=goal,
                         chat_backend=req.chat_backend,

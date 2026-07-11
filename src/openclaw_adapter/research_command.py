@@ -9,7 +9,7 @@ import statistics
 import threading
 import time
 import unicodedata
-from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Iterable, Protocol, Sequence
@@ -139,6 +139,16 @@ class BudgetExhaustedError(RuntimeError):
     """Raised when a /research job tries to exceed its shared Yahoo budget."""
 
 
+class ResearchCancelledError(RuntimeError):
+    """Raised at a cooperative checkpoint when the run's cancel probe fires
+    (issue #81). Checkpoints live in the orchestration skeleton only — stage
+    starts, heartbeats, and each budgeted search — so every stage inherits
+    mid-step cancellation without any per-domain wiring."""
+
+    def __init__(self, message: str = "任務已取消。") -> None:
+        super().__init__(message)
+
+
 @dataclass(slots=True)
 class ResearchBudget:
     max_searches: int = 5
@@ -160,8 +170,14 @@ class ResearchBudget:
             self.searches_used += 1
 
 
-def build_budgeted_search_fn(search_fn: SearchFn, budget: ResearchBudget) -> SearchFn:
+def build_budgeted_search_fn(
+    search_fn: SearchFn,
+    budget: ResearchBudget,
+    cancel_check: Callable[[], bool] | None = None,
+) -> SearchFn:
     def budgeted(query: str, limit: int) -> tuple[object, ...]:
+        if cancel_check is not None and cancel_check():
+            raise ResearchCancelledError()
         budget.consume()
         return search_fn(query, limit)
 
@@ -310,8 +326,19 @@ class ResearchJobContext:
     # Serialises section_results/warnings appends across stages 3/4/5/7 when they
     # run on parallel threads (Phase 2 parallelisation).
     _section_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+    # Cooperative cancel probe (issue #81): consulted at stage starts, every
+    # heartbeat call, and each budgeted search, so a cancel lands mid-stage —
+    # not only between stages. None (Telegram path) means "never cancelled".
+    cancel_check: Callable[[], bool] | None = None
+
+    def check_cancelled(self) -> None:
+        if self.cancel_check is not None and self.cancel_check():
+            raise ResearchCancelledError()
 
     def heartbeat(self, note: str = "仍在處理…") -> None:
+        # Heartbeats are emitted from inside long stage loops (scrape retries,
+        # comp pagination), which makes them natural mid-step cancel points.
+        self.check_cancelled()
         now = time.monotonic()
         if self.heartbeat_interval_seconds > 0:
             if self.stage_started_monotonic and now - self.stage_started_monotonic < self.heartbeat_interval_seconds:
@@ -346,7 +373,11 @@ class _NullResearchNotifier:
         return None
 
 
-_NOOP_SEARCH_FN: SearchFn = lambda query, limit: ()
+def _noop_search_fn(query: str, limit: int) -> tuple[object, ...]:
+    return ()
+
+
+_NOOP_SEARCH_FN: SearchFn = _noop_search_fn
 
 
 def _utc_now_iso() -> str:
@@ -1023,8 +1054,10 @@ class ResearchCommandService:
         condition_assessor_fn: "ConditionAssessorFn | None" = None,
         final_formatter: Callable[[ResearchReport], object] | None = None,
         heartbeat_interval_seconds: float = 15.0,
+        cancel_probe_factory: Callable[[str], Callable[[], bool]] | None = None,
     ) -> None:
         self._notifier_factory = notifier_factory or (lambda chat_id: _NullResearchNotifier())
+        self._cancel_probe_factory = cancel_probe_factory
         self._search_fn = search_fn or _NOOP_SEARCH_FN
         self._max_searches = max_searches
         self._item_fetcher = item_fetcher or MercariItemAdapter()
@@ -1060,8 +1093,14 @@ class ResearchCommandService:
             return "同一個聊天室目前已有 /research 在執行中，請等上一個研究完成。"
 
         notifier = self._notifier_factory(chat_key)
+        cancel_check = (
+            self._cancel_probe_factory(chat_key)
+            if self._cancel_probe_factory is not None else None
+        )
         budget = ResearchBudget(max_searches=self._max_searches)
-        budgeted_search_fn = build_budgeted_search_fn(self._search_fn, budget)
+        budgeted_search_fn = build_budgeted_search_fn(
+            self._search_fn, budget, cancel_check=cancel_check
+        )
         ctx = ResearchJobContext(
             raw_input=raw_input,
             chat_id=chat_key,
@@ -1069,6 +1108,7 @@ class ResearchCommandService:
             budget=budget,
             search_fn=budgeted_search_fn,
             heartbeat_interval_seconds=self._heartbeat_interval_seconds,
+            cancel_check=cancel_check,
         )
         try:
             notifier.send("⏳ /research 已開始，先抓商品頁與市場資料…")
@@ -1080,6 +1120,7 @@ class ResearchCommandService:
             }
 
             def _run_tracked(stage_no: int) -> str:
+                ctx.check_cancelled()
                 label, runner = stage_by_no[stage_no]
                 ctx.current_stage = stage_no
                 ctx.current_label = label
@@ -1126,8 +1167,16 @@ class ResearchCommandService:
                 with ThreadPoolExecutor(
                     max_workers=4, thread_name_prefix="research-stage"
                 ) as pool:
+
+                    def _run_parallel_stage(stage_no: int) -> str:
+                        # Checked here (thread start) and again inside the stage
+                        # via heartbeat()/budgeted search, so a cancel that lands
+                        # mid-marketplace-search stops queued AND running stages.
+                        ctx.check_cancelled()
+                        return stage_by_no[stage_no][1](ctx)
+
                     futures = {
-                        pool.submit(stage_by_no[stage_no][1], ctx): stage_no
+                        pool.submit(_run_parallel_stage, stage_no): stage_no
                         for stage_no in (3, 4, 5, 7)
                     }
                     try:
@@ -1777,6 +1826,7 @@ def build_research_handler(
     condition_assessor_fn: "ConditionAssessorFn | None" = None,
     final_formatter: Callable[[ResearchReport], object] | None = None,
     heartbeat_interval_seconds: float = 15.0,
+    cancel_probe_factory: Callable[[str], Callable[[], bool]] | None = None,
 ) -> Callable[[str, str], object]:
     service = ResearchCommandService(
         notifier_factory=notifier_factory,
@@ -1800,6 +1850,7 @@ def build_research_handler(
         condition_assessor_fn=condition_assessor_fn,
         final_formatter=final_formatter,
         heartbeat_interval_seconds=heartbeat_interval_seconds,
+        cancel_probe_factory=cancel_probe_factory,
     )
     return service.run
 
