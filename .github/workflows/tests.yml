@@ -28,6 +28,15 @@ jobs:
           python -m pip install --upgrade build
           python -m build
 
+      - name: Clean wheel install smoke (fresh venv, D1.4)
+        # --no-deps because sibling deps (telegram-core etc.) are bare names
+        # only resolvable via local editable installs / the pinned _deps
+        # checkout, never from an index.
+        run: |
+          python -m venv /tmp/wheel-smoke
+          /tmp/wheel-smoke/bin/pip install --no-deps dist/*.whl
+          /tmp/wheel-smoke/bin/python -c "import openclaw_adapter; print('wheel smoke OK:', openclaw_adapter.__doc__)"
+
       - name: Static checks (Ruff, non-blocking baseline)
         # Reports the existing repo-wide backlog without failing the build
         # (C4: don't make a legacy backlog a required gate in the same PR
