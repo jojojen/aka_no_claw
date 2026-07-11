@@ -521,6 +521,20 @@ contract tests using explicitly reported SHAs.
   producer→consumer matrix (blocked on #73's SHA-manifest — there's no
   pinning mechanism to build it on top of yet), CI for the other 5 repos,
   C4 static checks, C5 branch protection.
+- 2026-07-11 — first `full-offline` run went red (11 failures, all in
+  `tests/test_research_command.py`). Root-caused: `_load_fixture()` hardcoded
+  `Path(__file__).resolve().parents[2] / "price_monitor_bot"`, a path that
+  only resolves in the local multi-repo dev layout (true sibling checkouts).
+  Under CI's nested `actions/checkout` layout (siblings under `_deps/` inside
+  this workspace, since `checkout` refuses a `path` outside
+  `$GITHUB_WORKSPACE`), that path pointed outside the workspace entirely and
+  `FileNotFoundError` cascaded into 11 assertion failures with unrelated-
+  looking symptoms (missing title, empty entity list, URL-only search query).
+  Not a sibling-repo version-drift issue — ruled that out first via SHA-
+  matched fresh clones reproducing 100% pass locally. Fixed by trying both
+  candidate paths (sibling-dev layout, then `_deps/` layout) before raising.
+  Verified against a simulated CI directory layout locally (92/92 pass) in
+  addition to the full local suite (2501 passed / 7 skipped, unchanged).
 
 ## 9. Workstream R1 — Command Bridge Decomposition
 

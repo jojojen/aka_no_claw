@@ -52,14 +52,20 @@ def _placeholder(note: str):
 
 
 def _load_fixture(name: str) -> str:
-    fixture_path = (
-        Path(__file__).resolve().parents[2]
-        / "price_monitor_bot"
-        / "tests"
-        / "fixtures"
-        / name
+    repo_root = Path(__file__).resolve().parents[1]
+    candidates = [
+        # Local multi-repo dev layout: price_monitor_bot as a true sibling.
+        repo_root.parent / "price_monitor_bot" / "tests" / "fixtures" / name,
+        # CI layout: sibling repos checked out under _deps/ inside this
+        # workspace (actions/checkout can't place them outside $GITHUB_WORKSPACE).
+        repo_root / "_deps" / "price_monitor_bot" / "tests" / "fixtures" / name,
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.read_text(encoding="utf-8")
+    raise FileNotFoundError(
+        f"fixture {name!r} not found in any of: {[str(c) for c in candidates]}"
     )
-    return fixture_path.read_text(encoding="utf-8")
 
 
 def _fake_active_search(query: str, price_cap: int, max_results: int) -> list[dict[str, object]]:
