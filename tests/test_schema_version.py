@@ -86,3 +86,30 @@ def test_opportunity_schema_version_constant() -> None:
 def test_knowledge_schema_version_constant() -> None:
     """KnowledgeDatabase should export SCHEMA_VERSION=1."""
     assert KNOWLEDGE_SCHEMA_VERSION == 1
+
+
+def test_sns_llm_candidate_provider_logs_state_on_schema_mismatch(tmp_path: Path, caplog) -> None:
+    """_read_recent_posts probes+logs the SNS DB state on OperationalError
+    instead of a bare exception message (aka_no_claw#77 D2.3 follow-up)."""
+    import logging
+
+    from openclaw_adapter.opportunity_agent import SnsLlmCandidateProvider
+
+    db_path = tmp_path / "broken_sns.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA user_version = 1")
+        conn.execute("CREATE TABLE dummy (id TEXT)")
+
+    provider = SnsLlmCandidateProvider(
+        db_path=db_path,
+        endpoint="http://localhost:0",
+        model="dummy",
+        timeout_seconds=1,
+        lookback_hours=24,
+    )
+    with caplog.at_level(logging.WARNING):
+        posts = provider._read_recent_posts(limit=5)
+
+    assert posts == []
+    assert any("Opportunity SNS read failed" in rec.message for rec in caplog.records)
+    assert any("state=" in rec.message for rec in caplog.records)

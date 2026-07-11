@@ -20,6 +20,7 @@ from typing import Any, Sequence
 from assistant_runtime import AssistantSettings, build_ssl_context, get_settings
 from market_monitor.mercari_search import DEFAULT_CONDITION_IDS, search_mercari
 from market_monitor.storage import MarketplaceWatch, MonitorDatabase
+from sns_monitor.interest_profile import probe_sns_db
 from telegram_core.transport import TelegramBotClient
 from price_monitor_bot.commands import lookup_card
 from tcg_tracker.catalog import normalize_game_key, supported_game_hint
@@ -152,7 +153,13 @@ class SnsLlmCandidateProvider:
                     (cutoff, cutoff, limit * 8),
                 ).fetchall()
         except sqlite3.Error as exc:
-            logger.warning("Opportunity SNS read failed path=%s error=%s", self._db_path, exc)
+            state = probe_sns_db(Path(self._db_path))
+            if state == "ok":
+                state = "incompatible"
+            logger.warning(
+                "Opportunity SNS read failed; SNS DB state=%s path=%s error=%s",
+                state, self._db_path, exc
+            )
             return []
         from sns_monitor.models import TCG_DOMAINS, normalize_domains
 
