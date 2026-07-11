@@ -1638,6 +1638,28 @@ CODEGEN_SEED: tuple[dict, ...] = (
         ],
         "confidence": 0.9,
     },
+    {
+        "category": "testing",
+        "title": "測試載入相依檔案的路徑，不能只寫死本機開發目錄佈局",
+        "technique": (
+            "測試/腳本用相對路徑走訪找 sibling 目錄或相依檔案時"
+            "（例如 Path(__file__).resolve().parents[N] / \"other_repo\" / ...），"
+            "若只硬編一種目錄佈局，換一個執行環境（CI checkout、容器、他人機器）"
+            "佈局不同就會靜默指到不存在的路徑；若載入函式本身沒有明確的"
+            "『找不到就報錯』防呆，缺檔會被下游當成『資料是空的』處理，"
+            "產生一長串看似無關的斷言失敗（缺標題、缺欄位、query 退化成只剩 URL 等），"
+            "很容易被誤判成別的成因（版本漂移、平台差異），浪費大量時間繞遠路。\n"
+            "根治法：路徑解析函式列出所有可能佈局的候選路徑（本機 sibling 目錄、"
+            "CI 巢狀 checkout 目錄等），依序嘗試，全部找不到才明確 raise "
+            "FileNotFoundError 並把所有候選路徑印出來——絕不要吞掉成空字串/空結果。"
+            "定位這類問題時，先確認『輸入資料是否真的被讀到』，不要跳過這步直接懷疑邏輯本身。"
+        ),
+        "keywords": [
+            "*", "fixture", "sibling", "path", "路徑", "ci", "checkout",
+            "監控", "測試環境", "test layout", "relative path", "找不到",
+        ],
+        "confidence": 0.9,
+    },
 )
 
 
