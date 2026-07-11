@@ -2235,6 +2235,75 @@ def test_cancel_running_goal_loop_interrupts_and_persists(monkeypatch):
     assert snap["job_status"] == "interrupted"
 
 
+def test_cancel_finished_job_reports_real_terminal_state(bridge, monkeypatch):
+    """Cancelling a job that already completed (but has not been GC'd) must NOT
+    report 'interrupted' — the job finished, so cancel is a no-op that relays
+    the real terminal status and leaves the cancel flag unset (#81 round 2)."""
+    monkeypatch.setattr(bridge, "_run_command_raw",
+                        lambda *a, **k: ("[research]X", {"inline_keyboard": []}))
+    job_id = bridge.start_async(parse_request({"mode": "investment", "input": "X"}))["job_id"]
+    _wait_job(bridge, job_id, "done")
+
+    res = bridge.cancel_job(job_id)
+    assert res["status"] == STATUS_OK
+    assert res["job_status"] == "done"
+    assert not bridge._jobs.get(job_id).cancel_event.is_set()
+    # And the poll still shows the completed answer, untouched.
+    assert bridge.poll_job(job_id)["message"] == "[research]X"
+
+
+def test_cancel_async_research_worker_observes_cancel(bridge, monkeypatch):
+    """start_async's worker observes the cancel flag: once the user cancels, a
+    late-finishing /research run must persist 'interrupted' — its produced
+    answer must not overwrite the interrupted terminal state with 'done'."""
+    started = threading.Event()
+
+    def _slow_run(command, remainder, chat_id="web-bridge"):
+        started.set()
+        job = bridge._jobs.get(chat_id)
+        for _ in range(500):
+            if job.cancel_event.is_set():
+                break
+            time.sleep(0.01)
+        return ("[research]遲到的答案", {"inline_keyboard": []})
+
+    monkeypatch.setattr(bridge, "_run_command_raw", _slow_run)
+    job_id = bridge.start_async(parse_request({"mode": "investment", "input": "X"}))["job_id"]
+    assert started.wait(timeout=5.0)
+
+    res = bridge.cancel_job(job_id)
+    assert res["job_status"] == "interrupted"
+
+    snap = _wait_job(bridge, job_id, "interrupted")
+    assert snap["job_status"] == "interrupted"
+    assert snap["message"] == "任務已取消。"
+    assert "遲到的答案" not in (snap["message"] or "")
+    # The persisted snapshot agrees (poll after in-memory GC would read this).
+    persisted = bridge._get_job_store().load(job_id)
+    assert persisted["status"] == "interrupted"
+
+
+def test_cancel_async_research_error_after_cancel_is_interrupted(bridge, monkeypatch):
+    """If cancellation makes the underlying run raise (e.g. an aborted HTTP
+    call), the terminal state is still 'interrupted', not 'error'."""
+    started = threading.Event()
+
+    def _raise_after_cancel(command, remainder, chat_id="web-bridge"):
+        started.set()
+        job = bridge._jobs.get(chat_id)
+        job.cancel_event.wait(timeout=5.0)
+        raise RuntimeError("connection aborted mid-cancel")
+
+    monkeypatch.setattr(bridge, "_run_command_raw", _raise_after_cancel)
+    job_id = bridge.start_async(parse_request({"mode": "investment", "input": "X"}))["job_id"]
+    assert started.wait(timeout=5.0)
+    bridge.cancel_job(job_id)
+
+    snap = _wait_job(bridge, job_id, "interrupted")
+    assert snap["job_status"] == "interrupted"
+    assert snap["error"] is None
+
+
 # --- streaming cancellation on client disconnect (#30 review gap) ---------
 def test_stream_cloud_disconnect_aborts_worker(bridge, monkeypatch):
     """When the phone drops mid-stream the generator is closed; the cloud model

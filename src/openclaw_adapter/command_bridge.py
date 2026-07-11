@@ -594,14 +594,19 @@ class _JobManager:
             with job.lock:
                 job.progress.append(text)
 
-    def cancel(self, job_id: str) -> bool:
-        """Signal cooperative cancel for a running job. Returns False when the
-        job is unknown (already GC'd / never existed)."""
+    def cancel(self, job_id: str) -> str | None:
+        """Signal cooperative cancel for a running job. Returns the job's
+        status at signal time — only ``running`` jobs get the event set, so a
+        completed-but-not-yet-GC'd job keeps its real terminal state instead of
+        falsely reporting ``interrupted``. Returns None when the job is unknown
+        (already GC'd / never existed)."""
         job = self.get(job_id)
         if job is None:
-            return False
-        job.cancel_event.set()
-        return True
+            return None
+        with job.lock:
+            if job.status == JOB_RUNNING:
+                job.cancel_event.set()
+            return job.status
 
     def _gc_locked(self) -> None:
         cutoff = time.monotonic() - _JOB_TTL_SECONDS
@@ -3511,40 +3516,49 @@ class CommandBridge:
         })
         store.purge_expired()
 
+        def _persist_terminal(*, status: str, message: str,
+                              actions: list[dict], error: str | None) -> None:
+            # Explicit cancel wins over whatever the worker produced: once the
+            # user asked to stop, a late-finishing run must not resurrect a
+            # "done" (or "error") over the interrupted terminal state (#81).
+            with job.lock:
+                if job.cancel_event.is_set():
+                    status, message, actions, error = (
+                        JOB_INTERRUPTED, "任務已取消。", [], None
+                    )
+                job.status = status
+                job.message = message
+                job.actions = actions
+                job.error = error
+                progress_snapshot = list(job.progress)
+            store.save({
+                "job_id": job.id,
+                "status": status,
+                "progress": progress_snapshot,
+                "message": message,
+                "actions": list(actions),
+                "error": error,
+                "created_at": job.wall_created_at,
+                "updated_at": time.time(),
+            })
+
         def _worker() -> None:
             try:
                 message, markup = self._run_command_raw(
                     "/research", text, chat_id=job.id
                 )
-                with job.lock:
-                    job.message = message
-                    job.actions = self._markup_to_actions(markup)
-                    job.status = JOB_DONE
-                store.save({
-                    "job_id": job.id,
-                    "status": JOB_DONE,
-                    "progress": list(job.progress),
-                    "message": message,
-                    "actions": list(job.actions),
-                    "error": None,
-                    "created_at": job.wall_created_at,
-                    "updated_at": time.time(),
-                })
+                _persist_terminal(
+                    status=JOB_DONE, message=message,
+                    actions=self._markup_to_actions(markup), error=None,
+                )
             except Exception as exc:  # noqa: BLE001
-                logger.exception("async research failed job=%s", job.id)
-                with job.lock:
-                    job.error = str(exc)
-                    job.status = JOB_ERROR
-                store.save({
-                    "job_id": job.id,
-                    "status": JOB_ERROR,
-                    "progress": list(job.progress),
-                    "message": "",
-                    "actions": [],
-                    "error": str(exc),
-                    "created_at": job.wall_created_at,
-                    "updated_at": time.time(),
-                })
+                if job.cancel_event.is_set():
+                    logger.info("async research cancelled job=%s", job.id)
+                else:
+                    logger.exception("async research failed job=%s", job.id)
+                _persist_terminal(
+                    status=JOB_ERROR, message="", actions=[], error=str(exc),
+                )
 
         threading.Thread(target=_worker, daemon=True).start()
         return {"status": "accepted", "job_id": job.id}
@@ -3607,13 +3621,16 @@ class CommandBridge:
         ``interrupted`` terminal state. Idempotent: cancelling an already-gone
         or already-finished job is reported, not treated as an error.
         """
-        signalled = self._jobs.cancel(job_id)
-        if not signalled:
+        status = self._jobs.cancel(job_id)
+        if status is None:
             persisted = self._get_job_store().load(job_id)
             if persisted is None:
                 return {"status": STATUS_ERROR, "not_found": True,
                         "message": "找不到此任務（可能已結束或過期）。"}
             return {"status": STATUS_OK, "job_status": persisted.get("status"),
+                    "message": "任務已結束，無需取消。"}
+        if status != JOB_RUNNING:
+            return {"status": STATUS_OK, "job_status": status,
                     "message": "任務已結束，無需取消。"}
         logger.info("[job] cancel requested job=%s", job_id)
         return {"status": STATUS_OK, "job_status": JOB_INTERRUPTED,
