@@ -1,0 +1,33 @@
+# Immutable workspace-level sibling revision manifest
+#
+# Full commit SHAs ONLY (no local absolute paths).
+# This file is the single source of truth for CI and deployment resolution.
+# Local editable worktrees may differ, but the mismatch must be surfaced by the validator (D1.3).
+# Every update must state: reason, affected consumers, and verification performed (commit message).
+
+schema_version = 1
+generated_at = "2026-07-11T10:45:26+00:00"
+
+[packages.telegram-core]
+repository = "https://github.com/jojojen/telegram_core.git"
+revision = "24744015696ed72879a5a8f67f57e8d59171a2c7"
+distribution = "telegram-core"
+contract_version = 1
+
+[packages.telegram-nl]
+repository = "https://github.com/jojojen/telegram_nl.git"
+revision = "1481f18f0f5dd2312c0d9fc8d380b2a3a8fb25ad"
+distribution = "telegram-nl"
+contract_version = 1
+
+[packages.price-monitor-bot]
+repository = "https://github.com/jojojen/price_monitor_bot.git"
+revision = "c9fc7e753e4ac2bdf2e74e881c68c4b57fd3cbeb"
+distribution = "price-monitor-bot"
+contract_version = 1
+
+[packages.sns-monitor-bot]
+repository = "https://github.com/jojojen/sns_monitor_bot.git"
+revision = "812540b24ec8a9d77a095705099d3a2882bf1adf"
+distribution = "sns-monitor-bot"
+contract_version = 1

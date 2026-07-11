@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "openclaw-price-monitor"
+name = "aka-no-claw"
 version = "0.1.0"
 description = "Reusable price-monitoring core with a separate OpenClaw adapter and first-phase TCG support."
 readme = "README.md"
@@ -18,6 +18,7 @@ dependencies = [
   "price-monitor-bot",
   "sns-monitor-bot",
   "telegram-core",
+  "telegram-nl",
   "requests>=2.31,<3",
   "SudachiDict-full>=20260428,<20270101",
   "SudachiPy>=0.6,<1",
