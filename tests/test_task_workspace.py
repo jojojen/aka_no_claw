@@ -14,17 +14,12 @@ Coverage:
 import pytest
 
 from openclaw_adapter.task_workspace import (
-    COMMAND_SINK_ALLOWLIST,
     COMMAND_SINK_DENYLIST,
     COMMAND_SINK_INPUT_TYPES,
     VARIABLE_TYPE_COMMAND_RESULT,
     VARIABLE_TYPE_PLAIN_TEXT,
     VARIABLE_TYPE_SPEECH_TEXT,
     is_command_sink_allowed,
-    LLMClient,
-    StepTrace,
-    ToolCallExecutor,
-    Variable,
     VariableStore,
     Workflow,
     WorkflowRunner,
@@ -1012,15 +1007,12 @@ def test_registry_command_not_in_denylist_accepted():
 
 def test_registry_command_dispatched_through_registry():
     """/musiclistall injected via command_registry is executed by _run_command_sink."""
-    from types import SimpleNamespace
 
     called: list[str] = []
 
     def musiclistall_handler(remainder, chat_id):
         called.append(remainder)
         return "list ok"
-
-    registry = {"/musiclistall": SimpleNamespace(handler=musiclistall_handler)}
 
     ex = FakeExecutor()
     runner = WorkflowRunner(

@@ -23,7 +23,6 @@ import json
 import logging
 import queue
 import re
-import secrets
 import threading
 import time
 from collections import deque
@@ -59,9 +58,7 @@ from .llm_pool_settings import (
     normalize_chat_llm_pool_settings,
     provider_enabled,
     resolve_provider_model,
-    resolve_vision_provider_model,
     save_chat_llm_pool_settings,
-    vision_pool_order,
 )
 from .command_bridge_models import (
     Action,
@@ -117,7 +114,6 @@ from .continuation_policy import (
     ContinuationAction,
     classify_outcome,
     decide_continuation,
-    operation_key,
 )
 from .goal_loop import GoalLoop, GoalLoopContinuation, GoalLoopReport
 from .goal_planner import GoalPlanner
@@ -128,6 +124,7 @@ from .task_loop import (
     StepOutcome,
     resume_loop,
 )
+from .task_workspace import Workflow
 
 logger = logging.getLogger(__name__)
 
@@ -4247,7 +4244,6 @@ class CommandBridge:
     def save_chat_settings(self, payload: object) -> dict:
         current = chat_llm_pool_payload(self.settings)
         normalized = normalize_chat_llm_pool_settings(self.settings, payload)
-        previous_local = self._local_model()
         next_local = resolve_provider_model(self.settings, LLM_PROVIDER_LOCAL)
         local_changed = normalized.providers[LLM_PROVIDER_LOCAL].model != current["providers"]["local"]["model"]
         local_reload = {"status": "skipped", "model": normalized.providers[LLM_PROVIDER_LOCAL].model}
