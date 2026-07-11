@@ -568,6 +568,11 @@ class _Job:
         self.created_at = time.monotonic()   # monotonic for GC comparisons
         self.wall_created_at = time.time()   # wall clock for persisted snapshots
         self.lock = threading.Lock()
+        # Set by an explicit cancel (e.g. /api/command/cancel). A running goal
+        # loop polls this at each stage/step boundary and stops cooperatively
+        # (issue #81). Distinct from the client merely disconnecting, which by
+        # design lets the worker finish so the answer stays poll-recoverable.
+        self.cancel_event = threading.Event()
 
 
 class _JobManager:
@@ -591,6 +596,15 @@ class _JobManager:
         if job is not None:
             with job.lock:
                 job.progress.append(text)
+
+    def cancel(self, job_id: str) -> bool:
+        """Signal cooperative cancel for a running job. Returns False when the
+        job is unknown (already GC'd / never existed)."""
+        job = self.get(job_id)
+        if job is None:
+            return False
+        job.cancel_event.set()
+        return True
 
     def _gc_locked(self) -> None:
         cutoff = time.monotonic() - _JOB_TTL_SECONDS
@@ -2014,6 +2028,7 @@ class CommandBridge:
                         chat_backend=req.chat_backend,
                         narrator=_emit,
                         seed_variables=seed_variables,
+                        cancel_check=job.cancel_event.is_set,
                     )
             except Exception as exc:  # noqa: BLE001
                 result["error"] = str(exc)
@@ -2023,7 +2038,20 @@ class CommandBridge:
                 # Persist the terminal outcome to the job unconditionally so a
                 # reconnecting/polling client recovers it deterministically.
                 try:
-                    if isinstance(report, GoalLoopReport):
+                    if job.cancel_event.is_set():
+                        # Explicit cancel: terminal interrupted state, with any
+                        # progress gathered so far, so a poll shows a clean stop
+                        # rather than a phantom "done" or a hard error.
+                        _persist_job(
+                            status=JOB_INTERRUPTED,
+                            message=(
+                                self._format_goal_loop_message(report)
+                                if isinstance(report, GoalLoopReport)
+                                else "任務已取消。"
+                            ),
+                            error=None,
+                        )
+                    elif isinstance(report, GoalLoopReport):
                         _persist_job(
                             status=JOB_DONE,
                             message=self._format_goal_loop_message(report),
@@ -2099,6 +2127,7 @@ class CommandBridge:
         narrator: Callable[[str], None] | None = None,
         seed_variables: dict[str, str] | None = None,
         seed_operations: dict[str, str] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ):
         runner = _WorkflowShimRunner(self.settings)
         # One rotation cursor shared by every LLM call this run makes (draft,
@@ -2125,6 +2154,7 @@ class CommandBridge:
             conservative_synthesizer=self._goal_conservative_synthesizer(
                 chat_backend, pool_rotation=pool_rotation
             ),
+            cancel_check=cancel_check,
         )
         report = loop.run(resume=resume)
         logger.info(
@@ -3571,6 +3601,26 @@ class CommandBridge:
             "actions": [],
             "error": None,
         }
+
+    def cancel_job(self, job_id: str) -> dict:
+        """Request cooperative cancellation of a running job (issue #81).
+
+        Sets the job's cancel flag; the goal-loop worker observes it at its next
+        stage/step boundary, stops all remaining sub-stages, and persists an
+        ``interrupted`` terminal state. Idempotent: cancelling an already-gone
+        or already-finished job is reported, not treated as an error.
+        """
+        signalled = self._jobs.cancel(job_id)
+        if not signalled:
+            persisted = self._get_job_store().load(job_id)
+            if persisted is None:
+                return {"status": STATUS_ERROR, "not_found": True,
+                        "message": "找不到此任務（可能已結束或過期）。"}
+            return {"status": STATUS_OK, "job_status": persisted.get("status"),
+                    "message": "任務已結束，無需取消。"}
+        logger.info("[job] cancel requested job=%s", job_id)
+        return {"status": STATUS_OK, "job_status": JOB_INTERRUPTED,
+                "message": "已要求取消，將於下一個安全點停止。"}
 
     def run_action(self, job_id: str, callback_data: str) -> dict:
         """Re-invoke a research follow-up button (e.g. ``rs:<token>:price``).

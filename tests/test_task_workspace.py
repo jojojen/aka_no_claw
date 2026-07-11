@@ -386,6 +386,47 @@ def test_failure_halts_downstream_steps():
     assert "s1" in (trace.final_result or "")
 
 
+def test_cooperative_cancel_stops_before_next_step():
+    """#81 cooperative cancel: when the cancel probe flips True between steps the
+    runner stops at that safe boundary — the already-run step keeps its result,
+    the pending step is marked failed(已取消), no further executor call is made,
+    and the trace reports the explicit '工作流已取消' (not the successful first
+    step's output) so callers can tell a cancel from a completion."""
+    ex = FakeExecutor({"t1": (True, "第一步結果"), "t2": (True, "第二步結果")})
+    probes = {"n": 0}
+
+    def cancel_check() -> bool:
+        probes["n"] += 1
+        return probes["n"] >= 2  # False before s1, True before s2
+
+    runner = WorkflowRunner(executor=ex, cancel_check=cancel_check)
+    wf = Workflow(id="wf", goal="g", steps=[
+        WorkflowStep(id="s1", kind="tool_call", tool="t1", output="a"),
+        WorkflowStep(id="s2", kind="tool_call", tool="t2", output="b"),
+    ])
+    trace = runner.run(wf)
+    assert [st.status for st in trace.steps] == ["ok", "failed"]
+    assert trace.steps[1].error == "已取消"
+    assert ex.calls == [("t1", {})]          # s2 never executed
+    assert not trace.ok
+    assert trace.final_result == "工作流已取消"
+
+
+def test_cooperative_cancel_absent_probe_is_unchanged():
+    """No cancel_check → byte-for-byte the old behaviour: both steps run and the
+    trace carries the last step's output (no regression for the common path)."""
+    ex = FakeExecutor({"t1": (True, "一"), "t2": (True, "二")})
+    runner = WorkflowRunner(executor=ex)  # no cancel_check
+    wf = Workflow(id="wf", goal="g", steps=[
+        WorkflowStep(id="s1", kind="tool_call", tool="t1", output="a"),
+        WorkflowStep(id="s2", kind="tool_call", tool="t2", output="b"),
+    ])
+    trace = runner.run(wf)
+    assert [st.status for st in trace.steps] == ["ok", "ok"]
+    assert trace.ok
+    assert trace.final_result == "二"
+
+
 def test_all_skipped_after_first_fail():
     ex, runner = _make_runner({"t1": (False, "fail"), "t2": (True, "ok"), "t3": (True, "ok")})
     wf = Workflow(id="wf", goal="g", steps=[

@@ -2125,6 +2125,60 @@ def test_poll_unknown_job_is_not_found():
     assert snap["job_status"] == "error"
 
 
+# --- cooperative cancellation (#81 stop button, backend half) --------------
+def test_cancel_unknown_job_reports_not_found():
+    """Cancelling a job that never existed is not an error state to abort on —
+    it's reported as not_found so the caller can tell 'already gone' from 'now
+    stopping' (the /api/command/cancel route relays this verbatim)."""
+    b = CommandBridge(settings=_tool_settings())
+    res = b.cancel_job("does-not-exist")
+    assert res["status"] == STATUS_ERROR
+    assert res["not_found"] is True
+
+
+def test_cancel_running_goal_loop_interrupts_and_persists(monkeypatch):
+    """End-to-end backend cancel: a streaming goal-loop run is cancelled while it
+    is still working. cancel_job signals the job's cancel event, the worker sees
+    it at its cancel_check boundary and stops, and the terminal state persists as
+    'interrupted' so a poll recovers a clean stop (not a phantom done/error)."""
+    b = CommandBridge(settings=_tool_settings())
+
+    def _plan(req):
+        if False:
+            yield {}
+        return ChatToolPlan(tool=CHAT_TOOL_GOAL, query="長研究", reason_summary="多步驟"), None
+
+    monkeypatch.setattr(b, "_stream_chat_tool_plan", _plan)
+
+    def _slow_exec(**kw):
+        cancel_check = kw["cancel_check"]
+        for _ in range(500):
+            if cancel_check():
+                break
+            time.sleep(0.01)
+        return GoalLoopReport(
+            done=False, final_result="任務已取消。", workflow=None, trace=None,
+            continuation=None, replans_used=0, narration=("分析中",),
+        )
+
+    monkeypatch.setattr(b, "_execute_goal_loop", _slow_exec)
+    gen = b.stream(parse_request({"mode": "chat", "input": "長研究"}), "rid-cancel")
+    job_id = None
+    for ev in gen:
+        if ev["type"] == "job":
+            job_id = ev["job_id"]
+            break
+    assert job_id
+
+    res = b.cancel_job(job_id)
+    assert res["status"] == STATUS_OK
+    assert res["job_status"] == "interrupted"
+
+    list(gen)  # let the (now-cancelled) worker finish and persist
+    snap = _wait_job(b, job_id, "interrupted")
+    assert snap["job_status"] == "interrupted"
+
+
 # --- streaming cancellation on client disconnect (#30 review gap) ---------
 def test_stream_cloud_disconnect_aborts_worker(bridge, monkeypatch):
     """When the phone drops mid-stream the generator is closed; the cloud model

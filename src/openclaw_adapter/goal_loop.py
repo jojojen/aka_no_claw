@@ -91,6 +91,7 @@ class GoalLoop:
         seed_variables: dict[str, str] | None = None,
         seed_operations: dict[str, str] | None = None,
         conservative_synthesizer: Callable[[str, dict[str, str], str], str] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> None:
         self.goal = goal
         self.planner = planner
@@ -124,6 +125,13 @@ class GoalLoop:
         # guarantee (issue #81), not a hope pinned on the planner prompt or the
         # LLM satisfaction judge. Purely structural — no domain rules.
         self.seed_operations = dict(seed_operations or {})
+        # Optional cooperative-cancel probe. Checked at every stage boundary
+        # (before draft / run / replan) and, via the runner, before each
+        # workflow step, so an explicit cancel stops all sub-stages promptly
+        # instead of the run finishing regardless (issue #81). Cancel is
+        # distinct from replan-exhaustion: it must NOT trigger conservative
+        # synthesis or a resumable continuation.
+        self.cancel_check = cancel_check
 
     def run(self, resume: GoalLoopContinuation | None = None) -> GoalLoopReport:
         scratch = {
@@ -137,6 +145,10 @@ class GoalLoop:
             # distinguishes that terminal case from other aborts so only it
             # gets conservative synthesis.
             "exhausted": False,
+            # Set when an explicit cooperative cancel is observed; terminal,
+            # and deliberately NOT eligible for conservative synthesis or a
+            # resumable continuation.
+            "cancelled": False,
             # Last judge reason for "goal not achieved", forwarded to the
             # conservative synthesizer so it can name what stayed unknown.
             "last_reason": "",
@@ -178,6 +190,19 @@ class GoalLoop:
         workflow = scratch["workflow"]
         narration = tuple(scratch["narration"])
 
+        if scratch.get("cancelled"):
+            # Explicit cancel: report a terminal, non-resumable stop. No
+            # conservative synthesis (the user asked to stop, not for a hedged
+            # answer) and no continuation (a reload must not silently resume).
+            self._narrate(scratch, "任務已取消。")
+            return GoalLoopReport(
+                done=False,
+                final_result="任務已取消。",
+                workflow=workflow,
+                trace=trace,
+                replans_used=int(scratch["replans_used"]),
+                narration=tuple(scratch["narration"]),
+            )
         if scratch["abort"]:
             if scratch.get("exhausted") and self.conservative_synthesizer is not None:
                 synthesized = self._synthesize_conservative(scratch)
@@ -368,6 +393,7 @@ class GoalLoop:
                 seed_variable_types=scratch["seed_types"],
                 executed_operations=scratch["executed_operations"],
                 narrate=lambda line: self._narrate(scratch, line),
+                cancel_check=self.cancel_check,
             ).run(workflow)
             scratch["trace"] = trace
             # Carry every bound variable (succeeded steps + prior seeds) forward
@@ -469,6 +495,12 @@ class GoalLoop:
 
     def _decider(self, scratch: dict):
         def decide(ctx: LoopContext) -> str:
+            # Cancel preempts every other transition — including replan — so a
+            # cancelled run never spends more budget or drafts another workflow.
+            if self.cancel_check is not None and self.cancel_check():
+                scratch["cancelled"] = True
+                scratch["abort"] = "任務已取消。"
+                return ""
             if scratch.get("abort"):
                 return ""
             if scratch.get("pause_reason"):
@@ -507,6 +539,7 @@ class GoalLoop:
         seed_variable_types: dict[str, str] | None = None,
         executed_operations: dict[str, str] | None = None,
         narrate: Callable[[str], None] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> WorkflowRunner:
         return WorkflowRunner(
             executor=self.executor,
@@ -520,6 +553,7 @@ class GoalLoop:
             step_observer=step_observer,
             seed_variables=seed_variables,
             seed_variable_types=seed_variable_types,
+            cancel_check=cancel_check,
         )
 
     def _judge_result(self, scratch: dict, final_result: str) -> tuple[bool, str]:

@@ -498,11 +498,16 @@ class WorkflowRunner:
         step_observer: Callable[[str], None] | None = None,
         seed_variables: dict[str, str] | None = None,
         seed_variable_types: dict[str, str] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> None:
         self.executor = executor
         self.command_dispatcher: CommandDispatcher = command_dispatcher or {}
         self.llm_client = llm_client
         self.step_observer = step_observer
+        # Optional cooperative-cancel probe. Checked before each step so a
+        # long workflow stops promptly at a safe boundary when the caller
+        # cancels (issue #81); when absent, behaviour is unchanged.
+        self.cancel_check = cancel_check
         self.seed_variables = dict(seed_variables or {})
         # Types (plain_text/speech_text/command_result/...) that seed variables
         # had when they were first produced. Without these every seed defaults
@@ -549,11 +554,28 @@ class WorkflowRunner:
         last_output_var: str | None = None
 
         total = len(workflow.steps)
+        cancelled = False
         for index, step in enumerate(workflow.steps, 1):
-            if failed:
+            if failed or cancelled:
                 trace.steps.append(
                     StepTrace(step_id=step.id, kind=step.kind, status="skipped")
                 )
+                continue
+
+            # Cooperative cancel: stop at this safe boundary rather than
+            # starting another (possibly expensive) step. The already-run
+            # steps' bound variables stay in the trace so a caller can still
+            # use partial evidence.
+            if self.cancel_check is not None and self.cancel_check():
+                self._observe(f"步驟 {index}/{total}：已取消，停止後續步驟")
+                trace.steps.append(
+                    StepTrace(
+                        step_id=step.id, kind=step.kind, status="failed",
+                        error="已取消",
+                    )
+                )
+                trace.final_result = "工作流已取消"
+                cancelled = True
                 continue
 
             self._observe(f"步驟 {index}/{total}：{describe_workflow_step(step)}")
@@ -579,6 +601,9 @@ class WorkflowRunner:
         trace.variables = store.snapshot()
 
         if trace.budget_exhausted is not None:
+            pass
+        elif cancelled:
+            # keep the explicit "工作流已取消" set at the cancel boundary
             pass
         elif not failed and last_output_var:
             trace.final_result = store.resolve(last_output_var)

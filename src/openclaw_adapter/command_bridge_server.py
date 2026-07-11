@@ -195,6 +195,8 @@ def _build_handler(
                 self._handle_async()
             elif path == "/api/command/action":
                 self._handle_action()
+            elif path == "/api/command/cancel":
+                self._handle_cancel()
             elif path == "/api/command/music":
                 self._handle_music()
             elif path == "/api/command/bluetooth":
@@ -275,6 +277,22 @@ def _build_handler(
                                  status=HTTPStatus.BAD_REQUEST)
                 return
             self._write_json(bridge.run_action(job_id, callback_data))
+
+        def _handle_cancel(self) -> None:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            try:
+                raw = self.rfile.read(length) if length else b""
+                data = json.loads(raw.decode("utf-8")) if raw else {}
+            except (ValueError, UnicodeDecodeError) as exc:
+                self._write_json({"status": "error", "message": f"無效的請求：{exc}"},
+                                 status=HTTPStatus.BAD_REQUEST)
+                return
+            job_id = str(data.get("job_id") or "")
+            if not job_id:
+                self._write_json({"status": "error", "message": "缺少 job_id。"},
+                                 status=HTTPStatus.BAD_REQUEST)
+                return
+            self._write_json(bridge.cancel_job(job_id))
 
         def _handle_music(self) -> None:
             """生活 mode music surface (aka_no_claw_web#3/#4). A button press

@@ -644,3 +644,56 @@ def test_goal_loop_seed_operation_blocks_reentrant_research():
     assert research_calls == []  # the seeded op is never re-run
     assert report.done is True
     assert report.final_result == "先前研究：市價¥16000"
+
+
+def test_goal_loop_cancel_preempts_all_work():
+    """#81 cooperative cancel: an explicit cancel signal stops the loop at the
+    next stage boundary — it never drafts, never runs the workflow, and reports a
+    terminal non-resumable stop (done=False, '任務已取消。'). This is the backend
+    half of the user's 停止 button (an explicit cancel, not a stream-drop)."""
+    research_calls: list[str] = []
+
+    def research_handler(text: str, chat_id: str) -> str:
+        research_calls.append(text)
+        return "不應執行"
+
+    planner = _FakePlanner(drafts=[(_research_command_workflow("wf"), None, False)])
+    loop = GoalLoop(
+        goal="會賺嗎",
+        planner=planner,
+        executor=_FakeExecutor({}),
+        command_registry={"/research": _FakeRegistered(handler=research_handler)},
+        seed_variables={"q": "mercari m123"},
+        cancel_check=lambda: True,  # cancelled from the outset
+    )
+    report = loop.run()
+    assert report.done is False
+    assert report.final_result == "任務已取消。"
+    assert planner.draft_calls == []   # never drafted
+    assert research_calls == []        # never ran the command
+    assert report.continuation is None  # terminal, not resumable
+
+
+def test_goal_loop_cancel_does_not_trigger_conservative_synthesis():
+    """A cancel is a stop, not a request for a hedged answer: even when a
+    conservative synthesizer is wired in, cancelling must NOT invoke it — the
+    report stays the terminal '任務已取消。' rather than a best-effort conclusion."""
+    synth_calls: list[str] = []
+
+    def synth(goal: str, seeds: dict, last_reason: str) -> str:
+        synth_calls.append(goal)
+        return "保守結論（不應出現）"
+
+    planner = _FakePlanner(drafts=[(_workflow_with_tool("t", wf_id="wf"), None, False)])
+    loop = GoalLoop(
+        goal="會賺嗎",
+        planner=planner,
+        executor=_FakeExecutor({"t": (True, "市價¥16000")}),
+        command_registry={},
+        conservative_synthesizer=synth,
+        cancel_check=lambda: True,
+    )
+    report = loop.run()
+    assert report.done is False
+    assert report.final_result == "任務已取消。"
+    assert synth_calls == []  # synthesizer never consulted on cancel
