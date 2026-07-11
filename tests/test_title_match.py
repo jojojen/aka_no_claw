@@ -6,7 +6,10 @@ lexical fallback — not the quality of any real model (that's the live spike).
 """
 from __future__ import annotations
 
-from openclaw_adapter.title_match import build_semantic_title_matcher
+from openclaw_adapter.title_match import (
+    build_semantic_title_matcher,
+    extract_identity_tokens,
+)
 
 
 def _make_embedder(table: dict[str, list[float] | None]):
@@ -99,3 +102,50 @@ def test_matcher_returns_empty_for_empty_items_without_embedding() -> None:
 
     assert matcher("query", []) == []
     assert calls == []  # short-circuits before embedding the query
+
+
+def test_extract_identity_tokens_keeps_serials_drops_rarity_and_small_numbers() -> None:
+    tokens = extract_identity_tokens("山田リョウ BSF-01/123 SSP RR 10")
+    assert "bsf-01/123" in tokens
+    # bare rarities have no digit; "10" is a short pure-digit quantity
+    assert "ssp" not in tokens
+    assert "rr" not in tokens
+    assert "10" not in tokens
+
+
+def test_extract_identity_tokens_keeps_long_pure_digit_run() -> None:
+    assert extract_identity_tokens("card 123456") == {"123456"}
+
+
+def test_matcher_identity_bypass_rescues_same_card_near_miss() -> None:
+    # Below-threshold semantic score, but the title carries the exact serial
+    # from the query -> kept (the original #81 0.717 near-miss case).
+    embedder = _make_embedder(
+        {
+            "山田リョウ BSF-01/123": [1.0, 0.0],
+            "山田リョウ ロックスター BSF-01/123 SP": [0.6, 0.8],  # cosine 0.6 < 0.72
+        }
+    )
+    matcher = build_semantic_title_matcher(
+        embedder, threshold=0.72, lexical_fallback=_lexical_fallback
+    )
+    items = [{"item_id": "a", "title": "山田リョウ ロックスター BSF-01/123 SP"}]
+    kept = matcher("山田リョウ BSF-01/123", items)
+    assert [it["item_id"] for it in kept] == ["a"]
+
+
+def test_matcher_identity_bypass_does_not_rescue_different_card() -> None:
+    # Wrong card, below threshold, and it does NOT carry the query serial ->
+    # stays dropped even though it shares the character name and a rarity.
+    embedder = _make_embedder(
+        {
+            "山田リョウ BSF-01/123": [1.0, 0.0],
+            "貫きたい音楽 山田リョウ SSP": [0.3, 0.95],  # cosine ~0.3 < 0.72
+        }
+    )
+    matcher = build_semantic_title_matcher(
+        embedder, threshold=0.72, lexical_fallback=_lexical_fallback
+    )
+    items = [{"item_id": "b", "title": "貫きたい音楽 山田リョウ SSP"}]
+    kept = matcher("山田リョウ BSF-01/123", items)
+    assert kept == []

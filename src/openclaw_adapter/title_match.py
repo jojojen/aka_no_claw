@@ -14,6 +14,7 @@ embedder (it lives here, in the higher repo).
 from __future__ import annotations
 
 import logging
+import re
 from typing import Callable, Optional
 
 from .embedding_match import cosine, l2_normalize
@@ -24,6 +25,48 @@ Embedder = Callable[[str], "Optional[list[float]]"]
 Items = "list[dict[str, object]]"
 LexicalFallback = Callable[[str, Items], Items]
 TitleMatcher = Callable[[str, Items], Items]
+
+# Contiguous alphanumeric run allowing the '/' and '-' separators that appear
+# inside card serial numbers (e.g. ``123/456``, ``BSF-01``).
+_IDENTITY_RUN_RE = re.compile(r"[0-9A-Za-z/\-]+")
+_DIGIT_RUN_RE = re.compile(r"\d+")
+
+
+def extract_identity_tokens(text: str) -> set[str]:
+    """Distinctive serial-like tokens (card numbers) in a query or title.
+
+    Structural, not a keyword list (Rule G): a run qualifies as an identity
+    token when it contains a digit and is *distinctive* — either mixed
+    alphanumeric / separated (``BSF-01``, ``123/456``, ``SP01``) or a long
+    pure-digit run. Bare rarities (``RR``, ``SSP`` — no digit) and short
+    quantities (``10``) are deliberately excluded so they can never trigger a
+    false identity match between two different cards.
+    """
+    tokens: set[str] = set()
+    for raw in _IDENTITY_RUN_RE.findall(text or ""):
+        tok = raw.strip("/-").lower()
+        if len(tok) < 3 or not any(ch.isdigit() for ch in tok):
+            continue
+        has_alpha_or_sep = any(ch.isalpha() or ch in "/-" for ch in tok)
+        longest_digit_run = max((len(m) for m in _DIGIT_RUN_RE.findall(tok)), default=0)
+        if has_alpha_or_sep or longest_digit_run >= 4:
+            tokens.add(tok)
+    return tokens
+
+
+def _title_matches_identity(title: str, query_identity: set[str]) -> bool:
+    """True when every distinctive query serial appears verbatim in ``title``.
+
+    An exact card-number match is a stronger identity signal than embedding
+    similarity (the embedder is exactly what mis-ranks a same-card near-miss),
+    so it overrides the semantic threshold. Requiring *all* query identity
+    tokens keeps a different card that merely shares one coincidental number
+    from being rescued.
+    """
+    if not query_identity:
+        return False
+    hay = title.lower()
+    return all(tok in hay for tok in query_identity)
 
 
 def _unit_vector(embedder: Embedder, text: str) -> "Optional[list[float]]":
@@ -60,7 +103,9 @@ def build_semantic_title_matcher(
             )
             return lexical_fallback(query, items)
 
+        query_identity = extract_identity_tokens(query)
         kept: list[dict[str, object]] = []
+        rescued = 0
         for item in items:
             title = str(item.get("title") or "").strip()
             if not title:
@@ -71,13 +116,20 @@ def build_semantic_title_matcher(
             score = cosine(query_vec, title_vec)
             if score >= threshold:
                 kept.append(item)
+            elif _title_matches_identity(title, query_identity):
+                rescued += 1
+                logger.info(
+                    "title_match: identity bypass score=%.3f title=%r ids=%s",
+                    score, title[:60], sorted(query_identity),
+                )
+                kept.append(item)
             else:
                 logger.debug(
                     "title_match: dropped score=%.3f title=%r", score, title[:60]
                 )
         logger.info(
-            "title_match: query=%s kept=%d/%d threshold=%.2f",
-            query, len(kept), len(items), threshold,
+            "title_match: query=%s kept=%d/%d (identity_rescued=%d) threshold=%.2f",
+            query, len(kept), len(items), rescued, threshold,
         )
         return kept
 
