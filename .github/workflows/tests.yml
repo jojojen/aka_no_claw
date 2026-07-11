@@ -10,6 +10,35 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  incremental-static:
+    name: Incremental static checks
+    runs-on: ubuntu-latest
+    steps:
+      # The merge base / pushed-from SHA must be available to diff only files
+      # this change introduces; a repository-wide Ruff run is kept as a
+      # non-blocking backlog report in fast-pr below.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Ruff
+        run: python -m pip install ruff
+
+      - name: Lint changed Python files (blocking #72 C4 gate)
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          # A branch's first push uses GitHub's all-zero "before" SHA. There
+          # is no prior change set in that case, so lint the checked-out files.
+          if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            BASE_SHA="$(git rev-list --max-parents=0 HEAD)"
+          fi
+          python scripts/check_incremental_static.py --base "$BASE_SHA" --head "$GITHUB_SHA"
+
   fast-pr:
     name: Fast PR (syntax + package build)
     runs-on: ubuntu-latest

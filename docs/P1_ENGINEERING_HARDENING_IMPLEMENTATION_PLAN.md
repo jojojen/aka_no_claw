@@ -560,6 +560,13 @@ contract tests using explicitly reported SHAs.
     checked out as siblings for aka_no_claw's suite), C5 branch-protection
     rule changes (a GitHub repo-settings change affecting what blocks merges
     for everyone — deliberately not flipped without explicit sign-off).
+- 2026-07-12 — C4 corrective follow-up: added a blocking `Incremental static
+  checks` job. It computes the PR base / pushed-from SHA, invokes
+  `scripts/check_incremental_static.py`, and runs Ruff only on changed Python
+  files under `src/` and `tests/`; the historical whole-repo report remains
+  non-blocking. C5 readiness now documents the exact candidate contexts and
+  requires one green deterministic run of this new job before enabling them
+  as GitHub required checks.
 
 ## 9. Workstream R1 — Command Bridge Decomposition
 

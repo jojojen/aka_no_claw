@@ -8,8 +8,13 @@ from openclaw_adapter.knowledge_db import (
     ENTITY_TYPES,
     KnowledgeDatabase,
     KnowledgeEntry,
+    NO_DATA_SUMMARY,
+    OBSERVATION_MARKER,
+    OBSERVATION_SUMMARY_CAP,
     ORIGINS,
     format_knowledge_block,
+    is_insufficient_entry,
+    is_operational_cache_entry,
     is_source_id,
 )
 
@@ -29,6 +34,17 @@ def test_codegen_seed_for_restart_health_checks_is_always_retrievable(db):
     assert "*" in rule.keywords
     assert "lockfile" in rule.technique
     assert "port" in rule.technique
+
+
+def test_codegen_seed_for_corrupt_streams_is_always_retrievable(db):
+    db.seed_codegen_knowledge()
+
+    rows = db.retrieve_codegen_knowledge("任意程式需求", k=100)
+    rule = next(row for row in rows if row.title == "串流協定損毀必須可觀測且終止成功路徑")
+
+    assert rule.category == "validation"
+    assert "*" in rule.keywords
+    assert "不能略過壞資料" in rule.technique
 
 
 def test_upsert_and_get_entry_roundtrip(db):
@@ -238,15 +254,6 @@ def test_format_knowledge_block_truncates_long_summary():
 
 
 # ── append_observation — silenced-signal sink ───────────────────────────────
-
-
-from openclaw_adapter.knowledge_db import (
-    NO_DATA_SUMMARY,
-    OBSERVATION_MARKER,
-    OBSERVATION_SUMMARY_CAP,
-    is_insufficient_entry,
-    is_operational_cache_entry,
-)
 
 
 def _seed_entity(db, *, canonical="union_arena", summary="UNION ARENA。Bandai 旗下 TCG。", origin="manual"):

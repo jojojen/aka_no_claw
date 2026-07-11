@@ -21,7 +21,6 @@ import pytest
 from openclaw_adapter.command_bridge import CommandBridge, _WorkflowShimRunner, build_chat_prompt
 from openclaw_adapter.command_bridge_models import (
     CHAT_BACKEND_GEMINI,
-    CHAT_BACKEND_CLOUD_PICKLE,
     CHAT_BACKEND_CLOUD_POOL,
     CHAT_BACKEND_LOCAL,
     CHAT_TOOL_BLUETOOTH,
@@ -38,12 +37,9 @@ from openclaw_adapter.command_bridge_models import (
     MUSIC_ACTION_PLAN,
     ChatToolPlan,
     ChatToolPolicy,
-    ChatToolRequest,
     ChatToolResult,
     ChatTurn,
     MODE_CHAT,
-    MODE_INVESTMENT,
-    MODE_TRANSLATION,
     MusicIntent,
     STATUS_ERROR,
     STATUS_OK,
@@ -4141,7 +4137,6 @@ def test_build_nvidia_chat_client_present_with_key():
 
 def test_build_nvidia_vision_client_none_without_key(monkeypatch):
     from openclaw_adapter.vision_pool import build_vision_pool_chain
-    from openclaw_adapter.llm_pool_settings import enabled_vision_pool_providers
 
     # Mock enabled_vision_pool_providers to return nvidia
     # but without the API key, it should not be configured
@@ -4327,7 +4322,6 @@ def test_cloud_pool_stream_all_fail_fallback_local(monkeypatch):
 
     req = parse_request({"mode": "chat", "input": "hello", "chat_backend": "cloud_pool"})
     events = list(b.stream(req, "test-rid"))
-    deltas = [e for e in events if e.get("type") == "delta"]
     errors = [e for e in events if e.get("type") == "error"]
     done = [e for e in events if e.get("type") == "done"]
     assert len(errors) == 0
@@ -4489,7 +4483,7 @@ def test_cloud_pool_blocking_pin_updates_on_pinned_failure(monkeypatch):
         "mode": "chat", "input": "t2", "chat_backend": "cloud_pool",
         "conversation_id": "conv-c",
     })
-    resp2 = b.handle(req2)
+    b.handle(req2)
     # Pin = mistral, now make Mistral fail on this turn
     monkeypatch.setattr(b, "_build_mistral_chat_client",
                         lambda: _FakeCloudClient("mistral", fail=True))
@@ -4584,7 +4578,6 @@ def test_cloud_pool_stream_pin_is_per_conversation(monkeypatch):
 
 
 def test_goal_llm_transform_client_cloud_pool_uses_rotation(monkeypatch):
-    from openclaw_adapter.command_bridge import _WorkflowShimRunner
     from openclaw_adapter.llm_pool_settings import CloudPoolRotation
 
     b = CommandBridge(settings=_tool_settings(

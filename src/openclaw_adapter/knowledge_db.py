@@ -28,7 +28,7 @@ import math
 import re
 import sqlite3
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha1
 from pathlib import Path
@@ -986,6 +986,17 @@ DEPRECATED_CODEGEN_SEED: tuple[tuple[str, str], ...] = (
 
 
 CODEGEN_SEED: tuple[dict, ...] = (
+    {
+        "category": "validation",
+        "title": "串流協定損毀必須可觀測且終止成功路徑",
+        "technique": (
+            "解析逐行或分幀串流時，JSON/欄位結構/版本驗證失敗都要轉成明確的錯誤狀態，"
+            "不能略過壞資料後繼續把後續成功事件交給使用者。發出錯誤後要停止或取消該串流，"
+            "並以 producer/consumer 測試確認損毀資料不會被誤報成空結果或成功。"
+        ),
+        "keywords": ["*", "stream", "protocol", "ndjson", "corrupt", "validation"],
+        "confidence": 0.95,
+    },
     {
         "category": "validation",
         "title": "重啟後驗證相依性與對外服務真的可用",

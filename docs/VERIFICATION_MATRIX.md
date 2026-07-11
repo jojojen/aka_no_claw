@@ -60,7 +60,8 @@ equivalent local command.
 
 | Repo | Lane | CI trigger | Local equivalent |
 |---|---|---|---|
-| `aka_no_claw` | Fast PR (syntax + build + non-blocking Ruff) | every push/PR | `python -m compileall -q src tests && python -m build` |
+| `aka_no_claw` | Incremental static checks (blocking changed-file Ruff) | every push/PR | `python scripts/check_incremental_static.py --base <base-sha> --head HEAD` |
+| `aka_no_claw` | Fast PR (syntax + build + non-blocking full Ruff report) | every push/PR | `python -m compileall -q src tests && python -m build` |
 | `aka_no_claw` | Full offline suite | every push/PR | see below (needs 4 sibling repos on `PYTHONPATH`) |
 | `aka_no_claw_web` | Frontend (test + typecheck + build) | every push/PR | `cd frontend && npm ci && npm test && npm run build` |
 
@@ -81,6 +82,13 @@ Ruff baseline (non-blocking in CI for now — see C4 note in `pyproject.toml`'s
 ```bash
 .venv/bin/ruff check src tests
 ```
+
+The blocking C4 gate is intentionally incremental: it runs Ruff only on
+changed `src/` and `tests/` Python files, so the legacy repo-wide backlog does
+not block unrelated work. The GitHub required-check candidates for `main` are
+`Incremental static checks`, `Fast PR (syntax + package build)`, `Full offline
+suite`, and `docs-health`; configure them only after each has a green,
+deterministic run on the candidate revision.
 
 ## Verification Boundaries
 
