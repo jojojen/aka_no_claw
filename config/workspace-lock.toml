@@ -6,11 +6,11 @@
 # Every update must state: reason, affected consumers, and verification performed (commit message).
 
 schema_version = 1
-generated_at = "2026-07-11T10:45:26+00:00"
+generated_at = "2026-07-11T14:20:00+00:00"
 
 [packages.telegram-core]
 repository = "https://github.com/jojojen/telegram_core.git"
-revision = "24744015696ed72879a5a8f67f57e8d59171a2c7"
+revision = "961589f62124e0ec0a573cb529a6f5eb416432ea"
 distribution = "telegram-core"
 contract_version = 1
 
@@ -22,12 +22,12 @@ contract_version = 1
 
 [packages.price-monitor-bot]
 repository = "https://github.com/jojojen/price_monitor_bot.git"
-revision = "c9fc7e753e4ac2bdf2e74e881c68c4b57fd3cbeb"
+revision = "601928508a240cac319f0e932b3fe40fde92f1ce"
 distribution = "price-monitor-bot"
 contract_version = 1
 
 [packages.sns-monitor-bot]
 repository = "https://github.com/jojojen/sns_monitor_bot.git"
-revision = "812540b24ec8a9d77a095705099d3a2882bf1adf"
+revision = "2f76b7679dd5c8205cd0a7d10fa4de586063b87e"
 distribution = "sns-monitor-bot"
 contract_version = 1
