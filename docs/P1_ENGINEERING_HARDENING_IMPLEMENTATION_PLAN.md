@@ -507,6 +507,21 @@ Only mark a lane required after:
 Exit gate: every repo has required offline CI and shared producers run consumer
 contract tests using explicitly reported SHAs.
 
+### Progress log
+
+- 2026-07-11 — `aka_no_claw`'s own lanes only (C2 step 6's non-D1-dependent
+  half): `fast-pr` job (byte-compile gate + `python -m build` sdist/wheel,
+  no runtime deps needed) and `full-offline` job (full 2500+ test suite,
+  siblings `price_monitor_bot`/`telegram_nl`/`telegram_core`/`sns_monitor_bot`
+  checked out and put on `PYTHONPATH`, resolved SHAs printed per C2). Found
+  and fixed two undeclared runtime dependencies while proving out the CI
+  install list: `numpy` (used by `intent_cache.py`) and `sns-monitor-bot`
+  (used by `opportunity_sns_discovery.py`) were missing from
+  `pyproject.toml`'s `dependencies`. Still open: C3's pinned
+  producer→consumer matrix (blocked on #73's SHA-manifest — there's no
+  pinning mechanism to build it on top of yet), CI for the other 5 repos,
+  C4 static checks, C5 branch protection.
+
 ## 9. Workstream R1 — Command Bridge Decomposition
 
 Tracking issue: [`#74`](https://github.com/jojojen/aka_no_claw/issues/74)

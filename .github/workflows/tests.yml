@@ -2,9 +2,34 @@ name: tests
 
 on:
   pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  goal-loop-evals:
+  fast-pr:
+    name: Fast PR (syntax + package build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Byte-compile source tree (syntax gate)
+        run: python -m compileall -q src tests
+
+      - name: Build sdist + wheel (packaging metadata gate)
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+
+  full-offline:
+    name: Full offline suite
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -12,12 +37,12 @@ jobs:
       # Companion repos, checked out as subdirectories of this workspace
       # (actions/checkout refuses a `path` outside $GITHUB_WORKSPACE, so a
       # true `../<repo>` sibling — matching the local multi-repo dev layout
-      # — isn't possible here). Their own code is pure-stdlib (market_monitor,
-      # telegram_nl, telegram_core), so no `pip install -e` of them is needed —
-      # sys.path injection below is enough. But assistant_runtime.tls imports
-      # the real PyPI package `truststore` (a price_monitor_bot dependency
-      # normally pulled in transitively via editable install locally), so
-      # that one still needs an explicit pip install — see below.
+      # — isn't possible here). None of these are `pip install`-able from an
+      # index (price-monitor-bot/telegram-core/telegram-nl/sns-monitor-bot
+      # are declared as bare names in pyproject.toml precisely because they
+      # only resolve via local editable installs), so sys.path injection via
+      # PYTHONPATH below is the substitute until #73 lands a pinned-revision
+      # install path.
       - uses: actions/checkout@v4
         with:
           repository: jojojen/price_monitor_bot
@@ -33,19 +58,34 @@ jobs:
           repository: jojojen/telegram_core
           path: _deps/telegram_core
 
+      - uses: actions/checkout@v4
+        with:
+          repository: jojojen/sns_monitor_bot
+          path: _deps/sns_monitor_bot
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install pytest
-        run: python -m pip install pytest truststore
-
-      - name: Run goal-loop eval slice
+      - name: Install runtime + test dependencies
         run: |
-          PYTHONPATH=.:src:_deps/price_monitor_bot/src:_deps/telegram_nl/src:_deps/telegram_core/src \
-          python -m pytest \
-          tests/test_eval_cases.py \
-          tests/test_goal_loop.py \
-          tests/test_goal_planner.py \
-          tests/test_task_loop.py \
-          tests/test_task_workspace.py -q
+          python -m pip install --upgrade pip
+          python -m pip install \
+            pytest truststore \
+            beautifulsoup4 broadlink multipart numpy requests \
+            imagehash pillow \
+            twikit python-dotenv \
+            SudachiPy SudachiDict-full
+
+      - name: Print resolved sibling revisions
+        run: |
+          echo "aka_no_claw:        $(git rev-parse HEAD)"
+          echo "price_monitor_bot:  $(git -C _deps/price_monitor_bot rev-parse HEAD)"
+          echo "telegram_nl:        $(git -C _deps/telegram_nl rev-parse HEAD)"
+          echo "telegram_core:      $(git -C _deps/telegram_core rev-parse HEAD)"
+          echo "sns_monitor_bot:    $(git -C _deps/sns_monitor_bot rev-parse HEAD)"
+
+      - name: Run full offline test suite
+        run: |
+          PYTHONPATH=.:src:_deps/price_monitor_bot/src:_deps/telegram_nl/src:_deps/telegram_core/src:_deps/sns_monitor_bot/src \
+          python -m pytest -q -rs
