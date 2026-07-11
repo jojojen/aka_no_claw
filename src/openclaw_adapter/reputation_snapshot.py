@@ -13,6 +13,25 @@ from assistant_runtime import AssistantSettings, build_ssl_context
 
 _LOGGER = logging.getLogger(__name__)
 
+# Envelope versions this client can interpret (aka_no_claw#77 D2.4). A
+# response with NO envelope_version is the legacy/implicit-v0 case and stays
+# accepted during the compatibility window.
+SUPPORTED_ENVELOPE_VERSIONS = frozenset({1})
+
+
+class IncompatibleEnvelopeError(RuntimeError):
+    """Server responded with an envelope version this client does not
+    support. Must not be interpreted as unavailable or empty."""
+
+
+class CorruptResponseError(RuntimeError):
+    """Server response could not be parsed as the expected JSON object.
+    Must not be interpreted as unavailable or empty."""
+
+
+class RateLimitedError(RuntimeError):
+    """Server explicitly throttled the request (HTTP 429)."""
+
 
 class SnapshotStillPending(RuntimeError):
     """Raised when a job did not complete within the initial poll budget.
@@ -173,7 +192,7 @@ class ReputationSnapshotClient:
                 timeout=self._timeout_seconds,
                 context=self._ssl_context,
             ) as response:
-                payload = json.loads(response.read().decode("utf-8"))
+                raw = response.read().decode("utf-8")
         except HTTPError as exc:
             detail = exc.reason
             try:
@@ -187,12 +206,31 @@ class ReputationSnapshotClient:
                     detail = body_text
                 else:
                     detail = parsed.get("error") or parsed
+            if exc.code == 429:
+                raise RateLimitedError(
+                    f"reputation_snapshot rate limited (HTTP 429): {detail}"
+                ) from exc
             raise RuntimeError(f"reputation_snapshot HTTP {exc.code}: {detail}") from exc
         except URLError as exc:
             raise RuntimeError(f"reputation_snapshot request failed: {exc.reason}") from exc
 
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise CorruptResponseError(
+                "reputation_snapshot returned malformed JSON."
+            ) from exc
         if not isinstance(payload, dict):
-            raise RuntimeError("reputation_snapshot returned a non-object response.")
+            raise CorruptResponseError("reputation_snapshot returned a non-object response.")
+
+        # Missing envelope_version = legacy v0, accepted during the
+        # compatibility window (#77 D2.4 migration sequence).
+        envelope_version = payload.get("envelope_version")
+        if envelope_version is not None and envelope_version not in SUPPORTED_ENVELOPE_VERSIONS:
+            raise IncompatibleEnvelopeError(
+                f"reputation_snapshot envelope_version {envelope_version!r} unsupported "
+                f"(supported: {sorted(SUPPORTED_ENVELOPE_VERSIONS)})"
+            )
         return payload
 
 

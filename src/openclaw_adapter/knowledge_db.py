@@ -39,6 +39,8 @@ from .url_canonicalize import canonicalize_url, is_traceable_source, source_doma
 
 logger = logging.getLogger(__name__)
 
+SCHEMA_VERSION = 1
+
 
 @runtime_checkable
 class Embedder(Protocol):
@@ -291,6 +293,10 @@ class KnowledgeDatabase:
 
     def bootstrap(self) -> None:
         with self.connect() as conn:
+            # Stamp schema version only if currently at 0 (implicit v0 or fresh DB).
+            current_version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if current_version == 0:
+                conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             conn.executescript(_SCHEMA)
             self._migrate_source_domain_id(conn)
 

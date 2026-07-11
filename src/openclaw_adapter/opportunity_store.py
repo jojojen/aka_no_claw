@@ -7,6 +7,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+SCHEMA_VERSION = 1
+
 from .opportunity_models import (
     ListingOffer,
     OpportunityCandidate,
@@ -115,6 +117,10 @@ class OpportunityStore:
 
     def bootstrap(self) -> None:
         with self.connect() as connection:
+            # Stamp schema version only if currently at 0 (implicit v0 or fresh DB).
+            current_version = connection.execute("PRAGMA user_version").fetchone()[0]
+            if current_version == 0:
+                connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             # One-time migration: legacy schemas had no product_type column.
             # Drop the opportunity tables so the new schema can be applied
             # cleanly. The opportunity cron tick repopulates candidates

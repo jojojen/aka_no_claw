@@ -195,3 +195,94 @@ def test_poll_until_done_tolerates_transient_http_errors(monkeypatch) -> None:
     result = client._poll_until_done("job_retry", max_seconds=60.0)
     assert result is not None
     assert result.proof_id == "proof_ok"
+
+
+# ── D2.4 (aka_no_claw#77): envelope versioning + failure-state parsing ──────
+# These mock urlopen (not _request_json) so the real parsing path runs.
+
+import io
+import json as _json
+
+import pytest
+
+import openclaw_adapter.reputation_snapshot as reputation_snapshot_module
+from openclaw_adapter.reputation_snapshot import (
+    CorruptResponseError,
+    IncompatibleEnvelopeError,
+    RateLimitedError,
+    SUPPORTED_ENVELOPE_VERSIONS,
+)
+
+
+class _FakeResponse:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self) -> "_FakeResponse":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+
+def _client_with_body(monkeypatch, body: bytes) -> ReputationSnapshotClient:
+    monkeypatch.setattr(
+        reputation_snapshot_module,
+        "urlopen",
+        lambda *args, **kwargs: _FakeResponse(body),
+    )
+    return ReputationSnapshotClient(settings=_settings())
+
+
+def test_request_json_accepts_envelope_version_1(monkeypatch) -> None:
+    body = _json.dumps({"proof_url": "/p/abc", "envelope_version": 1}).encode()
+    client = _client_with_body(monkeypatch, body)
+    payload = client._request_json("/api/proofs/abc", method="GET")
+    assert payload["proof_url"] == "/p/abc"
+
+
+def test_request_json_accepts_missing_envelope_version_as_legacy(monkeypatch) -> None:
+    body = _json.dumps({"proof_url": "/p/abc"}).encode()
+    client = _client_with_body(monkeypatch, body)
+    payload = client._request_json("/api/proofs/abc", method="GET")
+    assert payload["proof_url"] == "/p/abc"
+
+
+def test_request_json_rejects_unsupported_envelope_version(monkeypatch) -> None:
+    body = _json.dumps({"proof_url": "/p/abc", "envelope_version": 99}).encode()
+    client = _client_with_body(monkeypatch, body)
+    with pytest.raises(IncompatibleEnvelopeError, match="99"):
+        client._request_json("/api/proofs/abc", method="GET")
+
+
+def test_request_json_rejects_malformed_json_as_corrupt(monkeypatch) -> None:
+    client = _client_with_body(monkeypatch, b"<html>not json</html>")
+    with pytest.raises(CorruptResponseError, match="malformed"):
+        client._request_json("/api/proofs/abc", method="GET")
+
+
+def test_request_json_rejects_non_object_response_as_corrupt(monkeypatch) -> None:
+    client = _client_with_body(monkeypatch, b"[1, 2, 3]")
+    with pytest.raises(CorruptResponseError, match="non-object"):
+        client._request_json("/api/proofs/abc", method="GET")
+
+
+def test_request_json_maps_http_429_to_rate_limited(monkeypatch) -> None:
+    from urllib.error import HTTPError
+
+    def raise_429(*args, **kwargs):
+        raise HTTPError(
+            "http://x", 429, "Too Many Requests", hdrs=None, fp=io.BytesIO(b"")
+        )
+
+    monkeypatch.setattr(reputation_snapshot_module, "urlopen", raise_429)
+    client = ReputationSnapshotClient(settings=_settings())
+    with pytest.raises(RateLimitedError, match="429"):
+        client._request_json("/api/captures", method="POST", body={})
+
+
+def test_supported_envelope_versions_contains_v1() -> None:
+    assert 1 in SUPPORTED_ENVELOPE_VERSIONS
