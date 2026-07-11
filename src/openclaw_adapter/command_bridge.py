@@ -117,6 +117,7 @@ from .continuation_policy import (
     ContinuationAction,
     classify_outcome,
     decide_continuation,
+    operation_key,
 )
 from .goal_loop import GoalLoop, GoalLoopContinuation, GoalLoopReport
 from .goal_planner import GoalPlanner
@@ -1902,6 +1903,7 @@ class CommandBridge:
         planner_metadata: ModelMetadata | None,
         narrator: Callable[[str], None] | None = None,
         seed_variables: dict[str, str] | None = None,
+        seed_operations: dict[str, str] | None = None,
     ) -> WebCommandResponse:
         try:
             report = self._execute_goal_loop(
@@ -1909,6 +1911,7 @@ class CommandBridge:
                 chat_backend=req.chat_backend,
                 narrator=narrator,
                 seed_variables=seed_variables,
+                seed_operations=seed_operations,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("goal loop failed goal=%r", goal)
@@ -2095,6 +2098,7 @@ class CommandBridge:
         resume: GoalLoopContinuation | None = None,
         narrator: Callable[[str], None] | None = None,
         seed_variables: dict[str, str] | None = None,
+        seed_operations: dict[str, str] | None = None,
     ):
         runner = _WorkflowShimRunner(self.settings)
         # One rotation cursor shared by every LLM call this run makes (draft,
@@ -2117,6 +2121,7 @@ class CommandBridge:
             narrator=narrator,
             result_judge=self._goal_result_judge(chat_backend, pool_rotation=pool_rotation),
             seed_variables=seed_variables,
+            seed_operations=seed_operations,
             conservative_synthesizer=self._goal_conservative_synthesizer(
                 chat_backend, pool_rotation=pool_rotation
             ),
@@ -3115,12 +3120,17 @@ class CommandBridge:
         # exhaustion can state plainly what stayed unknown (no keyword rules).
         if outcome.missing_evidence:
             seeds["missing_evidence"] = outcome.missing_evidence
+        # Tell the goal loop this tool already ran (keyed structurally) so its
+        # workflow can't spend a second identical /research on the same query —
+        # a duplicate step gets the answer we already hold, not a fresh run.
+        seed_operations = {outcome.operation_key: tool_result.answer}
         response = self._run_goal_loop_blocking(
             req,
             user_input,
             planner_metadata=planner_metadata,
             narrator=narrator,
             seed_variables=seeds,
+            seed_operations=seed_operations,
         )
         if response.status == STATUS_ERROR:
             logger.warning("goal loop upgrade failed after unsatisfied tool tool=%s", plan.tool)

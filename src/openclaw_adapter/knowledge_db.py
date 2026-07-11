@@ -1012,6 +1012,22 @@ CODEGEN_SEED: tuple[dict, ...] = (
         "confidence": 0.9,
     },
     {
+        "category": "architecture",
+        "title": "昂貴操作的去重要靠結構化 key 在執行邊界強制，不要只靠提示或評審模型",
+        "technique": (
+            "當一個多步驟迴圈可能重跑昂貴且不可逆或高成本的操作（例如一次網路研究、一次付費 "
+            "API 呼叫），不要只在 planner 提示或 LLM 滿意度評審裡「請不要重複」——那會漂。"
+            "改用結構化的 operation key（把指令名 + 正規化輸入 collapse 成穩定字串）當識別，"
+            "在真正呼叫 handler 的 dispatcher／executor 邊界維護一份 run-scoped 的 memo："
+            "key 已存在就直接回傳先前產物（artifact），不再執行。memo 要跨 draft 與每次 replan "
+            "共用，且把觸發升級前就已跑過的那次操作（連同結果）當 seed 塞進去，才能保證「每個"
+            "正規化操作最多執行一次」是可測試的確定性保證，而非機率。以「第一輪 partial → 進入"
+            "重規劃 → 最終仍有答案，且該操作 handler 呼叫次數嚴格等於 1」的 mocked E2E 驗證。"
+        ),
+        "keywords": ["*", "dedup", "idempotent", "operation key", "planner", "executor", "replan", "goal loop", "memo"],
+        "confidence": 0.9,
+    },
+    {
         "category": "validation",
         "title": "重啟後驗證相依性與對外服務真的可用",
         "technique": (

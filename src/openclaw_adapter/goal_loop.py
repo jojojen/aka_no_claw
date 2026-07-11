@@ -10,6 +10,7 @@ import logging
 from dataclasses import dataclass
 from typing import Callable
 
+from .continuation_policy import operation_key
 from .goal_planner import GoalPlanner
 from .task_loop import BoundedTaskLoop, ContinuationState, LoopContext, LoopResult, StepOutcome
 from .task_workspace import (
@@ -88,6 +89,7 @@ class GoalLoop:
         narrator: Callable[[str], None] | None = None,
         result_judge: Callable[[str, str], tuple[bool, str]] | None = None,
         seed_variables: dict[str, str] | None = None,
+        seed_operations: dict[str, str] | None = None,
         conservative_synthesizer: Callable[[str, dict[str, str], str], str] | None = None,
     ) -> None:
         self.goal = goal
@@ -113,6 +115,15 @@ class GoalLoop:
         # are pre-bound in the runner and shown to the planner so plans consume
         # them instead of re-executing expensive steps.
         self.seed_variables = dict(seed_variables or {})
+        # Operations (``operation_key`` -> produced result) that already ran
+        # before or during this goal — most importantly the chat tool whose
+        # incomplete result triggered the escalation. The command dispatcher
+        # refuses to re-run any command whose (command, input) collapses to a
+        # key already here, returning the prior artifact instead. This makes
+        # "at most one expensive run per canonical operation" a deterministic
+        # guarantee (issue #81), not a hope pinned on the planner prompt or the
+        # LLM satisfaction judge. Purely structural — no domain rules.
+        self.seed_operations = dict(seed_operations or {})
 
     def run(self, resume: GoalLoopContinuation | None = None) -> GoalLoopReport:
         scratch = {
@@ -135,6 +146,10 @@ class GoalLoop:
             # had when it was first produced, so a replan carrying it forward
             # doesn't lose that information (see WorkflowRunner.run()).
             "seed_types": {},
+            # Shared across draft + every replan of this run so a command that
+            # already ran (with the same normalised input) is never executed a
+            # second time — the dispatcher returns the cached artifact instead.
+            "executed_operations": dict(self.seed_operations),
         }
         if resume is not None and resume.trace is not None:
             # A resumed run may go straight to replan; make the previous
@@ -351,6 +366,8 @@ class GoalLoop:
                 step_observer=lambda line: self._narrate(scratch, line),
                 seed_variables=scratch["seeds"],
                 seed_variable_types=scratch["seed_types"],
+                executed_operations=scratch["executed_operations"],
+                narrate=lambda line: self._narrate(scratch, line),
             ).run(workflow)
             scratch["trace"] = trace
             # Carry every bound variable (succeeded steps + prior seeds) forward
@@ -488,12 +505,16 @@ class GoalLoop:
         step_observer: Callable[[str], None] | None = None,
         seed_variables: dict[str, str] | None = None,
         seed_variable_types: dict[str, str] | None = None,
+        executed_operations: dict[str, str] | None = None,
+        narrate: Callable[[str], None] | None = None,
     ) -> WorkflowRunner:
         return WorkflowRunner(
             executor=self.executor,
             command_dispatcher=_command_dispatcher_for_chat(
                 self.command_registry,
                 chat_id=self.chat_id,
+                executed_operations=executed_operations,
+                narrate=narrate,
             ),
             llm_client=self.llm_client,
             step_observer=step_observer,
@@ -567,14 +588,45 @@ class GoalLoop:
         return "budget exhausted"
 
 
-def _command_dispatcher_for_chat(command_registry: dict[str, object], *, chat_id: str) -> dict[str, Callable[[str], str]]:
+def _command_dispatcher_for_chat(
+    command_registry: dict[str, object],
+    *,
+    chat_id: str,
+    executed_operations: dict[str, str] | None = None,
+    narrate: Callable[[str], None] | None = None,
+) -> dict[str, Callable[[str], str]]:
+    # ``executed_operations`` is the run-scoped dedup memo (operation_key ->
+    # result). When present, a command whose (command, input) collapses to a
+    # key already run is NOT executed again — its prior artifact is returned,
+    # so an expensive operation like /research runs at most once per canonical
+    # request even across replans (issue #81). When absent, behaviour is the
+    # plain pass-through (used by callers that don't want dedup, e.g. tests).
+    memo = executed_operations
+
+    def _announce_reuse(command: str) -> None:
+        if narrate is None:
+            return
+        try:
+            narrate(f"略過重複操作：{command}（沿用先前結果）")
+        except Exception:  # noqa: BLE001
+            logger.exception("goal_loop: dedup narrate callback failed")
+
     dispatcher: dict[str, Callable[[str], str]] = {}
     for command, registered in command_registry.items():
         handler = getattr(registered, "handler", None)
         if handler is None:
             continue
 
-        def _dispatch(text: str, handler=handler, chat_id=chat_id) -> str:
+        def _dispatch(text: str, handler=handler, chat_id=chat_id, command=command) -> str:
+            if memo is not None:
+                key = operation_key(command, text)
+                if key in memo:
+                    _announce_reuse(command)
+                    return memo[key]
+                result = handler(text, chat_id)
+                answer = str(result[0] if isinstance(result, tuple) else result)
+                memo[key] = answer
+                return answer
             result = handler(text, chat_id)
             return str(result[0] if isinstance(result, tuple) else result)
 

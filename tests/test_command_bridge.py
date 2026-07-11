@@ -888,7 +888,7 @@ def test_chat_tool_unsatisfied_upgrades_to_goal_loop_run(monkeypatch):
     )
     seen_goals: list[str] = []
 
-    def _fake_run(req, goal, planner_metadata=None, narrator=None, seed_variables=None):
+    def _fake_run(req, goal, planner_metadata=None, narrator=None, seed_variables=None, seed_operations=None):
         seen_goals.append(goal)
         return WebCommandResponse(
             status=STATUS_OK,
@@ -984,7 +984,7 @@ def test_stream_chat_tool_unsatisfied_upgrades_to_goal_loop_run(monkeypatch):
         lambda req, plan, tool_result: {"satisfied": False, "environment_blocked": False},
     )
 
-    def _fake_run(req, goal, planner_metadata=None, narrator=None, seed_variables=None):
+    def _fake_run(req, goal, planner_metadata=None, narrator=None, seed_variables=None, seed_operations=None):
         # the real goal loop pushes narration through this callback live
         for line in (
             "已理解目標為：播放米津玄師的熱門歌曲",
@@ -5005,6 +5005,7 @@ def test_router_prompt_includes_prior_tool_ledger_per_conversation(monkeypatch):
 
 def test_unsatisfied_upgrade_passes_tool_answer_as_seed(monkeypatch):
     from openclaw_adapter.command_bridge import _seed_variable_name_for_tool
+    from openclaw_adapter.continuation_policy import operation_key
 
     b = CommandBridge(settings=_tool_settings())
     monkeypatch.setattr(
@@ -5027,8 +5028,9 @@ def test_unsatisfied_upgrade_passes_tool_answer_as_seed(monkeypatch):
     )
     seen: dict = {}
 
-    def _fake_run(req, goal, planner_metadata=None, narrator=None, seed_variables=None):
+    def _fake_run(req, goal, planner_metadata=None, narrator=None, seed_variables=None, seed_operations=None):
         seen["seeds"] = seed_variables
+        seen["ops"] = seed_operations
         return WebCommandResponse(status=STATUS_OK, mode=MODE_CHAT, message="工作流完成：ok")
 
     monkeypatch.setattr(b, "_run_goal_loop_blocking", _fake_run)
@@ -5036,6 +5038,11 @@ def test_unsatisfied_upgrade_passes_tool_answer_as_seed(monkeypatch):
     assert resp.status == STATUS_OK
     assert seen["seeds"] == {
         _seed_variable_name_for_tool(CHAT_TOOL_RESEARCH): "部分研究結果"
+    }
+    # The escalation must also hand the goal loop the operation key of the
+    # /research it already ran, so the loop can't spend a second identical run.
+    assert seen["ops"] == {
+        operation_key(CHAT_TOOL_RESEARCH, "https://x.example/item"): "部分研究結果"
     }
 
 def test_research_notifier_uses_live_callback_when_registered(monkeypatch):
@@ -5148,7 +5155,7 @@ def test_unsatisfied_upgrade_seeds_conversation_context(monkeypatch):
     )
     seen: dict = {}
 
-    def _fake_run(req_, goal, planner_metadata=None, narrator=None, seed_variables=None):
+    def _fake_run(req_, goal, planner_metadata=None, narrator=None, seed_variables=None, seed_operations=None):
         seen["seeds"] = seed_variables
         return WebCommandResponse(status=STATUS_OK, mode=MODE_CHAT, message="工作流完成：ok")
 

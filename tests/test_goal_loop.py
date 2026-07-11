@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from openclaw_adapter.goal_loop import GoalLoop, GoalLoopContinuation
+from openclaw_adapter.continuation_policy import operation_key
+from openclaw_adapter.goal_loop import (
+    GoalLoop,
+    GoalLoopContinuation,
+    _command_dispatcher_for_chat,
+)
 from openclaw_adapter.task_loop import ContinuationState
 from openclaw_adapter.task_workspace import (
     Workflow,
@@ -511,3 +516,131 @@ def test_goal_loop_exhaustion_without_synthesizer_keeps_raw_abort():
     report = loop.run()
     assert report.done is False
     assert report.final_result == "市價約 ¥16000"
+
+
+def _research_command_workflow(wf_id: str) -> Workflow:
+    return Workflow(
+        id=wf_id,
+        goal="goal",
+        steps=[
+            WorkflowStep(
+                id="s1", kind="command_sink", command="/research",
+                input="q", output="r1",
+            ),
+        ],
+    )
+
+
+def test_command_dispatcher_dedupes_repeated_operation():
+    """The run-scoped dedup memo makes an expensive command run at most once per
+    (command, input): a second identical call returns the cached artifact
+    without re-invoking the handler, while a genuinely different input still
+    runs (issue #81 — deterministic 'at most one /research', not a prompt hope)."""
+    calls: list[str] = []
+
+    def research_handler(text: str, chat_id: str) -> str:
+        calls.append(text)
+        return f"研究結果:{text}(#{len(calls)})"
+
+    memo: dict[str, str] = {}
+    reuse: list[str] = []
+    dispatcher = _command_dispatcher_for_chat(
+        {"/research": _FakeRegistered(handler=research_handler)},
+        chat_id="c",
+        executed_operations=memo,
+        narrate=reuse.append,
+    )
+    first = dispatcher["/research"]("mercari m123")
+    second = dispatcher["/research"]("  Mercari   M123 ")  # same op key
+    third = dispatcher["/research"]("別張卡 x999")
+
+    assert calls == ["mercari m123", "別張卡 x999"]  # duplicate never re-runs
+    assert first == second  # cached artifact reused verbatim
+    assert "別張卡 x999" in third
+    assert any("略過重複操作" in line for line in reuse)
+    assert operation_key("/research", "mercari m123") in memo
+
+
+def test_command_dispatcher_without_memo_is_plain_passthrough():
+    """No memo → no dedup: byte-for-byte the old behaviour so any caller that
+    doesn't opt in (e.g. other multi-step flows) is unchanged."""
+    calls: list[str] = []
+
+    def handler(text: str, chat_id: str) -> str:
+        calls.append(text)
+        return "ok"
+
+    dispatcher = _command_dispatcher_for_chat(
+        {"/x": _FakeRegistered(handler=handler)}, chat_id="c"
+    )
+    dispatcher["/x"]("same")
+    dispatcher["/x"]("same")
+    assert calls == ["same", "same"]  # runs both times
+
+
+def test_goal_loop_runs_research_at_most_once_across_replan():
+    """#81 regression guard (the mocked E2E the acceptance review asked for):
+    a first /research that the judge rejects as partial escalates into a replan,
+    but the loop must NOT spend a second identical /research — the dedup memo
+    returns the first artifact, so the command is invoked exactly once for the
+    whole run while a final answer is still produced."""
+    research_calls: list[str] = []
+
+    def research_handler(text: str, chat_id: str) -> str:
+        research_calls.append(text)
+        return "市價約¥16000（未計鑑定費）"
+
+    planner = _FakePlanner(
+        drafts=[(_research_command_workflow("wf-a"), None, False)],
+        replans=[(_research_command_workflow("wf-b"), None, False)],
+    )
+    judge_calls: list[str] = []
+
+    def judge(goal: str, final_result: str):
+        judge_calls.append(final_result)
+        achieved = len(judge_calls) > 1
+        return achieved, "" if achieved else "只有市價，未算獲利"
+
+    loop = GoalLoop(
+        goal="這張卡送鑑定會賺嗎",
+        planner=planner,
+        executor=_FakeExecutor({}),  # no tool_call steps in these workflows
+        command_registry={"/research": _FakeRegistered(handler=research_handler)},
+        replan_limit=1,
+        result_judge=judge,
+        seed_variables={"q": "mercari m123"},
+    )
+    report = loop.run()
+    assert report.done is True
+    assert report.replans_used == 1
+    # First round ran /research once; the replan re-drafted the same /research
+    # but it was served from the memo — invocation count stays exactly one.
+    assert research_calls == ["mercari m123"]
+
+
+def test_goal_loop_seed_operation_blocks_reentrant_research():
+    """The chat tool that escalated already ran /research; passing its operation
+    key + answer as a seed means a goal-loop workflow re-drafting the same
+    /research reuses that answer instead of paying for it a second time —
+    closing the 'seeded operation dedup enforcement' gap in the review."""
+    research_calls: list[str] = []
+
+    def research_handler(text: str, chat_id: str) -> str:
+        research_calls.append(text)
+        return "重新研究（不應發生）"
+
+    planner = _FakePlanner(drafts=[(_research_command_workflow("wf"), None, False)])
+    loop = GoalLoop(
+        goal="會賺嗎",
+        planner=planner,
+        executor=_FakeExecutor({}),
+        command_registry={"/research": _FakeRegistered(handler=research_handler)},
+        seed_variables={"q": "mercari m123"},
+        seed_operations={
+            operation_key("/research", "mercari m123"): "先前研究：市價¥16000",
+        },
+    )
+    report = loop.run()
+    assert research_calls == []  # the seeded op is never re-run
+    assert report.done is True
+    assert report.final_result == "先前研究：市價¥16000"
