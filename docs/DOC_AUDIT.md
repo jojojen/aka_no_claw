@@ -45,6 +45,7 @@ for which question each one answers.
 | `NEW_OPENCODE_DECOUPLING_PLAN.md` | Planned | dynamic-tools | Keep until shipped; then fold into canonical and archive. Cross-linked from canonical. |
 | `CHAT_GOAL_LOOP_PLAN.md` | Planned | dynamic-tools | Keep until shipped (chat goal loop + eval harness, issues #50–#54); then mark Current or fold into canonical and archive. |
 | `CHAT_CLOUD_POOL_STICKY_PROVIDER_PLAN.md` | Planned | dynamic-tools | Keep until shipped (sticky-provider pin for chat `cloud_pool`, ported from musubi issue #11 Case C P1); then mark Current or fold into canonical and archive. |
+| `P1_ENGINEERING_HARDENING_IMPLEMENTATION_PLAN.md` | Planned | agent-maintenance | Canonical P1 execution/handoff plan for issue #80; keep while active, then fold stable rules into truth docs and archive. |
 | `TELEGRAM_NL_OWNERSHIP_REFACTOR_ISSUE.md` | Planned | telegram | Draft issue; keep until the cross-repo NL ownership refactor is filed/resolved. |
 | `TELEGRAM_CORE_EXTRACTION_PLAN.md` | Current | telegram | Extraction shipped (phases P0–P4, all 3 repos' suites green); kept in place (not archived) as the `telegram_core` hook/registry contract reference. |
 | `OPPORTUNITY_AGENT_SPEC.md` | Needs review | opportunity | Verify thresholds vs code; canonical Opportunity doc. |
