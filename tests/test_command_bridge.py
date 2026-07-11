@@ -885,7 +885,11 @@ def test_chat_tool_unsatisfied_upgrades_to_goal_loop_run(monkeypatch):
             result_summary="miss",
         ),
     )
-    monkeypatch.setattr(b, "_chat_tool_result_satisfies_intent", lambda req, plan, tool_result: False)
+    monkeypatch.setattr(
+        b,
+        "_chat_tool_result_satisfies_intent",
+        lambda req, plan, tool_result: {"satisfied": False, "environment_blocked": False},
+    )
     seen_goals: list[str] = []
 
     def _fake_run(req, goal, planner_metadata=None, narrator=None, seed_variables=None):
@@ -916,6 +920,50 @@ def test_chat_tool_unsatisfied_upgrades_to_goal_loop_run(monkeypatch):
     assert "確認" not in resp.message
 
 
+def test_chat_tool_environment_blocked_failure_skips_goal_loop(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    tool_answer = (
+        "🔧 已使用工具：紅外線控制（/ir）｜指令：send 燈 power\n\n"
+        "找到 RM4 Mini 但無法連線：[Errno 65] No route to host\n"
+        "請先確認 Mac mini 可直連 RM4：關閉 NordVPN/防火牆的區網阻擋。"
+    )
+    monkeypatch.setattr(
+        b,
+        "_select_chat_tool_plan",
+        lambda req: (
+            ChatToolPlan(tool="/ir", query="send 燈 power", reason_summary="開燈"),
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        b,
+        "_run_chat_tool",
+        lambda req, plan: ChatToolResult(
+            answer=tool_answer, source_count=0, result_summary="連線失敗"
+        ),
+    )
+    monkeypatch.setattr(
+        b,
+        "_chat_tool_result_satisfies_intent",
+        lambda req, plan, tool_result: {
+            "satisfied": False,
+            "environment_blocked": True,
+            "reason": "裝置無法連線",
+        },
+    )
+
+    def _fail_goal_loop(*args, **kwargs):
+        raise AssertionError("environment-blocked failure must not start the goal loop")
+
+    monkeypatch.setattr(b, "_run_goal_loop_blocking", _fail_goal_loop)
+
+    resp = b.handle(parse_request({"mode": "chat", "input": "開燈"}))
+
+    assert resp.status == STATUS_OK
+    assert "無法連線" in resp.message
+    assert "直接指令沒有完成" not in resp.message
+
+
 def test_stream_chat_tool_unsatisfied_upgrades_to_goal_loop_run(monkeypatch):
     b = CommandBridge(settings=_tool_settings())
 
@@ -934,7 +982,11 @@ def test_stream_chat_tool_unsatisfied_upgrades_to_goal_loop_run(monkeypatch):
             result_summary="miss",
         ),
     )
-    monkeypatch.setattr(b, "_chat_tool_result_satisfies_intent", lambda req, plan, tool_result: False)
+    monkeypatch.setattr(
+        b,
+        "_chat_tool_result_satisfies_intent",
+        lambda req, plan, tool_result: {"satisfied": False, "environment_blocked": False},
+    )
 
     def _fake_run(req, goal, planner_metadata=None, narrator=None, seed_variables=None):
         # the real goal loop pushes narration through this callback live
@@ -975,7 +1027,26 @@ def test_chat_tool_satisfaction_parser_accepts_wrapped_json():
     parsed = CommandBridge._parse_chat_tool_satisfaction(
         '```json\n{"satisfied": false, "reason": "只完成部分"}\n```'
     )
-    assert parsed == {"satisfied": False, "reason": "只完成部分"}
+    assert parsed == {
+        "satisfied": False,
+        "environment_blocked": False,
+        "reason": "只完成部分",
+    }
+
+
+def test_chat_tool_satisfaction_parser_reads_environment_blocked():
+    parsed = CommandBridge._parse_chat_tool_satisfaction(
+        '{"satisfied": false, "environment_blocked": true, "reason": "裝置無法連線"}'
+    )
+    assert parsed["environment_blocked"] is True
+
+
+def test_chat_tool_satisfaction_parser_ignores_environment_blocked_when_satisfied():
+    parsed = CommandBridge._parse_chat_tool_satisfaction(
+        '{"satisfied": true, "environment_blocked": true, "reason": "已完成"}'
+    )
+    assert parsed["satisfied"] is True
+    assert parsed["environment_blocked"] is False
 
 
 def test_router_prompt_includes_registered_control_tool_usage(monkeypatch):
@@ -4859,7 +4930,9 @@ def test_unsatisfied_upgrade_passes_tool_answer_as_seed(monkeypatch):
         lambda req, plan: ChatToolResult(answer="部分研究結果"),
     )
     monkeypatch.setattr(
-        b, "_chat_tool_result_satisfies_intent", lambda req, plan, tool_result: False
+        b,
+        "_chat_tool_result_satisfies_intent",
+        lambda req, plan, tool_result: {"satisfied": False, "environment_blocked": False},
     )
     seen: dict = {}
 
@@ -4952,10 +5025,10 @@ def test_satisfaction_prompt_includes_conversation_context(monkeypatch):
         return '{"satisfied": false, "reason": "只有新資訊沒有整合結論"}'
 
     monkeypatch.setattr(b, "_generate_chat_tool_satisfaction_text", _fake_generate)
-    satisfied = b._chat_tool_result_satisfies_intent(
+    verdict = b._chat_tool_result_satisfies_intent(
         req, plan, ChatToolResult(answer="卡面外觀：邊角完好，置中良好。")
     )
-    assert satisfied is False
+    assert verdict["satisfied"] is False
     prompt = captured["prompt"]
     assert "對話脈絡" in prompt
     assert "這張卡投資角度值得買嗎？" in prompt
@@ -4978,7 +5051,9 @@ def test_unsatisfied_upgrade_seeds_conversation_context(monkeypatch):
     })
     plan = ChatToolPlan(tool="/visionlook", query="https://x.example/item 卡況")
     monkeypatch.setattr(
-        b, "_chat_tool_result_satisfies_intent", lambda *_a, **_k: False
+        b,
+        "_chat_tool_result_satisfies_intent",
+        lambda *_a, **_k: {"satisfied": False, "environment_blocked": False},
     )
     seen: dict = {}
 
