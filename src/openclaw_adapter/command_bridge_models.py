@@ -64,6 +64,7 @@ EVENT_DONE = "done"
 EVENT_ERROR = "error"
 EVENT_REDIRECT = "redirect"
 EVENT_PROCESS = "process"
+EVENT_JOB = "job"
 
 DEFAULT_SOURCE = "aka_no_claw_web"
 
@@ -498,6 +499,13 @@ def stream_error(message: str) -> dict[str, object]:
 
 def stream_process(text: str) -> dict[str, object]:
     return {"type": EVENT_PROCESS, "text": text}
+
+
+def stream_job(job_id: str) -> dict[str, object]:
+    """Announce the recovery job id backing a long streamed run so a client
+    whose stream drops (mobile screen-lock) can poll it for the final result
+    instead of losing the answer (issue #81 PR3)."""
+    return {"type": EVENT_JOB, "job_id": job_id}
 
 
 def stream_redirect(

@@ -108,6 +108,7 @@ from .command_bridge_models import (
     stream_done,
     stream_error,
     stream_heartbeat,
+    stream_job,
     stream_process,
     stream_redirect,
     stream_start,
@@ -1960,39 +1961,98 @@ class CommandBridge:
         abandoned = threading.Event()
         narration_queue: queue.Queue[str] = queue.Queue()
 
+        # Back this long run with a job (issue #81 PR3). A mobile stream that
+        # drops mid-research (screen-lock/backgrounding kills the held NDJSON
+        # connection — heartbeats can't stop the OS) can then poll this job id
+        # for the final answer, instead of the answer only surviving as a
+        # session-memory reload. The worker persists the terminal state whether
+        # or not the client is still attached.
+        job = self._jobs.create()
+        store = self._get_job_store()
+        store.save({
+            "job_id": job.id,
+            "status": JOB_RUNNING,
+            "progress": [],
+            "message": "",
+            "actions": [],
+            "error": None,
+            "created_at": job.wall_created_at,
+            "updated_at": job.wall_created_at,
+        })
+
+        def _emit(line: str) -> None:
+            narration_queue.put(line)
+            self._jobs.append_progress(job.id, line)
+
+        def _persist_job(*, status: str, message: str, error: str | None) -> None:
+            with job.lock:
+                job.status = status
+                job.message = message
+                job.error = error
+                progress_snapshot = list(job.progress)
+            store.save({
+                "job_id": job.id,
+                "status": status,
+                "progress": progress_snapshot,
+                "message": message,
+                "actions": [],
+                "error": error,
+                "created_at": job.wall_created_at,
+                "updated_at": time.time(),
+            })
+
         def _worker() -> None:
             try:
                 # Workflow steps that run registered commands (e.g. /research)
                 # emit staged milestones; surface them on this stream live.
-                with self._live_progress(narration_queue.put):
+                with self._live_progress(_emit):
                     result["report"] = self._execute_goal_loop(
                         goal=goal,
                         chat_backend=req.chat_backend,
-                        narrator=narration_queue.put,
+                        narrator=_emit,
                         seed_variables=seed_variables,
                     )
             except Exception as exc:  # noqa: BLE001
                 result["error"] = str(exc)
             finally:
                 done.set()
-                # Client gone (page closed / phone locked): the run still
-                # finished, so persist the continuation and push the outcome
-                # into session memory for the next page load.
-                if abandoned.is_set():
-                    report = result.get("report")
+                report = result.get("report")
+                # Persist the terminal outcome to the job unconditionally so a
+                # reconnecting/polling client recovers it deterministically.
+                try:
                     if isinstance(report, GoalLoopReport):
-                        try:
-                            self._record_goal_loop_run(req, goal, report)
-                            self._sync_goal_continuation(
-                                req, report, planner_metadata=planner_metadata
-                            )
-                            self._push_orphaned_result(self._format_goal_loop_message(report))
-                        except Exception:  # noqa: BLE001
-                            logger.exception(
-                                "command bridge: failed to persist abandoned goal result"
-                            )
+                        _persist_job(
+                            status=JOB_DONE,
+                            message=self._format_goal_loop_message(report),
+                            error=None,
+                        )
+                    elif "error" in result:
+                        _persist_job(
+                            status=JOB_ERROR, message="",
+                            error=f"目標執行失敗：{result['error']}",
+                        )
+                except Exception:  # noqa: BLE001
+                    logger.exception("command bridge: failed to persist goal job result")
+                # Client gone (page closed / phone locked): the run still
+                # finished, so persist the continuation for the next page load.
+                # The final answer itself is recovered via the job poll above,
+                # so we no longer push it into session memory (which would
+                # double-render alongside the polled result).
+                if abandoned.is_set() and isinstance(report, GoalLoopReport):
+                    try:
+                        self._record_goal_loop_run(req, goal, report)
+                        self._sync_goal_continuation(
+                            req, report, planner_metadata=planner_metadata
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "command bridge: failed to persist abandoned goal result"
+                        )
 
         threading.Thread(target=_worker, daemon=True).start()
+        # Announce the recovery job id before the long work so the client has
+        # it well before any ~26s mobile drop.
+        yield stream_job(job.id)
         last_beat = time.time()
         try:
             while not done.is_set() or not narration_queue.empty():

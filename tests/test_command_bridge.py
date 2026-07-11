@@ -1611,6 +1611,73 @@ def test_stream_goal_plan_runs_goal_loop_directly(monkeypatch):
     assert events[-1]["message"] == "run:先查天氣再播報的工作流"
 
 
+def test_stream_goal_loop_emits_job_event_and_poll_recovers_answer(monkeypatch):
+    # #81 PR3: a long goal-loop stream is backed by a job so a client can poll
+    # the same answer. Here the client stays attached; the job event still fires
+    # and the job is recoverable afterwards.
+    b = CommandBridge(settings=_tool_settings())
+
+    def _plan(req):
+        if False:
+            yield {}
+        return ChatToolPlan(tool=CHAT_TOOL_GOAL, query="查天氣並播報", reason_summary="多步驟"), None
+
+    monkeypatch.setattr(b, "_stream_chat_tool_plan", _plan)
+    monkeypatch.setattr(
+        b, "_execute_goal_loop",
+        lambda **kw: GoalLoopReport(
+            done=True, final_result="今天東京晴，20°C。", workflow=None,
+            trace=None, continuation=None, replans_used=0, narration=("查詢天氣中",),
+        ),
+    )
+    events = list(b.stream(parse_request({"mode": "chat", "input": "查天氣並播報"}), "rid-j1"))
+    types = [e["type"] for e in events]
+    assert "job" in types
+    job_ev = next(e for e in events if e["type"] == "job")
+    assert job_ev["job_id"]
+    assert types[-1] == "done"
+    assert "今天東京晴" in events[-1]["message"]
+    snap = _wait_job(b, job_ev["job_id"], "done")
+    assert snap["job_status"] == "done"
+    assert "今天東京晴" in snap["message"]
+
+
+def test_stream_goal_loop_disconnect_recovers_answer_via_job(monkeypatch):
+    # #81 PR3: the phone screen-locks and drops the NDJSON stream mid-run. The
+    # backend run still finishes and persists its answer to the job, so polling
+    # the job id recovers the final answer instead of losing it.
+    b = CommandBridge(settings=_tool_settings())
+    release = threading.Event()
+
+    def _plan(req):
+        if False:
+            yield {}
+        return ChatToolPlan(tool=CHAT_TOOL_GOAL, query="長研究", reason_summary="多步驟"), None
+
+    monkeypatch.setattr(b, "_stream_chat_tool_plan", _plan)
+
+    def _slow_exec(**kw):
+        release.wait(timeout=5.0)
+        return GoalLoopReport(
+            done=True, final_result="建議購買並送鑑定。", workflow=None, trace=None,
+            continuation=None, replans_used=0, narration=("分析中",),
+        )
+
+    monkeypatch.setattr(b, "_execute_goal_loop", _slow_exec)
+    gen = b.stream(parse_request({"mode": "chat", "input": "長研究"}), "rid-j2")
+    job_id = None
+    for ev in gen:
+        if ev["type"] == "job":
+            job_id = ev["job_id"]
+            break
+    assert job_id
+    gen.close()  # phone screen-locked: NDJSON stream dropped mid-run
+    release.set()  # the backend run finishes anyway
+    snap = _wait_job(b, job_id, "done")
+    assert snap["job_status"] == "done"
+    assert "建議購買並送鑑定" in snap["message"]
+
+
 def test_chat_goal_resume_uses_saved_continuation(monkeypatch):
     b = CommandBridge(settings=_tool_settings())
     continuation = GoalLoopContinuation(
