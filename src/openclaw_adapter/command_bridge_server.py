@@ -39,6 +39,22 @@ from .local_stt import (
 
 logger = logging.getLogger(__name__)
 
+# Transport envelope version stamped on every JSON object response and NDJSON
+# stream event (aka_no_claw#77 D2.4 follow-up), mirroring reputation_snapshot's
+# after_request hook. A response with NO envelope_version is the legacy/
+# implicit-v0 case; the frontend client accepts it during the compatibility
+# window per docs/CROSS_REPO_CONTRACTS.md.
+COMMAND_BRIDGE_ENVELOPE_VERSION = 1
+
+
+def _stamp_envelope_version(payload: dict) -> dict:
+    """Add envelope_version to a JSON-object payload if not already present.
+    Never overrides an existing value (mirrors reputation_snapshot's hook)."""
+    if "envelope_version" in payload:
+        return payload
+    return {**payload, "envelope_version": COMMAND_BRIDGE_ENVELOPE_VERSION}
+
+
 # Mesh VPN CGNAT range (NordVPN Meshnet / Tailscale) — always allowed so the
 # user's own phone reaches the bridge over the encrypted mesh.
 _MESHNET_CGNAT = ipaddress.ip_network("100.64.0.0/10")
@@ -521,7 +537,9 @@ def _build_handler(
             stream = bridge.stream(req, request_id)
             try:
                 for event in stream:
-                    line = (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
+                    line = (
+                        json.dumps(_stamp_envelope_version(event), ensure_ascii=False) + "\n"
+                    ).encode("utf-8")
                     self.wfile.write(line)
                     self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
@@ -537,7 +555,7 @@ def _build_handler(
             return
 
         def _write_json(self, payload: dict, *, status: int = 200) -> None:
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            body = json.dumps(_stamp_envelope_version(payload), ensure_ascii=False).encode("utf-8")
             self.send_response(status)
             self._send_cors_headers()
             self.send_header("Content-Type", "application/json; charset=utf-8")

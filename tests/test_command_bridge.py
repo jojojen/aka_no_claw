@@ -2222,7 +2222,8 @@ def test_stream_route_sends_cors_and_no_buffering_headers():
     raw = h.wfile.getvalue().decode("utf-8")
     assert "Access-Control-Allow-Origin: http://127.0.0.1:5173" in raw
     assert "X-Accel-Buffering: no" in raw
-    assert '{"type": "done", "message": "ok"}' in raw
+    # envelope_version stamped on every NDJSON event (#77 D2.4 follow-up).
+    assert '{"type": "done", "message": "ok", "envelope_version": 1}' in raw
 
 
 def test_options_preflight_allows_direct_bridge_streaming():
@@ -2333,6 +2334,7 @@ def test_server_transcribe_route_accepts_browser_multipart_contract():
         "language": "zh",
         "language_probability": 0.97,
         "duration_seconds": 1.2,
+        "envelope_version": 1,  # #77 D2.4 follow-up
     }
     assert seen["request"].data == b"webm audio"
     assert seen["request"].mime_type == "audio/webm"
