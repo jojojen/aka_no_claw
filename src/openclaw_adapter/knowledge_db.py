@@ -998,6 +998,20 @@ CODEGEN_SEED: tuple[dict, ...] = (
         "confidence": 0.95,
     },
     {
+        "category": "architecture",
+        "title": "長時任務不要只綁在單一長連線，改用可輪詢的持久化任務",
+        "technique": (
+            "行動裝置上的長連線（SSE/NDJSON/WebSocket）在螢幕鎖定或切到背景時會被作業系統"
+            "強制中斷，heartbeat 也擋不住。任何可能跑數十秒以上的工作，不要把結果只綁在那條"
+            "連線上：建立一個持久化、可輪詢的任務（job），先把 job_id 回傳給前端；背景 worker"
+            "無論客戶端是否還在都要把最終結果寫進可查詢的儲存區；前端在連線中斷或重新載入時"
+            "改用 job_id 輪詢/重連取回結果，而不是把中斷當成失敗。以「發出 job → 中途關閉連線"
+            "→ 仍能輪詢到最終結果」的 producer/consumer 測試驗證。"
+        ),
+        "keywords": ["*", "streaming", "sse", "ndjson", "job", "poll", "reconnect", "mobile", "background"],
+        "confidence": 0.9,
+    },
+    {
         "category": "validation",
         "title": "重啟後驗證相依性與對外服務真的可用",
         "technique": (
