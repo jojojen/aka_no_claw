@@ -591,6 +591,11 @@ Names are provisional. Prefer fewer modules if responsibilities remain cohesive.
 
 ### R1.0 Characterization inventory
 
+> 2026-07-12 — inventory shipped: [`R1_COMMAND_BRIDGE_INVENTORY.md`](R1_COMMAND_BRIDGE_INVENTORY.md)
+> (public surface × routes × consumers, state/locks, threads/cancellation,
+> providers, stores, response contracts, coverage gaps, risk notes).
+> Remaining in R1.0: the four characterization-test gaps listed in its §8.
+
 Before moving code, map:
 
 - public `CommandBridge` methods;

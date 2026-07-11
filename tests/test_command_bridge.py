@@ -2125,6 +2125,62 @@ def test_poll_unknown_job_is_not_found():
     assert snap["job_status"] == "error"
 
 
+# --- orphaned result handling (#74 R1.0 characterization gap) --------------
+def test_disconnected_stream_pushes_orphaned_result_to_session(monkeypatch, tmp_path):
+    """R1.0 contract: when the streaming client disconnects mid-tool-run, the
+    worker's completed answer is pushed into server-side session memory so the
+    next session load shows it — the answer must not silently vanish."""
+    from openclaw_adapter.session_memory import SessionMemoryStore
+
+    monkeypatch.setattr(
+        "openclaw_adapter.command_bridge._HEARTBEAT_SECONDS", 0.02, raising=False
+    )
+    b = CommandBridge(settings=_tool_settings())
+    b._session_store = SessionMemoryStore(str(tmp_path))
+    release = threading.Event()
+    pushed = threading.Event()
+
+    def _plan(req):
+        if False:
+            yield {}
+        return ChatToolPlan(tool=CHAT_TOOL_SEARCH, query="東京 天氣", reason_summary="查詢"), None
+
+    started = threading.Event()
+
+    def _slow_tool(req, plan):
+        started.set()
+        release.wait(timeout=5.0)
+        return ChatToolResult(answer="東京明天晴，最高 28 度。", source_count=2)
+
+    monkeypatch.setattr(b, "_stream_chat_tool_plan", _plan)
+    monkeypatch.setattr(b, "_run_chat_tool", _slow_tool)
+    monkeypatch.setattr(
+        b, "_maybe_upgrade_tool_result_to_goal_loop", lambda *a, **k: None
+    )
+    orig_push = b._push_orphaned_result
+    monkeypatch.setattr(
+        b, "_push_orphaned_result",
+        lambda text: (orig_push(text), pushed.set()) and None,
+    )
+
+    gen = b.stream(parse_request({"mode": "chat", "input": "東京天氣"}), "rid-orphan")
+    for ev in gen:
+        # Consume past the tool-calling notice until the drain loop is live
+        # (worker started) — closing earlier would cancel before the worker
+        # even spawns, which is a different (non-orphan) path.
+        if started.is_set() and ev["type"] == "heartbeat":
+            break
+    gen.close()  # phone screen-locks: stream dropped before the tool finished
+    release.set()  # the tool completes anyway
+    assert pushed.wait(2.0), "orphaned result was never pushed to session memory"
+
+    messages = (b.load_session().get("session") or {}).get("messages") or []
+    assert any(
+        m.get("role") == "assistant" and "東京明天晴" in (m.get("text") or "")
+        for m in messages
+    )
+
+
 # --- cooperative cancellation (#81 stop button, backend half) --------------
 def test_cancel_unknown_job_reports_not_found():
     """Cancelling a job that never existed is not an error state to abort on —
