@@ -38,6 +38,16 @@ class AssistantSettings:
     openclaw_stt_download_root: str = ".openclaw_tmp/whisper"
     openclaw_stt_max_audio_bytes: int = 15 * 1024 * 1024
     openclaw_stt_max_duration_seconds: int = 120
+    # Voice personalization store (#82 PR2): SQLite for utterance rows and
+    # per-action prototypes. Empty path disables the store entirely — the
+    # voice gate still works, learning just stays off (fail-soft).
+    openclaw_voice_store_path: str = "data/voice_personalization.sqlite3"
+    # Embedding backend id. Empty = disabled (utterances persist without
+    # embeddings); "synthetic" = deterministic test backend. A real local
+    # acoustic backend is selected by benchmark (design §21) in a later PR.
+    openclaw_voice_embedding_backend: str = ""
+    # Unresolved-utterance retention (design §12.2 suggests 10–30 min).
+    openclaw_voice_utterance_ttl_seconds: int = 1800
     # Fast, code-specialized tier-1 model for /new codegen. Escalates to the
     # (larger) openclaw_local_text_model only when this tier exhausts repairs.
     openclaw_codegen_fast_model: str | None = "qwen2.5-coder:7b"
@@ -237,6 +247,10 @@ def load_dotenv(path: str | Path = DEFAULT_ENV_PATH, *, override: bool = False) 
 def get_settings() -> AssistantSettings:
     _raw_chat_ids = _getenv_any("OPENCLAW_TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_ID")
     _parsed_chat_ids = _parse_chat_ids(_raw_chat_ids)
+    # Empty path = voice store disabled; don't resolve "" into the repo root.
+    _voice_store_raw = os.getenv(
+        "OPENCLAW_VOICE_STORE_PATH", "data/voice_personalization.sqlite3"
+    ).strip()
     return AssistantSettings(
         monitor_db_path=_resolve_runtime_path(os.getenv("MONITOR_DB_PATH", "data/monitor.sqlite3")),
         yuyutei_user_agent=os.getenv("YUYUTEI_USER_AGENT", bs.MAC_CHROME_UA),
@@ -280,6 +294,16 @@ def get_settings() -> AssistantSettings:
         openclaw_stt_max_duration_seconds=_as_int(
             os.getenv("OPENCLAW_STT_MAX_DURATION_SECONDS"),
             default=120,
+        ),
+        openclaw_voice_store_path=(
+            _resolve_runtime_path(_voice_store_raw) if _voice_store_raw else ""
+        ),
+        openclaw_voice_embedding_backend=os.getenv(
+            "OPENCLAW_VOICE_EMBEDDING_BACKEND", ""
+        ).strip(),
+        openclaw_voice_utterance_ttl_seconds=_as_int(
+            os.getenv("OPENCLAW_VOICE_UTTERANCE_TTL_SECONDS"),
+            default=1800,
         ),
         openclaw_codegen_fast_model=_none_if_empty(
             os.getenv("OPENCLAW_CODEGEN_FAST_MODEL", "qwen2.5-coder:7b")

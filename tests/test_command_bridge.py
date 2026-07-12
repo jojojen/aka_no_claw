@@ -2686,7 +2686,9 @@ def _multipart_body(parts, *, boundary="----BrowserFormBoundary"):
     return bytes(body), f"multipart/form-data; boundary={boundary}"
 
 
-def _invoke_transcribe_route(body, content_type, transcriber, *, content_length=None):
+def _invoke_transcribe_route(
+    body, content_type, transcriber, *, content_length=None, **handler_kwargs
+):
     from http.server import BaseHTTPRequestHandler
 
     from openclaw_adapter import command_bridge_server as srv
@@ -2695,6 +2697,7 @@ def _invoke_transcribe_route(body, content_type, transcriber, *, content_length=
         object(),
         lan_enabled=False,
         transcriber=transcriber,
+        **handler_kwargs,
     )
     h = handler_cls.__new__(handler_cls)
     h.headers = {
@@ -2746,9 +2749,11 @@ def test_server_transcribe_route_accepts_browser_multipart_contract():
 
     assert b" 200 " in raw
     # #82 PR1: an opaque utterance_id joins the contract for the voice
-    # personalization pipeline; it is random per request.
+    # personalization pipeline; it is random per request. PR2 adds
+    # embedding_status ("disabled" when no store/backend is configured).
     utterance_id = payload.pop("utterance_id")
     assert isinstance(utterance_id, str) and utterance_id
+    assert payload.pop("embedding_status") == "disabled"
     assert payload == {
         "status": "ok",
         "transcript": "打開音樂",
@@ -2759,6 +2764,95 @@ def test_server_transcribe_route_accepts_browser_multipart_contract():
     }
     assert seen["request"].data == b"webm audio"
     assert seen["request"].mime_type == "audio/webm"
+
+
+def _pr2_fake_transcriber():
+    from openclaw_adapter.local_stt import TranscriptionResult
+
+    class _FakeTranscriber:
+        max_audio_bytes = 1024
+        max_request_bytes = 2048
+
+        def transcribe(self, request):
+            return TranscriptionResult(
+                transcript="關鍵善",
+                language="zh",
+                language_probability=0.98,
+                duration_seconds=1.45,
+            )
+
+    return _FakeTranscriber()
+
+
+def test_server_transcribe_persists_utterance_with_embedding():
+    """#82 PR2: a configured store+backend records the utterance (embedding,
+    TTL) at transcribe time; only the embedding is stored, never audio."""
+    from openclaw_adapter.voice.embedding import SyntheticEmbeddingBackend
+
+    class _RecordingStore:
+        def __init__(self):
+            self.saved = []
+            self.gc_calls = 0
+
+        def gc_expired(self):
+            self.gc_calls += 1
+            return 0
+
+        def save_utterance(self, **kwargs):
+            self.saved.append(kwargs)
+
+    store = _RecordingStore()
+    body, content_type = _multipart_body(
+        [("file", b"webm audio", "recording.webm", "audio/webm")]
+    )
+    raw, payload = _invoke_transcribe_route(
+        body,
+        content_type,
+        _pr2_fake_transcriber(),
+        voice_store=store,
+        voice_embedding_backend=SyntheticEmbeddingBackend(dim=8),
+        voice_utterance_ttl_seconds=900.0,
+    )
+
+    assert b" 200 " in raw
+    assert payload["embedding_status"] == "ready"
+    assert store.gc_calls == 1
+    assert len(store.saved) == 1
+    saved = store.saved[0]
+    assert saved["utterance_id"] == payload["utterance_id"]
+    assert saved["transcript"] == "關鍵善"
+    assert saved["duration_ms"] == 1450
+    assert saved["ttl_seconds"] == 900.0
+    assert len(saved["embedding"]) == 8
+    assert saved["embedding_model_version"].startswith("synthetic-v1")
+    # Raw audio bytes must not be handed to the store.
+    assert all(not isinstance(v, (bytes, bytearray)) for v in saved.values())
+
+
+def test_server_transcribe_store_failure_is_fail_soft():
+    """#82 PR2 acceptance: store failure must not break STT (design §13.4)."""
+
+    class _ExplodingStore:
+        def gc_expired(self):
+            raise RuntimeError("disk detached")
+
+        def save_utterance(self, **kwargs):
+            raise AssertionError("unreachable")
+
+    body, content_type = _multipart_body(
+        [("file", b"webm audio", "recording.webm", "audio/webm")]
+    )
+    raw, payload = _invoke_transcribe_route(
+        body,
+        content_type,
+        _pr2_fake_transcriber(),
+        voice_store=_ExplodingStore(),
+    )
+
+    assert b" 200 " in raw
+    assert payload["status"] == "ok"
+    assert payload["transcript"] == "關鍵善"
+    assert payload["embedding_status"] == "error"
 
 
 @pytest.mark.parametrize(

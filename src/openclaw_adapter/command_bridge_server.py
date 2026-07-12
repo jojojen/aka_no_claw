@@ -154,6 +154,9 @@ def _build_handler(
     *,
     lan_enabled: bool,
     transcriber: LocalWhisperTranscriber | None = None,
+    voice_store: object | None = None,
+    voice_embedding_backend: object | None = None,
+    voice_utterance_ttl_seconds: float = 1800.0,
 ) -> type[BaseHTTPRequestHandler]:
     class CommandBridgeHandler(BaseHTTPRequestHandler):
         def _is_allowed(self) -> bool:
@@ -406,6 +409,42 @@ def _build_handler(
                 return
             self._write_json(bridge.confirm_voice_action(action_id))
 
+        def _persist_utterance(self, *, utterance_id, request, result) -> str:
+            """#82 PR2: store the utterance row (embedding included when a
+            backend is configured) with a short TTL. Raw audio only lives in
+            the request buffer and is dropped when this request ends. Any
+            failure here is fail-soft — STT must keep working (design §13.4).
+            Returns the embedding_status reported to the client."""
+            if voice_store is None:
+                return "disabled"
+            embedding = None
+            model_version = None
+            status = "disabled"
+            if voice_embedding_backend is not None:
+                try:
+                    embedding = voice_embedding_backend.embed(request.data)  # type: ignore[attr-defined]
+                    model_version = voice_embedding_backend.model_version  # type: ignore[attr-defined]
+                    status = "ready"
+                except Exception:  # noqa: BLE001
+                    logger.exception("voice embedding failed; storing without vector")
+                    status = "error"
+            try:
+                voice_store.gc_expired()  # type: ignore[attr-defined]
+                voice_store.save_utterance(  # type: ignore[attr-defined]
+                    utterance_id=utterance_id,
+                    transcript=result.transcript,
+                    duration_ms=int((result.duration_seconds or 0) * 1000),
+                    ttl_seconds=voice_utterance_ttl_seconds,
+                    language=result.language,
+                    language_probability=result.language_probability,
+                    embedding=embedding,
+                    embedding_model_version=model_version,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("voice utterance persistence failed (fail-soft)")
+                return "error"
+            return status
+
         def _handle_transcribe(self) -> None:
             if transcriber is None:
                 self._write_json(
@@ -475,12 +514,17 @@ def _build_handler(
                 )
                 return
 
+            # Opaque id for the voice-personalization pipeline (#82): the
+            # frontend echoes it back in the command request's voice metadata
+            # so the learning transaction (PR3) can associate the utterance.
+            utterance_id = uuid4().hex
+            embedding_status = self._persist_utterance(
+                utterance_id=utterance_id, request=request, result=result
+            )
             response: dict[str, object] = {
                 "status": "ok",
-                # Opaque id for the voice-personalization pipeline (#82): the
-                # frontend echoes it back in the command request's voice
-                # metadata so later PRs can associate learning data.
-                "utterance_id": uuid4().hex,
+                "utterance_id": utterance_id,
+                "embedding_status": embedding_status,
                 "transcript": result.transcript,
             }
             if result.language is not None:
@@ -623,9 +667,33 @@ def serve_command_bridge(
     bind_host = host or ("0.0.0.0" if lan else "127.0.0.1")
     bridge = CommandBridge(settings)
     transcriber = LocalWhisperTranscriber.from_settings(settings)
+    # #82 PR2: voice personalization store + embedding backend. A corrupt DB
+    # is reported loudly and the feature is disabled — it is never silently
+    # rebuilt, and it never blocks the bridge itself (design §13.4).
+    from .voice.embedding import resolve_embedding_backend
+    from .voice.prototype_store import VoiceStoreCorruptError, open_voice_store
+
+    try:
+        voice_store = open_voice_store(settings)
+    except VoiceStoreCorruptError:
+        logger.exception(
+            "voice store is CORRUPT — voice personalization disabled; "
+            "inspect/back up the DB before deleting it"
+        )
+        voice_store = None
+    voice_embedding_backend = resolve_embedding_backend(settings)
     server = ThreadingHTTPServer(
         (bind_host, port),
-        _build_handler(bridge, lan_enabled=lan, transcriber=transcriber),
+        _build_handler(
+            bridge,
+            lan_enabled=lan,
+            transcriber=transcriber,
+            voice_store=voice_store,
+            voice_embedding_backend=voice_embedding_backend,
+            voice_utterance_ttl_seconds=float(
+                getattr(settings, "openclaw_voice_utterance_ttl_seconds", 1800)
+            ),
+        ),
     )
     logger.info("command-bridge server starting host=%s port=%s lan=%s", bind_host, port, lan)
     print(f"OpenClaw command bridge running on http://{bind_host}:{port} (lan={lan})")
