@@ -150,7 +150,16 @@ from .voice import (
     VoiceUserContext,
 )
 from .voice.action_registry import DISPATCH_IR_SEND, DISPATCH_MUSIC_CALLBACK
+from .voice.learning import (
+    LEARNING_ACTION_FAILED,
+    LEARNING_SKIPPED_NO_TOKEN,
+    LEARNING_STORE_ERROR,
+    commit_prototype,
+    issue_learning_token,
+    redeem_learning_token,
+)
 from .voice.models import RISK_LOW
+from .voice.prototype_store import VoiceStoreCorruptError, open_voice_store
 
 logger = logging.getLogger(__name__)
 
@@ -558,6 +567,9 @@ class CommandBridge:
             ir_buttons=lambda: self._voice_ir_buttons(),
         )
         self._voice_gate = VoiceIntentGate(self._voice_registry)
+        # #82 PR3: personalization store, opened lazily on first voice turn.
+        self._voice_store_cached: object | None = None
+        self._voice_store_checked = False
         self._goal_pending_confirms: dict[str, dict] = {}
         self._goal_pending_lock = threading.Lock()
         # A goal run that finished successfully offers a "💾 存為工作流" button
@@ -3570,6 +3582,22 @@ class CommandBridge:
     def _voice_user_context(self, req: WebCommandRequest) -> VoiceUserContext:
         return VoiceUserContext(conversation_id=req.conversation_id)
 
+    def _voice_store(self):
+        """Lazy personalization store (#82 PR3). A corrupt DB is reported
+        loudly and the feature stays off — never silently rebuilt, never a
+        reason for chat to fail (design §13.4)."""
+        if not self._voice_store_checked:
+            try:
+                self._voice_store_cached = open_voice_store(self.settings)
+            except VoiceStoreCorruptError:
+                logger.exception(
+                    "voice store is CORRUPT — voice learning disabled; "
+                    "inspect/back up the DB before deleting it"
+                )
+                self._voice_store_cached = None
+            self._voice_store_checked = True
+        return self._voice_store_cached
+
     def _maybe_voice_clarification(
         self, req: WebCommandRequest, plan: ChatToolPlan
     ) -> VoiceClarification | None:
@@ -3598,9 +3626,25 @@ class CommandBridge:
         )
         if not clarification.candidates:
             return None
+        # #82 PR3: bind a single-use learning token to this utterance and
+        # candidate set so a confirmed successful action becomes a prototype.
+        store = self._voice_store()
+        if store is not None and voice is not None and voice.utterance_id:
+            token = issue_learning_token(
+                store,
+                utterance_id=voice.utterance_id,
+                candidate_action_ids=tuple(
+                    c.action_id for c in clarification.candidates
+                ),
+            )
+            if token:
+                clarification = dataclasses.replace(
+                    clarification, learning_token=token
+                )
         logger.info(
-            "[voice-gate] clarify before tool=%s transcript=%r candidates=%d",
+            "[voice-gate] clarify before tool=%s transcript=%r candidates=%d token=%s",
             plan.tool, req.input, len(clarification.candidates),
+            "yes" if clarification.learning_token else "no",
         )
         return clarification
 
@@ -3611,14 +3655,39 @@ class CommandBridge:
             "你是要執行哪一個？（也可以選「都不是」當一般問題處理）"
         )
 
-    def confirm_voice_action(self, action_id: str) -> dict:
+    def confirm_voice_action(
+        self, action_id: str, *, learning_token: str | None = None
+    ) -> dict:
         """Execute a clarification candidate. The client submits only the
-        ``action_id``; the registry is re-read and availability/risk are
-        re-validated server-side (design §5.5) — display labels, payloads and
-        risk levels from the client are never trusted."""
+        ``action_id`` (+ the opaque learning token); the registry is re-read
+        and availability/risk re-validated server-side (design §5.5) — labels,
+        payloads and risk levels from the client are never trusted.
+
+        Learning transaction (#82 PR3, §5.4): a provided token is consumed
+        BEFORE execution (single-use — a replayed token is rejected without
+        re-executing), the confirmed action must be inside the token's
+        candidate set, and a prototype is committed only after the action
+        reports success. No token = execute without learning."""
         aid = (action_id or "").strip()
         if not aid:
             return {"status": STATUS_ERROR, "message": "缺少 action_id。", "actions": []}
+        store = self._voice_store()
+        redeemed = None
+        if learning_token:
+            if store is not None:
+                redeemed = redeem_learning_token(store, learning_token)
+                if redeemed is None:
+                    return {
+                        "status": STATUS_ERROR,
+                        "message": "確認已失效（逾時或已使用過），請重新語音操作一次。",
+                        "actions": [],
+                    }
+                if aid not in redeemed.candidate_action_ids:
+                    return {
+                        "status": STATUS_ERROR,
+                        "message": "選擇與候選清單不一致，已取消執行。",
+                        "actions": [],
+                    }
         try:
             actions = self._voice_registry.list_actions(
                 user_context=VoiceUserContext()
@@ -3637,12 +3706,72 @@ class CommandBridge:
             }
         if descriptor.dispatch_kind == DISPATCH_MUSIC_CALLBACK:
             callback = str(descriptor.dispatch_payload.get("callback_data") or "")
-            return self.run_music_action(callback)
-        if descriptor.dispatch_kind == DISPATCH_IR_SEND:
+            result = self.run_music_action(callback)
+        elif descriptor.dispatch_kind == DISPATCH_IR_SEND:
             device = str(descriptor.dispatch_payload.get("device") or "")
             button = str(descriptor.dispatch_payload.get("button") or "")
-            return self.run_ir_command(f"send {device} {button}")
-        return {"status": STATUS_ERROR, "message": "未知的操作類型。", "actions": []}
+            result = self.run_ir_command(f"send {device} {button}")
+        else:
+            return {"status": STATUS_ERROR, "message": "未知的操作類型。", "actions": []}
+
+        success = str(result.get("status")) == STATUS_OK
+        out = dict(result)
+        if store is not None:
+            try:
+                store.record_action_outcome(aid, success=success)
+            except Exception:  # noqa: BLE001
+                logger.exception("voice action stats update failed (fail-soft)")
+        if redeemed is not None and store is not None:
+            out["learning_status"] = (
+                commit_prototype(
+                    store, utterance_id=redeemed.utterance_id, action_id=aid
+                )
+                if success
+                else LEARNING_ACTION_FAILED
+            )
+        elif learning_token:
+            out["learning_status"] = LEARNING_STORE_ERROR
+        else:
+            out["learning_status"] = LEARNING_SKIPPED_NO_TOKEN
+        return out
+
+    def list_voice_prototypes(self) -> dict:
+        """Personalization inspection surface (#82 §17: 檢視)."""
+        store = self._voice_store()
+        if store is None:
+            return {"status": STATUS_OK, "prototypes": [], "message": "語音個人化未啟用。"}
+        try:
+            prototypes = store.list_prototypes(status=None)
+        except Exception:  # noqa: BLE001
+            logger.exception("voice prototype listing failed")
+            return {"status": STATUS_ERROR, "prototypes": [], "message": "無法讀取語音個人化資料。"}
+        return {
+            "status": STATUS_OK,
+            "prototypes": [
+                {
+                    "prototype_id": p.prototype_id,
+                    "action_id": p.action_id,
+                    "status": p.status,
+                    "confirmed_count": p.confirmed_count,
+                    "rejected_count": p.rejected_count,
+                    "embedding_model_version": p.embedding_model_version,
+                    "updated_at": p.updated_at,
+                }
+                for p in prototypes
+            ],
+        }
+
+    def reset_voice_personalization(self) -> dict:
+        """Delete prototypes, utterances, tokens and stats (#82 §13.3)."""
+        store = self._voice_store()
+        if store is None:
+            return {"status": STATUS_OK, "message": "語音個人化未啟用，無資料可清除。"}
+        try:
+            store.reset_profile()
+        except Exception:  # noqa: BLE001
+            logger.exception("voice personalization reset failed")
+            return {"status": STATUS_ERROR, "message": "清除失敗，請檢查儲存空間狀態。"}
+        return {"status": STATUS_OK, "message": "已清除語音個人化資料。"}
 
     def run_music_command(self, text: str) -> dict:
         """Run the ``/music`` handler for the 生活 mode text box — an empty box

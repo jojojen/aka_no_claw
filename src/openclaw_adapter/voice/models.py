@@ -63,19 +63,27 @@ class VoiceActionCandidate:
 
 @dataclass(frozen=True)
 class VoiceClarification:
-    """Wire contract for a clarify resolution (design §5.3, PR1 subset:
-    no learning_token until PR3)."""
+    """Wire contract for a clarify resolution (design §5.3).
+
+    ``learning_token`` (PR3) is the raw single-use token the client must echo
+    back on confirm for a successful action to become a prototype; None when
+    the voice store or utterance embedding is unavailable — clarification
+    still works, learning is simply off for this turn."""
 
     transcript: str
     reason_code: str
     candidates: tuple[VoiceActionCandidate, ...]
     fallback_label: str
+    learning_token: str | None = None
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        out: dict[str, object] = {
             "kind": VOICE_RESOLUTION_CLARIFY,
             "transcript": self.transcript,
             "reason_code": self.reason_code,
             "candidates": [c.to_dict() for c in self.candidates],
             "fallback": {"label": self.fallback_label},
         }
+        if self.learning_token:
+            out["learning_token"] = self.learning_token
+        return out

@@ -218,6 +218,8 @@ def _build_handler(
                 self._handle_transcribe()
             elif path == "/api/command/voice/confirm":
                 self._handle_voice_confirm()
+            elif path == "/api/command/voice/reset":
+                self._write_json(bridge.reset_voice_personalization())
             elif path == "/api/command/restartall":
                 self._write_json(bridge.restart_all())
             else:
@@ -243,6 +245,8 @@ def _build_handler(
                 self._write_json(bridge.model_routes())
             elif split.path == "/api/command/chat-settings":
                 self._write_json(bridge.load_chat_settings())
+            elif split.path == "/api/command/voice/prototypes":
+                self._write_json(bridge.list_voice_prototypes())
             else:
                 self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
@@ -407,7 +411,10 @@ def _build_handler(
                 self._write_json({"status": "error", "message": "缺少 action_id。"},
                                  status=HTTPStatus.BAD_REQUEST)
                 return
-            self._write_json(bridge.confirm_voice_action(action_id))
+            learning_token = str(data.get("learning_token") or "") or None
+            self._write_json(
+                bridge.confirm_voice_action(action_id, learning_token=learning_token)
+            )
 
         def _persist_utterance(self, *, utterance_id, request, result) -> str:
             """#82 PR2: store the utterance row (embedding included when a

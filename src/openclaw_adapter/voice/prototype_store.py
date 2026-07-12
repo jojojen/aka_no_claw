@@ -419,6 +419,65 @@ class VoiceStore:
 
         return self._execute(_op)
 
+    # --- learning tokens (design §13.2; consumed by learning.py in PR3) ------
+    def create_learning_token(
+        self,
+        *,
+        token_hash: str,
+        utterance_id: str,
+        candidate_action_ids: tuple[str, ...],
+        ttl_seconds: float,
+        profile_id: str = DEFAULT_PROFILE_ID,
+    ) -> None:
+        now = self._now()
+
+        def _op(conn: sqlite3.Connection):
+            conn.execute(
+                """INSERT OR REPLACE INTO voice_learning_tokens
+                   (token_hash, utterance_id, profile_id,
+                    candidate_action_ids_json, created_at, expires_at, consumed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, NULL)""",
+                (
+                    token_hash, utterance_id, profile_id,
+                    json.dumps(list(candidate_action_ids)),
+                    now, now + max(1.0, ttl_seconds),
+                ),
+            )
+
+        self._execute(_op)
+
+    def consume_learning_token(self, token_hash: str) -> dict | None:
+        """Atomically consume a token: returns its binding exactly once.
+
+        A second call (duplicate/replayed token), an expired token, or an
+        unknown hash all return None — single-use is enforced by the guarded
+        UPDATE, not by a read-then-write race."""
+        now = self._now()
+
+        def _op(conn: sqlite3.Connection):
+            cur = conn.execute(
+                """UPDATE voice_learning_tokens SET consumed_at = ?
+                   WHERE token_hash = ? AND consumed_at IS NULL AND expires_at > ?""",
+                (now, token_hash, now),
+            )
+            if cur.rowcount != 1:
+                return None
+            row = conn.execute(
+                "SELECT * FROM voice_learning_tokens WHERE token_hash = ?",
+                (token_hash,),
+            ).fetchone()
+            try:
+                candidates = tuple(json.loads(row["candidate_action_ids_json"]))
+            except (ValueError, TypeError):
+                candidates = ()
+            return {
+                "utterance_id": row["utterance_id"],
+                "profile_id": row["profile_id"],
+                "candidate_action_ids": candidates,
+            }
+
+        return self._execute(_op)
+
     # --- action stats ---------------------------------------------------------
     def record_action_outcome(
         self,

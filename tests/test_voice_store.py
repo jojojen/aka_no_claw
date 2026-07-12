@@ -1,4 +1,4 @@
-"""#82 PR2 — embedding abstraction, SQLite voice store, benchmark harness."""
+"""#82 PR2/PR3 — embedding, SQLite voice store, benchmark, learning tokens."""
 
 from __future__ import annotations
 
@@ -9,6 +9,13 @@ from types import SimpleNamespace
 import pytest
 
 from openclaw_adapter.voice.benchmark import load_manifest, run_benchmark
+from openclaw_adapter.voice.learning import (
+    LEARNING_COMMITTED,
+    LEARNING_SKIPPED_NO_EMBEDDING,
+    commit_prototype,
+    issue_learning_token,
+    redeem_learning_token,
+)
 from openclaw_adapter.voice.embedding import (
     SyntheticEmbeddingBackend,
     cosine_similarity,
@@ -189,6 +196,81 @@ def test_open_voice_store_disabled_and_corrupt(tmp_path):
     bad_path.write_bytes(b"garbage-not-sqlite-garbage-not-sqlite-garbage")
     with pytest.raises(VoiceStoreCorruptError):
         open_voice_store(SimpleNamespace(openclaw_voice_store_path=str(bad_path)))
+
+
+# --- learning tokens (PR3, §5.4/§13.2) ---------------------------------------
+def _save_embedded_utterance(store, utterance_id="u1"):
+    store.save_utterance(
+        utterance_id=utterance_id,
+        transcript="關鍵善",
+        duration_ms=1450,
+        ttl_seconds=600,
+        embedding=[0.6, 0.8],
+        embedding_model_version="synthetic-v1-d2",
+    )
+
+
+def test_learning_token_roundtrip_and_single_use(store):
+    _save_embedded_utterance(store)
+    token = issue_learning_token(
+        store, utterance_id="u1",
+        candidate_action_ids=("ir.fan.power", "music.playpause"),
+    )
+    assert token is not None
+    # Raw token never stored — only its hash (design §13.2).
+    conn = sqlite3.connect(store._path)
+    rows = conn.execute(
+        "SELECT token_hash FROM voice_learning_tokens"
+    ).fetchall()
+    conn.close()
+    assert len(rows) == 1 and rows[0][0] != token
+
+    redeemed = redeem_learning_token(store, token)
+    assert redeemed is not None
+    assert redeemed.utterance_id == "u1"
+    assert redeemed.candidate_action_ids == ("ir.fan.power", "music.playpause")
+    # Replay must fail (§7.4).
+    assert redeem_learning_token(store, token) is None
+
+
+def test_learning_token_expiry(store):
+    _save_embedded_utterance(store)
+    token = issue_learning_token(
+        store, utterance_id="u1",
+        candidate_action_ids=("ir.fan.power",), ttl_seconds=60,
+    )
+    store._clock["now"] = 1061.0
+    assert redeem_learning_token(store, token) is None
+
+
+def test_unknown_token_redeems_nothing(store):
+    assert redeem_learning_token(store, "never-issued-token") is None
+
+
+def test_commit_prototype_success_and_consumed_gc(store):
+    _save_embedded_utterance(store)
+    assert commit_prototype(
+        store, utterance_id="u1", action_id="ir.fan.power"
+    ) == LEARNING_COMMITTED
+    protos = store.list_prototypes(embedding_model_version="synthetic-v1-d2")
+    assert len(protos) == 1
+    assert protos[0].action_id == "ir.fan.power"
+    assert protos[0].embedding == pytest.approx((0.6, 0.8))
+    # Consumed utterance is GC'd promptly (§12.2).
+    assert store.gc_expired() == 1
+
+
+def test_commit_prototype_requires_embedding(store):
+    store.save_utterance(
+        utterance_id="u1", transcript="hi", duration_ms=500, ttl_seconds=600
+    )
+    assert commit_prototype(
+        store, utterance_id="u1", action_id="ir.fan.power"
+    ) == LEARNING_SKIPPED_NO_EMBEDDING
+    assert commit_prototype(
+        store, utterance_id="missing", action_id="ir.fan.power"
+    ) == LEARNING_SKIPPED_NO_EMBEDDING
+    assert store.list_prototypes(status=None) == ()
 
 
 # --- benchmark harness --------------------------------------------------------

@@ -16,6 +16,10 @@ SHORT_UTTERANCE_MAX_MS = 4_000
 
 MAX_CLARIFY_CANDIDATES = 6
 
+# Learning tokens (§13.2) are single-use and short-lived; long enough for a
+# user to read the clarification card, far shorter than the utterance TTL.
+LEARNING_TOKEN_TTL_SECONDS = 600
+
 CLARIFY_FALLBACK_LABEL = "都不是，當一般問題處理"
 
 REASON_FIRST_USE_CONTROL_SUSPICION = "first_use_control_suspicion"

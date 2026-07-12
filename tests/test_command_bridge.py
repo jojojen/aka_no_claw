@@ -6060,3 +6060,143 @@ def test_confirm_voice_action_rejects_unknown_action(monkeypatch):
     assert result["status"] == STATUS_ERROR
     result = b.confirm_voice_action("")
     assert result["status"] == STATUS_ERROR
+
+
+# --- #82 PR3: learning transaction (token + atomic prototype commit) --------
+def _learning_bridge(monkeypatch, tmp_path, *, music_ok=True):
+    """Bridge with a real (tmp) voice store; music dispatch is recorded so
+    tests can assert exactly how many times an action executed."""
+    settings = _tool_settings()
+    settings.openclaw_voice_store_path = str(tmp_path / "voice.sqlite3")
+    b = CommandBridge(settings=settings)
+    monkeypatch.setattr(
+        b,
+        "_select_chat_tool_plan",
+        lambda req: (
+            ChatToolPlan(tool=CHAT_TOOL_SEARCH, query="關鍵善", reason_summary="查詢"),
+            None,
+        ),
+    )
+    monkeypatch.setattr(b, "_voice_music_available", lambda: True)
+    monkeypatch.setattr(b, "_voice_ir_buttons", lambda: [])
+    dispatched = []
+
+    def _music_action(callback_data):
+        dispatched.append(callback_data)
+        status = STATUS_OK if music_ok else STATUS_ERROR
+        return {"status": status, "message": "⏯", "actions": []}
+
+    monkeypatch.setattr(b, "run_music_action", _music_action)
+    return b, dispatched
+
+
+def _save_bridge_utterance(b, utterance_id="utt-1"):
+    b._voice_store().save_utterance(
+        utterance_id=utterance_id,
+        transcript="關鍵善",
+        duration_ms=1450,
+        ttl_seconds=600,
+        embedding=[0.6, 0.8],
+        embedding_model_version="synthetic-v1-d2",
+    )
+
+
+def test_voice_clarification_carries_learning_token(monkeypatch, tmp_path):
+    b, _ = _learning_bridge(monkeypatch, tmp_path)
+    _save_bridge_utterance(b)
+    resp = b.handle(_voice_chat_request())
+    assert resp.clarification is not None
+    token = resp.clarification.get("learning_token")
+    assert isinstance(token, str) and len(token) > 20
+
+
+def test_confirm_with_valid_token_commits_prototype(monkeypatch, tmp_path):
+    b, dispatched = _learning_bridge(monkeypatch, tmp_path)
+    _save_bridge_utterance(b)
+    resp = b.handle(_voice_chat_request())
+    token = resp.clarification["learning_token"]
+
+    result = b.confirm_voice_action("music.playpause", learning_token=token)
+    assert result["status"] == STATUS_OK
+    assert result["learning_status"] == "committed"
+    assert dispatched == ["music:playpause"]
+    protos = b._voice_store().list_prototypes(
+        embedding_model_version="synthetic-v1-d2"
+    )
+    assert len(protos) == 1
+    assert protos[0].action_id == "music.playpause"
+    # Consumed utterance is GC-able immediately (§12.2).
+    assert b._voice_store().gc_expired() >= 1
+
+
+def test_confirm_replayed_token_rejected_without_reexecution(
+    monkeypatch, tmp_path
+):
+    b, dispatched = _learning_bridge(monkeypatch, tmp_path)
+    _save_bridge_utterance(b)
+    resp = b.handle(_voice_chat_request())
+    token = resp.clarification["learning_token"]
+
+    first = b.confirm_voice_action("music.playpause", learning_token=token)
+    assert first["status"] == STATUS_OK
+    replay = b.confirm_voice_action("music.playpause", learning_token=token)
+    assert replay["status"] == STATUS_ERROR
+    # Replay must be rejected BEFORE execution (§7.4): still exactly one run.
+    assert dispatched == ["music:playpause"]
+
+
+def test_confirm_action_outside_candidate_set_rejected(monkeypatch, tmp_path):
+    from openclaw_adapter.voice.learning import issue_learning_token
+
+    b, dispatched = _learning_bridge(monkeypatch, tmp_path)
+    _save_bridge_utterance(b)
+    token = issue_learning_token(
+        b._voice_store(), utterance_id="utt-1",
+        candidate_action_ids=("ir.fan.power",),
+    )
+    result = b.confirm_voice_action("music.playpause", learning_token=token)
+    assert result["status"] == STATUS_ERROR
+    assert dispatched == []
+
+
+def test_confirm_failed_action_learns_nothing(monkeypatch, tmp_path):
+    b, dispatched = _learning_bridge(monkeypatch, tmp_path, music_ok=False)
+    _save_bridge_utterance(b)
+    resp = b.handle(_voice_chat_request())
+    token = resp.clarification["learning_token"]
+
+    result = b.confirm_voice_action("music.playpause", learning_token=token)
+    assert result["status"] == STATUS_ERROR
+    assert result["learning_status"] == "action_failed"
+    assert dispatched == ["music:playpause"]
+    assert b._voice_store().list_prototypes(status=None) == ()
+
+
+def test_confirm_without_token_skips_learning(monkeypatch, tmp_path):
+    b, dispatched = _learning_bridge(monkeypatch, tmp_path)
+    result = b.confirm_voice_action("music.playpause")
+    assert result["status"] == STATUS_OK
+    assert result["learning_status"] == "skipped_no_token"
+    assert b._voice_store().list_prototypes(status=None) == ()
+
+
+def test_voice_prototypes_listing_and_reset(monkeypatch, tmp_path):
+    # Disabled store: both surfaces stay OK with explanatory messages.
+    off = CommandBridge(settings=_tool_settings())
+    assert off.list_voice_prototypes()["status"] == STATUS_OK
+    assert off.list_voice_prototypes()["prototypes"] == []
+    assert off.reset_voice_personalization()["status"] == STATUS_OK
+
+    b, _ = _learning_bridge(monkeypatch, tmp_path)
+    _save_bridge_utterance(b)
+    resp = b.handle(_voice_chat_request())
+    b.confirm_voice_action(
+        "music.playpause", learning_token=resp.clarification["learning_token"]
+    )
+    listed = b.list_voice_prototypes()
+    assert listed["status"] == STATUS_OK
+    assert [p["action_id"] for p in listed["prototypes"]] == ["music.playpause"]
+    assert listed["prototypes"][0]["embedding_model_version"] == "synthetic-v1-d2"
+
+    assert b.reset_voice_personalization()["status"] == STATUS_OK
+    assert b.list_voice_prototypes()["prototypes"] == []
