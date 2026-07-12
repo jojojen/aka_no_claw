@@ -3764,7 +3764,18 @@ class CommandBridge:
         ``handle_text_capture`` instead of being dispatched as a new subcommand.
         This mirrors the Telegram path in
         ``TelegramCommandProcessor._build_workflow_capture_plan``."""
-        return self._workflow_capability.run_command(text, chat_backend=chat_backend)
+        return self._workflow_capability_for_compat().run_command(
+            text, chat_backend=chat_backend
+        )
+
+    def _workflow_capability_for_compat(self) -> WorkflowCapability:
+        """Lazy fallback for minimal bridge fixtures that intentionally bypass
+        ``__init__`` while injecting workflow seams."""
+        capability = getattr(self, "_workflow_capability", None)
+        if capability is None:
+            capability = WorkflowCapability(self)
+            self._workflow_capability = capability
+        return capability
 
     def _legacy_run_workflow_command(self, text: str, *, chat_backend: str | None = None) -> dict:
         handler, editor = self._workflow_surface()
@@ -3926,7 +3937,7 @@ class CommandBridge:
         """Re-invoke a ``wfe:`` workflow-editor button for the web console
         (reorder / delete / save / cancel a draft step). The same editor handler
         the Telegram bot dispatches, so step validation on save is identical."""
-        return self._workflow_capability.run_action(callback_data)
+        return self._workflow_capability_for_compat().run_action(callback_data)
 
     def _legacy_run_workflow_action(self, callback_data: str) -> dict:
         _, editor = self._workflow_surface()
