@@ -15,6 +15,7 @@ Line numbers drift; symbol names are the stable reference.
 | Module | Owns |
 | --- | --- |
 | `command_bridge_models.py` (~740 ln) | modes/submodes/backends/status enums, NDJSON event vocabulary + `stream_*` builders, `WebCommandRequest/Response`, `parse_request`, history sanitization, chat-tool constants, `ChatToolPlan` parsing, pure helpers (`build_chat_prompt`, `_clip`, `_tool_calling_notice`, `_extract_gemini_text`, `_seed_variable_name_for_tool`, `markup_to_actions`, image-attachment helpers) |
+| `command_bridge_providers.py` | provider-routing primitives: `_MODEL_STATUS_*` vocabulary, `_GeminiTextClient` + `_GeminiRequestError` + HTTP-status classification, `_walk_cloud_pool_chain` shared failover walk, `_pin_provider_chain` sticky reorder |
 | `command_bridge_server.py` (610 ln) | HTTP routing only (stdlib server), envelope versioning |
 | `job_store.py` | persisted job payloads (see §6) |
 | `session_memory.py` | session snapshot persistence |
