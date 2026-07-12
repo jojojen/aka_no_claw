@@ -100,42 +100,33 @@ def test_generate_with_chat_backend_routes_local_through_deps_seam():
 
 
 class _PromptDeps:
-    """Deps for build_plan_prompt: real prompt assembly, stubbed probes."""
+    """Deps for build_plan_prompt: real prompt assembly, stubbed seams."""
 
-    def __init__(self, now_playing: object) -> None:
-        self._now_playing = now_playing
+    def __init__(self, ledger: list[dict] | None = None) -> None:
+        self._ledger = ledger or []
 
     def _chat_tool_plan_system_prompt(self):
         return "SYSTEM"
 
     def _chat_tool_ledger_entries(self, req):
-        return []
-
-    def now_playing(self):
-        if isinstance(self._now_playing, Exception):
-            raise self._now_playing
-        return self._now_playing
+        return self._ledger
 
 
-def test_plan_prompt_reports_live_now_playing_state():
-    # Ledger history can claim "nothing playing" while a goal-started track is
-    # audible; the prompt must carry the live probe so the planner never
-    # asserts playback state from stale tool records.
-    deps = _PromptDeps({"status": "ok", "name": "夜に駆ける"})
-    prompt = _planner(deps).build_plan_prompt(_req("音樂停止"))
-    assert "正在播放「夜に駆ける」" in prompt
-    assert "即時環境狀態" in prompt
-    assert "不要從工具紀錄或對話內容推測" in prompt
-
-
-def test_plan_prompt_reports_idle_music_state():
-    deps = _PromptDeps({"status": "ok", "name": None})
-    prompt = _planner(deps).build_plan_prompt(_req("音樂停止"))
-    assert "目前沒有音樂在播放" in prompt
-
-
-def test_plan_prompt_survives_now_playing_probe_failure():
-    deps = _PromptDeps(RuntimeError("state file gone"))
-    prompt = _planner(deps).build_plan_prompt(_req("音樂停止"))
-    assert "即時環境狀態" not in prompt
+def test_plan_prompt_forbids_state_gating_of_requested_actions():
+    # Ledger history once claimed "nothing playing" while a goal-started track
+    # was audible, and the planner refused a stop request. Requested actions
+    # must be dispatched as asked — the tool reports reality, not the ledger.
+    prompt = _planner(_PromptDeps()).build_plan_prompt(_req("音樂停止"))
+    assert "以使用者的要求為準" in prompt
+    assert "不要根據對話紀錄或工具紀錄推測" in prompt
     assert "使用者最新訊息：音樂停止" in prompt
+
+
+def test_plan_prompt_ledger_repeat_rule_excludes_new_action_requests():
+    ledger = [
+        {"tool": "/music", "query": "resume", "status": "partial",
+         "summary": "工具回覆表示無可繼續播放的音樂"},
+    ]
+    prompt = _planner(_PromptDeps(ledger)).build_plan_prompt(_req("音樂停止"))
+    assert "不是重複，要照常執行" in prompt
+    assert "無可繼續播放的音樂" in prompt  # ledger still present, but bounded

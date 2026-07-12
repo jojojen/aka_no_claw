@@ -988,18 +988,19 @@ DEPRECATED_CODEGEN_SEED: tuple[tuple[str, str], ...] = (
 CODEGEN_SEED: tuple[dict, ...] = (
     {
         "category": "architecture",
-        "title": "LLM 決策 prompt 中的環境狀態要用即時探針，不可讓模型從歷史紀錄推斷",
+        "title": "LLM 規劃器不可用推測的環境狀態否決使用者要求的動作",
         "technique": (
-            "當 LLM 規劃器/路由器的 prompt 只含歷史執行紀錄（tool ledger、對話摘要）時，"
-            "模型會把「最後一筆相關紀錄」當成現在的環境狀態——但非同步任務（goal loop、"
-            "背景 job）的結果往往在下一次規劃之後才落帳，造成模型以過期狀態拒絕動作"
-            "（如：音樂明明在播放卻回答『沒有音樂在播放』）。修法：規劃前對便宜的"
-            "真實狀態來源（狀態檔、status API）做即時探針，把結果以『即時狀態，"
-            "以此為準、不要從紀錄推測』的措辭注入 prompt；探針失敗要 fail-soft 略過。"
-            "驗證方式：重建失敗當下的 ledger+對話，對真實模型做有/無狀態行的 A/B 探測，"
-            "斷言決策翻轉。"
+            "LLM 規劃器/路由器的 prompt 若含歷史執行紀錄（tool ledger、對話摘要），"
+            "模型會把「最後一筆相關紀錄」當成現在的環境狀態，並以此拒絕使用者要求的"
+            "動作——但非同步任務（goal loop、背景 job）的結果往往在下一次規劃之後才落帳"
+            "（如：音樂明明在播放卻回答『沒有音樂在播放』而不派發停止）。正解不是把"
+            "各領域的即時狀態塞進共用 prompt（那是領域特定硬編碼、每加一個裝置就要"
+            "加一行），而是通用規則：使用者要求執行動作時一律以要求為準直接派發工具，"
+            "工具本身是狀態的唯一真相來源，執行後回報實際結果；冪等動作（停止、靜音）"
+            "重複執行本來就無害。驗證方式：重建失敗當下的 ledger+對話，對真實模型做"
+            "有/無規則行的 A/B 探測，斷言決策翻轉。"
         ),
-        "keywords": ["*", "llm", "planner", "router", "prompt", "state", "ledger", "stale", "async"],
+        "keywords": ["*", "llm", "planner", "router", "prompt", "state", "ledger", "stale", "idempotent", "dispatch"],
         "confidence": 0.95,
     },
     {

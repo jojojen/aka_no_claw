@@ -116,8 +116,6 @@ class PlannerDeps(Protocol):
 
     def _chat_tool_ledger_entries(self, req: WebCommandRequest) -> list[dict]: ...
 
-    def now_playing(self) -> dict: ...
-
     def _local_judgment_model(self) -> str: ...
 
     def _build_chat_tool_plan_prompt(
@@ -214,6 +212,8 @@ class ChatToolPlanner:
                 "以上是已完成（或已失敗）的工作，不要為同樣的需求重複執行同一個工具："
                 "若既有結果足以回答（包括使用者在問你做過什麼），直接用 no_tool 統整回答；"
                 "若先前失敗，優先改用其他工具或利用已有資訊，而不是原樣重試。"
+                "「同樣的需求」只指使用者重複要求同一件事；"
+                "使用者提出新的動作要求（例如先前是播放、現在要停止）不是重複，要照常執行。"
             )
         if observation:
             lines += [
@@ -223,34 +223,21 @@ class ChatToolPlanner:
                 "若觀察結果足以回答，請直接回答（no_tool）；"
                 "只有在需要針對問題重新細看圖片時才使用圖片查看工具。",
             ]
-        state_lines = self._live_state_lines()
-        if state_lines:
-            lines += ["", "即時環境狀態（剛剛查詢，比上面的工具紀錄與對話內容都新）："]
-            lines += state_lines
-            lines.append(
-                "涉及目前播放狀態的判斷一律以上述即時狀態為準，"
-                "不要從工具紀錄或對話內容推測現在是否有音樂在播放。"
-            )
+        # Ledger summaries describe the past, and async goal-loop results land
+        # in the ledger only after completion — the planner once refused a
+        # stop request "because nothing is playing" while a goal-started track
+        # was audible. The planner must never veto a requested action based on
+        # environment state it inferred from history; the tool is the source
+        # of truth and reports reality itself.
+        lines += [
+            "",
+            "當使用者的最新訊息是要求執行一個動作（停止、暫停、繼續、開、關等），"
+            "一律以使用者的要求為準，直接呼叫對應工具執行；"
+            "不要根據對話紀錄或工具紀錄推測目前的裝置／播放狀態，"
+            "再以推測的狀態為理由拒絕執行——紀錄只描述過去，實際狀態由工具執行後回報。",
+        ]
         lines += ["", f"使用者最新訊息：{(req.input or '').strip()}", "", "JSON："]
         return "\n".join(lines)
-
-    def _live_state_lines(self) -> list[str]:
-        """Ground-truth environment facts for the plan prompt.
-
-        Tool-ledger summaries describe the past, and long-running goal-loop
-        results land in the ledger only after completion — a stale
-        「無可繼續播放的音樂」 line once made the planner answer that nothing
-        was playing while a goal-started playbest was audibly playing. State
-        assertions must come from a live probe, never from history."""
-        try:
-            info = self._deps.now_playing()
-        except Exception:  # noqa: BLE001
-            logger.debug("plan prompt: now_playing probe failed", exc_info=True)
-            return []
-        name = info.get("name") if isinstance(info, dict) else None
-        if name:
-            return [f"- 音樂：正在播放「{name}」"]
-        return ["- 音樂：目前沒有音樂在播放"]
 
     def plan_system_prompt(self) -> str:
         tools = []
