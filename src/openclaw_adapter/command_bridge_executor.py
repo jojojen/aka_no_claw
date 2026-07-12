@@ -115,6 +115,8 @@ class ExecutorDeps(Protocol):
 
     def _tool_display_name(self, command: str) -> str: ...
 
+    def _tool_stream_heartbeat_seconds(self) -> float: ...
+
     def _exec_grounded_search(
         self, req: WebCommandRequest, tool_req: ChatToolRequest
     ) -> ChatToolResult: ...
@@ -271,7 +273,7 @@ class ChatToolExecutor:
                 try:
                     line = narration_queue.get(timeout=0.5)
                 except queue.Empty:
-                    if time.time() - last_beat >= _HEARTBEAT_SECONDS:
+                    if time.time() - last_beat >= self._deps._tool_stream_heartbeat_seconds():
                         yield stream_heartbeat()
                         last_beat = time.time()
                     continue
