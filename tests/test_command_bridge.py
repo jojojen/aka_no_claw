@@ -5399,6 +5399,102 @@ def test_unsatisfied_upgrade_passes_tool_answer_as_seed(monkeypatch):
         operation_key(CHAT_TOOL_RESEARCH, "https://x.example/item"): "部分研究結果"
     }
 
+
+def test_e2e_partial_research_final_answer_with_single_research_call(monkeypatch):
+    """#81 acceptance (bridge-level mocked E2E): the first /research round is
+    partial (market price only, judged incomplete), the escalation enters the
+    REAL goal loop, the drafted workflow re-targets the same canonical item,
+    and the dedup memo serves the first artifact — the /research handler runs
+    exactly once end-to-end while the user still gets a final answer."""
+    from openclaw_adapter import command_bridge as cb_module
+    from openclaw_adapter.task_workspace import WorkflowStep
+
+    b = CommandBridge(settings=_tool_settings())
+    url = "https://jp.mercari.com/item/m28552067562"
+    partial = "市價約¥14,000（marketplace 逾時，僅得市價，未計鑑定費與獲利）"
+    research_calls: list[str] = []
+
+    def _research_handler(text, chat_id="web"):
+        research_calls.append(text)
+        return partial
+
+    monkeypatch.setattr(
+        b, "_handlers",
+        lambda: {"/research": SimpleNamespace(handler=_research_handler)},
+    )
+    monkeypatch.setattr(
+        b, "_select_chat_tool_plan",
+        lambda req: (
+            ChatToolPlan(tool=CHAT_TOOL_RESEARCH, query=url, reason_summary="研究"),
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        b, "_run_chat_tool",
+        lambda req, plan: ChatToolResult(
+            answer=_research_handler(plan.query), result_summary="partial"
+        ),
+    )
+    monkeypatch.setattr(
+        b, "_chat_tool_result_satisfies_intent",
+        lambda req, plan, tool_result: {
+            "satisfied": False,
+            "environment_blocked": False,
+            "reason": "只有市價，未算獲利",
+        },
+    )
+
+    # Real _execute_goal_loop, with only the LLM-backed collaborators faked:
+    # the planner drafts the SAME /research on the same canonical item (the
+    # 07-11 failure mode), and the judge accepts the produced result.
+    drafted = Workflow(
+        id="wf-research-again",
+        goal="這張卡買了送鑑定會賺嗎",
+        steps=[
+            WorkflowStep(
+                id="s1", kind="command_sink", command="/research",
+                literal=url, output="r1",
+            ),
+        ],
+    )
+
+    class _E2EPlanner:
+        def draft(self, goal, seed_variables=None):
+            return drafted, None, False
+
+        def replan(self, goal, workflow, trace, seed_variables=None):
+            raise AssertionError("memo hit must satisfy the run without a replan")
+
+    class _FakeShim:
+        def __init__(self, settings):
+            self.catalog = None
+            self.client = None
+
+        def run_tool_step(self, slug, params):
+            return True, "ok"
+
+    monkeypatch.setattr(cb_module, "_WorkflowShimRunner", _FakeShim)
+    monkeypatch.setattr(b, "_build_goal_planner", lambda *a, **k: _E2EPlanner())
+    monkeypatch.setattr(
+        b, "_goal_result_judge",
+        lambda chat_backend, pool_rotation=None: (lambda goal, final: (True, "")),
+    )
+    monkeypatch.setattr(b, "_goal_trace_saver", lambda runner: (lambda trace: None))
+
+    resp = b.handle(parse_request({
+        "mode": "chat",
+        "input": f"這張卡買了送鑑定轉賣會賺嗎？ {url}",
+        "conversation_id": "c-e2e-81",
+    }))
+
+    assert resp.status == STATUS_OK
+    # The expensive command ran exactly once end-to-end: the goal-loop step
+    # re-targeting the same item was served from the seeded operation memo.
+    assert research_calls == [url]
+    assert "市價約¥14,000" in resp.message  # a final answer is still produced
+    assert "略過重複操作" in resp.message  # proof the dedup path actually fired
+
+
 def test_research_notifier_uses_live_callback_when_registered(monkeypatch):
     from openclaw_adapter.command_bridge import (
         _BRIDGE_CHAT_ID,
