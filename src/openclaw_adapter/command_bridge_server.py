@@ -518,7 +518,9 @@ def _build_handler(
                     content_type=self.headers.get("Content-Type", ""),
                     content_length=length,
                     max_audio_bytes=transcriber.max_audio_bytes,
-                    default_language=getattr(bridge.settings, "openclaw_stt_language", None),
+                    default_language=getattr(
+                        getattr(bridge, "settings", None), "openclaw_stt_language", None
+                    ),
                 )
                 result = transcriber.transcribe(request)
             except ParserLimitReached as exc:
