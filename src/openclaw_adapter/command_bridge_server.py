@@ -36,6 +36,7 @@ from .local_stt import (
     SttRuntimeError,
     build_audio_request,
 )
+from .voice import metrics as voice_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -220,6 +221,8 @@ def _build_handler(
                 self._handle_voice_confirm()
             elif path == "/api/command/voice/reset":
                 self._write_json(bridge.reset_voice_personalization())
+            elif path == "/api/command/voice/feedback":
+                self._handle_voice_feedback()
             elif path == "/api/command/restartall":
                 self._write_json(bridge.restart_all())
             else:
@@ -247,6 +250,10 @@ def _build_handler(
                 self._write_json(bridge.load_chat_settings())
             elif split.path == "/api/command/voice/prototypes":
                 self._write_json(bridge.list_voice_prototypes())
+            elif split.path == "/api/command/voice/metrics":
+                self._write_json(
+                    {"status": "ok", **voice_metrics.METRICS.snapshot()}
+                )
             else:
                 self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
@@ -415,6 +422,28 @@ def _build_handler(
             self._write_json(
                 bridge.confirm_voice_action(action_id, learning_token=learning_token)
             )
+
+        def _handle_voice_feedback(self) -> None:
+            """#82 PR4: negative feedback「不是這個」against the prototype that
+            triggered a direct dispatch (design §7.6)."""
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b""
+                data = json.loads(raw.decode("utf-8")) if raw else {}
+            except (ValueError, UnicodeDecodeError) as exc:
+                self._write_json({"status": "error", "message": f"無效的請求：{exc}"},
+                                 status=HTTPStatus.BAD_REQUEST)
+                return
+            if not isinstance(data, dict):
+                self._write_json({"status": "error", "message": "請求必須是 JSON 物件。"},
+                                 status=HTTPStatus.BAD_REQUEST)
+                return
+            prototype_id = str(data.get("prototype_id") or "")
+            if not prototype_id:
+                self._write_json({"status": "error", "message": "缺少 prototype_id。"},
+                                 status=HTTPStatus.BAD_REQUEST)
+                return
+            self._write_json(bridge.report_voice_direct_rejection(prototype_id))
 
         def _persist_utterance(self, *, utterance_id, request, result) -> str:
             """#82 PR2: store the utterance row (embedding included when a

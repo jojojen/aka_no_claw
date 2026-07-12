@@ -14,14 +14,84 @@ learning loop in later PRs.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from . import policy
+from .embedding import cosine_similarity
 from .models import (
     RISK_LOW,
     VoiceActionCandidate,
+    VoiceActionDescriptor,
     VoiceActionRegistry,
     VoiceClarification,
+    VoiceDirectAction,
     VoiceUserContext,
 )
+
+
+def resolve_direct_prototype_action(
+    *,
+    embedding: Sequence[float],
+    prototypes: Sequence[object],
+    actions: Sequence[VoiceActionDescriptor],
+    min_confirmed: int = policy.DIRECT_MIN_CONFIRMED,
+    similarity_threshold: float = policy.DIRECT_SIMILARITY_THRESHOLD,
+    required_margin: float = policy.DIRECT_MARGIN,
+) -> VoiceDirectAction | None:
+    """Prototype direct fast path decision (#82 PR4, design §8.3), pure.
+
+    Returns a dispatchable resolution ONLY when every hard rule holds:
+    the best-matching action is available, low-risk AND reversible; the
+    matched prototype has enough confirmed samples; similarity clears the
+    absolute threshold; and the top-1/top-2 margin across *different*
+    actions is wide enough. Any miss returns None — open-set rejection
+    (§3.4): unknown speech must never dispatch. With a single learned
+    action there is no top-2, so safety rests on the absolute threshold
+    (margin is then trivially satisfied).
+    """
+    if not embedding or not prototypes:
+        return None
+    eligible = {
+        a.action_id: a
+        for a in actions
+        if a.available and a.risk == RISK_LOW and a.reversible
+    }
+    if not eligible:
+        return None
+    # Best similarity + best prototype per action (§7.5: nearest prototype).
+    best_by_action: dict[str, tuple[float, object]] = {}
+    for proto in prototypes:
+        action_id = getattr(proto, "action_id", "")
+        if action_id not in eligible:
+            continue
+        score = cosine_similarity(embedding, getattr(proto, "embedding", ()))
+        prev = best_by_action.get(action_id)
+        if prev is None or score > prev[0]:
+            best_by_action[action_id] = (score, proto)
+    if not best_by_action:
+        return None
+    ranked = sorted(
+        best_by_action.items(), key=lambda item: item[1][0], reverse=True
+    )
+    top_action_id, (top_score, top_proto) = ranked[0]
+    runner_up = ranked[1][1][0] if len(ranked) > 1 else 0.0
+    margin = top_score - runner_up
+    if top_score < similarity_threshold:
+        return None
+    if margin < required_margin:
+        return None
+    if int(getattr(top_proto, "confirmed_count", 0)) < min_confirmed:
+        return None
+    descriptor = eligible[top_action_id]
+    return VoiceDirectAction(
+        action_id=descriptor.action_id,
+        display_label=descriptor.display_label,
+        risk=descriptor.risk,
+        confidence=top_score,
+        margin=margin,
+        reason_code=policy.REASON_PROTOTYPE_HIGH_CONFIDENCE,
+        prototype_id=str(getattr(top_proto, "prototype_id", "")),
+    )
 
 
 class VoiceIntentGate:

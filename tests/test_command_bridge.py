@@ -6200,3 +6200,203 @@ def test_voice_prototypes_listing_and_reset(monkeypatch, tmp_path):
 
     assert b.reset_voice_personalization()["status"] == STATUS_OK
     assert b.list_voice_prototypes()["prototypes"] == []
+
+
+# --- #82 PR4: prototype direct fast path -------------------------------------
+def _direct_bridge(monkeypatch, tmp_path, *, enabled=True, music_ok=True):
+    """Bridge with the direct fast path flag; the Chat router is booby-trapped
+    so any direct-path test that reaches it fails loudly (§15.2: mature
+    prototype ⇒ router call count = 0)."""
+    settings = _tool_settings()
+    settings.openclaw_voice_store_path = str(tmp_path / "voice.sqlite3")
+    settings.openclaw_voice_direct_action_enabled = enabled
+    b = CommandBridge(settings=settings)
+    monkeypatch.setattr(b, "_voice_music_available", lambda: True)
+    monkeypatch.setattr(b, "_voice_ir_buttons", lambda: [])
+    dispatched = []
+
+    def _music_action(callback_data):
+        dispatched.append(callback_data)
+        status = STATUS_OK if music_ok else STATUS_ERROR
+        return {"status": status, "message": "⏯", "actions": []}
+
+    monkeypatch.setattr(b, "run_music_action", _music_action)
+    return b, dispatched
+
+
+def _seed_mature_prototype(b, *, embedding=(1.0, 0.0), confirmed=3):
+    store = b._voice_store()
+    store.save_utterance(
+        utterance_id="utt-1",
+        transcript="關鍵善",
+        duration_ms=1450,
+        ttl_seconds=600,
+        embedding=list(embedding),
+        embedding_model_version="synthetic-v1-d2",
+    )
+    store.add_prototype(
+        prototype_id="p-direct",
+        action_id="music.playpause",
+        embedding=[1.0, 0.0],
+        embedding_model_version="synthetic-v1-d2",
+    )
+    for _ in range(confirmed - 1):  # add_prototype starts at confirmed_count=1
+        store.record_confirmation("p-direct")
+    return store
+
+
+def _router_trap(monkeypatch, b):
+    def _must_not_run(*a, **k):
+        raise AssertionError("Chat router must not run on direct fast path (#82 PR4)")
+
+    monkeypatch.setattr(b, "_select_chat_tool_plan", _must_not_run)
+
+
+def test_mature_prototype_dispatches_directly_without_router(
+    monkeypatch, tmp_path
+):
+    b, dispatched = _direct_bridge(monkeypatch, tmp_path)
+    _seed_mature_prototype(b)
+    _router_trap(monkeypatch, b)
+
+    resp = b.handle(_voice_chat_request())
+    assert resp.status == STATUS_OK
+    assert dispatched == ["music:playpause"]
+    assert resp.direct_action is not None
+    assert resp.direct_action["kind"] == "direct_action"
+    assert resp.direct_action["action"]["action_id"] == "music.playpause"
+    assert resp.direct_action["prototype_id"] == "p-direct"
+    assert "已辨識" in resp.message
+
+
+def test_direct_fast_path_disabled_by_flag(monkeypatch, tmp_path):
+    b, dispatched = _direct_bridge(monkeypatch, tmp_path, enabled=False)
+    _seed_mature_prototype(b)
+    monkeypatch.setattr(
+        b,
+        "_select_chat_tool_plan",
+        lambda req: (
+            ChatToolPlan(tool=CHAT_TOOL_SEARCH, query="關鍵善", reason_summary="查詢"),
+            None,
+        ),
+    )
+    resp = b.handle(_voice_chat_request())
+    # Falls through to the PR1 clarification path — no auto execution.
+    assert resp.direct_action is None
+    assert resp.clarification is not None
+    assert dispatched == []
+
+
+def test_immature_prototype_never_direct(monkeypatch, tmp_path):
+    b, dispatched = _direct_bridge(monkeypatch, tmp_path)
+    _seed_mature_prototype(b, confirmed=1)
+    monkeypatch.setattr(
+        b,
+        "_select_chat_tool_plan",
+        lambda req: (
+            ChatToolPlan(tool=CHAT_TOOL_SEARCH, query="關鍵善", reason_summary="查詢"),
+            None,
+        ),
+    )
+    resp = b.handle(_voice_chat_request())
+    assert resp.direct_action is None
+    assert resp.clarification is not None
+    assert dispatched == []
+
+
+def test_unknown_speech_never_direct(monkeypatch, tmp_path):
+    # Orthogonal embedding = open-set unknown (§15.5): no automatic execution.
+    b, dispatched = _direct_bridge(monkeypatch, tmp_path)
+    _seed_mature_prototype(b, embedding=(0.0, 1.0))
+    monkeypatch.setattr(
+        b,
+        "_select_chat_tool_plan",
+        lambda req: (
+            ChatToolPlan(tool=CHAT_TOOL_SEARCH, query="關鍵善", reason_summary="查詢"),
+            None,
+        ),
+    )
+    resp = b.handle(_voice_chat_request())
+    assert resp.direct_action is None
+    assert dispatched == []
+
+
+def test_high_risk_descriptor_never_direct(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from openclaw_adapter.voice.models import RISK_HIGH, VoiceActionDescriptor
+
+    b, dispatched = _direct_bridge(monkeypatch, tmp_path)
+    _seed_mature_prototype(b)
+    risky = VoiceActionDescriptor(
+        action_id="music.playpause",
+        display_label="暫停／繼續播放",
+        surface="music",
+        risk=RISK_HIGH,
+        reversible=True,
+        available=True,
+        dispatch_kind="music_callback",
+        dispatch_payload={"callback_data": "music:playpause"},
+    )
+    b._voice_registry = SimpleNamespace(
+        list_actions=lambda *, user_context: (risky,)
+    )
+    assert b._maybe_voice_direct_action(_voice_chat_request()) is None
+    assert dispatched == []
+
+
+def test_stream_direct_action_emits_done_with_contract(monkeypatch, tmp_path):
+    b, dispatched = _direct_bridge(monkeypatch, tmp_path)
+    _seed_mature_prototype(b)
+
+    def _must_not_run(*a, **k):
+        raise AssertionError("streaming router must not run on direct path")
+
+    monkeypatch.setattr(b, "_stream_chat_tool_plan", _must_not_run)
+    events = list(b.stream(_voice_chat_request(), "rid-direct"))
+    assert events[0]["type"] == "start"
+    done = events[-1]
+    assert done["type"] == "done"
+    assert done["direct_action"]["kind"] == "direct_action"
+    assert dispatched == ["music:playpause"]
+
+
+def test_negative_feedback_disables_prototype_and_stops_direct(
+    monkeypatch, tmp_path
+):
+    b, dispatched = _direct_bridge(monkeypatch, tmp_path)
+    store = _seed_mature_prototype(b)
+    _router_trap(monkeypatch, b)
+
+    resp = b.handle(_voice_chat_request())
+    assert resp.direct_action is not None
+    # 「不是這個」three times → prototype disabled (§7.6).
+    for _ in range(3):
+        out = b.report_voice_direct_rejection("p-direct")
+        assert out["status"] == STATUS_OK
+    store.save_utterance(
+        utterance_id="utt-2",
+        transcript="關鍵善",
+        duration_ms=1450,
+        ttl_seconds=600,
+        embedding=[1.0, 0.0],
+        embedding_model_version="synthetic-v1-d2",
+    )
+    req2 = parse_request(
+        {
+            "mode": "chat",
+            "input": "關鍵善",
+            "chat_backend": "local",
+            "input_source": "voice",
+            "voice": {"utterance_id": "utt-2", "duration_ms": 1450},
+        }
+    )
+    assert b._maybe_voice_direct_action(req2) is None
+    assert dispatched == ["music:playpause"]  # only the first run executed
+
+
+def test_direct_rejection_requires_store_and_id(monkeypatch, tmp_path):
+    off = CommandBridge(settings=_tool_settings())
+    assert off.report_voice_direct_rejection("p-direct")["status"] == STATUS_ERROR
+    b, _ = _direct_bridge(monkeypatch, tmp_path)
+    assert b.report_voice_direct_rejection("")["status"] == STATUS_ERROR

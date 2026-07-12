@@ -149,7 +149,9 @@ from .voice import (
     VoiceIntentGate,
     VoiceUserContext,
 )
+from .voice import policy as voice_policy
 from .voice.action_registry import DISPATCH_IR_SEND, DISPATCH_MUSIC_CALLBACK
+from .voice.intent_gate import resolve_direct_prototype_action
 from .voice.learning import (
     LEARNING_ACTION_FAILED,
     LEARNING_SKIPPED_NO_TOKEN,
@@ -158,6 +160,7 @@ from .voice.learning import (
     issue_learning_token,
     redeem_learning_token,
 )
+from .voice.metrics import METRICS as VOICE_METRICS
 from .voice.models import RISK_LOW
 from .voice.prototype_store import VoiceStoreCorruptError, open_voice_store
 
@@ -830,6 +833,12 @@ class CommandBridge:
                 message=self._chat_backend_disabled_message(req.chat_backend),
                 mode=MODE_CHAT,
             )
+        # #82 PR4: mature-prototype direct fast path — must run BEFORE the
+        # router so a confident control match never enters /search planning
+        # (§15.2: Chat router call count = 0 for mature prototypes).
+        direct = self._maybe_voice_direct_action(req)
+        if direct is not None:
+            return direct
         prompt = build_chat_prompt(req.input, req.history)
         plan, metadata = self._select_chat_tool_plan(req)
         if plan is not None and plan.tool == CHAT_TOOL_CREATE_WORKFLOW:
@@ -911,6 +920,12 @@ class CommandBridge:
         # shortcuts masking the model's decision.
         if not chat_backend_enabled(self.settings, req.chat_backend):
             yield stream_error(self._chat_backend_disabled_message(req.chat_backend))
+            return
+
+        # #82 PR4 voice direct fast path (streaming twin of the blocking path).
+        direct = self._maybe_voice_direct_action(req)
+        if direct is not None:
+            yield stream_done(direct.message, direct_action=direct.direct_action)
             return
 
         # WP-5a: vision observe step — if the current turn has an image attachment,
@@ -3646,6 +3661,7 @@ class CommandBridge:
             plan.tool, req.input, len(clarification.candidates),
             "yes" if clarification.learning_token else "no",
         )
+        VOICE_METRICS.record_resolution("clarify", clarification.reason_code)
         return clarification
 
     @staticmethod
@@ -3704,14 +3720,8 @@ class CommandBridge:
                 "message": "此操作風險等級需要進一步確認，尚不支援語音直接執行。",
                 "actions": [],
             }
-        if descriptor.dispatch_kind == DISPATCH_MUSIC_CALLBACK:
-            callback = str(descriptor.dispatch_payload.get("callback_data") or "")
-            result = self.run_music_action(callback)
-        elif descriptor.dispatch_kind == DISPATCH_IR_SEND:
-            device = str(descriptor.dispatch_payload.get("device") or "")
-            button = str(descriptor.dispatch_payload.get("button") or "")
-            result = self.run_ir_command(f"send {device} {button}")
-        else:
+        result = self._dispatch_voice_descriptor(descriptor)
+        if result is None:
             return {"status": STATUS_ERROR, "message": "未知的操作類型。", "actions": []}
 
         success = str(result.get("status")) == STATUS_OK
@@ -3733,7 +3743,126 @@ class CommandBridge:
             out["learning_status"] = LEARNING_STORE_ERROR
         else:
             out["learning_status"] = LEARNING_SKIPPED_NO_TOKEN
+        VOICE_METRICS.record_learning_commit(str(out["learning_status"]))
         return out
+
+    def _dispatch_voice_descriptor(self, descriptor) -> dict | None:
+        """Execute a registry descriptor via its surface; None = unknown kind."""
+        if descriptor.dispatch_kind == DISPATCH_MUSIC_CALLBACK:
+            callback = str(descriptor.dispatch_payload.get("callback_data") or "")
+            return self.run_music_action(callback)
+        if descriptor.dispatch_kind == DISPATCH_IR_SEND:
+            device = str(descriptor.dispatch_payload.get("device") or "")
+            button = str(descriptor.dispatch_payload.get("button") or "")
+            return self.run_ir_command(f"send {device} {button}")
+        return None
+
+    def _maybe_voice_direct_action(
+        self, req: WebCommandRequest
+    ) -> WebCommandResponse | None:
+        """Prototype direct fast path (#82 PR4, design §8.3): a short voice
+        utterance whose embedding confidently matches a mature low-risk
+        reversible prototype is dispatched immediately — the Chat router
+        never runs. Every miss returns None and the request proceeds
+        unchanged; store/registry failures are fail-soft (§13.4)."""
+        if not req.is_voice:
+            return None
+        if not getattr(self.settings, "openclaw_voice_direct_action_enabled", False):
+            return None
+        voice = req.voice
+        if voice is None or not voice.utterance_id or voice.clarification_declined:
+            return None
+        if not voice_policy.is_short_form(req.input, duration_ms=voice.duration_ms):
+            return None
+        store = self._voice_store()
+        if store is None:
+            return None
+        started = time.monotonic()
+        try:
+            utterance = store.get_utterance(voice.utterance_id)
+            if (
+                utterance is None
+                or not utterance.embedding
+                or not utterance.embedding_model_version
+            ):
+                return None
+            prototypes = store.list_prototypes(
+                embedding_model_version=utterance.embedding_model_version
+            )
+        except Exception:  # noqa: BLE001 — fall back to normal routing
+            logger.exception("voice direct path: store lookup failed")
+            return None
+        if not prototypes:
+            return None
+        try:
+            actions = self._voice_registry.list_actions(
+                user_context=self._voice_user_context(req)
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("voice direct path: registry listing failed")
+            return None
+        direct = resolve_direct_prototype_action(
+            embedding=utterance.embedding,
+            prototypes=prototypes,
+            actions=actions,
+        )
+        VOICE_METRICS.observe_stage("gate_ms", (time.monotonic() - started) * 1000.0)
+        if direct is None:
+            return None
+        descriptor = next(
+            (a for a in actions if a.action_id == direct.action_id), None
+        )
+        if descriptor is None:
+            return None
+        dispatch_started = time.monotonic()
+        result = self._dispatch_voice_descriptor(descriptor)
+        VOICE_METRICS.observe_stage(
+            "dispatch_ms", (time.monotonic() - dispatch_started) * 1000.0
+        )
+        if result is None:
+            return None
+        success = str(result.get("status")) == STATUS_OK
+        VOICE_METRICS.record_resolution("direct_action", direct.reason_code)
+        VOICE_METRICS.record_direct_action(
+            direct.action_id, "ok" if success else "error"
+        )
+        try:
+            store.record_action_outcome(direct.action_id, success=success)
+            # §10.4: direct execution updates usage stats only — it must not
+            # create or reinforce prototypes (no self-confirmation loop).
+            store.mark_utterance_consumed(voice.utterance_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("voice direct path: stats update failed (fail-soft)")
+        logger.info(
+            "[voice-direct] action=%s confidence=%.3f margin=%.3f ok=%s",
+            direct.action_id, direct.confidence, direct.margin, success,
+        )
+        outcome = str(result.get("message") or "")
+        return WebCommandResponse(
+            status=str(result.get("status") or STATUS_ERROR),
+            message=f"已辨識：{direct.display_label}\n{outcome}".rstrip(),
+            mode=MODE_CHAT,
+            direct_action=direct.to_dict(),
+        )
+
+    def report_voice_direct_rejection(self, prototype_id: str) -> dict:
+        """Negative feedback「不是這個」(#82 PR4, §7.6): lower trust in the
+        prototype that triggered a direct dispatch; repeated rejections
+        disable it. Never auto-transfers the utterance to another action —
+        the user re-confirms via a fresh clarification instead."""
+        pid = (prototype_id or "").strip()
+        if not pid:
+            return {"status": STATUS_ERROR, "message": "缺少 prototype_id。"}
+        store = self._voice_store()
+        if store is None:
+            return {"status": STATUS_ERROR, "message": "語音個人化未啟用。"}
+        try:
+            store.record_rejection(pid)
+        except Exception:  # noqa: BLE001
+            logger.exception("voice direct rejection failed")
+            return {"status": STATUS_ERROR, "message": "回饋記錄失敗。"}
+        VOICE_METRICS.record_negative_correction(pid)
+        return {"status": STATUS_OK, "message": "已記錄回饋，將降低此語音對應的信任度。"}
 
     def list_voice_prototypes(self) -> dict:
         """Personalization inspection surface (#82 §17: 檢視)."""

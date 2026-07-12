@@ -271,6 +271,9 @@ class WebCommandResponse:
     # (kind/transcript/reason_code/candidates/fallback). Kept as a plain dict
     # here so the wire-contract module does not import the voice package.
     clarification: dict[str, object] | None = None
+    # Voice direct fast path (#82 PR4): serialized VoiceDirectAction contract
+    # (kind/action/confidence/margin/reason_code/prototype_id).
+    direct_action: dict[str, object] | None = None
 
     def to_dict(self) -> dict[str, object]:
         out: dict[str, object] = {"status": self.status, "message": self.message}
@@ -288,6 +291,8 @@ class WebCommandResponse:
             out["model_metadata"] = self.model_metadata.to_dict()
         if self.clarification is not None:
             out["clarification"] = self.clarification
+        if self.direct_action is not None:
+            out["direct_action"] = self.direct_action
         return out
 
 
@@ -551,6 +556,7 @@ def stream_done(
     model_metadata: ModelMetadata | None = None,
     actions: list[dict[str, object]] | None = None,
     clarification: dict[str, object] | None = None,
+    direct_action: dict[str, object] | None = None,
 ) -> dict[str, object]:
     ev: dict[str, object] = {"type": EVENT_DONE, "message": message}
     if model_metadata is not None:
@@ -559,6 +565,8 @@ def stream_done(
         ev["actions"] = list(actions)
     if clarification is not None:
         ev["clarification"] = clarification
+    if direct_action is not None:
+        ev["direct_action"] = direct_action
     return ev
 
 

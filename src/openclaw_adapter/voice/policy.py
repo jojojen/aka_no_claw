@@ -23,6 +23,15 @@ LEARNING_TOKEN_TTL_SECONDS = 600
 CLARIFY_FALLBACK_LABEL = "都不是，當一般問題處理"
 
 REASON_FIRST_USE_CONTROL_SUSPICION = "first_use_control_suspicion"
+REASON_PROTOTYPE_HIGH_CONFIDENCE = "prototype_high_confidence"
+
+# Direct fast path (#82 PR4, §8.3): a prototype match may skip the Chat
+# router only when ALL of these hold — absolute similarity, top-1/top-2
+# margin across different actions, and enough confirmed samples. Conservative
+# pre-benchmark values; open-set safety leans on the absolute threshold.
+DIRECT_SIMILARITY_THRESHOLD = 0.85
+DIRECT_MARGIN = 0.10
+DIRECT_MIN_CONFIRMED = 3
 
 
 def is_short_form(

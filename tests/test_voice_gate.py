@@ -190,3 +190,112 @@ def test_gate_fail_soft_when_registry_raises():
         gate.should_clarify_before_open_tool(transcript="關鍵善", plan_query="關鍵善")
         is False
     )
+
+
+# --- direct fast path (#82 PR4, §8.3) ----------------------------------------
+from types import SimpleNamespace  # noqa: E402
+
+from openclaw_adapter.voice.intent_gate import resolve_direct_prototype_action  # noqa: E402
+
+
+def _descriptor(action_id="music.playpause", *, risk=RISK_LOW, reversible=True,
+                available=True):
+    return VoiceActionDescriptor(
+        action_id=action_id,
+        display_label=f"label:{action_id}",
+        surface="music",
+        risk=risk,
+        reversible=reversible,
+        available=available,
+        dispatch_kind=DISPATCH_MUSIC_CALLBACK,
+        dispatch_payload={"callback_data": "music:playpause"},
+    )
+
+
+def _proto(action_id="music.playpause", *, embedding=(1.0, 0.0), confirmed=3,
+           prototype_id="p1"):
+    return SimpleNamespace(
+        action_id=action_id,
+        embedding=tuple(embedding),
+        confirmed_count=confirmed,
+        prototype_id=prototype_id,
+    )
+
+
+def test_direct_resolves_mature_high_confidence_match():
+    direct = resolve_direct_prototype_action(
+        embedding=[1.0, 0.0],
+        prototypes=[_proto()],
+        actions=[_descriptor()],
+    )
+    assert direct is not None
+    assert direct.action_id == "music.playpause"
+    assert direct.prototype_id == "p1"
+    assert direct.confidence >= policy.DIRECT_SIMILARITY_THRESHOLD
+    assert direct.reason_code == policy.REASON_PROTOTYPE_HIGH_CONFIDENCE
+    payload = direct.to_dict()
+    assert payload["kind"] == "direct_action"
+    assert payload["action"]["action_id"] == "music.playpause"
+    assert payload["prototype_id"] == "p1"
+
+
+def test_direct_rejects_below_similarity_threshold():
+    # Orthogonal vectors: similarity 0 — open-set unknown speech (§3.4).
+    assert resolve_direct_prototype_action(
+        embedding=[0.0, 1.0],
+        prototypes=[_proto()],
+        actions=[_descriptor()],
+    ) is None
+
+
+def test_direct_rejects_small_top1_top2_margin():
+    # Two different actions with near-identical scores must clarify, not direct.
+    close = (0.9995, 0.0316)  # cosine vs [1,0] ≈ 0.9995
+    assert resolve_direct_prototype_action(
+        embedding=[1.0, 0.0],
+        prototypes=[
+            _proto("music.playpause", prototype_id="p1"),
+            _proto("music.next", embedding=close, prototype_id="p2"),
+        ],
+        actions=[_descriptor("music.playpause"), _descriptor("music.next")],
+    ) is None
+
+
+def test_direct_rejects_immature_prototype():
+    assert resolve_direct_prototype_action(
+        embedding=[1.0, 0.0],
+        prototypes=[_proto(confirmed=policy.DIRECT_MIN_CONFIRMED - 1)],
+        actions=[_descriptor()],
+    ) is None
+
+
+def test_direct_never_dispatches_risky_or_unavailable_actions():
+    proto = _proto()
+    embedding = [1.0, 0.0]
+    # High risk always confirms (§13.1).
+    assert resolve_direct_prototype_action(
+        embedding=embedding, prototypes=[proto],
+        actions=[_descriptor(risk=RISK_HIGH)],
+    ) is None
+    # Irreversible actions never direct (§8.3).
+    assert resolve_direct_prototype_action(
+        embedding=embedding, prototypes=[proto],
+        actions=[_descriptor(reversible=False)],
+    ) is None
+    # Unavailable actions never execute from old prototypes (§17).
+    assert resolve_direct_prototype_action(
+        embedding=embedding, prototypes=[proto],
+        actions=[_descriptor(available=False)],
+    ) is None
+
+
+def test_direct_handles_empty_inputs():
+    assert resolve_direct_prototype_action(
+        embedding=[], prototypes=[_proto()], actions=[_descriptor()]
+    ) is None
+    assert resolve_direct_prototype_action(
+        embedding=[1.0, 0.0], prototypes=[], actions=[_descriptor()]
+    ) is None
+    assert resolve_direct_prototype_action(
+        embedding=[1.0, 0.0], prototypes=[_proto()], actions=[]
+    ) is None

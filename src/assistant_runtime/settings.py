@@ -48,6 +48,10 @@ class AssistantSettings:
     openclaw_voice_embedding_backend: str = ""
     # Unresolved-utterance retention (design §12.2 suggests 10–30 min).
     openclaw_voice_utterance_ttl_seconds: int = 1800
+    # Direct fast path (#82 PR4): a mature low-risk prototype match may skip
+    # the Chat router entirely. Off by default per the rollout plan (§18) —
+    # enable only after clarification-mode data looks sane.
+    openclaw_voice_direct_action_enabled: bool = False
     # Fast, code-specialized tier-1 model for /new codegen. Escalates to the
     # (larger) openclaw_local_text_model only when this tier exhausts repairs.
     openclaw_codegen_fast_model: str | None = "qwen2.5-coder:7b"
@@ -304,6 +308,9 @@ def get_settings() -> AssistantSettings:
         openclaw_voice_utterance_ttl_seconds=_as_int(
             os.getenv("OPENCLAW_VOICE_UTTERANCE_TTL_SECONDS"),
             default=1800,
+        ),
+        openclaw_voice_direct_action_enabled=_as_bool(
+            os.getenv("OPENCLAW_VOICE_DIRECT_ACTION_ENABLED")
         ),
         openclaw_codegen_fast_model=_none_if_empty(
             os.getenv("OPENCLAW_CODEGEN_FAST_MODEL", "qwen2.5-coder:7b")

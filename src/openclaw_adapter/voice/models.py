@@ -11,7 +11,7 @@ RISK_HIGH = "high"
 
 VOICE_RESOLUTION_CLARIFY = "clarify"
 VOICE_RESOLUTION_FALLBACK = "fallback"
-# direct_action arrives with the prototype fast path (PR4).
+VOICE_RESOLUTION_DIRECT_ACTION = "direct_action"
 
 
 @dataclass(frozen=True)
@@ -58,6 +58,36 @@ class VoiceActionCandidate:
             "display_label": self.display_label,
             "risk": self.risk,
             "score": self.score,
+        }
+
+
+@dataclass(frozen=True)
+class VoiceDirectAction:
+    """Wire contract for a prototype direct-action resolution (design §5.3).
+
+    ``prototype_id`` lets the client send negative feedback（「不是這個」）
+    against exactly the prototype that triggered the dispatch (§7.6)."""
+
+    action_id: str
+    display_label: str
+    risk: str
+    confidence: float
+    margin: float
+    reason_code: str
+    prototype_id: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "kind": VOICE_RESOLUTION_DIRECT_ACTION,
+            "action": {
+                "action_id": self.action_id,
+                "display_label": self.display_label,
+                "risk": self.risk,
+            },
+            "confidence": self.confidence,
+            "margin": self.margin,
+            "reason_code": self.reason_code,
+            "prototype_id": self.prototype_id,
         }
 
 
