@@ -987,6 +987,32 @@ DEPRECATED_CODEGEN_SEED: tuple[tuple[str, str], ...] = (
 
 CODEGEN_SEED: tuple[dict, ...] = (
     {
+        "category": "validation",
+        "title": "對定長 padding 的特徵做 pooling 前先裁掉 padding 區段",
+        "technique": (
+            "凡是模型把變長輸入 pad 到固定視窗（如音訊 pad 到 30 秒、序列 pad 到定長）再輸出"
+            "frame/token 級特徵時，mean/max pooling 必須只涵蓋真實內容對應的 frames，"
+            "不可對整個 padded 視窗取平均——否則短輸入的向量會被 padding 主導、全部塌縮到同方向"
+            "（不同輸入 cosine 相似度可高到 0.98，喪失鑑別力）。驗證方式：對同一內容的不同"
+            "rendition 與完全不同內容各算 pairwise 相似度，同類必須嚴格高於異類。"
+        ),
+        "keywords": ["*", "embedding", "pooling", "padding", "cosine", "audio", "feature"],
+        "confidence": 0.95,
+    },
+    {
+        "category": "validation",
+        "title": "累積計數的成熟門檻必須配套「合併/強化」路徑並用端到端劇本驗證",
+        "technique": (
+            "若功能要求某記錄累積 N 次事件才解鎖（如 confirmed_count >= 3 才允許快路徑），"
+            "寫入端就必須有把新事件歸併到既有記錄的邏輯（相似度合併、upsert、外鍵對應），"
+            "不能每次都 insert 新列——否則計數永遠停在 1，門檻在現實中不可達，而單元測試"
+            "各自綠燈完全看不出來。驗收要用完整劇本跑真實路徑：重複同一輸入 N 次後，"
+            "斷言只有一筆記錄且計數等於 N、且解鎖行為真的發生。"
+        ),
+        "keywords": ["*", "counter", "threshold", "merge", "upsert", "maturity", "e2e"],
+        "confidence": 0.95,
+    },
+    {
         "category": "architecture",
         "title": "抽取 collaborator 時保留既有 facade 的可替換 seam",
         "technique": (
