@@ -118,6 +118,7 @@ from .command_bridge_models import (
     stream_start,
 )
 from .command_bridge_providers import (
+    ProviderRouter,
     _GeminiRequestError,
     _GeminiTextClient,
     _MODEL_STATUS_ERROR,
@@ -537,8 +538,9 @@ class CommandBridge:
         self._music_cont_lock = threading.Lock()
         self._goal_continuations: dict[str, dict] = {}
         self._goal_cont_lock = threading.Lock()
-        self._chat_pool_pins: dict[str, str] = {}
-        self._chat_pool_pins_lock = threading.Lock()
+        # Provider routing collaborator (#74 R1.2): sticky pins, pool chains,
+        # model metadata. Client builders stay on the bridge (ChatClientDeps).
+        self._providers = ProviderRouter(self)
         self._goal_pending_confirms: dict[str, dict] = {}
         self._goal_pending_lock = threading.Lock()
         # A goal run that finished successfully offers a "💾 存為工作流" button
@@ -2596,10 +2598,7 @@ class CommandBridge:
         conversation_key: str | None = None,
     ) -> tuple[str, ModelMetadata]:
         chain = self._cloud_pool_chain()
-        pinned: str | None = None
-        if conversation_key:
-            with self._chat_pool_pins_lock:
-                pinned = self._chat_pool_pins.get(conversation_key)
+        pinned = self._providers.pinned_provider(conversation_key)
         if pinned is not None and any(entry[0] == pinned for entry in chain):
             chain = _pin_provider_chain(chain, pinned)
         elif pool_rotation is not None:
@@ -2609,9 +2608,7 @@ class CommandBridge:
         )
         if text is None:
             raise RuntimeError("cloud-pool planner unavailable")
-        if conversation_key:
-            with self._chat_pool_pins_lock:
-                self._chat_pool_pins[conversation_key] = provider
+        self._providers.record_pin(conversation_key, provider)
         fb = len(attempts) > 1
         first_provider, first_model = (
             (chain[0][0], chain[0][1]) if chain else self._cloud_pool_preview()
@@ -4259,17 +4256,7 @@ class CommandBridge:
         }
 
     def _requested_model_for_backend(self, chat_backend: str) -> tuple[str, str]:
-        if chat_backend == CHAT_BACKEND_CLOUD_PICKLE:
-            return "opencode", self._big_pickle_model()
-        if chat_backend == CHAT_BACKEND_CLOUD_MISTRAL:
-            return "mistral", self._mistral_model()
-        if chat_backend == CHAT_BACKEND_CLOUD_NVIDIA:
-            return "nvidia", self._nvidia_model()
-        if chat_backend == CHAT_BACKEND_GEMINI:
-            return "gemini", self._gemini_primary_model()
-        if chat_backend == CHAT_BACKEND_CLOUD_POOL:
-            return self._cloud_pool_preview()
-        return "local", self._local_model()
+        return self._providers.requested_model_for_backend(chat_backend)
 
     def _model_metadata_for_backend(
         self,
@@ -4280,13 +4267,11 @@ class CommandBridge:
         *,
         fallback_reason: str | None = None,
     ) -> ModelMetadata:
-        requested_provider, requested_model = self._requested_model_for_backend(chat_backend)
-        return ModelMetadata(
-            requested_provider=requested_provider,
-            requested_model=requested_model,
-            attempted_models=attempted,
-            final_provider=final_provider,
-            final_model=final_model,
+        return self._providers.model_metadata_for_backend(
+            chat_backend,
+            attempted,
+            final_provider,
+            final_model,
             fallback_reason=fallback_reason,
         )
 
@@ -4600,70 +4585,7 @@ class CommandBridge:
     def _generate_gemini_with_fallback(
         self, prompt: str, *, temperature: float
     ) -> tuple[str, ModelMetadata]:
-        attempts: list[ModelAttempt] = []
-        gemini_models = self._gemini_route_models()
-        primary_model = gemini_models[0]
-
-        if not getattr(self.settings, "openclaw_gemini_api_key", None):
-            attempts.append(
-                ModelAttempt(
-                    "gemini",
-                    primary_model,
-                    _MODEL_STATUS_NOT_CONFIGURED,
-                    "Gemini API key missing",
-                )
-            )
-            text = self._ollama_generate_blocking(prompt)
-            attempts.append(ModelAttempt("local", self._local_model(), _MODEL_STATUS_OK))
-            return text, self._model_metadata_for_backend(
-                CHAT_BACKEND_GEMINI,
-                tuple(attempts),
-                "local",
-                self._local_model(),
-                fallback_reason="Gemini API key missing",
-            )
-
-        last_reason = ""
-        for model in gemini_models:
-            client = self._build_gemini_chat_client(model)
-            if client is None:
-                attempts.append(
-                    ModelAttempt(
-                        "gemini",
-                        model,
-                        _MODEL_STATUS_NOT_CONFIGURED,
-                        "Gemini API key missing",
-                    )
-                )
-                last_reason = "Gemini API key missing"
-                break
-            try:
-                text = client.generate(prompt, temperature=temperature)
-            except _GeminiRequestError as exc:
-                attempts.append(ModelAttempt("gemini", model, exc.status, str(exc)))
-                last_reason = str(exc)
-                if _is_gemini_fallback_status(exc.status):
-                    continue
-                raise
-            attempts.append(ModelAttempt("gemini", model, _MODEL_STATUS_OK))
-            fallback_reason = attempts[0].reason if len(attempts) > 1 else None
-            return text, self._model_metadata_for_backend(
-                CHAT_BACKEND_GEMINI,
-                tuple(attempts),
-                "gemini",
-                model,
-                fallback_reason=fallback_reason,
-            )
-
-        text = self._ollama_generate_blocking(prompt)
-        attempts.append(ModelAttempt("local", self._local_model(), _MODEL_STATUS_OK))
-        return text, self._model_metadata_for_backend(
-            CHAT_BACKEND_GEMINI,
-            tuple(attempts),
-            "local",
-            self._local_model(),
-            fallback_reason=last_reason or "Gemini quota or rate limit",
-        )
+        return self._providers.generate_gemini_with_fallback(prompt, temperature=temperature)
 
     def _stream_gemini_chat(self, prompt: str) -> Iterator[dict]:
         result: dict[str, object] = {}
@@ -4694,52 +4616,13 @@ class CommandBridge:
         )
 
     def _cloud_pool_chain(self) -> list[tuple[str, str, object, object]]:
-        """Return ordered list of (provider_label, model_name, build_fn, is_configured_fn)."""
-        raw_entries = {
-            LLM_PROVIDER_GEMINI: (
-                "gemini",
-                self._gemini_primary_model(),
-                self._build_gemini_chat_client,
-                lambda: chat_backend_configured(self.settings, CHAT_BACKEND_GEMINI),
-            ),
-            LLM_PROVIDER_MISTRAL: (
-                "mistral",
-                self._mistral_model(),
-                self._build_mistral_chat_client,
-                lambda: chat_backend_configured(self.settings, CHAT_BACKEND_CLOUD_MISTRAL),
-            ),
-            LLM_PROVIDER_BIG_PICKLE: (
-                "opencode",
-                self._big_pickle_model(),
-                self._build_cloud_chat_client,
-                lambda: chat_backend_configured(self.settings, CHAT_BACKEND_CLOUD_PICKLE),
-            ),
-            LLM_PROVIDER_NVIDIA: (
-                "nvidia",
-                self._nvidia_model(),
-                self._build_nvidia_chat_client,
-                lambda: chat_backend_configured(self.settings, CHAT_BACKEND_CLOUD_NVIDIA),
-            ),
-        }
-        return [raw_entries[provider] for provider in enabled_cloud_pool_providers(self.settings)]
+        return self._providers.cloud_pool_chain()
 
     def _vision_pool_chain(self) -> list[tuple[str, str, Callable[[], object], Callable[[], bool]]]:
-        from .vision_pool import build_vision_pool_chain
-        return build_vision_pool_chain(self.settings)
+        return self._providers.vision_pool_chain()
 
     def _cloud_pool_preview(self) -> tuple[str, str]:
-        """First actually usable (provider, model) for the cloud_pool tab preview.
-        Checks settings only — no probing. Falls through to Big Pickle which is
-        always considered configured."""
-        for provider, model_name, _build_fn, configured_fn in self._cloud_pool_chain():
-            if configured_fn():
-                return provider, model_name
-        if provider_enabled(self.settings, LLM_PROVIDER_LOCAL):
-            return "local", self._local_model()
-        chain = self._cloud_pool_chain()
-        if chain:
-            return chain[0][0], chain[0][1]
-        return "local", self._local_model()
+        return self._providers.cloud_pool_preview()
 
     def _handle_cloud_pool_blocking(
         self,
@@ -4748,56 +4631,9 @@ class CommandBridge:
         pool_rotation: "CloudPoolRotation | None" = None,
         conversation_key: str | None = None,
     ) -> tuple[str, ModelMetadata]:
-        """Try Gemini → Mistral → Big Pickle → local; return (text, metadata)."""
-        chain = self._cloud_pool_chain()
-        pinned: str | None = None
-        if conversation_key:
-            with self._chat_pool_pins_lock:
-                pinned = self._chat_pool_pins.get(conversation_key)
-        if pinned is not None and any(entry[0] == pinned for entry in chain):
-            rotated = _pin_provider_chain(chain, pinned)
-        elif pool_rotation is not None:
-            rotated = pool_rotation.rotate(chain)
-        else:
-            rotated = chain
-        text, provider, model_name, attempts = _walk_cloud_pool_chain(
-            rotated, prompt, temperature=0.7
+        return self._providers.generate_cloud_pool_blocking(
+            prompt, pool_rotation=pool_rotation, conversation_key=conversation_key
         )
-        if text is not None:
-            if conversation_key:
-                with self._chat_pool_pins_lock:
-                    self._chat_pool_pins[conversation_key] = provider
-            fb = len(attempts) > 1
-            first_provider, first_model = (
-                (rotated[0][0], rotated[0][1]) if rotated else self._cloud_pool_preview()
-            )
-            return text, ModelMetadata(
-                requested_provider=first_provider,
-                requested_model=first_model,
-                attempted_models=attempts,
-                final_provider=provider,
-                final_model=model_name,
-                fallback_reason=None if not fb else f"Fell back from {attempts[0].provider}",
-                fallback_occurred=fb,
-                requested_tab=CHAT_BACKEND_CLOUD_POOL,
-            )
-
-        if provider_enabled(self.settings, LLM_PROVIDER_LOCAL):
-            local_model = self._local_model()
-            local_text = self._ollama_generate_blocking(prompt)
-            attempts = attempts + (ModelAttempt("local", local_model, _MODEL_STATUS_OK),)
-            first_provider, first_model = self._cloud_pool_preview()
-            return local_text, ModelMetadata(
-                requested_provider=first_provider,
-                requested_model=first_model,
-                attempted_models=attempts,
-                final_provider="local",
-                final_model=local_model,
-                fallback_reason="All cloud providers unavailable",
-                fallback_occurred=True,
-                requested_tab=CHAT_BACKEND_CLOUD_POOL,
-            )
-        raise RuntimeError("雲端池目前沒有可用模型。")
 
     def _stream_cloud_pool_chat(
         self, prompt: str, *, conversation_key: str | None = None
@@ -4805,10 +4641,7 @@ class CommandBridge:
         """Try Gemini → Mistral → Big Pickle → local for streaming."""
         attempts: list[ModelAttempt] = []
 
-        pinned: str | None = None
-        if conversation_key:
-            with self._chat_pool_pins_lock:
-                pinned = self._chat_pool_pins.get(conversation_key)
+        pinned = self._providers.pinned_provider(conversation_key)
         chain = (
             _pin_provider_chain(self._cloud_pool_chain(), pinned)
             if pinned is not None
@@ -4865,9 +4698,7 @@ class CommandBridge:
                 continue
 
             attempts.append(ModelAttempt(provider, model_name, _MODEL_STATUS_OK))
-            if conversation_key:
-                with self._chat_pool_pins_lock:
-                    self._chat_pool_pins[conversation_key] = provider
+            self._providers.record_pin(conversation_key, provider)
             text = str(result.get("text") or "").strip()
             if text:
                 yield stream_delta(text)
@@ -4909,34 +4740,25 @@ class CommandBridge:
         yield stream_error("雲端池目前沒有可用模型。")
 
     def _local_model(self) -> str:
-        return resolve_provider_model(self.settings, LLM_PROVIDER_LOCAL)
+        return self._providers.local_model()
 
     def _big_pickle_model(self) -> str:
-        return resolve_provider_model(self.settings, LLM_PROVIDER_BIG_PICKLE)
+        return self._providers.big_pickle_model()
 
     def _mistral_model(self) -> str:
-        return resolve_provider_model(self.settings, LLM_PROVIDER_MISTRAL)
+        return self._providers.mistral_model()
 
     def _nvidia_model(self) -> str:
-        return resolve_provider_model(self.settings, LLM_PROVIDER_NVIDIA)
+        return self._providers.nvidia_model()
 
     def _gemini_primary_model(self) -> str:
-        return resolve_provider_model(self.settings, LLM_PROVIDER_GEMINI)
+        return self._providers.gemini_primary_model()
 
     def _gemini_flash_model(self) -> str:
-        return (
-            getattr(self.settings, "openclaw_gemini_flash_model", None)
-            or "gemini-2.5-flash"
-        ).strip()
+        return self._providers.gemini_flash_model()
 
     def _gemini_route_models(self) -> tuple[str, ...]:
-        seen: set[str] = set()
-        ordered: list[str] = []
-        for model in (self._gemini_primary_model(), self._gemini_flash_model()):
-            if model and model not in seen:
-                seen.add(model)
-                ordered.append(model)
-        return tuple(ordered)
+        return self._providers.gemini_route_models()
 
     def _warm_local_model(self, model: str) -> None:
         from .dynamic_tools import OllamaTextClient

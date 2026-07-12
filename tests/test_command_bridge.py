@@ -4472,6 +4472,80 @@ def test_pin_provider_chain_empty_chain():
     assert result == []
 
 
+# --- ProviderRouter direct contract (deterministic fake deps, #74 R1.2) ----
+
+class _FakeProviderDeps:
+    """Deterministic ChatClientDeps fake — proves the protocol is sufficient
+    without a CommandBridge behind it."""
+
+    def __init__(self, settings, *, gemini=None, mistral=None, opencode=None, nvidia=None):
+        self.settings = settings
+        self._gemini = gemini
+        self._mistral = mistral
+        self._opencode = opencode
+        self._nvidia = nvidia
+        self.local_calls: list[str] = []
+
+    def _build_gemini_chat_client(self, model):
+        return self._gemini
+
+    def _build_mistral_chat_client(self):
+        return self._mistral
+
+    def _build_cloud_chat_client(self):
+        return self._opencode
+
+    def _build_nvidia_chat_client(self):
+        return self._nvidia
+
+    def _ollama_generate_blocking(self, prompt):
+        self.local_calls.append(prompt)
+        return f"local:{prompt}"
+
+
+def test_provider_router_pin_roundtrip_and_none_key():
+    from openclaw_adapter.command_bridge_providers import ProviderRouter
+
+    router = ProviderRouter(_FakeProviderDeps(_tool_settings()))
+    assert router.pinned_provider("conv-1") is None
+    router.record_pin("conv-1", "mistral")
+    assert router.pinned_provider("conv-1") == "mistral"
+    # None / empty conversation keys are no-ops on both sides.
+    router.record_pin(None, "gemini")
+    assert router.pinned_provider(None) is None
+    assert router.pinned_provider("conv-1") == "mistral"
+
+
+def test_provider_router_blocking_prefers_pinned_provider():
+    from openclaw_adapter.command_bridge_providers import ProviderRouter
+
+    deps = _FakeProviderDeps(
+        _tool_settings(gemini_key="fake-key", mistral_key="fake-mistral"),
+        gemini=_FakeCloudClient("gemini"),
+        mistral=_FakeCloudClient("mistral"),
+    )
+    router = ProviderRouter(deps)
+    router.record_pin("conv-1", "mistral")
+    text, metadata = router.generate_cloud_pool_blocking("hi", conversation_key="conv-1")
+    assert text == "mistral:hi"
+    assert metadata.final_provider == "mistral"
+    # Success re-records the pin for the next turn.
+    assert router.pinned_provider("conv-1") == "mistral"
+
+
+def test_provider_router_all_cloud_fail_falls_back_to_local():
+    from openclaw_adapter.command_bridge_providers import ProviderRouter
+
+    deps = _FakeProviderDeps(_tool_settings())  # no keys, all builders → None
+    router = ProviderRouter(deps)
+    text, metadata = router.generate_cloud_pool_blocking("hi")
+    assert text == "local:hi"
+    assert deps.local_calls == ["hi"]
+    assert metadata.final_provider == "local"
+    assert metadata.fallback_reason == "All cloud providers unavailable"
+    assert metadata.fallback_occurred is True
+
+
 def test_cloud_pool_success_with_gemini(monkeypatch):
     """cloud_pool uses Gemini when it is configured and succeeds (no fallback)."""
     b = CommandBridge(settings=_tool_settings(gemini_key="fake-key"))
