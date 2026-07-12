@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 from . import policy
+from .embedding import cosine_similarity
 from .prototype_store import VoiceStore, VoiceStoreError
 
 logger = logging.getLogger(__name__)
@@ -98,12 +99,30 @@ def commit_prototype(
             or not utterance.embedding_model_version
         ):
             return LEARNING_SKIPPED_NO_EMBEDDING
-        store.add_prototype(
-            prototype_id=uuid4().hex,
+        embedding = list(utterance.embedding)
+        # §7.5 merge: reinforce an existing over-similar prototype of the same
+        # action instead of stacking count=1 siblings that can never mature.
+        existing = store.list_prototypes(
             action_id=action_id,
-            embedding=list(utterance.embedding),
             embedding_model_version=utterance.embedding_model_version,
         )
+        best = None
+        best_score = 0.0
+        for proto in existing:
+            if len(proto.embedding) != len(embedding):
+                continue
+            score = cosine_similarity(list(proto.embedding), embedding)
+            if score > best_score:
+                best, best_score = proto, score
+        if best is not None and best_score >= policy.PROTOTYPE_MERGE_SIMILARITY:
+            store.record_confirmation(best.prototype_id)
+        else:
+            store.add_prototype(
+                prototype_id=uuid4().hex,
+                action_id=action_id,
+                embedding=embedding,
+                embedding_model_version=utterance.embedding_model_version,
+            )
         # Consumed utterances are GC'd promptly (§12.2).
         store.mark_utterance_consumed(utterance_id)
         return LEARNING_COMMITTED

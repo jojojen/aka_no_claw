@@ -79,7 +79,10 @@ class WhisperEncoderEmbeddingBackend:
 
     @property
     def model_version(self) -> str:
-        return f"whisper-encoder-v1:{self._model_name}"
+        # v2: mean-pool only the frames covering the real audio. v1 pooled the
+        # whole 30s padded window, so short commands were ~93% silence and all
+        # embeddings collapsed together (different phrases scored 0.98 cosine).
+        return f"whisper-encoder-v2:{self._model_name}"
 
     def _get_model(self):
         if self._model is None:
@@ -107,10 +110,16 @@ class WhisperEncoderEmbeddingBackend:
             from faster_whisper.feature_extractor import FeatureExtractor
 
             waveform = decode_audio(path, sampling_rate=16000)
-            features = FeatureExtractor()(waveform)
+            extractor = FeatureExtractor()
+            features = extractor(waveform)
             encoded = np.asarray(self._get_model().encode(features))
             frames = encoded.reshape(-1, encoded.shape[-1])
-            vector = frames.mean(axis=0)
+            # The extractor pads to a fixed 30s window; the encoder halves the
+            # mel frame rate. Pool only the frames that cover the real audio,
+            # otherwise the padding dominates and every utterance looks alike.
+            mel_frames = max(1, len(waveform) // extractor.hop_length)
+            content_frames = min(len(frames), max(1, math.ceil(mel_frames / 2)))
+            vector = frames[:content_frames].mean(axis=0)
             norm = float(np.linalg.norm(vector))
             if norm == 0.0:
                 raise ValueError("Whisper encoder returned a zero embedding")

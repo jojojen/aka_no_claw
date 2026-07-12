@@ -144,20 +144,42 @@ def run_benchmark(
 def main(argv: list[str] | None = None) -> int:
     import argparse
 
-    from .embedding import SyntheticEmbeddingBackend
+    from .embedding import (
+        BACKEND_SYNTHETIC,
+        BACKEND_WHISPER_ENCODER,
+        SyntheticEmbeddingBackend,
+        WhisperEncoderEmbeddingBackend,
+    )
+    from .policy import DIRECT_SIMILARITY_THRESHOLD
 
     parser = argparse.ArgumentParser(description="Voice embedding benchmark (#82)")
     parser.add_argument("manifest", help="path to benchmark manifest JSON")
     parser.add_argument("--base-dir", default=".", help="root for audio_path entries")
     parser.add_argument("--top-k", type=int, default=3)
-    parser.add_argument("--accept-threshold", type=float, default=0.8)
+    parser.add_argument("--accept-threshold", type=float, default=DIRECT_SIMILARITY_THRESHOLD)
+    parser.add_argument(
+        "--backend",
+        default=BACKEND_SYNTHETIC,
+        choices=[BACKEND_SYNTHETIC, BACKEND_WHISPER_ENCODER],
+    )
+    parser.add_argument("--whisper-model", default="base")
+    parser.add_argument("--whisper-download-root", default=".openclaw_tmp/whisper")
     args = parser.parse_args(argv)
 
+    if args.backend == BACKEND_WHISPER_ENCODER:
+        backend = WhisperEncoderEmbeddingBackend(
+            model_name=args.whisper_model,
+            device="auto",
+            compute_type="default",
+            download_root=args.whisper_download_root,
+        )
+    else:
+        backend = SyntheticEmbeddingBackend()
+
     samples = load_manifest(args.manifest)
-    # Backend selection expands here as real local backends are evaluated.
     report = run_benchmark(
         samples,
-        SyntheticEmbeddingBackend(),
+        backend,
         base_dir=args.base_dir,
         top_k=args.top_k,
         accept_threshold=args.accept_threshold,

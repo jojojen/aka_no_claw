@@ -27,11 +27,26 @@ REASON_PROTOTYPE_HIGH_CONFIDENCE = "prototype_high_confidence"
 
 # Direct fast path (#82 PR4, §8.3): a prototype match may skip the Chat
 # router only when ALL of these hold — absolute similarity, top-1/top-2
-# margin across different actions, and enough confirmed samples. Conservative
-# pre-benchmark values; open-set safety leans on the absolute threshold.
-DIRECT_SIMILARITY_THRESHOLD = 0.85
-DIRECT_MARGIN = 0.10
+# margin across different actions, and enough confirmed samples.
+#
+# Calibrated 2026-07-13 against whisper-encoder-v2:base on a zh TTS corpus
+# (benchmark.py, 15 known / 3 open-set): same-phrase pairs score ≥0.984,
+# different-phrase pairs ≤0.966 (worst case 關電扇 vs 開電扇), open-set
+# utterances ≈0.89. At 0.85 the open-set false-accept rate was 100%; at 0.98
+# it is 0% with top-1 accuracy 1.0. Margin follows the same scale: own-
+# prototype ~0.99 vs nearest other action ~0.96 leaves ~0.03, so 0.10 would
+# permanently block direct dispatch. Re-calibrate on real recorded voice (PR5).
+DIRECT_SIMILARITY_THRESHOLD = 0.98
+DIRECT_MARGIN = 0.02
 DIRECT_MIN_CONFIRMED = 3
+
+# Commit-time merge (§7.5「定期合併過度相近樣本」): a confirmed utterance whose
+# embedding already scores this close to an existing prototype of the SAME
+# action reinforces it (confirmed_count += 1) instead of inserting a sibling.
+# Without merging, every confirmation lands as a fresh count=1 row and no
+# prototype can ever reach DIRECT_MIN_CONFIRMED. Same scale as the direct
+# threshold: measured same-phrase renditions score ≥0.984.
+PROTOTYPE_MERGE_SIMILARITY = 0.98
 
 
 def is_short_form(

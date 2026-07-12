@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from types import SimpleNamespace
 
@@ -18,6 +19,7 @@ from openclaw_adapter.voice.learning import (
 )
 from openclaw_adapter.voice.embedding import (
     SyntheticEmbeddingBackend,
+    WhisperEncoderEmbeddingBackend,
     cosine_similarity,
     resolve_embedding_backend,
 )
@@ -61,6 +63,69 @@ def test_resolve_embedding_backend_settings():
     )
     assert backend is not None
     assert backend.model_version.startswith("synthetic-v1")
+
+
+def test_resolve_embedding_backend_whisper_encoder():
+    backend = resolve_embedding_backend(
+        SimpleNamespace(
+            openclaw_voice_embedding_backend="whisper_encoder",
+            openclaw_stt_model="base",
+        )
+    )
+    assert backend is not None
+    assert backend.model_version == "whisper-encoder-v2:base"
+
+
+def test_whisper_backend_rejects_empty_audio():
+    with pytest.raises(ValueError):
+        WhisperEncoderEmbeddingBackend(
+            model_name="base",
+            device="auto",
+            compute_type="default",
+            download_root=".openclaw_tmp/whisper",
+        ).embed(b"")
+
+
+@pytest.mark.skipif(
+    os.getenv("OPENCLAW_RUN_LIVE_VOICE_EMBEDDING") != "1",
+    reason="Set OPENCLAW_RUN_LIVE_VOICE_EMBEDDING=1 to run the live acoustic discrimination check (macOS `say` + Whisper model).",
+)
+def test_whisper_backend_discriminates_real_speech(tmp_path):
+    """Same phrase re-rendered must score above threshold; different phrases below.
+
+    Guards the v1→v2 padding regression: pooling the whole 30s padded window
+    collapsed all short commands to ~0.95+ mutual similarity."""
+    import subprocess
+
+    from openclaw_adapter.voice.policy import DIRECT_SIMILARITY_THRESHOLD
+
+    renditions = {
+        "fan_off_a": ("關電扇", "150"),
+        "fan_off_b": ("關電扇", "210"),
+        "weather": ("今天天氣如何", "180"),
+    }
+    audio: dict[str, bytes] = {}
+    for name, (phrase, rate) in renditions.items():
+        path = tmp_path / f"{name}.wav"
+        subprocess.run(
+            ["say", "-v", "Meijia", "-r", rate, "--data-format=LEI16@16000",
+             "-o", str(path), phrase],
+            check=True,
+        )
+        audio[name] = path.read_bytes()
+
+    backend = WhisperEncoderEmbeddingBackend(
+        model_name="base",
+        device="auto",
+        compute_type="default",
+        download_root=".openclaw_tmp/whisper",
+    )
+    vecs = {name: backend.embed(data) for name, data in audio.items()}
+    same = cosine_similarity(vecs["fan_off_a"], vecs["fan_off_b"])
+    diff = cosine_similarity(vecs["fan_off_a"], vecs["weather"])
+    assert same >= DIRECT_SIMILARITY_THRESHOLD
+    assert diff < DIRECT_SIMILARITY_THRESHOLD
+    assert same > diff
 
 
 # --- voice store -------------------------------------------------------------
@@ -258,6 +323,44 @@ def test_commit_prototype_success_and_consumed_gc(store):
     assert protos[0].embedding == pytest.approx((0.6, 0.8))
     # Consumed utterance is GC'd promptly (§12.2).
     assert store.gc_expired() == 1
+
+
+def test_commit_prototype_reinforces_similar_prototype(store):
+    """Repeated confirmations of the same phrase must mature ONE prototype
+    (§7.5 merge) — count=1 siblings would keep the direct path unreachable."""
+    for uid in ("u1", "u2", "u3"):
+        store.save_utterance(
+            utterance_id=uid,
+            transcript="關鍵善",
+            duration_ms=1450,
+            ttl_seconds=600,
+            embedding=[0.6, 0.8],
+            embedding_model_version="synthetic-v1-d2",
+        )
+        assert commit_prototype(
+            store, utterance_id=uid, action_id="ir.fan.power"
+        ) == LEARNING_COMMITTED
+    protos = store.list_prototypes(embedding_model_version="synthetic-v1-d2")
+    assert len(protos) == 1
+    assert protos[0].confirmed_count == 3
+
+
+def test_commit_prototype_keeps_distinct_phrases_separate(store):
+    for uid, emb in (("u1", [0.6, 0.8]), ("u2", [1.0, 0.0])):
+        store.save_utterance(
+            utterance_id=uid,
+            transcript="關鍵善",
+            duration_ms=1450,
+            ttl_seconds=600,
+            embedding=emb,
+            embedding_model_version="synthetic-v1-d2",
+        )
+        assert commit_prototype(
+            store, utterance_id=uid, action_id="ir.fan.power"
+        ) == LEARNING_COMMITTED
+    protos = store.list_prototypes(embedding_model_version="synthetic-v1-d2")
+    assert len(protos) == 2
+    assert all(p.confirmed_count == 1 for p in protos)
 
 
 def test_commit_prototype_requires_embedding(store):
