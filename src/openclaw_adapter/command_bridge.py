@@ -25,7 +25,6 @@ import queue
 import re
 import threading
 import time
-from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Callable
@@ -117,6 +116,16 @@ from .command_bridge_models import (
     stream_start,
 )
 from .command_bridge_planner import ChatToolPlanner
+from .command_bridge_executor import (
+    ChatToolExecutor,
+    _BLUETOOTH_TOOL_POLICY,
+    _IR_TOOL_POLICY,
+    _MUSIC_TOOL_POLICY,
+    _MUSICQUEUE_TOOL_POLICY,
+    _RESEARCH_TOOL_POLICY,
+    _SEARCH_TOOL_POLICY,
+    _VISION_TOOL_POLICY,
+)
 from .command_bridge_providers import (
     ProviderRouter,
     _GeminiRequestError,
@@ -175,8 +184,6 @@ _HEARTBEAT_SECONDS = 10.0
 
 # Chat-tool ledger: how many recent executions to keep per conversation and how
 # much of each result to quote back to the tool-plan router.
-_CHAT_TOOL_LEDGER_LIMIT = 8
-_CHAT_TOOL_LEDGER_SUMMARY_CHARS = 400
 
 
 # Finished jobs linger this long so a phone that reconnects after a screen-lock
@@ -302,26 +309,6 @@ _TOOL_USED_PREFIX = "🔧 已使用工具："
 _SOURCE_PACK_TITLE_CAP = 200
 _SOURCE_PACK_SNIPPET_CAP = 500
 _SOURCE_PACK_TOTAL_CAP = 4000
-
-# Central chat tool registry (#46): maps tool name → (policy, executor).
-# The executor signature is (bridge, ChatToolRequest) → ChatToolResult.
-# Adding a new tool means: (a) whitelist it in command_bridge_models.CHAT_TOOLS,
-# (b) add an entry here. No other file needs to change.
-_SEARCH_TOOL_POLICY = ChatToolPolicy(
-    display_name="網路搜尋",
-    max_query_chars=256,
-    max_source_field_chars=_SOURCE_PACK_SNIPPET_CAP,
-    max_source_pack_chars=_SOURCE_PACK_TOTAL_CAP,
-)
-_RESEARCH_TOOL_POLICY = ChatToolPolicy(display_name="商品研究", max_query_chars=512)
-_MUSIC_TOOL_POLICY = ChatToolPolicy(display_name="音樂控制", max_query_chars=128)
-# Queue queries carry several song names at once, so they get the full router
-# query budget instead of the single-song cap.
-_MUSICQUEUE_TOOL_POLICY = ChatToolPolicy(display_name="音樂連播", max_query_chars=256)
-_BLUETOOTH_TOOL_POLICY = ChatToolPolicy(display_name="藍牙控制", max_query_chars=128)
-_IR_TOOL_POLICY = ChatToolPolicy(display_name="紅外線控制", max_query_chars=128)
-_VISION_TOOL_POLICY = ChatToolPolicy(display_name="圖片查看", max_query_chars=512)
-
 
 _NO_IMAGE_MSG = "請附上要翻譯的圖片。"
 _BAD_IMAGE_TYPE_MSG = "不支援的檔案類型，請改用 JPG / PNG / WEBP / GIF 等圖片格式。"
@@ -528,6 +515,7 @@ class CommandBridge:
         # model metadata. Client builders stay on the bridge (ChatClientDeps).
         self._providers = ProviderRouter(self)
         self._planner = ChatToolPlanner(self, self._providers)
+        self._executor = ChatToolExecutor(self)
         # Voice-intent gate (#82 PR1): clarify before open-ended chat tools
         # when a short voice utterance may be a misrecognized control command.
         # Lambdas keep the providers late-bound so instance monkeypatching of
@@ -553,8 +541,6 @@ class CommandBridge:
         # (success AND failure). Shown to the tool-plan router so it stops
         # re-running tools whose results (or failures) this conversation
         # already has. In-process only, bounded per conversation.
-        self._chat_tool_ledgers: dict[str, deque] = {}
-        self._chat_tool_ledger_lock = threading.Lock()
         # #53: workflow surface for web chat (NL draft + editable card buttons).
         # Built lazily — the shared editor must persist draft sessions across the
         # separate HTTP requests that a draft → reorder → save flow spans.
@@ -1168,22 +1154,10 @@ class CommandBridge:
         status: str,
         summary: str,
     ) -> None:
-        entry = {
-            "tool": tool,
-            "query": " ".join(str(query or "").split())[:200],
-            "status": status,
-            "summary": " ".join(str(summary or "").split())[:_CHAT_TOOL_LEDGER_SUMMARY_CHARS],
-        }
-        with self._chat_tool_ledger_lock:
-            ledger = self._chat_tool_ledgers.setdefault(
-                self._conversation_key(req), deque(maxlen=_CHAT_TOOL_LEDGER_LIMIT)
-            )
-            ledger.append(entry)
+        self._executor.record_run(req, tool, query, status=status, summary=summary)
 
     def _chat_tool_ledger_entries(self, req: WebCommandRequest) -> list[dict]:
-        with self._chat_tool_ledger_lock:
-            ledger = self._chat_tool_ledgers.get(self._conversation_key(req))
-            return list(ledger) if ledger else []
+        return self._executor.ledger_entries(req)
 
     def _record_goal_loop_run(self, req: WebCommandRequest, goal: str, report) -> None:
         try:
@@ -2430,7 +2404,7 @@ class CommandBridge:
             prompt, pool_rotation=pool_rotation, conversation_key=conversation_key
         )
 
-    def _run_chat_tool(self, req: WebCommandRequest, plan: ChatToolPlan) -> ChatToolResult:
+    def _legacy_run_chat_tool(self, req: WebCommandRequest, plan: ChatToolPlan) -> ChatToolResult:
         """Dispatch a trusted plan to the appropriate tool executor via the registry."""
         policy_map: dict[str, tuple[ChatToolPolicy, object]] = {
             CHAT_TOOL_SEARCH: (_SEARCH_TOOL_POLICY, self._exec_grounded_search),
@@ -2474,7 +2448,7 @@ class CommandBridge:
         )
         return tool_result
 
-    def _stream_chat_tool(
+    def _legacy_stream_chat_tool(
         self, req: WebCommandRequest, plan: ChatToolPlan
     ) -> Iterator[dict]:
         """Run the tool off-thread, surfacing a live "正在調用…工具中" notice up
@@ -2926,7 +2900,7 @@ class CommandBridge:
                 )
         return "\n".join(lines)
 
-    def _chat_tool_result_satisfies_intent(
+    def _legacy_chat_tool_result_satisfies_intent(
         self,
         req: WebCommandRequest,
         plan: ChatToolPlan,
@@ -2951,7 +2925,7 @@ class CommandBridge:
         )
         return parsed
 
-    def _generate_chat_tool_satisfaction_text(
+    def _legacy_generate_chat_tool_satisfaction_text(
         self,
         chat_backend: str,
         prompt: str,
@@ -2981,7 +2955,7 @@ class CommandBridge:
         raise RuntimeError("no available backend for chat tool satisfaction check")
 
     @staticmethod
-    def _parse_chat_tool_satisfaction(raw: str) -> dict[str, object]:
+    def _legacy_parse_chat_tool_satisfaction(raw: str) -> dict[str, object]:
         text = (raw or "").strip()
         if not text:
             raise ValueError("empty chat tool satisfaction response")
@@ -3006,6 +2980,36 @@ class CommandBridge:
             "environment_blocked": environment_blocked and not satisfied,
             "reason": reason,
         }
+
+    # R1.3b compatibility delegates.  The executor calls back through these
+    # exact bridge names, preserving existing instance monkeypatch seams.
+    def _run_chat_tool(self, req: WebCommandRequest, plan: ChatToolPlan) -> ChatToolResult:
+        return self._executor.run(req, plan)
+
+    def _stream_chat_tool(
+        self, req: WebCommandRequest, plan: ChatToolPlan
+    ) -> Iterator[dict]:
+        yield from self._executor.stream(req, plan)
+
+    def _chat_tool_result_satisfies_intent(
+        self, req: WebCommandRequest, plan: ChatToolPlan, tool_result: ChatToolResult
+    ) -> dict[str, object]:
+        return self._executor.result_satisfies_intent(req, plan, tool_result)
+
+    def _generate_chat_tool_satisfaction_text(
+        self,
+        chat_backend: str,
+        prompt: str,
+        *,
+        pool_rotation: "CloudPoolRotation | None" = None,
+    ) -> str:
+        return self._executor.generate_satisfaction_text(
+            chat_backend, prompt, pool_rotation=pool_rotation
+        )
+
+    @staticmethod
+    def _parse_chat_tool_satisfaction(raw: str) -> dict[str, object]:
+        return ChatToolExecutor.parse_satisfaction(raw)
 
     @staticmethod
     def _format_search_source_pack(results, policy: ChatToolPolicy) -> str:

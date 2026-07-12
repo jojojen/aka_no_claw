@@ -47,6 +47,17 @@ def test_codegen_seed_for_corrupt_streams_is_always_retrievable(db):
     assert "不能略過壞資料" in rule.technique
 
 
+def test_codegen_seed_for_facade_collaborator_seams_is_always_retrievable(db):
+    db.seed_codegen_knowledge()
+
+    rows = db.retrieve_codegen_knowledge("任意程式需求", k=100)
+    rule = next(row for row in rows if row.title == "抽取 collaborator 時保留既有 facade 的可替換 seam")
+
+    assert rule.category == "architecture"
+    assert "*" in rule.keywords
+    assert "monkeypatch" in rule.technique
+
+
 def test_upsert_and_get_entry_roundtrip(db):
     db.upsert_entry(
         entity_canonical="pjsk",

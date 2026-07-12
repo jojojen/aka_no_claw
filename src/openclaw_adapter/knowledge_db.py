@@ -987,6 +987,19 @@ DEPRECATED_CODEGEN_SEED: tuple[tuple[str, str], ...] = (
 
 CODEGEN_SEED: tuple[dict, ...] = (
     {
+        "category": "architecture",
+        "title": "抽取 collaborator 時保留既有 facade 的可替換 seam",
+        "technique": (
+            "把 orchestration 從既有 facade 抽到 collaborator 時，不要讓新物件直接繞過原本"
+            "可替換的方法去呼叫網路、模型或副作用。collaborator 應經由明確 deps protocol 回呼"
+            "facade 的同名 seam，facade 再薄委派到 collaborator；如此既有 consumer、instance "
+            "monkeypatch、deterministic fake 與相容測試仍攔得到呼叫。為每個抽出的邊界保留一個"
+            "測試：替換 facade seam 後，collaborator 的實際路徑必須使用替身，絕不碰真實外部服務。"
+        ),
+        "keywords": ["*", "refactor", "facade", "collaborator", "dependency injection", "seam", "monkeypatch", "compatibility"],
+        "confidence": 0.95,
+    },
+    {
         "category": "validation",
         "title": "串流協定損毀必須可觀測且終止成功路徑",
         "technique": (
