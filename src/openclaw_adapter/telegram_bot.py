@@ -19,40 +19,40 @@ from assistant_runtime import AssistantSettings, build_ssl_context
 from assistant_runtime.logging_utils import trim_for_log
 
 from market_monitor.storage import MonitorDatabase
-from price_monitor_bot.bot import (  # noqa: F401
-    BoardLoader,
+from price_monitor_bot.bot import (
     CatalogRenderer,
     LookupRenderer,
     PhotoLookupRenderer,
     PhotoLookupReply,
     ResearchRenderer,
     ReputationRenderer,
-    TelegramLookupQuery,
     TelegramPhotoIntentAnalysis,
     TelegramPhotoIntentOption,
     TelegramPhotoQuery,
     TelegramResearchQuery,
     TelegramReputationDelivery,
     TelegramReputationQuery,
-    build_processing_ack,
     default_board_loader as _base_default_board_loader,
     default_lookup_renderer as _base_default_lookup_renderer,
     default_photo_renderer as _base_default_photo_renderer,
-    format_liquidity_board,
-    format_photo_lookup_result,
-    parse_lookup_command,
-    parse_reputation_snapshot_command,
     TelegramCommandProcessor as _BaseTelegramCommandProcessor,
 )
-from telegram_core.contracts import RegisteredCommand, TelegramTextReplyPlan  # noqa: F401
-from telegram_core.polling import (  # noqa: F401
-    handle_telegram_message,
-    run_telegram_polling as _core_run_telegram_polling,
-)
-from telegram_core.transport import (  # noqa: F401
+from telegram_core.contracts import RegisteredCommand, TelegramTextReplyPlan
+from telegram_core.polling import run_telegram_polling as _core_run_telegram_polling
+from telegram_core.transport import (
     TelegramBotClient,
     TelegramFileAttachment,
     send_telegram_test_message as _base_send_telegram_test_message,
+)
+from .telegram_compat import (  # noqa: F401 - legacy re-export surface (R2.1)
+    BoardLoader,
+    TelegramLookupQuery,
+    build_processing_ack,
+    format_liquidity_board,
+    format_photo_lookup_result,
+    handle_telegram_message,
+    parse_lookup_command,
+    parse_reputation_snapshot_command,
 )
 from price_monitor_bot.watch_monitor import ensure_monitor as _ensure_watch_monitor
 from tcg_tracker.image_lookup import TcgVisionSettings

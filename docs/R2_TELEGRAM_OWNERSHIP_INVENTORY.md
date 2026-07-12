@@ -12,6 +12,11 @@ registration site, handler, DB access, background behavior, formatter, tests,
 and compatibility requirements. The uniqueness/precedence rules below are
 pinned by `tests/test_registry_precedence.py`.
 
+R2.1 (done): pure re-exports (names telegram_bot.py imported from
+price_monitor_bot/telegram_core but never used) moved to
+`openclaw_adapter/telegram_compat.py`; telegram_bot re-imports them so legacy
+paths keep working. Surface pinned by `tests/test_telegram_compat.py`.
+
 Layer chain:
 
 ```text
