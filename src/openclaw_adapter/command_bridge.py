@@ -40,6 +40,7 @@ from .session_memory import SessionMemoryStore, SessionWriteError, empty_session
 from .command_bridge_conversation import ConversationSession, ConversationState
 from .command_bridge_music import MusicCapability
 from .command_bridge_workflow import WorkflowCapability
+from .command_bridge_home import HomeCapability
 from .service_restart import RESTART_MESSAGE, trigger_restart_all
 from .llm_pool_settings import (
     LLM_PROVIDER_BIG_PICKLE,
@@ -522,6 +523,7 @@ class CommandBridge:
         self._executor = ChatToolExecutor(self)
         self._music = MusicCapability(self)
         self._workflow_capability = WorkflowCapability(self)
+        self._home = HomeCapability(self)
         # Voice-intent gate (#82 PR1): clarify before open-ended chat tools
         # when a short voice utterance may be a misrecognized control command.
         # Lambdas keep the providers late-bound so instance monkeypatching of
@@ -4078,6 +4080,7 @@ class CommandBridge:
         Empty input (or ``scan``) keeps the existing scan behavior; any other
         text is passed through as the device name so Web Chat and the 生活 mode
         both hit the same command handler."""
+        return self._home.command("bluetooth", text)
         remainder = (text or "").strip()
         if remainder.startswith("/bluetooth"):
             remainder = remainder[len("/bluetooth"):].strip()
@@ -4094,6 +4097,7 @@ class CommandBridge:
         """Re-invoke a ``bt:`` callback button for the web 生活 mode (re-scan or
         connect a selected device) — the same handler the Telegram bot dispatches,
         so address-token resolution and MAC validation are enforced identically."""
+        return self._home.action("bt", callback_data)
         prefix, _, payload = (callback_data or "").partition(":")
         if prefix != "bt":
             return {"status": STATUS_ERROR, "message": f"未知的藍牙動作：{callback_data}", "actions": []}
@@ -4119,6 +4123,7 @@ class CommandBridge:
         """Run the Telegram ``/ir`` handler from the web 生活 mode. The web UI may
         send either the full slash command (``/ir send ...``) or just the
         remainder (``send ...``); the bridge normalizes both forms."""
+        return self._home.command("ir", text)
         remainder = (text or "").strip()
         if remainder.startswith("/ir"):
             remainder = remainder[3:].strip()
@@ -4131,6 +4136,7 @@ class CommandBridge:
 
     def run_ir_action(self, callback_data: str) -> dict:
         """Re-invoke an ``ir:`` callback button for the web 生活 mode."""
+        return self._home.action("ir", callback_data)
         prefix, _, payload = (callback_data or "").partition(":")
         if prefix != "ir":
             return {"status": STATUS_ERROR, "message": f"未知的 IR 動作：{callback_data}", "actions": []}

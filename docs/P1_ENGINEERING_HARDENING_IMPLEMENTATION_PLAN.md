@@ -659,7 +659,9 @@ and locking. Test concurrent sessions, disconnect races, and process restart.
 > now-playing adapters moved to `command_bridge_music.py` (`MusicCapability`)
 > behind same-name bridge delegates. R1.5b moved Web workflow command and
 > editor callback routing to `command_bridge_workflow.py` (`WorkflowCapability`).
-> Next: home control.
+> R1.5c moved Bluetooth and IR Web command/callback routing to
+> `command_bridge_home.py` (`HomeCapability`). R1.5 is complete; next R1.6
+> removes transitional legacy implementations and leaves a thin facade.
 
 Recommended order: music, workflow, then home control. Each service owns no HTTP
 details and exposes narrow typed methods.
