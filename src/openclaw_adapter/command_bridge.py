@@ -37,6 +37,7 @@ from assistant_runtime import AssistantSettings, build_ssl_context
 
 from .job_store import JobStore
 from .session_memory import SessionMemoryStore, SessionWriteError, empty_session
+from .command_bridge_conversation import ConversationSession
 from .service_restart import RESTART_MESSAGE, trigger_restart_all
 from .llm_pool_settings import (
     LLM_PROVIDER_BIG_PICKLE,
@@ -499,8 +500,9 @@ class CommandBridge:
         self._cancel_probes: dict[str, Callable[[], bool]] = {}
         self._cancel_probe_lock = threading.Lock()
         self._live_notifier_lock = threading.Lock()
+        self._conversation_session: ConversationSession | None = None
+        self._conversation_session_lock = threading.Lock()
         self._session_store: SessionMemoryStore | None = None
-        self._session_lock = threading.Lock()
         self._image_renderer = None
         self._image_renderer_built = False
         self._image_renderer_lock = threading.Lock()
@@ -2369,6 +2371,15 @@ class CommandBridge:
         name = str(getattr(registered, "chat_tool_display_name", "") or "").strip()
         return name or command
 
+    @staticmethod
+    def _tool_stream_heartbeat_seconds() -> float:
+        """Compatibility seam for streamed tool heartbeats.
+
+        Tests and operational probes adjust the module-level cadence without
+        needing to reach into the executor collaborator.
+        """
+        return _HEARTBEAT_SECONDS
+
     def _local_judgment_model(self) -> str:
         return self._planner.local_judgment_model()
 
@@ -2546,17 +2557,7 @@ class CommandBridge:
         """Push a completed assistant message into session memory when the
         streaming client disconnected before delivery. The user sees it on
         the next reconnect/session load."""
-        from uuid import uuid4
-        snapshot = self._sessions().load()
-        messages = list(snapshot.get("messages") or [])
-        messages.append({
-            "id": uuid4().hex,
-            "role": "assistant",
-            "text": text,
-            "status": "ok",
-        })
-        snapshot["messages"] = messages
-        self._sessions().save(snapshot)
+        self._conversation_sessions().append_orphaned_result(text)
         logger.info(
             "command bridge: pushed orphaned tool result to session memory (%d chars)", len(text)
         )
@@ -4191,14 +4192,22 @@ class CommandBridge:
                 "actions": self._markup_to_actions(markup)}
 
     # --- web console session memory (issue #32) --------------------------
-    def _sessions(self) -> SessionMemoryStore:
-        if self._session_store is None:
-            with self._session_lock:
-                if self._session_store is None:
-                    self._session_store = SessionMemoryStore(
-                        self.settings.openclaw_web_memory_dir
+    def _conversation_sessions(self) -> ConversationSession:
+        if self._conversation_session is None:
+            with self._conversation_session_lock:
+                if self._conversation_session is None:
+                    self._conversation_session = ConversationSession(
+                        getattr(self.settings, "openclaw_web_memory_dir", None),
+                        store=self._session_store,
                     )
-        return self._session_store
+                if self._session_store is not None:
+                    self._conversation_session.adopt_store(self._session_store)
+        return self._conversation_session
+
+    def _sessions(self) -> SessionMemoryStore:
+        store = self._conversation_sessions().store()
+        self._session_store = store
+        return store
 
     def load_session(self) -> dict:
         """GET — the latest saved console snapshot, or an empty session. Never

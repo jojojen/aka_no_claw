@@ -639,6 +639,14 @@ steps. Untrusted model text never selects an arbitrary function.
 
 ### R1.4 Extract conversation state
 
+> 2026-07-12 — R1.4a shipped (see #74 comment for hash): the Web-console
+> session snapshot and disconnected-stream orphan append moved to
+> `command_bridge_conversation.py` (`ConversationSession`).  The collaborator
+> serializes lazy store construction and append read-modify-write, while the
+> bridge keeps `_sessions()` / injected-store seams compatible.  A concurrent
+> orphan-result test proves all simultaneous completions persist.  Remaining:
+> paused music and goal continuation state, expiry, and confirmation ownership.
+
 Move session memory, paused plans, continuation state, orphaned results, expiry,
 and locking. Test concurrent sessions, disconnect races, and process restart.
 
