@@ -987,6 +987,22 @@ DEPRECATED_CODEGEN_SEED: tuple[tuple[str, str], ...] = (
 
 CODEGEN_SEED: tuple[dict, ...] = (
     {
+        "category": "architecture",
+        "title": "LLM 決策 prompt 中的環境狀態要用即時探針，不可讓模型從歷史紀錄推斷",
+        "technique": (
+            "當 LLM 規劃器/路由器的 prompt 只含歷史執行紀錄（tool ledger、對話摘要）時，"
+            "模型會把「最後一筆相關紀錄」當成現在的環境狀態——但非同步任務（goal loop、"
+            "背景 job）的結果往往在下一次規劃之後才落帳，造成模型以過期狀態拒絕動作"
+            "（如：音樂明明在播放卻回答『沒有音樂在播放』）。修法：規劃前對便宜的"
+            "真實狀態來源（狀態檔、status API）做即時探針，把結果以『即時狀態，"
+            "以此為準、不要從紀錄推測』的措辭注入 prompt；探針失敗要 fail-soft 略過。"
+            "驗證方式：重建失敗當下的 ledger+對話，對真實模型做有/無狀態行的 A/B 探測，"
+            "斷言決策翻轉。"
+        ),
+        "keywords": ["*", "llm", "planner", "router", "prompt", "state", "ledger", "stale", "async"],
+        "confidence": 0.95,
+    },
+    {
         "category": "validation",
         "title": "對定長 padding 的特徵做 pooling 前先裁掉 padding 區段",
         "technique": (

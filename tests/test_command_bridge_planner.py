@@ -97,3 +97,45 @@ def test_generate_with_chat_backend_routes_local_through_deps_seam():
     assert deps.generate_calls == [("local-seam", "p")]
     assert "__no_tool__" in text
     assert metadata.final_model == "m"
+
+
+class _PromptDeps:
+    """Deps for build_plan_prompt: real prompt assembly, stubbed probes."""
+
+    def __init__(self, now_playing: object) -> None:
+        self._now_playing = now_playing
+
+    def _chat_tool_plan_system_prompt(self):
+        return "SYSTEM"
+
+    def _chat_tool_ledger_entries(self, req):
+        return []
+
+    def now_playing(self):
+        if isinstance(self._now_playing, Exception):
+            raise self._now_playing
+        return self._now_playing
+
+
+def test_plan_prompt_reports_live_now_playing_state():
+    # Ledger history can claim "nothing playing" while a goal-started track is
+    # audible; the prompt must carry the live probe so the planner never
+    # asserts playback state from stale tool records.
+    deps = _PromptDeps({"status": "ok", "name": "夜に駆ける"})
+    prompt = _planner(deps).build_plan_prompt(_req("音樂停止"))
+    assert "正在播放「夜に駆ける」" in prompt
+    assert "即時環境狀態" in prompt
+    assert "不要從工具紀錄或對話內容推測" in prompt
+
+
+def test_plan_prompt_reports_idle_music_state():
+    deps = _PromptDeps({"status": "ok", "name": None})
+    prompt = _planner(deps).build_plan_prompt(_req("音樂停止"))
+    assert "目前沒有音樂在播放" in prompt
+
+
+def test_plan_prompt_survives_now_playing_probe_failure():
+    deps = _PromptDeps(RuntimeError("state file gone"))
+    prompt = _planner(deps).build_plan_prompt(_req("音樂停止"))
+    assert "即時環境狀態" not in prompt
+    assert "使用者最新訊息：音樂停止" in prompt

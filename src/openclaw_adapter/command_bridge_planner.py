@@ -116,6 +116,8 @@ class PlannerDeps(Protocol):
 
     def _chat_tool_ledger_entries(self, req: WebCommandRequest) -> list[dict]: ...
 
+    def now_playing(self) -> dict: ...
+
     def _local_judgment_model(self) -> str: ...
 
     def _build_chat_tool_plan_prompt(
@@ -221,8 +223,34 @@ class ChatToolPlanner:
                 "若觀察結果足以回答，請直接回答（no_tool）；"
                 "只有在需要針對問題重新細看圖片時才使用圖片查看工具。",
             ]
+        state_lines = self._live_state_lines()
+        if state_lines:
+            lines += ["", "即時環境狀態（剛剛查詢，比上面的工具紀錄與對話內容都新）："]
+            lines += state_lines
+            lines.append(
+                "涉及目前播放狀態的判斷一律以上述即時狀態為準，"
+                "不要從工具紀錄或對話內容推測現在是否有音樂在播放。"
+            )
         lines += ["", f"使用者最新訊息：{(req.input or '').strip()}", "", "JSON："]
         return "\n".join(lines)
+
+    def _live_state_lines(self) -> list[str]:
+        """Ground-truth environment facts for the plan prompt.
+
+        Tool-ledger summaries describe the past, and long-running goal-loop
+        results land in the ledger only after completion — a stale
+        「無可繼續播放的音樂」 line once made the planner answer that nothing
+        was playing while a goal-started playbest was audibly playing. State
+        assertions must come from a live probe, never from history."""
+        try:
+            info = self._deps.now_playing()
+        except Exception:  # noqa: BLE001
+            logger.debug("plan prompt: now_playing probe failed", exc_info=True)
+            return []
+        name = info.get("name") if isinstance(info, dict) else None
+        if name:
+            return [f"- 音樂：正在播放「{name}」"]
+        return ["- 音樂：目前沒有音樂在播放"]
 
     def plan_system_prompt(self) -> str:
         tools = []
