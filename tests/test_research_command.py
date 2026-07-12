@@ -141,6 +141,103 @@ def test_comp_filter_keeps_same_sellable_unit_case_b() -> None:
     assert dropped == 0
 
 
+def test_comp_filter_exact_identity_bypasses_score_threshold() -> None:
+    # #81 acceptance: the incident listing contained the exact canonical title
+    # + rarity ("気になっちゃう背中 SEC") yet scored 0.717 < 0.72 because noise
+    # words (condition/shipping) dilute Jaccard. Reference ⊆ candidate token
+    # containment must force-keep regardless of the score gate.
+    from openclaw_adapter.research_command import (
+        _filter_market_items_for_price,
+        _title_similarity_score,
+    )
+
+    reference = "ヴァイスシュヴァルツ 気になっちゃう背中 SEC"
+    padded = (
+        "ヴァイスシュヴァルツ 気になっちゃう背中 SEC 美品 即日発送 "
+        "送料無料 匿名配送 24時間以内"
+    )
+    # Control: without the bypass the diluted score sits below this gate.
+    assert _title_similarity_score(reference, padded) < 0.72
+    kept, dropped = _filter_market_items_for_price(
+        reference_title=reference,
+        items=[{"title": padded, "price": 14000}],
+        min_similarity=0.72,
+    )
+    assert len(kept) == 1
+    assert dropped == 0
+
+
+def test_comp_filter_exact_identity_bypass_requires_all_reference_tokens() -> None:
+    # Same padding but the rarity differs (SR, not SEC): containment fails, so
+    # the ordinary score gate decides — a different rarity is a different
+    # sellable unit and must not be force-kept.
+    from openclaw_adapter.research_command import _filter_market_items_for_price
+
+    reference = "ヴァイスシュヴァルツ 気になっちゃう背中 SEC"
+    other_rarity = (
+        "ヴァイスシュヴァルツ 気になっちゃう背中 SR 美品 即日発送 "
+        "送料無料 匿名配送 24時間以内"
+    )
+    kept, dropped = _filter_market_items_for_price(
+        reference_title=reference,
+        items=[{"title": other_rarity, "price": 3000}],
+        min_similarity=0.72,
+    )
+    assert kept == []
+    assert dropped == 1
+
+
+def test_comp_filter_exact_identity_bypass_survives_gate_fallback() -> None:
+    # The bypass puts the candidate in the lexical-kept set, so even when the
+    # LLM sellable-unit gate cannot decide (returns None → lexical fallback)
+    # the exact-identity comp is retained instead of silently dropped.
+    from openclaw_adapter.research_command import _filter_market_items_with_semantic_gate
+
+    reference = "ヴァイスシュヴァルツ 気になっちゃう背中 SEC"
+    padded = (
+        "ヴァイスシュヴァルツ 気になっちゃう背中 SEC 美品 即日発送 "
+        "送料無料 匿名配送 24時間以内"
+    )
+    kept, dropped = _filter_market_items_with_semantic_gate(
+        reference_title=reference,
+        reference_price=14000,
+        items=[{"title": padded, "price": 14000}],
+        min_similarity=0.72,
+        semantic_gate_fn=lambda *_args: None,
+    )
+    assert len(kept) == 1
+    assert dropped == 0
+
+
+def test_comp_filter_exact_identity_bypass_inactive_for_single_token_reference() -> None:
+    # A one-token reference (e.g. bare product family) makes containment
+    # trivially true for every family listing; the bypass must stay off.
+    from openclaw_adapter.research_command import _filter_market_items_for_price
+
+    kept, dropped = _filter_market_items_for_price(
+        reference_title="ポケモンカード",
+        items=[{"title": "ポケモンカード 黒炎の支配者 BOX シュリンク付き 未開封 即日発送", "price": 6000}],
+        min_similarity=0.72,
+    )
+    assert kept == []
+    assert dropped == 1
+
+
+def test_comp_filter_exact_identity_bypass_does_not_override_graded_hard_drop() -> None:
+    # A graded (PSA) copy of the exact card is still not a comp for a raw
+    # reference: the graded-vs-raw hard drop runs before the bypass.
+    from openclaw_adapter.research_command import _filter_market_items_for_price
+
+    reference = "ヴァイスシュヴァルツ 気になっちゃう背中 SEC"
+    kept, dropped = _filter_market_items_for_price(
+        reference_title=reference,
+        items=[{"title": "PSA10 ヴァイスシュヴァルツ 気になっちゃう背中 SEC", "price": 30000}],
+        min_similarity=0.72,
+    )
+    assert kept == []
+    assert dropped == 1
+
+
 def test_comp_filter_case_c_scores_below_case_b() -> None:
     # Shares product name but missing the BOX/spec tokens. PR1 (idf=None = plain
     # Jaccard) only removes subset inflation; it does NOT promise to drop this

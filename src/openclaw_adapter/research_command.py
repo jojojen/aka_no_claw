@@ -3498,6 +3498,17 @@ def _classify_market_items_for_price(
         default_bigram_idf = idf_stats.default_bigram_idf
     specific_tokens = _specific_reference_tokens(reference_title)
     anchor_tokens = set(specific_tokens[1:] if len(specific_tokens) >= 2 else specific_tokens)
+    # Exact-identity bypass (#81): a candidate whose title contains EVERY
+    # reference token (reference ⊆ candidate) is the same canonical listing
+    # padded with noise words (condition/shipping), which dilutes Jaccard-style
+    # scores below the threshold. Force such candidates into the lexical-kept
+    # set so a score gate alone can never drop them; the sellable-unit gate
+    # still reviews them (bundles / condition mismatches remain droppable).
+    # This is the safe containment direction — the banned one is
+    # candidate ⊂ reference, which inflates single-card subsets. Structural
+    # token containment only; no card/rarity keyword lists (Rule G).
+    reference_token_set = set(_market_title_tokens(_normalize_market_title(reference_title)))
+    exact_bypass_active = len(reference_token_set) >= 2
     kept: list[tuple[dict[str, object], float]] = []
     gray: list[tuple[dict[str, object], float]] = []
     hard_dropped = 0
@@ -3525,7 +3536,8 @@ def _classify_market_items_for_price(
             default_token_idf=default_token_idf,
             default_bigram_idf=default_bigram_idf,
         )
-        if anchor_ok and similarity >= min_similarity:
+        contains_reference = exact_bypass_active and reference_token_set <= candidate_tokens
+        if contains_reference or (anchor_ok and similarity >= min_similarity):
             kept.append((item, similarity))
         elif similarity >= semantic_floor:
             gray.append((item, similarity))
