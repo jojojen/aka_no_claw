@@ -623,6 +623,14 @@ fakes. Preserve explicit unavailable/fallback reporting.
 
 ### R1.3 Separate planner and executor
 
+> 2026-07-12 — R1.3a shipped (see #74 comment for hash): trusted planning
+> extracted to `command_bridge_planner.py` (`ChatToolPlanner` + `PlannerDeps`
+> protocol; prompt assembly, per-backend plan generation, strict-JSON
+> validation). Bridge keeps same-name thin delegates so instance monkeypatches
+> keep working. Remaining in R1.3 (→ R1.3b): executor side (`_run_chat_tool` /
+> `_stream_chat_tool` / `_exec_*` policy-map dispatch + tool ledger) and the
+> satisfaction judge (`_chat_tool_result_satisfies_intent` and friends).
+
 Planner produces validated typed plans only. Executor maps an allowlisted plan
 to registered tools. Satisfaction judgement and goal escalation are explicit
 steps. Untrusted model text never selects an arbitrary function.
