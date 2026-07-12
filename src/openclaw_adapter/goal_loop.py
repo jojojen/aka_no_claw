@@ -7,7 +7,7 @@ can wire it in later without changing the planner or the typed workflow runner.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 from .continuation_policy import operation_key
@@ -41,6 +41,10 @@ class GoalLoopContinuation:
     trace: WorkflowTrace | None = None
     replans_used: int = 0
     narration: tuple[str, ...] = ()
+    # Run-scoped dedup memo (operation_key -> produced result). Persisted so a
+    # paused run resumed later (budget extension / confirm) still refuses to
+    # re-run an expensive command like /research it already executed (#81).
+    executed_operations: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         data: dict[str, object] = {
@@ -52,10 +56,13 @@ class GoalLoopContinuation:
             data["workflow"] = self.workflow.to_dict()
         if self.trace is not None:
             data["trace"] = self.trace.to_dict()
+        if self.executed_operations:
+            data["executed_operations"] = dict(self.executed_operations)
         return data
 
     @classmethod
     def from_dict(cls, data: dict) -> "GoalLoopContinuation":
+        raw_ops = data.get("executed_operations")
         return cls(
             state=ContinuationState.from_dict(dict(data.get("state") or {})),
             workflow=(
@@ -70,6 +77,11 @@ class GoalLoopContinuation:
             ),
             replans_used=int(data.get("replans_used") or 0),
             narration=tuple(str(x) for x in (data.get("narration") or [])),
+            executed_operations=(
+                {str(k): str(v) for k, v in raw_ops.items()}
+                if isinstance(raw_ops, dict)
+                else {}
+            ),
         )
 
 
@@ -163,6 +175,10 @@ class GoalLoop:
             # second time — the dispatcher returns the cached artifact instead.
             "executed_operations": dict(self.seed_operations),
         }
+        if resume is not None and resume.executed_operations:
+            # A resumed run must keep refusing to repeat work the paused run
+            # already did — merge the persisted memo over the constructor seeds.
+            scratch["executed_operations"].update(resume.executed_operations)
         if resume is not None and resume.trace is not None:
             # A resumed run may go straight to replan; make the previous
             # attempt's bound variables reusable there too.
@@ -231,6 +247,7 @@ class GoalLoop:
                     replans_used=int(scratch["replans_used"]),
                     replan_limit=self.replan_limit,
                     narration=narration,
+                    executed_operations=scratch["executed_operations"],
                 ),
                 replans_used=int(scratch["replans_used"]),
                 narration=narration,
@@ -253,6 +270,7 @@ class GoalLoop:
                     replans_used=int(scratch["replans_used"]),
                     replan_limit=self.replan_limit,
                     narration=narration,
+                    executed_operations=scratch["executed_operations"],
                     next_action_override="run_workflow",
                     stop_condition_override=str(scratch["pause_reason"]),
                 ),
@@ -284,6 +302,7 @@ class GoalLoop:
                 replans_used=int(scratch["replans_used"]),
                 replan_limit=self.replan_limit,
                 narration=narration,
+                executed_operations=scratch["executed_operations"],
             ),
             replans_used=int(scratch["replans_used"]),
             narration=narration,
@@ -298,6 +317,7 @@ class GoalLoop:
         replans_used: int,
         replan_limit: int,
         narration: tuple[str, ...],
+        executed_operations: dict[str, str] | None = None,
         next_action_override: str | None = None,
         stop_condition_override: str | None = None,
     ) -> GoalLoopContinuation | None:
@@ -344,6 +364,7 @@ class GoalLoop:
             trace=trace,
             replans_used=replans_used,
             narration=narration,
+            executed_operations=dict(executed_operations or {}),
         )
 
     @staticmethod

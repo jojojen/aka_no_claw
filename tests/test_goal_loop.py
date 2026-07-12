@@ -618,6 +618,95 @@ def test_goal_loop_runs_research_at_most_once_across_replan():
     assert research_calls == ["mercari m123"]
 
 
+def test_goal_loop_continuation_roundtrip_preserves_executed_operations():
+    """The dedup memo must survive serialization: the bridge persists paused
+    goals as dicts, and a memo lost in the round-trip would let a resumed run
+    re-pay for /research (#81)."""
+    memo = {operation_key("/research", "mercari m123"): "市價¥16000"}
+    cont = GoalLoopContinuation(
+        state=ContinuationState(
+            goal="完成任務",
+            completed=["draft: drafted wf with 1 step(s)"],
+            budget={"steps_used": 1, "steps_limit": 6},
+            next_action="run_workflow",
+            stop_condition="paused",
+        ),
+        executed_operations=memo,
+    )
+    restored = GoalLoopContinuation.from_dict(cont.to_dict())
+    assert restored.executed_operations == memo
+    # Old persisted continuations (no memo key) still load, with an empty memo.
+    legacy = GoalLoopContinuation.from_dict(
+        {"state": cont.state.to_dict(), "replans_used": 0, "narration": []}
+    )
+    assert legacy.executed_operations == {}
+
+
+def test_goal_loop_resume_after_pause_does_not_rerun_research():
+    """#81: a run that pauses after /research already produced its artifact
+    (the live bug: search budget ran dry mid-goal, user pressed 繼續) must NOT
+    re-run /research when resumed — even though the resume path builds a FRESH
+    GoalLoop from the persisted continuation dict, exactly like the bridge."""
+    research_calls: list[str] = []
+
+    def research_handler(text: str, chat_id: str) -> str:
+        research_calls.append(text)
+        return "市價約¥16000（未計鑑定費）"
+
+    registry = {"/research": _FakeRegistered(handler=research_handler)}
+    paused_wf = Workflow(
+        id="wf-a",
+        goal="goal",
+        steps=[
+            WorkflowStep(
+                id="s1", kind="command_sink", command="/research",
+                input="q", output="r1",
+            ),
+            WorkflowStep(id="s2", kind="tool_call", tool="search_tool", args={}, output="r2"),
+        ],
+    )
+    first = GoalLoop(
+        goal="這張卡送鑑定會賺嗎",
+        planner=_FakePlanner(drafts=[(paused_wf, None, False)]),
+        executor=_FakeExecutor(
+            {
+                "search_tool": (
+                    False,
+                    "web-search grounding budget exhausted (10/10)",
+                    WorkflowBudgetExhausted(
+                        kind="search", used=10, limit=10, hard_limit=20, granted_extra=0
+                    ),
+                )
+            }
+        ),
+        command_registry=registry,
+        seed_variables={"q": "mercari m123"},
+    )
+    paused = first.run()
+    assert paused.done is False
+    assert paused.continuation is not None
+    assert research_calls == ["mercari m123"]
+    key = operation_key("/research", "mercari m123")
+    assert key in paused.continuation.executed_operations
+
+    # The bridge persists continuations as JSON dicts and rebuilds from them.
+    # The resumed run re-executes the paused workflow with the extended search
+    # budget: the search step legitimately runs again, but /research must be
+    # served from the memo instead of paying for a second live run.
+    restored = GoalLoopContinuation.from_dict(paused.continuation.to_dict())
+    second = GoalLoop(
+        goal="這張卡送鑑定會賺嗎",
+        planner=_FakePlanner(drafts=[]),
+        executor=_FakeExecutor({"search_tool": (True, "找到鑑定費行情")}),
+        command_registry=registry,
+        result_judge=lambda goal, result: (True, ""),
+        seed_variables={"q": "mercari m123"},
+    )
+    resumed = second.run(resume=restored)
+    assert resumed.done is True
+    assert research_calls == ["mercari m123"]  # still exactly one live run
+
+
 def test_goal_loop_seed_operation_blocks_reentrant_research():
     """The chat tool that escalated already ran /research; passing its operation
     key + answer as a seed means a goal-loop workflow re-drafting the same
