@@ -35,6 +35,9 @@ class AssistantSettings:
     openclaw_stt_model: str = "base"
     openclaw_stt_device: str = "auto"
     openclaw_stt_compute_type: str = "default"
+    # Default to Chinese for this single-user assistant. Empty restores
+    # faster-whisper auto-detection; a request-supplied language still wins.
+    openclaw_stt_language: str | None = "zh"
     openclaw_stt_download_root: str = ".openclaw_tmp/whisper"
     openclaw_stt_max_audio_bytes: int = 15 * 1024 * 1024
     openclaw_stt_max_duration_seconds: int = 120
@@ -288,6 +291,7 @@ def get_settings() -> AssistantSettings:
         openclaw_stt_model=os.getenv("OPENCLAW_STT_MODEL", "base"),
         openclaw_stt_device=os.getenv("OPENCLAW_STT_DEVICE", "auto"),
         openclaw_stt_compute_type=os.getenv("OPENCLAW_STT_COMPUTE_TYPE", "default"),
+        openclaw_stt_language=_none_if_empty(os.getenv("OPENCLAW_STT_LANGUAGE", "zh")),
         openclaw_stt_download_root=_resolve_runtime_path(
             os.getenv("OPENCLAW_STT_DOWNLOAD_ROOT", ".openclaw_tmp/whisper")
         ),

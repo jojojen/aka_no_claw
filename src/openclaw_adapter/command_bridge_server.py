@@ -77,6 +77,7 @@ def _parse_stt_multipart(
     content_type: str,
     content_length: int,
     max_audio_bytes: int,
+    default_language: str | None = None,
 ):
     if content_type.split(";", 1)[0].strip().lower() != "multipart/form-data":
         raise SttRequestError("Content-Type 必須是 multipart/form-data。")
@@ -114,7 +115,7 @@ def _parse_stt_multipart(
         languages = forms.getall("language")
         if len(languages) > 1:
             raise SttRequestError("language 欄位只能出現一次。")
-        language = languages[0].strip() if languages else None
+        language = languages[0].strip() if languages else default_language
         if language and (
             not 2 <= len(language) <= 3
             or not language.isascii()
@@ -517,6 +518,7 @@ def _build_handler(
                     content_type=self.headers.get("Content-Type", ""),
                     content_length=length,
                     max_audio_bytes=transcriber.max_audio_bytes,
+                    default_language=getattr(bridge.settings, "openclaw_stt_language", None),
                 )
                 result = transcriber.transcribe(request)
             except ParserLimitReached as exc:

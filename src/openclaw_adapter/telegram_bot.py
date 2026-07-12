@@ -448,6 +448,7 @@ class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
                 audio_bytes,
                 mime_type=mime_type,
                 max_audio_bytes=self._stt_transcriber.max_audio_bytes,
+                language=getattr(self.settings, "openclaw_stt_language", None),
                 trusted_duration_seconds=float(duration),
             )
             result = self._stt_transcriber.transcribe(request)
