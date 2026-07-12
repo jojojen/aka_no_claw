@@ -53,7 +53,8 @@ Frontend = `aka_no_claw_web/frontend/src/api/commandClient.ts` (sole web consume
 | `load_chat_settings` / `save_chat_settings` | `GET/POST /api/command/chat-settings` | yes | backend/model prefs |
 | `model_routes()` | `GET /api/command/model-routes` | yes | route→model listing |
 | `restart_all()` | `POST /api/command/restartall` | yes | `service_restart.trigger_restart_all` |
-| (server-only) | `POST /api/command/transcribe` | yes | `local_stt`, multipart audio |
+| (server-only) | `POST /api/command/transcribe` | yes | `local_stt`, multipart audio; returns opaque `utterance_id` (#82 PR1) |
+| `confirm_voice_action(action_id)` | `POST /api/command/voice/confirm` | pending (#82 PR1 frontend) | executes a voice clarification candidate; backend re-resolves the `voice/` action registry, client submits only `action_id` |
 
 Telegram is NOT a consumer of `CommandBridge`; it shares the underlying
 handler registries via `telegram_bot._build_registries` (§4).

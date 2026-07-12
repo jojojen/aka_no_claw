@@ -213,6 +213,8 @@ def _build_handler(
                 self._handle_chat_settings_save()
             elif path == "/api/command/transcribe":
                 self._handle_transcribe()
+            elif path == "/api/command/voice/confirm":
+                self._handle_voice_confirm()
             elif path == "/api/command/restartall":
                 self._write_json(bridge.restart_all())
             else:
@@ -382,6 +384,28 @@ def _build_handler(
             status = HTTPStatus.OK if result.get("status") != "error" else HTTPStatus.BAD_REQUEST
             self._write_json(result, status=status)
 
+        def _handle_voice_confirm(self) -> None:
+            """#82 PR1: execute a clarification candidate. Body carries only
+            ``action_id``; the bridge re-resolves the registry server-side."""
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            try:
+                raw = self.rfile.read(length) if length else b""
+                data = json.loads(raw.decode("utf-8")) if raw else {}
+            except (ValueError, UnicodeDecodeError) as exc:
+                self._write_json({"status": "error", "message": f"無效的請求：{exc}"},
+                                 status=HTTPStatus.BAD_REQUEST)
+                return
+            if not isinstance(data, dict):
+                self._write_json({"status": "error", "message": "請求必須是 JSON 物件。"},
+                                 status=HTTPStatus.BAD_REQUEST)
+                return
+            action_id = str(data.get("action_id") or "")
+            if not action_id:
+                self._write_json({"status": "error", "message": "缺少 action_id。"},
+                                 status=HTTPStatus.BAD_REQUEST)
+                return
+            self._write_json(bridge.confirm_voice_action(action_id))
+
         def _handle_transcribe(self) -> None:
             if transcriber is None:
                 self._write_json(
@@ -453,6 +477,10 @@ def _build_handler(
 
             response: dict[str, object] = {
                 "status": "ok",
+                # Opaque id for the voice-personalization pipeline (#82): the
+                # frontend echoes it back in the command request's voice
+                # metadata so later PRs can associate learning data.
+                "utterance_id": uuid4().hex,
                 "transcript": result.transcript,
             }
             if result.language is not None:

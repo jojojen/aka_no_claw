@@ -143,6 +143,14 @@ from .task_loop import (
     resume_loop,
 )
 from .task_workspace import Workflow
+from .voice import (
+    CompositeVoiceActionRegistry,
+    VoiceClarification,
+    VoiceIntentGate,
+    VoiceUserContext,
+)
+from .voice.action_registry import DISPATCH_IR_SEND, DISPATCH_MUSIC_CALLBACK
+from .voice.models import RISK_LOW
 
 logger = logging.getLogger(__name__)
 
@@ -541,6 +549,15 @@ class CommandBridge:
         # Provider routing collaborator (#74 R1.2): sticky pins, pool chains,
         # model metadata. Client builders stay on the bridge (ChatClientDeps).
         self._providers = ProviderRouter(self)
+        # Voice-intent gate (#82 PR1): clarify before open-ended chat tools
+        # when a short voice utterance may be a misrecognized control command.
+        # Lambdas keep the providers late-bound so instance monkeypatching of
+        # the _voice_* methods still intercepts (same pattern as ChatClientDeps).
+        self._voice_registry = CompositeVoiceActionRegistry(
+            music_available=lambda: self._voice_music_available(),
+            ir_buttons=lambda: self._voice_ir_buttons(),
+        )
+        self._voice_gate = VoiceIntentGate(self._voice_registry)
         self._goal_pending_confirms: dict[str, dict] = {}
         self._goal_pending_lock = threading.Lock()
         # A goal run that finished successfully offers a "💾 存為工作流" button
@@ -818,6 +835,16 @@ class CommandBridge:
         if plan is not None and plan.tool == CHAT_TOOL_GOAL:
             return self._run_goal_loop_blocking(req, plan.query, planner_metadata=metadata)
         if plan is not None and plan.tool != CHAT_TOOL_NO_TOOL:
+            # #82 PR1 voice guard: must run BEFORE the tool executes so a
+            # misrecognized control utterance never triggers /search.
+            clarification = self._maybe_voice_clarification(req, plan)
+            if clarification is not None:
+                return WebCommandResponse(
+                    status=STATUS_OK,
+                    message=self._voice_clarification_message(clarification),
+                    mode=MODE_CHAT,
+                    clarification=clarification.to_dict(),
+                )
             try:
                 tool_result = self._run_chat_tool(req, plan)
                 logger.info(
@@ -902,6 +929,14 @@ class CommandBridge:
             )
             return
         if plan is not None and plan.tool != CHAT_TOOL_NO_TOOL:
+            # #82 PR1 voice guard (streaming twin of the blocking path).
+            clarification = self._maybe_voice_clarification(req, plan)
+            if clarification is not None:
+                yield stream_done(
+                    self._voice_clarification_message(clarification),
+                    clarification=clarification.to_dict(),
+                )
+                return
             yield from self._stream_chat_tool(req, plan)
             return
         if plan is not None and plan.tool == CHAT_TOOL_NO_TOOL:
@@ -3520,6 +3555,95 @@ class CommandBridge:
         }
 
     # --- 生活 mode: music control surface (aka_no_claw_web#3 / #4) ---------
+    # --- voice-intent gate (#82 PR1) ---------------------------------------
+    def _voice_music_available(self) -> bool:
+        return self._callbacks().get("music") is not None
+
+    def _voice_ir_buttons(self) -> list[tuple[str, str]]:
+        from .ir_command import IrStore
+
+        return [
+            (b.device, b.button)
+            for b in IrStore(self.settings.openclaw_ir_devices_path).list_buttons()
+        ]
+
+    def _voice_user_context(self, req: WebCommandRequest) -> VoiceUserContext:
+        return VoiceUserContext(conversation_id=req.conversation_id)
+
+    def _maybe_voice_clarification(
+        self, req: WebCommandRequest, plan: ChatToolPlan
+    ) -> VoiceClarification | None:
+        """First-use unresolved-control gate (design §9.3): a short voice
+        utterance about to hit an open-ended tool gets a clarification card
+        instead. MUST run before the tool executes; returns None whenever the
+        request should proceed unchanged (all non-voice input, long-form
+        speech, declined clarification, or no available candidates)."""
+        if not req.is_voice:
+            return None
+        if plan.tool not in (CHAT_TOOL_SEARCH, CHAT_TOOL_RESEARCH):
+            return None
+        voice = req.voice
+        context = self._voice_user_context(req)
+        should = self._voice_gate.should_clarify_before_open_tool(
+            transcript=req.input,
+            plan_query=plan.query,
+            duration_ms=voice.duration_ms if voice else None,
+            clarification_declined=bool(voice and voice.clarification_declined),
+            user_context=context,
+        )
+        if not should:
+            return None
+        clarification = self._voice_gate.build_first_use_clarification(
+            transcript=req.input, user_context=context
+        )
+        if not clarification.candidates:
+            return None
+        logger.info(
+            "[voice-gate] clarify before tool=%s transcript=%r candidates=%d",
+            plan.tool, req.input, len(clarification.candidates),
+        )
+        return clarification
+
+    @staticmethod
+    def _voice_clarification_message(clarification: VoiceClarification) -> str:
+        return (
+            f"我聽到：「{clarification.transcript}」\n"
+            "你是要執行哪一個？（也可以選「都不是」當一般問題處理）"
+        )
+
+    def confirm_voice_action(self, action_id: str) -> dict:
+        """Execute a clarification candidate. The client submits only the
+        ``action_id``; the registry is re-read and availability/risk are
+        re-validated server-side (design §5.5) — display labels, payloads and
+        risk levels from the client are never trusted."""
+        aid = (action_id or "").strip()
+        if not aid:
+            return {"status": STATUS_ERROR, "message": "缺少 action_id。", "actions": []}
+        try:
+            actions = self._voice_registry.list_actions(
+                user_context=VoiceUserContext()
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("voice confirm: registry listing failed")
+            return {"status": STATUS_ERROR, "message": "語音操作清單暫時不可用。", "actions": []}
+        descriptor = next((a for a in actions if a.action_id == aid), None)
+        if descriptor is None or not descriptor.available:
+            return {"status": STATUS_ERROR, "message": "此操作目前不可用。", "actions": []}
+        if descriptor.risk != RISK_LOW:
+            return {
+                "status": STATUS_ERROR,
+                "message": "此操作風險等級需要進一步確認，尚不支援語音直接執行。",
+                "actions": [],
+            }
+        if descriptor.dispatch_kind == DISPATCH_MUSIC_CALLBACK:
+            callback = str(descriptor.dispatch_payload.get("callback_data") or "")
+            return self.run_music_action(callback)
+        if descriptor.dispatch_kind == DISPATCH_IR_SEND:
+            device = str(descriptor.dispatch_payload.get("device") or "")
+            button = str(descriptor.dispatch_payload.get("button") or "")
+            return self.run_ir_command(f"send {device} {button}")
+        return {"status": STATUS_ERROR, "message": "未知的操作類型。", "actions": []}
+
     def run_music_command(self, text: str) -> dict:
         """Run the ``/music`` handler for the 生活 mode text box — an empty box
         returns the music menu (text + control buttons); a query plays/searches

@@ -2745,6 +2745,10 @@ def test_server_transcribe_route_accepts_browser_multipart_contract():
     )
 
     assert b" 200 " in raw
+    # #82 PR1: an opaque utterance_id joins the contract for the voice
+    # personalization pipeline; it is random per request.
+    utterance_id = payload.pop("utterance_id")
+    assert isinstance(utterance_id, str) and utterance_id
     assert payload == {
         "status": "ok",
         "transcript": "打開音樂",
@@ -5748,3 +5752,217 @@ def test_first_workflow_request_on_fresh_bridge_does_not_deadlock(monkeypatch, t
     handlers = b._handlers()
     assert "/workflow" in handlers
     assert handlers["/workflow"].handler("list", "wf-web") == "[wf]list"
+
+
+# --- #82 PR1: voice provenance + first-use unresolved-control gate ----------
+def _voice_chat_request(
+    text="關鍵善",
+    *,
+    duration_ms=1450,
+    clarification_declined=False,
+    input_source="voice",
+):
+    return parse_request(
+        {
+            "mode": "chat",
+            "input": text,
+            "chat_backend": "local",
+            "input_source": input_source,
+            "voice": {
+                "utterance_id": "utt-1",
+                "duration_ms": duration_ms,
+                "stt_language": "zh",
+                "stt_language_probability": 0.98,
+                "clarification_declined": clarification_declined,
+            },
+        }
+    )
+
+
+def test_parse_request_defaults_to_text_source():
+    req = parse_request({"mode": "chat", "input": "hi"})
+    assert req.input_source == "text"
+    assert req.is_voice is False
+    assert req.voice is None
+
+
+def test_parse_request_parses_voice_metadata():
+    req = _voice_chat_request()
+    assert req.is_voice is True
+    assert req.voice is not None
+    assert req.voice.utterance_id == "utt-1"
+    assert req.voice.duration_ms == 1450
+    assert req.voice.stt_language == "zh"
+    assert req.voice.clarification_declined is False
+
+
+def test_parse_request_rejects_unknown_input_source():
+    with pytest.raises(RequestValidationError):
+        parse_request({"mode": "chat", "input": "hi", "input_source": "psychic"})
+
+
+def test_parse_request_tolerates_malformed_voice_metadata():
+    req = parse_request(
+        {
+            "mode": "chat",
+            "input": "hi",
+            "input_source": "voice",
+            "voice": {"duration_ms": "soon", "stt_language_probability": True},
+        }
+    )
+    assert req.is_voice is True
+    assert req.voice is not None
+    assert req.voice.duration_ms is None
+    assert req.voice.stt_language_probability is None
+
+
+def _search_plan_bridge(monkeypatch, *, music_available=True):
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        b,
+        "_select_chat_tool_plan",
+        lambda req: (
+            ChatToolPlan(tool=CHAT_TOOL_SEARCH, query="關鍵善", reason_summary="查詢"),
+            None,
+        ),
+    )
+    monkeypatch.setattr(b, "_voice_music_available", lambda: music_available)
+    monkeypatch.setattr(b, "_voice_ir_buttons", lambda: [("fan", "power")])
+    return b
+
+
+def test_voice_short_utterance_clarifies_instead_of_search(monkeypatch):
+    b = _search_plan_bridge(monkeypatch)
+
+    def _no_search(*a, **k):
+        raise AssertionError("/search must not run before clarification (#82)")
+
+    monkeypatch.setattr("openclaw_adapter.web_search.web_search", _no_search)
+    resp = b.handle(_voice_chat_request())
+    assert resp.status == STATUS_OK
+    assert resp.clarification is not None
+    assert resp.clarification["kind"] == "clarify"
+    assert resp.clarification["transcript"] == "關鍵善"
+    ids = {c["action_id"] for c in resp.clarification["candidates"]}
+    # 7 music controls + 1 IR button exceed the candidate cap; the shortlist
+    # keeps registry order, so assert on membership + cap, not exact set.
+    assert "music.playpause" in ids
+    assert len(ids) <= 6
+    assert resp.clarification["fallback"]["label"]
+    assert "關鍵善" in resp.message
+
+
+def test_text_input_same_transcript_still_searches(monkeypatch):
+    b = _search_plan_bridge(monkeypatch)
+    seen = {}
+
+    def _search(q, *, max_results, reuse_browser):
+        seen["query"] = q
+        return (_result("t", "https://x.example/a", "s"),)
+
+    monkeypatch.setattr("openclaw_adapter.web_search.web_search", _search)
+    monkeypatch.setattr(b, "_ollama_generate_blocking", lambda prompt: "答案")
+    resp = b.handle(
+        parse_request({"mode": "chat", "input": "關鍵善", "chat_backend": "local"})
+    )
+    assert resp.status == STATUS_OK
+    assert resp.clarification is None
+    assert seen["query"] == "關鍵善"
+
+
+def test_voice_declined_clarification_falls_back_to_search(monkeypatch):
+    b = _search_plan_bridge(monkeypatch)
+    seen = {}
+
+    def _search(q, *, max_results, reuse_browser):
+        seen["query"] = q
+        return (_result("t", "https://x.example/a", "s"),)
+
+    monkeypatch.setattr("openclaw_adapter.web_search.web_search", _search)
+    monkeypatch.setattr(b, "_ollama_generate_blocking", lambda prompt: "答案")
+    resp = b.handle(_voice_chat_request(clarification_declined=True))
+    assert resp.status == STATUS_OK
+    assert resp.clarification is None
+    assert seen["query"] == "關鍵善"
+
+
+def test_voice_without_candidates_falls_back_to_search(monkeypatch):
+    b = _search_plan_bridge(monkeypatch, music_available=False)
+    monkeypatch.setattr(b, "_voice_ir_buttons", lambda: [])
+    seen = {}
+
+    def _search(q, *, max_results, reuse_browser):
+        seen["query"] = q
+        return (_result("t", "https://x.example/a", "s"),)
+
+    monkeypatch.setattr("openclaw_adapter.web_search.web_search", _search)
+    monkeypatch.setattr(b, "_ollama_generate_blocking", lambda prompt: "答案")
+    resp = b.handle(_voice_chat_request())
+    assert resp.clarification is None
+    assert seen["query"] == "關鍵善"
+
+
+def test_stream_voice_short_utterance_emits_clarification_done(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+
+    def _plan(req):
+        if False:
+            yield {}
+        return ChatToolPlan(tool=CHAT_TOOL_SEARCH, query="關鍵善"), None
+
+    monkeypatch.setattr(b, "_stream_chat_tool_plan", _plan)
+    monkeypatch.setattr(b, "_voice_music_available", lambda: True)
+    monkeypatch.setattr(b, "_voice_ir_buttons", lambda: [])
+
+    def _no_search(*a, **k):
+        raise AssertionError("/search must not run before clarification (#82)")
+
+    monkeypatch.setattr("openclaw_adapter.web_search.web_search", _no_search)
+    events = list(b.stream(_voice_chat_request(), "rid-voice"))
+    assert events[0]["type"] == "start"
+    done = events[-1]
+    assert done["type"] == "done"
+    assert done["clarification"]["kind"] == "clarify"
+    assert done["clarification"]["candidates"]
+
+
+def test_confirm_voice_action_dispatches_music_callback(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(b, "_voice_music_available", lambda: True)
+    monkeypatch.setattr(b, "_voice_ir_buttons", lambda: [])
+    seen = {}
+
+    def _music_action(callback_data):
+        seen["callback"] = callback_data
+        return {"status": STATUS_OK, "message": "⏯", "actions": []}
+
+    monkeypatch.setattr(b, "run_music_action", _music_action)
+    result = b.confirm_voice_action("music.playpause")
+    assert result["status"] == STATUS_OK
+    assert seen["callback"] == "music:playpause"
+
+
+def test_confirm_voice_action_dispatches_ir_send(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(b, "_voice_music_available", lambda: False)
+    monkeypatch.setattr(b, "_voice_ir_buttons", lambda: [("fan", "power")])
+    seen = {}
+
+    def _ir_command(text):
+        seen["text"] = text
+        return {"status": STATUS_OK, "message": "已送出", "actions": []}
+
+    monkeypatch.setattr(b, "run_ir_command", _ir_command)
+    result = b.confirm_voice_action("ir.fan.power")
+    assert result["status"] == STATUS_OK
+    assert seen["text"] == "send fan power"
+
+
+def test_confirm_voice_action_rejects_unknown_action(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(b, "_voice_music_available", lambda: False)
+    monkeypatch.setattr(b, "_voice_ir_buttons", lambda: [])
+    result = b.confirm_voice_action("ir.fan.power")
+    assert result["status"] == STATUS_ERROR
+    result = b.confirm_voice_action("")
+    assert result["status"] == STATUS_ERROR

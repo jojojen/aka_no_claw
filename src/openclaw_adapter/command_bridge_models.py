@@ -132,6 +132,27 @@ class ChatTurn:
     content: str
 
 
+# --- Voice provenance (issue #82) ------------------------------------------
+INPUT_SOURCE_TEXT = "text"
+INPUT_SOURCE_VOICE = "voice"
+_INPUT_SOURCES = {INPUT_SOURCE_TEXT, INPUT_SOURCE_VOICE}
+
+
+@dataclass(frozen=True, slots=True)
+class VoiceMetadata:
+    """STT provenance a voice-originated request carries (design §5.2).
+
+    ``clarification_declined`` is set by the frontend when the user picked
+    「都不是，當一般問題處理」 on a clarification card, so the resent
+    transcript keeps voice provenance without being gated again."""
+
+    utterance_id: str | None = None
+    duration_ms: int | None = None
+    stt_language: str | None = None
+    stt_language_probability: float | None = None
+    clarification_declined: bool = False
+
+
 @dataclass(frozen=True, slots=True)
 class WebCommandRequest:
     mode: str
@@ -145,10 +166,16 @@ class WebCommandRequest:
     history: tuple[ChatTurn, ...] = ()
     session_id: str | None = None
     conversation_id: str | None = None
+    input_source: str = INPUT_SOURCE_TEXT
+    voice: VoiceMetadata | None = None
 
     @property
     def has_image_attachment(self) -> bool:
         return any(a.type == "image" for a in self.attachments)
+
+    @property
+    def is_voice(self) -> bool:
+        return self.input_source == INPUT_SOURCE_VOICE
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,6 +267,10 @@ class WebCommandResponse:
     warnings: tuple[str, ...] = ()
     sources: tuple[Source, ...] = ()
     model_metadata: ModelMetadata | None = None
+    # Voice clarification card (#82): serialized VoiceClarification contract
+    # (kind/transcript/reason_code/candidates/fallback). Kept as a plain dict
+    # here so the wire-contract module does not import the voice package.
+    clarification: dict[str, object] | None = None
 
     def to_dict(self) -> dict[str, object]:
         out: dict[str, object] = {"status": self.status, "message": self.message}
@@ -255,6 +286,8 @@ class WebCommandResponse:
             out["sources"] = [s.to_dict() for s in self.sources]
         if self.model_metadata is not None:
             out["model_metadata"] = self.model_metadata.to_dict()
+        if self.clarification is not None:
+            out["clarification"] = self.clarification
         return out
 
 
@@ -292,6 +325,14 @@ def parse_request(data: object) -> WebCommandRequest:
 
     history = _sanitize_history(data.get("history"))
 
+    input_source = (
+        str(data.get("input_source") or INPUT_SOURCE_TEXT).strip().lower()
+    )
+    if input_source not in _INPUT_SOURCES:
+        raise RequestValidationError(
+            f"input_source must be one of {sorted(_INPUT_SOURCES)}, got {input_source!r}"
+        )
+
     return WebCommandRequest(
         mode=mode,
         input=text,
@@ -302,6 +343,31 @@ def parse_request(data: object) -> WebCommandRequest:
         history=history,
         session_id=_opt_str(data.get("session_id")),
         conversation_id=_opt_str(data.get("conversation_id")),
+        input_source=input_source,
+        voice=_parse_voice_metadata(data.get("voice")),
+    )
+
+
+def _parse_voice_metadata(raw: object) -> VoiceMetadata | None:
+    """Best-effort voice provenance (#82): like history, this is context, not
+    authoritative data — malformed fields are dropped, never fatal."""
+    if not isinstance(raw, dict):
+        return None
+    duration_ms: int | None = None
+    raw_duration = raw.get("duration_ms")
+    if isinstance(raw_duration, (int, float)) and not isinstance(raw_duration, bool):
+        if raw_duration > 0:
+            duration_ms = int(raw_duration)
+    probability: float | None = None
+    raw_probability = raw.get("stt_language_probability")
+    if isinstance(raw_probability, (int, float)) and not isinstance(raw_probability, bool):
+        probability = float(raw_probability)
+    return VoiceMetadata(
+        utterance_id=_opt_str(raw.get("utterance_id")),
+        duration_ms=duration_ms,
+        stt_language=_opt_str(raw.get("stt_language")),
+        stt_language_probability=probability,
+        clarification_declined=bool(raw.get("clarification_declined")),
     )
 
 
@@ -484,12 +550,15 @@ def stream_done(
     *,
     model_metadata: ModelMetadata | None = None,
     actions: list[dict[str, object]] | None = None,
+    clarification: dict[str, object] | None = None,
 ) -> dict[str, object]:
     ev: dict[str, object] = {"type": EVENT_DONE, "message": message}
     if model_metadata is not None:
         ev["model_metadata"] = model_metadata.to_dict()
     if actions:
         ev["actions"] = list(actions)
+    if clarification is not None:
+        ev["clarification"] = clarification
     return ev
 
 
