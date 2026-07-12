@@ -15,7 +15,7 @@ from __future__ import annotations
 import base64
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 # --- Modes ----------------------------------------------------------------
 MODE_CHAT = "chat"
@@ -612,3 +612,128 @@ def make_chat_tool_request(
         user_question=(user_question or "").strip(),
         policy=policy,
     )
+
+
+def _seed_variable_name_for_tool(tool: str) -> str:
+    """Mechanical variable name for a completed tool result handed to the goal
+    loop (e.g. "/research" → "prior_research_result")."""
+    slug = re.sub(r"[^a-z0-9]+", "_", str(tool or "").lower()).strip("_") or "tool"
+    return f"prior_{slug}_result"
+
+
+# Web Chat continuity (#44). Prepended so the model continues the conversation
+# (e.g. resolves 「她/它/這個」 against earlier turns) instead of treating each
+# message as a one-shot. Blocking and streaming chat share build_chat_prompt so
+# the two paths can't drift.
+_CHAT_SYSTEM_PROMPT = (
+    "你是 aka_no_claw 的本機聊天助理。下面是這段對話最近的內容，"
+    "請延續上下文回答使用者最新的訊息（例如代名詞「她／它／這個」指的是先前提到的主題），"
+    "並以繁體中文自然作答。"
+)
+_CHAT_ROLE_LABELS = {"user": "使用者", "assistant": "助理", "system": "系統"}
+
+
+def _extract_gemini_text(data: object) -> str:
+    if not isinstance(data, dict):
+        return ""
+    parts: list[str] = []
+    for candidate in data.get("candidates") or []:
+        if not isinstance(candidate, dict):
+            continue
+        content = candidate.get("content")
+        if not isinstance(content, dict):
+            continue
+        for part in content.get("parts") or []:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+    return "".join(parts).strip()
+
+
+def _clip(text: str, cap: int) -> str:
+    text = (text or "").strip()
+    if len(text) <= cap:
+        return text
+    return text[:cap].rstrip() + "…"
+
+
+def _tool_calling_notice(tool: str, name: str) -> str:
+    return f"🔧 正在調用「{name}（{tool}）」工具中…"
+
+
+def build_chat_prompt(user_input: str, history: tuple[ChatTurn, ...] = ()) -> str:
+    """Assemble the chat prompt from recent history + the current input.
+
+    With no history this is just the bare input (back-compat with the old
+    stateless behaviour). With history it becomes ``system + recent turns +
+    current input`` as a single string, which works for both the local Ollama
+    and cloud-pickle backends. Server-side trimming/sanitization already happened
+    in parse_request; this only formats."""
+    user_input = (user_input or "").strip()
+    if not history:
+        return user_input
+    lines = [_CHAT_SYSTEM_PROMPT, "", "對話紀錄："]
+    for turn in history:
+        label = _CHAT_ROLE_LABELS.get(turn.role, turn.role)
+        lines.append(f"{label}：{turn.content}")
+    lines += ["", f"使用者：{user_input}", "助理："]
+    return "\n".join(lines)
+
+
+_SUPPORTED_IMAGE_EXTENSIONS = (
+    ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".heic", ".heif",
+)
+_IMAGE_SUFFIX_BY_CONTENT_TYPE = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "image/bmp": ".bmp",
+    "image/heic": ".heic",
+    "image/heif": ".heif",
+}
+
+
+def _is_supported_image(att) -> bool:
+    """Whether an image attachment is a format the OCR pipeline can open. Trust an
+    explicit content_type when present (must be image/*); otherwise fall back to
+    the filename extension."""
+    ct = (att.content_type or "").strip().lower()
+    if ct:
+        return ct.startswith("image/")
+    name = (att.filename or "").lower()
+    return any(name.endswith(ext) for ext in _SUPPORTED_IMAGE_EXTENSIONS)
+
+
+def _encode_image_attachment(att) -> str | None:
+    """Encode an image attachment bytes to base64, downscaling via Pillow."""
+    from .vision_pool import encode_image_bytes_for_vision
+    if att.data:
+        return encode_image_bytes_for_vision(att.data)
+    return None
+
+
+def _image_temp_suffix(att) -> str:
+    name = (att.filename or "").lower()
+    for ext in _SUPPORTED_IMAGE_EXTENSIONS:
+        if name.endswith(ext):
+            return ext
+    ct = (att.content_type or "").strip().lower()
+    return _IMAGE_SUFFIX_BY_CONTENT_TYPE.get(ct, ".img")
+
+
+def markup_to_actions(markup: object) -> list[dict]:
+    """Convert a Telegram inline_keyboard to web action buttons, preserving
+    the row index so the frontend can re-group buttons into their original
+    keyboard rows (avoids misaligned layouts on multi-entry lists)."""
+    actions: list[dict] = []
+    if isinstance(markup, dict):
+        for row_idx, row in enumerate(markup.get("inline_keyboard", [])):
+            for btn in row:
+                if not isinstance(btn, dict):
+                    continue
+                cb = btn.get("callback_data")
+                label = btn.get("text")
+                if cb and label:
+                    actions.append({"label": str(label), "callback_data": str(cb), "row": row_idx})
+    return actions

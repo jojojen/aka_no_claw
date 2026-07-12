@@ -14,7 +14,7 @@ Line numbers drift; symbol names are the stable reference.
 
 | Module | Owns |
 | --- | --- |
-| `command_bridge_models.py` (614 ln) | modes/submodes/backends/status enums, NDJSON event vocabulary + `stream_*` builders, `WebCommandRequest/Response`, `parse_request`, history sanitization, chat-tool constants, `ChatToolPlan` parsing |
+| `command_bridge_models.py` (~740 ln) | modes/submodes/backends/status enums, NDJSON event vocabulary + `stream_*` builders, `WebCommandRequest/Response`, `parse_request`, history sanitization, chat-tool constants, `ChatToolPlan` parsing, pure helpers (`build_chat_prompt`, `_clip`, `_tool_calling_notice`, `_extract_gemini_text`, `_seed_variable_name_for_tool`, `markup_to_actions`, image-attachment helpers) |
 | `command_bridge_server.py` (610 ln) | HTTP routing only (stdlib server), envelope versioning |
 | `job_store.py` | persisted job payloads (see §6) |
 | `session_memory.py` | session snapshot persistence |
@@ -22,11 +22,14 @@ Line numbers drift; symbol names are the stable reference.
 | `continuation_policy.py` | tool outcome classification, `operation_key` dedup identity |
 | `goal_planner.py` | trusted plan generation/validation |
 
-R1.1's "pure response/model helpers" is therefore ~80% shipped; the remaining
-pure helpers still in `command_bridge.py`: `build_chat_prompt`, `_clip`,
+R1.1 is DONE: the remaining pure helpers (`build_chat_prompt`, `_clip`,
 `_tool_calling_notice`, `_extract_gemini_text`, `_seed_variable_name_for_tool`,
-`_markup_to_actions`, `_is_supported_image` / `_encode_image_attachment` /
-`_image_temp_suffix`.
+`markup_to_actions`, `_is_supported_image` / `_encode_image_attachment` /
+`_image_temp_suffix`, plus `_CHAT_SYSTEM_PROMPT` / `_CHAT_ROLE_LABELS` /
+image-format constants) now live in `command_bridge_models.py`;
+`command_bridge.py` re-imports them so existing consumers/tests keep importing
+from `openclaw_adapter.command_bridge` unchanged (`CommandBridge._markup_to_actions`
+stays as a `staticmethod` alias).
 
 ## 2. Public `CommandBridge` surface × HTTP route × frontend consumer
 
