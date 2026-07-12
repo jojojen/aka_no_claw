@@ -657,7 +657,9 @@ and locking. Test concurrent sessions, disconnect races, and process restart.
 
 > 2026-07-12 — R1.5a shipped: Web music command, queue, callback, and
 > now-playing adapters moved to `command_bridge_music.py` (`MusicCapability`)
-> behind same-name bridge delegates. Next: workflow, then home control.
+> behind same-name bridge delegates. R1.5b moved Web workflow command and
+> editor callback routing to `command_bridge_workflow.py` (`WorkflowCapability`).
+> Next: home control.
 
 Recommended order: music, workflow, then home control. Each service owns no HTTP
 details and exposes narrow typed methods.

@@ -39,6 +39,7 @@ from .job_store import JobStore
 from .session_memory import SessionMemoryStore, SessionWriteError, empty_session
 from .command_bridge_conversation import ConversationSession, ConversationState
 from .command_bridge_music import MusicCapability
+from .command_bridge_workflow import WorkflowCapability
 from .service_restart import RESTART_MESSAGE, trigger_restart_all
 from .llm_pool_settings import (
     LLM_PROVIDER_BIG_PICKLE,
@@ -520,6 +521,7 @@ class CommandBridge:
         self._planner = ChatToolPlanner(self, self._providers)
         self._executor = ChatToolExecutor(self)
         self._music = MusicCapability(self)
+        self._workflow_capability = WorkflowCapability(self)
         # Voice-intent gate (#82 PR1): clarify before open-ended chat tools
         # when a short voice utterance may be a misrecognized control command.
         # Lambdas keep the providers late-bound so instance monkeypatching of
@@ -3760,6 +3762,9 @@ class CommandBridge:
         ``handle_text_capture`` instead of being dispatched as a new subcommand.
         This mirrors the Telegram path in
         ``TelegramCommandProcessor._build_workflow_capture_plan``."""
+        return self._workflow_capability.run_command(text, chat_backend=chat_backend)
+
+    def _legacy_run_workflow_command(self, text: str, *, chat_backend: str | None = None) -> dict:
         handler, editor = self._workflow_surface()
         raw = (text or "").strip()
 
@@ -3919,6 +3924,9 @@ class CommandBridge:
         """Re-invoke a ``wfe:`` workflow-editor button for the web console
         (reorder / delete / save / cancel a draft step). The same editor handler
         the Telegram bot dispatches, so step validation on save is identical."""
+        return self._workflow_capability.run_action(callback_data)
+
+    def _legacy_run_workflow_action(self, callback_data: str) -> dict:
         _, editor = self._workflow_surface()
         prefix, _, payload = (callback_data or "").partition(":")
         if prefix != "wfe":
