@@ -1678,6 +1678,159 @@ def test_stream_goal_loop_disconnect_recovers_answer_via_job(monkeypatch):
     assert "建議購買並送鑑定" in snap["message"]
 
 
+def test_stream_goal_loop_final_answer_excludes_live_narration(monkeypatch):
+    # #81 core: planner narration is delivered live as stream deltas / job
+    # progress; the terminal done message must carry the answer only, not
+    # repeat the narration.
+    b = CommandBridge(settings=_tool_settings())
+
+    def _plan(req):
+        if False:
+            yield {}
+        return ChatToolPlan(tool=CHAT_TOOL_GOAL, query="研究卡片", reason_summary="多步驟"), None
+
+    monkeypatch.setattr(b, "_stream_chat_tool_plan", _plan)
+
+    def _exec(**kw):
+        kw["narrator"]("正在起草工作流")
+        kw["narrator"]("執行步驟 1/2")
+        return GoalLoopReport(
+            done=True, final_result="建議：買入成本約 1000 元。", workflow=None,
+            trace=None, continuation=None, replans_used=0,
+            narration=("正在起草工作流", "執行步驟 1/2"),
+        )
+
+    monkeypatch.setattr(b, "_execute_goal_loop", _exec)
+    events = list(b.stream(parse_request({"mode": "chat", "input": "研究卡片"}), "rid-n1"))
+    deltas = "".join(e.get("text", "") for e in events if e["type"] == "delta")
+    assert "正在起草工作流" in deltas  # narration arrived live
+    done_ev = events[-1]
+    assert done_ev["type"] == "done"
+    assert "建議：買入成本約 1000 元。" in done_ev["message"]
+    assert "正在起草工作流" not in done_ev["message"]
+
+    job_ev = next(e for e in events if e["type"] == "job")
+    snap = _wait_job(b, job_ev["job_id"], "done")
+    assert "正在起草工作流" in "\n".join(snap["progress"])  # kept as progress
+    assert "正在起草工作流" not in snap["message"]
+    assert "建議：買入成本約 1000 元。" in snap["message"]
+
+
+def test_goal_stop_synthesizes_final_answer_from_gathered_evidence(monkeypatch):
+    # #81 core: 停止並總結 must still try to answer the goal (e.g. 買入成本/
+    # 鑑定費/打平售價) from evidence already gathered, via the generic
+    # conservative synthesizer — not just dump raw progress.
+    from openclaw_adapter.task_workspace import Variable, WorkflowTrace
+
+    b = CommandBridge(settings=_tool_settings())
+    trace = WorkflowTrace(
+        workflow_id="wf-card",
+        goal="研究這張卡值不值得送鑑定",
+        variables={
+            "research_result": Variable(
+                name="research_result", type="text",
+                value="Mercari 成交約 1200 元；PSA 鑑定費約 600 元。",
+                source_step="s1", provenance="command:/research",
+            ),
+        },
+    )
+    continuation = GoalLoopContinuation(
+        state=ContinuationState(
+            goal="研究這張卡值不值得送鑑定",
+            next_action="run_workflow",
+            stop_condition="search hard cap reached (20/20)",
+        ),
+        workflow=Workflow(id="wf-card", goal="研究這張卡值不值得送鑑定", steps=[]),
+        trace=trace,
+        narration=("步驟 1 完成",),
+    )
+    req = parse_request({"mode": "chat", "input": "x", "conversation_id": "g-stop"})
+    b._store_goal_continuation(req, continuation, chat_backend=CHAT_BACKEND_LOCAL, planner_metadata=None)
+
+    calls: dict[str, object] = {}
+
+    def _fake_synth_factory(chat_backend, **kwargs):
+        calls["chat_backend"] = chat_backend
+
+        def _synth(goal, seeds, last_reason):
+            calls["goal"] = goal
+            calls["seeds"] = seeds
+            calls["last_reason"] = last_reason
+            return "保守估計：買入成本 1200、鑑定費 600、打平售價約 1800（不確定性高）。"
+
+        return _synth
+
+    monkeypatch.setattr(b, "_goal_conservative_synthesizer", _fake_synth_factory)
+    resp = b.handle(parse_request({"mode": "chat", "input": "__goal_stop__", "conversation_id": "g-stop"}))
+
+    assert resp.status == STATUS_OK
+    assert resp.message.startswith("已停止目前目標。")
+    assert "打平售價約 1800" in resp.message
+    assert "步驟 1 完成" not in resp.message  # narration not re-dumped
+    assert calls["goal"] == "研究這張卡值不值得送鑑定"
+    assert "Mercari 成交約 1200 元" in str(calls["seeds"]["research_result"])
+    assert calls["last_reason"] == "search hard cap reached (20/20)"
+    assert "g-stop" not in b._goal_continuations  # stop clears the continuation
+
+
+def test_goal_stop_without_evidence_falls_back_to_plain_summary(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    continuation = GoalLoopContinuation(
+        state=ContinuationState(
+            goal="查資料",
+            current_status="規劃中",
+            next_action="run_workflow",
+        ),
+        narration=("已理解目標",),
+    )
+    req = parse_request({"mode": "chat", "input": "x", "conversation_id": "g-stop2"})
+    b._store_goal_continuation(req, continuation, chat_backend=CHAT_BACKEND_LOCAL, planner_metadata=None)
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("no evidence → synthesizer must not be invoked")
+
+    monkeypatch.setattr(b, "_goal_conservative_synthesizer", _boom)
+    resp = b.handle(parse_request({"mode": "chat", "input": "__goal_stop__", "conversation_id": "g-stop2"}))
+
+    assert resp.status == STATUS_OK
+    assert "已停止目前目標。" in resp.message
+    assert "已理解目標" in resp.message
+    assert "目前進度：規劃中" in resp.message
+
+
+def test_goal_stop_synthesis_failure_falls_back_to_plain_summary(monkeypatch):
+    from openclaw_adapter.task_workspace import Variable, WorkflowTrace
+
+    b = CommandBridge(settings=_tool_settings())
+    trace = WorkflowTrace(
+        workflow_id="wf-x", goal="查資料",
+        variables={
+            "r": Variable(name="r", type="text", value="部分資料",
+                          source_step="s1", provenance="command:/search"),
+        },
+    )
+    continuation = GoalLoopContinuation(
+        state=ContinuationState(goal="查資料", next_action="run_workflow"),
+        trace=trace,
+        narration=("找到部分資料",),
+    )
+    req = parse_request({"mode": "chat", "input": "x", "conversation_id": "g-stop3"})
+    b._store_goal_continuation(req, continuation, chat_backend=CHAT_BACKEND_LOCAL, planner_metadata=None)
+
+    def _factory(chat_backend, **kwargs):
+        def _synth(goal, seeds, last_reason):
+            raise RuntimeError("LLM 掛了")
+
+        return _synth
+
+    monkeypatch.setattr(b, "_goal_conservative_synthesizer", _factory)
+    resp = b.handle(parse_request({"mode": "chat", "input": "__goal_stop__", "conversation_id": "g-stop3"}))
+
+    assert resp.status == STATUS_OK
+    assert "已停止目前目標。" in resp.message
+    assert "找到部分資料" in resp.message
+
+
 def test_chat_goal_resume_uses_saved_continuation(monkeypatch):
     b = CommandBridge(settings=_tool_settings())
     continuation = GoalLoopContinuation(

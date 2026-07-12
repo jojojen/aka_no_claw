@@ -1813,7 +1813,9 @@ class CommandBridge:
                 self._goal_continuations.pop(self._conversation_key(req), None)
         return WebCommandResponse(
             status=STATUS_OK,
-            message=self._format_goal_loop_message(report),
+            message=self._goal_loop_response_message(
+                report, narrated_live=narrator is not None
+            ),
             mode=MODE_CHAT,
             actions=self._goal_web_actions(req, report),
         )
@@ -1902,7 +1904,9 @@ class CommandBridge:
                 }
         return WebCommandResponse(
             status=STATUS_OK,
-            message=self._format_goal_loop_message(report),
+            message=self._goal_loop_response_message(
+                report, narrated_live=narrator is not None
+            ),
             mode=MODE_CHAT,
             actions=self._goal_web_actions(req, report),
         )
@@ -1937,12 +1941,48 @@ class CommandBridge:
                     mode=MODE_CHAT,
                 )
             continuation = GoalLoopContinuation.from_dict(continuation_data)
-        summary = self._format_goal_stop_summary(continuation)
+        chat_backend = str(
+            entry.get("chat_backend") or req.chat_backend or CHAT_BACKEND_LOCAL
+        )
+        synthesized = self._synthesize_goal_stop_answer(continuation, chat_backend)
+        if synthesized:
+            message = f"已停止目前目標。\n\n{synthesized}"
+        else:
+            message = self._format_goal_stop_summary(continuation)
         return WebCommandResponse(
             status=STATUS_OK,
-            message=summary,
+            message=message,
             mode=MODE_CHAT,
         )
+
+    def _synthesize_goal_stop_answer(
+        self, continuation: GoalLoopContinuation, chat_backend: str
+    ) -> str:
+        """Best-effort hedged answer when the user stops a goal mid-run (#81):
+        relay whatever evidence the run already gathered through the generic
+        conservative synthesizer instead of returning a bare progress dump.
+        Fail-soft: any problem (no trace, no evidence, LLM error) returns ""
+        so the caller falls back to the plain stop summary."""
+        trace = continuation.trace
+        if trace is None:
+            return ""
+        seeds = {
+            name: str(var.value)
+            for name, var in trace.variables.items()
+            if str(var.value).strip()
+        }
+        if not seeds:
+            return ""
+        try:
+            synthesize = self._goal_conservative_synthesizer(chat_backend)
+            return synthesize(
+                continuation.state.goal,
+                seeds,
+                continuation.state.stop_condition or "使用者停止",
+            ).strip()
+        except Exception:  # noqa: BLE001
+            logger.exception("goal stop synthesis failed")
+            return ""
 
     @staticmethod
     def _format_goal_stop_summary(continuation: GoalLoopContinuation) -> str:
@@ -1988,7 +2028,9 @@ class CommandBridge:
         self._sync_goal_continuation(req, report, planner_metadata=planner_metadata)
         return WebCommandResponse(
             status=STATUS_OK,
-            message=self._format_goal_loop_message(report),
+            message=self._goal_loop_response_message(
+                report, narrated_live=narrator is not None
+            ),
             mode=MODE_CHAT,
             model_metadata=None,
             actions=self._goal_web_actions(req, report),
@@ -2096,7 +2138,7 @@ class CommandBridge:
                         _persist_job(
                             status=JOB_INTERRUPTED,
                             message=(
-                                self._format_goal_loop_message(report)
+                                self._format_goal_loop_final_answer(report)
                                 if isinstance(report, GoalLoopReport)
                                 else "任務已取消。"
                             ),
@@ -2105,7 +2147,7 @@ class CommandBridge:
                     elif isinstance(report, GoalLoopReport):
                         _persist_job(
                             status=JOB_DONE,
-                            message=self._format_goal_loop_message(report),
+                            message=self._format_goal_loop_final_answer(report),
                             error=None,
                         )
                     elif "error" in result:
@@ -2164,7 +2206,7 @@ class CommandBridge:
         self._sync_goal_continuation(req, report, planner_metadata=planner_metadata)
         actions = [a.to_dict() for a in self._goal_web_actions(req, report)]
         yield stream_done(
-            self._format_goal_loop_message(report),
+            self._format_goal_loop_final_answer(report),
             model_metadata=None,
             actions=actions or None,
         )
@@ -2344,6 +2386,24 @@ class CommandBridge:
         if report.continuation is not None:
             parts.append(CommandBridge._format_goal_budget_status(report.continuation))
         return "\n\n".join(part for part in parts if part)
+
+    @staticmethod
+    def _format_goal_loop_final_answer(report) -> str:
+        """Final message for channels that already delivered the narration live
+        (stream deltas / job progress list): the answer itself plus, when the
+        run paused, the budget status. Planner narration must not be repeated
+        inside the final answer (#81)."""
+        parts = []
+        if report.final_result:
+            parts.append(report.final_result.strip())
+        if report.continuation is not None:
+            parts.append(CommandBridge._format_goal_budget_status(report.continuation))
+        return "\n\n".join(part for part in parts if part) or "（無輸出）"
+
+    def _goal_loop_response_message(self, report, *, narrated_live: bool) -> str:
+        if narrated_live:
+            return self._format_goal_loop_final_answer(report)
+        return self._format_goal_loop_message(report)
 
     @staticmethod
     def _format_goal_budget_status(continuation: GoalLoopContinuation) -> str:
