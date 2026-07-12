@@ -37,7 +37,7 @@ from assistant_runtime import AssistantSettings, build_ssl_context
 
 from .job_store import JobStore
 from .session_memory import SessionMemoryStore, SessionWriteError, empty_session
-from .command_bridge_conversation import ConversationSession
+from .command_bridge_conversation import ConversationSession, ConversationState
 from .service_restart import RESTART_MESSAGE, trigger_restart_all
 from .llm_pool_settings import (
     LLM_PROVIDER_BIG_PICKLE,
@@ -151,7 +151,6 @@ from .task_loop import (
     StepOutcome,
     resume_loop,
 )
-from .task_workspace import Workflow
 from .voice import (
     CompositeVoiceActionRegistry,
     VoiceClarification,
@@ -509,10 +508,11 @@ class CommandBridge:
         # #51 PR3: per-conversation paused music plans awaiting a track choice.
         # Maps a conversation key -> {"state": ContinuationState dict, "candidates": [names]}.
         # In-process only: a resume is a follow-up turn within the same bridge run.
-        self._music_continuations: dict[str, dict] = {}
-        self._music_cont_lock = threading.Lock()
-        self._goal_continuations: dict[str, dict] = {}
-        self._goal_cont_lock = threading.Lock()
+        self._conversation_state = ConversationState()
+        self._music_continuations = self._conversation_state.music_continuations
+        self._music_cont_lock = self._conversation_state.music_lock
+        self._goal_continuations = self._conversation_state.goal_continuations
+        self._goal_cont_lock = self._conversation_state.goal_lock
         # Provider routing collaborator (#74 R1.2): sticky pins, pool chains,
         # model metadata. Client builders stay on the bridge (ChatClientDeps).
         self._providers = ProviderRouter(self)
@@ -530,15 +530,15 @@ class CommandBridge:
         # #82 PR3: personalization store, opened lazily on first voice turn.
         self._voice_store_cached: object | None = None
         self._voice_store_checked = False
-        self._goal_pending_confirms: dict[str, dict] = {}
-        self._goal_pending_lock = threading.Lock()
+        self._goal_pending_confirms = self._conversation_state.goal_pending_confirms
+        self._goal_pending_lock = self._conversation_state.goal_pending_lock
         # A goal run that finished successfully offers a "💾 存為工作流" button
         # instead of auto-saving -- most completed goals are one-off asks, not
         # something the user wants cluttering the workflow list. This holds the
         # most recent completed-but-not-yet-saved workflow per conversation so
         # that button click has something to persist.
-        self._goal_completed_workflows: dict[str, Workflow] = {}
-        self._goal_completed_lock = threading.Lock()
+        self._goal_completed_workflows = self._conversation_state.goal_completed_workflows
+        self._goal_completed_lock = self._conversation_state.goal_completed_lock
         # Per-conversation record of every chat tool / goal-loop execution
         # (success AND failure). Shown to the tool-plan router so it stops
         # re-running tools whose results (or failures) this conversation

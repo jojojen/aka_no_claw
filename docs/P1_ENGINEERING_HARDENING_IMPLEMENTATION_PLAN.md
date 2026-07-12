@@ -646,6 +646,9 @@ steps. Untrusted model text never selects an arbitrary function.
 > bridge keeps `_sessions()` / injected-store seams compatible.  A concurrent
 > orphan-result test proves all simultaneous completions persist.  Remaining:
 > paused music and goal continuation state, expiry, and confirmation ownership.
+> 2026-07-12 — R1.4b shipped: `ConversationState` now owns paused music,
+> goal continuation, pending-confirmation, and completed-workflow maps plus
+> their locks. Bridge attributes remain compatibility aliases until R1.6.
 
 Move session memory, paused plans, continuation state, orphaned results, expiry,
 and locking. Test concurrent sessions, disconnect races, and process restart.

@@ -68,3 +68,21 @@ class ConversationSession:
             })
             snapshot["messages"] = messages
             self.store().save(snapshot)
+
+
+class ConversationState:
+    """Own in-process continuation state and its synchronization primitives.
+
+    The bridge keeps compatibility aliases during R1.4 so existing callers that
+    inspect a paused continuation keep working while ownership is centralized.
+    """
+
+    def __init__(self) -> None:
+        self.music_continuations: dict[str, dict] = {}
+        self.music_lock = threading.Lock()
+        self.goal_continuations: dict[str, dict] = {}
+        self.goal_lock = threading.Lock()
+        self.goal_pending_confirms: dict[str, dict] = {}
+        self.goal_pending_lock = threading.Lock()
+        self.goal_completed_workflows: dict[str, object] = {}
+        self.goal_completed_lock = threading.Lock()
