@@ -1,6 +1,6 @@
 # Docs Index
 
-Last reviewed: 2026-07-05
+Last reviewed: 2026-07-12
 
 Governance for this index lives in [DOCUMENTATION_GOVERNANCE.md](DOCUMENTATION_GOVERNANCE.md).
 Full inventory with recommended actions is in [DOC_AUDIT.md](DOC_AUDIT.md).
@@ -50,6 +50,7 @@ Full inventory with recommended actions is in [DOC_AUDIT.md](DOC_AUDIT.md).
 | [TELEGRAM_CORE_EXTRACTION_PLAN.md](TELEGRAM_CORE_EXTRACTION_PLAN.md) | Current | telegram | Shared `telegram_core` package (transport, dispatcher contract, polling, list_view) extracted from `price_monitor_bot`, P0–P4 shipped; kept as the implementation record and hook/registry contract reference. |
 | [KB_EMBEDDING_PLAN.md](KB_EMBEDDING_PLAN.md) | Needs review | knowledge | Embedding/RAG plan and status may need fresh verification. |
 | [voice-latency-optimization-references.md](voice-latency-optimization-references.md) | Current | telegram | Voice-pipeline latency work: semantic intent cache (threshold + digit/containment guards, live-probed), keep_alive/KV reuse, audio-side STT fixes, deferred options; citation trail. |
+| [VOICE_CONTROL_PERSONALIZATION_DESIGN.md](VOICE_CONTROL_PERSONALIZATION_DESIGN.md) | Planned | voice / command-bridge / web | Canonical #82 design for voice provenance, pre-tool intent gating, registry-derived clarification, local prototype learning, safety policy, API contracts, rollout, and evaluation. |
 | [OPENCLAW_TCG_MONITOR_PLAN.md](OPENCLAW_TCG_MONITOR_PLAN.md) | Needs review | price/tcg | Original monitor plan; verify against current code before relying on it. |
 | [OPPORTUNITY_AGENT_SPEC.md](OPPORTUNITY_AGENT_SPEC.md) | Needs review (canonical: opportunity) | opportunity | Spec for recommendation pipeline; verify thresholds against code. |
 | [OPPORTUNITY_AGENT_HANDOFF.md](OPPORTUNITY_AGENT_HANDOFF.md) | Needs review | opportunity | Companion: operational handoff notes. |

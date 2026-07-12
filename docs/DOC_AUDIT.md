@@ -1,6 +1,6 @@
 # Documentation Audit
 
-Last reviewed: 2026-07-03
+Last reviewed: 2026-07-12
 Owner area: agent-maintenance
 
 Full inventory of repository documentation with lifecycle status, owner area, and
@@ -48,6 +48,7 @@ for which question each one answers.
 | `P1_ENGINEERING_HARDENING_IMPLEMENTATION_PLAN.md` | Planned | agent-maintenance | Canonical P1 execution/handoff plan for issue #80; keep while active, then fold stable rules into truth docs and archive. |
 | `TELEGRAM_NL_OWNERSHIP_REFACTOR_ISSUE.md` | Planned | telegram | Draft issue; keep until the cross-repo NL ownership refactor is filed/resolved. |
 | `TELEGRAM_CORE_EXTRACTION_PLAN.md` | Current | telegram | Extraction shipped (phases P0–P4, all 3 repos' suites green); kept in place (not archived) as the `telegram_core` hook/registry contract reference. |
+| `VOICE_CONTROL_PERSONALIZATION_DESIGN.md` | Planned | voice / command-bridge / web | Canonical #82 design for local-only voice-control personalization, pre-tool safety gate, and registry-derived action clarification; keep as the implementation source until shipped. |
 | `OPPORTUNITY_AGENT_SPEC.md` | Needs review | opportunity | Verify thresholds vs code; canonical Opportunity doc. |
 | `OPPORTUNITY_AGENT_HANDOFF.md` | Needs review | opportunity | Keep as operational companion; cross-link to spec. |
 | `KB_EMBEDDING_PLAN.md` | Needs review | knowledge | Re-verify embedding/RAG status. |
