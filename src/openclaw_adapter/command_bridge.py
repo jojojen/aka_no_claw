@@ -38,6 +38,7 @@ from assistant_runtime import AssistantSettings, build_ssl_context
 from .job_store import JobStore
 from .session_memory import SessionMemoryStore, SessionWriteError, empty_session
 from .command_bridge_conversation import ConversationSession, ConversationState
+from .command_bridge_music import MusicCapability
 from .service_restart import RESTART_MESSAGE, trigger_restart_all
 from .llm_pool_settings import (
     LLM_PROVIDER_BIG_PICKLE,
@@ -518,6 +519,7 @@ class CommandBridge:
         self._providers = ProviderRouter(self)
         self._planner = ChatToolPlanner(self, self._providers)
         self._executor = ChatToolExecutor(self)
+        self._music = MusicCapability(self)
         # Voice-intent gate (#82 PR1): clarify before open-ended chat tools
         # when a short voice utterance may be a misrecognized control command.
         # Lambdas keep the providers late-bound so instance monkeypatching of
@@ -3654,22 +3656,12 @@ class CommandBridge:
         """Run the ``/music`` handler for the 生活 mode text box — an empty box
         returns the music menu (text + control buttons); a query plays/searches
         a song. The same handler the Telegram bot uses, so no logic is duped."""
-        message, markup = self._run_command_raw("/music", (text or "").strip())
-        return {
-            "status": STATUS_OK,
-            "message": message,
-            "actions": self._markup_to_actions(markup),
-        }
+        return self._music.run_command(text)
 
     def run_musicqueue_command(self, text: str) -> dict:
         """Run the ``/musicqueue`` handler (ordered multi-song play-once queue)
         — the same registered handler the Telegram bot uses."""
-        message, markup = self._run_command_raw("/musicqueue", (text or "").strip())
-        return {
-            "status": STATUS_OK,
-            "message": message,
-            "actions": self._markup_to_actions(markup),
-        }
+        return self._music.run_queue_command(text)
 
     def run_music_action(self, callback_data: str) -> dict:
         """Re-invoke a music callback button for the web 生活 mode. Handles the
@@ -3677,6 +3669,9 @@ class CommandBridge:
         list callbacks (``pg`` / ``del`` / ``close``) the favorites list uses —
         the very same handlers the Telegram bot dispatches, so playback safety
         (path re-validation under the music root) is enforced identically."""
+        return self._music.run_action(callback_data)
+
+    def _legacy_run_music_action(self, callback_data: str) -> dict:
         prefix, _, payload = (callback_data or "").partition(":")
         if prefix == "music":
             handler = self._callbacks().get("music")
@@ -3704,14 +3699,7 @@ class CommandBridge:
         so the web 生活 mode can show a small now-playing strip and hide it when
         nothing is playing. Reads the live-verified player state via the same
         music module the handlers use."""
-        from . import music_command
-
-        try:
-            name = music_command.now_playing(self.settings)
-        except Exception:  # noqa: BLE001
-            logger.exception("now_playing lookup failed")
-            name = None
-        return {"status": STATUS_OK, "name": name}
+        return self._music.now_playing()
 
     # --- workflow surface: NL draft + editable card (issue #53, web) -------
     def _workflow_surface(self) -> tuple[object, object]:

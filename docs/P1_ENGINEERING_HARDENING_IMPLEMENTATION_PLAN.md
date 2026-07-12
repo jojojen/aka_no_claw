@@ -655,6 +655,10 @@ and locking. Test concurrent sessions, disconnect races, and process restart.
 
 ### R1.5 Extract capabilities one at a time
 
+> 2026-07-12 — R1.5a shipped: Web music command, queue, callback, and
+> now-playing adapters moved to `command_bridge_music.py` (`MusicCapability`)
+> behind same-name bridge delegates. Next: workflow, then home control.
+
 Recommended order: music, workflow, then home control. Each service owns no HTTP
 details and exposes narrow typed methods.
 
