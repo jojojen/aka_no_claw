@@ -668,6 +668,12 @@ details and exposes narrow typed methods.
 
 ### R1.6 Reduce the facade
 
+> 2026-07-12 — R1.6 complete: public chat-tool execution, conversation
+> persistence, music, workflow, Bluetooth, and IR capability entrypoints are
+> thin delegates to cohesive collaborators. Contract audit confirms the bridge
+> retains the stable HTTP-facing method names while provider/planner/executor,
+> conversation state, and capability implementations live in dedicated modules.
+
 `CommandBridge` should wire collaborators and preserve compatibility exports.
 Do not maintain two implementations. Remove temporary aliases only after all
 backend/server/frontend consumers migrate.
