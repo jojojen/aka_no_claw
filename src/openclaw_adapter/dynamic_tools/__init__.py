@@ -3115,6 +3115,15 @@ def run_benchmarks(runner: DynamicToolRunner, benchmarks: list[dict] | None = No
     return all_pass
 
 
+# R4.7 owns these generator-independent checks.  Assign after the legacy
+# compatibility definitions so existing callers retain the exact facade names.
+from .evaluation import (  # noqa: E402
+    _check_direction as _check_direction,
+    _check_numeric as _check_numeric,
+    _numbers as _numbers,
+)
+
+
 def _selftest_main() -> int:
     from assistant_runtime import get_settings, load_dotenv
 
