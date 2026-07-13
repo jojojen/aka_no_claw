@@ -83,6 +83,7 @@ from .models import (  # noqa: E402 — cooldown helpers are defined above
     IpHeatLookupFn,
     ItemData,
     PriceEvidence,
+    ResearchBudget as ResearchBudget,
     ResearchCancelledError as ResearchCancelledError,
     ResearchJobContext,
     ResearchNotifier,
@@ -110,6 +111,7 @@ from .models import (  # noqa: E402 — cooldown helpers are defined above
     _REVIEW_WHITESPACE_RE,
     _SHOPS_TITLE_SUFFIX_RE,
     _TITLE_SUFFIX_RE,
+    build_budgeted_search_fn as build_budgeted_search_fn,
 )
 class _NullResearchNotifier:
     def send(self, text: str) -> None:
@@ -132,6 +134,10 @@ from .input import (  # noqa: E402 — compatibility re-exports after constants
     normalize_mercari_item_url as normalize_mercari_item_url,
     normalize_mercari_shops_url as normalize_mercari_shops_url,
     parse_research_target,
+)
+from .reporting import (  # noqa: E402 — imported after stable facade re-exports
+    ordered_sections as _ordered_sections,
+    unique_warnings as _unique_warnings,
 )
 class MercariItemAdapter:
     def __init__(self, *, fetch_html_fn: FetchHtmlFn | None = None) -> None:
@@ -1426,16 +1432,8 @@ _SECTION_ORDER: dict[str, int] = {
 def build_research_report(ctx: ResearchJobContext) -> ResearchReport:
     assert ctx.target is not None
     mode_label = "Mercari 商品網址" if ctx.target.mode == "mercari_url" else "商品名稱"
-    ordered_sections = sorted(
-        ctx.section_results,
-        key=lambda result: _SECTION_ORDER.get(result.section_name, len(_SECTION_ORDER) + 1),
-    )
-    warnings = list(dict.fromkeys(ctx.warnings))
-    if ctx.marketplace_timed_out:
-        warnings.insert(
-            0,
-            "市場搜尋逾時，已用目前取得的資料回答；價格／成交資料可能不完整。",
-        )
+    sections = _ordered_sections(ctx.section_results, _SECTION_ORDER)
+    warnings = _unique_warnings(ctx.warnings, marketplace_timed_out=ctx.marketplace_timed_out)
     return ResearchReport(
         chat_id=ctx.chat_id,
         mode_label=mode_label,
@@ -1444,8 +1442,8 @@ def build_research_report(ctx: ResearchJobContext) -> ResearchReport:
         budget_max=ctx.budget.max_searches,
         item_data=ctx.item_data,
         seller_snapshot=ctx.seller_snapshot,
-        section_results=tuple(ordered_sections),
-        warnings=tuple(warnings),
+        section_results=sections,
+        warnings=warnings,
         marketplace_timed_out=ctx.marketplace_timed_out,
     )
 
