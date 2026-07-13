@@ -180,7 +180,20 @@ Owner area: dynamic-tools
       `_core` 命名空間而 fail，已放棄該做法。No intended semantic change。
       測試：dynamic_tools+boundary 142 passed；consumer 套件（command_bridge/
       telegram_bot/ir/catalog_planner/sns_buzz/fix/research）537 passed。
-- [ ] R4.2：抽 `specification.py` + `knowledge_context.py`。
+- [x] R4.2a（2026-07-13）：抽出 `dynamic_tools/specification.py`（stdlib-only leaf）。
+      內容：output-protocol markers（`===ANSWER===`/`===CODE===`/`===PLAN===`/
+      `===META===`/`===API_STRUCT===`、`_THINK_RE`、`_FENCE_RE`）、value objects
+      （`AttemptTrace`/`TaskTrace`/`DynamicToolResult`/`SearchGroundingResult`/
+      `SearchGroundingBudgetExhausted`/`ReusePlan`）、pure helpers（`_coerce_nonneg_int`/
+      `_utc_now_iso`）、pure parsers（`_normalize_request`/`_extract_code`/`_extract_meta`/
+      `_extract_answer`/`_extract_api_struct`/`_defaults_schema_from_code`/
+      `_load_json_object`）。`__init__` 用 `from .specification import (...)` 全部
+      import 回來，bare-name 引用照舊解析；順手刪掉 `__init__` 變 dead 的
+      `dataclasses`/`datetime.datetime`/`timezone` import。這些 symbol 都沒有被
+      任何測試 `mock.patch`，所以無需 retarget。No intended semantic change。
+      測試：dynamic_tools+boundary 142 passed；consumer 套件待背景驗證。
+      **未完**：`knowledge_context.py`（RAG grounding）留待 R4.2b。
+- [ ] R4.2b：抽 `knowledge_context.py`（reference/rule/search grounding + budget）。
 - [ ] R4.3：抽 `providers.py`（protocol + 決定性失敗 fake）。
 - [ ] R4.4：抽 `safety.py`（靜態政策 + 機器可讀拒絕理由）。
 - [ ] R4.5：抽 `sandbox.py`（資源上限 + 每個終態都清乾淨）。

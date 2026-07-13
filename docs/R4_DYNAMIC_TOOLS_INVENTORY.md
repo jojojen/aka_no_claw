@@ -206,8 +206,10 @@ and splits into a separate issue/PR after the facade is stable.
 
 ## 4. Delivery slices (plan §12)
 
-- [ ] R4.0 — this inventory + boundary/characterization tests.
-- [ ] R4.2 — `specification.py` + `knowledge_context.py` (typed spec, bounded RAG).
+- [x] R4.0 — this inventory + boundary/characterization tests.
+- [x] R4.1 — convert `dynamic_tools.py` to a package (`__init__` transitional monolith).
+- [x] R4.2a — `specification.py` (value objects, output-protocol markers, pure parsers).
+- [ ] R4.2b — `knowledge_context.py` (bounded RAG: reference/rule/search grounding).
 - [ ] R4.3 — `providers.py` (protocol + deterministic-failure fakes).
 - [ ] R4.4 — `safety.py` (static policy + machine-readable rejection reasons).
 - [ ] R4.5 — `sandbox.py` (resource limits + cleanup for every terminal state).
