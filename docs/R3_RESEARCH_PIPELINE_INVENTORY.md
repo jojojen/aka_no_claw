@@ -65,6 +65,8 @@ success.
 Completed: `research/market.py` owns the active-listing price-cap policy used by
 the price-evidence stage; a sold average now expands the cap for name-mode
 research without changing the existing listed-price precedence.
+It also owns the liquidity stage's hand-off from the shared comparable evidence
+set, so price and demand remain provenance-aligned.
 
 First unchecked extraction: the remaining comparable, liquidity and seller
 stage implementations from `research/service.py`.

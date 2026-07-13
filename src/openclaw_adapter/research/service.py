@@ -1064,14 +1064,13 @@ class ResearchCommandService:
         return result.summary
 
     def _stage_liquidity_placeholder(self, ctx: ResearchJobContext) -> str:
-        result = _build_liquidity_section_result(
-            query=_build_price_query(ctx),
-            active_evidence=ctx.active_price_evidence,
-            sold_evidence=ctx.sold_price_evidence,
-            sold_average_jpy=ctx.sold_average_jpy,
+        from .market import build_liquidity_stage
+
+        return build_liquidity_stage(
+            ctx,
+            query_for=_build_price_query,
+            build_result=_build_liquidity_section_result,
         )
-        ctx.add_section_result(result)
-        return result.summary
 
     def _stage_seller_placeholder(self, ctx: ResearchJobContext) -> str:
         if ctx.target and ctx.target.mode != "mercari_url":
