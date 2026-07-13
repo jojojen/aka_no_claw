@@ -50,4 +50,8 @@ Completed: `research_command.py` is now a stable thin compatibility facade;
 `research/service.py` owns the existing stage orchestration while consumers keep
 the same module-level seams.
 
+Completed: `research/scheduler.py` owns the sequential/parallel stage ordering,
+overall marketplace deadline, progress heartbeat and cancellation lifecycle;
+the service injects its configured limits and report builder explicitly.
+
 First unchecked extraction: `research/reporting.py`.
