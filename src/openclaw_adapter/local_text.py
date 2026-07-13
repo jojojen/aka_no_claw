@@ -18,8 +18,6 @@ from urllib.request import Request, urlopen
 
 from assistant_runtime import AssistantSettings, build_ssl_context
 
-logger = logging.getLogger(__name__)
-
 from .llm_pool_settings import (
     _LLM_NOT_CONFIGURED_MESSAGE,
     _TRANSLATE_NOT_CONFIGURED_MESSAGE,
@@ -31,6 +29,8 @@ from .web_search import (
     fetch_page_text,
     format_web_research_answer,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def default_web_fetch_renderer(settings: AssistantSettings) -> "Callable[[str, str], str]":
