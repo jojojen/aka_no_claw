@@ -19,6 +19,7 @@ import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
+from urllib.parse import urlsplit
 
 from assistant_runtime import AssistantSettings
 
@@ -33,6 +34,7 @@ logger = logging.getLogger(__name__)
 _MESHNET_CGNAT = ipaddress.ip_network("100.64.0.0/10")
 
 _CHAT_WEB_CHAT_ID = "chat-web"
+_WEB_FRONTEND_PORT = 5173
 
 
 def _is_allowed_client(client_host: str) -> bool:
@@ -46,6 +48,22 @@ def _is_allowed_client(client_host: str) -> bool:
     if ip.is_loopback:
         return True
     return ip.version == 4 and ip in _MESHNET_CGNAT
+
+
+def _web_frontend_url(host_header: str | None) -> str:
+    """Build the HTTPS URL for the full React console from an incoming Host.
+
+    The legacy chat-web service remains on port 8780 for its private API, but
+    its old one-command HTML page is no longer the user-facing console. Keep
+    phone and mesh hostnames intact while sending page requests to the Vite
+    frontend started alongside the command bridge on port 5173.
+    """
+    raw_host = (host_header or "localhost").strip()
+    parsed = urlsplit(f"//{raw_host}")
+    hostname = parsed.hostname or "localhost"
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
+    return f"https://{hostname}:{_WEB_FRONTEND_PORT}/"
 
 # First version supports /zh only (issue #23 non-goals: no /research, /snsbuzz…).
 _UNSUPPORTED_MESSAGE = (
@@ -74,85 +92,6 @@ def build_chat_router(settings: AssistantSettings) -> Callable[[str], str]:
     return route
 
 
-_CHAT_PAGE_HTML = """<!doctype html>
-<html lang="zh-Hant">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>龍蝦本機聊天測試</title>
-<style>
-  body { font-family: -apple-system, "Segoe UI", sans-serif; max-width: 720px;
-         margin: 2rem auto; padding: 0 1rem; color: #1d1d1f; }
-  h1 { font-size: 1.25rem; }
-  #log { border: 1px solid #d2d2d7; border-radius: 8px; padding: 0.75rem;
-         min-height: 240px; margin-bottom: 0.75rem; white-space: pre-wrap;
-         overflow-y: auto; max-height: 60vh; }
-  .msg { margin: 0.4rem 0; }
-  .me { color: #0066cc; }
-  .bot { color: #1d1d1f; }
-  .err { color: #cc0000; }
-  form { display: flex; gap: 0.5rem; }
-  input { flex: 1; padding: 0.5rem; border: 1px solid #d2d2d7; border-radius: 6px; }
-  button { padding: 0.5rem 1rem; border: 0; border-radius: 6px;
-           background: #0066cc; color: #fff; cursor: pointer; }
-  button:disabled { background: #999; cursor: default; }
-  .hint { color: #6e6e73; font-size: 0.85rem; }
-</style>
-</head>
-<body>
-  <h1>龍蝦本機聊天測試</h1>
-  <p class="hint">本機限定。第一版只支援 <code>/zh &lt;文字&gt;</code>。</p>
-  <div id="log"></div>
-  <form id="form">
-    <input id="message" autocomplete="off" placeholder="/zh 測試" autofocus>
-    <button id="send" type="submit">送出</button>
-  </form>
-<script>
-  const log = document.getElementById("log");
-  const form = document.getElementById("form");
-  const input = document.getElementById("message");
-  const send = document.getElementById("send");
-
-  function add(cls, prefix, text) {
-    const div = document.createElement("div");
-    div.className = "msg " + cls;
-    div.textContent = prefix + text;
-    log.appendChild(div);
-    log.scrollTop = log.scrollHeight;
-  }
-
-  form.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const message = input.value.trim();
-    if (!message) return;
-    add("me", "你：", message);
-    input.value = "";
-    send.disabled = true;
-    try {
-      const res = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message }),
-      });
-      const data = await res.json();
-      if (!res.ok || data.error) {
-        add("err", "錯誤：", data.error || ("HTTP " + res.status));
-      } else {
-        add("bot", "龍蝦：", data.reply);
-      }
-    } catch (err) {
-      add("err", "錯誤：", "無法連線到本機龍蝦後端 (" + err + ")");
-    } finally {
-      send.disabled = false;
-      input.focus();
-    }
-  });
-</script>
-</body>
-</html>
-"""
-
-
 def _build_handler(router: Callable[[str], str]) -> type[BaseHTTPRequestHandler]:
     class ChatWebHandler(BaseHTTPRequestHandler):
         def _is_allowed(self) -> bool:
@@ -163,7 +102,10 @@ def _build_handler(router: Callable[[str], str]) -> type[BaseHTTPRequestHandler]
                 self.send_error(HTTPStatus.FORBIDDEN, "Private access only")
                 return
             if self.path in ("/", "/chat"):
-                self._write_html(_CHAT_PAGE_HTML)
+                self.send_response(HTTPStatus.TEMPORARY_REDIRECT)
+                self.send_header("Location", _web_frontend_url(self.headers.get("Host")))
+                self.send_header("Cache-Control", "no-store, max-age=0")
+                self.end_headers()
                 return
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 

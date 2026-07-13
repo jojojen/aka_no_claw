@@ -51,14 +51,24 @@ def _serve(router):
     return server
 
 
-def test_chat_page_and_api_end_to_end() -> None:
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def test_chat_page_redirects_to_full_console_and_api_stays_available() -> None:
     server = _serve(lambda message: f"echo:{message}")
     host, port = server.server_address
     base = f"http://{host}:{port}"
     try:
-        with urllib.request.urlopen(f"{base}/chat") as resp:
-            assert resp.status == 200
-            assert "本機聊天測試" in resp.read().decode("utf-8")
+        opener = urllib.request.build_opener(_NoRedirect)
+        try:
+            opener.open(f"{base}/chat")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 307
+            assert exc.headers["Location"] == "https://127.0.0.1:5173/"
+        else:
+            raise AssertionError("legacy chat page should redirect to the full console")
 
         req = urllib.request.Request(
             f"{base}/api/chat",
@@ -72,6 +82,11 @@ def test_chat_page_and_api_end_to_end() -> None:
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_web_frontend_url_preserves_mesh_hostname_and_supports_ipv6() -> None:
+    assert chat_web._web_frontend_url("jen-mac-mini.nord:8780") == "https://jen-mac-mini.nord:5173/"
+    assert chat_web._web_frontend_url("[::1]:8780") == "https://[::1]:5173/"
 
 
 def test_api_requires_message() -> None:

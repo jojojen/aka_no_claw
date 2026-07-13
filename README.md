@@ -312,6 +312,10 @@ HTTP bridge: POST http://127.0.0.1:8781/api/command/restartall
 啟動，並確認 `5173` 已開始監聽。若仍失敗，重啟日誌會指出
 `logs/openclaw_web_vite.log`。
 
+完整 Web Console 位於 `https://<host>:5173/`。為了讓舊書籤與既有入口不會在
+重啟後顯示過期的輕量聊天頁，`http://<host>:8780/` 與 `/chat` 會暫時轉址到
+完整 Console；舊的 `POST /api/chat` 相容 API 則維持可用。
+
 Windows cold-start launcher（只用於尚未啟動 bot 時）：
 
 ```powershell

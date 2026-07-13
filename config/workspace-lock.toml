@@ -6,11 +6,11 @@
 # Every update must state: reason, affected consumers, and verification performed (commit message).
 
 schema_version = 1
-generated_at = "2026-07-11T14:20:00+00:00"
+generated_at = "2026-07-13T13:00:00+00:00"
 
 [packages.telegram-core]
 repository = "https://github.com/jojojen/telegram_core.git"
-revision = "961589f62124e0ec0a573cb529a6f5eb416432ea"
+revision = "d3306812e9703ee44dcb149e31db137ef9887c13"
 distribution = "telegram-core"
 contract_version = 1
 

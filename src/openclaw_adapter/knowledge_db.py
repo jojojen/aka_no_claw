@@ -988,6 +988,20 @@ DEPRECATED_CODEGEN_SEED: tuple[tuple[str, str], ...] = (
 CODEGEN_SEED: tuple[dict, ...] = (
     {
         "category": "architecture",
+        "title": "相容入口應導向唯一的正式 UI，避免重啟後回到過期頁面",
+        "technique": (
+            "同一個服務若同時保留相容 HTTP 入口與新的正式前端，重啟腳本可能讓使用者"
+            "再次從舊 port 或書籤進入，表面上像是『新版 UI 壞掉』。正解：相容入口只保留"
+            "必要 API，對頁面 GET 回傳明確的暫時轉址到正式 UI，並依請求 Host 組出目標網址，"
+            "以支援 localhost、LAN 與 IPv6。不要複製兩套 HTML 作為長期 fallback。驗證方式："
+            "測試轉址狀態碼與 Location、確認舊 API 仍可用，並在重啟後以瀏覽器從舊入口實測"
+            "最終頁面與 console error。"
+        ),
+        "keywords": ["*", "ui", "redirect", "compatibility", "routing", "restart", "web"],
+        "confidence": 0.95,
+    },
+    {
+        "category": "architecture",
         "title": "同一功能有多入口時，後端路由必須逐一稽核，UI 預設不會自動傳播到別的行程",
         "technique": (
             "一個面向使用者的功能常有多個入口：不同 UI（React 主控台、Telegram、輕量 chat "

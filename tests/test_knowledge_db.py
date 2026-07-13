@@ -36,6 +36,18 @@ def test_codegen_seed_for_restart_health_checks_is_always_retrievable(db):
     assert "port" in rule.technique
 
 
+def test_codegen_seed_for_legacy_ui_entry_is_always_retrievable(db):
+    db.seed_codegen_knowledge()
+
+    rows = db.retrieve_codegen_knowledge("任意程式需求", k=100)
+    rule = next(row for row in rows if row.title == "相容入口應導向唯一的正式 UI，避免重啟後回到過期頁面")
+
+    assert rule.category == "architecture"
+    assert "*" in rule.keywords
+    assert "轉址" in rule.technique
+    assert "舊 API" in rule.technique
+
+
 def test_codegen_seed_for_corrupt_streams_is_always_retrievable(db):
     db.seed_codegen_knowledge()
 
