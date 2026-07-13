@@ -19,6 +19,10 @@ class ProviderUnavailable(RuntimeError):
     """A provider could not supply a complete response for this request."""
 
 
+class CloudBackendUnavailable(ProviderUnavailable):
+    """A cloud code-generation transport timed out, failed, or was aborted."""
+
+
 @dataclass
 class DeterministicFailureProvider:
     """Offline test double that makes provider failure explicit and repeatable."""

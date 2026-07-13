@@ -40,7 +40,6 @@ import time
 from datetime import date
 from hashlib import sha1
 from pathlib import Path
-from typing import Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -82,6 +81,11 @@ from .safety import (
 from .catalog import record_outcome as _record_catalog_outcome_for, tool_type as _catalog_tool_type_for
 from .knowledge_context import ContextBudget, bounded_block
 from .repair import RepairBudget
+from .sandbox import TerminalCleanup
+from .providers import (
+    CloudBackendUnavailable,
+    TextGenerationProvider as TextGenerationClient,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -99,16 +103,6 @@ _OPENCODE_BROWSER_UA = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-
-class CloudBackendUnavailable(RuntimeError):
-    """The cloud codegen backend (OpenCode big-pickle) could not be reached or
-    used for this request — a timeout/hang or a CLI-level failure, NOT a bad
-    generation (a bad generation still returns text). It subclasses RuntimeError
-    so existing ``except RuntimeError`` sites keep their old behavior, but the
-    request path re-raises it specifically so ``run()`` can fail over: when the
-    cloud is down mid-request, restarting the launchd-managed bot makes the
-    relaunch re-probe the backend and (cloud still down) build the local Ollama
-    runner instead."""
 
 _REQUIRES_RE = re.compile(r"^#\s*requires:\s*(.+)$", re.MULTILINE)
 _MODULE_NOT_FOUND_RE = re.compile(r"ModuleNotFoundError: No module named ['\"]([\w\.]+)['\"]")
@@ -210,16 +204,6 @@ def _legacy_ensure_stdlib_imports(code: str) -> str:
     header = "".join(submodule_imports.get(m, f"import {m}") + "\n" for m in missing)
     return header + code
 
-
-class TextGenerationClient(Protocol):
-    model: str
-    timeout_seconds: int
-    num_ctx: int | None
-    num_predict: int | None
-
-    def generate(self, prompt: str, *, temperature: float = 0.0,
-                 think: bool = False) -> str:
-        ...
 
 
 def probe_ollama(endpoint: str, *, timeout: float = 3.0) -> bool:
@@ -561,27 +545,29 @@ class OpenCodeCliTextClient:
         ]
         if self._cancel.is_set():
             raise CloudBackendUnavailable("OpenCode CLI aborted by caller")
-        proc = subprocess.Popen(
-            cmd,
-            shell=False,
-            cwd=self.cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=env,
-        )
-        with self._abort_lock:
-            self._proc = proc
-        try:
-            stdout, stderr = proc.communicate(timeout=self.timeout_seconds)
-        except subprocess.TimeoutExpired as exc:
-            proc.kill()
-            proc.communicate()
-            raise CloudBackendUnavailable(
-                f"OpenCode CLI timeout >{self.timeout_seconds}s") from exc
-        finally:
+        with TerminalCleanup() as cleanup:
+            proc = subprocess.Popen(
+                cmd,
+                shell=False,
+                cwd=self.cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+            )
+            cleanup.add(lambda: proc.kill() if proc.poll() is None else None)
             with self._abort_lock:
-                self._proc = None
+                self._proc = proc
+            try:
+                stdout, stderr = proc.communicate(timeout=self.timeout_seconds)
+            except subprocess.TimeoutExpired as exc:
+                proc.kill()
+                proc.communicate()
+                raise CloudBackendUnavailable(
+                    f"OpenCode CLI timeout >{self.timeout_seconds}s") from exc
+            finally:
+                with self._abort_lock:
+                    self._proc = None
         if self._cancel.is_set():
             raise CloudBackendUnavailable("OpenCode CLI aborted by caller")
         if proc.returncode != 0:

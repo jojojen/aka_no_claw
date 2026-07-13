@@ -74,10 +74,10 @@ UTC day; failures fail-open but still burn budget (pinned by existing tests).
 
 | Responsibility | Current site |
 |---|---|
-| Protocol | `TextGenerationClient` |
+| Protocol | `providers.py: TextGenerationProvider` (compatibility alias: `TextGenerationClient`) |
 | Clients | `OllamaTextClient`, `OpenCodeTextClient`, `OpenCodeCliTextClient`, `MistralTextClient`, `NvidiaTextClient` |
 | Probes / builders | `probe_ollama`, `probe_opencode`, `probe_opencode_cli`, `build_research_cloud_text_client`, `_build_local_validator`, `_build_mistral_client`, `_select_model`, `_opencode_cli_model` |
-| Provider errors / classifiers | `CloudBackendUnavailable`, `_is_thinking_model`, `_is_truncation_error` |
+| Provider errors / classifiers | `providers.py: CloudBackendUnavailable`, `_is_thinking_model`, `providers.py: is_truncation_error` |
 
 Threats: cloud API keys in env; CLI subprocess isolation (`HOME`/`CLAUDE_CONFIG_DIR`
 sandboxed so `/new` doesn't read global CLAUDE.md). Resources: network, HTTP
@@ -109,8 +109,9 @@ its own allowlist). Resources: none (pure static analysis / `ast`).
 
 Threats: arbitrary-code execution surface. `_clean_env` strips `OPENCLAW_*` /
 token secrets (pinned). Resources: subprocess, filesystem (`generated_tools/`,
-venv), network (pip, fetch), timeouts. Contract: every terminal state cleans up
-child processes / temp artifacts (plan PR R4.5).
+venv), network (pip, fetch), timeouts. `OpenCodeCliTextClient` uses
+`sandbox.py: TerminalCleanup` to reap its tracked child on every terminal path;
+the generated-tool `subprocess.run` path remains terminal before it returns.
 
 ### 1.6 `repair.py` — bounded repair controller (R4.6)
 
