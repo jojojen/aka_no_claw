@@ -83,6 +83,3 @@ def normalize_mercari_shops_url(url: str) -> tuple[str, str] | None:
     canonical_path = f"/shops/product/{token}"
     canonical_url = urlunsplit(("https", "jp.mercari.com", canonical_path, "", ""))
     return canonical_url, token
-
-
-
