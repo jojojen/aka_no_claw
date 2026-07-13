@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 from .input import parse_research_target
 from .models import ResearchJobContext, ResearchSectionResult
+from ..reputation_snapshot import SnapshotStillPending
 
 logger = logging.getLogger(__name__)
 
@@ -155,3 +157,49 @@ def assess_condition(service, ctx: ResearchJobContext) -> str:
     )
     ctx.add_section_result(result)
     return summary
+
+
+def assess_seller(
+    service, ctx: ResearchJobContext, *, is_shops_item: Callable[[str], bool],
+    build_snapshot_result: Callable[[object], ResearchSectionResult],
+) -> str:
+    """Isolate reputation snapshot states and follow-up scheduling (R3.4)."""
+    def unavailable(summary: str, confidence: float = 0.0, warnings: tuple[str, ...] = ()) -> str:
+        result = ResearchSectionResult("賣家風險分析", "unavailable", confidence, 0, 0, summary, warnings=warnings)
+        ctx.add_section_result(result)
+        return summary
+    if ctx.target and ctx.target.mode != "mercari_url":
+        return unavailable("名稱模式首版不做賣家風險。", 1.0)
+    if ctx.item_data is None:
+        summary = "尚未取得商品頁資料，無法建立 reputation snapshot。"
+        return unavailable(summary, warnings=(summary,))
+    if ctx.item_data.seller_url is None and is_shops_item(ctx.item_data.item_url):
+        return unavailable("Mercari Shops 商品頁無個人賣家檔案，不適用賣家風險分析。", 1.0)
+    query_url = ctx.item_data.seller_url or ctx.item_data.item_url
+    sample_count = 1 if ctx.item_data.seller_id else 0
+    if service._seller_snapshot_lookup_fn is None:
+        summary = f"已抓到賣家 ID {ctx.item_data.seller_id or '未知'}，但 reputation snapshot 未啟用。"
+        result = ResearchSectionResult("賣家風險分析", "partial", 0.2, sample_count, 1, summary,
+            (query_url,), ("賣家 snapshot adapter 尚未注入；可單獨執行 /snapshot 驗證。",))
+        ctx.add_section_result(result)
+        return summary
+    try:
+        snapshot = service._seller_snapshot_lookup_fn(query_url)
+    except SnapshotStillPending as exc:
+        if service._seller_snapshot_followup_fn is not None:
+            service._seller_snapshot_followup_fn(query_url, exc.poll_fn, ctx.notifier)
+        summary = f"賣家快照處理中（Mercari 評價頁載入慢，job={exc.job_id}），完成後自動補送結果。"
+        result = ResearchSectionResult("賣家風險分析", "partial", 0.2, 0, 1, summary, (query_url,),
+            (summary, f"建議跟進：/snapshot {query_url}"))
+        ctx.add_section_result(result)
+        return summary
+    except Exception as exc:
+        summary = f"賣家 reputation snapshot 失敗：{exc}"
+        result = ResearchSectionResult("賣家風險分析", "partial", 0.2, sample_count, 1, summary, (query_url,),
+            (summary, f"建議跟進：/snapshot {query_url}"))
+        ctx.add_section_result(result)
+        return summary
+    ctx.seller_snapshot = snapshot
+    result = build_snapshot_result(snapshot)
+    ctx.add_section_result(result)
+    return result.summary

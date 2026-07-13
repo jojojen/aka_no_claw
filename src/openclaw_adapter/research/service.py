@@ -20,7 +20,6 @@ from market_monitor import browser_stealth as bs
 
 from ..knowledge_db import KnowledgeDatabase, KnowledgeEntry, is_source_id
 from ..market_title_corpus import record_titles as _record_market_titles
-from ..reputation_snapshot import SnapshotStillPending
 from ..scrape_subprocess import run_in_subprocess
 from ..web_search import WebSearchResult
 
@@ -1073,109 +1072,13 @@ class ResearchCommandService:
         )
 
     def _stage_seller_placeholder(self, ctx: ResearchJobContext) -> str:
-        if ctx.target and ctx.target.mode != "mercari_url":
-            summary = "名稱模式首版不做賣家風險。"
-            result = ResearchSectionResult(
-                section_name="賣家風險分析",
-                status="unavailable",
-                confidence=1.0,
-                sample_count=0,
-                evidence_count=0,
-                summary=summary,
-            )
-            ctx.add_section_result(result)
-            return summary
-        if ctx.item_data is None:
-            summary = "尚未取得商品頁資料，無法建立 reputation snapshot。"
-            result = ResearchSectionResult(
-                section_name="賣家風險分析",
-                status="unavailable",
-                confidence=0.0,
-                sample_count=0,
-                evidence_count=0,
-                summary=summary,
-                warnings=(summary,),
-            )
-            ctx.add_section_result(result)
-            return summary
-        if ctx.item_data.seller_url is None and _MERCARI_SHOPS_PATH_RE.match(
-            urlsplit(ctx.item_data.item_url).path or ""
-        ):
-            summary = "Mercari Shops 商品頁無個人賣家檔案，不適用賣家風險分析。"
-            result = ResearchSectionResult(
-                section_name="賣家風險分析",
-                status="unavailable",
-                confidence=1.0,
-                sample_count=0,
-                evidence_count=0,
-                summary=summary,
-            )
-            ctx.add_section_result(result)
-            return summary
-        snapshot_query_url = ctx.item_data.seller_url or ctx.item_data.item_url
-        if self._seller_snapshot_lookup_fn is None:
-            summary = f"已抓到賣家 ID {ctx.item_data.seller_id or '未知'}，但 reputation snapshot 未啟用。"
-            result = ResearchSectionResult(
-                section_name="賣家風險分析",
-                status="partial",
-                confidence=0.2,
-                sample_count=1 if ctx.item_data.seller_id else 0,
-                evidence_count=1,
-                summary=summary,
-                evidence_urls=(snapshot_query_url,),
-                warnings=("賣家 snapshot adapter 尚未注入；可單獨執行 /snapshot 驗證。",),
-            )
-            ctx.add_section_result(result)
-            return summary
+        from .stages import assess_seller
 
-        try:
-            snapshot = self._seller_snapshot_lookup_fn(snapshot_query_url)
-        except SnapshotStillPending as exc:
-            if self._seller_snapshot_followup_fn is not None:
-                self._seller_snapshot_followup_fn(
-                    snapshot_query_url, exc.poll_fn, ctx.notifier
-                )
-            summary = (
-                f"賣家快照處理中（Mercari 評價頁載入慢，job={exc.job_id}），"
-                "完成後自動補送結果。"
-            )
-            result = ResearchSectionResult(
-                section_name="賣家風險分析",
-                status="partial",
-                confidence=0.2,
-                sample_count=0,
-                evidence_count=1,
-                summary=summary,
-                evidence_urls=(snapshot_query_url,),
-                warnings=(
-                    summary,
-                    f"建議跟進：/snapshot {snapshot_query_url}",
-                ),
-            )
-            ctx.add_section_result(result)
-            return summary
-        except Exception as exc:
-            summary = f"賣家 reputation snapshot 失敗：{exc}"
-            result = ResearchSectionResult(
-                section_name="賣家風險分析",
-                status="partial",
-                confidence=0.2,
-                sample_count=1 if ctx.item_data.seller_id else 0,
-                evidence_count=1,
-                summary=summary,
-                evidence_urls=(snapshot_query_url,),
-                warnings=(
-                    summary,
-                    f"建議跟進：/snapshot {snapshot_query_url}",
-                ),
-            )
-            ctx.add_section_result(result)
-            return summary
-
-        ctx.seller_snapshot = snapshot
-        result = _build_seller_snapshot_section_result(snapshot)
-        ctx.add_section_result(result)
-        return result.summary
+        return assess_seller(
+            self, ctx,
+            is_shops_item=lambda url: bool(_MERCARI_SHOPS_PATH_RE.match(urlsplit(url).path or "")),
+            build_snapshot_result=_build_seller_snapshot_section_result,
+        )
 
 def build_research_handler(
     *,

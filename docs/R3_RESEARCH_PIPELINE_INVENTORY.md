@@ -67,6 +67,10 @@ vision-condition stage outcomes.  Both retain their previous explicit
 unavailable/partial evidence instead of promoting a failed optional backend to
 success.
 
+Completed: the seller/reputation stage now lives in `research/stages.py`,
+including Mercari Shops exclusion, unavailable adapters, pending snapshots,
+asynchronous follow-up and visible partial failure evidence.
+
 Completed: `research/market.py` owns the active-listing price-cap policy used by
 the price-evidence stage; a sold average now expands the cap for name-mode
 research without changing the existing listed-price precedence.
