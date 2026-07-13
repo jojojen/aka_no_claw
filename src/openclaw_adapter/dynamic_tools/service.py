@@ -79,6 +79,7 @@ from .safety import (
     sandbox_wrapper_failed as _sandbox_wrapper_failed,
     syntax_error as _syntax_error,
 )
+from .catalog import record_outcome as _record_catalog_outcome_for, tool_type as _catalog_tool_type_for
 
 logger = logging.getLogger(__name__)
 
@@ -1177,26 +1178,12 @@ class DynamicToolRunner:
     def _catalog_tool_type(self, slug: str | None) -> str | None:
         """tool_type of a generated tool, for the user-visible reuse trace.
         Best effort — never break a /new reply over a missing catalog entry."""
-        if not slug:
-            return None
-        try:
-            entry = self.catalog.get(slug)
-        except Exception:
-            return None
-        return entry.tool_type if entry else None
+        return _catalog_tool_type_for(self.catalog, slug)
 
     def _record_catalog_outcome(self, slug: str | None, ok: bool, reason: str | None) -> None:
         """Update lifecycle metrics after a real reuse attempt (#52 §5). Best
         effort: catalog bookkeeping must never break a /new reply."""
-        if not slug:
-            return
-        try:
-            if ok:
-                self.catalog.record_reuse_success(slug)
-            else:
-                self.catalog.record_failure(slug, reason)
-        except Exception:
-            logger.debug("dynamic_tools: catalog metric update failed slug=%s", slug, exc_info=True)
+        _record_catalog_outcome_for(self.catalog, slug, ok, reason)
 
     def _split_request_intent(self, request: str) -> tuple[str, str]:
         """Split a request into (core_data_request, format_spec). The format spec
