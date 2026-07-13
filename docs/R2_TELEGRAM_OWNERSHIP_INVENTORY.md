@@ -47,6 +47,26 @@ re-exported from telegram_bot (still consumed by `toolset`). chat_web keeps
 importing `build_translate_handler` via the telegram_bot re-export; the
 `_call_local_text_model` translate test retargets `local_text`.
 
+R2.2 slice 5 (done): registry construction itself. Slices 1–4 only extracted
+the renderer/research/local-text *helpers* that the registry depends on; the
+large `_build_registries(...)` factory — which assembles every aka slash
+command, callback prefix, list view and item-deleter into the four dicts
+injected into the generic dispatcher — still lived in telegram_bot.py, so the
+module was not yet a thin wiring facade. This slice moves `_build_registries`
+(and the `ragkeep`/`ragdel` callback helper `_build_rag_callback_handler` it
+closes over) into a dedicated `openclaw_adapter/telegram_registry.py` with its
+own self-contained import block. telegram_bot re-imports both (legacy re-export
+surface) so `run_telegram_polling` and `command_bridge._ensure_registries`
+(`from .telegram_bot import _build_registries`) keep their contract; the
+poller-wiring helpers `_open_sns_db_readonly` / `_build_buzz_fn_standalone`
+stay in telegram_bot (they build the sns_db/buzz_fn passed *into* the factory).
+telegram_bot.py drops ~600 lines plus 66 now-dead builder imports; the
+`_build_research_*` re-exports tests import from telegram_bot are kept as a
+noqa re-export block. The `test_build_registries` research monkeypatch
+retargets `telegram_registry.build_research_handler` (the name now resolves in
+the registry module's namespace). Command/callback precedence, aliases, ack
+strings, help output and the return-tuple shape are unchanged.
+
 R2.3 (done): media ingestion. The voice/audio download + validation (file_id /
 file_size / duration / mime-type limits) + local-whisper transcription logic
 moved out of the `TelegramCommandProcessor.handle_audio_message` body into

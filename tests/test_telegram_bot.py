@@ -761,7 +761,7 @@ def test_build_registries_passes_knowledge_db_path_to_research_handler(monkeypat
         seen.update(kwargs)
         return lambda remainder, chat_id: "ok"
 
-    monkeypatch.setattr("openclaw_adapter.telegram_bot.build_research_handler", _fake_build_research_handler)
+    monkeypatch.setattr("openclaw_adapter.telegram_registry.build_research_handler", _fake_build_research_handler)
 
     _build_registries(settings, dynamic_tool_runner=None)
 
