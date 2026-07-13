@@ -80,6 +80,8 @@ from .safety import (
     syntax_error as _syntax_error,
 )
 from .catalog import record_outcome as _record_catalog_outcome_for, tool_type as _catalog_tool_type_for
+from .knowledge_context import ContextBudget, bounded_block
+from .repair import RepairBudget
 
 logger = logging.getLogger(__name__)
 
@@ -1448,6 +1450,7 @@ class DynamicToolRunner:
                 (2, self.strong_model, False, self.max_repairs),
                 (3, self.strong_model, True,  1),
             ):
+                repair_budget = RepairBudget(limit=phase_max)
                 self.client.model = model
                 trace.tier = phase
                 trace.tier_generations_limit = phase_max
@@ -1561,7 +1564,7 @@ class DynamicToolRunner:
                     code = self._repair_code(request, code, last_error, knowledge_rows,
                                              think=think, api_structure=api_structure,
                                              references=references)
-                    if code.strip() == prev_code.strip():
+                    if not repair_budget.accept(code) or code.strip() == prev_code.strip():
                         # The model returned the same code — re-executing it will
                         # fail identically; skip straight to the next tier.
                         logger.info("dynamic_tools: repair produced identical code, "
@@ -1846,6 +1849,7 @@ class DynamicToolRunner:
         if not urls:
             return None
         texts: list[str] = []
+        context_budget = ContextBudget(limit=16_000)
         for url in urls[:2]:
             try:
                 text = self._fetch_url_text(url)
@@ -1853,12 +1857,16 @@ class DynamicToolRunner:
                 logger.info("dynamic_tools: reference fetch failed url=%s err=%s", url, exc)
                 continue
             if text:
-                texts.append(text)
+                grant = context_budget.grant(len(text))
+                if grant:
+                    texts.append(text[:grant])
             else:
                 logger.info("dynamic_tools: reference fetch empty url=%s", url)
         if not texts:
             return None
-        extract = self._distill_reference_texts(request, texts)
+        extract = self._distill_reference_texts(
+            request, [bounded_block([text], max_chars=8_000) for text in texts]
+        )
         if extract is None:
             return None
         logger.info("dynamic_tools: grounded %d reference page(s) -> %d chars: %s",

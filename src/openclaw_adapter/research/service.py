@@ -811,58 +811,9 @@ class ResearchCommandService:
         return fetch_item_data(self, ctx)
 
     def _stage_identify_entities(self, ctx: ResearchJobContext) -> str:
-        if ctx.item_data is not None:
-            self._persist_item_knowledge(ctx.item_data)
-            profile = self._recognize_entity(ctx.item_data)
-            if profile is not None:
-                ctx.entity_profile = profile
-                self._persist_entity_aliases(ctx.item_data, profile)
-                identity = " / ".join(
-                    part for part in (
-                        profile.card_name, profile.series, profile.character, profile.rarity,
-                    ) if part
-                ) or profile.canonical_query
-                summary = (
-                    f"已辨識實體：{identity}；canonical 查詢「{profile.canonical_query}」"
-                    f"（alias {len(profile.aliases)} 筆）已寫入 knowledge DB。"
-                )
-                result = ResearchSectionResult(
-                    section_name="實體辨識",
-                    status="ok",
-                    confidence=min(0.88, ctx.item_data.source_confidence + 0.1),
-                    sample_count=1,
-                    evidence_count=1,
-                    summary=summary,
-                    evidence_urls=(ctx.item_data.item_url,),
-                    warnings=(),
-                )
-                ctx.add_section_result(result)
-                return summary
-            summary = "已把商品基礎事實寫入 knowledge DB（origin=research_command）"
-            result = ResearchSectionResult(
-                section_name="實體辨識",
-                status="partial",
-                confidence=min(0.85, ctx.item_data.source_confidence),
-                sample_count=1,
-                evidence_count=1,
-                summary=summary,
-                evidence_urls=(ctx.item_data.item_url,),
-                warnings=("M2 僅寫入商品頁基礎事實，LLM 實體辨識未能定位 canonical 卡名（資料不足或不確定）。",),
-            )
-            ctx.add_section_result(result)
-            return summary
-        warning = "沒有商品頁基礎資料可供實體辨識，knowledge DB 寫回略過。"
-        result = ResearchSectionResult(
-            section_name="實體辨識",
-            status="unavailable",
-            confidence=0.0,
-            sample_count=0,
-            evidence_count=0,
-            summary=warning,
-            warnings=(warning,),
-        )
-        ctx.add_section_result(result)
-        return warning
+        from .stages import identify_entities
+
+        return identify_entities(self, ctx)
 
     def _stage_condition_assessment(self, ctx: ResearchJobContext) -> str:
         """Assess physical condition via vision LLM."""
