@@ -191,7 +191,8 @@ Owner area: dynamic-tools
       import 回來，bare-name 引用照舊解析；順手刪掉 `__init__` 變 dead 的
       `dataclasses`/`datetime.datetime`/`timezone` import。這些 symbol 都沒有被
       任何測試 `mock.patch`，所以無需 retarget。No intended semantic change。
-      測試：dynamic_tools+boundary 142 passed；consumer 套件待背景驗證。
+      測試：dynamic_tools+boundary 142 passed；consumer 套件（command_bridge/
+      telegram_bot/ir/catalog_planner/sns_buzz/fix/research）537 passed。已 commit。
       **未完**：`knowledge_context.py`（RAG grounding）留待 R4.2b。
 - [ ] R4.2b：抽 `knowledge_context.py`（reference/rule/search grounding + budget）。
 - [ ] R4.3：抽 `providers.py`（protocol + 決定性失敗 fake）。
