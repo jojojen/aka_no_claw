@@ -196,7 +196,7 @@ Owner area: dynamic-tools
       **未完**：`knowledge_context.py`（RAG grounding）留待 R4.2b。
 - [ ] R4.2b：抽 `knowledge_context.py`（reference/rule/search grounding + budget）。
 - [ ] R4.3：抽 `providers.py`（protocol + 決定性失敗 fake）。
-- [ ] R4.4：抽 `safety.py`（靜態政策 + 機器可讀拒絕理由）。
+- [x] R4.4：抽 `safety.py`（靜態政策；既有拒絕字串維持相容）。
 - [ ] R4.5：抽 `sandbox.py`（資源上限 + 每個終態都清乾淨）。
 - [ ] R4.6：抽 `repair.py`（有界修復 + 重複嘗試偵測）。
 - [ ] R4.7：抽 `evaluation.py`（generator-independent 驗證）。

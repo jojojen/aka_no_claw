@@ -25,7 +25,7 @@ Pipeline (see DynamicToolRunner.run_detailed):
 
 from __future__ import annotations
 
-import ast
+import ast  # temporary compatibility helpers are removed with the R4.5 slice
 import concurrent.futures
 import json
 import logging
@@ -71,6 +71,13 @@ from .specification import (  # R4.2: value objects, markers, pure parsers
     _load_json_object,
     _normalize_request,
     _utc_now_iso,
+)
+from .safety import (
+    ensure_stdlib_imports as _ensure_stdlib_imports,
+    is_approved_package as _is_approved_package,
+    is_safe_package as _is_safe_pkg,
+    sandbox_wrapper_failed as _sandbox_wrapper_failed,
+    syntax_error as _syntax_error,
 )
 
 logger = logging.getLogger(__name__)
@@ -132,7 +139,7 @@ _TRUNCATION_MARKERS = (
 )
 
 
-def _syntax_error(code: str) -> str:
+def _legacy_syntax_error(code: str) -> str:
     """Return a one-line SyntaxError description, or "" if the code parses."""
     try:
         ast.parse(code)
@@ -163,7 +170,7 @@ _AUTO_IMPORT_STDLIB = frozenset({
 })
 
 
-def _ensure_stdlib_imports(code: str) -> str:
+def _legacy_ensure_stdlib_imports(code: str) -> str:
     """Prepend `import <mod>` for any safelisted stdlib module that is used as a
     bare `mod.<attr>` but never imported/bound. Deterministic, no model call."""
     try:
@@ -2802,11 +2809,11 @@ _MODULE_TO_PIP: dict[str, str] = {
 }
 
 
-def _is_safe_pkg(name: str) -> bool:
+def _legacy_is_safe_pkg(name: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._\-\[\]=<>]*", name))
 
 
-def _is_approved_pkg(name: str) -> bool:
+def _legacy_is_approved_pkg(name: str) -> bool:
     base = re.split(r"[><=!\[]", name)[0].lower().strip().replace("-", "_").replace(".", "_")
     canon = re.split(r"[><=!\[]", name)[0].lower().strip()
     return canon in _APPROVED_PACKAGES or base in {
@@ -2814,12 +2821,17 @@ def _is_approved_pkg(name: str) -> bool:
     }
 
 
+def _is_approved_pkg(name: str) -> bool:
+    """Compatibility export for the generator-independent safety policy."""
+    return _is_approved_package(name, _APPROVED_PACKAGES)
+
+
 def _tail(text: str, limit: int) -> str:
     text = (text or "").strip()
     return text if len(text) <= limit else "…" + text[-limit:]
 
 
-def _sandbox_wrapper_failed(stderr: str) -> bool:
+def _legacy_sandbox_wrapper_failed(stderr: str) -> bool:
     low = (stderr or "").lower()
     return "sandbox-exec" in low and (
         "sandbox_apply" in low
