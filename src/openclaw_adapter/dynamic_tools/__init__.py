@@ -46,7 +46,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from .generated_tool_catalog import GeneratedToolCatalog, STATUS_PROMOTED
+from ..generated_tool_catalog import GeneratedToolCatalog, STATUS_PROMOTED
 
 logger = logging.getLogger(__name__)
 
@@ -1064,7 +1064,7 @@ class DynamicToolRunner:
                 reuse_note = ""
             footer = f"\n—\n🤖 codegen：{self.backend_label}{reuse_note}"
             answer = result.answer
-            from .outbound_guards import guard_outbound
+            from ..outbound_guards import guard_outbound
             _guard_reason = guard_outbound(answer, proactive=False)
             if _guard_reason:
                 logger.warning("outbound guard blocked /new answer: %s | answer=%r", _guard_reason, answer[:200])
@@ -1951,7 +1951,7 @@ class DynamicToolRunner:
         cached = self._reference_cache.get(url)
         if cached is not None:
             return cached
-        from .web_search import fetch_page_text
+        from ..web_search import fetch_page_text
         text = fetch_page_text(url, timeout_seconds=15, max_chars=8000,
                                user_agent="Mozilla/5.0")
         if text:  # don't cache failures — they may be transient
@@ -2415,7 +2415,7 @@ class DynamicToolRunner:
         All coding techniques/disciplines are RAG rules (knowledge_db CODEGEN_SEED
         always-on entries + distilled rules) injected via the methodology block,
         so they evolve through distillation instead of being hardcoded."""
-        from .knowledge_db import format_codegen_knowledge_block
+        from ..knowledge_db import format_codegen_knowledge_block
 
         methodology = format_codegen_knowledge_block(knowledge_rows) if knowledge_rows else "(無)"
         approved = ", ".join(sorted(_APPROVED_PACKAGES))
@@ -3195,7 +3195,7 @@ def _build_runner_with_client(
 
     knowledge_db = None
     try:
-        from .knowledge_db import KnowledgeDatabase
+        from ..knowledge_db import KnowledgeDatabase
 
         knowledge_db = KnowledgeDatabase(settings.knowledge_db_path)
         knowledge_db.seed_codegen_knowledge()
@@ -3216,7 +3216,7 @@ def _build_runner_with_client(
         distill_enabled=True,
     )
     try:
-        from .web_search import web_search
+        from ..web_search import web_search
 
         runner.search_fn = lambda q, max_results: web_search(
             q, max_results=max_results)
@@ -3240,14 +3240,14 @@ def _select_model(raw_models: str | None) -> str | None:
 
 
 def _resolve_tools_dir() -> Path:
-    # generated_tools/ at the aka_no_claw repo root (two levels up from this file:
-    # src/openclaw_adapter/dynamic_tools.py -> repo root).
-    return Path(__file__).resolve().parents[2] / "generated_tools"
+    # generated_tools/ at the aka_no_claw repo root (three levels up from this file:
+    # src/openclaw_adapter/dynamic_tools/_core.py -> repo root).
+    return Path(__file__).resolve().parents[3] / "generated_tools"
 
 
 # ── benchmarks / selftest ────────────────────────────────────────────────────
 
-_BENCHMARKS_PATH = Path(__file__).resolve().parent / "dynamic_tools_benchmarks.json"
+_BENCHMARKS_PATH = Path(__file__).resolve().parent.parent / "dynamic_tools_benchmarks.json"
 _NUM_RE = re.compile(r"-?\d+(?:,\d{3})*(?:\.\d+)?")
 _PCT_NUM_RE = re.compile(r"(-?\d+(?:,\d{3})*(?:\.\d+)?)\s*%")
 

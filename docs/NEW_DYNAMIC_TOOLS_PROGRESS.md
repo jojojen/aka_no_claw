@@ -167,6 +167,19 @@ Owner area: dynamic-tools
       safety/spec helper 是 module-level free function 而非 runner method）。
       No intended semantic change。`tests/test_dynamic_tools.py` 既有 ~90 測試已釘住
       行為契約，R4.0 只補「模組邊界」釘子。測試：142 passed。
+- [x] R4.1（2026-07-13）：把單體 `dynamic_tools.py` 轉成 `dynamic_tools/` 套件。
+      `git mv dynamic_tools.py → dynamic_tools/__init__.py`（**目前 `__init__.py`
+      就是過渡期單體，程式碼都在裡面**；之後每個 slice 把一組 symbol 抽到獨立
+      模組再 import 回來，`__init__` 逐步變薄）。調整：6 個相對 import `.X`→`..X`
+      （深一層）、`_resolve_tools_dir` parents[2]→[3]、`_BENCHMARKS_PATH`
+      `.parent`→`.parent.parent`（benchmark json 仍在 openclaw_adapter/ 下）。
+      **關鍵設計決定**：`__init__` 當單體 = 讓 `mock.patch("...dynamic_tools.urlopen"
+      / probe_*")` 這類 module-global patch 維持有效，直到該 symbol 真的被抽走時，
+      對應測試才 retarget 到新模組（單次 churn、與搬移的 slice 同步）。曾試過
+      `__init__` 當 facade + `_core` 當單體，導致 10 個 HTTP/probe 測試因 patch 打不到
+      `_core` 命名空間而 fail，已放棄該做法。No intended semantic change。
+      測試：dynamic_tools+boundary 142 passed；consumer 套件（command_bridge/
+      telegram_bot/ir/catalog_planner/sns_buzz/fix/research）537 passed。
 - [ ] R4.2：抽 `specification.py` + `knowledge_context.py`。
 - [ ] R4.3：抽 `providers.py`（protocol + 決定性失敗 fake）。
 - [ ] R4.4：抽 `safety.py`（靜態政策 + 機器可讀拒絕理由）。
