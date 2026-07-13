@@ -54,4 +54,7 @@ Completed: `research/scheduler.py` owns the sequential/parallel stage ordering,
 overall marketplace deadline, progress heartbeat and cancellation lifecycle;
 the service injects its configured limits and report builder explicitly.
 
-First unchecked extraction: `research/reporting.py`.
+Completed: `research/stages.py` owns normalized-input and item-fetch stage
+results, including visible partial/unavailable evidence contracts.
+
+First unchecked extraction: `research/market.py`.
