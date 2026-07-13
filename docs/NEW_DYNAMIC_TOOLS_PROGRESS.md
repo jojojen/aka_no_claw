@@ -195,7 +195,7 @@ Owner area: dynamic-tools
       telegram_bot/ir/catalog_planner/sns_buzz/fix/research）537 passed。已 commit。
       **未完**：`knowledge_context.py`（RAG grounding）留待 R4.2b。
 - [ ] R4.2b：抽 `knowledge_context.py`（reference/rule/search grounding + budget）。
-- [ ] R4.3：抽 `providers.py`（protocol + 決定性失敗 fake）。
+- [x] R4.3：`providers.py` 提供 protocol + 決定性失敗 fake；既有 HTTP/CLI clients 維持 service seam。
 - [x] R4.4：抽 `safety.py`（靜態政策；既有拒絕字串維持相容）。
 - [ ] R4.5：抽 `sandbox.py`（資源上限 + 每個終態都清乾淨）。
 - [ ] R4.6：抽 `repair.py`（有界修復 + 重複嘗試偵測）。
