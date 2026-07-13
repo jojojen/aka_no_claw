@@ -75,6 +75,24 @@ feed `_build_registries`, they are not background jobs). Removed the now-dead
 `RagDailyDigestScheduler` / `HomeScheduleScheduler` / reputation-snapshot
 imports that only the moved daemons used.
 
+R2.5 (done): narrow processor hooks — goal-bridge glue. The goal-loop
+behavior (natural-language goal routing, bridge request construction, blocking
+goal-loop execution, follow-up button rendering, and the async callback
+worker) moved to `openclaw_adapter/goal_bridge_telegram.py`:
+`ensure_goal_bridge`, `goal_conversation_id`, `goal_chat_backend`,
+`build_goal_bridge_request`, `route_goal_loop_intent`, `execute_goal_bridge`,
+`run_goal_bridge`, `goal_reply_markup`, `handle_goal_callback`,
+`run_goal_callback_async`. Each takes the bridge/settings explicitly; the
+processor keeps only thin delegators (`_get_goal_bridge`,
+`_route_goal_loop_intent`, `_execute_goal_bridge`, `_run_goal_bridge`,
+`_execute_goal_bridge_reply`, `_handle_goal_callback`,
+`handle_callback_query_async`) plus the lazy bridge cache on `self`. The
+`goal:` callback wire format is frozen (`callback_data=f"goal:{action.input}"`)
+and the ack / edit strings are byte-identical. Removed the now-dead
+`default_chat_backend` / `parse_request` / `STATUS_OK` / `trim_for_log` imports
+that only the goal methods used. Processor-level goal tests pass unchanged
+since they call the hooks, not internals.
+
 Layer chain:
 
 ```text
