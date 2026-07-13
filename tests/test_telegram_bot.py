@@ -2119,7 +2119,7 @@ def test_format_liquidity_board_includes_reference_url() -> None:
 
 def test_research_seller_snapshot_lookup_extracts_negative_review_excerpts(monkeypatch) -> None:
     monkeypatch.setattr(
-        "openclaw_adapter.telegram_bot.request_reputation_snapshot",
+        "openclaw_adapter.research_telegram.request_reputation_snapshot",
         lambda *, settings, query_url: ReputationSnapshotResult(
             proof_url="http://127.0.0.1:5000/p/proof_123",
             proof_id="proof_123",
@@ -2127,7 +2127,7 @@ def test_research_seller_snapshot_lookup_extracts_negative_review_excerpts(monke
         ),
     )
     monkeypatch.setattr(
-        "openclaw_adapter.telegram_bot.fetch_reputation_proof_document",
+        "openclaw_adapter.research_telegram.fetch_reputation_proof_document",
         lambda *, settings, proof_id: {
             "subject": {"display_name": "risk seller"},
             "metrics": {"total_reviews": 55, "listing_count": 8},
@@ -2157,7 +2157,7 @@ def test_research_seller_snapshot_lookup_proof_fetch_timeout_pends(monkeypatch) 
     # it should raise SnapshotStillPending so /research schedules the background
     # follow-up that re-fetches the proof.
     monkeypatch.setattr(
-        "openclaw_adapter.telegram_bot.request_reputation_snapshot",
+        "openclaw_adapter.research_telegram.request_reputation_snapshot",
         lambda *, settings, query_url: ReputationSnapshotResult(
             proof_url="http://127.0.0.1:5000/p/proof_done",
             proof_id="proof_done",
@@ -2170,7 +2170,7 @@ def test_research_seller_snapshot_lookup_proof_fetch_timeout_pends(monkeypatch) 
         raise RuntimeError("reputation_snapshot request failed: timed out")
 
     monkeypatch.setattr(
-        "openclaw_adapter.telegram_bot.fetch_reputation_proof_document",
+        "openclaw_adapter.research_telegram.fetch_reputation_proof_document",
         _timing_out_fetch,
     )
     settings = AssistantSettings(reputation_agent_server_url="http://127.0.0.1:5000")
@@ -2223,18 +2223,18 @@ def test_research_enricher_uses_cloud_summary(monkeypatch) -> None:
 
     fake = _FakeCloudTextClient(reply="雲端增值結論 [1]")
     monkeypatch.setattr(
-        "openclaw_adapter.telegram_bot.build_research_cloud_text_client",
+        "openclaw_adapter.research_telegram.build_research_cloud_text_client",
         lambda settings: fake,
     )
     monkeypatch.setattr(
-        "openclaw_adapter.telegram_bot.fetch_page_text", lambda url, **kw: "page text"
+        "openclaw_adapter.research_telegram.fetch_page_text", lambda url, **kw: "page text"
     )
 
     def _local_must_not_run(*args, **kwargs):
         raise AssertionError("local summarize must not run on cloud success")
 
     monkeypatch.setattr(
-        "openclaw_adapter.telegram_bot.summarize_web_sources_with_ollama",
+        "openclaw_adapter.research_telegram.summarize_web_sources_with_ollama",
         _local_must_not_run,
     )
 
@@ -2253,11 +2253,11 @@ def test_research_enricher_falls_back_to_local_on_cloud_outage(monkeypatch) -> N
 
     fake = _FakeCloudTextClient(raises=CloudBackendUnavailable("cloud down"))
     monkeypatch.setattr(
-        "openclaw_adapter.telegram_bot.build_research_cloud_text_client",
+        "openclaw_adapter.research_telegram.build_research_cloud_text_client",
         lambda settings: fake,
     )
     monkeypatch.setattr(
-        "openclaw_adapter.telegram_bot.fetch_page_text", lambda url, **kw: "page text"
+        "openclaw_adapter.research_telegram.fetch_page_text", lambda url, **kw: "page text"
     )
     local_calls = {"n": 0}
 
@@ -2266,7 +2266,7 @@ def test_research_enricher_falls_back_to_local_on_cloud_outage(monkeypatch) -> N
         return "地端 fallback 結論"
 
     monkeypatch.setattr(
-        "openclaw_adapter.telegram_bot.summarize_web_sources_with_ollama",
+        "openclaw_adapter.research_telegram.summarize_web_sources_with_ollama",
         _local_summarize,
     )
 
@@ -2283,14 +2283,14 @@ def test_research_enricher_local_path_keeps_relevance_gate_when_cloud_disabled(m
     from openclaw_adapter.telegram_bot import _build_research_appreciation_enricher
 
     monkeypatch.setattr(
-        "openclaw_adapter.telegram_bot.build_research_cloud_text_client",
+        "openclaw_adapter.research_telegram.build_research_cloud_text_client",
         lambda settings: None,
     )
     monkeypatch.setattr(
-        "openclaw_adapter.telegram_bot.fetch_page_text", lambda url, **kw: "page text"
+        "openclaw_adapter.research_telegram.fetch_page_text", lambda url, **kw: "page text"
     )
     monkeypatch.setattr(
-        "openclaw_adapter.telegram_bot.summarize_web_sources_with_ollama",
+        "openclaw_adapter.research_telegram.summarize_web_sources_with_ollama",
         lambda q, sources, **kwargs: "地端結論",
     )
     relevance = {"called": False}
@@ -2300,7 +2300,7 @@ def test_research_enricher_local_path_keeps_relevance_gate_when_cloud_disabled(m
         return sources
 
     monkeypatch.setattr(
-        "openclaw_adapter.telegram_bot.filter_relevant_sources_with_ollama", _filter
+        "openclaw_adapter.research_telegram.filter_relevant_sources_with_ollama", _filter
     )
 
     settings = _research_enricher_settings()
@@ -2316,7 +2316,7 @@ def test_research_enricher_none_when_no_backend(monkeypatch) -> None:
     from openclaw_adapter.telegram_bot import _build_research_appreciation_enricher
 
     monkeypatch.setattr(
-        "openclaw_adapter.telegram_bot.build_research_cloud_text_client",
+        "openclaw_adapter.research_telegram.build_research_cloud_text_client",
         lambda settings: None,
     )
     settings = AssistantSettings(openclaw_telegram_chat_id="123")

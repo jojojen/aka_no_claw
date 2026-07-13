@@ -17,6 +17,14 @@ price_monitor_bot/telegram_core but never used) moved to
 `openclaw_adapter/telegram_compat.py`; telegram_bot re-imports them so legacy
 paths keep working. Surface pinned by `tests/test_telegram_compat.py`.
 
+R2.2 slice 1 (done): /research Telegram glue (reply cache/views `rs`,
+notifier factory, seller-snapshot lookups, appreciation enricher, yuyutei
+resolver, `default_web_research_renderer`) moved to
+`openclaw_adapter/research_telegram.py`; token guards to `telegram_env.py`;
+local-text-model selector + not-configured messages to `llm_pool_settings.py`.
+telegram_bot re-imports everything, so registration sites and legacy import
+paths are unchanged.
+
 Layer chain:
 
 ```text

@@ -13,6 +13,7 @@ from openclaw_adapter import telegram_bot, telegram_compat
 PRICE_OWNED = (
     "BoardLoader",
     "TelegramLookupQuery",
+    "TelegramResearchQuery",
     "build_processing_ack",
     "format_liquidity_board",
     "format_photo_lookup_result",

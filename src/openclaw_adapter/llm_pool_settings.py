@@ -641,3 +641,18 @@ def _config_path(settings: AssistantSettings) -> Path:
     return Path(
         getattr(settings, "openclaw_llm_pool_config_path", "config/llm_pool.json")
     )
+
+
+_LLM_NOT_CONFIGURED_MESSAGE = (
+    "網路搜尋摘要功能已可使用，但本地文字 LLM 尚未設定。"
+    "請設定 OPENCLAW_LOCAL_TEXT_BACKEND=ollama 與 OPENCLAW_LOCAL_TEXT_MODEL。"
+)
+
+_TRANSLATE_NOT_CONFIGURED_MESSAGE = (
+    "翻譯功能尚未啟用。請設定 OPENCLAW_LOCAL_TEXT_BACKEND=ollama 與 "
+    "OPENCLAW_LOCAL_TEXT_MODEL。"
+)
+
+
+def _select_text_generation_model(settings: AssistantSettings) -> str | None:
+    return _first_model(settings.openclaw_local_text_model)
