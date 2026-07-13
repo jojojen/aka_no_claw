@@ -47,6 +47,17 @@ re-exported from telegram_bot (still consumed by `toolset`). chat_web keeps
 importing `build_translate_handler` via the telegram_bot re-export; the
 `_call_local_text_model` translate test retargets `local_text`.
 
+R2.3 (done): media ingestion. The voice/audio download + validation (file_id /
+file_size / duration / mime-type limits) + local-whisper transcription logic
+moved out of the `TelegramCommandProcessor.handle_audio_message` body into
+`openclaw_adapter/media_ingest.py::transcribe_telegram_audio`; the intake-ack
+string is now `media_ingest.AUDIO_INTAKE_ACK_TEXT`. The processor's
+`handle_audio_message` / `build_audio_intake_ack_text` are now thin delegating
+hooks — same (transcript, error) tuple contract, same validation order and
+error strings. (Photo ingestion already lives in `photo_render` from R2.2
+slice 2; there is no document/file ingestion path.) Existing processor-level
+audio tests pass unchanged since they exercise the hooks, not internals.
+
 Layer chain:
 
 ```text
