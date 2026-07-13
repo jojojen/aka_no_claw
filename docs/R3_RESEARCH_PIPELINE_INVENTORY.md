@@ -68,5 +68,8 @@ research without changing the existing listed-price precedence.
 It also owns the liquidity stage's hand-off from the shared comparable evidence
 set, so price and demand remain provenance-aligned.
 
-First unchecked extraction: the remaining comparable, liquidity and seller
-stage implementations from `research/service.py`.
+The #76 boundary work is complete: callers use the thin facade, and the typed
+contracts, input, scheduler, explicit stages, report synthesis and market
+policy each have dedicated collaborators.  Additional movement of low-level
+Mercari parsing or report-rendering helpers is ordinary follow-on maintenance,
+not a second orchestration pipeline.
