@@ -25,6 +25,12 @@ local-text-model selector + not-configured messages to `llm_pool_settings.py`.
 telegram_bot re-imports everything, so registration sites and legacy import
 paths are unchanged.
 
+R2.2 slice 2 (done): photo pipeline glue (composite `build_photo_renderer`,
+`default_photo_renderer`, `default_photo_intent_analyzer` + fixed photo menu,
+the `imgtr` 顯示原文 callback + its OCR-original cache, plus `default_lookup_renderer`
+/ `default_board_loader`) moved to `openclaw_adapter/photo_render.py`.
+telegram_bot re-imports them; test monkeypatches retarget the owning module.
+
 Layer chain:
 
 ```text

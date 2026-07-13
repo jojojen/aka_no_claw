@@ -134,7 +134,7 @@ def test_caption_recognizer_none_without_embedder() -> None:
 
 
 def test_caption_translation_keyword_detection() -> None:
-    from openclaw_adapter.telegram_bot import _caption_requests_image_translation
+    from openclaw_adapter.photo_render import _caption_requests_image_translation
 
     assert _caption_requests_image_translation("翻譯")
     assert _caption_requests_image_translation("幫我 OCR 這張")
@@ -145,13 +145,13 @@ def test_caption_translation_keyword_detection() -> None:
 
 def test_composite_photo_renderer_routes_by_caption(monkeypatch) -> None:
     from price_monitor_bot.bot import TelegramPhotoQuery, PhotoLookupReply
-    from openclaw_adapter import telegram_bot
+    from openclaw_adapter import photo_render
 
     monkeypatch.setattr(
-        telegram_bot, "default_photo_renderer", lambda settings, research_renderer=None: (lambda query: "CARD")
+        photo_render, "default_photo_renderer", lambda settings, research_renderer=None: (lambda query: "CARD")
     )
     monkeypatch.setattr(
-        telegram_bot,
+        photo_render,
         "build_image_ocr_translate_renderer_from_settings",
         lambda settings: (
             lambda image_path, caption=None: image_translate.ImageTranslateResult(
@@ -161,7 +161,7 @@ def test_composite_photo_renderer_routes_by_caption(monkeypatch) -> None:
         ),
     )
 
-    render = telegram_bot.build_photo_renderer(object())
+    render = photo_render.build_photo_renderer(object())
     translate_q = TelegramPhotoQuery(chat_id="1", image_path=Path("/tmp/x.jpg"), caption="翻譯")
     card_q = TelegramPhotoQuery(chat_id="1", image_path=Path("/tmp/x.jpg"), caption="查價")
 
@@ -181,13 +181,13 @@ def test_composite_photo_renderer_routes_by_caption(monkeypatch) -> None:
 
 def test_composite_renderer_returns_message_on_failure(monkeypatch) -> None:
     from price_monitor_bot.bot import TelegramPhotoQuery
-    from openclaw_adapter import telegram_bot
+    from openclaw_adapter import photo_render
 
     monkeypatch.setattr(
-        telegram_bot, "default_photo_renderer", lambda settings, research_renderer=None: (lambda query: "CARD")
+        photo_render, "default_photo_renderer", lambda settings, research_renderer=None: (lambda query: "CARD")
     )
     monkeypatch.setattr(
-        telegram_bot,
+        photo_render,
         "build_image_ocr_translate_renderer_from_settings",
         lambda settings: (
             lambda image_path, caption=None: image_translate.ImageTranslateResult(
@@ -196,17 +196,17 @@ def test_composite_renderer_returns_message_on_failure(monkeypatch) -> None:
             )
         ),
     )
-    render = telegram_bot.build_photo_renderer(object())
+    render = photo_render.build_photo_renderer(object())
     q = TelegramPhotoQuery(chat_id="1", image_path=Path("/tmp/x.jpg"), caption="翻譯")
     assert render(q) == "這張圖片裡沒有辨識到任何文字。"
 
 
 def test_image_translate_button_callback_reveals_original() -> None:
-    from openclaw_adapter import telegram_bot
+    from openclaw_adapter import photo_render
 
-    cache = telegram_bot._ImageTranslateOriginalCache()
+    cache = photo_render._ImageTranslateOriginalCache()
     token = cache.put(chat_id="42", ocr_text="日文原文內容")
-    handler = telegram_bot._build_image_translate_callback_handler(cache)
+    handler = photo_render._build_image_translate_callback_handler(cache)
 
     toast, new_text, markup = handler(token, "Merpay 譯文", "42")
     assert "已顯示原文" in str(toast)

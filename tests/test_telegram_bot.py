@@ -200,7 +200,7 @@ def test_default_photo_renderer_tolerates_disabled_local_vision_backend(monkeypa
         return lambda query: "unused"
 
     monkeypatch.setattr(
-        "openclaw_adapter.telegram_bot._base_default_photo_renderer",
+        "openclaw_adapter.photo_render._base_default_photo_renderer",
         fake_base_default_photo_renderer,
     )
     settings = AssistantSettings(
