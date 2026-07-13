@@ -209,12 +209,12 @@ and splits into a separate issue/PR after the facade is stable.
 - [x] R4.0 — this inventory + boundary/characterization tests.
 - [x] R4.1 — convert `dynamic_tools.py` to a package (`__init__` transitional monolith).
 - [x] R4.2a — `specification.py` (value objects, output-protocol markers, pure parsers).
-- [ ] R4.2b — `knowledge_context.py` (bounded RAG: reference/rule/search grounding).
+- [x] R4.2b — `knowledge_context.py` (bounded RAG: reference/rule/search grounding).
 - [x] R4.3 — `providers.py` (protocol + deterministic-failure fakes).
 - [x] R4.4 — `safety.py` (static policy + machine-readable rejection reasons).
-- [ ] R4.5 — `sandbox.py` (resource limits + cleanup for every terminal state).
-- [ ] R4.6 — `repair.py` (bounded repair + repeated-attempt detection).
-- [ ] R4.7 — `evaluation.py` (generator-independent eval + discriminating tests).
-- [ ] R4.8 — `catalog.py` + thin `service.py` facade (thin facade complete; catalog extraction remains).
+- [x] R4.5 — `sandbox.py` (resource limits + cleanup for every terminal state).
+- [x] R4.6 — `repair.py` (bounded repair + repeated-attempt detection).
+- [x] R4.7 — `evaluation.py` (generator-independent eval + discriminating tests).
+- [x] R4.8 — `catalog.py` + thin `service.py` facade.
 
 Handoff/progress log lives in `docs/NEW_DYNAMIC_TOOLS_PROGRESS.md` (§R4).
