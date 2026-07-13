@@ -244,6 +244,7 @@ launchers\start-telegram-bot.bat --notify-startup
 /help
 /ping
 /status
+/security
 /tools
 /price pokemon ピカチュウex
 /price pokemon | ピカチュウex | 132/106 | SAR | sv08
@@ -259,6 +260,12 @@ launchers\start-telegram-bot.bat --notify-startup
 /quiz grammar
 傳卡圖並加上 caption: /scan pokemon
 ```
+
+`/security` reports the Telegram polling watchdog status: bot health,
+unauthorized-chat attempts from the last 24 hours, polling conflicts, webhook
+presence, and a short token fingerprint. Its counters are deliberately
+in-memory and reset when the polling process restarts; no Telegram message
+content, full token, or unauthorized chat ID is displayed.
 
 - `Telegram Claw` 現在會對較花時間的操作先回一則確認訊息，再回最後結果。
 - 文字查價 / 趨勢榜會先回「收到…開始處理」。

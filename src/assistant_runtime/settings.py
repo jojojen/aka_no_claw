@@ -17,6 +17,8 @@ class AssistantSettings:
     openclaw_telegram_chat_id: str | None = None  # primary (first) chat id
     openclaw_telegram_chat_ids: tuple[str, ...] = ()  # all allowed chat ids
     openclaw_telegram_bot_token: str | None = None
+    openclaw_telegram_security_unauthorized_threshold: int = 3
+    openclaw_telegram_security_health_check_seconds: int = 900
     openclaw_tesseract_path: str | None = None
     openclaw_tessdata_dir: str | None = None
     openclaw_local_vision_backend: str | None = None
@@ -265,6 +267,12 @@ def get_settings() -> AssistantSettings:
         openclaw_telegram_chat_ids=tuple(_parsed_chat_ids),
         openclaw_telegram_bot_token=_none_if_empty(
             _getenv_any("OPENCLAW_TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN")
+        ),
+        openclaw_telegram_security_unauthorized_threshold=_as_int(
+            os.getenv("OPENCLAW_TELEGRAM_SECURITY_UNAUTHORIZED_THRESHOLD"), default=3
+        ),
+        openclaw_telegram_security_health_check_seconds=_as_int(
+            os.getenv("OPENCLAW_TELEGRAM_SECURITY_HEALTH_CHECK_SECONDS"), default=900
         ),
         openclaw_tesseract_path=_none_if_empty(
             _getenv_any("OPENCLAW_TESSERACT_PATH", "TESSERACT_PATH")

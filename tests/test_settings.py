@@ -19,6 +19,8 @@ def test_load_dotenv_reads_monitor_settings(tmp_path, monkeypatch) -> None:
                 "MONITOR_DB_PATH=data/custom.sqlite3",
                 "YUYUTEI_USER_AGENT=CustomAgent/1.0",
                 "OPENCLAW_TELEGRAM_BOT_TOKEN=secret-token",
+                "OPENCLAW_TELEGRAM_SECURITY_UNAUTHORIZED_THRESHOLD=7",
+                "OPENCLAW_TELEGRAM_SECURITY_HEALTH_CHECK_SECONDS=120",
                 "OPENCLAW_TLS_INSECURE_SKIP_VERIFY=1",
                 "LOG_FILE_PATH=logs/test-openclaw.log",
                 "LOG_RAW_RESULT_LIMIT=7",
@@ -39,6 +41,8 @@ def test_load_dotenv_reads_monitor_settings(tmp_path, monkeypatch) -> None:
     assert settings.monitor_db_path == str((expected_root / "data/custom.sqlite3").resolve())
     assert settings.yuyutei_user_agent == "CustomAgent/1.0"
     assert settings.openclaw_telegram_bot_token == "secret-token"
+    assert settings.openclaw_telegram_security_unauthorized_threshold == 7
+    assert settings.openclaw_telegram_security_health_check_seconds == 120
     assert settings.openclaw_tls_insecure_skip_verify is True
     assert settings.log_file_path == str((expected_root / "logs/test-openclaw.log").resolve())
     assert settings.log_raw_result_limit == 7

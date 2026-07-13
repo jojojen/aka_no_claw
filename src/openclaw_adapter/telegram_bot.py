@@ -64,6 +64,7 @@ from .research_telegram import (  # noqa: F401 - _build_research_* re-export sur
     default_web_research_renderer,
 )
 from .telegram_env import require_telegram_chat_id, require_telegram_token
+from .telegram_security import TelegramSecurityMonitor
 from .photo_render import (  # noqa: F401 - legacy re-export surface (R2.2)
     _IMAGE_TRANSLATE_ORIGINAL_CACHE,
     _ImageTranslateOriginalCache,
@@ -685,7 +686,7 @@ def _build_openclaw_help_text(command_registry: dict[str, RegisteredCommand] | N
             "OpenClaw — 指令一覧",
             "",
             "--- 系統 ---",
-            "/ping  /status  /tools  /help",
+            "/ping  /status  /security  /tools  /help",
             "",
             "--- 常用範例 ---",
             *examples,
@@ -745,6 +746,11 @@ def run_telegram_polling(
     drop_pending_updates: bool = True,
 ) -> int:
     token = require_telegram_token(settings)
+    security_monitor = TelegramSecurityMonitor(
+        alert_chat_ids=frozenset(settings.openclaw_telegram_chat_ids),
+        token=token,
+        unauthorized_warning_threshold=settings.openclaw_telegram_security_unauthorized_threshold,
+    )
     from .command_bridge import CommandBridge
 
     _wire_kb_embedder(settings)
@@ -775,6 +781,10 @@ def run_telegram_polling(
                           board_loader=board_loader,
                           reputation_renderer=default_reputation_renderer(settings),
                           research_notifier_factory=_build_research_notifier_factory(settings))
+    )
+    command_handlers["/security"] = RegisteredCommand(
+        lambda _remainder, _chat_id: security_monitor.render_status(),
+        usage="顯示 Telegram 安全監控狀態",
     )
     _start_home_schedule_scheduler(settings, command_handlers)
 
@@ -849,6 +859,9 @@ def run_telegram_polling(
         poll_timeout=poll_timeout,
         notify_startup=notify_startup,
         drop_pending_updates=drop_pending_updates,
+        security_event_handler=security_monitor.handle_event,
+        health_check_handler=security_monitor.run_health_check,
+        health_check_interval_seconds=settings.openclaw_telegram_security_health_check_seconds,
     )
 
 
