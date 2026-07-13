@@ -4,11 +4,8 @@ from __future__ import annotations
 
 import logging
 import mimetypes
-import os
 import json
-import shutil
 import threading
-import uuid
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from pathlib import Path
@@ -23,20 +20,20 @@ from price_monitor_bot.bot import (
     LookupRenderer,
     PhotoLookupRenderer,
     ReputationRenderer,
-    TelegramReputationDelivery,
-    TelegramReputationQuery,
     TelegramCommandProcessor as _BaseTelegramCommandProcessor,
 )
 from telegram_core.contracts import RegisteredCommand, TelegramTextReplyPlan
 from telegram_core.polling import run_telegram_polling as _core_run_telegram_polling
 from telegram_core.transport import (
     TelegramBotClient,
-    TelegramFileAttachment,
     send_telegram_test_message as _base_send_telegram_test_message,
 )
 from .telegram_compat import (  # noqa: F401 - legacy re-export surface (R2.1)
     BoardLoader,
+    TelegramFileAttachment,
     TelegramLookupQuery,
+    TelegramReputationDelivery,
+    TelegramReputationQuery,
     TelegramResearchQuery,
     build_processing_ack,
     format_liquidity_board,
@@ -120,6 +117,14 @@ from .photo_render import (  # noqa: F401 - legacy re-export surface (R2.2)
     default_photo_intent_analyzer,
     default_photo_renderer,
 )
+from .reputation_render import (  # noqa: F401 - legacy re-export surface (R2.2)
+    _chromium_launch_options,
+    _resolve_chromium_executable,
+    default_reputation_renderer,
+    format_reputation_snapshot_delivery_text,
+    format_reputation_snapshot_result,
+    render_reputation_snapshot_artifacts,
+)
 from .local_stt import (
     LocalWhisperTranscriber,
     SttPayloadTooLarge,
@@ -190,9 +195,7 @@ from .opportunity_command import (
     build_huntlist_item_deleter,
     build_huntlist_view_fn,
 )
-from .reputation_agent import ensure_agent_thread
 from .reputation_snapshot import (
-    ReputationSnapshotResult,
     fetch_reputation_proof_document,
     request_reputation_snapshot,
 )
@@ -853,46 +856,6 @@ class TelegramCommandProcessor(_BaseTelegramCommandProcessor):
         return {"inline_keyboard": rows}
 
 
-def default_reputation_renderer(settings: AssistantSettings) -> ReputationRenderer:
-    def render(query: TelegramReputationQuery) -> TelegramReputationDelivery:
-        logger.info("Telegram reputation snapshot requested query_url=%s", trim_for_log(query.query_url, limit=240))
-        thread, started_now = ensure_agent_thread(
-            server_url=settings.reputation_agent_server_url,
-            api_key=settings.reputation_agent_admin_token or "",
-            poll_secs=settings.reputation_agent_poll_secs,
-        )
-        logger.info(
-            "Telegram reputation agent ready started_now=%s thread_name=%s alive=%s",
-            started_now,
-            thread.name,
-            thread.is_alive(),
-        )
-        result = request_reputation_snapshot(settings=settings, query_url=query.query_url)
-        logger.info(
-            "Telegram reputation snapshot completed query_url=%s proof_id=%s reused=%s",
-            trim_for_log(query.query_url, limit=240),
-            result.proof_id,
-            result.reused,
-        )
-        proof_document = None
-        if result.proof_id is not None:
-            try:
-                proof_document = fetch_reputation_proof_document(settings=settings, proof_id=result.proof_id)
-            except Exception:
-                logger.exception("Telegram reputation proof fetch failed proof_id=%s", result.proof_id)
-        pdf_path, preview_path = render_reputation_snapshot_artifacts(settings=settings, result=result)
-        return TelegramReputationDelivery(
-            summary_text=format_reputation_snapshot_delivery_text(result, proof_document),
-            attachments=(
-                TelegramFileAttachment(kind="document", path=pdf_path, caption="Reputation snapshot PDF"),
-                TelegramFileAttachment(kind="photo", path=preview_path, caption="Reputation snapshot preview"),
-            ),
-            cleanup_paths=(pdf_path, preview_path),
-        )
-
-    return render
-
-
 def default_web_fetch_renderer(settings: AssistantSettings) -> "Callable[[str, str], str]":
     """Item 3: WebFetch equivalent — read one URL and answer a focused prompt."""
     backend = (settings.openclaw_local_text_backend or "").strip().lower()
@@ -1058,139 +1021,6 @@ def build_translate_handler(settings: AssistantSettings, *, target: str) -> Call
 
     return handler
 
-
-def render_reputation_snapshot_artifacts(
-    *,
-    settings: AssistantSettings,
-    result: ReputationSnapshotResult,
-) -> tuple[Path, Path]:
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError as exc:  # pragma: no cover - environment-dependent.
-        raise RuntimeError("playwright is not installed — run: pip install playwright && playwright install chromium") from exc
-
-    proof_id = result.proof_id or f"proof_{uuid.uuid4().hex[:12]}"
-    temp_root = Path.cwd() / ".openclaw_tmp" / "reputation_snapshot"
-    temp_root.mkdir(parents=True, exist_ok=True)
-    pdf_path = temp_root / f"{proof_id}.pdf"
-    preview_path = temp_root / f"{proof_id}.png"
-
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(**_chromium_launch_options())
-        context = browser.new_context(
-            locale="ja-JP",
-            viewport={"width": 1400, "height": 1800},
-            ignore_https_errors=settings.openclaw_tls_insecure_skip_verify,
-        )
-        page = context.new_page()
-        page.goto(result.proof_url, wait_until="networkidle", timeout=60000)
-        page.emulate_media(media="screen")
-        page.pdf(
-            path=str(pdf_path),
-            format="A4",
-            print_background=True,
-            margin={"top": "12mm", "right": "10mm", "bottom": "12mm", "left": "10mm"},
-        )
-        page.screenshot(path=str(preview_path), full_page=False)
-        context.close()
-        browser.close()
-
-    return pdf_path, preview_path
-
-
-def _chromium_launch_options() -> dict[str, object]:
-    options: dict[str, object] = {"headless": True}
-    executable_path = _resolve_chromium_executable()
-    if executable_path:
-        options["executable_path"] = executable_path
-    return options
-
-
-def _resolve_chromium_executable() -> str | None:
-    configured = os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH")
-    if configured:
-        return configured
-    for candidate in ("chromium", "chromium-browser", "google-chrome-stable"):
-        resolved = shutil.which(candidate)
-        if resolved:
-            return resolved
-    return None
-
-
-def format_reputation_snapshot_result(result: ReputationSnapshotResult) -> str:
-    action_text = "沿用既有快照" if result.reused else "已建立新快照"
-    lines = [
-        "信譽快照已就緒",
-        action_text,
-        result.proof_url,
-    ]
-    if result.proof_id:
-        lines.insert(2, f"proof_id: {result.proof_id}")
-    return "\n".join(lines)
-
-
-def format_reputation_snapshot_delivery_text(
-    result: ReputationSnapshotResult,
-    proof_document: dict[str, object] | None,
-) -> str:
-    action_text = "沿用既有快照" if result.reused else "已建立新快照"
-    subject = proof_document.get("subject", {}) if isinstance(proof_document, dict) else {}
-    metrics = proof_document.get("metrics", {}) if isinstance(proof_document, dict) else {}
-    quality = proof_document.get("quality", {}) if isinstance(proof_document, dict) else {}
-
-    display_name = subject.get("display_name") if isinstance(subject, dict) else None
-    captured_at = proof_document.get("captured_at") if isinstance(proof_document, dict) else None
-    total_reviews = metrics.get("total_reviews") if isinstance(metrics, dict) else None
-    listing_count = metrics.get("listing_count") if isinstance(metrics, dict) else None
-    followers_count = metrics.get("followers_count") if isinstance(metrics, dict) else None
-    following_count = metrics.get("following_count") if isinstance(metrics, dict) else None
-    as_seller = quality.get("as_seller") if isinstance(quality, dict) else None
-    as_buyer = quality.get("as_buyer") if isinstance(quality, dict) else None
-    overall = quality.get("overall") if isinstance(quality, dict) else None
-
-    lines = ["信譽快照已就緒", action_text]
-    if display_name:
-        lines.append(f"賣家：{display_name}")
-
-    # Overall review count (from metrics, covers full history)
-    meta_bits = []
-    if total_reviews is not None:
-        meta_bits.append(f"評價 {total_reviews}")
-    if listing_count is not None:
-        meta_bits.append(f"刊登 {listing_count}")
-    if followers_count is not None:
-        meta_bits.append(f"追蹤者 {followers_count}")
-    if following_count is not None:
-        meta_bits.append(f"追蹤中 {following_count}")
-    if meta_bits:
-        lines.append(" / ".join(meta_bits))
-
-    # Buyer / seller breakdown (from quality, based on captured review entries)
-    if isinstance(as_seller, dict) and (as_seller.get("positive") or as_seller.get("negative")):
-        pos = as_seller.get("positive") or 0
-        neg = as_seller.get("negative") or 0
-        rate = as_seller.get("rate")
-        rate_str = f"，好評率 {rate}%" if rate is not None else ""
-        lines.append(f"身為賣家：好評 {pos} / 差評 {neg}{rate_str}")
-    if isinstance(as_buyer, dict) and (as_buyer.get("positive") or as_buyer.get("negative")):
-        pos = as_buyer.get("positive") or 0
-        neg = as_buyer.get("negative") or 0
-        rate = as_buyer.get("rate")
-        rate_str = f"，好評率 {rate}%" if rate is not None else ""
-        lines.append(f"身為買家：好評 {pos} / 差評 {neg}{rate_str}")
-    elif isinstance(overall, dict) and as_seller is None and as_buyer is None:
-        # Fallback: only overall quality, no role breakdown available
-        rate = overall.get("rate")
-        if rate is not None:
-            lines.append(f"整體好評率：{rate}%")
-
-    if captured_at:
-        lines.append(f"快照時間：{captured_at}")
-    if result.proof_id:
-        lines.append(f"proof_id: {result.proof_id}")
-    lines.append("已附上 PDF 與預覽圖，可直接在手機查看。")
-    lines.append(result.proof_url)
-    return "\n".join(lines)
 
 
 def _build_registries(

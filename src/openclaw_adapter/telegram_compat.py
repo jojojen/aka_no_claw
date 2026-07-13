@@ -12,6 +12,8 @@ module's object. New code should import from the owning module directly.
 from price_monitor_bot.bot import (
     BoardLoader,
     TelegramLookupQuery,
+    TelegramReputationDelivery,
+    TelegramReputationQuery,
     TelegramResearchQuery,
     build_processing_ack,
     format_liquidity_board,
@@ -20,10 +22,14 @@ from price_monitor_bot.bot import (
     parse_reputation_snapshot_command,
 )
 from telegram_core.polling import handle_telegram_message
+from telegram_core.transport import TelegramFileAttachment
 
 __all__ = [
     "BoardLoader",
+    "TelegramFileAttachment",
     "TelegramLookupQuery",
+    "TelegramReputationDelivery",
+    "TelegramReputationQuery",
     "TelegramResearchQuery",
     "build_processing_ack",
     "format_liquidity_board",

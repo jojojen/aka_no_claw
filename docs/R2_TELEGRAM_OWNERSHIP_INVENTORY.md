@@ -31,6 +31,14 @@ the `imgtr` 顯示原文 callback + its OCR-original cache, plus `default_lookup
 / `default_board_loader`) moved to `openclaw_adapter/photo_render.py`.
 telegram_bot re-imports them; test monkeypatches retarget the owning module.
 
+R2.2 slice 3 (done): reputation-snapshot delivery (`default_reputation_renderer`,
+playwright PDF/preview `render_reputation_snapshot_artifacts`, chromium launch
+resolution, `format_reputation_snapshot_result` / `_delivery_text`) moved to
+`openclaw_adapter/reputation_render.py`. The `TelegramFileAttachment` /
+`TelegramReputation{Query,Delivery}` legacy re-exports now route through
+`telegram_compat`. telegram_bot re-imports everything; renderer test
+monkeypatches retarget `reputation_render`.
+
 Layer chain:
 
 ```text

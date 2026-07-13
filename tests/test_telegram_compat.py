@@ -8,11 +8,14 @@ with zero behavior change.
 
 import price_monitor_bot.bot as price_bot
 import telegram_core.polling as core_polling
+import telegram_core.transport as core_transport
 from openclaw_adapter import telegram_bot, telegram_compat
 
 PRICE_OWNED = (
     "BoardLoader",
     "TelegramLookupQuery",
+    "TelegramReputationDelivery",
+    "TelegramReputationQuery",
     "TelegramResearchQuery",
     "build_processing_ack",
     "format_liquidity_board",
@@ -20,14 +23,18 @@ PRICE_OWNED = (
     "parse_lookup_command",
     "parse_reputation_snapshot_command",
 )
-CORE_OWNED = ("handle_telegram_message",)
+POLLING_OWNED = ("handle_telegram_message",)
+TRANSPORT_OWNED = ("TelegramFileAttachment",)
+CORE_OWNED = POLLING_OWNED + TRANSPORT_OWNED
 
 
 def test_compat_names_resolve_to_owning_module():
     for name in PRICE_OWNED:
         assert getattr(telegram_compat, name) is getattr(price_bot, name)
-    for name in CORE_OWNED:
+    for name in POLLING_OWNED:
         assert getattr(telegram_compat, name) is getattr(core_polling, name)
+    for name in TRANSPORT_OWNED:
+        assert getattr(telegram_compat, name) is getattr(core_transport, name)
 
 
 def test_legacy_telegram_bot_paths_still_work():

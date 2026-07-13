@@ -1818,9 +1818,9 @@ def test_default_reputation_renderer_fails_fast_when_agent_cannot_start(monkeypa
     def fail_ensure(**kwargs):
         raise RuntimeError("REPUTATION_AGENT_ADMIN_TOKEN is not set")
 
-    monkeypatch.setattr("openclaw_adapter.telegram_bot.ensure_agent_thread", fail_ensure)
+    monkeypatch.setattr("openclaw_adapter.reputation_render.ensure_agent_thread", fail_ensure)
     monkeypatch.setattr(
-        "openclaw_adapter.telegram_bot.request_reputation_snapshot",
+        "openclaw_adapter.reputation_render.request_reputation_snapshot",
         lambda **kwargs: (_ for _ in ()).throw(AssertionError("request_reputation_snapshot should not run")),
     )
 
@@ -1843,9 +1843,9 @@ def test_default_reputation_renderer_fails_fast_when_agent_token_is_invalid(monk
     def fail_ensure(**kwargs):
         raise RuntimeError("REPUTATION_AGENT_ADMIN_TOKEN is invalid for REPUTATION_AGENT_SERVER_URL")
 
-    monkeypatch.setattr("openclaw_adapter.telegram_bot.ensure_agent_thread", fail_ensure)
+    monkeypatch.setattr("openclaw_adapter.reputation_render.ensure_agent_thread", fail_ensure)
     monkeypatch.setattr(
-        "openclaw_adapter.telegram_bot.request_reputation_snapshot",
+        "openclaw_adapter.reputation_render.request_reputation_snapshot",
         lambda **kwargs: (_ for _ in ()).throw(AssertionError("request_reputation_snapshot should not run")),
     )
 
