@@ -43,6 +43,11 @@ thread-safe cancellation/progress envelope; `research_command.py` re-exports
 the established surface for compatibility.  Tests: `tests/test_research_command.py`
 and `tests/test_research_command_boundaries.py`.
 
+The stage envelope records a schema version, payload, provenance URLs, terminal
+failure class, elapsed time, host-request count and cache-freshness marker.
+Legacy stage constructors remain compatible; `ResearchJobContext` fills stable
+defaults when a stage returns only the established result fields.
+
 Completed: `research/input.py` owns text/URL normalization and canonical Mercari
 target construction, while the facade preserves its public helper imports.
 

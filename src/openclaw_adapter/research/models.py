@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Protocol, Sequence
 
 from ..item_condition import ConditionAssessment
@@ -227,6 +227,16 @@ class ResearchSectionResult:
     summary: str
     evidence_urls: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
+    # R3 stage-envelope metadata.  Defaults preserve the legacy constructor
+    # while every result can now carry the information needed to distinguish a
+    # partial live result from a cached/failed one during follow-up work.
+    schema_version: int = 1
+    payload: tuple[tuple[str, str], ...] = ()
+    provenance_urls: tuple[str, ...] = ()
+    failure_class: str | None = None
+    elapsed_seconds: float | None = None
+    host_request_count: int = 0
+    cache_freshness: str = "unknown"
 
 
 @dataclass(slots=True)
@@ -284,6 +294,19 @@ class ResearchJobContext:
         self.notifier.send(f"⏳ [{self.current_stage}/7] {self.current_label}：{note}")
 
     def add_section_result(self, result: ResearchSectionResult) -> None:
+        elapsed = (
+            max(0.0, time.monotonic() - self.stage_started_monotonic)
+            if self.stage_started_monotonic else None
+        )
+        result = replace(
+            result,
+            payload=result.payload or (("summary", result.summary),),
+            provenance_urls=result.provenance_urls or result.evidence_urls,
+            failure_class=result.failure_class or (
+                result.status if result.status in {"partial", "unavailable"} else None
+            ),
+            elapsed_seconds=result.elapsed_seconds if result.elapsed_seconds is not None else elapsed,
+        )
         with self._section_lock:
             self.section_results.append(result)
             self.warnings.extend(result.warnings)
