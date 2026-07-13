@@ -32,6 +32,7 @@ Full inventory with recommended actions is in [DOC_AUDIT.md](DOC_AUDIT.md).
 |---|---|---|---|
 | [LIQUIDITY_METHODOLOGY.md](LIQUIDITY_METHODOLOGY.md) | Current | price/liquidity | Scoring approach for liquidity and market support. |
 | [RESEARCH_COMMAND_PLAN.md](RESEARCH_COMMAND_PLAN.md) | Current | research | `/research` implementation status, offload, and stage parallelization. |
+| [R3_RESEARCH_PIPELINE_INVENTORY.md](R3_RESEARCH_PIPELINE_INVENTORY.md) | Current | research | R3 responsibility and compatibility inventory for `/research` decomposition (issue #76). |
 | [BROWSER_UI_VALIDATION_PLAYBOOK.md](BROWSER_UI_VALIDATION_PLAYBOOK.md) | Current | verification | Browser smoke-test playbook for local web console validation. |
 | [NEW_DYNAMIC_TOOLS_PROGRESS.md](NEW_DYNAMIC_TOOLS_PROGRESS.md) | Current (canonical: dynamic-tools) | dynamic-tools | `/new` implementation notes and benchmark history. |
 | [R4_DYNAMIC_TOOLS_INVENTORY.md](R4_DYNAMIC_TOOLS_INVENTORY.md) | Current | dynamic-tools | R4 responsibility, threat, and resource inventory for the `/new` pipeline (issue #76). |
