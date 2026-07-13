@@ -215,6 +215,6 @@ and splits into a separate issue/PR after the facade is stable.
 - [ ] R4.5 — `sandbox.py` (resource limits + cleanup for every terminal state).
 - [ ] R4.6 — `repair.py` (bounded repair + repeated-attempt detection).
 - [ ] R4.7 — `evaluation.py` (generator-independent eval + discriminating tests).
-- [ ] R4.8 — `catalog.py` + thin `service.py` facade.
+- [ ] R4.8 — `catalog.py` + thin `service.py` facade (thin facade complete; catalog extraction remains).
 
 Handoff/progress log lives in `docs/NEW_DYNAMIC_TOOLS_PROGRESS.md` (§R4).

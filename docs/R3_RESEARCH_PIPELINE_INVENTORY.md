@@ -46,4 +46,8 @@ and `tests/test_research_command_boundaries.py`.
 Completed: `research/input.py` owns text/URL normalization and canonical Mercari
 target construction, while the facade preserves its public helper imports.
 
+Completed: `research_command.py` is now a stable thin compatibility facade;
+`research/service.py` owns the existing stage orchestration while consumers keep
+the same module-level seams.
+
 First unchecked extraction: `research/reporting.py`.
