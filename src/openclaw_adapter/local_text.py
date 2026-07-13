@@ -11,11 +11,14 @@ re-export.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from assistant_runtime import AssistantSettings, build_ssl_context
+
+logger = logging.getLogger(__name__)
 
 from .llm_pool_settings import (
     _LLM_NOT_CONFIGURED_MESSAGE,
@@ -121,13 +124,9 @@ def build_translate_handler(settings: AssistantSettings, *, target: str) -> Call
             "保留 URL、專有名詞、產品名。"
         )
 
-    def handler(remainder: str, chat_id: str) -> str:
-        text = (remainder or "").strip()
-        if not text:
-            return usage
+    def _local_translate(prompt: str) -> str:
         if backend != "ollama" or not endpoint or not model:
             return _TRANSLATE_NOT_CONFIGURED_MESSAGE
-        prompt = f"{instruction}\n\n原文：\n{text}\n\n譯文："
         translated = _call_local_text_model(
             endpoint=endpoint,
             model=model,
@@ -136,5 +135,25 @@ def build_translate_handler(settings: AssistantSettings, *, target: str) -> Call
             ssl_context=ssl_ctx,
         ).strip()
         return translated or "本地模型沒有回傳可用譯文。"
+
+    def handler(remainder: str, chat_id: str) -> str:
+        text = (remainder or "").strip()
+        if not text:
+            return usage
+        prompt = f"{instruction}\n\n原文：\n{text}\n\n譯文："
+        # Default to the cloud pool (Gemini→Mistral→Big Pickle→NVIDIA), matching
+        # the web console. generate_via_cloud_pool already falls back to local
+        # when every cloud provider is unavailable; the try/except guards the
+        # case where it raises (local also disabled) or a cloud call blows up
+        # mid-flight, so a translation never silently drops.
+        try:
+            from .command_bridge_providers import generate_via_cloud_pool
+
+            translated = (generate_via_cloud_pool(settings, prompt) or "").strip()
+            if translated:
+                return translated
+        except Exception:
+            logger.warning("translate cloud pool failed; local fallback", exc_info=True)
+        return _local_translate(prompt)
 
     return handler

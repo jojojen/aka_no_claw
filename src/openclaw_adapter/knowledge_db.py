@@ -987,6 +987,44 @@ DEPRECATED_CODEGEN_SEED: tuple[tuple[str, str], ...] = (
 
 CODEGEN_SEED: tuple[dict, ...] = (
     {
+        "category": "architecture",
+        "title": "同一功能有多入口時，後端路由必須逐一稽核，UI 預設不會自動傳播到別的行程",
+        "technique": (
+            "一個面向使用者的功能常有多個入口：不同 UI（React 主控台、Telegram、輕量 chat "
+            "頁）與不同行程（bridge、poller）。在其中一個 UI 選好的預設（例如前端 state 預設"
+            "『雲端池』）只在該請求裡帶著送出，並不會綁定其他行程裡的處理器——sibling 行程的"
+            "handler 各自有自己的預設，很容易停留在舊值（如 Telegram 自動翻譯 handler 寫死打"
+            "本地 qwen3:14b），造成『同一功能，換個入口就走不同模型/後端』的分歧。症狀是使用"
+            "者說『這功能應該預設用 X 才對，怎麼跑去用 Y』。正解：把後端/模型選擇抽成一個只吃"
+            "settings 的共用進入點（不依賴特定 UI 的 request 物件），讓每個入口都路由到同一條"
+            "選擇鏈（含 fallback）；修 bug 時逐一列出所有入口並確認各自實際打哪個後端，別只改"
+            "你手上那條路徑。驗證方式：對『沒帶明確後端』的請求斷言它走的是共用預設，並實測"
+            "每個入口的最終 provider 一致。"
+        ),
+        "keywords": ["*", "architecture", "entrypoint", "routing", "default", "backend", "llm", "consistency", "multi-process", "ui"],
+        "confidence": 0.9,
+    },
+    {
+        "category": "architecture",
+        "title": "一次性網路送出必須自帶重試，別假設外層有迴圈保護",
+        "technique": (
+            "對外部服務（Telegram、HTTP API）的請求會間歇性失敗——TLS 交握被切斷"
+            "（SSL: UNEXPECTED_EOF_WHILE_READING）、RemoteDisconnected、連線重置、逾時，"
+            "常見成因是 VPN 出口切換或網路瞬斷。長輪詢類呼叫（getUpdates）因為外層 poll"
+            "迴圈會重試而看似穩定，但一次性的送出（sendMessage、背景回覆、通知）沒有任何"
+            "重試，單一瞬斷就把使用者的回覆永遠吞掉——症狀是『最近一次成功、前幾次失敗』"
+            "這種間歇性掉訊。正解：在傳輸層本身對暫時性錯誤（URLError 及非 URLError 的原始"
+            "串流錯誤 HTTPException/OSError，含 SSLError）做有上限的退避重試，讓所有呼叫端"
+            "一致受惠；但對確定性的失敗（HTTPError 這種真正的 HTTP 狀態碼、應用層 ok:false）"
+            "絕不重試。觀察到的失敗在交握階段、請求主體尚未送出，故重試安全；即使極少數"
+            "情況在讀取階段失敗導致重送，一則罕見的重複訊息也遠優於整筆回覆遺失。驗證方式："
+            "mock 傳輸層第一次拋暫時性錯誤、第二次成功，斷言有重試且最終送達；並斷言"
+            "HTTPError 不被重試。"
+        ),
+        "keywords": ["*", "network", "retry", "backoff", "transient", "ssl", "tls", "timeout", "idempotent", "transport"],
+        "confidence": 0.95,
+    },
+    {
         "category": "validation",
         "title": "新增模組或文件時，以全套品質閘門驗證登錄與靜態匯出",
         "technique": (

@@ -911,14 +911,16 @@ def test_command_processor_handles_translate_aliases(monkeypatch) -> None:
         openclaw_local_text_model="qwen3:14b",
     )
 
-    def _fake_call_local_text_model(*, endpoint, model, prompt, timeout_seconds, ssl_context):
+    # Translation defaults to the cloud pool now, so stub that path (the local
+    # model is only the fallback and must not be reached on cloud success).
+    def _fake_cloud(settings, prompt):
         if "日文" in prompt:
             return "こんにちは、今日はお疲れさまでした。"
         return "你好，今天辛苦了。"
 
     monkeypatch.setattr(
-        "openclaw_adapter.local_text._call_local_text_model",
-        _fake_call_local_text_model,
+        "openclaw_adapter.command_bridge_providers.generate_via_cloud_pool",
+        _fake_cloud,
     )
 
     command_handlers, _, _, _ = _build_registries(settings, dynamic_tool_runner=None)

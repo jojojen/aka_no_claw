@@ -471,3 +471,87 @@ class ProviderRouter:
             self.local_model(),
             fallback_reason=last_reason or "Gemini quota or rate limit",
         )
+
+
+class _StandaloneChatClientDeps:
+    """Settings-only :class:`ChatClientDeps` for processes that have no
+    ``CommandBridge`` (the Telegram poller, chat_web). The client factories
+    mirror ``CommandBridge``'s — each depends solely on ``settings`` — so the
+    Telegram translate handler reaches the identical Gemini→Mistral→Big
+    Pickle→NVIDIA→local cloud pool the web console uses, instead of only local
+    qwen3:14b."""
+
+    def __init__(self, settings: object) -> None:
+        self.settings = settings
+
+    def _build_gemini_chat_client(self, model: str):
+        from assistant_runtime import build_ssl_context
+
+        key = getattr(self.settings, "openclaw_gemini_api_key", None)
+        if not key:
+            return None
+        return _GeminiTextClient(
+            api_key=key,
+            model=model,
+            timeout_seconds=180,
+            ssl_context=build_ssl_context(self.settings),
+        )
+
+    def _build_mistral_chat_client(self):
+        from .dynamic_tools import MistralTextClient
+
+        key = getattr(self.settings, "openclaw_mistral_api_key", None)
+        if not key:
+            return None
+        return MistralTextClient(
+            api_key=key,
+            model=resolve_provider_model(self.settings, LLM_PROVIDER_MISTRAL),
+            timeout_seconds=180,
+        )
+
+    def _build_cloud_chat_client(self):
+        from .dynamic_tools import OpenCodeTextClient, probe_opencode
+
+        base_url = self.settings.openclaw_opencode_base_url
+        model = resolve_provider_model(self.settings, LLM_PROVIDER_BIG_PICKLE)
+        if probe_opencode(base_url, model=model, timeout=10.0):
+            return OpenCodeTextClient(
+                base_url=base_url,
+                model=model,
+                api_key=self.settings.openclaw_opencode_api_key,
+                timeout_seconds=180,
+            )
+        return None
+
+    def _build_nvidia_chat_client(self):
+        from .dynamic_tools import NvidiaTextClient
+
+        key = getattr(self.settings, "openclaw_nvidia_api_key", None)
+        if not key:
+            return None
+        return NvidiaTextClient(
+            api_key=key,
+            model=resolve_provider_model(self.settings, LLM_PROVIDER_NVIDIA),
+            timeout_seconds=180,
+        )
+
+    def _ollama_generate_blocking(self, prompt: str) -> str:
+        from .dynamic_tools import OllamaTextClient
+
+        client = OllamaTextClient(
+            endpoint=self.settings.openclaw_local_text_endpoint,
+            model=resolve_provider_model(self.settings, LLM_PROVIDER_LOCAL),
+            timeout_seconds=self.settings.openclaw_local_text_timeout_seconds,
+        )
+        return client.generate(prompt, temperature=0.2)
+
+
+def generate_via_cloud_pool(settings: object, prompt: str) -> str:
+    """Run ``prompt`` through the shared cloud pool (with local fallback) from a
+    process that has no ``CommandBridge``. Returns the generated text; raises
+    ``RuntimeError`` when the pool has no usable provider AND local is disabled.
+    Used by the Telegram/chat_web translate handlers so translation defaults to
+    the cloud pool, matching the web console."""
+    router = ProviderRouter(_StandaloneChatClientDeps(settings))
+    text, _metadata = router.generate_cloud_pool_blocking(prompt)
+    return text
