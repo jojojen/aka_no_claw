@@ -151,3 +151,31 @@ Owner area: dynamic-tools
   按需裝（benchmark 會用 yfinance / 直接 urllib + Yahoo）。此為對 plan 的務實偏離。
 - 14b 真實任務成功率有限，靠自我修復拉高；`/new` 會比固定指令慢（每輪 30–90s+）。
 - 護欄非沙箱：仍可刪檔/連外網（開放 pip 的代價，使用者已同意）。
+
+## R4 — 管線分解 refactor（issue #76，接手指南）
+
+> 目標：把 3340 行的單體 `dynamic_tools.py` 拆成 `dynamic_tools/` 套件（9 個模組），
+> 讓 generation / safety / execution / repair / evaluation 各自獨立、generator 無法
+> 繞過 verifier。**完整責任→模組對照、威脅/資源、公開介面契約、分解不變式**都在
+> `docs/R4_DYNAMIC_TOOLS_INVENTORY.md`（single source of truth，接手先讀它）。
+
+進度：
+- [x] R4.0（2026-07-13）：inventory 文件 + boundary 測試。
+      新增 `docs/R4_DYNAMIC_TOOLS_INVENTORY.md`（責任地圖 §1、公開介面 §2、
+      分解不變式 §3、slice 清單 §4）與 `tests/test_dynamic_tools_boundaries.py`
+      （釘住 24 個外部消費者依賴的公開 symbol + safety 判定與 generator 無關 +
+      safety/spec helper 是 module-level free function 而非 runner method）。
+      No intended semantic change。`tests/test_dynamic_tools.py` 既有 ~90 測試已釘住
+      行為契約，R4.0 只補「模組邊界」釘子。測試：142 passed。
+- [ ] R4.2：抽 `specification.py` + `knowledge_context.py`。
+- [ ] R4.3：抽 `providers.py`（protocol + 決定性失敗 fake）。
+- [ ] R4.4：抽 `safety.py`（靜態政策 + 機器可讀拒絕理由）。
+- [ ] R4.5：抽 `sandbox.py`（資源上限 + 每個終態都清乾淨）。
+- [ ] R4.6：抽 `repair.py`（有界修復 + 重複嘗試偵測）。
+- [ ] R4.7：抽 `evaluation.py`（generator-independent 驗證）。
+- [ ] R4.8：抽 `catalog.py` + 收尾成 thin `service.py` facade。
+
+接手要點：每個 slice 都是 code-motion，`dynamic_tools.py` 要持續 re-export §2 的
+公開介面（`test_dynamic_tools_boundaries.py` 會擋回歸）；跑
+`.venv/bin/python -m pytest tests/test_dynamic_tools.py tests/test_dynamic_tools_boundaries.py -q`
+綠了才進下一片；任何行為改變都停下來另開 issue/PR。
