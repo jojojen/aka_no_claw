@@ -43,4 +43,7 @@ thread-safe cancellation/progress envelope; `research_command.py` re-exports
 the established surface for compatibility.  Tests: `tests/test_research_command.py`
 and `tests/test_research_command_boundaries.py`.
 
-First unchecked extraction: `research/input.py`.
+Completed: `research/input.py` owns text/URL normalization and canonical Mercari
+target construction, while the facade preserves its public helper imports.
+
+First unchecked extraction: `research/reporting.py`.
