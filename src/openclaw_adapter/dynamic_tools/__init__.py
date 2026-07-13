@@ -49,7 +49,7 @@ from ..generated_tool_catalog import GeneratedToolCatalog, STATUS_PROMOTED
 from .specification import (  # R4.2: value objects, markers, pure parsers
     ANSWER_START,
     ANSWER_END,
-    AttemptTrace,
+    AttemptTrace as AttemptTrace,
     DynamicToolResult,
     ReusePlan,
     SearchGroundingBudgetExhausted,
@@ -58,7 +58,7 @@ from .specification import (  # R4.2: value objects, markers, pure parsers
     _API_STRUCT_END,
     _API_STRUCT_START,
     _CODE_MARK,
-    _FENCE_RE,
+    _FENCE_RE as _FENCE_RE,
     _META_MARK,
     _PLAN_MARK,
     _THINK_RE,
@@ -1915,8 +1915,8 @@ class DynamicToolRunner:
                 # ("- **X**：NONE") instead of answering bare NONE; lines
                 # carrying it are junk, and an extract that is ONLY such lines
                 # grounded nothing.
-                lines = [l for l in extract.splitlines()
-                         if l.strip() and "NONE" not in l.upper()]
+                lines = [line for line in extract.splitlines()
+                         if line.strip() and "NONE" not in line.upper()]
                 if lines:
                     extracts.append("\n".join(lines))
         finally:

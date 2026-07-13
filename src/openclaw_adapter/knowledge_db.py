@@ -987,6 +987,19 @@ DEPRECATED_CODEGEN_SEED: tuple[tuple[str, str], ...] = (
 
 CODEGEN_SEED: tuple[dict, ...] = (
     {
+        "category": "validation",
+        "title": "新增模組或文件時，以全套品質閘門驗證登錄與靜態匯出",
+        "technique": (
+            "抽取模組、加入文件或重整匯出表面時，局部行為測試不足以發現交付物沒有被"
+            "靜態分析或文件索引接納。變更完成前應同時跑受影響檔案的 linter 與文件健康"
+            "檢查；對刻意 re-export 的名稱使用明確 alias 或 __all__，避免品質閘門把相容"
+            "性匯出誤判為未使用。把這些 gate 納入該抽取 slice 的測試，讓新增資產在首次"
+            "提交就被索引，且避免 CI 與本機驗證出現落差。"
+        ),
+        "keywords": ["*", "refactor", "lint", "documentation", "index", "re-export", "ci", "quality gate"],
+        "confidence": 0.95,
+    },
+    {
         "category": "architecture",
         "title": "LLM 規劃器不可用推測的環境狀態否決使用者要求的動作",
         "technique": (

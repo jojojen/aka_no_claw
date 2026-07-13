@@ -34,6 +34,7 @@ Full inventory with recommended actions is in [DOC_AUDIT.md](DOC_AUDIT.md).
 | [RESEARCH_COMMAND_PLAN.md](RESEARCH_COMMAND_PLAN.md) | Current | research | `/research` implementation status, offload, and stage parallelization. |
 | [BROWSER_UI_VALIDATION_PLAYBOOK.md](BROWSER_UI_VALIDATION_PLAYBOOK.md) | Current | verification | Browser smoke-test playbook for local web console validation. |
 | [NEW_DYNAMIC_TOOLS_PROGRESS.md](NEW_DYNAMIC_TOOLS_PROGRESS.md) | Current (canonical: dynamic-tools) | dynamic-tools | `/new` implementation notes and benchmark history. |
+| [R4_DYNAMIC_TOOLS_INVENTORY.md](R4_DYNAMIC_TOOLS_INVENTORY.md) | Current | dynamic-tools | R4 responsibility, threat, and resource inventory for the `/new` pipeline (issue #76). |
 | [NEW_E2E_DISCRIMINATING_TESTS.md](NEW_E2E_DISCRIMINATING_TESTS.md) | Current | dynamic-tools | Companion: discriminating tests for generated tools. |
 | [NEW_OPENCODE_DECOUPLING_PLAN.md](NEW_OPENCODE_DECOUPLING_PLAN.md) | Planned | dynamic-tools | Companion: plan to move `/new` + Chat off OpenCode CLI to direct HTTP; add Mistral switch (issues #51/#59). |
 | [CHAT_GOAL_LOOP_PLAN.md](CHAT_GOAL_LOOP_PLAN.md) | Planned | dynamic-tools | Companion: chat goal loop — plan-then-execute multi-tool runs with replan, budget-continue UX, narrated trace, eval harness (issues #50–#54). |
