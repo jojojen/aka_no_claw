@@ -203,3 +203,27 @@ def assess_seller(
     result = build_snapshot_result(snapshot)
     ctx.add_section_result(result)
     return result.summary
+
+
+def assess_appreciation(
+    service, ctx: ResearchJobContext, *, query_for: Callable[[ResearchJobContext], str],
+    should_enrich: Callable[[object, object], bool], collect_search: Callable[[ResearchJobContext], tuple],
+    build_result: Callable[..., ResearchSectionResult], database_factory: Callable[[str], object],
+) -> str:
+    """Build appreciation/context evidence through the explicit R3 stage seam."""
+    entries = service._lookup_appreciation_entries(ctx)
+    heat_by_canonical = service._ip_heat_lookup_fn(tuple(entry.entity_canonical for entry in entries))
+    search_results = ()
+    if should_enrich(entries, heat_by_canonical):
+        search_results = collect_search(ctx)
+        ctx.appreciation_search_results = search_results
+    query = query_for(ctx)
+    enrichment = service._enrich_appreciation(query, search_results)
+    ctx.appreciation_enrichment = enrichment
+    db = database_factory(service._knowledge_db_path) if service._knowledge_db_path else None
+    result = build_result(
+        query=query, entries=entries, heat_by_canonical=heat_by_canonical,
+        search_results=search_results, enrichment=enrichment, db=db,
+    )
+    ctx.add_section_result(result)
+    return result.summary

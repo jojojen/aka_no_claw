@@ -71,6 +71,10 @@ Completed: the seller/reputation stage now lives in `research/stages.py`,
 including Mercari Shops exclusion, unavailable adapters, pending snapshots,
 asynchronous follow-up and visible partial failure evidence.
 
+Completed: the appreciation/context stage is an explicit `research/stages.py`
+operation, with knowledge lookup, optional bounded search enrichment and source
+provenance passed into the existing report builder unchanged.
+
 Completed: `research/market.py` owns the active-listing price-cap policy used by
 the price-evidence stage; a sold average now expands the cap for name-mode
 research without changing the existing listed-price precedence.

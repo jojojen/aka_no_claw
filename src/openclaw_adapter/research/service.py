@@ -869,29 +869,16 @@ class ResearchCommandService:
                 db.add_alias(alias, entity_canonical)
 
     def _stage_appreciation_placeholder(self, ctx: ResearchJobContext) -> str:
-        entries = self._lookup_appreciation_entries(ctx)
-        heat_by_canonical = self._ip_heat_lookup_fn(tuple(entry.entity_canonical for entry in entries))
-        search_results = ()
-        if _should_enrich_appreciation(entries, heat_by_canonical):
-            search_results = _collect_appreciation_search_results(ctx)
-            ctx.appreciation_search_results = search_results
-        enrichment = self._enrich_appreciation(_build_price_query(ctx), search_results)
-        ctx.appreciation_enrichment = enrichment
-        db = (
-            KnowledgeDatabase(self._knowledge_db_path)
-            if self._knowledge_db_path
-            else None
+        from .stages import assess_appreciation
+
+        return assess_appreciation(
+            self, ctx,
+            query_for=_build_price_query,
+            should_enrich=_should_enrich_appreciation,
+            collect_search=_collect_appreciation_search_results,
+            build_result=_build_appreciation_section_result,
+            database_factory=KnowledgeDatabase,
         )
-        result = _build_appreciation_section_result(
-            query=_build_price_query(ctx),
-            entries=entries,
-            heat_by_canonical=heat_by_canonical,
-            search_results=search_results,
-            enrichment=enrichment,
-            db=db,
-        )
-        ctx.add_section_result(result)
-        return result.summary
 
     def _enrich_appreciation(
         self, query: str, search_results: tuple[WebSearchResult, ...]
