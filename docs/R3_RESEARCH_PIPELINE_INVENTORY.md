@@ -57,6 +57,11 @@ the service injects its configured limits and report builder explicitly.
 Completed: `research/stages.py` owns normalized-input and item-fetch stage
 results, including visible partial/unavailable evidence contracts.
 
+Completed: `research/stages.py` also owns entity-recognition persistence and
+vision-condition stage outcomes.  Both retain their previous explicit
+unavailable/partial evidence instead of promoting a failed optional backend to
+success.
+
 Completed: `research/market.py` owns the active-listing price-cap policy used by
 the price-evidence stage; a sold average now expands the cap for name-mode
 research without changing the existing listed-price precedence.

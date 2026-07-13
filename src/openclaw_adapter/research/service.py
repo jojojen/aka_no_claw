@@ -816,89 +816,9 @@ class ResearchCommandService:
         return identify_entities(self, ctx)
 
     def _stage_condition_assessment(self, ctx: ResearchJobContext) -> str:
-        """Assess physical condition via vision LLM."""
-        if ctx.item_data is None or not ctx.item_data.image_urls:
-            result = ResearchSectionResult(
-                section_name="商品狀況分析",
-                status="unavailable",
-                confidence=0.0,
-                sample_count=0,
-                evidence_count=0,
-                summary="無商品圖片可供狀況分析。",
-            )
-            ctx.add_section_result(result)
-            return result.summary
+        from .stages import assess_condition
 
-        if self._condition_assessor_fn is None:
-            result = ResearchSectionResult(
-                section_name="商品狀況分析",
-                status="unavailable",
-                confidence=0.0,
-                sample_count=0,
-                evidence_count=0,
-                summary="未設定影像狀況分析後端。",
-            )
-            ctx.add_section_result(result)
-            return result.summary
-
-        try:
-            assessment = self._condition_assessor_fn(
-                ctx.item_data.title,
-                ctx.item_data.condition_label,
-                ctx.item_data.image_urls,
-            )
-        except Exception as exc:
-            logger.warning("condition assessment failed for %s: %s", ctx.item_data.item_url, exc, exc_info=True)
-            result = ResearchSectionResult(
-                section_name="商品狀況分析",
-                status="unavailable",
-                confidence=0.0,
-                sample_count=0,
-                evidence_count=0,
-                summary=f"商品狀況分析失敗：{exc}",
-            )
-            ctx.add_section_result(result)
-            return result.summary
-
-        if assessment is None:
-            result = ResearchSectionResult(
-                section_name="商品狀況分析",
-                status="unavailable",
-                confidence=0.0,
-                sample_count=0,
-                evidence_count=0,
-                summary="商品圖片無法取得或影像模型無回應。",
-            )
-            ctx.add_section_result(result)
-            return result.summary
-
-        # Success: store assessment and build section result
-        ctx.condition_assessment = assessment
-        summary = assessment.summary
-        if assessment.flaws:
-            summary = f"{summary.rstrip('。；')}；可見瑕疵：{'、'.join(assessment.flaws)}"
-
-        warnings: list[str] = []
-        if assessment.consistency == "mismatch":
-            claimed = ctx.item_data.condition_label or "未提供"
-            warnings.append(
-                f"圖片狀況與賣家標示（{claimed}）可能不符，下單前請確認。"
-            )
-        if assessment.flaws:
-            warnings.append(f"圖片可見瑕疵：{'、'.join(assessment.flaws)}，估價時已列入考量。")
-
-        result = ResearchSectionResult(
-            section_name="商品狀況分析",
-            status="ok",
-            confidence=0.7,
-            sample_count=assessment.image_count,
-            evidence_count=assessment.image_count,
-            summary=summary,
-            evidence_urls=tuple(ctx.item_data.image_urls[:3]),
-            warnings=tuple(warnings),
-        )
-        ctx.add_section_result(result)
-        return summary
+        return assess_condition(self, ctx)
 
     def _persist_item_knowledge(self, item: ItemData) -> None:
         if not self._knowledge_db_path:
