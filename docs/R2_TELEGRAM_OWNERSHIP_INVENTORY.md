@@ -39,6 +39,14 @@ resolution, `format_reputation_snapshot_result` / `_delivery_text`) moved to
 `telegram_compat`. telegram_bot re-imports everything; renderer test
 monkeypatches retarget `reputation_render`.
 
+R2.2 slice 4 (done): local-text-model glue (`default_web_fetch_renderer` for
+`/fetch`, `_call_local_text_model`, `build_translate_handler` for
+`/translateja` `/translatezh`) moved to `openclaw_adapter/local_text.py`.
+telegram_bot re-imports the three names; `_select_text_generation_model` stays
+re-exported from telegram_bot (still consumed by `toolset`). chat_web keeps
+importing `build_translate_handler` via the telegram_bot re-export; the
+`_call_local_text_model` translate test retargets `local_text`.
+
 Layer chain:
 
 ```text

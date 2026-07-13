@@ -917,7 +917,7 @@ def test_command_processor_handles_translate_aliases(monkeypatch) -> None:
         return "你好，今天辛苦了。"
 
     monkeypatch.setattr(
-        "openclaw_adapter.telegram_bot._call_local_text_model",
+        "openclaw_adapter.local_text._call_local_text_model",
         _fake_call_local_text_model,
     )
 
