@@ -2236,11 +2236,9 @@ def _build_price_query(ctx: ResearchJobContext) -> str:
 
 
 def _derive_active_price_cap(listed_price_jpy: int | None, sold_average_jpy: int | None = None) -> int:
-    if listed_price_jpy is not None and listed_price_jpy > 0:
-        return max(5_000, int(listed_price_jpy * 2.0))
-    if sold_average_jpy is not None and sold_average_jpy > 0:
-        return max(5_000, int(sold_average_jpy * 2.0))
-    return 50_000
+    from .market import derive_active_price_cap
+
+    return derive_active_price_cap(listed_price_jpy, sold_average_jpy)
 
 
 def _classify_condition_class(title: str) -> str:
