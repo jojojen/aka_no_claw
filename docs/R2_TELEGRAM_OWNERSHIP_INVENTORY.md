@@ -58,6 +58,23 @@ error strings. (Photo ingestion already lives in `photo_render` from R2.2
 slice 2; there is no document/file ingestion path.) Existing processor-level
 audio tests pass unchanged since they exercise the hooks, not internals.
 
+R2.4 (done): background-job lifecycle. The poller-process daemons +
+inbox/DB bootstrap helpers moved to `openclaw_adapter/background_jobs.py`:
+`_start_rag_daily_digest`, `_start_home_schedule_scheduler`,
+`_start_backup_scheduler` (+ `_build_backup_notify`),
+`_start_title_corpus_rebuilder`, `_start_card_image_crawler`,
+`_start_watch_monitor` (Mercari watch notify + auto-snapshot thread),
+`_bootstrap_inboxes`, `_bootstrap_watch_inbox`, `_bootstrap_opportunity_inbox`,
+`_bootstrap_watch_db`. telegram_bot re-imports all 11 so `run_telegram_polling`
+is unchanged and `price_monitor_service` (which imports `_start_watch_monitor`
+/ `_start_card_image_crawler` from telegram_bot) keeps working via the
+re-export. The registry-data builders `_build_rag_callback_handler`,
+`_open_sns_db_readonly`, `_build_buzz_fn_standalone` stay in telegram_bot (they
+feed `_build_registries`, they are not background jobs). Removed the now-dead
+`TelegramBotClient` / `ensure_monitor` / `BackupScheduler` /
+`RagDailyDigestScheduler` / `HomeScheduleScheduler` / reputation-snapshot
+imports that only the moved daemons used.
+
 Layer chain:
 
 ```text
