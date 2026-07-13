@@ -38,4 +38,9 @@ provenance, partial-result, progress, or cancellation behaviour.
 - cancellation, progress messages, partial evidence and provenance;
 - complete/compact/detail report rendering.
 
-First unchecked extraction: `research/models.py`.
+Completed: `research/models.py` now owns the typed contracts, shared budget and
+thread-safe cancellation/progress envelope; `research_command.py` re-exports
+the established surface for compatibility.  Tests: `tests/test_research_command.py`
+and `tests/test_research_command_boundaries.py`.
+
+First unchecked extraction: `research/input.py`.
