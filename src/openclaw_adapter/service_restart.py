@@ -336,9 +336,52 @@ count_service() {{
   n="$(ps -Ao pid,command 2>/dev/null \\
     | grep -E "$pattern" \\
     | grep -v "tmux -L $TMUX_SOCKET" \\
+    | grep -vE '[[:space:]]/bin/(ba|z)?sh[[:space:]]+-lc([[:space:]]|$)' \\
     | grep -v grep \\
     | wc -l | tr -d ' ')"
   echo "[$(date '+%H:%M:%S')] final count $label: $n"
+}}
+
+# A restart is only announced after every core worker has settled to exactly
+# one real process. launchd services have a persistent `bash -lc` wrapper in
+# addition to the Python worker, so wrappers must not be counted as duplicate
+# workers. This deliberately excludes the optional Vite dev server; a broken
+# local frontend must not suppress the operational restart notice.
+wait_for_single_service() {{
+  local label="$1"
+  local pattern="$2"
+  local attempts="${{3:-8}}"
+  local attempt n
+  for attempt in $(seq 1 "$attempts"); do
+    n="$(ps -Ao pid,command 2>/dev/null \\
+      | grep -E "$pattern" \\
+      | grep -v "tmux -L $TMUX_SOCKET" \\
+      | grep -vE '[[:space:]]/bin/(ba|z)?sh[[:space:]]+-lc([[:space:]]|$)' \\
+      | grep -v grep \\
+      | wc -l | tr -d ' ')"
+    if [ "$n" = "1" ]; then
+      echo "[$(date '+%H:%M:%S')] $label ready (one worker)"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "[$(date '+%H:%M:%S')] $label not ready: expected one worker, found $n"
+  return 1
+}}
+
+notify_restart_success() {{
+  local message="✅ 龍蝦已重啟完成。"
+  if [ ! -x "$CLAW/.venv/bin/python" ]; then
+    echo "[$(date '+%H:%M:%S')] restart notification skipped: missing Python runtime"
+    return 1
+  fi
+  echo "[$(date '+%H:%M:%S')] sending Telegram restart notification"
+  (
+    cd "$CLAW" || exit 1
+    source "$CLAW/run/mac-mini-stack.env" 2>/dev/null || true
+    exec "$CLAW/.venv/bin/python" -m openclaw_adapter telegram-send-test --message "$message"
+  ) && echo "[$(date '+%H:%M:%S')] Telegram restart notification sent" \\
+    || echo "[$(date '+%H:%M:%S')] Telegram restart notification failed"
 }}
 
 snapshot() {{
@@ -443,6 +486,16 @@ count_service "opportunity" "openclaw_adapter opportunity-agent"
 count_service "telegram" "python.*openclaw_adapter telegram-poll"
 count_service "chat_web" "openclaw_adapter chat-web"
 count_service "command bridge" "python.*openclaw_adapter command-bridge --lan --port 8781"
+if wait_for_single_service "price_monitor" "openclaw_adapter price-monitor-service" \\
+  && wait_for_single_service "sns_monitor" "openclaw_adapter sns-monitor-service" \\
+  && wait_for_single_service "opportunity" "openclaw_adapter opportunity-agent" \\
+  && wait_for_single_service "telegram" "python.*openclaw_adapter telegram-poll" \\
+  && wait_for_single_service "chat_web" "openclaw_adapter chat-web" \\
+  && wait_for_single_service "command bridge" "python.*openclaw_adapter command-bridge --lan --port 8781"; then
+  notify_restart_success
+else
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] restartall incomplete; Telegram success notification not sent"
+fi
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] restartall finished"
 """
 

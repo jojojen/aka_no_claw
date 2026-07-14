@@ -208,6 +208,64 @@ def test_orphan_launchd_workers_are_reaped() -> None:
     assert script.index('snapshot "before"') < script.index('snapshot "after"')
 
 
+def test_successful_restart_sends_a_telegram_confirmation() -> None:
+    script = _build_restart_script(
+        workspace_dir=Path("/tmp/workspace"),
+        claw_dir=Path("/tmp/workspace/aka_no_claw"),
+        source="test",
+    )
+
+    # The script waits until every required service has exactly one real worker
+    # before it invokes the existing Telegram sender. A send failure is logged
+    # but does not restart/kill healthy services again.
+    assert "wait_for_single_service() {" in script
+    assert "notify_restart_success() {" in script
+    assert 'local message="✅ 龍蝦已重啟完成。"' in script
+    assert 'source "$CLAW/run/mac-mini-stack.env"' in script
+    assert 'telegram-send-test --message "$message"' in script
+    assert 'restartall incomplete; Telegram success notification not sent' in script
+    assert script.rindex('wait_for_single_service "telegram"') < script.rindex(
+        "notify_restart_success"
+    )
+    assert script.rindex("notify_restart_success") < script.rindex("restartall finished")
+
+
+def test_restart_readiness_excludes_launchd_shell_wrapper(tmp_path) -> None:
+    script = _build_restart_script(
+        workspace_dir=Path("/tmp/workspace"),
+        claw_dir=Path("/tmp/workspace/aka_no_claw"),
+        source="test",
+    )
+    wait_func = _extract_func(script, "wait_for_single_service")
+
+    # launchd keeps a bash wrapper and its Python child alive. Both command
+    # lines contain the module name, but only the child is a service worker.
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    (fakebin / "ps").write_text(
+        "#!/bin/bash\n"
+        'echo "  111 /bin/bash -lc source /x/run/mac-mini-stack.env; '
+        '/x/.venv/bin/python -m openclaw_adapter price-monitor-service"\n'
+        'echo "  222 /x/.venv/bin/python -m openclaw_adapter '
+        'price-monitor-service"\n'
+    )
+    p = fakebin / "ps"
+    p.chmod(p.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+    harness = (
+        'TMUX_SOCKET="openclaw_stack"\n'
+        + wait_func
+        + '\nwait_for_single_service "price_monitor" '
+        '"openclaw_adapter price-monitor-service" 1\n'
+    )
+    env = dict(os.environ, PATH=f"{fakebin}:{os.environ['PATH']}")
+    result = subprocess.run(
+        ["/bin/bash", "-c", harness], capture_output=True, text=True, env=env
+    )
+    assert result.returncode == 0
+    assert "price_monitor ready (one worker)" in result.stdout
+
+
 def test_count_service_excludes_tmux_launcher(tmp_path) -> None:
     # aka_no_claw#40: telegram/bridge launch via `tmux -L openclaw_stack
     # new-session … python -m openclaw_adapter telegram-poll …`, so the tmux

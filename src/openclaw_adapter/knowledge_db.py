@@ -987,6 +987,19 @@ DEPRECATED_CODEGEN_SEED: tuple[tuple[str, str], ...] = (
 
 CODEGEN_SEED: tuple[dict, ...] = (
     {
+        "category": "operations",
+        "title": "程序健康檢查要辨識實際 worker，不可把 supervisor wrapper 算成重複實例",
+        "technique": (
+            "以程序表驗證服務唯一性時，同一個服務常同時存在 supervisor、shell wrapper 與"
+            "真正 worker；若只 grep 模組名稱，wrapper 的命令列也會內嵌完整啟動命令，造成"
+            "正常單一 worker 被誤判為兩個實例，後續成功通知或部署閘門便會被錯誤阻擋。"
+            "正解：健康檢查必須依程序角色過濾 supervisor/wrapper，並用包含 wrapper 與 child"
+            "的真實程序表樣本做回歸測試；不要把裸字串命中數直接等同 worker 數。"
+        ),
+        "keywords": ["*", "process", "health-check", "supervisor", "worker", "restart"],
+        "confidence": 0.95,
+    },
+    {
         "category": "architecture",
         "title": "相容入口應導向唯一的正式 UI，避免重啟後回到過期頁面",
         "technique": (
