@@ -987,6 +987,19 @@ DEPRECATED_CODEGEN_SEED: tuple[tuple[str, str], ...] = (
 
 CODEGEN_SEED: tuple[dict, ...] = (
     {
+        "category": "performance",
+        "title": "只需要首個合格結果時，使用增量結果流而非等待完整蒐集窗",
+        "technique": (
+            "處理探索、掃描或查詢時，先量測每個階段；若使用者操作只需要第一個符合條件的"
+            "結果，應消費能逐筆產生結果的 iterator/stream，命中後立刻停止，而不是等待"
+            "完整蒐集 timeout。保留完整 timeout 作為『沒有合格結果』的錯誤路徑，並以"
+            "回歸測試保證首個合格結果不會繼續等待後續資料。這能縮短正常路徑，同時保留"
+            "網路波動時的發現能力。"
+        ),
+        "keywords": ["*", "performance", "latency", "timeout", "iterator", "stream", "discovery"],
+        "confidence": 0.95,
+    },
+    {
         "category": "operations",
         "title": "程序健康檢查要辨識實際 worker，不可把 supervisor wrapper 算成重複實例",
         "technique": (

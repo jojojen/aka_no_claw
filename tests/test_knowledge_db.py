@@ -36,6 +36,17 @@ def test_codegen_seed_for_restart_health_checks_is_always_retrievable(db):
     assert "port" in rule.technique
 
 
+def test_codegen_seed_for_incremental_results_is_always_retrievable(db):
+    db.seed_codegen_knowledge()
+
+    rows = db.retrieve_codegen_knowledge("任意程式需求", k=100)
+    rule = next(row for row in rows if row.title == "只需要首個合格結果時，使用增量結果流而非等待完整蒐集窗")
+
+    assert rule.category == "performance"
+    assert "*" in rule.keywords
+    assert "iterator" in rule.technique
+
+
 def test_codegen_seed_for_legacy_ui_entry_is_always_retrievable(db):
     db.seed_codegen_knowledge()
 

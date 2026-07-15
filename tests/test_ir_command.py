@@ -44,13 +44,13 @@ def test_discover_uses_lan_broadcast_from_local_ip(tmp_path, monkeypatch):
     seen = {}
     fake = FakeRm()
 
-    def discover(**kwargs):
+    def xdiscover(**kwargs):
         seen.update(kwargs)
-        return [fake]
+        yield fake
 
     monkeypatch.setattr(ir, "_local_ip", lambda: "192.168.11.34")
     monkeypatch.setattr(ir, "_RM_CLASS_NAMES", {"fakerm"})
-    monkeypatch.setattr(ir.broadlink, "discover", discover)
+    monkeypatch.setattr(ir.broadlink, "xdiscover", xdiscover)
     device, msg = ir.discover_rm(_settings(tmp_path))
     assert device is fake
     assert fake.authed is True
@@ -62,15 +62,15 @@ def test_discover_uses_lan_broadcast_from_local_ip(tmp_path, monkeypatch):
 def test_discover_respects_configured_broadcast(tmp_path, monkeypatch):
     seen = {}
 
-    def discover(**kwargs):
+    def xdiscover(**kwargs):
         seen.update(kwargs)
-        return [FakeRm()]
+        yield FakeRm()
 
     settings = _settings(tmp_path)
     settings.openclaw_broadlink_discover_broadcast = "10.0.0.255"
     monkeypatch.setattr(ir, "_local_ip", lambda: "192.168.11.34")
     monkeypatch.setattr(ir, "_RM_CLASS_NAMES", {"fakerm"})
-    monkeypatch.setattr(ir.broadlink, "discover", discover)
+    monkeypatch.setattr(ir.broadlink, "xdiscover", xdiscover)
     ir.discover_rm(settings)
     assert seen["discover_ip_address"] == "10.0.0.255"
 
@@ -82,7 +82,7 @@ def test_discover_retries_transient_auth_no_route(tmp_path, monkeypatch):
 
     monkeypatch.setattr(ir, "_local_ip", lambda: "192.168.11.34")
     monkeypatch.setattr(ir, "_RM_CLASS_NAMES", {"fakerm"})
-    monkeypatch.setattr(ir.broadlink, "discover", lambda **kwargs: [fake])
+    monkeypatch.setattr(ir.broadlink, "xdiscover", lambda **kwargs: iter([fake]))
     monkeypatch.setattr(ir, "_warm_host_route", lambda device: warms.append(device))
     monkeypatch.setattr(ir.time, "sleep", lambda seconds: None)
     device, msg = ir.discover_rm(_settings(tmp_path))
@@ -91,6 +91,24 @@ def test_discover_retries_transient_auth_no_route(tmp_path, monkeypatch):
     assert fake.auth_calls == 2
     assert warms == [fake, fake]
     assert "192.0.2.38" in msg
+
+
+def test_discover_stops_after_first_matching_rm(tmp_path, monkeypatch):
+    fake = FakeRm()
+
+    def xdiscover(**kwargs):
+        yield fake
+        raise AssertionError("discovery should stop after the first matching RM")
+
+    monkeypatch.setattr(ir, "_local_ip", lambda: "192.168.11.34")
+    monkeypatch.setattr(ir, "_RM_CLASS_NAMES", {"fakerm"})
+    monkeypatch.setattr(ir.broadlink, "xdiscover", xdiscover)
+    monkeypatch.setattr(ir, "_warm_host_route", lambda device: None)
+
+    device, _ = ir.discover_rm(_settings(tmp_path))
+
+    assert device is fake
+    assert fake.auth_calls == 1
 
 
 def test_route_warmup_uses_available_ping_candidate(tmp_path, monkeypatch):
@@ -125,6 +143,18 @@ def test_send_code_replays_persisted_payload(tmp_path, monkeypatch):
     ir.IrStore(settings.openclaw_ir_devices_path).put("ceiling_light", "night", "cGxheQ==")
     monkeypatch.setattr(ir, "discover_rm", lambda settings: (fake, "fake rm"))
     msg = ir.send_code(settings, "ceiling_light", "night")
+    assert "已送出" in msg
+    assert fake.sent == [b"play"]
+
+
+def test_send_code_replays_fan_payload_through_the_shared_rm_path(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    fake = FakeRm()
+    ir.IrStore(settings.openclaw_ir_devices_path).put("fan", "power", "cGxheQ==")
+    monkeypatch.setattr(ir, "discover_rm", lambda settings: (fake, "fake rm"))
+
+    msg = ir.send_code(settings, "fan", "power")
+
     assert "已送出" in msg
     assert fake.sent == [b"play"]
 

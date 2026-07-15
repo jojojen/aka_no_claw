@@ -166,20 +166,33 @@ def _broadcast_for(local_ip: str | None, configured: str | None = None) -> str:
 def discover_rm(settings: AssistantSettings) -> tuple[Any | None, str]:
     local_ip = _local_ip()
     broadcast = _broadcast_for(local_ip, settings.openclaw_broadlink_discover_broadcast)
+    device = None
+    devices = None
     try:
-        devices = broadlink.discover(
+        # ``discover`` collects responses until its whole timeout expires.  An
+        # IR send needs only one RM device, so consume the incremental API and
+        # stop as soon as the first compatible reply arrives.  If none arrives,
+        # xdiscover still runs through the same full timeout and preserves the
+        # existing no-device behaviour.
+        devices = broadlink.xdiscover(
             timeout=_DISCOVER_TIMEOUT_SECONDS,
             local_ip_address=local_ip,
             discover_ip_address=broadcast,
         )
+        for candidate in devices:
+            if type(candidate).__name__.lower() in _RM_CLASS_NAMES:
+                device = candidate
+                break
     except Exception as exc:  # noqa: BLE001 - surface actionable hardware errors.
         logger.warning("ir: BroadLink discovery failed: %s", exc)
         return None, f"BroadLink 掃描失敗：{exc}"
+    finally:
+        close = getattr(devices, "close", None)
+        if callable(close):
+            close()
 
-    rm_devices = [d for d in devices if type(d).__name__.lower() in _RM_CLASS_NAMES]
-    if not rm_devices:
+    if device is None:
         return None, f"找不到 RM4 Mini（local_ip={local_ip or 'unknown'}, broadcast={broadcast}）。"
-    device = rm_devices[0]
     auth_error: Exception | None = None
     for attempt in range(1, _AUTH_ATTEMPTS + 1):
         _warm_host_route(device)
