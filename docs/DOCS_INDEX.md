@@ -1,6 +1,6 @@
 # Docs Index
 
-Last reviewed: 2026-07-12
+Last reviewed: 2026-07-17
 
 Governance for this index lives in [DOCUMENTATION_GOVERNANCE.md](DOCUMENTATION_GOVERNANCE.md).
 Full inventory with recommended actions is in [DOC_AUDIT.md](DOC_AUDIT.md).
@@ -44,6 +44,10 @@ Full inventory with recommended actions is in [DOC_AUDIT.md](DOC_AUDIT.md).
 | [CHAT_CLOUD_POOL_STICKY_PROVIDER_PLAN.md](CHAT_CLOUD_POOL_STICKY_PROVIDER_PLAN.md) | Planned | dynamic-tools | Companion: pin the `cloud_pool` chat backend to whichever provider last answered successfully within a conversation, instead of re-walking the chain from the top every turn; ported from musubi issue #11 Case C's P1 sticky-provider fix. |
 | [CHAT_TOOL_PLANNER_STABILITY_FIX.md](CHAT_TOOL_PLANNER_STABILITY_FIX.md) | Done | telegram | Debug record + fix: local chat-tool planner ran on the chat-pool model override (qwen2.5-coder:7b) and misjudged 開燈 as `__no_tool__`; re-homed hidden judgment calls to the dedicated local text model. |
 | [P1_ENGINEERING_HARDENING_IMPLEMENTATION_PLAN.md](P1_ENGINEERING_HARDENING_IMPLEMENTATION_PLAN.md) | Planned | agent-maintenance | Canonical execution and handoff plan for P1 deterministic tests, multi-repo CI, reproducible sibling revisions, versioned contracts, and oversized-orchestrator decomposition (issue #80). |
+| [WEB_SESSION_RUN_EVENT_SPINE_IMPLEMENTATION_PLAN.md](WEB_SESSION_RUN_EVENT_SPINE_IMPLEMENTATION_PLAN.md) | Planned | command-bridge / conversation-runtime | Canonical backend plan for append-only session/run events, cursor-exact recovery, compatibility adapters, background completion injection, migration, and rollout (issue #84). Implement first. |
+| [WEB_DYNAMIC_TOOL_APPROVAL_IMPLEMENTATION_PLAN.md](WEB_DYNAMIC_TOOL_APPROVAL_IMPLEMENTATION_PLAN.md) | Planned | dynamic-tools / command-bridge safety | Manifest-bound, fail-closed Web approval gate for generated-tool and later risky actions (issue #85). Depends on the event spine. |
+| [WEB_PROMPT_QUEUE_IMPLEMENTATION_PLAN.md](WEB_PROMPT_QUEUE_IMPLEMENTATION_PLAN.md) | Planned | command-bridge / conversation-runtime | Durable next-turn queue plus bounded safe-boundary interjections, capture isolation, and exact-once drain (issue #86). Depends on the event spine. |
+| [WEB_CONVERSATION_COMPACTION_IMPLEMENTATION_PLAN.md](WEB_CONVERSATION_COMPACTION_IMPLEMENTATION_PLAN.md) | Planned | command-bridge / model-context | Grounded, versioned context checkpoints that preserve the authoritative event history (issue #87). Depends on the event spine. |
 | [R1_COMMAND_BRIDGE_INVENTORY.md](R1_COMMAND_BRIDGE_INVENTORY.md) | Living | agent-maintenance | R1.0 characterization inventory of `command_bridge.py` before decomposition (issue #74): public surface × routes × consumers, state/locks, threads/cancellation, providers, stores, response contracts, coverage gaps, risk notes. |
 | [R2_TELEGRAM_OWNERSHIP_INVENTORY.md](R2_TELEGRAM_OWNERSHIP_INVENTORY.md) | Current | telegram | R2.0 ownership inventory (issue #75): every command/callback prefix's owning layer, registration site, DB access, and the dispatch/merge precedence contract pinned by `tests/test_registry_precedence.py`. |
 | [WORKSPACE_DEPENDENCIES.md](WORKSPACE_DEPENDENCIES.md) | Current | build | D1.1 inventory: direct dependencies, sibling distributions, import packages, and version matrix. |

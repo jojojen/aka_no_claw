@@ -1,6 +1,6 @@
 # Documentation Audit
 
-Last reviewed: 2026-07-12
+Last reviewed: 2026-07-17
 Owner area: agent-maintenance
 
 Full inventory of repository documentation with lifecycle status, owner area, and
@@ -46,6 +46,10 @@ for which question each one answers.
 | `CHAT_GOAL_LOOP_PLAN.md` | Planned | dynamic-tools | Keep until shipped (chat goal loop + eval harness, issues #50–#54); then mark Current or fold into canonical and archive. |
 | `CHAT_CLOUD_POOL_STICKY_PROVIDER_PLAN.md` | Planned | dynamic-tools | Keep until shipped (sticky-provider pin for chat `cloud_pool`, ported from musubi issue #11 Case C P1); then mark Current or fold into canonical and archive. |
 | `P1_ENGINEERING_HARDENING_IMPLEMENTATION_PLAN.md` | Planned | agent-maintenance | Canonical P1 execution/handoff plan for issue #80; keep while active, then fold stable rules into truth docs and archive. |
+| `WEB_SESSION_RUN_EVENT_SPINE_IMPLEMENTATION_PLAN.md` | Planned | command-bridge / conversation-runtime | Canonical #84 backend event-spine plan; implement first, keep as living handoff, then fold shipped contracts into truth docs and archive the execution record. |
+| `WEB_DYNAMIC_TOOL_APPROVAL_IMPLEMENTATION_PLAN.md` | Planned | dynamic-tools / command-bridge safety | Canonical #85 manifest-bound approval plan; depends on #84 and the Web consumer plan. |
+| `WEB_PROMPT_QUEUE_IMPLEMENTATION_PLAN.md` | Planned | command-bridge / conversation-runtime | Canonical #86 prompt queue and safe interjection plan; depends on #84 and the Web consumer plan. |
+| `WEB_CONVERSATION_COMPACTION_IMPLEMENTATION_PLAN.md` | Planned | command-bridge / model-context | Canonical #87 grounded compaction/checkpoint plan; depends on #84 and the Web consumer plan. |
 | `TELEGRAM_NL_OWNERSHIP_REFACTOR_ISSUE.md` | Planned | telegram | Draft issue; keep until the cross-repo NL ownership refactor is filed/resolved. |
 | `TELEGRAM_CORE_EXTRACTION_PLAN.md` | Current | telegram | Extraction shipped (phases P0–P4, all 3 repos' suites green); kept in place (not archived) as the `telegram_core` hook/registry contract reference. |
 | `VOICE_CONTROL_PERSONALIZATION_DESIGN.md` | Planned | voice / command-bridge / web | Canonical #82 design for local-only voice-control personalization, pre-tool safety gate, and registry-derived action clarification; keep as the implementation source until shipped. |
