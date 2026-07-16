@@ -1939,6 +1939,30 @@ CODEGEN_SEED: tuple[dict, ...] = (
         ],
         "confidence": 0.9,
     },
+    {
+        "category": "architecture",
+        "title": "去重 key 必須與序列閘門同尺度（per-writer），純時間戳 ID 會跨產生者碰撞",
+        "technique": (
+            "分散式事件複製常同時有兩層機制：以 event id 去重、以 per-writer sequence "
+            "連續性閘門擋亂序。若去重用全域 id 而序列閘門是 per-writer，兩者尺度不一致："
+            "不同 writer 合法鑄出相同 id（典型成因：id 只含 `<名稱>-<Date.now()>`，"
+            "兩個節點同毫秒對同一資源動作）時，第二個 writer 的事件被靜默丟棄，"
+            "卻仍佔用它自己的 sequence 槽位 → 閘門視為永遠補不上的 gap → 該 writer "
+            "之後所有事件被永久拒收，且兩側都不會記錄任何錯誤。\n"
+            "正解：(1) 去重 key 與序列閘門同尺度——(writer, event_id) 而非 event_id；"
+            "(2) 產生 id 一律含產生者身分（node id）或真熵，純 Date.now() 不是 id；"
+            "(3) key 串接要防注入式歧義（writer 名可含任意字元，用 length-prefix 或"
+            "結構化 tuple，別用裸分隔符）。\n"
+            "除錯線索：症狀是『事件存在於節點 X、永遠不出現在節點 Y、無任何錯誤 log』"
+            "——先懷疑去重/閘門層，再懷疑傳輸層；『靜默丟棄＋永久閘門』的組合是最難"
+            "觀測的失效形狀，值得在合併層對『被丟棄但佔序列槽』的事件加計數或斷言。"
+        ),
+        "keywords": [
+            "*", "dedup", "event_id", "sequence", "contiguity", "replication",
+            "distributed", "collision", "Date.now", "writer", "去重", "序列", "閘門",
+        ],
+        "confidence": 0.9,
+    },
 )
 
 
