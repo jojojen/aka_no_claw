@@ -1889,6 +1889,30 @@ CODEGEN_SEED: tuple[dict, ...] = (
         ],
         "confidence": 0.9,
     },
+    {
+        "category": "performance",
+        "title": "把大集合展開成呼叫引數（spread/*args）在十萬元素級會爆呼叫棧，規模路徑要逐元素處理",
+        "technique": (
+            "任何『把整個集合展開成單一函式呼叫的引數』的寫法——JS 的 fn(...arr)、"
+            "arr.push(...items)、Math.max(...nums)，Python 的 fn(*huge_list)——"
+            "引數是放在呼叫棧上的，集合一到 ~10 萬元素就丟 RangeError: Maximum call "
+            "stack size exceeded / 等價的棧溢位，而且小規模測試永遠不會踩到，"
+            "只在生產資料長大後突然炸。曾在 CRDT ledger 的合併路徑用 push(...events) "
+            "攤平 peer bucket，1k/10k 測試全綠，300k 事件一跑就棧溢位。\n"
+            "根治法：規模會隨資料成長的路徑一律逐元素 push / extend / concat，"
+            "不要用展開語法傳集合；聚合（max/min）改用 reduce 或迴圈。\n"
+            "同場加映：對有硬上限的共用 heap（wasm32 4GB、embedded runtime）做大規模"
+            "實驗時，同時只保留一份大物件並顯式釋放（如 Automerge 的 A.free），"
+            "兩份 30 萬事件的文件同時在 heap 就 OOM——close()/GC 不保證釋放原生資源。\n"
+            "定位這類問題：錯誤棧指在 push/呼叫行而非業務邏輯，且只在大 N 出現，"
+            "先懷疑展開語法而不是資料本身。"
+        ),
+        "keywords": [
+            "*", "performance", "spread", "棧溢位", "stack overflow", "RangeError",
+            "push", "args", "scale", "大陣列", "wasm", "oom", "heap",
+        ],
+        "confidence": 0.9,
+    },
 )
 
 
