@@ -1913,6 +1913,32 @@ CODEGEN_SEED: tuple[dict, ...] = (
         ],
         "confidence": 0.9,
     },
+    {
+        "category": "testing",
+        "title": "驗證持續增長系統的兩次讀取時，用回應自帶的高水位游標切齊比對窗做精確比對，別用牆鐘順序的包含檢查",
+        "technique": (
+            "被測系統若在測試進行中持續追加資料（心跳、audit tick、背景同步），"
+            "兩個時刻的快照永遠不相等，直覺的處理是降級成包含檢查"
+            "（快照A ⊆ 回應 ⊆ 快照B 的三明治）。但包含檢查有系統性盲點："
+            "落在兩次讀取之間新增、又被受測路徑漏掉的資料，兩側包含都抓不到——"
+            "測試綠燈但完整性沒被證明。同一個測試曾歷經三輪演化：精確相等（flaky）→"
+            "三明治包含（有漏偵測盲點）→ 正解。\n"
+            "正解：如果受測回應自帶『我計算到哪個時點』的標記（server cursor、"
+            "high-water mark、sequence 上限、etag），就用該標記把稍後的完整快照"
+            "切齊到同一瞬間（filter seq <= cursor[writer]），然後做雙向精確集合比對；"
+            "窗外資料因超過游標被排除，比對既 race-free 又完整。"
+            "若協定沒有這種標記，先考慮加上——它同時是生產端 resume 和測試端"
+            "可驗證性的基礎。\n"
+            "同場加映：接受外部量測檔（benchmark/probe artifacts）當驗收證據時，"
+            "驗收規則必須驗證檔案的實驗參數（seed、樣本數、方法論）與預註冊宣稱"
+            "配對一致，否則任何人丟一個參數不同的假檔就能讓規則誤判 PASS。"
+        ),
+        "keywords": [
+            "*", "testing", "flaky", "race", "snapshot", "cursor", "high-water mark",
+            "精確比對", "包含檢查", "收斂", "replication", "驗收", "benchmark", "evidence",
+        ],
+        "confidence": 0.9,
+    },
 )
 
 
