@@ -58,6 +58,10 @@ def test_risk_is_closed_and_generated_writes_require_approval():
     assert classify_generated_tool(
         "import sqlite3\nsqlite3.connect('x.db').execute('INSERT INTO x VALUES (1)')\n"
     ).risk is RiskLevel.PERSISTENT_WRITE
+    assert classify_generated_tool("open('params.json')\n").risk is RiskLevel.READ_ONLY
+    assert classify_generated_tool("open('params.json', 'r')\n").risk is RiskLevel.READ_ONLY
+    assert classify_generated_tool("open('result.json', 'w')\n").risk is RiskLevel.PERSISTENT_WRITE
+    assert classify_generated_tool("from pathlib import Path\nPath('x').open(mode='a')\n").risk is RiskLevel.PERSISTENT_WRITE
     mixed = classify_generated_tool(
         "import requests\nfrom pathlib import Path\n"
         "requests.post('https://api.example.com/items')\nPath('x').write_text('x')\n"
@@ -75,10 +79,9 @@ def test_risk_is_closed_and_generated_writes_require_approval():
 
 
 def test_codegen_seed_records_manifest_bound_approval_lesson():
-    assert any(
-        entry["title"] == "一次性核准必須在消費邊界重驗完整綁定並以權威事件恢復狀態"
-        for entry in CODEGEN_SEED
-    )
+    titles = {entry["title"] for entry in CODEGEN_SEED}
+    assert "一次性核准必須在消費邊界重驗完整綁定並以權威事件恢復狀態" in titles
+    assert "副作用分類器要解析呼叫語意並累積所有效果" in titles
 
 
 def test_manifest_hash_is_canonical_and_binds_code_and_arguments():

@@ -75,6 +75,7 @@ def classify_generated_tool(code: str) -> EffectProfile:
     network_scopes: set[str] = set()
     network_write = False
     network_delete = False
+    filesystem_write = False
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             imports.update(alias.name.split(".", 1)[0] for alias in node.names)
@@ -104,6 +105,17 @@ def classify_generated_tool(code: str) -> EffectProfile:
                 keyword.arg == "data" for keyword in node.keywords
             ):
                 network_write = True
+            if function_name == "open":
+                mode = next((kw.value for kw in node.keywords if kw.arg == "mode"), None)
+                if mode is None:
+                    position = 1 if isinstance(node.func, ast.Name) else 0
+                    mode = node.args[position] if len(node.args) > position else None
+                if mode is not None:
+                    filesystem_write = filesystem_write or not (
+                        isinstance(mode, ast.Constant)
+                        and isinstance(mode.value, str)
+                        and not set(mode.value) & {"w", "a", "x", "+"}
+                    )
             if function_name == "Request":
                 method = next((kw.value for kw in node.keywords if kw.arg == "method"), None)
                 data = next((kw.value for kw in node.keywords if kw.arg == "data"), None)
@@ -129,7 +141,7 @@ def classify_generated_tool(code: str) -> EffectProfile:
         capabilities.add("filesystem_delete")
         risks.add(RiskLevel.DESTRUCTIVE)
         filesystem_scopes = ("tool_workspace",)
-    if calls & _WRITE_METHODS or "open" in calls:
+    if calls & _WRITE_METHODS or filesystem_write:
         capabilities.add("filesystem_write")
         risks.add(RiskLevel.PERSISTENT_WRITE)
         filesystem_scopes = ("tool_workspace",)

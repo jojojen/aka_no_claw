@@ -988,6 +988,22 @@ DEPRECATED_CODEGEN_SEED: tuple[tuple[str, str], ...] = (
 CODEGEN_SEED: tuple[dict, ...] = (
     {
         "category": "security",
+        "title": "副作用分類器要解析呼叫語意並累積所有效果",
+        "technique": (
+            "用 AST 做風險分類時，不能只看到方法名稱就判斷副作用；例如 open() 與 Path.open()"
+            "的預設或 r 模式是讀取，只有 w/a/x/+ 或無法靜態確定的 mode 才應保守視為寫入。"
+            "同一 artifact 可能同時有網路與檔案效果，分類器必須以 OR/集合累積，不能讓後續"
+            "read call 覆蓋先前已發現的 write。為每個語意分支加入 read、write、dynamic 與"
+            "mixed-effect 測試，讓核准畫面既 fail closed 又不製造錯誤權限要求。"
+        ),
+        "keywords": [
+            "*", "security", "ast", "effect", "risk", "open", "read", "write",
+            "mixed-effect", "approval",
+        ],
+        "confidence": 0.97,
+    },
+    {
+        "category": "security",
         "title": "一次性核准必須在消費邊界重驗完整綁定並以權威事件恢復狀態",
         "technique": (
             "高風險動作的核准不能只比對客戶端送回的 token 與資料庫字串；消費時要用伺服器"
