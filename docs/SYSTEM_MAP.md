@@ -157,6 +157,22 @@ while historical recovery advances page-by-page with `server_cursor`. Background
 completion and cancellation each use a single terminal compare-and-set so a run
 cannot resurrect or emit duplicate final messages.
 
+Generated-tool steps launched by Web workflows pass through a second boundary:
+
+```text
+resolved generated tool + arguments
+  -> deterministic safety validation
+  -> frozen action manifest + effect classification
+  -> auto-allow harmless/read-only work, or persist approval.requested and pause
+  -> POST /api/command/approval with a one-shot decision token
+  -> reload and re-hash the artifact/dependencies/arguments
+  -> execute once, or fail closed on reject/expiry/restart/hash mismatch
+```
+
+Approval does not override the existing generated-tool validators. The Web card
+shows bounded effects and scopes, destructive actions require a second click,
+and the event journal carries durable request/resolution state for reconnect.
+
 Primary paths:
 
 - `src/openclaw_adapter/session_events.py`
@@ -164,6 +180,9 @@ Primary paths:
 - `src/openclaw_adapter/session_event_service.py`
 - `src/openclaw_adapter/session_projection.py`
 - `src/openclaw_adapter/run_recorder.py`
+- `src/openclaw_adapter/approval_models.py`
+- `src/openclaw_adapter/approval_store.py`
+- `src/openclaw_adapter/approval_service.py`
 - `src/openclaw_adapter/command_bridge.py`
 - `src/openclaw_adapter/command_bridge_server.py`
 

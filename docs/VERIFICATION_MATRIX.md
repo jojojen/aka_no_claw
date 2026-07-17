@@ -24,6 +24,7 @@ Last reviewed: 2026-07-17
 | Dashboard | Dashboard unit tests if available | `serve-dashboard` local browser smoke |
 | DB schema or runtime path | Init/migration tests for all readers/writers | `/restartall` or `POST /api/command/restartall` smoke and log check |
 | Web session/run event spine | `tests/test_session_events.py`, `tests/test_session_event_journal.py`, `tests/test_session_projection.py`, `tests/test_command_bridge_event_contract.py` | Restart bridge; replay `/api/command/events` after a completed async run and verify one final message |
+| Web generated-tool approval | `tests/test_approval_store.py`, `tests/test_dynamic_tool_approval.py`, `tests/test_command_bridge_approval_http.py` plus Web approval-card tests | Enable staged config; restart; prove approve-once, reject, expiry, hash mismatch, reconnect recovery, replay idempotency, privacy-safe events, and destructive second confirmation |
 | Launchd/service wiring | Targeted service tests and path-resolution tests | `/restartall` smoke plus log inspection on this machine; run the device setup script only for first-setup/cold-start verification |
 
 ## Web Event Spine Live Proof (2026-07-17)
@@ -39,6 +40,20 @@ Last reviewed: 2026-07-17
   event (`seq` 1622–1630). Repeated poll/replay did not advance cursor 1630.
 - A separate live cancellation remained interrupted and produced one
   `run.cancelled`; it did not regress to completed.
+
+## Web Generated-Tool Approval Live Proof (2026-07-17)
+
+- With `OPENCLAW_WEB_APPROVALS_ENABLED=true` after `/restartall`, a controlled
+  generated tool paused before its first write and rendered an approval card.
+- Approve-once executed exactly once. Replaying the same decision token was
+  idempotent and left the output timestamp unchanged.
+- Explicit reject, expiry, and artifact-hash mismatch produced no side effect.
+- Reload recovered the single unresolved approval card; its controls remained
+  usable, then became disabled after resolution.
+- A destructive fixture required `再按一次確認`; the first approval click made
+  no HTTP decision and created no file.
+- Request events contained bounded hashes/effects/scopes but no generated source
+  or raw arguments. Temporary proof fixtures were deleted and audit events kept.
 
 ## Reporting Verification
 

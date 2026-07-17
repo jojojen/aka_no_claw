@@ -1,7 +1,7 @@
 # Web Dynamic-Tool Approval Implementation Plan
 
 Last reviewed: 2026-07-17
-Status: Implemented behind `OPENCLAW_WEB_APPROVALS_ENABLED=0` pending staged live rollout
+Status: Current — shipped and locally enabled with `OPENCLAW_WEB_APPROVALS_ENABLED=true`
 Owner area: dynamic-tools / command-bridge safety
 Tracking issue: [`aka_no_claw#85`](https://github.com/jojojen/aka_no_claw/issues/85)
 Depends on: `WEB_SESSION_RUN_EVENT_SPINE_IMPLEMENTATION_PLAN.md` through E3
@@ -464,9 +464,26 @@ runner. Telegram and the shared runner are unchanged.
 - [x] A4.1 implement Web card and decision client.
 - [x] A4.2 retain pending approval on its workflow card across response updates.
 - [x] A4.3 disable decision controls immediately after submit.
-- [ ] A5.1 enable policy in staged config.
-- [ ] A5.2 restart and run approve/reject/mismatch live proof.
-- [ ] A5.3 update system truth and issue trail.
+- [x] A5.1 enable policy in staged config.
+- [x] A5.2 restart and run approve/reject/mismatch/expiry/reconnect live proof.
+- [x] A5.3 update system truth.
+- [ ] A5.4 update issue trail after the implementation commits are pushed.
+
+### Staged Live Proof — 2026-07-17
+
+- `/restartall` recreated the bridge, Telegram bot, and Web listener with the
+  approval feature enabled.
+- A controlled generated tool paused before its first write; approve-once ran
+  it exactly once, while token replay did not execute it again.
+- Explicit reject, expiry, and artifact-hash mismatch all failed closed without
+  changing the controlled output.
+- A pending card survived a Web reload and remained actionable; resolved cards
+  stayed disabled.
+- A destructive fixture required a second deliberate click. The first click
+  only changed the button to `再按一次確認` and produced no side effect.
+- `approval.requested` exposed bounded manifest metadata without source code or
+  raw arguments. Temporary fixtures and traces were removed; durable approval
+  audit events were retained.
 
 ## 19. Rollback
 
