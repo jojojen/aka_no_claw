@@ -64,6 +64,7 @@ def test_cursor_pages_are_replayable_without_duplicates(tmp_path, monkeypatch):
     second = bridge.read_session_events(after=first["server_cursor"], limit=20)
     sequences = [event["seq"] for event in first["events"] + second["events"]]
     assert sequences == sorted(set(sequences))
+    assert first["latest_cursor"] == second["latest_cursor"] == sequences[-1]
     assert second["has_more"] is False
 
 
@@ -136,7 +137,7 @@ def test_negotiated_ndjson_includes_new_durable_event_envelopes():
 
         def read_session_events(self, *, after=None, **kwargs):
             if after is None:
-                return {"status": "ok", "events": [], "server_cursor": 0}
+                return {"status": "ok", "events": [], "server_cursor": 0, "latest_cursor": 0}
             if after == 0:
                 return {"status": "ok", "events": [durable], "server_cursor": 1}
             return {"status": "ok", "events": [], "server_cursor": 1}
@@ -150,3 +151,42 @@ def test_negotiated_ndjson_includes_new_durable_event_envelopes():
     payloads = [json.loads(line) for line in handler.wfile.getvalue().split(b"\r\n\r\n", 1)[1].splitlines()]
     assert payloads[1]["type"] == "session_event"
     assert payloads[1]["event"] == durable
+
+
+def test_negotiated_ndjson_starts_at_journal_head_not_first_bootstrap_page():
+    historic = {"seq": 500, "type": "run.completed", "event_id": "historic"}
+    current = {"seq": 1001, "type": "run.accepted", "event_id": "current"}
+
+    class _Bridge:
+        def stream(self, req, request_id):
+            yield {"type": "start", "request_id": request_id}
+            yield {"type": "done", "message": "ok"}
+
+        def read_session_events(self, *, after=None, **kwargs):
+            if after is None:
+                return {
+                    "status": "ok", "events": [historic],
+                    "server_cursor": 500, "latest_cursor": 1000, "has_more": True,
+                }
+            if after == 1000:
+                return {
+                    "status": "ok", "events": [current],
+                    "server_cursor": 1001, "latest_cursor": 1001, "has_more": False,
+                }
+            return {
+                "status": "ok", "events": [],
+                "server_cursor": 1001, "latest_cursor": 1001, "has_more": False,
+            }
+
+    body = json.dumps({"mode": "chat", "input": "hi"}).encode()
+    handler = _handler(
+        _Bridge(), "POST", "/api/command/stream", body,
+        {"X-OpenClaw-Event-Version": "1"},
+    )
+    handler.do_POST()
+    payloads = [
+        json.loads(line)
+        for line in handler.wfile.getvalue().split(b"\r\n\r\n", 1)[1].splitlines()
+    ]
+    durable = [payload["event"] for payload in payloads if payload["type"] == "session_event"]
+    assert durable == [current]

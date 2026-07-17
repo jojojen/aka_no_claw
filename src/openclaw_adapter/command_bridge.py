@@ -4407,6 +4407,7 @@ class CommandBridge:
                 "session_id": journal.session_id,
                 "events": [event.to_dict() for event in page.events],
                 "server_cursor": page.server_cursor,
+                "latest_cursor": page.latest_seq,
                 "has_more": page.has_more,
             }
         except CursorExpiredError:

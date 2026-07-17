@@ -685,7 +685,13 @@ def _build_handler(
             cursor = 0
             if event_version:
                 bootstrap = bridge.read_session_events(session_id=req.session_id, after=None)
-                cursor = int(bootstrap.get("server_cursor") or 0)
+                # A bootstrap page can be capped below the journal head.  Start
+                # negotiated live delivery at the atomic latest cursor, not at
+                # the end of page one, or large sessions replay old events into
+                # an otherwise-live NDJSON response.
+                cursor = int(
+                    bootstrap.get("latest_cursor", bootstrap.get("server_cursor")) or 0
+                )
             try:
                 for event in stream:
                     line = (
