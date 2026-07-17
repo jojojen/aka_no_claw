@@ -686,17 +686,21 @@ then recorded in `docs/VERIFICATION_MATRIX.md`.
 
 ## 18. Progress / Handoff Checklist
 
-Implementation has not started. The first unchecked item is E1.1.
+E1 foundation is complete; it is deliberately not wired into request paths yet.
+The first unchecked item is E2.1 (`RunRecorder`). Verify E1 with:
+`\.venv/bin/python -m pytest -q tests/test_session_events.py
+tests/test_session_event_journal.py tests/test_session_projection.py
+tests/test_settings.py tests/test_session_memory.py`.
 
 ### E1 — foundation
 
-- [ ] E1.1 define event vocabulary and golden wire fixtures.
-- [ ] E1.2 implement bounded serializer/validator.
-- [ ] E1.3 implement append-only journal and sequence lock.
-- [ ] E1.4 implement cursor reads and pagination.
-- [ ] E1.5 implement tail recovery and explicit corruption handling.
-- [ ] E1.6 implement deterministic projector.
-- [ ] E1.7 implement legacy snapshot migration fixtures.
+- [x] E1.1 define event vocabulary and golden wire fixtures.
+- [x] E1.2 implement bounded serializer/validator.
+- [x] E1.3 implement append-only journal and sequence lock.
+- [x] E1.4 implement cursor reads and pagination.
+- [x] E1.5 implement tail recovery and explicit corruption handling.
+- [x] E1.6 implement deterministic projector.
+- [x] E1.7 implement legacy snapshot migration fixtures.
 
 ### E2 — blocking compatibility
 

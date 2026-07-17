@@ -203,6 +203,13 @@ class AssistantSettings:
     # reconnects restores its session from the Mac mini. Gitignored runtime data
     # under .openclaw_tmp/, never committed and never written to knowledge.sqlite3.
     openclaw_web_memory_dir: str = ".openclaw_tmp/web_console_memory"
+    # Replayable, append-only Web session/run history (#84). This stays in a
+    # separate runtime directory so legacy snapshot compatibility remains
+    # available while the event spine is rolled out in later slices.
+    openclaw_web_event_dir: str = ".openclaw_tmp/web_sessions"
+    openclaw_web_event_max_bytes: int = 25 * 1024 * 1024
+    openclaw_web_event_max_age_days: int = 30
+    openclaw_web_event_max_payload_bytes: int = 64 * 1024
     # ── chat LLM pool settings (issue #66) ────────────────────────────────
     # User-editable provider order, enable flags, and selected model ids for
     # Web Chat + Telegram natural-language routing. Secrets stay in .env.
@@ -572,6 +579,18 @@ def get_settings() -> AssistantSettings:
         ),
         openclaw_web_memory_dir=_resolve_runtime_path(
             os.getenv("OPENCLAW_WEB_MEMORY_DIR", ".openclaw_tmp/web_console_memory")
+        ),
+        openclaw_web_event_dir=_resolve_runtime_path(
+            os.getenv("OPENCLAW_WEB_EVENT_DIR", ".openclaw_tmp/web_sessions")
+        ),
+        openclaw_web_event_max_bytes=_as_int(
+            os.getenv("OPENCLAW_WEB_EVENT_MAX_BYTES"), default=25 * 1024 * 1024
+        ),
+        openclaw_web_event_max_age_days=_as_int(
+            os.getenv("OPENCLAW_WEB_EVENT_MAX_AGE_DAYS"), default=30
+        ),
+        openclaw_web_event_max_payload_bytes=_as_int(
+            os.getenv("OPENCLAW_WEB_EVENT_MAX_PAYLOAD_BYTES"), default=64 * 1024
         ),
         openclaw_llm_pool_config_path=_resolve_runtime_path(
             os.getenv("OPENCLAW_LLM_POOL_CONFIG_PATH", "config/llm_pool.json")

@@ -210,3 +210,18 @@ def test_get_settings_resolves_runtime_db_paths_against_repo_root(monkeypatch) -
     assert settings.sns_inbox_db_path == str((expected_root / "data/sns_inbox.sqlite3").resolve())
     assert settings.knowledge_inbox_db_path == str((expected_root / "data/knowledge_inbox.sqlite3").resolve())
     assert settings.opportunity_db_path == str((expected_root / "data/opportunities.sqlite3").resolve())
+
+
+def test_get_settings_reads_web_event_journal_environment_keys(monkeypatch, tmp_path) -> None:
+    event_dir = tmp_path / "web-events"
+    monkeypatch.setenv("OPENCLAW_WEB_EVENT_DIR", str(event_dir))
+    monkeypatch.setenv("OPENCLAW_WEB_EVENT_MAX_BYTES", "123456")
+    monkeypatch.setenv("OPENCLAW_WEB_EVENT_MAX_AGE_DAYS", "14")
+    monkeypatch.setenv("OPENCLAW_WEB_EVENT_MAX_PAYLOAD_BYTES", "4096")
+
+    settings = get_settings()
+
+    assert settings.openclaw_web_event_dir == str(event_dir)
+    assert settings.openclaw_web_event_max_bytes == 123456
+    assert settings.openclaw_web_event_max_age_days == 14
+    assert settings.openclaw_web_event_max_payload_bytes == 4096
