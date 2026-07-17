@@ -55,6 +55,12 @@ class SessionEventService:
             return journal
         if legacy_snapshot is not None:
             snapshot = legacy_snapshot
+        elif journal.session_id != DEFAULT_SESSION_ID:
+            # The legacy store is a single global browser snapshot. Importing
+            # it into every newly named session cross-contaminates otherwise
+            # independent conversations. Named sessions only migrate a
+            # snapshot when the compatibility POST supplies it explicitly.
+            snapshot = {}
         else:
             try:
                 snapshot = self._legacy_store().load()

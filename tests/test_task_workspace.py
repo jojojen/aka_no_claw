@@ -17,6 +17,7 @@ from openclaw_adapter.task_workspace import (
     COMMAND_SINK_DENYLIST,
     COMMAND_SINK_INPUT_TYPES,
     VARIABLE_TYPE_COMMAND_RESULT,
+    VARIABLE_TYPE_EVIDENCE,
     VARIABLE_TYPE_PLAIN_TEXT,
     VARIABLE_TYPE_SPEECH_TEXT,
     is_command_sink_allowed,
@@ -227,6 +228,7 @@ def test_tool_call_ok_binds_variable():
     assert trace.final_result == "東京：晴れ"
     assert trace.steps[0].status == "ok"
     assert trace.steps[0].output_var == "weather"
+    assert trace.variables["weather"].type == VARIABLE_TYPE_EVIDENCE
 
 
 def test_tool_call_fail_marks_failed():
@@ -635,6 +637,77 @@ def test_llm_transform_prompt_embeds_all_input_variables():
     assert "ご主人様" in prompt
     assert "[weather]" in prompt
     assert "[user_name]" in prompt
+
+
+def test_llm_transform_repairs_numeric_claim_missing_from_evidence():
+    class SequentialLLM:
+        def __init__(self) -> None:
+            self.responses = [
+                "建議再加上鑑定費¥1,000 後計算。",
+                "現有證據沒有鑑定費用，無法完成利潤計算。",
+            ]
+            self.prompts: list[str] = []
+
+        def generate(self, prompt: str, *, temperature: float = 0.0) -> str:
+            self.prompts.append(prompt)
+            return self.responses.pop(0)
+
+    llm = SequentialLLM()
+    ex, runner = _make_runner()
+    runner.llm_client = llm
+    store = VariableStore()
+    store.bind(
+        "market_data",
+        "目前售價¥8,100；已售均價¥11,110。",
+        "s0",
+        "research",
+        type_=VARIABLE_TYPE_EVIDENCE,
+    )
+    step = WorkflowStep(
+        id="s1",
+        kind="llm_transform",
+        inputs=["market_data"],
+        instructions="評估轉賣利潤",
+        output="answer",
+    )
+
+    step_trace, var_name = runner._run_llm_transform(step, store)
+
+    assert step_trace.status == "ok"
+    assert var_name == "answer"
+    assert len(llm.prompts) == 2
+    assert "¥1,000" in llm.prompts[1]
+    assert "¥1,000" not in store.resolve("answer")
+    assert "沒有鑑定費用" in store.resolve("answer")
+
+
+def test_llm_transform_falls_back_when_numeric_repair_still_invents():
+    llm = FakeLLMClient("估計成本¥1,000。")
+    ex, runner = _make_runner()
+    runner.llm_client = llm
+    store = VariableStore()
+    store.bind(
+        "facts",
+        "成交價¥8,100。",
+        "s0",
+        "tool",
+        type_=VARIABLE_TYPE_EVIDENCE,
+    )
+    step = WorkflowStep(
+        id="s1",
+        kind="llm_transform",
+        inputs=["facts"],
+        instructions="計算結果",
+        output="answer",
+    )
+
+    step_trace, _ = runner._run_llm_transform(step, store)
+
+    assert step_trace.status == "ok"
+    assert len(llm.prompts) == 2
+    assert store.resolve("answer").startswith("現有輸入不足")
+    assert "¥1,000" not in store.resolve("answer")
+    assert "¥8,100" in store.resolve("answer")
 
 
 def test_llm_transform_no_client_fails():

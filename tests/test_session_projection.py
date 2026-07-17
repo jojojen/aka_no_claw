@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from openclaw_adapter.session_events import SessionRunEvent
-from openclaw_adapter.session_projection import migrate_legacy_snapshot, project_session
+from openclaw_adapter.session_projection import (
+    is_authoritative_message,
+    migrate_legacy_snapshot,
+    project_session,
+)
 
 
 def _event(seq, event_type, payload=None, run_id="run-1", event_id=None):
@@ -39,6 +43,23 @@ def test_projection_preserves_message_mode_and_legacy_chat_route():
     assert projection.messages[0]["mode"] == "chat"
     assert projection.runs["new"]["mode"] == "chat"
     assert projection.runs["old"]["route"] == "stream_chat"
+
+
+def test_projection_marks_interrupted_partial_as_non_authoritative_but_keeps_it_visible():
+    projection = project_session([
+        _event(1, "user.message", {"text": "question", "mode": "chat"}),
+        _event(2, "run.accepted", {"mode": "chat"}),
+        _event(3, "assistant.message", {
+            "text": "unfinished reasoning", "mode": "chat", "partial": True,
+        }),
+        _event(4, "run.interrupted"),
+    ])
+
+    assert [message["text"] for message in projection.messages] == [
+        "question", "unfinished reasoning",
+    ]
+    assert is_authoritative_message(projection.messages[0], projection.runs) is True
+    assert is_authoritative_message(projection.messages[1], projection.runs) is False
 
 
 def test_legacy_snapshot_migration_is_stable_and_projects_visible_messages():

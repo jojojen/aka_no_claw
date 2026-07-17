@@ -19,7 +19,7 @@ from uuid import uuid4
 from .session_events import SessionRunEvent
 
 
-CHECKPOINT_VERSION = 1
+CHECKPOINT_VERSION = 2
 _SECRET_RE = re.compile(r"(?:api[_ -]?key|authorization|password|secret)\s*[:=]\s*\S+", re.I)
 
 
@@ -140,7 +140,14 @@ class ContextCheckpointStore:
 
 
 class ContextCompactor:
-    """Deterministic first compactor; it never asserts facts beyond events."""
+    """Typed hierarchical compactor with a raw recent tail.
+
+    A checkpoint covers only a closed prefix.  Recent authoritative messages
+    remain raw in normal history, while older user statements, unverified
+    assistant prose, and tool evidence retain distinct trust labels.  This is
+    the same boundary-preserving shape as a two-pass compactor without asking a
+    weak model to invent the summary itself.
+    """
 
     def __init__(self, store: ContextCheckpointStore, *, recent_turns: int = 6) -> None:
         self._store = store
@@ -164,14 +171,63 @@ class ContextCompactor:
             event.run_id for event in events
             if event.seq <= clear_seq and event.type in {"run.accepted", "run.started"}
         }
+        terminal_status = {
+            event.run_id: event.type
+            for event in events
+            if event.type in {"run.completed", "run.failed", "run.cancelled", "run.interrupted"}
+        }
         messages = [
             event for event in events
             if event.seq > clear_seq
             and event.run_id not in cleared_run_ids
             and event.type in {"user.message", "assistant.message"}
             and event.visibility == "user"
+            and not (
+                event.type == "assistant.message"
+                and (
+                    event.payload.get("partial") is True
+                    or terminal_status.get(event.run_id)
+                    in {"run.failed", "run.cancelled", "run.interrupted"}
+                )
+            )
         ]
-        eligible = messages[:-self._recent_turns]
+        if len(messages) <= self._recent_turns:
+            return None
+        # Keep the newest raw tail and never split inside the run containing
+        # its first item.  Tool results produced by the older closed prefix are
+        # carried with that prefix instead of being orphaned.
+        tail_item = messages[-self._recent_turns]
+        tail_run_id = tail_item.run_id
+        # Normal journals have one user prompt per run, so snap to that run's
+        # beginning.  Legacy imports put many turns in one synthetic run; in
+        # that shape the message boundary is already the safest available cut.
+        user_items_in_tail_run = sum(
+            1
+            for event in events
+            if event.run_id == tail_run_id and event.type == "user.message"
+        )
+        tail_run_start = (
+            min(event.seq for event in events if event.run_id == tail_run_id)
+            if user_items_in_tail_run <= 1
+            else tail_item.seq
+        )
+        eligible = [
+            event for event in events
+            if event.seq > clear_seq
+            and event.seq < tail_run_start
+            and event.run_id not in cleared_run_ids
+            and event.visibility in {"user", "internal"}
+            and (
+                event.type == "user.message"
+                or event.type == "tool.result"
+                or (
+                    event.type == "assistant.message"
+                    and event.payload.get("partial") is not True
+                    and terminal_status.get(event.run_id)
+                    not in {"run.failed", "run.cancelled", "run.interrupted"}
+                )
+            )
+        ]
         if not eligible:
             return None
         previous = self._store.latest(session_id)
@@ -183,27 +239,46 @@ class ContextCompactor:
             if not eligible:
                 return previous
             start = previous.source_seq_start
-        source_ids = {event.event_id for event in eligible}
-        lines = ["較早對話的可追溯摘要（不是原始歷史）："]
+        lines = [
+            "較早對話的分層可追溯摘要（不是原始歷史）：",
+            "信任規則：使用者後來的更正優先；助理舊說法未經驗證；工具證據只支持其明載內容。",
+        ]
         if previous is not None:
             previous_lines = previous.summary.splitlines()
             if previous_lines and previous_lines[0] == lines[0]:
-                previous_lines = previous_lines[1:]
+                previous_lines = previous_lines[2:]
             lines.extend(previous_lines)
         for event in eligible:
-            text = event.payload.get("text")
+            text = (
+                event.payload.get("content")
+                if event.type == "tool.result"
+                else event.payload.get("text")
+            )
             if not isinstance(text, str):
                 continue
             excerpt = _safe_excerpt(text)
             if excerpt is not None:
-                label = "使用者" if event.type == "user.message" else "助理"
-                lines.append(f"- {label}（{event.event_id}）：{excerpt}")
-        if len(lines) == 1:
+                if event.type == "user.message":
+                    label = "使用者陳述／更正"
+                elif event.type == "assistant.message":
+                    label = "助理先前說法（未驗證）"
+                else:
+                    evidence_id = str(event.payload.get("evidence_id") or event.event_id)
+                    status = str(event.payload.get("status") or "unknown")
+                    source_type = str(event.payload.get("source_type") or "legacy_untyped")
+                    label = (
+                        f"工具證據 {evidence_id}（status={status}）"
+                        if source_type == "tool_result"
+                        else f"衍生助理結果（未驗證，source_type={source_type}）"
+                    )
+                lines.append(f"- {label}（event={event.event_id}）：{excerpt}")
+        if len(lines) == 2:
             return None
+        source_ids = {event.event_id for event in eligible}
         checkpoint = ContextCheckpoint(
             checkpoint_version=CHECKPOINT_VERSION, checkpoint_id=uuid4().hex, session_id=session_id,
             source_seq_start=start, source_seq_end=eligible[-1].seq, created_at=time.time(),
-            model_provider="deterministic", model_id="event-excerpt-v1", prompt_version="context-checkpoint-v1",
+            model_provider="deterministic", model_id="typed-hierarchical-v2", prompt_version="context-checkpoint-v2",
             summary="\n".join(lines), pinned_facts=(), unresolved_items=(), artifact_refs=(),
             validation_status="valid", previous_checkpoint_id=previous.checkpoint_id if previous else None,
         )

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -65,14 +66,66 @@ def is_command_sink_allowed(command: str) -> bool:
 VARIABLE_TYPE_PLAIN_TEXT = "plain_text"
 VARIABLE_TYPE_SPEECH_TEXT = "speech_text"
 VARIABLE_TYPE_COMMAND_RESULT = "command_result"
+VARIABLE_TYPE_EVIDENCE = "evidence"
+VARIABLE_TYPE_USER_CONTEXT = "user_context"
+VARIABLE_TYPE_UNTRUSTED_CONTEXT = "untrusted_context"
+VARIABLE_TYPE_REQUIREMENT = "requirement"
+
+_TRUSTED_FACT_TYPES = frozenset({
+    VARIABLE_TYPE_EVIDENCE,
+    VARIABLE_TYPE_USER_CONTEXT,
+    VARIABLE_TYPE_COMMAND_RESULT,
+})
+_NUMERIC_ATOM_RE = re.compile(
+    r"(?<![\w])(?:[¥$€£]\s*)?\d[\d,]*(?:\.\d+)?%?(?![\w])"
+)
+
+
+def _normalise_numeric_atom(value: str) -> str:
+    return re.sub(r"[\s,]", "", value).lower()
+
+
+def unsupported_numeric_atoms(answer: str, trusted_inputs: str) -> list[str]:
+    """Return material numeric claims absent from factual/user evidence.
+
+    Small bare integers are commonly list numbering, so only currency,
+    percentages, decimals, or magnitudes >= 100 are gated.  This is a generic
+    provenance check: no product, price, marketplace, or grading vocabulary is
+    involved.
+    """
+    allowed = {
+        _normalise_numeric_atom(atom)
+        for atom in _NUMERIC_ATOM_RE.findall(trusted_inputs)
+    }
+    unsupported: list[str] = []
+    for match in _NUMERIC_ATOM_RE.finditer(answer):
+        atom = match.group(0)
+        normalized = _normalise_numeric_atom(atom)
+        digits = re.sub(r"\D", "", normalized)
+        line_prefix = answer[answer.rfind("\n", 0, match.start()) + 1 : match.start()]
+        suffix = answer[match.end() : match.end() + 1]
+        is_list_marker = not line_prefix.strip() and suffix in {".", "、", ")", "）"}
+        material = (
+            any(symbol in atom for symbol in "¥$€£%")
+            or "." in atom
+            or (digits.isdigit() and int(digits) >= 100)
+            or not is_list_marker
+        )
+        if material and normalized not in allowed and atom not in unsupported:
+            unsupported.append(atom)
+    return unsupported
 
 # Accepted input variable types per command sink.
 # None means any text type is accepted (generic text-input commands).
 # Commands that are TTS-focused require plain or speech text to avoid passing
 # raw command-result objects (e.g. JSON) to a voice synthesiser.
 COMMAND_SINK_INPUT_TYPES: dict[str, frozenset[str] | None] = {
-    "/saynow": frozenset({VARIABLE_TYPE_PLAIN_TEXT, VARIABLE_TYPE_SPEECH_TEXT}),
-    "/generateaudio":    frozenset({VARIABLE_TYPE_PLAIN_TEXT, VARIABLE_TYPE_SPEECH_TEXT}),
+    "/saynow": frozenset({
+        VARIABLE_TYPE_PLAIN_TEXT, VARIABLE_TYPE_SPEECH_TEXT, VARIABLE_TYPE_EVIDENCE,
+    }),
+    "/generateaudio": frozenset({
+        VARIABLE_TYPE_PLAIN_TEXT, VARIABLE_TYPE_SPEECH_TEXT, VARIABLE_TYPE_EVIDENCE,
+    }),
 }
 
 # Maps slash-command string to a callable that takes the input text and returns
@@ -277,7 +330,7 @@ class Workflow:
                         )
             defined.add(step.output)
             var_types[step.output] = {
-                "tool_call": VARIABLE_TYPE_PLAIN_TEXT,
+                "tool_call": VARIABLE_TYPE_EVIDENCE,
                 "command_sink": VARIABLE_TYPE_COMMAND_RESULT,
                 "llm_transform": VARIABLE_TYPE_SPEECH_TEXT,
             }.get(step.kind, VARIABLE_TYPE_PLAIN_TEXT)
@@ -663,7 +716,7 @@ class WorkflowRunner:
                 step.output, result_text,
                 source_step=step.id,
                 provenance=provenance,
-                type_=VARIABLE_TYPE_PLAIN_TEXT,
+                type_=VARIABLE_TYPE_EVIDENCE,
             )
             return (
                 StepTrace(
@@ -813,8 +866,11 @@ class WorkflowRunner:
                 None,
             )
 
-        # Resolve and embed each input variable — these are the sole grounding source.
+        # Resolve and embed each input variable with its trust class.  Context
+        # and earlier model prose may clarify intent, but only user/tool/command
+        # observations may ground factual claims.
         input_blocks: list[str] = []
+        trusted_values: list[str] = []
         for var_name in step.inputs:
             try:
                 value = store.resolve(var_name)
@@ -826,7 +882,18 @@ class WorkflowRunner:
                     ),
                     None,
                 )
-            input_blocks.append(f"[{var_name}]\n{value}")
+            variable = store.get(var_name)
+            variable_type = variable.type if variable is not None else "text"
+            if variable_type in _TRUSTED_FACT_TYPES:
+                trust = "grounding_source"
+                trusted_values.append(value)
+            elif variable_type == VARIABLE_TYPE_REQUIREMENT:
+                trust = "requirement_only"
+            else:
+                trust = "untrusted_context_only"
+            input_blocks.append(
+                f"[{var_name}] type={variable_type} trust={trust}\n{value}"
+            )
 
         inputs_text = "\n\n".join(input_blocks)
         prompt = (
@@ -834,6 +901,11 @@ class WorkflowRunner:
             f"Task instructions: {step.instructions or 'Transform the input data.'}\n\n"
             "Strict rules (never break these):\n"
             "- Use ONLY information present in the input data above.\n"
+            "- Only blocks marked trust=grounding_source may support factual or numeric claims.\n"
+            "- Blocks marked untrusted_context_only may clarify what is being discussed, "
+            "but their assistant claims are NOT evidence and must not be repeated as facts.\n"
+            "- If the requested conclusion requires facts absent from grounding_source blocks, "
+            "state exactly what is missing instead of filling the gap.\n"
             "- Do NOT invent, infer, or supplement facts absent from the input "
             "(e.g. temperatures, weather, locations, numbers, events).\n"
             "- Output the result only — no explanations, headings, or preamble."
@@ -850,6 +922,34 @@ class WorkflowRunner:
                 ),
                 None,
             )
+
+        trusted_text = "\n".join(trusted_values)
+        unsupported = unsupported_numeric_atoms(result, trusted_text)
+        if unsupported:
+            repair_prompt = (
+                f"Grounding sources:\n{trusted_text}\n\n"
+                f"Draft answer:\n{result}\n\n"
+                "Rewrite the draft using only the grounding sources. The following material "
+                f"numeric claims have no matching source value: {unsupported}. "
+                "Remove them, or replace the affected conclusion with a clear statement of "
+                "what evidence is missing. Do not add any new facts or numbers. Output only "
+                "the corrected answer."
+            )
+            try:
+                repaired = self.llm_client.generate(repair_prompt, temperature=0.2)
+            except Exception:  # noqa: BLE001 - retain the structural safe fallback below
+                logger.exception(
+                    "task_workspace: numeric grounding repair failed step=%s", step.id
+                )
+                repaired = ""
+            if repaired and not unsupported_numeric_atoms(repaired, trusted_text):
+                result = repaired
+            else:
+                excerpts = "\n\n".join(value[:1600] for value in trusted_values if value.strip())
+                result = (
+                    "現有輸入不足以支持包含新數字的結論；以下是目前可確認的資料：\n\n"
+                    f"{excerpts or '（沒有可用的事實證據）'}"
+                )
 
         provenance = f"llm_transform(inputs={step.inputs})"
         var = store.bind(

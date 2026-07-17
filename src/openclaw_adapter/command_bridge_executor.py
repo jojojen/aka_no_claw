@@ -19,6 +19,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, Protocol
+from uuid import uuid4
 
 from .command_bridge_models import (
     CHAT_BACKEND_LOCAL,
@@ -31,6 +32,7 @@ from .command_bridge_models import (
     CHAT_TOOL_VISION,
     STATUS_ERROR,
     ChatToolPlan,
+    ChatEvidence,
     ChatToolPolicy,
     ChatToolRequest,
     ChatToolResult,
@@ -110,8 +112,9 @@ class ExecutorDeps(Protocol):
     def _conversation_key(self, req: WebCommandRequest) -> str: ...
 
     def _record_chat_tool_run(
-        self, req: WebCommandRequest, tool: str, query: str, *, status: str, summary: str
-    ) -> None: ...
+        self, req: WebCommandRequest, tool: str, query: str, *, status: str, summary: str,
+        source_type: str = "tool_result",
+    ) -> ChatEvidence: ...
 
     def _tool_display_name(self, command: str) -> str: ...
 
@@ -173,12 +176,18 @@ class ChatToolExecutor:
         self._ledger_lock = threading.Lock()
 
     def record_run(
-        self, req: WebCommandRequest, tool: str, query: str, *, status: str, summary: str
-    ) -> None:
+        self, req: WebCommandRequest, tool: str, query: str, *, status: str, summary: str,
+        source_type: str = "tool_result",
+    ) -> ChatEvidence:
+        record_id = uuid4().hex
         entry = {
+            "evidence_id": record_id,
+            "tool_call_id": record_id,
+            "source_type": source_type,
             "tool": tool,
             "query": " ".join(str(query or "").split())[:200],
             "status": status,
+            "content": " ".join(str(summary or "").split())[:4000],
             "summary": " ".join(str(summary or "").split())[:_CHAT_TOOL_LEDGER_SUMMARY_CHARS],
         }
         with self._ledger_lock:
@@ -186,6 +195,7 @@ class ChatToolExecutor:
                 self._deps._conversation_key(req), deque(maxlen=_CHAT_TOOL_LEDGER_LIMIT)
             )
             ledger.append(entry)
+        return ChatEvidence(**entry)
 
     def ledger_entries(self, req: WebCommandRequest) -> list[dict]:
         with self._ledger_lock:

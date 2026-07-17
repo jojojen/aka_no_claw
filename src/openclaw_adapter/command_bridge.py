@@ -41,6 +41,7 @@ from .session_memory import SessionMemoryStore, SessionWriteError, empty_session
 from .session_event_service import SessionEventService
 from .session_event_journal import CursorExpiredError
 from .session_events import TERMINAL_EVENT_TYPES
+from .session_projection import is_authoritative_message, project_session
 from .run_recorder import RunRecorder
 from .context_checkpoint import ContextCheckpointStore, ContextCompactor, estimate_tokens
 from .action_risk import (
@@ -118,7 +119,6 @@ from .command_bridge_models import (
     WebCommandRequest,
     WebCommandResponse,
     RequestValidationError,
-    _CHAT_ROLE_LABELS,
     _clip,
     _encode_image_attachment,
     _image_temp_suffix,
@@ -233,6 +233,17 @@ _GOAL_STOP_INPUT = "__goal_stop__"
 _GOAL_SAVE_WORKFLOW_INPUT = "__goal_save_workflow__"
 _GOAL_STEP_GRANT = 6
 _GOAL_REPLAN_LIMIT = 2
+# Capability scope inherited by a goal that escalates from an incomplete
+# read/query operation. Unknown commands default to excluded: the planner may
+# gather more evidence, but it cannot add device, playback, speech, mutation,
+# or other side effects that the user never authorized.
+_GOAL_READ_ONLY_COMMANDS = frozenset({
+    "/fetch", "/heat", "/hot", "/kb", "/knowledge", "/liquidity",
+    "/lookup", "/musiclistall", "/musiclistbest", "/price", "/proof",
+    "/read", "/repcheck", "/reputation", "/research", "/resaerch",
+    "/scorecard", "/search", "/snapshot", "/stats", "/trend",
+    "/trending", "/web",
+})
 _GOAL_SEARCH_GRANT = 5
 
 _SELLER_UNSUPPORTED_MSG = "賣家信譽快照目前尚未由本地 command bridge 支援。"
@@ -287,13 +298,18 @@ _GOAL_RESULT_SATISFACTION_PROMPT = """你要判斷「執行結果」是否已真
 4. 若目標是「改變狀態的動作」（例如開關某裝置、調整某設定），只要執行結果已回報
    該動作執行成功、或回報狀態已在極限無法再改變，就算達成，請判定 satisfied=true；
    不要因為結果沒有附加額外資訊而判定未達成。
-5. 只能輸出 JSON，不要加任何其他文字。
+5. 同時檢查結果中的外部事實與數字是否能由「可用證據」支持；若結果加入證據沒有的
+   費用、價格、時間、比率、狀態或其他事實，必須判定 satisfied=false。
+6. 只能輸出 JSON，不要加任何其他文字。
 
 請輸出：
 {{"satisfied": true 或 false, "reason": "一句極短理由"}}
 
 任務目標：
 {goal}
+
+可用證據（source_type=derived/untrusted 的內容不是事實來源）：
+{evidence}
 
 執行結果：
 {final_result}
@@ -594,6 +610,9 @@ class CommandBridge:
         self._active_goal_runs_lock = threading.Lock()
         self._active_run_recorder: ContextVar[RunRecorder | None] = ContextVar(
             "active_run_recorder", default=None
+        )
+        self._goal_read_only_scope: ContextVar[bool] = ContextVar(
+            "goal_read_only_scope", default=False
         )
         self._image_renderer = None
         self._image_renderer_built = False
@@ -979,7 +998,10 @@ class CommandBridge:
         if direct is not None:
             return direct
         prompt = build_chat_prompt(
-            req.input, req.history, trusted_context=self._trusted_context_checkpoint(req)
+            req.input,
+            req.history,
+            trusted_context=self._trusted_context_checkpoint(req),
+            evidence_context=self._trusted_evidence_context(req),
         )
         plan, metadata = self._select_chat_tool_plan(req)
         if plan is not None and plan.tool == CHAT_TOOL_CREATE_WORKFLOW:
@@ -1035,7 +1057,15 @@ class CommandBridge:
                     mode=MODE_CHAT,
                 )
         if plan is not None and plan.tool == CHAT_TOOL_NO_TOOL:
-            message = plan.answer
+            if plan.answer:
+                # Compatibility seam for tests/older direct callers that inject
+                # a plan without going through ChatToolPlanner.  Production
+                # planner output is normalized to answer="" above.
+                message = plan.answer
+            else:
+                message, metadata = self._generate_chat_response_blocking(
+                    prompt, req.chat_backend, conversation_key=self._conversation_key(req)
+                )
         else:
             message, metadata = self._generate_chat_response_blocking(
                 prompt, req.chat_backend, conversation_key=self._conversation_key(req)
@@ -1079,7 +1109,10 @@ class CommandBridge:
                 yield stream_process(f"🔍 圖片觀察：{observation}")
 
         prompt = build_chat_prompt(
-            req.input, req.history, trusted_context=self._trusted_context_checkpoint(req)
+            req.input,
+            req.history,
+            trusted_context=self._trusted_context_checkpoint(req),
+            evidence_context=self._trusted_evidence_context(req),
         )
         # The observation also reaches the router-failed fallback prompt below.
         if observation:
@@ -1114,8 +1147,14 @@ class CommandBridge:
             return
         if plan is not None and plan.tool == CHAT_TOOL_NO_TOOL:
             if plan.answer:
+                # Same compatibility seam as the blocking path; the real
+                # planner strips obsolete router prose before this point.
                 yield stream_delta(plan.answer)
-            yield stream_done(plan.answer, model_metadata=metadata)
+                yield stream_done(plan.answer, model_metadata=metadata)
+            else:
+                yield from self._stream_chat_response(
+                    prompt, req.chat_backend, conversation_key=self._conversation_key(req)
+                )
         else:
             # plan is None only when the router failed or emitted untrusted
             # output — say so, instead of silently degrading to plain chat.
@@ -1405,11 +1444,35 @@ class CommandBridge:
         *,
         status: str,
         summary: str,
+        source_type: str = "tool_result",
     ) -> None:
-        self._executor.record_run(req, tool, query, status=status, summary=summary)
+        evidence = self._executor.record_run(
+            req, tool, query, status=status, summary=summary, source_type=source_type
+        )
+        recorder = self._active_run_recorder.get()
+        if recorder is not None:
+            recorder.tool_result(evidence.to_dict())
 
     def _chat_tool_ledger_entries(self, req: WebCommandRequest) -> list[dict]:
-        return self._executor.ledger_entries(req)
+        durable: list[dict] = []
+        if req.session_id:
+            try:
+                projected = project_session(
+                    self._event_sessions().ensure(req.session_id).events()
+                )
+                durable = [
+                    dict(item) for item in projected.evidence
+                    if isinstance(item, dict)
+                ]
+            except Exception:  # noqa: BLE001 - evidence improves quality, not availability
+                logger.warning("chat evidence hydration failed", exc_info=True)
+        current = self._executor.ledger_entries(req)
+        merged: dict[str, dict] = {}
+        for item in [*durable, *current]:
+            evidence_id = str(item.get("evidence_id") or "")
+            key = evidence_id or f"{item.get('tool')}:{item.get('query')}:{item.get('summary')}"
+            merged[key] = item
+        return list(merged.values())[-8:]
 
     def _record_goal_loop_run(self, req: WebCommandRequest, goal: str, report) -> None:
         try:
@@ -1428,6 +1491,7 @@ class CommandBridge:
                 goal,
                 status="ok" if getattr(report, "done", False) else "partial",
                 summary=summary,
+                source_type="derived_answer",
             )
         except Exception:  # noqa: BLE001
             logger.exception("chat tool ledger: failed to record goal loop run")
@@ -2026,6 +2090,7 @@ class CommandBridge:
                 narrator=narrator,
                 seed_variables=seed_variables,
                 seed_operations=seed_operations,
+                cancel_check=self._cancel_probe(_BRIDGE_CHAT_ID),
                 safe_boundary=(
                     (lambda boundary: self._consume_goal_interjections(goal_session_id, recorder.run_id, recorder, boundary))
                     if recorder is not None else None
@@ -2034,7 +2099,8 @@ class CommandBridge:
         except Exception as exc:  # noqa: BLE001
             logger.exception("goal loop failed goal=%r", goal)
             self._record_chat_tool_run(
-                req, CHAT_TOOL_GOAL, goal, status="error", summary=str(exc)
+                req, CHAT_TOOL_GOAL, goal, status="error", summary=str(exc),
+                source_type="derived_answer",
             )
             return WebCommandResponse(
                 status=STATUS_ERROR,
@@ -2237,7 +2303,8 @@ class CommandBridge:
             raise
         if "error" in result:
             self._record_chat_tool_run(
-                req, CHAT_TOOL_GOAL, goal, status="error", summary=str(result["error"])
+                req, CHAT_TOOL_GOAL, goal, status="error", summary=str(result["error"]),
+                source_type="derived_answer",
             )
             yield stream_error(f"目標執行失敗：{result['error']}")
             return
@@ -2272,6 +2339,20 @@ class CommandBridge:
         # multi-step goal spreads load across the cloud pool instead of
         # retrying provider[0] first on every single call.
         pool_rotation = CloudPoolRotation()
+        try:
+            result_judge = self._goal_result_judge(
+                chat_backend,
+                pool_rotation=pool_rotation,
+                seed_variables=seed_variables,
+            )
+        except TypeError as exc:
+            # Compatibility for integrations/tests that replace the historical
+            # two-argument factory. Production uses the evidence-aware branch.
+            if "seed_variables" not in str(exc):
+                raise
+            result_judge = self._goal_result_judge(
+                chat_backend, pool_rotation=pool_rotation
+            )
         loop = GoalLoop(
             goal=resume.state.goal if resume is not None else goal,
             planner=self._build_goal_planner(
@@ -2285,7 +2366,7 @@ class CommandBridge:
             max_steps=_GOAL_STEP_GRANT,
             replan_limit=_GOAL_REPLAN_LIMIT,
             narrator=narrator,
-            result_judge=self._goal_result_judge(chat_backend, pool_rotation=pool_rotation),
+            result_judge=result_judge,
             seed_variables=seed_variables,
             seed_operations=seed_operations,
             conservative_synthesizer=self._goal_conservative_synthesizer(
@@ -2310,10 +2391,17 @@ class CommandBridge:
         progress: Callable[[str], None] | None = None,
         pool_rotation: "CloudPoolRotation | None" = None,
     ) -> GoalPlanner:
+        command_registry = self._handlers()
+        if self._goal_read_only_scope.get():
+            command_registry = {
+                command: handler
+                for command, handler in command_registry.items()
+                if command in _GOAL_READ_ONLY_COMMANDS
+            }
         return GoalPlanner(
             catalog=runner.catalog,
             llm_client=self._goal_planner_client(chat_backend),
-            command_registry=self._handlers(),
+            command_registry=command_registry,
             command_usage_resolver=lambda command, _registry: self._registered_command_usage(command),
             progress=progress,
             pool_rotation=pool_rotation,
@@ -3087,14 +3175,18 @@ class CommandBridge:
         # workflow can't spend a second identical /research on the same query —
         # a duplicate step gets the answer we already hold, not a fresh run.
         seed_operations = {outcome.operation_key: tool_result.answer}
-        response = self._run_goal_loop_blocking(
-            req,
-            user_input,
-            planner_metadata=planner_metadata,
-            narrator=narrator,
-            seed_variables=seeds,
-            seed_operations=seed_operations,
-        )
+        scope_token = self._goal_read_only_scope.set(True)
+        try:
+            response = self._run_goal_loop_blocking(
+                req,
+                user_input,
+                planner_metadata=planner_metadata,
+                narrator=narrator,
+                seed_variables=seeds,
+                seed_operations=seed_operations,
+            )
+        finally:
+            self._goal_read_only_scope.reset(scope_token)
         if response.status == STATUS_ERROR:
             logger.warning("goal loop upgrade failed after unsatisfied tool tool=%s", plan.tool)
             return None
@@ -3114,14 +3206,21 @@ class CommandBridge:
         chat_backend: str,
         *,
         pool_rotation: "CloudPoolRotation | None" = None,
+        seed_variables: dict[str, str] | None = None,
     ) -> Callable[[str, str], tuple[bool, str]]:
         """LLM judge for GoalLoop: does the workflow's final result actually
         achieve the goal? Reuses the chat-tool satisfaction backend chain
         (chosen backend → local fallback)."""
 
         def judge(goal: str, final_result: str) -> tuple[bool, str]:
+            evidence = "\n".join(
+                f"- {name}：{_clip(str(value), 1600)}"
+                for name, value in (seed_variables or {}).items()
+                if name != "conversation_context" and str(value).strip()
+            ) or "（無）"
             prompt = _GOAL_RESULT_SATISFACTION_PROMPT.format(
                 goal=json.dumps(goal, ensure_ascii=False),
+                evidence=evidence,
                 final_result=json.dumps(final_result.strip(), ensure_ascii=False),
             )
             raw = self._generate_chat_tool_satisfaction_text(
@@ -3171,29 +3270,39 @@ class CommandBridge:
         return synthesize
 
     def _conversation_context_block(self, req: WebCommandRequest) -> str:
-        """Compact conversational context (recent visible turns + the tool
-        ledger) so follow-up turns can be judged/planned against their full
-        intent instead of the elliptical latest message alone."""
-        lines: list[str] = []
+        """Build goal-loop context without promoting assistant prose to evidence."""
+        lines: list[str] = [
+            "信任規則：使用者訊息只代表使用者提供的條件；工具結果才是外部觀察；"
+            "先前助理回答不會放入此證據區。"
+        ]
         checkpoint = self._context_compactor().latest(req.session_id or "web-default")
         if checkpoint is not None and checkpoint.validation_status == "valid":
-            lines.append(checkpoint.summary)
+            retained = [
+                line for line in checkpoint.summary.splitlines()
+                if line.startswith("- 使用者陳述／更正")
+                or line.startswith("- 工具證據")
+            ]
+            if retained:
+                lines.append("較早的使用者條件與工具證據：")
+                lines.extend(retained)
         history = list(req.history)[-_CONTEXT_HISTORY_TURNS:]
-        if history:
-            lines.append("對話紀錄（由舊到新）：")
-            for turn in history:
-                label = _CHAT_ROLE_LABELS.get(turn.role, turn.role)
-                lines.append(f"{label}：{_clip(turn.content, _CONTEXT_TURN_CHARS)}")
+        user_history = [turn for turn in history if turn.role == "user"]
+        if user_history:
+            lines.append("使用者先前提供的條件（由舊到新，未經外部驗證）：")
+            for turn in user_history:
+                lines.append(f"使用者：{_clip(turn.content, _CONTEXT_TURN_CHARS)}")
         ledger = self._chat_tool_ledger_entries(req)
         if ledger:
-            lines.append("本次對話先前已執行過的工具紀錄（由舊到新）：")
+            lines.append("執行紀錄（由舊到新；只有 source_type=tool_result 是工具證據）：")
             for entry in ledger:
                 status_label = {"ok": "成功", "partial": "部分完成"}.get(
                     str(entry.get("status")), "失敗"
                 )
+                source_type = str(entry.get("source_type") or "legacy_untyped")
+                content = entry.get("content") or entry.get("summary")
                 lines.append(
-                    f"- {entry.get('tool')}（參數：{entry.get('query')}）→ "
-                    f"{status_label}｜{entry.get('summary')}"
+                    f"- source_type={source_type} {entry.get('tool')}"
+                    f"（參數：{entry.get('query')}）→ {status_label}｜{content}"
                 )
         return "\n".join(lines)
 
@@ -3203,6 +3312,29 @@ class CommandBridge:
         if checkpoint is None or checkpoint.validation_status != "valid":
             return ""
         return checkpoint.summary
+
+    def _trusted_evidence_context(self, req: WebCommandRequest) -> str:
+        """Render typed tool observations without mixing them into assistant history."""
+        lines: list[str] = []
+        total = 0
+        for entry in self._chat_tool_ledger_entries(req):
+            evidence_id = str(entry.get("evidence_id") or "legacy")
+            status = str(entry.get("status") or "unknown")
+            tool = str(entry.get("tool") or "unknown")
+            source_type = str(entry.get("source_type") or "legacy_untyped")
+            query = _clip(str(entry.get("query") or ""), 300)
+            content = _clip(
+                str(entry.get("content") or entry.get("summary") or ""), 2000
+            )
+            line = (
+                f"- [{evidence_id}] source_type={source_type} status={status} "
+                f"tool={tool} query={query!r}\n  content={content}"
+            )
+            if lines and total + len(line) > 12_000:
+                break
+            lines.append(line)
+            total += len(line)
+        return "\n".join(lines)
 
     def _hydrate_chat_history(self, req: WebCommandRequest) -> WebCommandRequest:
         """Replace browser-supplied history with the durable session projection.
@@ -3215,7 +3347,11 @@ class CommandBridge:
         if req.mode != MODE_CHAT or not req.session_id:
             return req
         try:
-            messages = self._event_sessions().projection(req.session_id).get("messages", [])
+            projected = project_session(
+                self._event_sessions().ensure(req.session_id).events()
+            )
+            messages = projected.messages
+            runs = projected.runs
         except Exception:  # noqa: BLE001 - availability beats optional hydration
             logger.warning(
                 "chat history hydration failed session=%s; using request history",
@@ -3223,11 +3359,21 @@ class CommandBridge:
                 exc_info=True,
             )
             return req
-        raw_history = [
-            {"role": item.get("role"), "content": item.get("text")}
-            for item in messages
-            if isinstance(item, dict) and item.get("mode") == MODE_CHAT
-        ]
+        raw_history = []
+        for item in messages:
+            if not isinstance(item, dict) or not is_authoritative_message(item, runs):
+                continue
+            run = runs.get(str(item.get("run_id") or ""), {})
+            mode = item.get("mode")
+            if not isinstance(mode, str) and isinstance(run, dict):
+                mode = run.get("mode")
+            if not isinstance(mode, str) and isinstance(run, dict):
+                if run.get("route") in {"stream_chat", "command_bridge"}:
+                    mode = MODE_CHAT
+            if mode == MODE_CHAT:
+                raw_history.append({
+                    "role": item.get("role"), "content": item.get("text")
+                })
         authoritative = _sanitize_history(raw_history)
         if not authoritative:
             return req
@@ -3575,6 +3721,7 @@ class CommandBridge:
                 job.error = error
 
         def _worker() -> None:
+            recorder_token = self._active_run_recorder.set(recorder)
             try:
                 message, actions = runner(job)
                 _persist_terminal(
@@ -3589,6 +3736,8 @@ class CommandBridge:
                 _persist_terminal(
                     status=JOB_ERROR, message="", actions=[], error=str(exc),
                 )
+            finally:
+                self._active_run_recorder.reset(recorder_token)
 
         threading.Thread(target=_worker, daemon=True).start()
         return {"status": "accepted", "job_id": job.id}
@@ -4789,6 +4938,10 @@ class CommandBridge:
         checkpoint = self._context_compactor().latest(resolved)
         if checkpoint is not None and checkpoint.source_seq_end <= clear_seq:
             checkpoint = None
+        terminal_status = {
+            event.run_id: event.type for event in events
+            if event.type in TERMINAL_EVENT_TYPES
+        }
         visible = "\n".join(
             str(event.payload.get("text", "")) for event in events
             if event.seq > clear_seq
@@ -4796,11 +4949,30 @@ class CommandBridge:
             and event.type in {"user.message", "assistant.message"}
             and event.visibility == "user"
             and (checkpoint is None or event.seq > checkpoint.source_seq_end)
+            and not (
+                event.type == "assistant.message"
+                and (
+                    event.payload.get("partial") is True
+                    or terminal_status.get(event.run_id)
+                    in {"run.failed", "run.cancelled", "run.interrupted"}
+                )
+            )
+        )
+        evidence_text = "\n".join(
+            str(event.payload.get("content", "")) for event in events
+            if event.seq > clear_seq
+            and event.run_id not in cleared_run_ids
+            and event.type == "tool.result"
+            and (checkpoint is None or event.seq > checkpoint.source_seq_end)
         )
         window = max(1, int(getattr(self.settings, "openclaw_web_context_window_tokens", 32768)))
         reserve = max(0, int(getattr(self.settings, "openclaw_web_context_reserve_tokens", 4096)))
         usable_window = max(1, window - reserve)
-        estimate = estimate_tokens(visible) + (estimate_tokens(checkpoint.summary) if checkpoint else 0)
+        estimate = (
+            estimate_tokens(visible)
+            + estimate_tokens(evidence_text)
+            + (estimate_tokens(checkpoint.summary) if checkpoint else 0)
+        )
         return {
             "status": STATUS_OK, "session_id": resolved, "estimated_tokens": estimate,
             "context_window": window, "reserve_tokens": reserve,
@@ -5392,7 +5564,66 @@ class CommandBridge:
             fallback_reason=fallback_reason,
         )
 
+    @staticmethod
+    def _chat_grounding_sources(prompt: str) -> str:
+        """Extract only user statements and typed tool results from an answer prompt."""
+        sources: list[str] = []
+        trusted_tool_entry = False
+        for line in prompt.splitlines():
+            stripped = line.strip()
+            if line.startswith("使用者："):
+                sources.append(line.removeprefix("使用者：").strip())
+                trusted_tool_entry = False
+            elif stripped.startswith("- 使用者陳述／更正") or stripped.startswith("- 工具證據"):
+                sources.append(stripped)
+                trusted_tool_entry = False
+            elif stripped.startswith("- ["):
+                trusted_tool_entry = (
+                    "source_type=tool_result" in stripped
+                    and "status=error" not in stripped
+                )
+            elif trusted_tool_entry and stripped.startswith("content="):
+                sources.append(stripped.removeprefix("content="))
+                trusted_tool_entry = False
+        return "\n".join(source for source in sources if source)
+
     def _generate_chat_response_blocking(
+        self, prompt: str, chat_backend: str, *, conversation_key: str | None = None
+    ) -> tuple[str, ModelMetadata]:
+        from .task_workspace import unsupported_numeric_atoms
+
+        draft, metadata = self._generate_chat_response_raw_blocking(
+            prompt, chat_backend, conversation_key=conversation_key
+        )
+        grounding = self._chat_grounding_sources(prompt)
+        unsupported = unsupported_numeric_atoms(draft, grounding)
+        if not unsupported:
+            return draft, metadata
+        repair_prompt = (
+            f"可作為事實依據的資料：\n{grounding or '（無）'}\n\n"
+            f"未審核草稿：\n{draft}\n\n"
+            "請重寫草稿。只有上方依據可支持事實或數字主張；"
+            f"下列數字在依據中找不到：{unsupported}。"
+            "刪除它們，或明確說明缺少哪些證據才能下結論。"
+            "不可新增任何事實、數字、一般行情或時間估計。只輸出修正後回答。"
+        )
+        try:
+            repaired, repaired_metadata = self._generate_chat_response_raw_blocking(
+                repair_prompt, chat_backend, conversation_key=conversation_key
+            )
+        except Exception:  # noqa: BLE001 - structural fallback remains available
+            logger.exception("chat answer grounding repair failed")
+            repaired = ""
+            repaired_metadata = metadata
+        if repaired and not unsupported_numeric_atoms(repaired, grounding):
+            return repaired, repaired_metadata
+        return (
+            "現有證據不足以支持草稿中的新數字或進一步結論。\n\n"
+            f"目前可確認的資料：\n{_clip(grounding, 2400) or '（無可用工具證據）'}",
+            metadata,
+        )
+
+    def _generate_chat_response_raw_blocking(
         self, prompt: str, chat_backend: str, *, conversation_key: str | None = None
     ) -> tuple[str, ModelMetadata]:
         if chat_backend == CHAT_BACKEND_CLOUD_PICKLE:
@@ -5447,22 +5678,34 @@ class CommandBridge:
     def _stream_chat_response(
         self, prompt: str, chat_backend: str, *, conversation_key: str | None = None
     ) -> Iterator[dict]:
-        if chat_backend == CHAT_BACKEND_CLOUD_PICKLE:
-            yield from self._stream_cloud_chat(prompt)
+        result: dict[str, object] = {}
+        done = threading.Event()
+
+        def _worker() -> None:
+            try:
+                message, metadata = self._generate_chat_response_blocking(
+                    prompt, chat_backend, conversation_key=conversation_key
+                )
+                result["message"] = message
+                result["metadata"] = metadata
+            except Exception as exc:  # noqa: BLE001
+                result["error"] = str(exc)
+            finally:
+                done.set()
+
+        threading.Thread(target=_worker, daemon=True).start()
+        while not done.wait(timeout=_HEARTBEAT_SECONDS):
+            yield stream_heartbeat()
+        if "error" in result:
+            yield stream_error(str(result["error"]))
             return
-        if chat_backend == CHAT_BACKEND_CLOUD_MISTRAL:
-            yield from self._stream_mistral_chat(prompt)
-            return
-        if chat_backend == CHAT_BACKEND_CLOUD_NVIDIA:
-            yield from self._stream_nvidia_chat(prompt)
-            return
-        if chat_backend == CHAT_BACKEND_GEMINI:
-            yield from self._stream_gemini_chat(prompt)
-            return
-        if chat_backend == CHAT_BACKEND_CLOUD_POOL:
-            yield from self._stream_cloud_pool_chat(prompt, conversation_key=conversation_key)
-            return
-        yield from self._stream_ollama_chat(prompt)
+        message = str(result.get("message") or "")
+        metadata = result.get("metadata")
+        yield stream_delta(message)
+        yield stream_done(
+            message,
+            model_metadata=metadata if isinstance(metadata, ModelMetadata) else None,
+        )
 
     def _stream_ollama_chat(self, prompt: str) -> Iterator[dict]:
         endpoint = self.settings.openclaw_local_text_endpoint.rstrip("/")

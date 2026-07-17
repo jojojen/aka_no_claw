@@ -19,6 +19,7 @@ _TERMINAL_STATUS = {
 class SessionProjection:
     session_id: str | None = None
     messages: list[dict[str, object]] = field(default_factory=list)
+    evidence: list[dict[str, object]] = field(default_factory=list)
     runs: dict[str, dict[str, object]] = field(default_factory=dict)
     progress: dict[str, dict[str, object]] = field(default_factory=dict)
     display_preferences: dict[str, object] = field(default_factory=dict)
@@ -32,6 +33,7 @@ class SessionProjection:
             "projection_version": PROJECTION_VERSION,
             "session_id": self.session_id,
             "messages": self.messages,
+            "evidence": self.evidence,
             "runs": {key: self.runs[key] for key in sorted(self.runs)},
             "progress": {key: self.progress[key] for key in sorted(self.progress)},
             "display_preferences": self.display_preferences,
@@ -67,6 +69,26 @@ def project_session(events: Iterable[SessionRunEvent]) -> SessionProjection:
     return projection
 
 
+def is_authoritative_message(
+    message: dict[str, object], runs: dict[str, dict[str, object]]
+) -> bool:
+    """Whether a projected message may be replayed into model context.
+
+    Presentation history deliberately retains interrupted/error output for UI
+    recovery and diagnostics.  Model history accepts every real user message,
+    but accepts an assistant message only when it is not partial and its run did
+    not fail, cancel, or get interrupted.  Legacy imports without a terminal
+    status remain compatible.
+    """
+    if message.get("role") != "assistant":
+        return True
+    run = runs.get(str(message.get("run_id") or ""), {})
+    return (
+        message.get("partial") is not True
+        and run.get("status") not in {"failed", "cancelled", "interrupted"}
+    )
+
+
 def _apply(projection: SessionProjection, event: SessionRunEvent) -> None:
     if event.run_id in projection._cleared_run_ids:
         return
@@ -84,6 +106,7 @@ def _apply(projection: SessionProjection, event: SessionRunEvent) -> None:
                 if isinstance(message.get("run_id"), str)
             )
             projection.messages.clear()
+            projection.evidence.clear()
             projection.runs.clear()
             projection.progress.clear()
             projection.display_preferences.clear()
@@ -99,6 +122,13 @@ def _apply(projection: SessionProjection, event: SessionRunEvent) -> None:
                 "running_prompt_id": event.payload.get("running_prompt_id"),
                 "entries": [dict(item) for item in entries if isinstance(item, dict)],
             }
+        return
+    if event.type == "tool.result":
+        projection.evidence.append({
+            **event.payload,
+            "event_id": event.event_id,
+            "run_id": event.run_id,
+        })
         return
     if event.type in {"user.message", "assistant.message"}:
         text = event.payload.get("text")

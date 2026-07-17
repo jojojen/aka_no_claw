@@ -14,6 +14,9 @@ from .continuation_policy import operation_key
 from .goal_planner import GoalPlanner
 from .task_loop import BoundedTaskLoop, ContinuationState, LoopContext, LoopResult, StepOutcome
 from .task_workspace import (
+    VARIABLE_TYPE_EVIDENCE,
+    VARIABLE_TYPE_REQUIREMENT,
+    VARIABLE_TYPE_USER_CONTEXT,
     Workflow,
     WorkflowRunner,
     WorkflowTrace,
@@ -174,7 +177,16 @@ class GoalLoop:
             # Static type (plain_text/speech_text/command_result/...) each seed
             # had when it was first produced, so a replan carrying it forward
             # doesn't lose that information (see WorkflowRunner.run()).
-            "seed_types": {},
+            "seed_types": {
+                name: (
+                    VARIABLE_TYPE_USER_CONTEXT
+                    if name in {"conversation_context", "operator_constraints"}
+                    else VARIABLE_TYPE_REQUIREMENT
+                    if name == "missing_evidence"
+                    else VARIABLE_TYPE_EVIDENCE
+                )
+                for name in self.seed_variables
+            },
             # Shared across draft + every replan of this run so a command that
             # already ran (with the same normalised input) is never executed a
             # second time — the dispatcher returns the cached artifact instead.
@@ -570,7 +582,7 @@ class GoalLoop:
         previous = str(scratch["seeds"].get("operator_constraints") or "")
         merged = "\n".join(part for part in (previous, *additions) if part)[-4000:]
         scratch["seeds"]["operator_constraints"] = merged
-        scratch["seed_types"]["operator_constraints"] = "plain_text"
+        scratch["seed_types"]["operator_constraints"] = VARIABLE_TYPE_USER_CONTEXT
         self._narrate(scratch, f"已納入使用者補充條件（{boundary}）。")
 
     def _planner_replan(self, scratch: dict, workflow: Workflow, trace: WorkflowTrace):

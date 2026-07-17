@@ -18,7 +18,9 @@ are exactly the bridge methods tests monkeypatch:
 
 from __future__ import annotations
 
+import dataclasses
 import logging
+import re
 from typing import TYPE_CHECKING, Protocol
 
 from .command_bridge_models import (
@@ -35,6 +37,7 @@ from .command_bridge_models import (
     CHAT_TOOL_RESEARCH,
     CHAT_TOOL_SEARCH,
     CHAT_TOOL_VISION,
+    CHAT_TOOL_NO_TOOL,
     ChatToolPlan,
     ModelAttempt,
     ModelMetadata,
@@ -58,28 +61,34 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Web Chat tool planning (#45 follow-up). The selected chat backend decides, in
-# one strict-JSON response, whether to answer directly or call an allowlisted
-# tool. Direct answers are represented as a hidden no-tool plan so Web Chat and
-# Telegram-style tool use share the same main path.
+# one strict-JSON response, whether a dedicated answer stage or an allowlisted
+# tool should run.  The router never writes user-visible prose.
 _ROUTER_TIMEOUT_CAP_SECONDS = 30
+_EVIDENCE_TOOLS = frozenset({CHAT_TOOL_SEARCH, CHAT_TOOL_RESEARCH, CHAT_TOOL_VISION})
+_EXPLICIT_REFRESH_RE = re.compile(
+    r"(?:再|重新|幫我|請)?(?:查|查詢|查查|搜尋|搜索|找資料|驗證|核實)"
+    r"|(?:search|look\s*up|check|verify|refresh|update)\b",
+    re.IGNORECASE,
+)
+_URL_RE = re.compile(r"https?://", re.IGNORECASE)
 _CHAT_TOOL_PLAN_PROMPT_TEMPLATE = (
     "你是 aka_no_claw 聊天助理。請根據對話決定："
-    "直接回答使用者，或使用一個工具處理『最新訊息』。\n"
+    "交給一般回答階段，或使用一個工具處理『最新訊息』。\n"
     "可用工具：\n{tool_lines}\n"
     "若是閒聊、改寫、翻譯、一般常識、人物介紹、解釋、摘要，"
     "或任何你可直接回答的情況，就不要用工具，直接回答。\n"
     "只輸出一個 JSON 物件，不要加任何多餘文字或說明：\n"
-    '{{"tool":"__no_tool__","answer":"...","reason_summary":"..."}}\n'
+    '{{"tool":"__no_tool__","reason_summary":"..."}}\n'
     "或\n"
     '{{"tool":"{tool_choices}","query":"...","reason_summary":"..."}}\n'
     "例如：\n"
-    '- 問「米津玄師是誰」→ {{"tool":"__no_tool__","answer":"...","reason_summary":"一般知識"}}\n'
+    '- 問「米津玄師是誰」→ {{"tool":"__no_tool__","reason_summary":"一般知識"}}\n'
     '- 問「今天東京天氣」→ {{"tool":"/search","query":"東京 今天天氣","reason_summary":"需要最新資訊"}}\n'
     '- 問「先幫我查一下東京天氣，再用日文念出來」→ {{"tool":"__goal__","query":"查東京天氣後用日文念出來","reason_summary":"想現在就完成的多步驟任務"}}\n'
     '- 問「建立工作流：查東京天氣，用女僕口吻以日文報告」→ '
     '{{"tool":"__create_workflow__","query":"查東京天氣，用女僕口吻以日文報告","reason_summary":"要求建立可重複使用的工作流程"}}\n'
-    "當 tool=__no_tool__ 時，answer 必須是給使用者看的最終答案，"
-    "用繁體中文自然回答。對話紀錄按時間由舊到新排列；較早的助理回答只是先前說法，"
+    "當 tool=__no_tool__ 時，不要輸出 answer；後續會由獨立回答階段處理。"
+    "對話紀錄按時間由舊到新排列；較早的助理回答只是先前說法，"
     "不是權威事實。使用者後來補充、更正或否定的內容優先，不能繼續沿用已被更正的前提。\n"
     "當使用者是明確要求「建立/新增/設定一個工作流程」這件事本身（例如訊息以"
     "「建立工作流：」、「幫我建立一個工作流」開頭），要用 __create_workflow__，"
@@ -184,14 +193,53 @@ class ChatToolPlanner:
                 (raw or "")[:200],
             )
             return None, None
+        if plan.tool == CHAT_TOOL_NO_TOOL:
+            # Rolling compatibility: older models may still emit the obsolete
+            # answer field.  Never let router prose cross the decision boundary.
+            plan = dataclasses.replace(plan, answer="")
+        elif self._should_reuse_existing_evidence(req, plan, observation):
+            plan = ChatToolPlan(
+                tool=CHAT_TOOL_NO_TOOL,
+                reason_summary="reuse existing typed evidence for follow-up",
+            )
         logger.info(
             "[chat-tool-plan] tool=%s query=%r direct_answer=%s reason=%s",
             plan.tool,
             plan.query,
-            bool(plan.answer),
+            False,
             plan.reason_summary,
         )
         return plan, metadata
+
+    def _should_reuse_existing_evidence(
+        self,
+        req: WebCommandRequest,
+        plan: ChatToolPlan,
+        observation: str | None,
+    ) -> bool:
+        """Prevent an elliptical follow-up from re-running the same read tool.
+
+        A new URL/image or an explicit request to search/refresh remains
+        authorized. Otherwise an existing successful typed result is reused;
+        the answer stage can state that more evidence is needed instead of
+        silently spending another long tool run.
+        """
+        if plan.tool not in _EVIDENCE_TOOLS:
+            return False
+        latest = (req.input or "").strip()
+        if observation or req.has_image_attachment or _URL_RE.search(latest):
+            return False
+        if _EXPLICIT_REFRESH_RE.search(latest):
+            return False
+        ledger_reader = getattr(self._deps, "_chat_tool_ledger_entries", None)
+        if not callable(ledger_reader):
+            return False
+        return any(
+            str(entry.get("tool")) == plan.tool
+            and str(entry.get("status")) in {"ok", "partial"}
+            and str(entry.get("source_type") or "tool_result") == "tool_result"
+            for entry in ledger_reader(req)
+        )
 
     def build_plan_prompt(
         self, req: WebCommandRequest, observation: str | None = None
@@ -222,6 +270,10 @@ class ChatToolPlanner:
                 "若先前失敗，優先改用其他工具或利用已有資訊，而不是原樣重試。"
                 "「同樣的需求」只指使用者重複要求同一件事；"
                 "使用者提出新的動作要求（例如先前是播放、現在要停止）不是重複，要照常執行。"
+            )
+            lines.append(
+                "若最新訊息只是質疑、更正或追問先前結果，且沒有新 URL／圖片，"
+                "也沒有明確要求重新查詢，必須用 no_tool 重用現有證據。"
             )
         if observation:
             lines += [

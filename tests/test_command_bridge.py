@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import threading
 import time
 from types import SimpleNamespace
@@ -57,6 +58,12 @@ from openclaw_adapter.command_bridge_models import (
 from openclaw_adapter.goal_loop import GoalLoopContinuation, GoalLoopReport
 from openclaw_adapter.task_loop import ContinuationState
 from openclaw_adapter.task_workspace import Workflow
+
+
+def _fake_model_answer(prompt: str) -> str:
+    """Return the latest user turn from either a bare or contracted prompt."""
+    matches = re.findall(r"^使用者：(.*)$", prompt, re.MULTILINE)
+    return matches[-1] if matches else prompt
 
 
 class _FakeRegistered:
@@ -219,8 +226,11 @@ def test_parse_request_trims_history_to_recent_turns():
     assert req.history[-1].content == f"m{MAX_HISTORY_TURNS + 4}"
 
 
-def test_build_chat_prompt_without_history_is_bare_input():
-    assert build_chat_prompt("  hello  ", ()) == "hello"
+def test_build_chat_prompt_without_history_still_has_answer_contract():
+    prompt = build_chat_prompt("  hello  ", ())
+    assert "本機聊天助理" in prompt
+    assert "不得自行補造" in prompt
+    assert "使用者：hello" in prompt
 
 
 def test_build_chat_prompt_with_history_includes_turns():
@@ -288,6 +298,54 @@ def test_chat_history_hydration_recovers_pre_mode_journal_entries(tmp_path):
 
     assert [(turn.role, turn.content) for turn in hydrated.history] == [
         ("user", "舊版問題"), ("assistant", "舊版回答"),
+    ]
+
+
+def test_new_named_session_does_not_import_global_legacy_snapshot(tmp_path):
+    settings = _tool_settings()
+    settings.openclaw_web_memory_dir = str(tmp_path / "memory")
+    settings.openclaw_web_event_dir = str(tmp_path / "events")
+    bridge = CommandBridge(settings=settings)
+    bridge._sessions().save({
+        "mode": "chat",
+        "messages": [
+            {"role": "user", "text": "舊對話問題"},
+            {"role": "assistant", "text": "舊對話回答"},
+        ],
+    })
+
+    named = bridge._event_sessions().projection("brand-new-session")
+    default = bridge._event_sessions().projection("web-default")
+
+    assert named["messages"] == []
+    assert [item["text"] for item in default["messages"]] == [
+        "舊對話問題",
+        "舊對話回答",
+    ]
+
+
+def test_chat_history_hydration_excludes_interrupted_partial_assistant(tmp_path):
+    settings = _tool_settings()
+    settings.openclaw_web_memory_dir = str(tmp_path / "memory")
+    settings.openclaw_web_event_dir = str(tmp_path / "events")
+    bridge = CommandBridge(settings=settings)
+    bad = bridge._event_sessions().recorder("browser-session")
+    bad.accepted("第一題", mode="chat")
+    bad.started()
+    bad.assistant_message("尚未完成的錯誤推論", partial=True)
+    bad.terminal("interrupted")
+    good = bridge._event_sessions().recorder("browser-session")
+    good.accepted("第二題", mode="chat")
+    good.started()
+    good.assistant_message("完整回答")
+    good.terminal("completed")
+
+    hydrated = CommandBridge(settings=settings)._hydrate_chat_history(parse_request({
+        "mode": "chat", "input": "接著呢", "session_id": "browser-session", "history": [],
+    }))
+
+    assert [(turn.role, turn.content) for turn in hydrated.history] == [
+        ("user", "第一題"), ("user", "第二題"), ("assistant", "完整回答"),
     ]
 
 
@@ -528,7 +586,9 @@ def test_investment_no_submode_defaults_to_research(bridge):
 
 # --- chat routing ---------------------------------------------------------
 def test_chat_local_uses_ollama(bridge, monkeypatch):
-    monkeypatch.setattr(bridge, "_ollama_generate_blocking", lambda prompt: f"local:{prompt}")
+    monkeypatch.setattr(
+        bridge, "_ollama_generate_blocking", lambda prompt: f"local:{_fake_model_answer(prompt)}"
+    )
     req = parse_request({"mode": "chat", "input": "hello", "chat_backend": "local"})
     resp = bridge.handle(req)
     assert resp.status == STATUS_OK
@@ -538,7 +598,7 @@ def test_chat_local_uses_ollama(bridge, monkeypatch):
 def test_chat_cloud_uses_cloud_client(bridge, monkeypatch):
     class _Client:
         def generate(self, prompt, *, temperature=0.0):
-            return f"cloud:{prompt}"
+            return f"cloud:{_fake_model_answer(prompt)}"
 
     monkeypatch.setattr(bridge, "_build_cloud_chat_client", lambda: _Client())
     req = parse_request({"mode": "chat", "input": "hello", "chat_backend": "cloud_pickle"})
@@ -582,7 +642,7 @@ def test_chat_gemini_quota_falls_back_to_flash(monkeypatch):
                 from openclaw_adapter.command_bridge import _GeminiRequestError
 
                 raise _GeminiRequestError("RESOURCE_EXHAUSTED", status="quota_exhausted")
-            return f"flash:{prompt}"
+            return f"flash:{_fake_model_answer(prompt)}"
 
     monkeypatch.setattr(b, "_build_gemini_chat_client", lambda model: _Client(model))
     req = parse_request({"mode": "chat", "input": "hello", "chat_backend": "gemini"})
@@ -609,7 +669,9 @@ def test_chat_gemini_flash_quota_falls_back_to_local(monkeypatch):
             raise _GeminiRequestError("RESOURCE_EXHAUSTED", status="quota_exhausted")
 
     monkeypatch.setattr(b, "_build_gemini_chat_client", lambda model: _Client(model))
-    monkeypatch.setattr(b, "_ollama_generate_blocking", lambda prompt: f"local:{prompt}")
+    monkeypatch.setattr(
+        b, "_ollama_generate_blocking", lambda prompt: f"local:{_fake_model_answer(prompt)}"
+    )
     req = parse_request({"mode": "chat", "input": "hello", "chat_backend": "gemini"})
     resp = b.handle(req)
     assert resp.status == STATUS_OK
@@ -648,13 +710,11 @@ def test_chat_local_blocking_uses_history(bridge, monkeypatch):
 def test_chat_stream_uses_history(bridge, monkeypatch):
     captured: dict[str, str] = {}
 
-    def _fake_stream(prompt):
-        from openclaw_adapter.command_bridge_models import stream_delta, stream_done
+    def _fake_answer(prompt, _backend, *, conversation_key=None):
         captured["prompt"] = prompt
-        yield stream_delta("ok")
-        yield stream_done("ok")
+        return "ok", None
 
-    monkeypatch.setattr(bridge, "_stream_ollama_chat", _fake_stream)
+    monkeypatch.setattr(bridge, "_generate_chat_response_blocking", _fake_answer)
     req = parse_request({
         "mode": "chat", "input": "再講一首", "chat_backend": "local",
         "history": [{"role": "assistant", "content": "千本櫻"}],
@@ -1590,7 +1650,6 @@ def test_select_chat_tool_plan_uses_selected_gemini_backend_not_local(monkeypatc
     )
     assert plan == ChatToolPlan(
         tool=CHAT_TOOL_NO_TOOL,
-        answer="米津玄師是日本創作歌手",
         reason_summary="一般知識",
     )
 
@@ -2260,20 +2319,18 @@ def test_restart_all_schedules_detached_script(bridge, monkeypatch):
 
 # --- streaming ------------------------------------------------------------
 def test_stream_chat_local_emits_start_delta_done(bridge, monkeypatch):
-    def _fake_stream(prompt):
-        from openclaw_adapter.command_bridge_models import stream_delta, stream_done
-        yield stream_delta("par")
-        yield stream_delta("tial")
-        yield stream_done("partial")
+    def _fake_answer(prompt, _backend, *, conversation_key=None):
+        return "partial", None
 
-    monkeypatch.setattr(bridge, "_stream_ollama_chat", _fake_stream)
+    monkeypatch.setattr(bridge, "_generate_chat_response_blocking", _fake_answer)
     req = parse_request({"mode": "chat", "input": "hi", "chat_backend": "local"})
     events = list(bridge.stream(req, "rid-1"))
     assert events[0] == {"type": "start", "request_id": "rid-1"}
     # The router is unreachable in this test, so the visible degradation notice
     # streams first instead of a silent fallback.
     assert events[1] == {"type": "delta", "text": "（工具路由暫時不可用，改以一般模式直接回答）\n"}
-    assert events[2] == {"type": "delta", "text": "par"}
+    # Grounded answers are buffered until validation, then emitted atomically.
+    assert events[2] == {"type": "delta", "text": "partial"}
     assert events[-1] == {"type": "done", "message": "partial"}
 
 
@@ -4615,7 +4672,7 @@ class _FakeCloudClient:
             raise _GeminiRequestError(
                 f"{self.name} failed", status=self.fail_status or "error"
             )
-        return f"{self.name}:{prompt}"
+        return f"{self.name}:{_fake_model_answer(prompt)}"
 
 
 # --- _pin_provider_chain (sticky provider) ---------------------------------
@@ -4999,7 +5056,9 @@ def test_cloud_pool_all_cloud_fail_fallback_to_local(monkeypatch):
     """All cloud providers fail/unconfigured → local fallback."""
     b = CommandBridge(settings=_tool_settings(gemini_key=None))
     monkeypatch.setattr(b, "_build_cloud_chat_client", lambda: None)
-    monkeypatch.setattr(b, "_ollama_generate_blocking", lambda prompt: f"local:{prompt}")
+    monkeypatch.setattr(
+        b, "_ollama_generate_blocking", lambda prompt: f"local:{_fake_model_answer(prompt)}"
+    )
 
     req = parse_request({"mode": "chat", "input": "hello", "chat_backend": "cloud_pool"})
     resp = b.handle(req)
@@ -5054,7 +5113,9 @@ def test_cloud_pool_stream_all_fail_fallback_local(monkeypatch):
     monkeypatch.setattr(b, "_build_mistral_chat_client",
                         lambda: _FakeCloudClient("mistral", fail=True))
     monkeypatch.setattr(b, "_build_cloud_chat_client", lambda: None)
-    monkeypatch.setattr(b, "_ollama_generate_blocking", lambda prompt: f"local:{prompt}")
+    monkeypatch.setattr(
+        b, "_ollama_generate_blocking", lambda prompt: f"local:{_fake_model_answer(prompt)}"
+    )
 
     req = parse_request({"mode": "chat", "input": "hello", "chat_backend": "cloud_pool"})
     events = list(b.stream(req, "test-rid"))
@@ -5672,6 +5733,226 @@ def test_router_prompt_includes_prior_tool_ledger_per_conversation(monkeypatch):
     assert "先前已執行過的工具紀錄" not in other
 
 
+def test_no_tool_router_decision_uses_separate_answer_call(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    calls: list[tuple[str, str]] = []
+
+    def _route(_backend, prompt, **_kwargs):
+        calls.append(("router", prompt))
+        return '{"tool":"__no_tool__","reason_summary":"follow-up"}', None
+
+    def _answer(prompt, _backend, *, conversation_key=None):
+        calls.append(("answer", prompt))
+        return "獨立回答", None
+
+    monkeypatch.setattr(b, "_generate_chat_tool_plan_with_chat_backend", _route)
+    monkeypatch.setattr(b, "_generate_chat_response_blocking", _answer)
+
+    response = b.handle(parse_request({
+        "mode": "chat", "input": "現在呢", "chat_backend": "local",
+        "history": [
+            {"role": "user", "content": "先前問題"},
+            {"role": "assistant", "content": "先前猜測"},
+        ],
+    }))
+
+    assert response.message == "獨立回答"
+    assert [kind for kind, _ in calls] == ["router", "answer"]
+    assert "助理先前說法（未驗證）：先前猜測" in calls[1][1]
+
+
+def test_normal_chat_answer_repairs_numbers_missing_from_typed_evidence(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    prompt = build_chat_prompt(
+        "均價1萬1怎麼可能鑑定後一樣一萬",
+        evidence_context=(
+            "- [ev-1] source_type=tool_result status=ok tool=/research query='item'\n"
+            "  content=現價 ¥9,500；已售均價 ¥10,574；樣本 3 筆。"
+        ),
+    )
+    responses = [
+        "建議低於均價20%入手，大約¥7,000–¥8,000；鑑定8級或9級。",
+        "工具資料只有現價、已售均價與樣本數；沒有鑑定後成交價與鑑定成本，無法據此決定入手價。",
+    ]
+    calls: list[str] = []
+
+    def _raw(raw_prompt, _backend, *, conversation_key=None):
+        calls.append(raw_prompt)
+        return responses.pop(0), None
+
+    monkeypatch.setattr(b, "_generate_chat_response_raw_blocking", _raw)
+
+    answer, _metadata = b._generate_chat_response_blocking(
+        prompt, CHAT_BACKEND_LOCAL
+    )
+
+    assert len(calls) == 2
+    assert "¥7,000" in calls[1]
+    assert "鑑定8級" in calls[1]
+    assert "¥7,000" not in answer
+    assert "沒有鑑定後成交價" in answer
+
+
+def test_router_reuses_existing_research_for_plain_followup(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    req = parse_request({
+        "mode": "chat",
+        "input": "起標8千怎麼可能6000入手",
+        "conversation_id": "reuse-research",
+    })
+    b._record_chat_tool_run(
+        req,
+        CHAT_TOOL_RESEARCH,
+        "https://example.test/item",
+        status="ok",
+        summary="現價與成交樣本",
+    )
+    monkeypatch.setattr(
+        b,
+        "_generate_chat_tool_plan_with_chat_backend",
+        lambda *args, **kwargs: (
+            '{"tool":"/research","query":"same item","reason_summary":"product follow-up"}',
+            None,
+        ),
+    )
+
+    plan, _metadata = b._select_chat_tool_plan(req)
+
+    assert plan is not None
+    assert plan.tool == CHAT_TOOL_NO_TOOL
+
+
+def test_router_allows_explicit_research_refresh(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    req = parse_request({
+        "mode": "chat",
+        "input": "請重新查最新價格",
+        "conversation_id": "refresh-research",
+    })
+    b._record_chat_tool_run(
+        req,
+        CHAT_TOOL_RESEARCH,
+        "old item query",
+        status="ok",
+        summary="舊結果",
+    )
+    monkeypatch.setattr(
+        b,
+        "_generate_chat_tool_plan_with_chat_backend",
+        lambda *args, **kwargs: (
+            '{"tool":"/research","query":"latest item price","reason_summary":"explicit refresh"}',
+            None,
+        ),
+    )
+
+    plan, _metadata = b._select_chat_tool_plan(req)
+
+    assert plan is not None
+    assert plan.tool == CHAT_TOOL_RESEARCH
+
+
+def test_tool_evidence_is_durable_across_bridge_restart(tmp_path):
+    settings = _tool_settings()
+    settings.openclaw_web_memory_dir = str(tmp_path / "memory")
+    settings.openclaw_web_event_dir = str(tmp_path / "events")
+    req = parse_request({
+        "mode": "chat", "input": "追問", "session_id": "evidence-session",
+        "conversation_id": "evidence-conversation",
+    })
+    first = CommandBridge(settings=settings)
+    recorder = first._event_sessions().recorder("evidence-session")
+    recorder.accepted("先做研究", mode="chat")
+    recorder.started()
+    token = first._active_run_recorder.set(recorder)
+    try:
+        first._record_chat_tool_run(
+            req, "/research", "item-url", status="ok",
+            summary="成交均價 ¥11,110；來源：https://example.test/item",
+        )
+    finally:
+        first._active_run_recorder.reset(token)
+    recorder.terminal("completed")
+
+    restarted = CommandBridge(settings=settings)
+    entries = restarted._chat_tool_ledger_entries(req)
+    evidence_prompt = restarted._trusted_evidence_context(req)
+
+    assert len(entries) == 1
+    assert entries[0]["source_type"] == "tool_result"
+    assert entries[0]["evidence_id"] == entries[0]["tool_call_id"]
+    assert "成交均價 ¥11,110" in evidence_prompt
+    assert "source_type=tool_result" in evidence_prompt
+
+
+def test_async_research_job_persists_typed_evidence_across_restart(tmp_path, monkeypatch):
+    settings = _tool_settings()
+    settings.openclaw_web_memory_dir = str(tmp_path / "memory")
+    settings.openclaw_web_event_dir = str(tmp_path / "events")
+    req = parse_request({
+        "mode": "chat",
+        "input": "研究這個商品",
+        "session_id": "async-evidence-session",
+        "conversation_id": "async-evidence-conversation",
+    })
+    plan = ChatToolPlan(tool=CHAT_TOOL_RESEARCH, query="item-url")
+    first = CommandBridge(settings=settings)
+    monkeypatch.setattr(first, "_tool_display_name", lambda _tool: "商品研究")
+    monkeypatch.setattr(
+        first,
+        "_exec_registered_command_chat_tool",
+        lambda _req, _tool_req: ChatToolResult(answer="工具證據：現價 ¥9,500"),
+    )
+    monkeypatch.setattr(
+        first,
+        "_maybe_upgrade_tool_result_to_goal_loop",
+        lambda *args, **kwargs: None,
+    )
+
+    events = list(first._stream_chat_research_job(req, plan))
+
+    assert events[-1]["type"] == "done"
+    restarted = CommandBridge(settings=settings)
+    entries = restarted._chat_tool_ledger_entries(req)
+    assert len(entries) == 1
+    assert entries[0]["source_type"] == "tool_result"
+    assert "現價 ¥9,500" in entries[0]["content"]
+
+
+def test_goal_context_keeps_user_and_tool_evidence_but_excludes_assistant_claims():
+    b = CommandBridge(settings=_tool_settings())
+    req = parse_request({
+        "mode": "chat",
+        "input": "現在已經是八千了",
+        "conversation_id": "typed-goal-context",
+        "history": [
+            {"role": "user", "content": "起標價是八千"},
+            {"role": "assistant", "content": "鑑定費大約¥1,000"},
+        ],
+    })
+    b._record_chat_tool_run(
+        req,
+        "/research",
+        "item-url",
+        status="ok",
+        summary="工具查到售價¥8,100",
+    )
+    b._record_goal_loop_run(
+        req,
+        "評估轉賣",
+        SimpleNamespace(done=True, final_result="預估可賣¥12,000", workflow=None),
+    )
+
+    context = b._conversation_context_block(req)
+    evidence = b._trusted_evidence_context(req)
+
+    assert "起標價是八千" in context
+    assert "鑑定費大約¥1,000" not in context
+    assert "source_type=tool_result" in context
+    assert "source_type=derived_answer" in context
+    assert "source_type=tool_result" in evidence
+    assert "source_type=derived_answer" in evidence
+
+
 def test_unsatisfied_upgrade_passes_tool_answer_as_seed(monkeypatch):
     from openclaw_adapter.command_bridge import _seed_variable_name_for_tool
     from openclaw_adapter.continuation_policy import operation_key
@@ -5700,19 +5981,38 @@ def test_unsatisfied_upgrade_passes_tool_answer_as_seed(monkeypatch):
     def _fake_run(req, goal, planner_metadata=None, narrator=None, seed_variables=None, seed_operations=None):
         seen["seeds"] = seed_variables
         seen["ops"] = seed_operations
+        seen["read_only_scope"] = b._goal_read_only_scope.get()
         return WebCommandResponse(status=STATUS_OK, mode=MODE_CHAT, message="工作流完成：ok")
 
     monkeypatch.setattr(b, "_run_goal_loop_blocking", _fake_run)
     resp = b.handle(parse_request({"mode": "chat", "input": "這張卡值得買嗎？"}))
     assert resp.status == STATUS_OK
-    assert seen["seeds"] == {
-        _seed_variable_name_for_tool(CHAT_TOOL_RESEARCH): "部分研究結果"
-    }
+    assert seen["seeds"][_seed_variable_name_for_tool(CHAT_TOOL_RESEARCH)] == "部分研究結果"
+    assert "工具結果才是外部觀察" in seen["seeds"]["conversation_context"]
     # The escalation must also hand the goal loop the operation key of the
     # /research it already ran, so the loop can't spend a second identical run.
     assert seen["ops"] == {
         operation_key(CHAT_TOOL_RESEARCH, "https://x.example/item"): "部分研究結果"
     }
+    assert seen["read_only_scope"] is True
+
+
+def test_read_only_goal_scope_hides_unrequested_side_effect_commands(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    registry = {
+        "/search": SimpleNamespace(usage="搜尋外部事實"),
+        "/saynow": SimpleNamespace(usage="立即念出文字"),
+    }
+    monkeypatch.setattr(b, "_handlers", lambda: registry)
+    runner = SimpleNamespace(catalog=None)
+
+    token = b._goal_read_only_scope.set(True)
+    try:
+        planner = b._build_goal_planner(CHAT_BACKEND_LOCAL, runner)
+    finally:
+        b._goal_read_only_scope.reset(token)
+
+    assert set(planner.command_registry) == {"/search"}
 
 
 def test_e2e_partial_research_final_answer_with_single_research_call(monkeypatch):

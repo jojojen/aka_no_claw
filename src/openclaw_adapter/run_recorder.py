@@ -57,6 +57,10 @@ class RunRecorder:
     def tool_completed(self, tool: str, *, ok: bool) -> None:
         self.emit("tool.completed", {"tool": tool, "ok": ok})
 
+    def tool_result(self, evidence: dict[str, object]) -> None:
+        """Persist a typed, model-visible evidence record separately from UI prose."""
+        self.emit("tool.result", evidence, visibility="internal")
+
     def progress(self, stage: str, label: str) -> None:
         now = time.monotonic()
         if now - self._last_progress.get(stage, 0.0) < 0.5:

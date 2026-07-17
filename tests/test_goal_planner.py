@@ -80,6 +80,7 @@ def test_build_goal_workflow_prompt_warns_against_duplicate_alternative_sinks():
     assert "互斥" in prompt  # rule 7c
     assert "與 /saynow 是同一需求的兩種互斥實作方式" in prompt
     assert "與 /generateaudio 是同一需求的兩種互斥實作方式" in prompt
+    assert "只有使用者的原始需求明確要求該動作" in prompt
 
 
 def test_generate_workflow_from_goal_uses_fallback_and_backfills():

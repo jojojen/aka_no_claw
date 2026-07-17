@@ -88,6 +88,54 @@ def test_chained_checkpoint_keeps_previous_summary_and_extends_range(tmp_path) -
     assert "recent one" in second.summary
 
 
+def test_checkpoint_separates_tool_evidence_from_unverified_assistant_claims(tmp_path) -> None:
+    compactor = ContextCompactor(ContextCheckpointStore(str(tmp_path)), recent_turns=2)
+    events = [
+        _event(1, "user.message", "均價是一萬一", run_id="old"),
+        SessionRunEvent(
+            event_version=1, event_id="event-2", session_id="s1", run_id="old", seq=2,
+            occurred_at=2.0, type="tool.result", visibility="internal",
+            payload={
+                "evidence_id": "e-market", "tool_call_id": "call-market",
+                "source_type": "tool_result", "tool": "/research", "query": "item",
+                "status": "ok", "content": "成交均價 ¥11,110", "summary": "market",
+            },
+        ),
+        _event(3, "assistant.message", "鑑定後一定賣一萬三", run_id="old"),
+        _event(4, "user.message", "現在已經八千了", run_id="new"),
+        _event(5, "assistant.message", "收到更正", run_id="new"),
+    ]
+
+    checkpoint = compactor.build("s1", events)
+
+    assert checkpoint is not None
+    assert "使用者陳述／更正" in checkpoint.summary
+    assert "工具證據 e-market" in checkpoint.summary
+    assert "成交均價 ¥11,110" in checkpoint.summary
+    assert "助理先前說法（未驗證）" in checkpoint.summary
+    assert "現在已經八千了" not in checkpoint.summary
+
+
+def test_checkpoint_drops_interrupted_assistant_partial(tmp_path) -> None:
+    compactor = ContextCompactor(ContextCheckpointStore(str(tmp_path)), recent_turns=2)
+    events = [
+        _event(1, "user.message", "old", run_id="bad"),
+        SessionRunEvent(
+            event_version=1, event_id="event-2", session_id="s1", run_id="bad", seq=2,
+            occurred_at=2.0, type="assistant.message", visibility="user",
+            payload={"text": "unfinished false claim", "partial": True},
+        ),
+        _event(3, "run.interrupted", "", run_id="bad"),
+        _event(4, "user.message", "new", run_id="good"),
+        _event(5, "assistant.message", "answer", run_id="good"),
+    ]
+
+    checkpoint = compactor.build("s1", events)
+
+    assert checkpoint is not None
+    assert "unfinished false claim" not in checkpoint.summary
+
+
 def test_auto_compaction_obeys_threshold_and_writes_an_event(tmp_path) -> None:
     bridge = CommandBridge(AssistantSettings(
         openclaw_web_memory_dir=str(tmp_path / "memory"), openclaw_web_event_dir=str(tmp_path / "events"),
