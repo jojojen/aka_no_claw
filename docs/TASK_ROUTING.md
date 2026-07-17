@@ -3,7 +3,7 @@
 Status: Current
 Owner area: agent-maintenance
 
-Last reviewed: 2026-07-03
+Last reviewed: 2026-07-17
 
 ## Quick Routing Table
 
@@ -12,6 +12,7 @@ Last reviewed: 2026-07-03
 | Add or change Telegram command | `aka_no_claw` | `src/openclaw_adapter/telegram_bot.py`, `toolset.py` | Keep command wiring thin. Move business logic to dedicated modules. |
 | Change Telegram infra (transport, poll loop, list-view pagination, generic dispatch/registries) | `telegram_core` | `src/telegram_core/{transport,polling,processor,list_view,contracts}.py` | Zero-dependency shared package; both `aka_no_claw` and `price_monitor_bot` consume it. Never add domain vocabulary (command names, callback prefixes) here — that belongs in a consumer repo's hook overrides/registries. Run its own `pytest` plus both consumer suites after any change. |
 | Change CLI command | `aka_no_claw` | `src/openclaw_adapter/toolset.py`, `__main__.py` | Update docs and verification matrix if entry points change. |
+| Change Web command/session/run recovery | `aka_no_claw` | `command_bridge.py`, `command_bridge_server.py`, `session_event_*.py`, `session_projection.py`, `run_recorder.py` | Preserve blocking/NDJSON/async/poll/session compatibility. The append-only journal and exact cursor contract are authoritative; test with more than one retained page. |
 | Change card matching or card aliases | `price_monitor_bot` | `src/tcg_tracker` | `aka_no_claw` imports this package through `requirements.txt`; do not put TCG rules in `market_monitor`. |
 | Change generic price source logic | `price_monitor_bot` | `src/market_monitor` | `aka_no_claw` imports this package through `requirements.txt`; keep domain-specific rules out. |
 | Change price command formatting | `aka_no_claw` / `price_monitor_bot` | `openclaw_adapter`, historical bot formatter paths | Inspect integration boundary first. |

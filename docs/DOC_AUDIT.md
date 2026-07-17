@@ -46,7 +46,7 @@ for which question each one answers.
 | `CHAT_GOAL_LOOP_PLAN.md` | Planned | dynamic-tools | Keep until shipped (chat goal loop + eval harness, issues #50–#54); then mark Current or fold into canonical and archive. |
 | `CHAT_CLOUD_POOL_STICKY_PROVIDER_PLAN.md` | Planned | dynamic-tools | Keep until shipped (sticky-provider pin for chat `cloud_pool`, ported from musubi issue #11 Case C P1); then mark Current or fold into canonical and archive. |
 | `P1_ENGINEERING_HARDENING_IMPLEMENTATION_PLAN.md` | Planned | agent-maintenance | Canonical P1 execution/handoff plan for issue #80; keep while active, then fold stable rules into truth docs and archive. |
-| `WEB_SESSION_RUN_EVENT_SPINE_IMPLEMENTATION_PLAN.md` | Planned | command-bridge / conversation-runtime | Canonical #84 backend event-spine plan; implement first, keep as living handoff, then fold shipped contracts into truth docs and archive the execution record. |
+| `WEB_SESSION_RUN_EVENT_SPINE_IMPLEMENTATION_PLAN.md` | Current | command-bridge / conversation-runtime | Shipped #84 event-spine contract and implementation record; stable ownership and verification are folded into the authoritative truth docs. |
 | `WEB_DYNAMIC_TOOL_APPROVAL_IMPLEMENTATION_PLAN.md` | Planned | dynamic-tools / command-bridge safety | Canonical #85 manifest-bound approval plan; depends on #84 and the Web consumer plan. |
 | `WEB_PROMPT_QUEUE_IMPLEMENTATION_PLAN.md` | Planned | command-bridge / conversation-runtime | Canonical #86 prompt queue and safe interjection plan; depends on #84 and the Web consumer plan. |
 | `WEB_CONVERSATION_COMPACTION_IMPLEMENTATION_PLAN.md` | Planned | command-bridge / model-context | Canonical #87 grounded compaction/checkpoint plan; depends on #84 and the Web consumer plan. |

@@ -9,7 +9,6 @@ Exit 0 = aligned, 1 = drift detected. PyYAML-free.
 """
 from __future__ import annotations
 
-import re
 import sys
 from pathlib import Path
 
@@ -25,6 +24,7 @@ CURRENT_STATE = REPO_ROOT / "docs" / "CURRENT_STATE.md"
 SUBSYSTEM_LABELS = {
     "telegram": "Telegram bot",
     "cli_registry": "CLI tool registry",
+    "web_command_bridge": "Web command bridge",
     "price_lookup": "Price lookup",
     "liquidity_board": "Liquidity board",
     "research": "/research",

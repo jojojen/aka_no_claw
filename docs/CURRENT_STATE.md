@@ -3,7 +3,7 @@
 Status: Current
 Owner area: agent-maintenance
 
-Last reviewed: 2026-07-03
+Last reviewed: 2026-07-17
 
 ## Status Legend
 
@@ -22,6 +22,7 @@ Last reviewed: 2026-07-03
 |---|---|---|---|---|
 | Telegram bot | `beta` | `python -m openclaw_adapter telegram-poll --notify-startup`, `launchers/start-telegram-bot.*` | Telegram-facing runtime settings, inbox DBs | Main user interface. Requires token/chat ID in `.env`. Three-package split: `telegram_core` (zero-dep transport/poll-loop/dispatch, shared) → `price_monitor_bot.bot.TelegramCommandProcessor` (price-domain hooks/registries) → `openclaw_adapter.telegram_bot.TelegramCommandProcessor` (aka-domain hooks/registries, the class actually run in production). See [TELEGRAM_CORE_EXTRACTION_PLAN.md](TELEGRAM_CORE_EXTRACTION_PLAN.md). |
 | CLI tool registry | `shipped` | `python -m openclaw_adapter list-tools` | n/a | Central registry for assistant tools. |
+| Web command bridge | `shipped` | `python -m openclaw_adapter command-bridge --lan --port 8781`, `/api/command`, `/api/command/stream`, `/api/command/async`, `/api/command/events`, `/api/command/session` | `.openclaw_tmp/web_sessions/` authoritative event journals; legacy session/job snapshots remain compatibility views | Versioned append-only run/session history is authoritative. Exact cursor replay, deterministic projection rebuild, negotiated NDJSON events, background completion injection, bounded retention, migration, and terminal compare-and-set shipped in issue #84. |
 | Price lookup | `beta` | `/price`, `python -m openclaw_adapter lookup-card` | Source caches / runtime DBs | Uses TCG and market layers plus historical price monitor behavior. |
 | Liquidity board | `beta` | `/liquidity`, dashboard | Market/source data | Methodology is documented in `LIQUIDITY_METHODOLOGY.md`. |
 | `/research` | `beta` | Telegram `/research`, `/resaerch` alias | `knowledge.sqlite3`, Mercari and market evidence | Implemented with Mercari item research, seller risk, price, liquidity, and optional Big Pickle appreciation offload. |

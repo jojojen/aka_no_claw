@@ -3,7 +3,7 @@
 Status: Current
 Owner area: architecture
 
-Last reviewed: 2026-07-03
+Last reviewed: 2026-07-17
 
 ## Repo Map
 
@@ -24,6 +24,11 @@ Last reviewed: 2026-07-03
 | Generic market core | `price_monitor_bot/src/market_monitor` | Generic monitoring and source-management logic imported through the sibling package. Keep card-specific heuristics out. |
 | TCG domain | `price_monitor_bot/src/tcg_tracker` | Card aliases, matching, TCG source adapters, and TCG-specific lookup behavior imported through the sibling package. |
 | OpenClaw adapter | `src/openclaw_adapter` | CLI, Telegram, dashboard, dynamic tools, `/research`, SNS integration, opportunity agent, and sibling repo adapters. |
+
+The OpenClaw adapter also owns the Web command bridge's transport-compatible
+event runtime. `session_event_journal.py` is the append-only authority,
+`session_projection.py` rebuilds the Web view, and `command_bridge.py` records
+blocking, streaming, and background-job lifecycles through `RunRecorder`.
 
 ## Main Runtime Flow
 
@@ -135,6 +140,33 @@ Primary paths:
 - `src/openclaw_adapter/dashboard.py`
 - `src/openclaw_adapter/dashboard_assets/`
 
+### Web Command Bridge
+
+```text
+Web blocking / NDJSON / async request
+  -> openclaw_adapter.command_bridge_server compatibility endpoint
+  -> openclaw_adapter.command_bridge + RunRecorder
+  -> versioned events appended to the per-session JSONL journal
+  -> deterministic session projection and legacy response/poll/session views
+  -> GET /api/command/events exact cursor replay after reconnect
+```
+
+The journal is authoritative; mutable session and job snapshots are compatibility
+views. Negotiated NDJSON live delivery starts at the atomic `latest_cursor`,
+while historical recovery advances page-by-page with `server_cursor`. Background
+completion and cancellation each use a single terminal compare-and-set so a run
+cannot resurrect or emit duplicate final messages.
+
+Primary paths:
+
+- `src/openclaw_adapter/session_events.py`
+- `src/openclaw_adapter/session_event_journal.py`
+- `src/openclaw_adapter/session_event_service.py`
+- `src/openclaw_adapter/session_projection.py`
+- `src/openclaw_adapter/run_recorder.py`
+- `src/openclaw_adapter/command_bridge.py`
+- `src/openclaw_adapter/command_bridge_server.py`
+
 ### `/research`
 
 ```text
@@ -166,6 +198,7 @@ Runtime paths are resolved through `assistant_runtime.settings`; keep docs gener
 | Opportunity DB | `data/opportunities.sqlite3` | Opportunity agent store. |
 | Opportunity inbox | `data/opportunity_inbox.sqlite3` | Telegram writes requests; opportunity agent consumes. |
 | Quiz DB | `data/quiz.sqlite3` | Quiz state and review material. |
+| Web session event journals | `.openclaw_tmp/web_sessions/<session_id>/` | Command bridge authority: bounded JSONL events plus sequence metadata; rebuildable projections and compatibility snapshots must not overwrite it. |
 
 ## High-Risk Boundaries
 
@@ -174,3 +207,4 @@ Runtime paths are resolved through `assistant_runtime.settings`; keep docs gener
 - Runtime DB and log paths must be repo-root resolved, not current-working-directory guesses.
 - TCG-specific matching belongs in sibling package `tcg_tracker`, not `market_monitor`.
 - Generic source and price aggregation behavior belongs in sibling package `market_monitor`, not Telegram handlers.
+- Web clients must recover durable history with `/api/command/events`; they must not treat mutable poll/session snapshots or an NDJSON page cursor as the authoritative journal head.

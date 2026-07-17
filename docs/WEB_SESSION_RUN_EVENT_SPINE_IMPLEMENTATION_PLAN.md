@@ -1,7 +1,7 @@
 # Web Session/Run Event Spine Implementation Plan
 
 Last reviewed: 2026-07-17
-Status: Planned
+Status: Current
 Owner area: command-bridge / conversation-runtime
 Tracking issue: [`aka_no_claw#84`](https://github.com/jojojen/aka_no_claw/issues/84)
 Companion Web issue: [`aka_no_claw_web#12`](https://github.com/jojojen/aka_no_claw_web/issues/12)
@@ -19,6 +19,10 @@ The GitHub issue corresponding to this document should remain short. The issue
 defines the outcome and acceptance boundary; this file owns file-level work and
 execution order. During implementation, keep the progress checklist in section
 18 current so a new agent can resume without reconstructing the design.
+
+Implementation and supported restart/live recovery verification completed on
+2026-07-17. This document now serves as the shipped contract and implementation
+record for issue #84.
 
 Read these first:
 
@@ -328,6 +332,7 @@ Response:
   "session_id": "web-default",
   "events": [],
   "server_cursor": 57,
+  "latest_cursor": 57,
   "has_more": false
 }
 ```
@@ -339,6 +344,8 @@ Rules:
 - `limit` has a server cap;
 - `server_cursor` is the greatest sequence included/known according to the
   chosen contract; define and test this exactly;
+- `latest_cursor` is the atomic journal head at read time; live subscription
+  bootstrap uses this value and must not infer the head from a capped page;
 - pagination must never skip or duplicate events;
 - a cursor older than retention returns a typed `cursor_expired` response with
   the current projection/bootstrap path, not an empty false-success;
@@ -736,7 +743,26 @@ tests/test_settings.py tests/test_session_memory.py`.
 - [x] E6.1 rebuild compatibility snapshot from journal.
 - [x] E6.2 enable migration and bounded retention.
 - [x] E6.3 update system truth and verification docs.
-- [ ] E6.4 restart and complete live recovery proof.
+- [x] E6.4 restart and complete live recovery proof.
+
+### 2026-07-17 live recovery result
+
+- `/restartall` recreated the bridge and Telegram workers; the bridge listened
+  on 8781 and Telegram established polling over 443.
+- The production journal exceeded three 500-event pages. A negotiated NDJSON
+  smoke exposed and then regression-fixed a page-tail-vs-journal-head bootstrap
+  bug; after the second supported restart, the stream emitted only the current
+  run's nine durable events (`seq` 1613–1621), with no historic replay.
+- A long async research request completed after the submitting connection had
+  closed. Reopen polling recovered six progress items; cursor recovery returned
+  four durable progress checkpoints, one assistant message, and one
+  `run.completed` (`seq` 1622–1630). Repeated poll/replay did not advance cursor
+  1630.
+- A separate cancelled research run remained interrupted after waiting and
+  emitted exactly one `run.cancelled`, proving the terminal state did not
+  resurrect as completed.
+- Payload text and local credentials were excluded from the recorded proof;
+  only event types, counts, run identity continuity, and cursors were inspected.
 
 ## 19. Rollback Strategy
 

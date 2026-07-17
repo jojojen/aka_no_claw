@@ -1,5 +1,5 @@
 schema_version: 1
-last_reviewed: "2026-07-03"
+last_reviewed: "2026-07-17"
 system_name: OpenClaw
 primary_repo: aka_no_claw
 status_vocabulary:
@@ -13,7 +13,7 @@ system_summary: >-
   Personal assistant workspace that monitors SNS and market signals, evaluates
   TCG price and liquidity, checks Mercari seller reputation, runs user-triggered
   research and dynamic tools, and sends results through Telegram, CLI, dashboard,
-  and local services.
+  the replayable Web command bridge, and local services.
 
 repos:
   aka_no_claw:
@@ -22,6 +22,7 @@ repos:
     responsibility:
       - assistant runtime
       - CLI and Telegram adapter
+      - Web command bridge and authoritative session/run event journals
       - dashboard
       - TCG and market integration
       - SNS monitor integration
@@ -136,6 +137,40 @@ subsystems:
       - docs/VERIFICATION_MATRIX.md
     verification:
       - .venv/bin/python -m openclaw_adapter list-tools
+
+  web_command_bridge:
+    status: shipped
+    owner_repo: aka_no_claw
+    owner_paths:
+      - src/openclaw_adapter/command_bridge.py
+      - src/openclaw_adapter/command_bridge_server.py
+      - src/openclaw_adapter/session_events.py
+      - src/openclaw_adapter/session_event_journal.py
+      - src/openclaw_adapter/session_event_service.py
+      - src/openclaw_adapter/session_projection.py
+      - src/openclaw_adapter/run_recorder.py
+    entrypoints:
+      - python -m openclaw_adapter command-bridge --lan --port 8781
+      - GET /api/command/events
+      - GET/POST/DELETE /api/command/session
+      - POST /api/command
+      - POST /api/command/stream
+      - POST /api/command/async
+      - GET /api/command/poll
+      - POST /api/command/cancel
+    docs:
+      - docs/WEB_SESSION_RUN_EVENT_SPINE_IMPLEMENTATION_PLAN.md
+      - docs/SYSTEM_MAP.md
+      - docs/VERIFICATION_MATRIX.md
+    data_stores:
+      - .openclaw_tmp/web_sessions
+      - .openclaw_tmp/web_console_memory
+    verification:
+      - .venv/bin/python -m pytest tests/test_session_events.py tests/test_session_event_journal.py tests/test_session_projection.py tests/test_command_bridge_event_contract.py
+    risks:
+      - keep existing blocking, NDJSON, async/poll/cancel, and session response shapes compatible
+      - distinguish page server_cursor from atomic latest_cursor
+      - never persist private reasoning, credentials, or unbounded payloads
 
   price_lookup:
     status: beta
@@ -416,6 +451,9 @@ docs:
   dynamic_tools:
     path: docs/NEW_DYNAMIC_TOOLS_PROGRESS.md
     status: current
+  web_session_run_event_spine:
+    path: docs/WEB_SESSION_RUN_EVENT_SPINE_IMPLEMENTATION_PLAN.md
+    status: current
 
 agent_rules:
   required_reading_order:
@@ -465,4 +503,7 @@ issue_tracking:
       status: implemented
     - issue: 7
       title: "docs/tooling: Documentation Health & Drift Enforcement"
+      status: implemented
+    - issue: 84
+      title: "architecture(web): add replayable session/run event spine and cursor recovery"
       status: implemented

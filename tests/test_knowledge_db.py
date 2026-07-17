@@ -108,6 +108,22 @@ def test_codegen_seed_for_durable_terminal_transitions_is_always_retrievable(db)
     assert "compare-and-set" in rule.technique
 
 
+def test_codegen_seed_for_page_cursor_vs_journal_head_is_always_retrievable(db):
+    db.seed_codegen_knowledge()
+
+    rows = db.retrieve_codegen_knowledge("任意程式需求", k=100)
+    rule = next(
+        row
+        for row in rows
+        if row.title == "分頁游標與資料頭游標是不同契約，live 訂閱不可拿第一頁尾端當 journal head"
+    )
+
+    assert rule.category == "architecture"
+    assert "*" in rule.keywords
+    assert "page cursor" in rule.technique
+    assert "latest cursor" in rule.technique
+
+
 def test_upsert_and_get_entry_roundtrip(db):
     db.upsert_entry(
         entity_canonical="pjsk",

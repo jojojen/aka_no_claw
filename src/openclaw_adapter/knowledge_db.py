@@ -1968,6 +1968,26 @@ CODEGEN_SEED: tuple[dict, ...] = (
     },
     {
         "category": "architecture",
+        "title": "分頁游標與資料頭游標是不同契約，live 訂閱不可拿第一頁尾端當 journal head",
+        "technique": (
+            "有分頁的 append-only API 通常同時存在兩個高水位：本頁最後一筆的 cursor，"
+            "以及整份資料目前最新的 cursor。當 retained history 超過 page limit 時，"
+            "第一頁的 server cursor 只代表『這一頁讀到哪裡』，不代表 journal head；"
+            "若 live stream 用它當 bootstrap 起點，就會把後續歷史頁誤當成新事件重送，"
+            "小資料測試全綠、累積到多頁才爆出 duplicate replay。\n"
+            "契約應明確分開 page cursor 與 atomic latest/high-water cursor；live 訂閱從"
+            "latest cursor 開始，歷史 recovery 才從 page cursor 逐頁前進。測試必須預載"
+            "超過一頁的事件，斷言 negotiated stream 只送 bootstrap 後新增的事件，不能"
+            "用空 journal fixture 代表這個邊界。"
+        ),
+        "keywords": [
+            "*", "pagination", "cursor", "journal", "high-water mark", "live stream",
+            "bootstrap", "duplicate replay", "分頁", "游標", "重播", "契約",
+        ],
+        "confidence": 0.95,
+    },
+    {
+        "category": "architecture",
         "title": "去重 key 必須與序列閘門同尺度（per-writer），純時間戳 ID 會跨產生者碰撞",
         "technique": (
             "分散式事件複製常同時有兩層機制：以 event id 去重、以 per-writer sequence "
