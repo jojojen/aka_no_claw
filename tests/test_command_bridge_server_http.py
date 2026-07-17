@@ -59,6 +59,10 @@ class _FakeBridge:
         return {"status": STATUS_OK, "job_status": "interrupted",
                 "message": "已要求取消，將於下一個安全點停止。"}
 
+    def resolve_workflow_approval(self, payload):
+        self.approval_payload = payload
+        return {"status": STATUS_OK, "message": "approved", "approval": {"resolution": "approved"}}
+
 
 @pytest.fixture()
 def server():
@@ -163,3 +167,13 @@ def test_unknown_route_is_404(server):
     with pytest.raises(urllib.error.HTTPError) as excinfo:
         _post(base, "/api/command/nope", {})
     assert excinfo.value.code == 404
+
+
+def test_approval_route_relays_typed_decision(server):
+    base, bridge = server
+    payload = {"approval_id": "a", "session_id": "s", "run_id": "r", "approval_token": "t", "decision": "approve"}
+    with _post(base, "/api/command/approval", payload) as resp:
+        data = json.loads(resp.read())
+    assert bridge.approval_payload == payload
+    assert data["approval"]["resolution"] == "approved"
+    assert data["envelope_version"] == 1

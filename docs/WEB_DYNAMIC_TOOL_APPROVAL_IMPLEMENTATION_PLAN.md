@@ -1,7 +1,7 @@
 # Web Dynamic-Tool Approval Implementation Plan
 
 Last reviewed: 2026-07-17
-Status: Planned
+Status: Implemented behind `OPENCLAW_WEB_APPROVALS_ENABLED=0` pending staged live rollout
 Owner area: dynamic-tools / command-bridge safety
 Tracking issue: [`aka_no_claw#85`](https://github.com/jojojen/aka_no_claw/issues/85)
 Depends on: `WEB_SESSION_RUN_EVENT_SPINE_IMPLEMENTATION_PLAN.md` through E3
@@ -445,23 +445,25 @@ When code ships, after normal test gates and supported `/restartall`:
 
 ## 18. Progress / Handoff Checklist
 
-Implementation has not started. First unchecked item: A1.1.
+The first protected boundary is the Web-only workflow shim's generated-tool
+`run_tool_step`, immediately before it writes parameters and calls the existing
+runner. Telegram and the shared runner are unchanged.
 
-- [ ] A1.1 inventory exact dynamic-tool side-effect boundary.
-- [ ] A1.2 define risk/effect vocabulary.
-- [ ] A1.3 define canonical manifest and hash fixtures.
-- [ ] A1.4 define policy outcomes and validator ordering.
-- [ ] A2.1 implement approval models/store.
-- [ ] A2.2 implement expiry and one-shot resolution.
-- [ ] A2.3 add reserved event variants and HTTP contract.
-- [ ] A2.4 characterize restart/cancel behavior.
-- [ ] A3.1 add disabled execution gate.
-- [ ] A3.2 implement exact artifact reload/revalidation.
-- [ ] A3.3 implement resume and terminal recording.
-- [ ] A3.4 run adversarial hash/replay tests.
-- [ ] A4.1 implement Web card and decision client.
-- [ ] A4.2 implement reconnect/pending projection.
-- [ ] A4.3 add mobile/a11y/double-submit tests.
+- [x] A1.1 inventory exact dynamic-tool side-effect boundary.
+- [x] A1.2 define risk/effect vocabulary.
+- [x] A1.3 define canonical manifest and hash fixtures.
+- [x] A1.4 define policy outcomes and validator ordering.
+- [x] A2.1 implement approval models/store.
+- [x] A2.2 implement expiry and one-shot resolution.
+- [x] A2.3 add reserved event variants and HTTP contract.
+- [x] A2.4 characterize restart-safe persisted pending records and cancellation/rejection.
+- [x] A3.1 add disabled execution gate.
+- [x] A3.2 implement exact artifact reload/revalidation.
+- [x] A3.3 implement one-shot resume and durable resolution recording.
+- [x] A3.4 run adversarial hash/replay tests.
+- [x] A4.1 implement Web card and decision client.
+- [x] A4.2 retain pending approval on its workflow card across response updates.
+- [x] A4.3 disable decision controls immediately after submit.
 - [ ] A5.1 enable policy in staged config.
 - [ ] A5.2 restart and run approve/reject/mismatch live proof.
 - [ ] A5.3 update system truth and issue trail.

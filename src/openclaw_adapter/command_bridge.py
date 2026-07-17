@@ -41,6 +41,10 @@ from .session_memory import SessionMemoryStore, SessionWriteError, empty_session
 from .session_event_service import SessionEventService
 from .session_event_journal import CursorExpiredError
 from .run_recorder import RunRecorder
+from .action_risk import PolicyOutcome, classify_generated_tool, decide_policy
+from .approval_models import FrozenActionManifest, PendingApproval
+from .approval_service import ApprovalService
+from .approval_store import ApprovalStore
 from .command_bridge_conversation import ConversationSession, ConversationState
 from .command_bridge_music import MusicCapability
 from .command_bridge_workflow import WorkflowCapability
@@ -188,6 +192,18 @@ _BRIDGE_CHAT_ID = "web-bridge"
 _WF_WEB_CHAT_ID = "web-workflow"
 _SH_WEB_CHAT_ID = "web-schedule"
 _HEARTBEAT_SECONDS = 10.0
+
+
+@dataclasses.dataclass(slots=True)
+class _WorkflowApprovalContext:
+    service: ApprovalService
+    recorder: RunRecorder
+    pending: list[dict]
+
+
+_WORKFLOW_APPROVAL_CONTEXT: ContextVar[_WorkflowApprovalContext | None] = ContextVar(
+    "workflow_approval_context", default=None
+)
 
 # Chat-tool ledger: how many recent executions to keep per conversation and how
 # much of each result to quote back to the tool-plan router.
@@ -460,6 +476,7 @@ class _WorkflowShimRunner:
     from the web bridge process."""
 
     def __init__(self, settings: AssistantSettings) -> None:
+        self._approval_settings = settings
         from .dynamic_tools import DynamicToolRunner, OllamaTextClient, _resolve_tools_dir
 
         self.tools_dir = _resolve_tools_dir()
@@ -483,6 +500,34 @@ class _WorkflowShimRunner:
         self.catalog = self._tool_runner.catalog
 
     def run_tool_step(self, slug: str, explicit_params: dict) -> tuple[bool, str]:
+        context = _WORKFLOW_APPROVAL_CONTEXT.get()
+        if context is not None and bool(getattr(self._approval_settings, "openclaw_web_approvals_enabled", False)):
+            tool_path = self.tools_dir / slug / "tool.py"
+            try:
+                code = tool_path.read_text(encoding="utf-8")
+            except OSError:
+                return False, f"工具 '{slug}' 的 tool.py 不存在"
+            profile = classify_generated_tool(code)
+            policy = decide_policy(profile, getattr(
+                self._approval_settings, "openclaw_dynamic_tool_approval_policy", "ask_generated_writes"
+            ))
+            if policy is PolicyOutcome.DENY:
+                return False, "此 generated tool 不符合 Web 執行安全政策"
+            if policy is PolicyOutcome.ASK:
+                manifest = FrozenActionManifest.for_generated_tool(
+                    slug=slug, code=code, arguments=explicit_params, profile=profile,
+                    policy_version=getattr(self._approval_settings, "openclaw_dynamic_tool_approval_policy", "ask_generated_writes"),
+                    created_at=time.time(),
+                )
+                record = context.service.request(
+                    session_id=context.recorder.journal.session_id, run_id=context.recorder.run_id,
+                    manifest=manifest, risk=profile.risk.value,
+                    descriptor={"tool_slug": slug, "arguments": dict(explicit_params)},
+                )
+                public = record.public()
+                context.pending.append(public)
+                context.recorder.emit("approval.requested", public)
+                return False, "此 generated tool 正等待一次性核准"
         return self._tool_runner.run_tool_step(slug, explicit_params)
 
 
@@ -516,6 +561,8 @@ class CommandBridge:
         self._session_store: SessionMemoryStore | None = None
         self._event_sessions_inst: SessionEventService | None = None
         self._event_sessions_lock = threading.Lock()
+        self._approval_service_inst: ApprovalService | None = None
+        self._approval_service_lock = threading.Lock()
         self._active_run_recorder: ContextVar[RunRecorder | None] = ContextVar(
             "active_run_recorder", default=None
         )
@@ -3875,6 +3922,7 @@ class CommandBridge:
                     from .workflow_editor import WorkflowEditor
 
                     runner = _WorkflowShimRunner(self.settings)
+                    self._workflow_runner = runner
                     # Pass the full command registry so the web command picker
                     # lists every allowed registered command and _cmd_run can
                     # dispatch any registered handler (not just the fallbacks).
@@ -3908,7 +3956,9 @@ class CommandBridge:
                     )
         return self._workflow_handler, self._workflow_editor  # type: ignore[return-value]
 
-    def run_workflow_command(self, text: str, *, chat_backend: str | None = None) -> dict:
+    def run_workflow_command(
+        self, text: str, *, chat_backend: str | None = None, session_id: str | None = None
+    ) -> dict:
         """Run the ``/workflow`` handler for the web console. ``text`` is the
         remainder after the command (e.g. ``create 先查天氣再念出來…``); a
         natural-language ``create`` drafts a workflow via the cloud-preferred LLM
@@ -3920,9 +3970,107 @@ class CommandBridge:
         ``handle_text_capture`` instead of being dispatched as a new subcommand.
         This mirrors the Telegram path in
         ``TelegramCommandProcessor._build_workflow_capture_plan``."""
-        return self._workflow_capability_for_compat().run_command(
-            text, chat_backend=chat_backend
+        recorder = self._active_run_recorder.get()
+        own_recorder = recorder is None
+        if recorder is None:
+            recorder = self._event_sessions().recorder(session_id)
+            recorder.accepted("")
+            recorder.started()
+        scope = _WorkflowApprovalContext(self._approval_service(), recorder, [])
+        token = _WORKFLOW_APPROVAL_CONTEXT.set(scope)
+        try:
+            result = self._workflow_capability_for_compat().run_command(
+                text, chat_backend=chat_backend
+            )
+            if scope.pending:
+                result = dict(result)
+                result["status"] = "pending_approval"
+                result["approval"] = scope.pending[-1]
+                result["message"] = "動態工具已暫停，等待一次性核准。"
+            if own_recorder and not scope.pending:
+                recorder.assistant_message(str(result.get("message") or ""))
+                recorder.terminal(
+                    "completed" if result.get("status") != STATUS_ERROR else "failed",
+                    message=str(result.get("message") or ""),
+                )
+            return result
+        except Exception as exc:
+            if own_recorder:
+                recorder.assistant_message(f"工作流指令失敗：{exc}")
+                recorder.terminal("failed", message=str(exc))
+            raise
+        finally:
+            _WORKFLOW_APPROVAL_CONTEXT.reset(token)
+
+    def _approval_service(self) -> ApprovalService:
+        service = getattr(self, "_approval_service_inst", None)
+        if service is None:
+            lock = getattr(self, "_approval_service_lock", None)
+            if lock is None:
+                lock = threading.Lock()
+                self._approval_service_lock = lock
+            with lock:
+                service = getattr(self, "_approval_service_inst", None)
+                if service is None:
+                    root = getattr(self.settings, "openclaw_web_approval_store_dir", None)
+                    if not root:
+                        root = str(Path(getattr(self.settings, "openclaw_web_event_dir", ".openclaw_tmp") ) / "approvals")
+                    service = ApprovalService(
+                        ApprovalStore(str(root)),
+                        ttl_seconds=getattr(self.settings, "openclaw_web_approval_ttl_seconds", 300),
+                    )
+                    self._approval_service_inst = service
+        return service
+
+    def resolve_workflow_approval(self, payload: dict) -> dict:
+        """Resolve exactly one persisted Web approval, then revalidate and execute it."""
+        required = ("approval_id", "session_id", "run_id", "approval_token", "decision")
+        if not isinstance(payload, dict) or any(not isinstance(payload.get(key), str) or not payload[key] for key in required):
+            raise ValueError("approval request requires approval_id, session_id, run_id, approval_token, and decision")
+        record, idempotent = self._approval_service().resolve(
+            approval_id=payload["approval_id"], session_id=payload["session_id"],
+            run_id=payload["run_id"], token=payload["approval_token"], decision=payload["decision"],
+            execute=self._execute_approved_workflow_tool,
         )
+        recorder = RunRecorder(self._event_sessions().journal(record.session_id), run_id=record.run_id)
+        event = {
+            "approval_id": record.approval_id, "manifest_hash": record.manifest_hash,
+            "resolution": record.resolution, "risk": record.risk,
+        }
+        recorder.emit("approval.resolved", event)
+        return {
+            "status": "ok" if record.resolution == "approved" else "error",
+            "approval": {**record.public(), "resolution": record.resolution,
+                         "result_message": record.result_message, "idempotent": idempotent},
+            "message": record.result_message or "核准狀態已更新",
+        }
+
+    def _execute_approved_workflow_tool(self, record: PendingApproval) -> tuple[bool, str]:
+        descriptor = record.descriptor
+        slug, arguments = descriptor.get("tool_slug"), descriptor.get("arguments")
+        if not isinstance(slug, str) or not isinstance(arguments, dict):
+            return False, "核准內容不完整，已拒絕執行"
+        self._workflow_surface()
+        runner = getattr(self, "_workflow_runner", None)
+        if runner is None:
+            return False, "工具執行器無法使用，已拒絕執行"
+        tool_path = runner.tools_dir / slug / "tool.py"
+        try:
+            code = tool_path.read_text(encoding="utf-8")
+        except OSError:
+            return False, "核准的工具 artifact 已不存在"
+        profile = classify_generated_tool(code)
+        manifest_data = record.manifest
+        manifest = FrozenActionManifest.for_generated_tool(
+            slug=slug, code=code, arguments=arguments, profile=profile,
+            policy_version=getattr(self.settings, "openclaw_dynamic_tool_approval_policy", "ask_generated_writes"),
+            created_at=float(manifest_data["created_at"]),
+        )
+        if manifest.hash != record.manifest_hash:
+            return False, "核准的工具內容或參數已變更，已拒絕執行"
+        if decide_policy(profile, manifest.policy_version) is not PolicyOutcome.ASK:
+            return False, "目前安全政策不再允許此核准執行"
+        return runner._tool_runner.run_tool_step(slug, arguments)
 
     def _workflow_capability_for_compat(self) -> WorkflowCapability:
         """Lazy fallback for minimal bridge fixtures that intentionally bypass

@@ -210,6 +210,8 @@ def _build_handler(
                 self._handle_ir()
             elif path == "/api/command/workflow":
                 self._handle_workflow()
+            elif path == "/api/command/approval":
+                self._handle_approval()
             elif path == "/api/command/schedulehome":
                 self._handle_schedulehome()
             elif path == "/api/command/session":
@@ -617,8 +619,30 @@ def _build_handler(
                 bridge.run_workflow_command(
                     str(data.get("input") or ""),
                     chat_backend=str(data.get("chat_backend") or ""),
+                    session_id=str(data.get("session_id") or "") or None,
                 )
             )
+
+        def _handle_approval(self) -> None:
+            """Resolve one manifest-bound generated-tool approval (#85)."""
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            try:
+                raw = self.rfile.read(length) if length else b""
+                data = json.loads(raw.decode("utf-8")) if raw else {}
+                response = bridge.resolve_workflow_approval(data)
+            except ValueError as exc:
+                self._write_json({"status": "error", "message": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            except KeyError:
+                self._write_json({"status": "error", "message": "找不到核准請求"}, status=HTTPStatus.NOT_FOUND)
+                return
+            except PermissionError as exc:
+                self._write_json({"status": "error", "message": str(exc)}, status=HTTPStatus.FORBIDDEN)
+                return
+            except RuntimeError as exc:
+                self._write_json({"status": "error", "message": str(exc)}, status=HTTPStatus.CONFLICT)
+                return
+            self._write_json(response)
 
         def _handle_schedulehome(self) -> None:
             """Schedule surface (web#9). ``callback_data`` (``sh:…``) dispatches a

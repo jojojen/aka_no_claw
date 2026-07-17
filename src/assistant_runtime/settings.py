@@ -210,6 +210,12 @@ class AssistantSettings:
     openclaw_web_event_max_bytes: int = 25 * 1024 * 1024
     openclaw_web_event_max_age_days: int = 30
     openclaw_web_event_max_payload_bytes: int = 64 * 1024
+    # Manifest-bound approval for risky Web-originated generated-tool actions.
+    # Disabled until the companion Web approval card is deployed.
+    openclaw_web_approvals_enabled: bool = False
+    openclaw_web_approval_ttl_seconds: int = 300
+    openclaw_web_approval_store_dir: str = ".openclaw_tmp/web_approvals"
+    openclaw_dynamic_tool_approval_policy: str = "ask_generated_writes"
     # ── chat LLM pool settings (issue #66) ────────────────────────────────
     # User-editable provider order, enable flags, and selected model ids for
     # Web Chat + Telegram natural-language routing. Secrets stay in .env.
@@ -592,6 +598,16 @@ def get_settings() -> AssistantSettings:
         openclaw_web_event_max_payload_bytes=_as_int(
             os.getenv("OPENCLAW_WEB_EVENT_MAX_PAYLOAD_BYTES"), default=64 * 1024
         ),
+        openclaw_web_approvals_enabled=_as_bool(os.getenv("OPENCLAW_WEB_APPROVALS_ENABLED")),
+        openclaw_web_approval_ttl_seconds=_as_int(
+            os.getenv("OPENCLAW_WEB_APPROVAL_TTL_SECONDS"), default=300
+        ),
+        openclaw_web_approval_store_dir=_resolve_runtime_path(
+            os.getenv("OPENCLAW_WEB_APPROVAL_STORE_DIR", ".openclaw_tmp/web_approvals")
+        ),
+        openclaw_dynamic_tool_approval_policy=os.getenv(
+            "OPENCLAW_DYNAMIC_TOOL_APPROVAL_POLICY", "ask_generated_writes"
+        ).strip() or "ask_generated_writes",
         openclaw_llm_pool_config_path=_resolve_runtime_path(
             os.getenv("OPENCLAW_LLM_POOL_CONFIG_PATH", "config/llm_pool.json")
         ),
