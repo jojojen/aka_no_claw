@@ -987,6 +987,23 @@ DEPRECATED_CODEGEN_SEED: tuple[tuple[str, str], ...] = (
 
 CODEGEN_SEED: tuple[dict, ...] = (
     {
+        "category": "security",
+        "title": "一次性核准必須在消費邊界重驗完整綁定並以權威事件恢復狀態",
+        "technique": (
+            "高風險動作的核准不能只比對客戶端送回的 token 與資料庫字串；消費時要用伺服器"
+            "密鑰重新計算 MAC，綁定 session、run、manifest hash、expiry 與 nonce，並在同一個"
+            "跨執行緒／跨程序 compare-and-set 中先消耗核准，才可執行副作用。執行前還要重新"
+            "讀取 artifact、參數、相依、能力範圍與現行 policy；任一變更都 fail closed。前端"
+            "重連時從 durable requested/resolved event 對帳，不把 bearer token 寫進一般 session"
+            "snapshot，也不能靜默吞掉事件恢復失敗。"
+        ),
+        "keywords": [
+            "*", "security", "approval", "hmac", "manifest", "single-use", "cas",
+            "replay", "event", "reconnect", "fail-closed",
+        ],
+        "confidence": 0.98,
+    },
+    {
         "category": "concurrency",
         "title": "終態狀態必須在所有可恢復副作用落盤後才對讀者可見",
         "technique": (

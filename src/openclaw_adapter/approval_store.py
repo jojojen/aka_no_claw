@@ -8,7 +8,10 @@ from pathlib import Path
 import secrets
 import tempfile
 import threading
+from contextlib import contextmanager
 from typing import Callable
+
+import fcntl
 
 from .approval_models import PendingApproval
 
@@ -18,11 +21,23 @@ class ApprovalStore:
         self.root = Path(root_dir)
         self.path = self.root / "approvals.json"
         self.key_path = self.root / "approval_hmac.key"
+        self.lock_path = self.root / "approvals.lock"
         self._lock = threading.Lock()
 
-    def signing_key(self) -> bytes:
+    @contextmanager
+    def _locked(self):
+        """Serialize reads and atomic replacements across threads and processes."""
         with self._lock:
             self.root.mkdir(parents=True, exist_ok=True)
+            with self.lock_path.open("a+b") as lock_file:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    def signing_key(self) -> bytes:
+        with self._locked():
             if self.key_path.exists():
                 key = self.key_path.read_bytes()
                 if len(key) >= 32:
@@ -35,13 +50,13 @@ class ApprovalStore:
             return key
 
     def get(self, approval_id: str) -> PendingApproval | None:
-        with self._lock:
+        with self._locked():
             data = self._read()
             value = data.get(approval_id)
             return PendingApproval.from_dict(value) if isinstance(value, dict) else None
 
     def put(self, record: PendingApproval) -> None:
-        with self._lock:
+        with self._locked():
             data = self._read()
             if record.approval_id in data:
                 raise RuntimeError("approval id already exists")
@@ -49,7 +64,7 @@ class ApprovalStore:
             self._write(data)
 
     def compare_and_set(self, approval_id: str, predicate: Callable[[PendingApproval], bool], replacement: PendingApproval) -> PendingApproval:
-        with self._lock:
+        with self._locked():
             data = self._read()
             value = data.get(approval_id)
             if not isinstance(value, dict):

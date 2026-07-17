@@ -1640,7 +1640,9 @@ class DynamicToolRunner:
     def _install_and_execute(self, slug: str, tool_path: Path, code: str) -> DynamicToolResult:
         """Install declared requires, execute, with one extra retry purely for an
         auto-installable ModuleNotFoundError (doesn't count as a generation)."""
-        requires = self._parse_requires(code)
+        valid, validation_error, requires = self.validate_tool_artifact(code)
+        if not valid:
+            return DynamicToolResult(ok=False, slug=slug, error=validation_error)
         if requires:
             try:
                 self._pip_install(requires)
@@ -1685,6 +1687,17 @@ class DynamicToolRunner:
             )
         # exhausted auto-install retry
         return DynamicToolResult(ok=False, slug=slug, error="缺少套件且自動安裝後仍失敗。")
+
+    def validate_tool_artifact(self, code: str) -> tuple[bool, str, tuple[str, ...]]:
+        """Run the deterministic, side-effect-free execution preflight."""
+        syntax = _syntax_error(code)
+        if syntax:
+            return False, f"generated tool syntax invalid: {syntax}", ()
+        requires = self._parse_requires(code)
+        blocked = tuple(package for package in requires if not _is_approved_pkg(package))
+        if blocked:
+            return False, f"generated tool dependencies denied: {', '.join(blocked)}", requires
+        return True, "", requires
 
     # macOS sandbox-exec profile: deny writes to /Users except tool dir,
     # allow everything else (network access needed for tools that fetch data).

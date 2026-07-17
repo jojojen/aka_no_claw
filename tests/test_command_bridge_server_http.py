@@ -37,6 +37,7 @@ class _FakeBridge:
     def __init__(self) -> None:
         self.cancelled: list[str] = []
         self.polled: list[str] = []
+        self.approval_error: Exception | None = None
 
     def handle(self, req):
         return WebCommandResponse(
@@ -60,6 +61,8 @@ class _FakeBridge:
                 "message": "已要求取消，將於下一個安全點停止。"}
 
     def resolve_workflow_approval(self, payload):
+        if self.approval_error is not None:
+            raise self.approval_error
         self.approval_payload = payload
         return {"status": STATUS_OK, "message": "approved", "approval": {"resolution": "approved"}}
 
@@ -171,9 +174,32 @@ def test_unknown_route_is_404(server):
 
 def test_approval_route_relays_typed_decision(server):
     base, bridge = server
-    payload = {"approval_id": "a", "session_id": "s", "run_id": "r", "approval_token": "t", "decision": "approve"}
+    payload = {
+        "approval_id": "a", "session_id": "s", "run_id": "r",
+        "decision_token": "t", "decision": "approve",
+    }
     with _post(base, "/api/command/approval", payload) as resp:
         data = json.loads(resp.read())
     assert bridge.approval_payload == payload
     assert data["approval"]["resolution"] == "approved"
+    assert data["envelope_version"] == 1
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status"),
+    [
+        (ValueError("bad approval"), 400),
+        (KeyError("missing"), 404),
+        (PermissionError("binding mismatch"), 403),
+        (RuntimeError("already resolved"), 409),
+    ],
+)
+def test_approval_route_maps_typed_failures(server, error, expected_status):
+    base, bridge = server
+    bridge.approval_error = error
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        _post(base, "/api/command/approval", {})
+    assert excinfo.value.code == expected_status
+    data = json.loads(excinfo.value.read())
+    assert data["status"] == "error"
     assert data["envelope_version"] == 1

@@ -32,34 +32,67 @@ class ApprovalService:
         self.store.put(record)
         return record
 
-    def resolve(self, *, approval_id: str, session_id: str, run_id: str, token: str, decision: str, execute: Callable[[PendingApproval], tuple[bool, str]]) -> tuple[PendingApproval, bool]:
+    def resolve(
+        self, *, approval_id: str, session_id: str, run_id: str, token: str,
+        decision: str, execute: Callable[[PendingApproval], tuple[str, str, str]],
+        approval_enabled: bool = True,
+    ) -> tuple[PendingApproval, bool]:
         if decision not in {"approve", "reject", "cancel"}:
             raise ValueError("decision must be approve, reject, or cancel")
         current = self.store.get(approval_id)
         if current is None:
             raise KeyError(approval_id)
-        if current.session_id != session_id or current.run_id != run_id or not hmac.compare_digest(current.token, token):
+        expected_token = self._token(
+            current.approval_id, current.session_id, current.run_id,
+            current.manifest_hash, current.expires_at, current.nonce,
+        )
+        if (
+            current.session_id != session_id
+            or current.run_id != run_id
+            or not hmac.compare_digest(current.token, expected_token)
+            or not hmac.compare_digest(token, expected_token)
+        ):
             raise PermissionError("approval binding does not match")
         if current.status != "pending":
-            expected_resolution = "approved" if decision == "approve" else decision
-            if current.resolution == expected_resolution:
+            if current.decision == decision:
                 return current, True
             raise RuntimeError("approval was already resolved")
         now = self.clock()
         if now >= current.expires_at:
-            expired = replace(current, status="resolved", resolution="expired", resolved_at=now, result_message="核准已逾期")
+            expired = replace(
+                current, status="resolved", decision=decision, resolution="expired", resolved_at=now,
+                result_message="核准已逾期", reason_code="expired",
+            )
             return self.store.compare_and_set(approval_id, lambda item: item.status == "pending", expired), False
         if decision != "approve":
-            resolved = replace(current, status="resolved", resolution=decision, resolved_at=now, result_message="操作未獲核准")
+            reason_code = "operator_rejected" if decision == "reject" else "run_cancelled"
+            resolved = replace(
+                current, status="resolved", decision=decision, resolution=decision, resolved_at=now,
+                result_message="操作未獲核准", reason_code=reason_code,
+            )
             return self.store.compare_and_set(approval_id, lambda item: item.status == "pending", resolved), False
-        consumed = replace(current, status="executing", resolution="approve", resolved_at=now)
+        if not approval_enabled:
+            disabled = replace(
+                current, status="resolved", decision=decision, resolution="disabled", resolved_at=now,
+                result_message="Web 核准功能目前已停用，操作未執行", reason_code="approval_disabled",
+            )
+            return self.store.compare_and_set(approval_id, lambda item: item.status == "pending", disabled), False
+        consumed = replace(current, status="executing", decision=decision, resolution="approve", resolved_at=now)
         actual = self.store.compare_and_set(approval_id, lambda item: item.status == "pending", consumed)
         if actual is not consumed:
-            if actual.resolution == "approve":
+            if actual.decision == decision:
                 return actual, True
             raise RuntimeError("approval was already resolved")
-        ok, message = execute(consumed)
-        resolved = replace(consumed, status="resolved", resolution="approved" if ok else "mismatch", result_message=message)
+        try:
+            resolution, reason_code, message = execute(consumed)
+        except Exception:
+            resolution, reason_code, message = (
+                "execution_failed", "execution_failed", "核准後執行失敗，操作不會重試",
+            )
+        resolved = replace(
+            consumed, status="resolved", resolution=resolution, resolved_at=self.clock(),
+            result_message=message, reason_code=reason_code,
+        )
         self.store.compare_and_set(approval_id, lambda item: item.status == "executing", resolved)
         return resolved, False
 
