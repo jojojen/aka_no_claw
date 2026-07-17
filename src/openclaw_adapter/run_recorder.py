@@ -18,10 +18,10 @@ class RunRecorder:
         self._planner_recorded = False
         self._last_progress: dict[str, float] = {}
 
-    def accepted(self, text: str) -> None:
+    def accepted(self, text: str, *, source_prompt_id: str | None = None) -> None:
         if text:
             self.emit("user.message", {"text": text})
-        self.emit("run.accepted", {})
+        self.emit("run.accepted", {"source_prompt_id": source_prompt_id} if source_prompt_id else {})
 
     def started(self) -> None:
         self.emit("run.started", {})

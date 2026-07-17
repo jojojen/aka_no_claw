@@ -1,7 +1,7 @@
 # Web Prompt Queue Implementation Plan
 
 Last reviewed: 2026-07-17
-Status: Planned
+Status: Current — implementation and supported-restart live proof complete
 Owner area: command-bridge / conversation-runtime
 Tracking issue: [`aka_no_claw#86`](https://github.com/jojojen/aka_no_claw/issues/86)
 Depends on: `WEB_SESSION_RUN_EVENT_SPINE_IMPLEMENTATION_PLAN.md`
@@ -165,6 +165,9 @@ ambiguous button.
 - Repeated terminal callbacks are idempotent.
 - If start fails before a run is accepted, return prompt to queued with bounded
   retry metadata or mark failed visibly; do not silently drop it.
+- If a goal ends before consuming its queued interjection, safely demote that
+  text to `next_turn`; never inject it into a later run or strand it on the
+  terminated run ID.
 - Apply a maximum queue length and text/attachment budget.
 
 Suggested initial limits:
@@ -347,31 +350,30 @@ Live proof after implementation:
 
 ## 15. Progress / Handoff Checklist
 
-Implementation has not started. First unchecked item: Q1.1.
+Implementation and supported-restart live proof are complete.
 
-- [ ] Q1.1 characterize current `generating` and capture routing behavior.
-- [ ] Q1.2 define DTO, bounds, state machine, and golden wire fixtures.
-- [ ] Q1.3 implement atomic queue store and version conflicts.
-- [ ] Q2.1 implement queue HTTP contract.
-- [ ] Q2.2 emit/project `queue.changed`.
-- [ ] Q2.3 implement restart/expiry reconciliation.
-- [ ] Q3.1 bind drain claim to run acceptance.
-- [ ] Q3.2 trigger one drain after terminal transition.
-- [ ] Q3.3 cover failure/cancel/concurrency exact-once cases.
-- [ ] Q4.1 implement Web queue client/hook.
-- [ ] Q4.2 implement composer choice and queue strip.
-- [ ] Q4.3 add reconnect/mobile/a11y tests.
-- [ ] Q5.1 define goal-loop safe-boundary contract.
-- [ ] Q5.2 implement bounded interjection.
-- [ ] Q5.3 run live queue/interjection proof.
+- [x] Q1.1 characterize current `generating` and capture routing behavior.
+- [x] Q1.2 define DTO, bounds, state machine, and golden wire fixtures.
+- [x] Q1.3 implement atomic queue store and version conflicts.
+- [x] Q2.1 implement queue HTTP contract.
+- [x] Q2.2 emit/project `queue.changed`.
+- [x] Q2.3 implement restart/expiry reconciliation.
+- [x] Q3.1 bind drain claim to run acceptance.
+- [x] Q3.2 trigger one drain after terminal transition.
+- [x] Q3.3 cover failure/cancel/concurrency exact-once cases.
+- [x] Q4.1 implement Web queue client/hook.
+- [x] Q4.2 implement composer choice and queue strip.
+- [x] Q4.3 add reconnect/mobile/a11y tests.
+- [x] Q5.1 define goal-loop safe-boundary contract.
+- [x] Q5.2 implement bounded interjection.
+- [x] Q5.3 run live queue/interjection proof.
 
 ## 16. Rollback
 
-- Queue endpoints and drain are separately feature flagged.
-- Disabling drain leaves queued items visible/exportable; it does not silently
-  execute or delete them.
-- Existing composer lock behavior remains available until Web rollout completes.
-- Interjection can be disabled independently while next-turn queue remains.
+- `OPENCLAW_WEB_PROMPT_QUEUE_ENABLED=0` disables the queue contract without
+  executing or deleting stored items.
+- The durable store remains inspectable on disk while the feature is disabled.
+- Re-enabling recovers orphaned drain claims once at first session access.
 - Event history is retained through rollback.
 
 ## 17. Exit Gate

@@ -37,3 +37,14 @@ def test_legacy_snapshot_migration_is_stable_and_projects_visible_messages():
     assert events == migrate_legacy_snapshot(legacy)
     assert [message["text"] for message in projection.messages] == ["hello", "world"]
     assert projection.display_preferences == {"mode": "chat", "chat_backend": "local"}
+
+
+def test_queue_snapshot_projects_without_creating_an_active_run():
+    projection = project_session([
+        _event(1, "queue.changed", {
+            "running_prompt_id": "p1",
+            "entries": [{"prompt_id": "p1", "version": 1, "position": 0, "text": "follow up"}],
+        }, run_id="queue"),
+    ])
+    assert projection.to_dict()["prompt_queue"]["running_prompt_id"] == "p1"
+    assert projection.active_run_ids == []

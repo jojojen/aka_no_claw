@@ -167,7 +167,7 @@ def _build_handler(
         def _send_cors_headers(self) -> None:
             origin = self.headers.get("Origin")
             self.send_header("Access-Control-Allow-Origin", origin or "*")
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "Content-Type, X-OpenClaw-Event-Version")
             self.send_header("Access-Control-Max-Age", "600")
 
@@ -186,6 +186,14 @@ def _build_handler(
             raw = self.rfile.read(length) if length else b""
             data = json.loads(raw.decode("utf-8")) if raw else {}
             return parse_request(data)
+
+        def _read_json_object(self) -> dict:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            raw = self.rfile.read(length) if length else b""
+            data = json.loads(raw.decode("utf-8")) if raw else {}
+            if not isinstance(data, dict):
+                raise ValueError("請求必須是 JSON 物件。")
+            return data
 
         def do_POST(self) -> None:  # noqa: N802
             if not self._is_allowed():
@@ -212,6 +220,10 @@ def _build_handler(
                 self._handle_workflow()
             elif path == "/api/command/approval":
                 self._handle_approval()
+            elif path == "/api/command/queue":
+                self._handle_queue_create()
+            elif path == "/api/command/queue/reorder":
+                self._handle_queue_reorder()
             elif path == "/api/command/schedulehome":
                 self._handle_schedulehome()
             elif path == "/api/command/session":
@@ -261,6 +273,11 @@ def _build_handler(
                     HTTPStatus.BAD_REQUEST if result.get("status") == "error" else HTTPStatus.OK
                 )
                 self._write_json(result, status=status)
+            elif split.path == "/api/command/queue":
+                session_id = (parse_qs(split.query).get("session_id") or [None])[0]
+                result = bridge.load_prompt_queue(session_id)
+                status = HTTPStatus.SERVICE_UNAVAILABLE if result.get("status") == "disabled" else HTTPStatus.OK
+                self._write_json(result, status=status)
             elif split.path == "/api/command/music/now":
                 self._write_json(bridge.now_playing())
             elif split.path == "/api/command/model-routes":
@@ -280,10 +297,70 @@ def _build_handler(
             if not self._is_allowed():
                 self.send_error(HTTPStatus.FORBIDDEN, "Private access only")
                 return
-            if urlsplit(self.path).path == "/api/command/session":
+            split = urlsplit(self.path)
+            if split.path == "/api/command/session":
                 self._write_json(bridge.clear_session())
+            elif split.path.startswith("/api/command/queue/"):
+                prompt_id = split.path.rsplit("/", 1)[-1]
+                params = parse_qs(split.query)
+                raw_version = (params.get("expected_version") or [None])[0]
+                try:
+                    expected_version = int(raw_version) if raw_version is not None else None
+                except ValueError:
+                    self._write_json({"status": "error", "message": "expected_version 必須是整數。"}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                result = bridge.cancel_prompt_queue_entry(
+                    prompt_id,
+                    session_id=(params.get("session_id") or [None])[0],
+                    expected_version=expected_version,
+                )
+                self._write_json(result, status=self._queue_status(result))
             else:
                 self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+
+        def do_PATCH(self) -> None:  # noqa: N802
+            if not self._is_allowed():
+                self.send_error(HTTPStatus.FORBIDDEN, "Private access only")
+                return
+            split = urlsplit(self.path)
+            if not split.path.startswith("/api/command/queue/"):
+                self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+                return
+            prompt_id = split.path.rsplit("/", 1)[-1]
+            try:
+                result = bridge.edit_prompt_queue_entry(prompt_id, self._read_json_object())
+            except (ValueError, UnicodeDecodeError) as exc:
+                self._write_json({"status": "error", "message": f"無效的請求：{exc}"}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._write_json(result, status=self._queue_status(result))
+
+        @staticmethod
+        def _queue_status(result: dict) -> HTTPStatus:
+            if result.get("status") == "conflict":
+                return HTTPStatus.CONFLICT
+            if result.get("status") == "capacity":
+                return HTTPStatus.TOO_MANY_REQUESTS
+            if result.get("status") == "disabled":
+                return HTTPStatus.SERVICE_UNAVAILABLE
+            if result.get("status") == "error":
+                return HTTPStatus.BAD_REQUEST
+            return HTTPStatus.OK
+
+        def _handle_queue_create(self) -> None:
+            try:
+                result = bridge.create_prompt_queue_entry(self._read_json_object())
+            except (ValueError, UnicodeDecodeError) as exc:
+                self._write_json({"status": "error", "message": f"無效的請求：{exc}"}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._write_json(result, status=self._queue_status(result))
+
+        def _handle_queue_reorder(self) -> None:
+            try:
+                result = bridge.reorder_prompt_queue(self._read_json_object())
+            except (ValueError, UnicodeDecodeError) as exc:
+                self._write_json({"status": "error", "message": f"無效的請求：{exc}"}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._write_json(result, status=self._queue_status(result))
 
         def _handle_async(self) -> None:
             try:

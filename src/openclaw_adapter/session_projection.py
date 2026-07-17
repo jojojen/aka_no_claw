@@ -22,6 +22,7 @@ class SessionProjection:
     runs: dict[str, dict[str, object]] = field(default_factory=dict)
     progress: dict[str, dict[str, object]] = field(default_factory=dict)
     display_preferences: dict[str, object] = field(default_factory=dict)
+    prompt_queue: dict[str, object] = field(default_factory=lambda: {"running_prompt_id": None, "entries": []})
     last_cursor: int = 0
     active_run_ids: list[str] = field(default_factory=list)
 
@@ -33,6 +34,7 @@ class SessionProjection:
             "runs": {key: self.runs[key] for key in sorted(self.runs)},
             "progress": {key: self.progress[key] for key in sorted(self.progress)},
             "display_preferences": self.display_preferences,
+            "prompt_queue": self.prompt_queue,
             "last_cursor": self.last_cursor,
             "active_run_ids": self.active_run_ids,
         }
@@ -75,9 +77,18 @@ def _apply(projection: SessionProjection, event: SessionRunEvent) -> None:
             projection.messages.clear()
             projection.runs.clear()
             projection.progress.clear()
+            projection.prompt_queue = {"running_prompt_id": None, "entries": []}
         preferences = event.payload.get("display_preferences")
         if isinstance(preferences, dict):
             projection.display_preferences = preferences
+        return
+    if event.type == "queue.changed":
+        entries = event.payload.get("entries")
+        if isinstance(entries, list):
+            projection.prompt_queue = {
+                "running_prompt_id": event.payload.get("running_prompt_id"),
+                "entries": [dict(item) for item in entries if isinstance(item, dict)],
+            }
         return
     if event.type in {"user.message", "assistant.message"}:
         text = event.payload.get("text")

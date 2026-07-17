@@ -987,6 +987,19 @@ DEPRECATED_CODEGEN_SEED: tuple[tuple[str, str], ...] = (
 
 CODEGEN_SEED: tuple[dict, ...] = (
     {
+        "category": "concurrency",
+        "title": "重啟復原只能在程序首次接觸持久狀態時執行一次",
+        "technique": (
+            "把『將未完成工作復原為可重試』的邏輯放在程序啟動後每個 session 的首次存取，"
+            "並以鎖保護一次性標記；不能在每次 reload、poll 或 GET 時重跑。否則一個仍在"
+            "執行中的 claim 會被重新標成 queued，造成重複副作用。用原子 claim 加 running id，"
+            "並以測試覆蓋 restart recovery、重複讀取與 start failure：失敗可回到可見 queue，"
+            "但不得形成無限自動重試。"
+        ),
+        "keywords": ["*", "concurrency", "restart", "recovery", "queue", "claim", "reload", "exactly-once"],
+        "confidence": 0.96,
+    },
+    {
         "category": "security",
         "title": "副作用分類器要解析呼叫語意並累積所有效果",
         "technique": (

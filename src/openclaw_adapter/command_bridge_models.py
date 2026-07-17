@@ -166,6 +166,7 @@ class WebCommandRequest:
     history: tuple[ChatTurn, ...] = ()
     session_id: str | None = None
     conversation_id: str | None = None
+    source_prompt_id: str | None = None
     input_source: str = INPUT_SOURCE_TEXT
     voice: VoiceMetadata | None = None
 
@@ -348,6 +349,7 @@ def parse_request(data: object) -> WebCommandRequest:
         history=history,
         session_id=_opt_str(data.get("session_id")),
         conversation_id=_opt_str(data.get("conversation_id")),
+        source_prompt_id=_opt_str(data.get("source_prompt_id")),
         input_source=input_source,
         voice=_parse_voice_metadata(data.get("voice")),
     )

@@ -50,6 +50,8 @@ from .action_risk import (
 from .approval_models import FrozenActionManifest, PendingApproval
 from .approval_service import ApprovalService
 from .approval_store import ApprovalStore
+from .prompt_queue import PromptQueueCapacityError, PromptQueueConflict, PromptQueueError
+from .prompt_queue_store import PromptQueueStore
 from .command_bridge_conversation import ConversationSession, ConversationState
 from .command_bridge_music import MusicCapability
 from .command_bridge_workflow import WorkflowCapability
@@ -113,6 +115,7 @@ from .command_bridge_models import (
     SUBMODE_TEXT_TRANSLATION,
     WebCommandRequest,
     WebCommandResponse,
+    RequestValidationError,
     _CHAT_ROLE_LABELS,
     _clip,
     _encode_image_attachment,
@@ -123,6 +126,7 @@ from .command_bridge_models import (
     build_chat_prompt,
     make_chat_tool_request,
     markup_to_actions,
+    parse_request,
     stream_delta,
     stream_done,
     stream_error,
@@ -576,6 +580,13 @@ class CommandBridge:
         self._event_sessions_lock = threading.Lock()
         self._approval_service_inst: ApprovalService | None = None
         self._approval_service_lock = threading.Lock()
+        self._prompt_queue_inst: PromptQueueStore | None = None
+        self._prompt_queue_lock = threading.Lock()
+        self._queue_reconciled_sessions: set[str] = set()
+        self._queue_drain_lock = threading.Lock()
+        self._queue_draining_sessions: set[str] = set()
+        self._active_goal_runs: dict[str, str] = {}
+        self._active_goal_runs_lock = threading.Lock()
         self._active_run_recorder: ContextVar[RunRecorder | None] = ContextVar(
             "active_run_recorder", default=None
         )
@@ -812,7 +823,7 @@ class CommandBridge:
     def handle(self, req: WebCommandRequest) -> WebCommandResponse:
         session_id = getattr(req, "session_id", None)
         recorder = self._event_sessions().recorder(session_id)
-        recorder.accepted((req.input or "").strip())
+        recorder.accepted((req.input or "").strip(), source_prompt_id=req.source_prompt_id)
         recorder.started()
         token = self._active_run_recorder.set(recorder)
         try:
@@ -824,6 +835,7 @@ class CommandBridge:
             )
             recorder.assistant_message(response.message)
             recorder.terminal("completed" if response.status != STATUS_ERROR else "failed", message=response.message)
+            self._maybe_drain_prompt_queue(session_id)
             return response
         except Exception as exc:  # noqa: BLE001 — surface as structured error
             logger.exception("command bridge failed mode=%s", req.mode)
@@ -835,6 +847,7 @@ class CommandBridge:
             )
             recorder.assistant_message(response.message)
             recorder.terminal("failed", message=response.message)
+            self._maybe_drain_prompt_queue(session_id)
             return response
         finally:
             self._active_run_recorder.reset(token)
@@ -874,7 +887,7 @@ class CommandBridge:
                 yield stream_error(f"後端處理失敗：{exc}")
             return
         recorder = self._event_sessions().recorder(req.session_id)
-        recorder.accepted((req.input or "").strip())
+        recorder.accepted((req.input or "").strip(), source_prompt_id=req.source_prompt_id)
         recorder.started()
         token = self._active_run_recorder.set(recorder)
         deltas: list[str] = []
@@ -914,6 +927,7 @@ class CommandBridge:
                 partial = "".join(deltas)
                 recorder.assistant_message(partial, partial=True)
                 recorder.terminal("interrupted")
+            self._maybe_drain_prompt_queue(req.session_id)
             self._active_run_recorder.reset(token)
 
     # --- chat ------------------------------------------------------------
@@ -1918,6 +1932,10 @@ class CommandBridge:
         seed_variables: dict[str, str] | None = None,
         seed_operations: dict[str, str] | None = None,
     ) -> WebCommandResponse:
+        recorder = self._active_run_recorder.get()
+        goal_session_id = self._register_active_goal_run(
+            req.session_id, recorder.run_id if recorder is not None else uuid4().hex
+        )
         try:
             report = self._execute_goal_loop(
                 goal=goal,
@@ -1925,6 +1943,10 @@ class CommandBridge:
                 narrator=narrator,
                 seed_variables=seed_variables,
                 seed_operations=seed_operations,
+                safe_boundary=(
+                    (lambda boundary: self._consume_goal_interjections(goal_session_id, recorder.run_id, recorder, boundary))
+                    if recorder is not None else None
+                ),
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("goal loop failed goal=%r", goal)
@@ -1935,6 +1957,10 @@ class CommandBridge:
                 status=STATUS_ERROR,
                 message=f"目標執行失敗：{exc}",
                 mode=MODE_CHAT,
+            )
+        finally:
+            self._unregister_active_goal_run(
+                goal_session_id, recorder.run_id if recorder is not None else ""
             )
         self._record_goal_loop_run(req, goal, report)
         self._sync_goal_continuation(req, report, planner_metadata=planner_metadata)
@@ -1990,6 +2016,7 @@ class CommandBridge:
         job.run_id = recorder.run_id
         job.session_id = getattr(req, "session_id", None)
         job.recorder = recorder
+        goal_session_id = self._register_active_goal_run(job.session_id, job.run_id)
         store = self._get_job_store()
         store.save({
             "job_id": job.id,
@@ -2051,10 +2078,14 @@ class CommandBridge:
                         narrator=_emit,
                         seed_variables=seed_variables,
                         cancel_check=job.cancel_event.is_set,
+                        safe_boundary=lambda boundary: self._consume_goal_interjections(
+                            goal_session_id, job.run_id, recorder, boundary
+                        ),
                     )
             except Exception as exc:  # noqa: BLE001
                 result["error"] = str(exc)
             finally:
+                self._unregister_active_goal_run(goal_session_id, job.run_id)
                 done.set()
                 report = result.get("report")
                 # Persist the terminal outcome to the job unconditionally so a
@@ -2150,6 +2181,7 @@ class CommandBridge:
         seed_variables: dict[str, str] | None = None,
         seed_operations: dict[str, str] | None = None,
         cancel_check: Callable[[], bool] | None = None,
+        safe_boundary: Callable[[str], tuple[str, ...]] | None = None,
     ):
         runner = _WorkflowShimRunner(self.settings)
         # One rotation cursor shared by every LLM call this run makes (draft,
@@ -2177,6 +2209,7 @@ class CommandBridge:
                 chat_backend, pool_rotation=pool_rotation
             ),
             cancel_check=cancel_check,
+            safe_boundary=safe_boundary,
         )
         report = loop.run(resume=resume)
         logger.info(
@@ -4614,6 +4647,239 @@ class CommandBridge:
         except (TypeError, ValueError) as exc:
             return {"status": STATUS_ERROR, "message": f"無效的 cursor：{exc}"}
 
+    # --- durable busy-session prompt queue (issue #86) -------------------
+    def _prompt_queue(self) -> PromptQueueStore:
+        if self._prompt_queue_inst is None:
+            with self._prompt_queue_lock:
+                if self._prompt_queue_inst is None:
+                    root = getattr(self.settings, "openclaw_web_prompt_queue_dir", None)
+                    if not root:
+                        root = str(Path(getattr(self.settings, "openclaw_web_event_dir", ".openclaw_tmp")) / "prompt_queue")
+                    self._prompt_queue_inst = PromptQueueStore(
+                        root,
+                        max_entries=getattr(self.settings, "openclaw_web_prompt_queue_max_entries", 20),
+                        ttl_seconds=getattr(self.settings, "openclaw_web_prompt_queue_ttl_seconds", 86400),
+                    )
+        return self._prompt_queue_inst
+
+    def _queue_enabled(self) -> bool:
+        return bool(getattr(self.settings, "openclaw_web_prompt_queue_enabled", False))
+
+    def _reconcile_prompt_queue_once(self, session_id: str) -> dict[str, object]:
+        """Recover interrupted drains once per bridge process, never on reload."""
+        with self._queue_drain_lock:
+            first_access = session_id not in self._queue_reconciled_sessions
+            if first_access:
+                self._queue_reconciled_sessions.add(session_id)
+        queue = self._prompt_queue()
+        return queue.reconcile(session_id) if first_access else queue.snapshot(session_id)
+
+    @staticmethod
+    def _queue_request_payload(req: WebCommandRequest) -> dict:
+        if req.attachments:
+            raise PromptQueueError("attachments cannot be queued yet; send this turn after the active run")
+        payload: dict[str, object] = {
+            "mode": req.mode, "input": req.input, "submode": req.submode,
+            "chat_backend": req.chat_backend, "source": req.source,
+            "history": [{"role": turn.role, "content": turn.content} for turn in req.history],
+            "session_id": req.session_id, "conversation_id": req.conversation_id,
+            "source_prompt_id": req.source_prompt_id,
+            "input_source": req.input_source,
+        }
+        if req.voice is not None:
+            payload["voice"] = {
+                "utterance_id": req.voice.utterance_id,
+                "duration_ms": req.voice.duration_ms,
+                "stt_language": req.voice.stt_language,
+                "stt_language_probability": req.voice.stt_language_probability,
+                "clarification_declined": req.voice.clarification_declined,
+            }
+        return payload
+
+    def _queue_changed(self, session_id: str, snapshot: dict[str, object]) -> None:
+        self._event_sessions().ensure(session_id).append(
+            "queue.changed", run_id="queue", payload={
+                "running_prompt_id": snapshot.get("running_prompt_id"),
+                "entries": snapshot.get("entries", []),
+            },
+        )
+
+    def load_prompt_queue(self, session_id: str | None = None) -> dict:
+        if not self._queue_enabled():
+            return {"status": "disabled", "message": "Web prompt queue is disabled", "entries": []}
+        resolved = session_id or "web-default"
+        try:
+            snapshot = self._reconcile_prompt_queue_once(resolved)
+            self._queue_changed(resolved, snapshot)
+            self._maybe_drain_prompt_queue(resolved)
+            return {"status": STATUS_OK, **snapshot}
+        except PromptQueueError as exc:
+            return {"status": STATUS_ERROR, "message": str(exc), "entries": []}
+
+    def create_prompt_queue_entry(self, payload: dict) -> dict:
+        if not self._queue_enabled():
+            return {"status": "disabled", "message": "Web prompt queue is disabled"}
+        try:
+            raw_request = payload.get("request")
+            if not isinstance(raw_request, dict):
+                raise PromptQueueError("queue request must include request object")
+            req = parse_request(raw_request)
+            session_id = req.session_id or "web-default"
+            self._reconcile_prompt_queue_once(session_id)
+            if payload.get("capture_context"):
+                raise PromptQueueError("capture context cannot be queued; finish or cancel that editor first")
+            intent = str(payload.get("intent") or "next_turn")
+            target_run_id = None
+            if intent == "interjection":
+                with self._active_goal_runs_lock:
+                    target_run_id = self._active_goal_runs.get(session_id)
+                if target_run_id is None:
+                    raise PromptQueueConflict("interjection is only available during an active goal loop")
+            prompt, snapshot = self._prompt_queue().create(
+                session_id, intent=intent, request=self._queue_request_payload(req),
+                target_run_id=target_run_id,
+            )
+            self._queue_changed(session_id, snapshot)
+            return {"status": STATUS_OK, "entry": prompt.public(), **snapshot}
+        except PromptQueueCapacityError as exc:
+            return {"status": "capacity", "message": str(exc)}
+        except PromptQueueConflict as exc:
+            return {"status": "conflict", "message": str(exc)}
+        except (PromptQueueError, RequestValidationError) as exc:
+            return {"status": STATUS_ERROR, "message": str(exc)}
+
+    def edit_prompt_queue_entry(self, prompt_id: str, payload: dict) -> dict:
+        try:
+            session_id = str(payload.get("session_id") or "web-default")
+            self._reconcile_prompt_queue_once(session_id)
+            snapshot = self._prompt_queue().edit(
+                session_id, prompt_id, text=str(payload.get("text") or ""),
+                expected_version=int(payload.get("expected_version")),
+            )
+            self._queue_changed(session_id, snapshot)
+            return {"status": STATUS_OK, **snapshot}
+        except (TypeError, ValueError):
+            return {"status": STATUS_ERROR, "message": "expected_version must be an integer"}
+        except PromptQueueConflict as exc:
+            return {"status": "conflict", "message": str(exc)}
+        except PromptQueueError as exc:
+            return {"status": STATUS_ERROR, "message": str(exc)}
+
+    def cancel_prompt_queue_entry(self, prompt_id: str, *, session_id: str | None, expected_version: int | None) -> dict:
+        try:
+            if expected_version is None:
+                raise PromptQueueError("expected_version is required")
+            resolved = session_id or "web-default"
+            self._reconcile_prompt_queue_once(resolved)
+            snapshot = self._prompt_queue().cancel(resolved, prompt_id, expected_version=expected_version)
+            self._queue_changed(resolved, snapshot)
+            return {"status": STATUS_OK, **snapshot}
+        except PromptQueueConflict as exc:
+            return {"status": "conflict", "message": str(exc)}
+        except PromptQueueError as exc:
+            return {"status": STATUS_ERROR, "message": str(exc)}
+
+    def reorder_prompt_queue(self, payload: dict) -> dict:
+        try:
+            session_id = str(payload.get("session_id") or "web-default")
+            self._reconcile_prompt_queue_once(session_id)
+            prompt_ids = payload.get("prompt_ids")
+            expected_versions = payload.get("expected_versions")
+            if not isinstance(prompt_ids, list) or not isinstance(expected_versions, dict):
+                raise PromptQueueError("prompt_ids and expected_versions are required")
+            snapshot = self._prompt_queue().reorder(
+                session_id,
+                prompt_ids=[str(value) for value in prompt_ids],
+                expected_versions={str(key): int(value) for key, value in expected_versions.items()},
+            )
+            self._queue_changed(session_id, snapshot)
+            return {"status": STATUS_OK, **snapshot}
+        except (TypeError, ValueError):
+            return {"status": STATUS_ERROR, "message": "expected_versions must contain integers"}
+        except PromptQueueConflict as exc:
+            return {"status": "conflict", "message": str(exc)}
+        except PromptQueueError as exc:
+            return {"status": STATUS_ERROR, "message": str(exc)}
+
+    def _maybe_drain_prompt_queue(self, session_id: str | None) -> None:
+        if not self._queue_enabled():
+            return
+        resolved = session_id or "web-default"
+        with self._queue_drain_lock:
+            if resolved in self._queue_draining_sessions:
+                return
+            self._queue_draining_sessions.add(resolved)
+
+        def _worker() -> None:
+            prompt = None
+            completed = False
+            try:
+                self._reconcile_prompt_queue_once(resolved)
+                prompt, snapshot = self._prompt_queue().claim_next(resolved)
+                self._queue_changed(resolved, snapshot)
+                if prompt is None:
+                    return
+                request = parse_request({**prompt.request, "source_prompt_id": prompt.prompt_id})
+                if request.mode == MODE_CHAT:
+                    for _event in self.stream(request, f"queued-{prompt.prompt_id}"):
+                        pass
+                else:
+                    self.handle(request)
+                completed = self._prompt_queue().complete(resolved, prompt.prompt_id)
+                self._queue_changed(resolved, completed)
+                completed = True
+            except Exception:  # noqa: BLE001 - preserve the queued durable state for recovery
+                logger.exception("prompt queue drain failed session=%s", resolved)
+                if prompt is not None:
+                    try:
+                        released = self._prompt_queue().release(resolved, prompt.prompt_id)
+                        self._queue_changed(resolved, released)
+                    except PromptQueueError:
+                        logger.exception("prompt queue release failed session=%s", resolved)
+            finally:
+                with self._queue_drain_lock:
+                    self._queue_draining_sessions.discard(resolved)
+                # Completing one prompt may reveal the next FIFO entry.
+                if completed:
+                    self._maybe_drain_prompt_queue(resolved)
+
+        threading.Thread(target=_worker, daemon=True, name=f"prompt-drain-{resolved}").start()
+
+    def _register_active_goal_run(self, session_id: str | None, run_id: str) -> str:
+        resolved = session_id or "web-default"
+        with self._active_goal_runs_lock:
+            self._active_goal_runs[resolved] = run_id
+        return resolved
+
+    def _unregister_active_goal_run(self, session_id: str, run_id: str) -> None:
+        ended = False
+        with self._active_goal_runs_lock:
+            if self._active_goal_runs.get(session_id) == run_id:
+                self._active_goal_runs.pop(session_id, None)
+                ended = True
+        if ended and self._queue_enabled():
+            try:
+                snapshot = self._prompt_queue().fallback_interjections(session_id, run_id)
+                self._queue_changed(session_id, snapshot)
+            except PromptQueueError:
+                logger.exception("prompt queue interjection fallback failed session=%s", session_id)
+
+    def _consume_goal_interjections(
+        self, session_id: str, run_id: str, recorder: RunRecorder, _boundary: str
+    ) -> tuple[str, ...]:
+        if not self._queue_enabled():
+            return ()
+        accepted: list[str] = []
+        while True:
+            prompt, snapshot = self._prompt_queue().claim_interjection(session_id, run_id)
+            self._queue_changed(session_id, snapshot)
+            if prompt is None:
+                return tuple(accepted)
+            completed = self._prompt_queue().complete(session_id, prompt.prompt_id, run_id=run_id)
+            self._queue_changed(session_id, completed)
+            recorder.emit("interjection.accepted", {"prompt_id": prompt.prompt_id})
+            accepted.append(prompt.text)
+
     def save_session(self, snapshot: object) -> dict:
         """POST — preserve legacy compatibility without overwriting event history."""
         try:
@@ -4631,6 +4897,8 @@ class CommandBridge:
         try:
             self._event_sessions().clear()
             self._sessions().clear()
+            if self._queue_enabled():
+                self._prompt_queue().clear("web-default")
         except Exception as exc:  # noqa: BLE001
             logger.exception("session memory: clear failed")
             return {"status": STATUS_ERROR, "message": f"清除 session 失敗：{exc}"}

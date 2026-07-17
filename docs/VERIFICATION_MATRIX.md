@@ -25,6 +25,7 @@ Last reviewed: 2026-07-17
 | DB schema or runtime path | Init/migration tests for all readers/writers | `/restartall` or `POST /api/command/restartall` smoke and log check |
 | Web session/run event spine | `tests/test_session_events.py`, `tests/test_session_event_journal.py`, `tests/test_session_projection.py`, `tests/test_command_bridge_event_contract.py` | Restart bridge; replay `/api/command/events` after a completed async run and verify one final message |
 | Web generated-tool approval | `tests/test_approval_store.py`, `tests/test_dynamic_tool_approval.py`, `tests/test_command_bridge_approval_http.py` plus Web approval-card tests | Enable staged config; restart; prove approve-once, reject, expiry, hash mismatch, reconnect recovery, replay idempotency, privacy-safe events, and destructive second confirmation |
+| Web prompt queue / interjection | `tests/test_prompt_queue_store.py`, `tests/test_prompt_queue_drain.py`, `tests/test_command_bridge_server_http.py`, `tests/test_goal_loop.py`, Web `PromptQueueStrip`/`InputBar` tests | Enable staged config; supported restart; queue/reorder/edit/reload/cancel two prompts, prove one FIFO drain, then prove a goal-loop interjection is accepted only at a declared boundary |
 | Launchd/service wiring | Targeted service tests and path-resolution tests | `/restartall` smoke plus log inspection on this machine; run the device setup script only for first-setup/cold-start verification |
 
 ## Web Event Spine Live Proof (2026-07-17)
@@ -54,6 +55,23 @@ Last reviewed: 2026-07-17
   no HTTP decision and created no file.
 - Request events contained bounded hashes/effects/scopes but no generated source
   or raw arguments. Temporary proof fixtures were deleted and audit events kept.
+
+## Web Prompt Queue Live Proof (2026-07-17)
+
+- After the supported `/restartall`, bridge, Telegram, TLS Web frontend, and
+  `GET /api/command/queue` were healthy with the queue feature enabled.
+- Two queued prompts persisted in the per-session atomic snapshot, survived
+  reconnect inspection, accepted an edit, and reordered by server positions
+  rather than timestamps. Exactly one prompt entered `draining`; the second
+  began only after the first terminal event. Both `run.accepted` events carried
+  their matching `source_prompt_id` values.
+- A queued prompt cancelled before claim disappeared from the public snapshot
+  and created no run.
+- A live goal run accepted an interjection only while its run ID was active.
+  The local planner timed out before its next declared boundary; the queued
+  interjection was therefore safely demoted to `next_turn`, started once with a
+  new source ID, and completed independently. It was never injected into the
+  terminated goal run.
 
 ## Reporting Verification
 

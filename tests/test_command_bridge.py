@@ -2662,7 +2662,7 @@ def test_options_preflight_allows_direct_bridge_streaming():
     h.do_OPTIONS()
     raw = h.wfile.getvalue().decode("utf-8")
     assert " 204 " in raw
-    assert "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS" in raw
+    assert "Access-Control-Allow-Methods: GET, POST, PATCH, DELETE, OPTIONS" in raw
     assert "Access-Control-Allow-Headers: Content-Type" in raw
 
 

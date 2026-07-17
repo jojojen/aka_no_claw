@@ -38,6 +38,7 @@ class _FakeBridge:
         self.cancelled: list[str] = []
         self.polled: list[str] = []
         self.approval_error: Exception | None = None
+        self.queue_entries = []
 
     def handle(self, req):
         return WebCommandResponse(
@@ -65,6 +66,26 @@ class _FakeBridge:
             raise self.approval_error
         self.approval_payload = payload
         return {"status": STATUS_OK, "message": "approved", "approval": {"resolution": "approved"}}
+
+    def load_prompt_queue(self, session_id):
+        return {"status": STATUS_OK, "session_id": session_id or "web-default", "entries": self.queue_entries, "running_prompt_id": None}
+
+    def create_prompt_queue_entry(self, payload):
+        self.queue_payload = payload
+        self.queue_entries = [{"prompt_id": "p1", "session_id": "s1", "version": 1, "position": 0, "intent": "next_turn", "mode": "chat", "text": "later", "status": "queued"}]
+        return {"status": STATUS_OK, "entry": self.queue_entries[0], "entries": self.queue_entries, "running_prompt_id": None}
+
+    def edit_prompt_queue_entry(self, prompt_id, payload):
+        self.queue_edit = (prompt_id, payload)
+        return {"status": STATUS_OK, "entries": self.queue_entries, "running_prompt_id": None}
+
+    def cancel_prompt_queue_entry(self, prompt_id, *, session_id, expected_version):
+        self.queue_cancel = (prompt_id, session_id, expected_version)
+        return {"status": STATUS_OK, "entries": [], "running_prompt_id": None}
+
+    def reorder_prompt_queue(self, payload):
+        self.queue_reorder = payload
+        return {"status": STATUS_OK, "entries": self.queue_entries, "running_prompt_id": None}
 
 
 @pytest.fixture()
@@ -183,6 +204,28 @@ def test_approval_route_relays_typed_decision(server):
     assert bridge.approval_payload == payload
     assert data["approval"]["resolution"] == "approved"
     assert data["envelope_version"] == 1
+
+
+def test_queue_routes_relay_versioned_mutations(server):
+    base, bridge = server
+    payload = {"intent": "next_turn", "request": {"mode": "chat", "input": "later", "session_id": "s1"}}
+    with _post(base, "/api/command/queue", payload) as response:
+        created = json.loads(response.read())
+    assert bridge.queue_payload == payload
+    assert created["entry"]["prompt_id"] == "p1"
+    with urllib.request.urlopen(base + "/api/command/queue?session_id=s1", timeout=5) as response:
+        assert json.loads(response.read())["entries"][0]["text"] == "later"
+    edit = urllib.request.Request(
+        base + "/api/command/queue/p1", data=json.dumps({"session_id": "s1", "text": "edited", "expected_version": 1}).encode(),
+        method="PATCH", headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(edit, timeout=5):
+        pass
+    assert bridge.queue_edit[0] == "p1"
+    delete = urllib.request.Request(base + "/api/command/queue/p1?session_id=s1&expected_version=1", method="DELETE")
+    with urllib.request.urlopen(delete, timeout=5):
+        pass
+    assert bridge.queue_cancel == ("p1", "s1", 1)
 
 
 @pytest.mark.parametrize(

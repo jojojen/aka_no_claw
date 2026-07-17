@@ -151,6 +151,12 @@ Web blocking / NDJSON / async request
   -> GET /api/command/events exact cursor replay after reconnect
 ```
 
+When the opt-in prompt queue is enabled, busy Web input follows a separate,
+single-session durable path: `POST /api/command/queue` records an atomic JSON
+snapshot and appends `queue.changed`; one drain owner claims FIFO position only
+after a terminal run. A claim carries its prompt ID into `run.accepted`, and
+goal-loop interjections are consumed only at declared safe boundaries.
+
 The journal is authoritative; mutable session and job snapshots are compatibility
 views. Negotiated NDJSON live delivery starts at the atomic `latest_cursor`,
 while historical recovery advances page-by-page with `server_cursor`. Background
@@ -218,6 +224,7 @@ Runtime paths are resolved through `assistant_runtime.settings`; keep docs gener
 | Opportunity inbox | `data/opportunity_inbox.sqlite3` | Telegram writes requests; opportunity agent consumes. |
 | Quiz DB | `data/quiz.sqlite3` | Quiz state and review material. |
 | Web session event journals | `.openclaw_tmp/web_sessions/<session_id>/` | Command bridge authority: bounded JSONL events plus sequence metadata; rebuildable projections and compatibility snapshots must not overwrite it. |
+| Web prompt queues | `.openclaw_tmp/web_prompt_queue/<session_id>.json` | Opt-in #86 bounded per-session request snapshots. Atomic claim/version mutations; event journal receives public `queue.changed` snapshots. |
 
 ## High-Risk Boundaries
 

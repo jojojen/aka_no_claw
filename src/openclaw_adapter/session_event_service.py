@@ -83,6 +83,7 @@ class SessionEventService:
             "chat_backend": preferences.get("chat_backend"),
             "investment_submode": preferences.get("investment_submode"),
             "active_job_id": payload["active_run_ids"][0] if payload["active_run_ids"] else None,
+            "queue": payload["prompt_queue"],
             "event_projection": payload,
         }
 

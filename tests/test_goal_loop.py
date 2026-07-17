@@ -99,6 +99,21 @@ def test_goal_loop_runs_draft_then_workflow_to_completion():
     assert "草稿完成" in "\n".join(report.narration)
 
 
+def test_goal_loop_only_consumes_interjection_at_declared_safe_boundary():
+    workflow = _workflow_with_tool("real_tool", wf_id="wf-safe-boundary")
+    planner = _FakePlanner(drafts=[(workflow, None, False)])
+    executor = _FakeExecutor({"real_tool": (True, "done")})
+    boundaries = []
+    loop = GoalLoop(
+        goal="完成任務", planner=planner, executor=executor, command_registry={},
+        safe_boundary=lambda boundary: boundaries.append(boundary) or ("只看日本市場",),
+    )
+    report = loop.run()
+    assert report.done is True
+    assert boundaries == ["before_draft", "before_workflow"]
+    assert planner.draft_seeds[0]["operator_constraints"] == "只看日本市場"
+
+
 def test_goal_loop_replans_after_failed_run():
     broken = _workflow_with_tool("broken_tool", wf_id="wf-broken")
     fixed = _workflow_with_tool("real_tool", wf_id="wf-fixed")

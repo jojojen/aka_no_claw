@@ -104,6 +104,7 @@ class GoalLoop:
         seed_operations: dict[str, str] | None = None,
         conservative_synthesizer: Callable[[str, dict[str, str], str], str] | None = None,
         cancel_check: Callable[[], bool] | None = None,
+        safe_boundary: Callable[[str], tuple[str, ...]] | None = None,
     ) -> None:
         self.goal = goal
         self.planner = planner
@@ -144,6 +145,10 @@ class GoalLoop:
         # distinct from replan-exhaustion: it must NOT trigger conservative
         # synthesis or a resumable continuation.
         self.cancel_check = cancel_check
+        # Interjections are consumed only before a goal-loop orchestration
+        # phase. WorkflowRunner never receives one mid-step, so a generated
+        # tool or external command cannot be modified while executing (#86).
+        self.safe_boundary = safe_boundary
 
     def run(self, resume: GoalLoopContinuation | None = None) -> GoalLoopReport:
         scratch = {
@@ -391,6 +396,7 @@ class GoalLoop:
 
     def _steps(self, scratch: dict) -> dict[str, Callable[[LoopContext], StepOutcome]]:
         def draft(ctx: LoopContext) -> StepOutcome:
+            self._consume_safe_boundary(scratch, "before_draft")
             self._narrate(scratch, "規劃任務工作流草稿…")
             workflow, error, _used_fallback = self._planner_draft(scratch)
             if workflow is None:
@@ -403,6 +409,7 @@ class GoalLoop:
             return StepOutcome(observation=f"drafted {workflow.id} with {len(workflow.steps)} step(s)")
 
         def run_workflow(ctx: LoopContext) -> StepOutcome:
+            self._consume_safe_boundary(scratch, "before_workflow")
             workflow = scratch.get("workflow")
             if workflow is None:
                 scratch["abort"] = "沒有可執行的工作流草稿"
@@ -486,6 +493,7 @@ class GoalLoop:
             )
 
         def replan(ctx: LoopContext) -> StepOutcome:
+            self._consume_safe_boundary(scratch, "before_replan")
             workflow = scratch.get("workflow")
             trace = scratch.get("trace")
             if workflow is None or trace is None:
@@ -548,6 +556,22 @@ class GoalLoop:
     def _planner_draft(self, scratch: dict):
         seeds = dict(scratch.get("seeds") or {})
         return self.planner.draft(self.goal, seed_variables=seeds)
+
+    def _consume_safe_boundary(self, scratch: dict, boundary: str) -> None:
+        if self.safe_boundary is None:
+            return
+        try:
+            additions = tuple(str(value).strip() for value in self.safe_boundary(boundary) if str(value).strip())
+        except Exception:  # noqa: BLE001 - an unavailable queue must not kill a goal run
+            logger.exception("goal_loop: safe-boundary interjection lookup failed")
+            return
+        if not additions:
+            return
+        previous = str(scratch["seeds"].get("operator_constraints") or "")
+        merged = "\n".join(part for part in (previous, *additions) if part)[-4000:]
+        scratch["seeds"]["operator_constraints"] = merged
+        scratch["seed_types"]["operator_constraints"] = "plain_text"
+        self._narrate(scratch, f"已納入使用者補充條件（{boundary}）。")
 
     def _planner_replan(self, scratch: dict, workflow: Workflow, trace: WorkflowTrace):
         seeds = dict(scratch.get("seeds") or {})

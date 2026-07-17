@@ -48,7 +48,7 @@ for which question each one answers.
 | `P1_ENGINEERING_HARDENING_IMPLEMENTATION_PLAN.md` | Planned | agent-maintenance | Canonical P1 execution/handoff plan for issue #80; keep while active, then fold stable rules into truth docs and archive. |
 | `WEB_SESSION_RUN_EVENT_SPINE_IMPLEMENTATION_PLAN.md` | Current | command-bridge / conversation-runtime | Shipped #84 event-spine contract and implementation record; stable ownership and verification are folded into the authoritative truth docs. |
 | `WEB_DYNAMIC_TOOL_APPROVAL_IMPLEMENTATION_PLAN.md` | Current | dynamic-tools / command-bridge safety | Shipped #85 manifest-bound approval contract and staged live-proof record; depends on the #84 event spine. |
-| `WEB_PROMPT_QUEUE_IMPLEMENTATION_PLAN.md` | Planned | command-bridge / conversation-runtime | Canonical #86 prompt queue and safe interjection plan; depends on #84 and the Web consumer plan. |
+| `WEB_PROMPT_QUEUE_IMPLEMENTATION_PLAN.md` | Current | command-bridge / conversation-runtime | Canonical #86 prompt queue and safe interjection implementation record; supported-restart proof complete. Depends on #84 and the Web consumer plan. |
 | `WEB_CONVERSATION_COMPACTION_IMPLEMENTATION_PLAN.md` | Planned | command-bridge / model-context | Canonical #87 grounded compaction/checkpoint plan; depends on #84 and the Web consumer plan. |
 | `TELEGRAM_NL_OWNERSHIP_REFACTOR_ISSUE.md` | Planned | telegram | Draft issue; keep until the cross-repo NL ownership refactor is filed/resolved. |
 | `TELEGRAM_CORE_EXTRACTION_PLAN.md` | Current | telegram | Extraction shipped (phases P0–P4, all 3 repos' suites green); kept in place (not archived) as the `telegram_core` hook/registry contract reference. |

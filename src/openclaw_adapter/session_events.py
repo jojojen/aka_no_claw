@@ -19,6 +19,7 @@ EVENT_TYPES = frozenset({
     "judge.completed", "assistant.delta", "assistant.message", "run.completed",
     "run.failed", "run.cancel_requested", "run.cancelled", "run.interrupted",
     "approval.requested", "approval.resolved", "context.checkpoint", "queue.changed",
+    "interjection.accepted",
 })
 DURABLE_EVENT_TYPES = EVENT_TYPES - {"assistant.delta"}
 TERMINAL_EVENT_TYPES = frozenset({

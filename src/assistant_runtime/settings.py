@@ -216,6 +216,12 @@ class AssistantSettings:
     openclaw_web_approval_ttl_seconds: int = 300
     openclaw_web_approval_store_dir: str = ".openclaw_tmp/web_approvals"
     openclaw_dynamic_tool_approval_policy: str = "ask_generated_writes"
+    # Durable follow-up prompts are separate from the client-replaceable
+    # session snapshot and stay staged until the Web consumer is deployed.
+    openclaw_web_prompt_queue_enabled: bool = False
+    openclaw_web_prompt_queue_dir: str = ".openclaw_tmp/web_prompt_queue"
+    openclaw_web_prompt_queue_max_entries: int = 20
+    openclaw_web_prompt_queue_ttl_seconds: int = 86400
     # ── chat LLM pool settings (issue #66) ────────────────────────────────
     # User-editable provider order, enable flags, and selected model ids for
     # Web Chat + Telegram natural-language routing. Secrets stay in .env.
@@ -608,6 +614,18 @@ def get_settings() -> AssistantSettings:
         openclaw_dynamic_tool_approval_policy=os.getenv(
             "OPENCLAW_DYNAMIC_TOOL_APPROVAL_POLICY", "ask_generated_writes"
         ).strip() or "ask_generated_writes",
+        openclaw_web_prompt_queue_enabled=_as_bool(
+            os.getenv("OPENCLAW_WEB_PROMPT_QUEUE_ENABLED")
+        ),
+        openclaw_web_prompt_queue_dir=_resolve_runtime_path(
+            os.getenv("OPENCLAW_WEB_PROMPT_QUEUE_DIR", ".openclaw_tmp/web_prompt_queue")
+        ),
+        openclaw_web_prompt_queue_max_entries=_as_int(
+            os.getenv("OPENCLAW_WEB_PROMPT_QUEUE_MAX_ENTRIES"), default=20
+        ),
+        openclaw_web_prompt_queue_ttl_seconds=_as_int(
+            os.getenv("OPENCLAW_WEB_PROMPT_QUEUE_TTL_SECONDS"), default=86400
+        ),
         openclaw_llm_pool_config_path=_resolve_runtime_path(
             os.getenv("OPENCLAW_LLM_POOL_CONFIG_PATH", "config/llm_pool.json")
         ),
