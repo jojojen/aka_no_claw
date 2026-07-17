@@ -87,6 +87,17 @@ class _FakeBridge:
         self.queue_reorder = payload
         return {"status": STATUS_OK, "entries": self.queue_entries, "running_prompt_id": None}
 
+    def context_status(self, session_id):
+        return {"status": STATUS_OK, "session_id": session_id or "web-default", "usage_percent": 12, "checkpoint": None}
+
+    def compact_context(self, session_id):
+        self.compacted_session = session_id
+        return {"status": STATUS_OK, "checkpoint": {"checkpoint_id": "c1"}}
+
+    def clear_context_checkpoint(self, session_id):
+        self.cleared_context_session = session_id
+        return {"status": STATUS_OK, "cleared": True}
+
 
 @pytest.fixture()
 def server():
@@ -226,6 +237,19 @@ def test_queue_routes_relay_versioned_mutations(server):
     with urllib.request.urlopen(delete, timeout=5):
         pass
     assert bridge.queue_cancel == ("p1", "s1", 1)
+
+
+def test_context_routes_keep_checkpoint_separate_from_session(server):
+    base, bridge = server
+    with urllib.request.urlopen(base + "/api/command/context?session_id=s1", timeout=5) as response:
+        assert json.loads(response.read())["usage_percent"] == 12
+    with _post(base, "/api/command/context/compact", {"session_id": "s1"}) as response:
+        assert json.loads(response.read())["checkpoint"]["checkpoint_id"] == "c1"
+    assert bridge.compacted_session == "s1"
+    delete = urllib.request.Request(base + "/api/command/context/checkpoint?session_id=s1", method="DELETE")
+    with urllib.request.urlopen(delete, timeout=5) as response:
+        assert json.loads(response.read())["cleared"] is True
+    assert bridge.cleared_context_session == "s1"
 
 
 @pytest.mark.parametrize(

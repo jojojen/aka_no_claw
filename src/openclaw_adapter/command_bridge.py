@@ -41,6 +41,7 @@ from .session_memory import SessionMemoryStore, SessionWriteError, empty_session
 from .session_event_service import SessionEventService
 from .session_event_journal import CursorExpiredError
 from .run_recorder import RunRecorder
+from .context_checkpoint import ContextCheckpointStore, ContextCompactor, estimate_tokens
 from .action_risk import (
     PolicyOutcome,
     classify_generated_tool,
@@ -578,6 +579,8 @@ class CommandBridge:
         self._session_store: SessionMemoryStore | None = None
         self._event_sessions_inst: SessionEventService | None = None
         self._event_sessions_lock = threading.Lock()
+        self._context_compactor_inst: ContextCompactor | None = None
+        self._context_compactor_lock = threading.Lock()
         self._approval_service_inst: ApprovalService | None = None
         self._approval_service_lock = threading.Lock()
         self._prompt_queue_inst: PromptQueueStore | None = None
@@ -824,6 +827,7 @@ class CommandBridge:
         session_id = getattr(req, "session_id", None)
         recorder = self._event_sessions().recorder(session_id)
         recorder.accepted((req.input or "").strip(), source_prompt_id=req.source_prompt_id)
+        self._maybe_auto_compact_context(session_id)
         recorder.started()
         token = self._active_run_recorder.set(recorder)
         try:
@@ -888,6 +892,7 @@ class CommandBridge:
             return
         recorder = self._event_sessions().recorder(req.session_id)
         recorder.accepted((req.input or "").strip(), source_prompt_id=req.source_prompt_id)
+        self._maybe_auto_compact_context(req.session_id)
         recorder.started()
         token = self._active_run_recorder.set(recorder)
         deltas: list[str] = []
@@ -3092,6 +3097,9 @@ class CommandBridge:
         ledger) so follow-up turns can be judged/planned against their full
         intent instead of the elliptical latest message alone."""
         lines: list[str] = []
+        checkpoint = self._context_compactor().latest(req.session_id or "web-default")
+        if checkpoint is not None and checkpoint.validation_status == "valid":
+            lines.append(checkpoint.summary)
         history = list(req.history)[-_CONTEXT_HISTORY_TURNS:]
         if history:
             lines.append("對話紀錄（由舊到新）：")
@@ -4613,6 +4621,90 @@ class CommandBridge:
                 if self._event_sessions_inst is None:
                     self._event_sessions_inst = SessionEventService(self.settings, self._sessions)
         return self._event_sessions_inst
+
+    def _context_compactor(self) -> ContextCompactor:
+        if self._context_compactor_inst is None:
+            with self._context_compactor_lock:
+                if self._context_compactor_inst is None:
+                    root = str(Path(getattr(self.settings, "openclaw_web_event_dir", ".openclaw_tmp")) / "context_checkpoints")
+                    self._context_compactor_inst = ContextCompactor(
+                        ContextCheckpointStore(
+                            root,
+                            max_checkpoints=int(getattr(self.settings, "openclaw_web_context_max_checkpoints", 10)),
+                        ),
+                        recent_turns=int(getattr(self.settings, "openclaw_web_context_recent_turns", 6)),
+                    )
+        return self._context_compactor_inst
+
+    def context_status(self, session_id: str | None = None) -> dict:
+        """Return labelled context usage; journal history is never mutated here."""
+        resolved = session_id or "web-default"
+        events = self._event_sessions().ensure(resolved).events()
+        checkpoint = self._context_compactor().latest(resolved)
+        visible = "\n".join(
+            str(event.payload.get("text", "")) for event in events
+            if event.type in {"user.message", "assistant.message"} and event.visibility == "user"
+            and (checkpoint is None or event.seq > checkpoint.source_seq_end)
+        )
+        window = max(1, int(getattr(self.settings, "openclaw_web_context_window_tokens", 32768)))
+        reserve = max(0, int(getattr(self.settings, "openclaw_web_context_reserve_tokens", 4096)))
+        usable_window = max(1, window - reserve)
+        estimate = estimate_tokens(visible) + (estimate_tokens(checkpoint.summary) if checkpoint else 0)
+        return {
+            "status": STATUS_OK, "session_id": resolved, "estimated_tokens": estimate,
+            "context_window": window, "reserve_tokens": reserve,
+            "usage_percent": min(100, round(estimate * 100 / usable_window)),
+            "checkpoint": checkpoint.public() if checkpoint else None,
+            "manual_compaction_allowed": True,
+        }
+
+    def compact_context(self, session_id: str | None = None) -> dict:
+        resolved = session_id or "web-default"
+        previous = self._context_compactor().latest(resolved)
+        checkpoint = self._context_compactor().build(resolved, self._event_sessions().ensure(resolved).events())
+        if checkpoint is None:
+            return {"status": STATUS_ERROR, "session_id": resolved, "message": "目前沒有足夠的較早對話可壓縮。"}
+        if previous is not None and checkpoint.checkpoint_id == previous.checkpoint_id:
+            return {"status": STATUS_OK, "session_id": resolved, "checkpoint": checkpoint.public(), "unchanged": True}
+        self._event_sessions().ensure(resolved).append(
+            "context.checkpoint", run_id="session", visibility="user", payload={
+                "checkpoint_id": checkpoint.checkpoint_id, "source_seq_start": checkpoint.source_seq_start,
+                "source_seq_end": checkpoint.source_seq_end, "summary_preview": checkpoint.summary[:240],
+                "created_at": checkpoint.created_at, "validation_status": checkpoint.validation_status,
+            },
+        )
+        return {"status": STATUS_OK, "session_id": resolved, "checkpoint": checkpoint.public()}
+
+    def _maybe_auto_compact_context(self, session_id: str | None) -> None:
+        """Compact only a changed, old prefix before the estimated budget fills.
+
+        This is intentionally best-effort: a checkpoint failure never blocks a
+        user request and never causes a cloud/provider fallback.
+        """
+        resolved = session_id or "web-default"
+        status = self.context_status(resolved)
+        threshold = min(100, max(1, int(getattr(self.settings, "openclaw_web_context_compact_threshold_percent", 80))))
+        checkpoint = self._context_compactor().latest(resolved)
+        cooldown = max(0, int(getattr(self.settings, "openclaw_web_context_compact_cooldown_seconds", 300)))
+        if status["usage_percent"] < threshold or (checkpoint and time.time() - checkpoint.created_at < cooldown):
+            return
+        try:
+            result = self.compact_context(resolved)
+            if result.get("status") != STATUS_OK:
+                logger.info("context compaction deferred session=%s: %s", resolved, result.get("message"))
+        except Exception:  # noqa: BLE001 - context compaction cannot block a run
+            logger.exception("context compaction failed safely session=%s", resolved)
+
+    def clear_context_checkpoint(self, session_id: str | None = None) -> dict:
+        resolved = session_id or "web-default"
+        removed = self._context_compactor().clear(resolved)
+        if removed is not None:
+            self._event_sessions().ensure(resolved).append(
+                "context.checkpoint", run_id="session", visibility="user", payload={
+                    "checkpoint_id": removed.checkpoint_id, "deleted": True,
+                },
+            )
+        return {"status": STATUS_OK, "session_id": resolved, "cleared": removed is not None}
 
     def load_session(self) -> dict:
         """GET — journal projection with the historical snapshot wire shape."""

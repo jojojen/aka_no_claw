@@ -210,6 +210,14 @@ class AssistantSettings:
     openclaw_web_event_max_bytes: int = 25 * 1024 * 1024
     openclaw_web_event_max_age_days: int = 30
     openclaw_web_event_max_payload_bytes: int = 64 * 1024
+    # Grounded model-input checkpoints (#87).  They are kept separate from the
+    # append-only event journal and may be cleared without clearing chat.
+    openclaw_web_context_window_tokens: int = 32768
+    openclaw_web_context_reserve_tokens: int = 4096
+    openclaw_web_context_compact_threshold_percent: int = 80
+    openclaw_web_context_recent_turns: int = 6
+    openclaw_web_context_max_checkpoints: int = 10
+    openclaw_web_context_compact_cooldown_seconds: int = 300
     # Manifest-bound approval for risky Web-originated generated-tool actions.
     # Disabled until the companion Web approval card is deployed.
     openclaw_web_approvals_enabled: bool = False
@@ -603,6 +611,24 @@ def get_settings() -> AssistantSettings:
         ),
         openclaw_web_event_max_payload_bytes=_as_int(
             os.getenv("OPENCLAW_WEB_EVENT_MAX_PAYLOAD_BYTES"), default=64 * 1024
+        ),
+        openclaw_web_context_window_tokens=_as_int(
+            os.getenv("OPENCLAW_WEB_CONTEXT_WINDOW_TOKENS"), default=32768
+        ),
+        openclaw_web_context_reserve_tokens=_as_int(
+            os.getenv("OPENCLAW_WEB_CONTEXT_RESERVE_TOKENS"), default=4096
+        ),
+        openclaw_web_context_compact_threshold_percent=_as_int(
+            os.getenv("OPENCLAW_WEB_CONTEXT_COMPACT_THRESHOLD_PERCENT"), default=80
+        ),
+        openclaw_web_context_recent_turns=_as_int(
+            os.getenv("OPENCLAW_WEB_CONTEXT_RECENT_TURNS"), default=6
+        ),
+        openclaw_web_context_max_checkpoints=_as_int(
+            os.getenv("OPENCLAW_WEB_CONTEXT_MAX_CHECKPOINTS"), default=10
+        ),
+        openclaw_web_context_compact_cooldown_seconds=_as_int(
+            os.getenv("OPENCLAW_WEB_CONTEXT_COMPACT_COOLDOWN_SECONDS"), default=300
         ),
         openclaw_web_approvals_enabled=_as_bool(os.getenv("OPENCLAW_WEB_APPROVALS_ENABLED")),
         openclaw_web_approval_ttl_seconds=_as_int(

@@ -1,7 +1,7 @@
 # Web Conversation Compaction Implementation Plan
 
 Last reviewed: 2026-07-17
-Status: Planned
+Status: Current
 Owner area: command-bridge / model-context / memory
 Tracking issue: [`aka_no_claw#87`](https://github.com/jojojen/aka_no_claw/issues/87)
 Depends on: `WEB_SESSION_RUN_EVENT_SPINE_IMPLEMENTATION_PLAN.md`
@@ -371,24 +371,27 @@ Live proof when implemented:
 
 ## 16. Progress / Handoff Checklist
 
-Implementation has not started. First unchecked item: C1.1.
+Implementation completed on 2026-07-17. The first implementation is a local,
+deterministic excerpt compactor: it never sends content to a cloud provider or
+claims model-generated facts. The schema and provenance permit a future local
+JSON summarizer only after it can meet the same validation contract.
 
-- [ ] C1.1 inventory every current model-context layer and owner.
-- [ ] C1.2 define estimator interface and reserve policy.
-- [ ] C1.3 add diagnostics/golden fixture without behavior change.
-- [ ] C2.1 define checkpoint/output schema.
-- [ ] C2.2 implement source-reference validation.
-- [ ] C2.3 implement bounded atomic checkpoint store.
-- [ ] C2.4 add fake compactor/provider policy tests.
-- [ ] C3.1 implement manual compact/status/delete APIs.
-- [ ] C3.2 append/project `context.checkpoint`.
-- [ ] C3.3 add range/idempotency/failure tests.
-- [ ] C4.1 integrate checkpoint into request assembly.
-- [ ] C4.2 implement deterministic bounded fallback.
-- [ ] C4.3 add discriminating memory/correction tests.
-- [ ] C5.1 add auto-trigger threshold and cooldown.
-- [ ] C5.2 implement Web usage/inspect/clear UX.
-- [ ] C5.3 run live fresh-summary proof and update docs.
+- [x] C1.1 inventory every current model-context layer and owner.
+- [x] C1.2 define estimator interface and reserve policy.
+- [x] C1.3 add diagnostics/golden fixture without behavior change.
+- [x] C2.1 define checkpoint/output schema.
+- [x] C2.2 implement source-reference validation.
+- [x] C2.3 implement bounded atomic checkpoint store.
+- [x] C2.4 add deterministic compactor/privacy tests.
+- [x] C3.1 implement manual compact/status/delete APIs.
+- [x] C3.2 append/project `context.checkpoint`.
+- [x] C3.3 add range/idempotency/failure tests.
+- [x] C4.1 integrate checkpoint into request assembly.
+- [x] C4.2 implement deterministic bounded fallback (recent verbatim history remains authoritative).
+- [x] C4.3 add correction/secret-preservation tests.
+- [x] C5.1 add auto-trigger threshold and cooldown.
+- [x] C5.2 implement Web usage/inspect/clear UX.
+- [ ] C5.3 run supported-restart fresh-summary proof and update docs.
 
 ## 17. Rollback
 

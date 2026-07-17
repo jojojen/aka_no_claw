@@ -987,6 +987,18 @@ DEPRECATED_CODEGEN_SEED: tuple[tuple[str, str], ...] = (
 
 CODEGEN_SEED: tuple[dict, ...] = (
     {
+        "category": "testing",
+        "title": "新增可選 API 時，舊 client 與測試 mock 必須能安全降級",
+        "technique": (
+            "新增 capability 或 API method 後，先確認舊版 client、rolling deployment 與 focused test mock "
+            "未提供該 method 時的行為。初始化路徑必須做明確 capability check，並以 no-op 或可見的 "
+            "degraded state 降級；不要在 background effect 直接呼叫新 method，否則舊 mock 會產生未處理 "
+            "rejection。測試至少覆蓋 method 存在、缺席與失敗三種情況，並讓新控制項與既有主流程隔離。"
+        ),
+        "keywords": ["*", "compatibility", "optional api", "feature detection", "mock", "fallback", "react"],
+        "confidence": 0.96,
+    },
+    {
         "category": "concurrency",
         "title": "重啟復原只能在程序首次接觸持久狀態時執行一次",
         "technique": (

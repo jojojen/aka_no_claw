@@ -224,6 +224,8 @@ def _build_handler(
                 self._handle_queue_create()
             elif path == "/api/command/queue/reorder":
                 self._handle_queue_reorder()
+            elif path == "/api/command/context/compact":
+                self._handle_context_compact()
             elif path == "/api/command/schedulehome":
                 self._handle_schedulehome()
             elif path == "/api/command/session":
@@ -273,6 +275,9 @@ def _build_handler(
                     HTTPStatus.BAD_REQUEST if result.get("status") == "error" else HTTPStatus.OK
                 )
                 self._write_json(result, status=status)
+            elif split.path == "/api/command/context":
+                session_id = (parse_qs(split.query).get("session_id") or [None])[0]
+                self._write_json(bridge.context_status(session_id))
             elif split.path == "/api/command/queue":
                 session_id = (parse_qs(split.query).get("session_id") or [None])[0]
                 result = bridge.load_prompt_queue(session_id)
@@ -300,6 +305,9 @@ def _build_handler(
             split = urlsplit(self.path)
             if split.path == "/api/command/session":
                 self._write_json(bridge.clear_session())
+            elif split.path == "/api/command/context/checkpoint":
+                session_id = (parse_qs(split.query).get("session_id") or [None])[0]
+                self._write_json(bridge.clear_context_checkpoint(session_id))
             elif split.path.startswith("/api/command/queue/"):
                 prompt_id = split.path.rsplit("/", 1)[-1]
                 params = parse_qs(split.query)
@@ -353,6 +361,15 @@ def _build_handler(
                 self._write_json({"status": "error", "message": f"無效的請求：{exc}"}, status=HTTPStatus.BAD_REQUEST)
                 return
             self._write_json(result, status=self._queue_status(result))
+
+        def _handle_context_compact(self) -> None:
+            try:
+                payload = self._read_json_object()
+            except (ValueError, UnicodeDecodeError) as exc:
+                self._write_json({"status": "error", "message": f"無效的請求：{exc}"}, status=HTTPStatus.BAD_REQUEST)
+                return
+            result = bridge.compact_context(payload.get("session_id"))
+            self._write_json(result, status=HTTPStatus.OK if result.get("status") == "ok" else HTTPStatus.BAD_REQUEST)
 
         def _handle_queue_reorder(self) -> None:
             try:

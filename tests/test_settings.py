@@ -218,6 +218,9 @@ def test_get_settings_reads_web_event_journal_environment_keys(monkeypatch, tmp_
     monkeypatch.setenv("OPENCLAW_WEB_EVENT_MAX_BYTES", "123456")
     monkeypatch.setenv("OPENCLAW_WEB_EVENT_MAX_AGE_DAYS", "14")
     monkeypatch.setenv("OPENCLAW_WEB_EVENT_MAX_PAYLOAD_BYTES", "4096")
+    monkeypatch.setenv("OPENCLAW_WEB_CONTEXT_WINDOW_TOKENS", "8192")
+    monkeypatch.setenv("OPENCLAW_WEB_CONTEXT_RESERVE_TOKENS", "1024")
+    monkeypatch.setenv("OPENCLAW_WEB_CONTEXT_COMPACT_COOLDOWN_SECONDS", "33")
 
     settings = get_settings()
 
@@ -225,3 +228,6 @@ def test_get_settings_reads_web_event_journal_environment_keys(monkeypatch, tmp_
     assert settings.openclaw_web_event_max_bytes == 123456
     assert settings.openclaw_web_event_max_age_days == 14
     assert settings.openclaw_web_event_max_payload_bytes == 4096
+    assert settings.openclaw_web_context_window_tokens == 8192
+    assert settings.openclaw_web_context_reserve_tokens == 1024
+    assert settings.openclaw_web_context_compact_cooldown_seconds == 33
