@@ -988,6 +988,20 @@ DEPRECATED_CODEGEN_SEED: tuple[tuple[str, str], ...] = (
 CODEGEN_SEED: tuple[dict, ...] = (
     {
         "category": "performance",
+        "title": "不要在正式請求熱路徑前重複執行同等成本的生成式健康探測",
+        "technique": (
+            "當正式 API／模型請求本身已能判定服務是否可用，而且呼叫端已有明確的錯誤處理或 "
+            "fallback，便不要在每次正式請求前再送一次生成式 probe；這會把一次使用者操作變成 "
+            "兩次昂貴呼叫，並讓 probe 的 timeout、重試與 token 下限直接疊加到延遲。應直接建立 "
+            "client，讓正式請求成為權威健康檢查；若 UI 或監控需要預先顯示健康狀態，改用啟動時 "
+            "或有 TTL 的背景探測。另以不記錄內容的分段耗時紀錄 build、generate 與 total，才能 "
+            "區分 client 建立、上游生成及 fallback 的成本。"
+        ),
+        "keywords": ["*", "performance", "latency", "health probe", "hot path", "fallback", "timing"],
+        "confidence": 0.95,
+    },
+    {
+        "category": "performance",
         "title": "只需要首個合格結果時，使用增量結果流而非等待完整蒐集窗",
         "technique": (
             "處理探索、掃描或查詢時，先量測每個階段；若使用者操作只需要第一個符合條件的"

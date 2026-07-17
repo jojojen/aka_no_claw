@@ -10,7 +10,9 @@ keep importing from ``openclaw_adapter.command_bridge``.
 from __future__ import annotations
 
 import json
+import logging
 import threading
+import time
 from typing import Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
@@ -44,6 +46,8 @@ _MODEL_STATUS_NOT_CONFIGURED = "not_configured"
 _MODEL_STATUS_QUOTA_EXHAUSTED = "quota_exhausted"
 _MODEL_STATUS_RATE_LIMITED = "rate_limited"
 _GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
+logger = logging.getLogger(__name__)
 
 
 class _GeminiRequestError(RuntimeError):
@@ -146,28 +150,71 @@ def _walk_cloud_pool_chain(
     """
     attempts: list[ModelAttempt] = []
     for provider, model_name, build_fn, configured_fn in chain:
+        attempt_started = time.perf_counter()
         if not configured_fn():
             attempts.append(ModelAttempt(
                 provider, model_name, _MODEL_STATUS_NOT_CONFIGURED,
                 f"{provider} not configured",
             ))
             continue
+        build_started = time.perf_counter()
         client = build_fn(model_name) if provider == "gemini" else build_fn()
+        build_ms = int((time.perf_counter() - build_started) * 1000)
         if client is None:
             attempts.append(ModelAttempt(
                 provider, model_name, _MODEL_STATUS_NOT_CONFIGURED,
                 f"{provider} unavailable",
             ))
+            logger.info(
+                "cloud provider attempt provider=%s model=%s status=%s "
+                "build_ms=%d generate_ms=0 total_ms=%d",
+                provider,
+                model_name,
+                _MODEL_STATUS_NOT_CONFIGURED,
+                build_ms,
+                int((time.perf_counter() - attempt_started) * 1000),
+            )
             continue
+        generate_started = time.perf_counter()
         try:
             text = client.generate(prompt, temperature=temperature)
         except _GeminiRequestError as exc:
             attempts.append(ModelAttempt(provider, model_name, exc.status, str(exc)))
+            logger.info(
+                "cloud provider attempt provider=%s model=%s status=%s "
+                "build_ms=%d generate_ms=%d total_ms=%d",
+                provider,
+                model_name,
+                exc.status,
+                build_ms,
+                int((time.perf_counter() - generate_started) * 1000),
+                int((time.perf_counter() - attempt_started) * 1000),
+            )
             continue
         except Exception as exc:  # noqa: BLE001
             attempts.append(ModelAttempt(provider, model_name, _MODEL_STATUS_ERROR, str(exc)))
+            logger.info(
+                "cloud provider attempt provider=%s model=%s status=%s "
+                "build_ms=%d generate_ms=%d total_ms=%d",
+                provider,
+                model_name,
+                _MODEL_STATUS_ERROR,
+                build_ms,
+                int((time.perf_counter() - generate_started) * 1000),
+                int((time.perf_counter() - attempt_started) * 1000),
+            )
             continue
         attempts.append(ModelAttempt(provider, model_name, _MODEL_STATUS_OK))
+        logger.info(
+            "cloud provider attempt provider=%s model=%s status=%s "
+            "build_ms=%d generate_ms=%d total_ms=%d",
+            provider,
+            model_name,
+            _MODEL_STATUS_OK,
+            build_ms,
+            int((time.perf_counter() - generate_started) * 1000),
+            int((time.perf_counter() - attempt_started) * 1000),
+        )
         return text, provider, model_name, tuple(attempts)
     return None, None, None, tuple(attempts)
 
@@ -510,18 +557,19 @@ class _StandaloneChatClientDeps:
         )
 
     def _build_cloud_chat_client(self):
-        from .dynamic_tools import OpenCodeTextClient, probe_opencode
+        from .dynamic_tools import OpenCodeTextClient
 
         base_url = self.settings.openclaw_opencode_base_url
         model = resolve_provider_model(self.settings, LLM_PROVIDER_BIG_PICKLE)
-        if probe_opencode(base_url, model=model, timeout=10.0):
-            return OpenCodeTextClient(
-                base_url=base_url,
-                model=model,
-                api_key=self.settings.openclaw_opencode_api_key,
-                timeout_seconds=180,
-            )
-        return None
+        # Do not issue a separate generation-based health probe here. The real
+        # request is the authoritative availability check, and ProviderRouter
+        # already records a failed attempt before continuing to the next model.
+        return OpenCodeTextClient(
+            base_url=base_url,
+            model=model,
+            api_key=getattr(self.settings, "openclaw_opencode_api_key", None),
+            timeout_seconds=180,
+        )
 
     def _build_nvidia_chat_client(self):
         from .dynamic_tools import NvidiaTextClient

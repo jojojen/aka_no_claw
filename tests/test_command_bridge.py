@@ -4644,6 +4644,42 @@ def test_provider_router_all_cloud_fail_falls_back_to_local():
     assert metadata.fallback_occurred is True
 
 
+def test_command_bridge_big_pickle_client_skips_generation_probe(monkeypatch):
+    """A user request must not pay for a second model generation as preflight."""
+    from openclaw_adapter import dynamic_tools
+
+    settings = _tool_settings()
+    settings.openclaw_opencode_api_key = None
+    bridge = CommandBridge(settings=settings)
+
+    def _unexpected_probe(*_args, **_kwargs):
+        raise AssertionError("OpenCode generation probe must not run in the request hot path")
+
+    monkeypatch.setattr(dynamic_tools, "probe_opencode", _unexpected_probe)
+    client = bridge._build_cloud_chat_client()
+
+    assert client.model == "big-pickle"
+    assert client.base_url == "http://localhost:8080"
+
+
+def test_standalone_cloud_pool_big_pickle_client_skips_generation_probe(monkeypatch):
+    """Telegram's shared pool entrypoint follows the same single-call contract."""
+    from openclaw_adapter import command_bridge_providers, dynamic_tools
+
+    settings = _tool_settings()
+    settings.openclaw_opencode_api_key = None
+
+    def _unexpected_probe(*_args, **_kwargs):
+        raise AssertionError("OpenCode generation probe must not run in the request hot path")
+
+    monkeypatch.setattr(dynamic_tools, "probe_opencode", _unexpected_probe)
+    deps = command_bridge_providers._StandaloneChatClientDeps(settings)
+    client = deps._build_cloud_chat_client()
+
+    assert client.model == "big-pickle"
+    assert client.base_url == "http://localhost:8080"
+
+
 def test_cloud_pool_success_with_gemini(monkeypatch):
     """cloud_pool uses Gemini when it is configured and succeeds (no fallback)."""
     b = CommandBridge(settings=_tool_settings(gemini_key="fake-key"))

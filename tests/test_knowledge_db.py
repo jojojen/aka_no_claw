@@ -47,6 +47,22 @@ def test_codegen_seed_for_incremental_results_is_always_retrievable(db):
     assert "iterator" in rule.technique
 
 
+def test_codegen_seed_for_hot_path_generation_probes_is_always_retrievable(db):
+    db.seed_codegen_knowledge()
+
+    rows = db.retrieve_codegen_knowledge("任意程式需求", k=100)
+    rule = next(
+        row
+        for row in rows
+        if row.title == "不要在正式請求熱路徑前重複執行同等成本的生成式健康探測"
+    )
+
+    assert rule.category == "performance"
+    assert "*" in rule.keywords
+    assert "TTL" in rule.technique
+    assert "generate" in rule.technique
+
+
 def test_codegen_seed_for_legacy_ui_entry_is_always_retrievable(db):
     db.seed_codegen_knowledge()
 

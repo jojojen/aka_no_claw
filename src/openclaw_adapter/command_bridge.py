@@ -4606,18 +4606,19 @@ class CommandBridge:
 
     def _build_cloud_chat_client(self):
         """Big-pickle chat client via direct HTTP (zen/v1). No CLI fallback (#59)."""
-        from .dynamic_tools import OpenCodeTextClient, probe_opencode
+        from .dynamic_tools import OpenCodeTextClient
 
         base_url = self.settings.openclaw_opencode_base_url
         model = self._big_pickle_model()
-        if probe_opencode(base_url, model=model, timeout=10.0):
-            return OpenCodeTextClient(
-                base_url=base_url,
-                model=model,
-                api_key=self.settings.openclaw_opencode_api_key,
-                timeout_seconds=180,
-            )
-        return None
+        # The actual generation is the health check. A preflight generation
+        # doubled hot-path model calls and could consume the full probe timeout;
+        # cloud-pool callers already fail over when this client's request fails.
+        return OpenCodeTextClient(
+            base_url=base_url,
+            model=model,
+            api_key=getattr(self.settings, "openclaw_opencode_api_key", None),
+            timeout_seconds=180,
+        )
 
     def _build_mistral_chat_client(self):
         """Mistral cloud chat client; returns None when MISTRAL_API_KEY not set."""
