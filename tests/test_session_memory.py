@@ -20,7 +20,6 @@ import pytest
 from openclaw_adapter import command_bridge_server as srv
 from openclaw_adapter.command_bridge import CommandBridge
 from openclaw_adapter.session_memory import (
-    MAX_BYTES,
     MAX_MESSAGES,
     MAX_SCALAR_LEN,
     SCHEMA_VERSION,
