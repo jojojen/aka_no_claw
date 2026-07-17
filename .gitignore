@@ -49,6 +49,8 @@ spikes/**/emb_*.npz
 
 # Runtime-generated comp-filter IDF corpus (TitleCorpusRebuilder rebuilds weekly)
 data/market_title_df.json
+# Legacy source-root cache path used by the current title corpus rebuild path.
+src/data/market_title_df.json
 
 # Runtime workflow data (live execution state; fixtures go under tests/fixtures/)
 workflow_store/
