@@ -114,6 +114,46 @@ class SessionEventJournal:
             events, _ = self._load_locked(recover_tail=True)
             return events
 
+    def append_existing(self, event: SessionRunEvent) -> None:
+        """Append an already-versioned import event without changing its identity.
+
+        This is intentionally narrow: migration supplies the deterministic
+        sequence once, while ordinary runtime writers must use :meth:`append`.
+        """
+        if event.session_id != self.session_id:
+            raise EventValidationError("cannot import an event for another session")
+        if event.type not in DURABLE_EVENT_TYPES:
+            raise EventValidationError(f"{event.type} is not a durable event type")
+        with self._lock:
+            events, metadata = self._load_locked(recover_tail=True)
+            if event.seq != int(metadata["last_seq"]) + 1:
+                raise JournalError("import sequence must immediately follow the journal cursor")
+            self._append_line_locked(event)
+            self._write_metadata_locked(events + [event])
+
+    def expire_complete_runs_before(self, cutoff: float) -> int:
+        """Expire only whole terminal runs older than ``cutoff``.
+
+        Active/interrupted-unclassified work stays replayable; retention never
+        turns a complete result into an uninterpretable fragment.
+        """
+        with self._lock:
+            events, _ = self._load_locked(recover_tail=True)
+            by_run: dict[str, list[SessionRunEvent]] = {}
+            for event in events:
+                by_run.setdefault(event.run_id, []).append(event)
+            expired = {
+                run_id for run_id, run_events in by_run.items()
+                if any(event.is_terminal for event in run_events)
+                and all(event.occurred_at < cutoff for event in run_events)
+            }
+            if not expired:
+                return 0
+            retained = [event for event in events if event.run_id not in expired]
+            self._rewrite_locked(retained)
+            self._write_metadata_locked(retained)
+            return len(expired)
+
     def _bounded_payload(self, payload: dict[str, object]) -> dict[str, object]:
         from .session_events import normalise_payload
         return normalise_payload(payload, max_bytes=self._max_payload_bytes)

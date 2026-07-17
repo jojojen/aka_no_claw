@@ -168,7 +168,7 @@ def _build_handler(
             origin = self.headers.get("Origin")
             self.send_header("Access-Control-Allow-Origin", origin or "*")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-OpenClaw-Event-Version")
             self.send_header("Access-Control-Max-Age", "600")
 
         def do_OPTIONS(self) -> None:  # noqa: N802
@@ -243,6 +243,22 @@ def _build_handler(
                 self._write_json(bridge.poll_job(job_ids[0]))
             elif split.path == "/api/command/session":
                 self._write_json(bridge.load_session())
+            elif split.path == "/api/command/events":
+                params = parse_qs(split.query)
+                session_id = (params.get("session_id") or [None])[0]
+                raw_after = (params.get("after") or [None])[0]
+                raw_limit = (params.get("limit") or ["500"])[0]
+                try:
+                    after = int(raw_after) if raw_after is not None else None
+                    limit = int(raw_limit)
+                except ValueError:
+                    self._write_json({"status": "error", "message": "after 與 limit 必須是整數。"}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                result = bridge.read_session_events(session_id=session_id, after=after, limit=limit)
+                status = HTTPStatus.GONE if result.get("status") == "cursor_expired" else (
+                    HTTPStatus.BAD_REQUEST if result.get("status") == "error" else HTTPStatus.OK
+                )
+                self._write_json(result, status=status)
             elif split.path == "/api/command/music/now":
                 self._write_json(bridge.now_playing())
             elif split.path == "/api/command/model-routes":
@@ -657,6 +673,7 @@ def _build_handler(
                                  status=HTTPStatus.BAD_REQUEST)
                 return
             request_id = uuid4().hex
+            event_version = self.headers.get("X-OpenClaw-Event-Version") == "1"
             self.send_response(HTTPStatus.OK)
             self._send_cors_headers()
             self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
@@ -665,6 +682,10 @@ def _build_handler(
             self.send_header("Connection", "close")
             self.end_headers()
             stream = bridge.stream(req, request_id)
+            cursor = 0
+            if event_version:
+                bootstrap = bridge.read_session_events(session_id=req.session_id, after=None)
+                cursor = int(bootstrap.get("server_cursor") or 0)
             try:
                 for event in stream:
                     line = (
@@ -672,6 +693,15 @@ def _build_handler(
                     ).encode("utf-8")
                     self.wfile.write(line)
                     self.wfile.flush()
+                    if event_version:
+                        page = bridge.read_session_events(session_id=req.session_id, after=cursor)
+                        for durable in page.get("events") or []:
+                            envelope = {"type": "session_event", "event": durable}
+                            self.wfile.write(
+                                (json.dumps(_stamp_envelope_version(envelope), ensure_ascii=False) + "\n").encode("utf-8")
+                            )
+                            self.wfile.flush()
+                            cursor = int(durable["seq"])
             except (BrokenPipeError, ConnectionResetError):
                 # Client cancelled (AbortController) — stop quietly.
                 logger.info("command bridge stream: client disconnected request_id=%s", request_id)

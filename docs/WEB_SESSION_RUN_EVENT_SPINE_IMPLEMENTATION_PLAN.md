@@ -704,38 +704,38 @@ tests/test_settings.py tests/test_session_memory.py`.
 
 ### E2 — blocking compatibility
 
-- [ ] E2.1 implement `RunRecorder`.
-- [ ] E2.2 instrument blocking command path.
-- [ ] E2.3 compare journal projection with legacy snapshot behavior.
-- [ ] E2.4 add compatibility and concurrency tests.
+- [x] E2.1 implement `RunRecorder`.
+- [x] E2.2 instrument blocking command path.
+- [x] E2.3 compare journal projection with legacy snapshot behavior.
+- [x] E2.4 add compatibility and concurrency tests.
 
 ### E3 — stream/cursor
 
-- [ ] E3.1 define event negotiation.
-- [ ] E3.2 add cursor endpoint and golden contract.
-- [ ] E3.3 instrument durable stream checkpoints.
-- [ ] E3.4 add disconnect-at-boundary convergence harness.
+- [x] E3.1 define event negotiation.
+- [x] E3.2 add cursor endpoint and golden contract.
+- [x] E3.3 instrument durable stream checkpoints.
+- [x] E3.4 add disconnect-at-boundary convergence harness.
 
 ### E4 — jobs
 
-- [ ] E4.1 bind jobs to runs.
-- [ ] E4.2 centralize terminal compare-and-set.
-- [ ] E4.3 inject background completion into session events.
-- [ ] E4.4 add restart and cancellation race tests.
+- [x] E4.1 bind jobs to runs.
+- [x] E4.2 centralize terminal compare-and-set.
+- [x] E4.3 inject background completion into session events.
+- [x] E4.4 add restart and cancellation race tests.
 
 ### E5 — lifecycle detail
 
-- [ ] E5.1 planner event.
-- [ ] E5.2 executor tool events.
-- [ ] E5.3 satisfaction judge event.
-- [ ] E5.4 goal/research progress stages.
-- [ ] E5.5 audit visibility and private reasoning exclusion.
+- [x] E5.1 planner event.
+- [x] E5.2 executor tool events.
+- [x] E5.3 satisfaction judge event.
+- [x] E5.4 goal/research progress stages.
+- [x] E5.5 audit visibility and private reasoning exclusion.
 
 ### E6 — authority/rollout
 
-- [ ] E6.1 rebuild compatibility snapshot from journal.
-- [ ] E6.2 enable migration and bounded retention.
-- [ ] E6.3 update system truth and verification docs.
+- [x] E6.1 rebuild compatibility snapshot from journal.
+- [x] E6.2 enable migration and bounded retention.
+- [x] E6.3 update system truth and verification docs.
 - [ ] E6.4 restart and complete live recovery proof.
 
 ## 19. Rollback Strategy

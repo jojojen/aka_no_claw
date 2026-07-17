@@ -97,6 +97,17 @@ def test_codegen_seed_for_facade_collaborator_seams_is_always_retrievable(db):
     assert "monkeypatch" in rule.technique
 
 
+def test_codegen_seed_for_durable_terminal_transitions_is_always_retrievable(db):
+    db.seed_codegen_knowledge()
+
+    rows = db.retrieve_codegen_knowledge("任意程式需求", k=100)
+    rule = next(row for row in rows if row.title == "終態狀態必須在所有可恢復副作用落盤後才對讀者可見")
+
+    assert rule.category == "concurrency"
+    assert "*" in rule.keywords
+    assert "compare-and-set" in rule.technique
+
+
 def test_upsert_and_get_entry_roundtrip(db):
     db.upsert_entry(
         entity_canonical="pjsk",

@@ -73,3 +73,12 @@ def test_retention_never_splits_an_active_run(tmp_path):
     journal = _journal(tmp_path, max_bytes=300)
     with pytest.raises(JournalRetentionError):
         journal.append("run.accepted", run_id="run-1", payload={"text": "x" * 160})
+
+
+def test_age_retention_only_expires_a_whole_terminal_run(tmp_path):
+    journal = _journal(tmp_path)
+    journal.append("run.accepted", run_id="old-run", payload={}, occurred_at=1.0)
+    journal.append("run.completed", run_id="old-run", payload={}, occurred_at=2.0)
+    journal.append("run.accepted", run_id="active-run", payload={}, occurred_at=1.0)
+    assert journal.expire_complete_runs_before(10.0) == 1
+    assert [event.run_id for event in journal.events()] == ["active-run"]

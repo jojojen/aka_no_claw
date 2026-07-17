@@ -23,6 +23,7 @@ Last reviewed: 2026-07-11
 | Opportunity agent | Opportunity pipeline/store/scoring tests | Local agent tick with test DB or controlled candidate |
 | Dashboard | Dashboard unit tests if available | `serve-dashboard` local browser smoke |
 | DB schema or runtime path | Init/migration tests for all readers/writers | `/restartall` or `POST /api/command/restartall` smoke and log check |
+| Web session/run event spine | `tests/test_session_events.py`, `tests/test_session_event_journal.py`, `tests/test_session_projection.py`, `tests/test_command_bridge_event_contract.py` | Restart bridge; replay `/api/command/events` after a completed async run and verify one final message |
 | Launchd/service wiring | Targeted service tests and path-resolution tests | `/restartall` smoke plus log inspection on this machine; run the device setup script only for first-setup/cold-start verification |
 
 ## Reporting Verification

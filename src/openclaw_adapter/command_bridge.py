@@ -25,6 +25,7 @@ import queue
 import re
 import threading
 import time
+from contextvars import ContextVar
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Callable
@@ -37,6 +38,9 @@ from assistant_runtime import AssistantSettings, build_ssl_context
 
 from .job_store import JobStore
 from .session_memory import SessionMemoryStore, SessionWriteError, empty_session
+from .session_event_service import SessionEventService
+from .session_event_journal import CursorExpiredError
+from .run_recorder import RunRecorder
 from .command_bridge_conversation import ConversationSession, ConversationState
 from .command_bridge_music import MusicCapability
 from .command_bridge_workflow import WorkflowCapability
@@ -409,8 +413,13 @@ class _JobNotifier:
         with job.lock:
             progress_snapshot = list(job.progress)
             wall_created_at = job.wall_created_at
+            recorder = getattr(job, "recorder", None)
+        if recorder is not None:
+            recorder.progress("research", text)
         self._store.save({
             "job_id": self._job_id,
+            "run_id": getattr(job, "run_id", None),
+            "session_id": getattr(job, "session_id", None),
             "status": JOB_RUNNING,
             "progress": progress_snapshot,
             "message": "",
@@ -505,6 +514,11 @@ class CommandBridge:
         self._conversation_session: ConversationSession | None = None
         self._conversation_session_lock = threading.Lock()
         self._session_store: SessionMemoryStore | None = None
+        self._event_sessions_inst: SessionEventService | None = None
+        self._event_sessions_lock = threading.Lock()
+        self._active_run_recorder: ContextVar[RunRecorder | None] = ContextVar(
+            "active_run_recorder", default=None
+        )
         self._image_renderer = None
         self._image_renderer_built = False
         self._image_renderer_lock = threading.Lock()
@@ -714,8 +728,18 @@ class CommandBridge:
         """Run a handler and keep both the text and any Telegram reply_markup
         (inline_keyboard), so the web console can render the same follow-up
         buttons 龍蝦 shows after /research."""
+        recorder = self._active_run_recorder.get()
+        if recorder is not None:
+            recorder.tool_started(command)
         registered = self._handlers()[command]
-        result = registered.handler(remainder, chat_id)
+        try:
+            result = registered.handler(remainder, chat_id)
+        except Exception:
+            if recorder is not None:
+                recorder.tool_completed(command, ok=False)
+            raise
+        if recorder is not None:
+            recorder.tool_completed(command, ok=True)
         if isinstance(result, tuple):
             text = result[0]
             markup = result[1] if len(result) > 1 else None
@@ -726,6 +750,37 @@ class CommandBridge:
 
     # --- blocking entrypoint ---------------------------------------------
     def handle(self, req: WebCommandRequest) -> WebCommandResponse:
+        session_id = getattr(req, "session_id", None)
+        recorder = self._event_sessions().recorder(session_id)
+        recorder.accepted((req.input or "").strip())
+        recorder.started()
+        token = self._active_run_recorder.set(recorder)
+        try:
+            response = self._handle_unrecorded(req)
+            recorder.planner_completed("command_bridge" if req.mode == MODE_CHAT else req.mode)
+            recorder.judge_completed(
+                satisfied=response.status != STATUS_ERROR,
+                reason_code="response_ok" if response.status != STATUS_ERROR else "response_error",
+            )
+            recorder.assistant_message(response.message)
+            recorder.terminal("completed" if response.status != STATUS_ERROR else "failed", message=response.message)
+            return response
+        except Exception as exc:  # noqa: BLE001 — surface as structured error
+            logger.exception("command bridge failed mode=%s", req.mode)
+            response = WebCommandResponse(
+                status=STATUS_ERROR,
+                message=f"後端處理失敗：{exc}",
+                mode=req.mode,
+                submode=req.submode,
+            )
+            recorder.assistant_message(response.message)
+            recorder.terminal("failed", message=response.message)
+            return response
+        finally:
+            self._active_run_recorder.reset(token)
+
+    def _handle_unrecorded(self, req: WebCommandRequest) -> WebCommandResponse:
+        """The pre-event-spine router; callers must own lifecycle recording."""
         try:
             if req.mode == MODE_CHAT:
                 return self._handle_chat_blocking(req)
@@ -738,14 +793,8 @@ class CommandBridge:
                 message=f"未知的模式：{req.mode}",
                 mode=req.mode,
             )
-        except Exception as exc:  # noqa: BLE001 — surface as structured error
-            logger.exception("command bridge failed mode=%s", req.mode)
-            return WebCommandResponse(
-                status=STATUS_ERROR,
-                message=f"後端處理失敗：{exc}",
-                mode=req.mode,
-                submode=req.submode,
-            )
+        except Exception:
+            raise
 
     # --- streaming entrypoint (chat) -------------------------------------
     def stream(self, req: WebCommandRequest, request_id: str) -> Iterator[dict]:
@@ -753,21 +802,59 @@ class CommandBridge:
         in one block with heartbeats (cloud); non-chat modes run blocking and
         emit a single done event so the frontend can use one code path."""
         yield stream_start(request_id)
+        if req.mode != MODE_CHAT:
+            # ``handle`` is already the durable blocking compatibility adapter.
+            try:
+                response = self.handle(req)
+                if response.status == STATUS_ERROR:
+                    yield stream_error(response.message)
+                else:
+                    yield stream_done(response.message, model_metadata=response.model_metadata)
+            except Exception as exc:  # noqa: BLE001
+                yield stream_error(f"後端處理失敗：{exc}")
+            return
+        recorder = self._event_sessions().recorder(req.session_id)
+        recorder.accepted((req.input or "").strip())
+        recorder.started()
+        token = self._active_run_recorder.set(recorder)
+        deltas: list[str] = []
+        terminal = False
         try:
-            if req.mode == MODE_CHAT:
-                yield from self._stream_chat(req)
-                return
-            # Non-chat modes (translation): reuse the blocking router, emit as
-            # one event. Long research runs via the async job + poll endpoints
-            # instead, so a mobile screen-lock can't drop a held connection.
-            response = self.handle(req)
-            if response.status == STATUS_ERROR:
-                yield stream_error(response.message)
-            else:
-                yield stream_done(response.message, model_metadata=response.model_metadata)
+            for event in self._stream_chat(req):
+                event_type = event.get("type")
+                if event_type == "delta":
+                    text = event.get("text")
+                    if isinstance(text, str):
+                        deltas.append(text)
+                elif event_type == "process":
+                    text = event.get("text")
+                    if isinstance(text, str):
+                        recorder.progress("stream", text)
+                elif event_type == "done":
+                    message = event.get("message")
+                    recorder.planner_completed("stream_chat")
+                    recorder.judge_completed(satisfied=True, reason_code="stream_done")
+                    recorder.assistant_message(str(message or "".join(deltas)))
+                    recorder.terminal("completed")
+                    terminal = True
+                elif event_type == "error":
+                    message = str(event.get("message") or "")
+                    recorder.assistant_message(message)
+                    recorder.terminal("failed", message=message)
+                    terminal = True
+                yield event
         except Exception as exc:  # noqa: BLE001
             logger.exception("command bridge stream failed mode=%s", req.mode)
+            recorder.assistant_message(f"後端處理失敗：{exc}")
+            recorder.terminal("failed", message=str(exc))
+            terminal = True
             yield stream_error(f"後端處理失敗：{exc}")
+        finally:
+            if not terminal:
+                partial = "".join(deltas)
+                recorder.assistant_message(partial, partial=True)
+                recorder.terminal("interrupted")
+            self._active_run_recorder.reset(token)
 
     # --- chat ------------------------------------------------------------
     def _handle_chat_blocking(self, req: WebCommandRequest) -> WebCommandResponse:
@@ -1839,9 +1926,15 @@ class CommandBridge:
         # session-memory reload. The worker persists the terminal state whether
         # or not the client is still attached.
         job = self._jobs.create()
+        recorder = self._active_run_recorder.get() or self._event_sessions().recorder(req.session_id)
+        job.run_id = recorder.run_id
+        job.session_id = getattr(req, "session_id", None)
+        job.recorder = recorder
         store = self._get_job_store()
         store.save({
             "job_id": job.id,
+            "run_id": job.run_id,
+            "session_id": job.session_id,
             "status": JOB_RUNNING,
             "progress": [],
             "message": "",
@@ -1863,6 +1956,8 @@ class CommandBridge:
                 progress_snapshot = list(job.progress)
             store.save({
                 "job_id": job.id,
+                "run_id": job.run_id,
+                "session_id": job.session_id,
                 "status": status,
                 "progress": progress_snapshot,
                 "message": message,
@@ -1871,6 +1966,15 @@ class CommandBridge:
                 "created_at": job.wall_created_at,
                 "updated_at": time.time(),
             })
+            # Journal injection happens after the authoritative terminal job
+            # snapshot. A later reconnect sees one final message and one
+            # terminal state even if no stream stayed open.
+            if message:
+                recorder.assistant_message(message)
+            recorder.terminal(
+                "cancelled" if status == JOB_INTERRUPTED else ("completed" if status == JOB_DONE else "failed"),
+                message=message or (error or ""),
+            )
 
         def _worker() -> None:
             try:
@@ -2261,7 +2365,11 @@ class CommandBridge:
     def _select_chat_tool_plan(
         self, req: WebCommandRequest, observation: str | None = None
     ) -> tuple[ChatToolPlan | None, ModelMetadata | None]:
-        return self._planner.select_plan(req, observation)
+        plan, metadata = self._planner.select_plan(req, observation)
+        recorder = self._active_run_recorder.get()
+        if recorder is not None:
+            recorder.planner_completed(plan.tool if plan is not None else "fallback")
+        return plan, metadata
 
     def _stream_chat_tool_plan(
         self, req: WebCommandRequest, observation: str | None = None
@@ -2564,6 +2672,9 @@ class CommandBridge:
         streaming client disconnected before delivery. The user sees it on
         the next reconnect/session load."""
         self._conversation_sessions().append_orphaned_result(text)
+        self._event_sessions().ensure().append(
+            "assistant.message", run_id="orphaned-result", payload={"text": text, "orphaned": True}
+        )
         logger.info(
             "command bridge: pushed orphaned tool result to session memory (%d chars)", len(text)
         )
@@ -2991,7 +3102,18 @@ class CommandBridge:
     # R1.3b compatibility delegates.  The executor calls back through these
     # exact bridge names, preserving existing instance monkeypatch seams.
     def _run_chat_tool(self, req: WebCommandRequest, plan: ChatToolPlan) -> ChatToolResult:
-        return self._executor.run(req, plan)
+        recorder = self._active_run_recorder.get()
+        if recorder is not None:
+            recorder.tool_started(plan.tool)
+        try:
+            result = self._executor.run(req, plan)
+        except Exception:
+            if recorder is not None:
+                recorder.tool_completed(plan.tool, ok=False)
+            raise
+        if recorder is not None:
+            recorder.tool_completed(plan.tool, ok=True)
+        return result
 
     def _stream_chat_tool(
         self, req: WebCommandRequest, plan: ChatToolPlan
@@ -3177,9 +3299,18 @@ class CommandBridge:
         if not text:
             return {"status": STATUS_ERROR, "message": "請貼上商品 URL 或輸入商品名稱。"}
         job = self._jobs.create()
+        session_id = getattr(req, "session_id", None)
+        recorder = self._event_sessions().recorder(session_id)
+        recorder.accepted(text)
+        recorder.started()
+        job.run_id = recorder.run_id
+        job.session_id = session_id
+        job.recorder = recorder
         store = self._get_job_store()
         store.save({
             "job_id": job.id,
+            "run_id": job.run_id,
+            "session_id": session_id,
             "status": JOB_RUNNING,
             "progress": [],
             "message": "",
@@ -3200,21 +3331,33 @@ class CommandBridge:
                     status, message, actions, error = (
                         JOB_INTERRUPTED, "任務已取消。", [], None
                     )
+                progress_snapshot = list(job.progress)
+                # This is the sole terminal compare-and-set. Keep the job in
+                # ``running`` until its snapshot and event history are both
+                # durable, so poll cannot observe a finished job without the
+                # replayable final message.
+                store.save({
+                    "job_id": job.id,
+                    "run_id": job.run_id,
+                    "session_id": job.session_id,
+                    "status": status,
+                    "progress": progress_snapshot,
+                    "message": message,
+                    "actions": list(actions),
+                    "error": error,
+                    "created_at": job.wall_created_at,
+                    "updated_at": time.time(),
+                })
+                if message:
+                    recorder.assistant_message(message)
+                recorder.terminal(
+                    "cancelled" if status == JOB_INTERRUPTED else ("completed" if status == JOB_DONE else "failed"),
+                    message=message or (error or ""),
+                )
                 job.status = status
                 job.message = message
                 job.actions = actions
                 job.error = error
-                progress_snapshot = list(job.progress)
-            store.save({
-                "job_id": job.id,
-                "status": status,
-                "progress": progress_snapshot,
-                "message": message,
-                "actions": list(actions),
-                "error": error,
-                "created_at": job.wall_created_at,
-                "updated_at": time.time(),
-            })
 
         def _worker() -> None:
             try:
@@ -3250,6 +3393,7 @@ class CommandBridge:
             with job.lock:
                 return {
                     "job_status": job.status,
+                    "run_id": getattr(job, "run_id", None),
                     "progress": list(job.progress),
                     "message": job.message,
                     "actions": list(job.actions),
@@ -3265,6 +3409,7 @@ class CommandBridge:
         if status == JOB_DONE:
             return {
                 "job_status": JOB_DONE,
+                "run_id": persisted.get("run_id"),
                 "progress": persisted.get("progress") or [],
                 "message": persisted.get("message") or "",
                 "actions": persisted.get("actions") or [],
@@ -3273,14 +3418,21 @@ class CommandBridge:
         if status == JOB_ERROR:
             return {
                 "job_status": JOB_ERROR,
+                "run_id": persisted.get("run_id"),
                 "progress": persisted.get("progress") or [],
                 "message": "",
                 "actions": [],
                 "error": persisted.get("error") or "任務失敗",
             }
         # status == running but in-memory worker gone: bridge was restarted.
+        run_id = persisted.get("run_id")
+        session_id = persisted.get("session_id")
+        if isinstance(run_id, str):
+            recorder = RunRecorder(self._event_sessions().ensure(session_id), run_id=run_id)
+            recorder.terminal("interrupted", message="bridge_restart")
         return {
             "job_status": JOB_INTERRUPTED,
+            "run_id": run_id,
             "message": "研究任務因系統重啟而中斷，請重新執行 /research。",
             "progress": persisted.get("progress") or [],
             "actions": [],
@@ -3307,6 +3459,10 @@ class CommandBridge:
             return {"status": STATUS_OK, "job_status": status,
                     "message": "任務已結束，無需取消。"}
         logger.info("[job] cancel requested job=%s", job_id)
+        job = self._jobs.get(job_id)
+        recorder = getattr(job, "recorder", None) if job is not None else None
+        if recorder is not None:
+            recorder.emit("run.cancel_requested", {})
         return {"status": STATUS_OK, "job_status": JOB_INTERRUPTED,
                 "message": "已要求取消，將於下一個安全點停止。"}
 
@@ -4222,21 +4378,50 @@ class CommandBridge:
         self._session_store = store
         return store
 
+    def _event_sessions(self) -> SessionEventService:
+        if self._event_sessions_inst is None:
+            with self._event_sessions_lock:
+                if self._event_sessions_inst is None:
+                    self._event_sessions_inst = SessionEventService(self.settings, self._sessions)
+        return self._event_sessions_inst
+
     def load_session(self) -> dict:
-        """GET — the latest saved console snapshot, or an empty session. Never
-        raises; a missing/corrupt/expired file falls back to a blank session."""
+        """GET — journal projection with the historical snapshot wire shape."""
         try:
-            return {"status": STATUS_OK, "session": self._sessions().load()}
+            return {"status": STATUS_OK, "session": self._event_sessions().projection()}
         except Exception as exc:  # noqa: BLE001 — must never crash the API
             logger.exception("session memory: load failed")
             return {"status": STATUS_ERROR, "message": f"讀取 session 失敗：{exc}",
                     "session": empty_session()}
 
+    def read_session_events(
+        self, *, session_id: str | None = None, after: int | None = None, limit: int = 500
+    ) -> dict:
+        """Return exact cursor pages from the durable session authority."""
+        try:
+            journal = self._event_sessions().ensure(session_id)
+            page = journal.read(after=after, limit=limit)
+            return {
+                "status": STATUS_OK,
+                "event_version": 1,
+                "session_id": journal.session_id,
+                "events": [event.to_dict() for event in page.events],
+                "server_cursor": page.server_cursor,
+                "has_more": page.has_more,
+            }
+        except CursorExpiredError:
+            return {
+                "status": "cursor_expired", "event_version": 1,
+                "session_id": session_id or "web-default", "projection": self._event_sessions().projection(session_id),
+            }
+        except (TypeError, ValueError) as exc:
+            return {"status": STATUS_ERROR, "message": f"無效的 cursor：{exc}"}
+
     def save_session(self, snapshot: object) -> dict:
-        """POST — replace the saved snapshot. A failed write returns a
-        structured error (the frontend keeps its in-memory conversation)."""
+        """POST — preserve legacy compatibility without overwriting event history."""
         try:
             stored = self._sessions().save(snapshot)
+            self._event_sessions().save_compat_snapshot(snapshot)
         except SessionWriteError as exc:
             return {"status": STATUS_ERROR, "message": f"儲存 session 失敗：{exc}"}
         except Exception as exc:  # noqa: BLE001
@@ -4245,8 +4430,9 @@ class CommandBridge:
         return {"status": STATUS_OK, "updated_at": stored.get("updated_at")}
 
     def clear_session(self) -> dict:
-        """DELETE — drop the saved snapshot (idempotent)."""
+        """DELETE — clear projection through an event, then remove fallback state."""
         try:
+            self._event_sessions().clear()
             self._sessions().clear()
         except Exception as exc:  # noqa: BLE001
             logger.exception("session memory: clear failed")

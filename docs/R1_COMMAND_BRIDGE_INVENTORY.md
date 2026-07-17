@@ -19,6 +19,8 @@ Line numbers drift; symbol names are the stable reference.
 | `command_bridge_server.py` (610 ln) | HTTP routing only (stdlib server), envelope versioning |
 | `job_store.py` | persisted job payloads (see §6) |
 | `session_memory.py` | session snapshot persistence |
+| `session_events.py` / `session_event_journal.py` / `session_projection.py` | versioned, bounded replay history and deterministic projection (#84) |
+| `session_event_service.py` / `run_recorder.py` | journal authority, legacy import, and per-run lifecycle emission (#84) |
 | `goal_loop.py` / `task_workspace.py` / `task_loop.py` | goal orchestration, workflow runner, bounded loop |
 | `continuation_policy.py` | tool outcome classification, `operation_key` dedup identity |
 | `goal_planner.py` | trusted plan generation/validation |
@@ -50,6 +52,7 @@ Frontend = `aka_no_claw_web/frontend/src/api/commandClient.ts` (sole web consume
 | `run_bluetooth_command` / `run_bluetooth_action` | `POST /api/command/bluetooth` | yes | BT surface |
 | `run_ir_command` / `run_ir_action` | `POST /api/command/ir` | yes | IR surface |
 | `load_session` / `save_session` / `clear_session` | `GET/POST/DELETE /api/command/session` | yes | session snapshot |
+| `read_session_events` | `GET /api/command/events` | new | exact cursor replay; optional NDJSON v1 negotiation |
 | `load_chat_settings` / `save_chat_settings` | `GET/POST /api/command/chat-settings` | yes | backend/model prefs |
 | `model_routes()` | `GET /api/command/model-routes` | yes | route→model listing |
 | `restart_all()` | `POST /api/command/restartall` | yes | `service_restart.trigger_restart_all` |
@@ -117,6 +120,7 @@ in `_ensure_registries` for why `_workflow_lock` must never nest inside
 | --- | --- |
 | `JobStore` | `{job_id, status: running/done/error/interrupted, progress[], message, actions[], error, created_at, updated_at}` |
 | `SessionMemoryStore` | web session snapshot (history, view state) |
+| `SessionEventJournal` | append-only session/run JSONL events, metadata cursor, quarantine tails, bounded complete-run retention |
 | `WorkflowStore` | workflows + run traces (`task_workspace.py` schema) |
 | `HomeScheduleStore` | scheduled home-control commands |
 
@@ -131,6 +135,11 @@ in `_ensure_registries` for why `_workflow_lock` must never nest inside
    `start`, `delta`, `heartbeat`, `done`, `error`, `redirect`, `process`,
    `job`. Ordering contract: `start` first; `job` precedes goal-loop progress;
    terminal event is exactly one of `done`/`error`/`redirect`.
+   Clients that send `X-OpenClaw-Event-Version: 1` additionally receive
+   `session_event` envelopes containing the identical durable journal records.
+4. **Cursor replay** — `GET /api/command/events?session_id=web-default&after=N`;
+   returns an exact page, a server-issued cursor, or typed `cursor_expired`
+   with a projection bootstrap.
 
 ## 8. Test coverage and known gaps
 

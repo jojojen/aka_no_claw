@@ -987,6 +987,19 @@ DEPRECATED_CODEGEN_SEED: tuple[tuple[str, str], ...] = (
 
 CODEGEN_SEED: tuple[dict, ...] = (
     {
+        "category": "concurrency",
+        "title": "終態狀態必須在所有可恢復副作用落盤後才對讀者可見",
+        "technique": (
+            "背景工作要把狀態從 running 切到 completed/failed/cancelled 時，不能先更新可被 "
+            "poll/read 看到的記憶體旗標、再慢慢寫入結果檔或事件日誌；讀者會觀察到『已完成但 "
+            "沒有結果』的短暫矛盾。用一個鎖保護終態 compare-and-set：先判定取消/完成的勝者，"
+            "先持久化 recovery snapshot 與可重播結果，再發布終態旗標。測試要刻意在每個邊界讀取，"
+            "斷言任何終態回應都已帶齊其恢復資料。"
+        ),
+        "keywords": ["*", "concurrency", "terminal", "atomic", "durable", "event", "poll", "race"],
+        "confidence": 0.95,
+    },
+    {
         "category": "performance",
         "title": "不要在正式請求熱路徑前重複執行同等成本的生成式健康探測",
         "technique": (

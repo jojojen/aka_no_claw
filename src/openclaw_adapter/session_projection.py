@@ -70,6 +70,15 @@ def _apply(projection: SessionProjection, event: SessionRunEvent) -> None:
         if isinstance(preferences, dict):
             projection.display_preferences = preferences
         return
+    if event.type == "context.checkpoint":
+        if event.payload.get("clear") is True:
+            projection.messages.clear()
+            projection.runs.clear()
+            projection.progress.clear()
+        preferences = event.payload.get("display_preferences")
+        if isinstance(preferences, dict):
+            projection.display_preferences = preferences
+        return
     if event.type in {"user.message", "assistant.message"}:
         text = event.payload.get("text")
         if isinstance(text, str):

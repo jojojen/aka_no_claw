@@ -223,13 +223,13 @@ def test_bridge_save_non_object_is_error(tmp_path):
     assert res["status"] == "error"
 
 
-def test_bridge_load_corrupt_is_soft(tmp_path):
+def test_bridge_load_corrupt_rebuilds_from_event_journal(tmp_path):
     b = _bridge(tmp_path)
     b.save_session({"messages": [{"id": "1", "role": "user", "text": "hi"}]})
     b._sessions()._path.write_text("garbage{", encoding="utf-8")
     res = b.load_session()
     assert res["status"] == "ok"
-    assert res["session"]["messages"] == []
+    assert res["session"]["messages"][0]["text"] == "hi"
 
 
 # --- HTTP routes -----------------------------------------------------------
