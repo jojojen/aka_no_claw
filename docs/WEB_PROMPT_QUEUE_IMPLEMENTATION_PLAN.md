@@ -368,6 +368,18 @@ Implementation and supported-restart live proof are complete.
 - [x] Q5.2 implement bounded interjection.
 - [x] Q5.3 run live queue/interjection proof.
 
+### 2026-07-17 recovery hardening
+
+- A recovered prompt now consults the durable `run.accepted.source_prompt_id`
+  history before execution. A latest successful attempt closes the queue item
+  without replay; an accepted failed/orphan attempt becomes `interrupted`.
+- `interrupted` work requires an explicit retry, which receives a fresh prompt
+  ID, or explicit cancellation. Polling cannot turn recovery into an automatic
+  retry loop.
+- The Web strip treats `draining` as read-only, exposes retry/cancel only for
+  `interrupted`, polls active entries, and reloads the authoritative session
+  after completion so stale queue cards disappear without a page reload.
+
 ## 16. Rollback
 
 - `OPENCLAW_WEB_PROMPT_QUEUE_ENABLED=0` disables the queue contract without

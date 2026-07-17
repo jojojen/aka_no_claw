@@ -200,13 +200,31 @@ def test_bridge_clear_failure_returns_error(tmp_path):
 
 # --- bridge wiring ---------------------------------------------------------
 def _bridge(tmp_path):
-    settings = SimpleNamespace(openclaw_web_memory_dir=str(tmp_path / "mem"))
+    settings = SimpleNamespace(
+        openclaw_web_memory_dir=str(tmp_path / "mem"),
+        openclaw_web_event_dir=str(tmp_path / "events"),
+    )
     return CommandBridge(settings=settings)
 
 
 def test_bridge_save_load_clear(tmp_path):
     b = _bridge(tmp_path)
     assert b.load_session()["session"]["messages"] == []
+
+
+def test_bridge_clear_targets_selected_session_and_resets_context_usage(tmp_path):
+    b = _bridge(tmp_path)
+    journal = b._event_sessions().ensure("browser-1")
+    journal.append("run.accepted", run_id="run-1", payload={})
+    journal.append("user.message", run_id="run-1", payload={"text": "forget me"})
+    assert b.context_status("browser-1")["estimated_tokens"] > 0
+
+    result = b.clear_session("browser-1")
+
+    assert result == {"status": "ok", "session_id": "browser-1"}
+    journal.append("assistant.message", run_id="run-1", payload={"text": "late answer"})
+    assert b.load_session("browser-1")["session"]["messages"] == []
+    assert b.context_status("browser-1")["estimated_tokens"] == 0
     save = b.save_session({"messages": [{"id": "1", "role": "user", "text": "hi"}], "mode": "chat"})
     assert save["status"] == "ok"
     loaded = b.load_session()
@@ -240,12 +258,14 @@ class _FakeBridge:
     def load_session(self):
         return {"status": "ok", "session": {"messages": [{"id": "1"}]}}
 
-    def save_session(self, snapshot):
+    def save_session(self, snapshot, session_id=None):
         self.saved = snapshot
+        self.saved_session_id = session_id
         return {"status": "ok", "updated_at": 123.0}
 
-    def clear_session(self):
+    def clear_session(self, session_id=None):
         self.cleared = True
+        self.cleared_session_id = session_id
         return {"status": "ok"}
 
 
@@ -286,6 +306,15 @@ def test_route_post_session(tmp_path):
     assert fake.saved["messages"] == [{"id": "9"}]
 
 
+def test_route_post_session_relays_selected_session_id(tmp_path):
+    fake = _FakeBridge()
+    body = json.dumps({"messages": [], "mode": "chat"}).encode("utf-8")
+    h = _make_handler(fake, "POST", "/api/command/session?session_id=browser-1", body)
+    h.do_POST()
+
+    assert fake.saved_session_id == "browser-1"
+
+
 def test_route_delete_session(tmp_path):
     fake = _FakeBridge()
     h = _make_handler(fake, "DELETE", "/api/command/session")
@@ -293,3 +322,11 @@ def test_route_delete_session(tmp_path):
     out = _read_json(h)
     assert out["status"] == "ok"
     assert fake.cleared is True
+
+
+def test_route_delete_session_relays_selected_session_id(tmp_path):
+    fake = _FakeBridge()
+    h = _make_handler(fake, "DELETE", "/api/command/session?session_id=browser-1")
+    h.do_DELETE()
+
+    assert fake.cleared_session_id == "browser-1"

@@ -153,11 +153,30 @@ class ContextCompactor:
         return self._store.clear(session_id)
 
     def build(self, session_id: str, events: list[SessionRunEvent]) -> ContextCheckpoint | None:
-        messages = [event for event in events if event.type in {"user.message", "assistant.message"} and event.visibility == "user"]
+        clear_seq = max(
+            (
+                event.seq for event in events
+                if event.type == "context.checkpoint" and event.payload.get("clear") is True
+            ),
+            default=0,
+        )
+        cleared_run_ids = {
+            event.run_id for event in events
+            if event.seq <= clear_seq and event.type in {"run.accepted", "run.started"}
+        }
+        messages = [
+            event for event in events
+            if event.seq > clear_seq
+            and event.run_id not in cleared_run_ids
+            and event.type in {"user.message", "assistant.message"}
+            and event.visibility == "user"
+        ]
         eligible = messages[:-self._recent_turns]
         if not eligible:
             return None
         previous = self._store.latest(session_id)
+        if previous is not None and previous.source_seq_end <= clear_seq:
+            previous = None
         start = eligible[0].seq
         if previous is not None:
             eligible = [event for event in eligible if event.seq > previous.source_seq_end]

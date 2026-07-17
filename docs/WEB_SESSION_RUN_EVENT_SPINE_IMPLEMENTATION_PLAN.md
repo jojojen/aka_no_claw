@@ -386,6 +386,11 @@ stream framing until characterization tests pin both paths.
 Poll responses remain available, but their state is derived consistently from
 the same terminal transition rules used by event projection.
 
+Chat-planned `/research` uses the same durable job path as the Investment tab.
+The journal records `job.attached` on both the visible parent turn and the
+background run, so a reconnect projects the actual pollable `job_id` rather
+than mistaking a `run_id` for a job identifier.
+
 ### 9.4 Session snapshot
 
 `GET/POST/DELETE /api/command/session` remain compatible for the current Web.
@@ -395,6 +400,14 @@ During migration:
 - POST may update display preferences and import legacy message state once;
 - DELETE clears the selected session through a journal-aware operation;
 - arbitrary client snapshots must not overwrite authoritative run history.
+
+The current Web `清除記憶` action sends its browser `session_id`. The bridge
+installs a clear boundary in that journal and removes the same session's
+context checkpoint and prompt queue. Context usage and future compaction ignore
+all messages before the boundary, so cleared history cannot re-enter model
+context through a derived summary. Runs accepted before that boundary stay
+invalidated if a cooperative worker emits late progress, terminal output, or
+an answer after the clear.
 
 ## 10. Runtime Instrumentation Boundaries
 

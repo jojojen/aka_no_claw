@@ -156,6 +156,9 @@ single-session durable path: `POST /api/command/queue` records an atomic JSON
 snapshot and appends `queue.changed`; one drain owner claims FIFO position only
 after a terminal run. A claim carries its prompt ID into `run.accepted`, and
 goal-loop interjections are consumed only at declared safe boundaries.
+On restart, the latest accepted attempt is resolved against this journal before
+any replay: successful work is closed, while failed/orphan work becomes a
+visible `interrupted` item that needs an explicit fresh-ID retry or cancellation.
 
 The journal is authoritative; mutable session and job snapshots are compatibility
 views. Negotiated NDJSON live delivery starts at the atomic `latest_cursor`,

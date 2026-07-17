@@ -78,12 +78,12 @@ DEFAULT_SOURCE = "aka_no_claw_web"
 # able to inject a `system` instruction into the prompt, so system turns are
 # rejected (a trusted backend summary would be added server-side, not here).
 CHAT_ROLES = {"user", "assistant"}
-MAX_HISTORY_TURNS = 12
-MAX_HISTORY_CONTENT_LEN = 4000
+MAX_HISTORY_TURNS = 20
+MAX_HISTORY_CONTENT_LEN = 6000
 # Cumulative character budget across the kept turns (not just per-turn): the
 # window is "recent", so keep the newest turns until either the turn count or
 # this total budget is hit — otherwise 12 * 4000 chars could bloat the prompt.
-MAX_HISTORY_TOTAL_CHARS = 4000
+MAX_HISTORY_TOTAL_CHARS = 16000
 
 
 class RequestValidationError(ValueError):
@@ -707,7 +707,8 @@ def _seed_variable_name_for_tool(tool: str) -> str:
 _CHAT_SYSTEM_PROMPT = (
     "你是 aka_no_claw 的本機聊天助理。下面是這段對話最近的內容，"
     "請延續上下文回答使用者最新的訊息（例如代名詞「她／它／這個」指的是先前提到的主題），"
-    "並以繁體中文自然作答。"
+    "並以繁體中文自然作答。對話中較早的助理回答只是先前說法，不是權威事實；"
+    "若使用者後來補充或更正限制，必須以較新的使用者訊息為準。"
 )
 _CHAT_ROLE_LABELS = {"user": "使用者", "assistant": "助理", "system": "系統"}
 
@@ -739,7 +740,12 @@ def _tool_calling_notice(tool: str, name: str) -> str:
     return f"🔧 正在調用「{name}（{tool}）」工具中…"
 
 
-def build_chat_prompt(user_input: str, history: tuple[ChatTurn, ...] = ()) -> str:
+def build_chat_prompt(
+    user_input: str,
+    history: tuple[ChatTurn, ...] = (),
+    *,
+    trusted_context: str = "",
+) -> str:
     """Assemble the chat prompt from recent history + the current input.
 
     With no history this is just the bare input (back-compat with the old
@@ -748,9 +754,13 @@ def build_chat_prompt(user_input: str, history: tuple[ChatTurn, ...] = ()) -> st
     and cloud-pickle backends. Server-side trimming/sanitization already happened
     in parse_request; this only formats."""
     user_input = (user_input or "").strip()
-    if not history:
+    trusted_context = (trusted_context or "").strip()
+    if not history and not trusted_context:
         return user_input
-    lines = [_CHAT_SYSTEM_PROMPT, "", "對話紀錄："]
+    lines = [_CHAT_SYSTEM_PROMPT]
+    if trusted_context:
+        lines += ["", "伺服器保存的較早對話脈絡：", trusted_context]
+    lines += ["", "對話紀錄："]
     for turn in history:
         label = _CHAT_ROLE_LABELS.get(turn.role, turn.role)
         lines.append(f"{label}：{turn.content}")

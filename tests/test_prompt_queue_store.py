@@ -86,3 +86,22 @@ def test_release_returns_a_failed_start_to_the_visible_queue(tmp_path):
     released = store.release("s1", entry.prompt_id)
     assert released["running_prompt_id"] is None
     assert [(item["text"], item["status"]) for item in released["entries"]] == [("retry me", "queued")]
+
+
+def test_interrupted_prompt_retries_with_a_fresh_identity(tmp_path):
+    store = PromptQueueStore(tmp_path)
+    entry, _ = store.create("s1", intent="next_turn", request=_request("retry me"))
+    claimed, _ = store.claim_next("s1")
+    assert claimed is not None
+    interrupted = store.interrupt("s1", entry.prompt_id, run_id="old-run")
+    held = interrupted["entries"][0]
+    assert held["status"] == "interrupted"
+    assert held["started_run_id"] == "old-run"
+
+    retried, snapshot = store.retry(
+        "s1", entry.prompt_id, expected_version=held["version"]
+    )
+    assert retried.prompt_id != entry.prompt_id
+    assert retried.status == "queued"
+    assert retried.started_run_id is None
+    assert snapshot["entries"][0]["prompt_id"] == retried.prompt_id

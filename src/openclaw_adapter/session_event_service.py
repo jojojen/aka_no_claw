@@ -73,16 +73,65 @@ class SessionEventService:
         projection = project_session(self.ensure(session_id).events())
         payload = projection.to_dict()
         preferences = payload.pop("display_preferences")
+        runs = payload["runs"]
+        job_modes: dict[str, str] = {}
+        for run in runs.values():
+            if not isinstance(run, dict) or not isinstance(run.get("job_id"), str):
+                continue
+            run_mode = run.get("mode")
+            if not isinstance(run_mode, str) and run.get("route") in {"stream_chat", "command_bridge"}:
+                run_mode = "chat"
+            if isinstance(run_mode, str):
+                job_modes[run["job_id"]] = run_mode
+        messages = []
+        job_message_indexes: dict[str, int] = {}
+        for message in payload.pop("messages"):
+            item = {
+                "id": message["event_id"], "role": message["role"], "text": message["text"],
+            }
+            run = runs.get(message["run_id"], {})
+            mode = message.get("mode")
+            if not isinstance(mode, str) and isinstance(run, dict):
+                mode = run.get("mode")
+            # Older journals predate the explicit mode field.  Their completed
+            # planner route still lets us recover Chat membership after a
+            # reload instead of silently dropping those turns from context.
+            if not isinstance(mode, str) and isinstance(run, dict):
+                if run.get("route") in {"stream_chat", "command_bridge"}:
+                    mode = "chat"
+            if not isinstance(mode, str) and isinstance(run, dict):
+                job_id_for_mode = run.get("job_id")
+                if isinstance(job_id_for_mode, str):
+                    mode = job_modes.get(job_id_for_mode)
+            if isinstance(mode, str):
+                item["mode"] = mode
+                if mode == "chat":
+                    item["modeLabel"] = "Chat"
+            job_id = run.get("job_id") if isinstance(run, dict) else None
+            if message["role"] == "assistant" and isinstance(job_id, str):
+                item["jobId"] = job_id
+                previous = job_message_indexes.get(job_id)
+                if previous is not None:
+                    messages[previous] = item
+                    continue
+                job_message_indexes[job_id] = len(messages)
+            messages.append(item)
+        active_job_id = next(
+            (
+                runs[run_id].get("job_id")
+                for run_id in payload["active_run_ids"]
+                if isinstance(runs.get(run_id), dict)
+                and isinstance(runs[run_id].get("job_id"), str)
+            ),
+            None,
+        )
         return {
             "schema_version": 1,
-            "messages": [
-                {"id": message["event_id"], "role": message["role"], "text": message["text"]}
-                for message in payload.pop("messages")
-            ],
+            "messages": messages,
             "mode": preferences.get("mode"),
             "chat_backend": preferences.get("chat_backend"),
             "investment_submode": preferences.get("investment_submode"),
-            "active_job_id": payload["active_run_ids"][0] if payload["active_run_ids"] else None,
+            "active_job_id": active_job_id,
             "queue": payload["prompt_queue"],
             "event_projection": payload,
         }

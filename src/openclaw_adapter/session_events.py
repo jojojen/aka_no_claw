@@ -16,6 +16,7 @@ MAX_STRING_BYTES = 16 * 1024
 EVENT_TYPES = frozenset({
     "session.created", "user.message", "run.accepted", "run.started",
     "planner.completed", "tool.started", "tool.progress", "tool.completed",
+    "job.attached",
     "judge.completed", "assistant.delta", "assistant.message", "run.completed",
     "run.failed", "run.cancel_requested", "run.cancelled", "run.interrupted",
     "approval.requested", "approval.resolved", "context.checkpoint", "queue.changed",

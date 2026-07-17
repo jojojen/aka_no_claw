@@ -987,6 +987,52 @@ DEPRECATED_CODEGEN_SEED: tuple[tuple[str, str], ...] = (
 
 CODEGEN_SEED: tuple[dict, ...] = (
     {
+        "category": "validation",
+        "title": "高風險數字建議要通過證據與硬限制檢查",
+        "technique": (
+            "模型產生投資、醫療、法律或其他高風險數字時，不能把低溫或結構化輸出當作正確性保證。"
+            "輸出前要比對可追溯證據，禁止新增無來源的金額、機率與報酬；再檢查領域硬限制，例如建議買價"
+            "不得低於不可協商的起標價卻仍宣稱可成交。若經濟上限低於市場下限，結論必須收斂為不執行，"
+            "不能用道歉文字包裝矛盾。資料不足時明列缺口並停止估值。測試應包含模型流暢但數字矛盾的反例。"
+        ),
+        "keywords": [
+            "*", "validation", "high stakes", "numeric grounding", "hard constraint",
+            "financial advice", "evidence", "hallucination", "consistency gate",
+        ],
+        "confidence": 0.99,
+    },
+    {
+        "category": "validation",
+        "title": "結構化識別值要先從自然語言中抽取再分類",
+        "technique": (
+            "使用者常把 URL、商品 ID 或其他結構化識別值和問題寫在同一段文字；解析器不能要求整段輸入 "
+            "完全等於該識別值，否則明確商品頁會被誤降級成名稱搜尋。先以有界規則抽取候選 token，逐一做 "
+            "scheme、host、path 與 ID 驗證並 canonicalize，同時分開保留原始自然語言意圖。測試至少覆蓋 "
+            "識別值單獨輸入、前後帶問題、追蹤參數、尾端標點與不支援來源。"
+        ),
+        "keywords": [
+            "*", "validation", "structured identifier", "url extraction", "canonicalization",
+            "natural language", "routing", "parser",
+        ],
+        "confidence": 0.97,
+    },
+    {
+        "category": "concurrency",
+        "title": "持久佇列重啟復原前要先查權威執行紀錄",
+        "technique": (
+            "持久工作必須先落盤 claim，再開始執行；程序重啟看到 orphan claim 時，不能只把它改回 "
+            "queued 就自動重跑，應先用穩定的 source work ID 查權威事件日誌。最新 attempt 已成功終止就 "
+            "收斂為完成；已 accepted 但失敗、中斷或沒有終態時，改成可見的 interrupted 狀態，由操作者明確 "
+            "重試或取消。明確重試要換新的 work ID，前端也要區分 queued、draining、interrupted 並持續對帳，"
+            "避免重複網路、裝置或檔案副作用。"
+        ),
+        "keywords": [
+            "*", "concurrency", "durable queue", "restart", "recovery", "event journal",
+            "source id", "interrupted", "explicit retry", "exactly-once",
+        ],
+        "confidence": 0.98,
+    },
+    {
         "category": "testing",
         "title": "新增可選 API 時，舊 client 與測試 mock 必須能安全降級",
         "technique": (

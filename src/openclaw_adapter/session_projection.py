@@ -25,6 +25,7 @@ class SessionProjection:
     prompt_queue: dict[str, object] = field(default_factory=lambda: {"running_prompt_id": None, "entries": []})
     last_cursor: int = 0
     active_run_ids: list[str] = field(default_factory=list)
+    _cleared_run_ids: set[str] = field(default_factory=set, repr=False)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -67,6 +68,8 @@ def project_session(events: Iterable[SessionRunEvent]) -> SessionProjection:
 
 
 def _apply(projection: SessionProjection, event: SessionRunEvent) -> None:
+    if event.run_id in projection._cleared_run_ids:
+        return
     if event.type == "session.created":
         preferences = event.payload.get("display_preferences")
         if isinstance(preferences, dict):
@@ -74,9 +77,16 @@ def _apply(projection: SessionProjection, event: SessionRunEvent) -> None:
         return
     if event.type == "context.checkpoint":
         if event.payload.get("clear") is True:
+            projection._cleared_run_ids.update(projection.runs)
+            projection._cleared_run_ids.update(
+                str(message["run_id"])
+                for message in projection.messages
+                if isinstance(message.get("run_id"), str)
+            )
             projection.messages.clear()
             projection.runs.clear()
             projection.progress.clear()
+            projection.display_preferences.clear()
             projection.prompt_queue = {"running_prompt_id": None, "entries": []}
         preferences = event.payload.get("display_preferences")
         if isinstance(preferences, dict):
@@ -93,10 +103,15 @@ def _apply(projection: SessionProjection, event: SessionRunEvent) -> None:
     if event.type in {"user.message", "assistant.message"}:
         text = event.payload.get("text")
         if isinstance(text, str):
-            projection.messages.append({
+            message: dict[str, object] = {
                 "event_id": event.event_id, "run_id": event.run_id,
                 "role": "user" if event.type == "user.message" else "assistant", "text": text,
-            })
+                "partial": event.payload.get("partial") is True,
+            }
+            mode = event.payload.get("mode")
+            if isinstance(mode, str):
+                message["mode"] = mode
+            projection.messages.append(message)
         return
     run = projection.runs.setdefault(event.run_id, {"status": "accepted", "last_seq": event.seq})
     if run["status"] in _TERMINAL_STATUS.values() and event.type not in TERMINAL_EVENT_TYPES:
@@ -104,8 +119,19 @@ def _apply(projection: SessionProjection, event: SessionRunEvent) -> None:
     run["last_seq"] = event.seq
     if event.type == "run.accepted":
         run["status"] = "accepted"
+        mode = event.payload.get("mode")
+        if isinstance(mode, str):
+            run["mode"] = mode
     elif event.type == "run.started":
         run["status"] = "running"
+    elif event.type == "planner.completed":
+        route = event.payload.get("route")
+        if isinstance(route, str):
+            run["route"] = route
+    elif event.type == "job.attached":
+        job_id = event.payload.get("job_id")
+        if isinstance(job_id, str):
+            run["job_id"] = job_id
     elif event.type in _TERMINAL_STATUS:
         if run["status"] not in _TERMINAL_STATUS.values():
             run["status"] = _TERMINAL_STATUS[event.type]
@@ -138,10 +164,16 @@ def migrate_legacy_snapshot(snapshot: dict, *, session_id: str = "web-default") 
         text = message.get("text")
         if not isinstance(text, str):
             continue
+        message_payload: dict[str, object] = {"text": text, "evidence": "legacy_snapshot"}
+        mode = message.get("mode")
+        if not isinstance(mode, str) and message.get("modeLabel") == "Chat":
+            mode = "chat"
+        if isinstance(mode, str):
+            message_payload["mode"] = mode
         events.append(SessionRunEvent(
             event_version=1, event_id=uuid5(NAMESPACE_URL, f"{seed}:{index}").hex,
             session_id=session_id, run_id="legacy-import", seq=len(events) + 1,
             occurred_at=occurred_at, type=f"{message['role']}.message", visibility="user",
-            payload={"text": text, "evidence": "legacy_snapshot"},
+            payload=message_payload,
         ))
     return events

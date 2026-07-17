@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from urllib.parse import urlsplit, urlunsplit
 
 from .models import (
@@ -11,30 +12,44 @@ from .models import (
     _MERCARI_SHOPS_PATH_RE,
 )
 
+
+_URL_TOKEN_RE = re.compile(r"https?://[^\s<>\[\]\"']+", re.IGNORECASE)
+_TRAILING_URL_PUNCTUATION = ".,，。！？!?;；:：)]}）】"
+
+
+def _url_candidates(text: str) -> tuple[str, ...]:
+    candidates = [text]
+    candidates.extend(
+        match.group(0).rstrip(_TRAILING_URL_PUNCTUATION)
+        for match in _URL_TOKEN_RE.finditer(text)
+    )
+    return tuple(dict.fromkeys(candidate for candidate in candidates if candidate))
+
 def parse_research_target(raw_input: str) -> ResearchTarget:
     cleaned = " ".join((raw_input or "").split()).strip()
     if not cleaned:
         raise ValueError("請提供商品名稱或 Mercari 商品網址。")
-    mercari = normalize_mercari_item_url(cleaned)
-    if mercari is not None:
-        item_id = _extract_mercari_item_id(mercari)
-        return ResearchTarget(
-            mode="mercari_url",
-            raw_input=cleaned,
-            display_text=mercari,
-            canonical_url=mercari,
-            item_id=item_id,
-        )
-    shops = normalize_mercari_shops_url(cleaned)
-    if shops is not None:
-        canonical_url, token = shops
-        return ResearchTarget(
-            mode="mercari_url",
-            raw_input=cleaned,
-            display_text=canonical_url,
-            canonical_url=canonical_url,
-            item_id=token,
-        )
+    for candidate in _url_candidates(cleaned):
+        mercari = normalize_mercari_item_url(candidate)
+        if mercari is not None:
+            item_id = _extract_mercari_item_id(mercari)
+            return ResearchTarget(
+                mode="mercari_url",
+                raw_input=cleaned,
+                display_text=mercari,
+                canonical_url=mercari,
+                item_id=item_id,
+            )
+        shops = normalize_mercari_shops_url(candidate)
+        if shops is not None:
+            canonical_url, token = shops
+            return ResearchTarget(
+                mode="mercari_url",
+                raw_input=cleaned,
+                display_text=canonical_url,
+                canonical_url=canonical_url,
+                item_id=token,
+            )
     return ResearchTarget(mode="text_query", raw_input=cleaned, display_text=cleaned)
 
 

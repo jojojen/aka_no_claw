@@ -36,6 +36,42 @@ def test_codegen_seed_for_restart_health_checks_is_always_retrievable(db):
     assert "port" in rule.technique
 
 
+def test_codegen_seed_for_durable_queue_restart_is_always_retrievable(db):
+    db.seed_codegen_knowledge()
+
+    rows = db.retrieve_codegen_knowledge("任意程式需求", k=100)
+    rule = next(row for row in rows if row.title == "持久佇列重啟復原前要先查權威執行紀錄")
+
+    assert rule.category == "concurrency"
+    assert "*" in rule.keywords
+    assert "source work ID" in rule.technique
+    assert "interrupted" in rule.technique
+
+
+def test_codegen_seed_for_embedded_structured_identifiers_is_always_retrievable(db):
+    db.seed_codegen_knowledge()
+
+    rows = db.retrieve_codegen_knowledge("任意程式需求", k=100)
+    rule = next(row for row in rows if row.title == "結構化識別值要先從自然語言中抽取再分類")
+
+    assert rule.category == "validation"
+    assert "*" in rule.keywords
+    assert "canonicalize" in rule.technique
+    assert "原始自然語言意圖" in rule.technique
+
+
+def test_codegen_seed_for_high_stakes_numeric_grounding_is_always_retrievable(db):
+    db.seed_codegen_knowledge()
+
+    rows = db.retrieve_codegen_knowledge("任意程式需求", k=100)
+    rule = next(row for row in rows if row.title == "高風險數字建議要通過證據與硬限制檢查")
+
+    assert rule.category == "validation"
+    assert "*" in rule.keywords
+    assert "硬限制" in rule.technique
+    assert "不執行" in rule.technique
+
+
 def test_codegen_seed_for_incremental_results_is_always_retrievable(db):
     db.seed_codegen_knowledge()
 

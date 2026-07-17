@@ -85,6 +85,27 @@ def test_normalize_mercari_item_url_strips_tracking_query() -> None:
     ) == "https://jp.mercari.com/item/m65806654179"
 
 
+def test_parse_research_target_extracts_item_url_from_a_question() -> None:
+    target = parse_research_target(
+        "應該花多少錢送 ARS 才值得投資？ "
+        "https://jp.mercari.com/item/m16774551668?afid=123&utm_source=ios"
+    )
+
+    assert target.mode == "mercari_url"
+    assert target.item_id == "m16774551668"
+    assert target.canonical_url == "https://jp.mercari.com/item/m16774551668"
+    assert "ARS" in target.raw_input
+
+
+def test_parse_research_target_extracts_item_url_before_question_text() -> None:
+    target = parse_research_target(
+        "https://jp.mercari.com/item/m16774551668 這個商品值得送鑑定嗎？"
+    )
+
+    assert target.mode == "mercari_url"
+    assert target.display_text == "https://jp.mercari.com/item/m16774551668"
+
+
 def test_normalize_market_title_folds_katakana_vu_row_variants() -> None:
     from openclaw_adapter.research_command import _normalize_market_title
 

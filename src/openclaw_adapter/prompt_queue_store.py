@@ -77,7 +77,10 @@ class PromptQueueStore:
         now = time.time() if now is None else float(now)
         with self._lock:
             state, changed = self._load(session_id, now=now)
-            live = [item for item in state["entries"] if item.status in {"queued", "draining"}]
+            live = [
+                item for item in state["entries"]
+                if item.status in {"queued", "draining", "interrupted"}
+            ]
             if len(live) >= self.max_entries:
                 raise PromptQueueCapacityError(f"queue limit is {self.max_entries}")
             position = max((item.position for item in live), default=-1) + 1
@@ -109,7 +112,9 @@ class PromptQueueStore:
     def cancel(self, session_id: str, prompt_id: str, *, expected_version: int, now: float | None = None) -> dict[str, object]:
         with self._lock:
             state, _changed = self._load(session_id, now=now)
-            index, prompt = self._editable(state, prompt_id, expected_version)
+            index, prompt = self._mutable(
+                state, prompt_id, expected_version, statuses={"queued", "interrupted"}
+            )
             state["entries"][index] = prompt.evolve(
                 status="cancelled", version=prompt.version + 1,
                 updated_at=time.time() if now is None else float(now),
@@ -242,12 +247,72 @@ class PromptQueueStore:
             self._save(session_id, state)
             return self._public(state)
 
+    def interrupt(
+        self, session_id: str, prompt_id: str, *, run_id: str | None = None,
+        now: float | None = None,
+    ) -> dict[str, object]:
+        """Make an abandoned claim visible without automatically replaying it."""
+        with self._lock:
+            state, _changed = self._load(session_id, now=now)
+            at = time.time() if now is None else float(now)
+            found = False
+            entries: list[QueuedPrompt] = []
+            for item in state["entries"]:
+                if item.prompt_id != prompt_id:
+                    entries.append(item)
+                    continue
+                found = True
+                if item.status != "draining":
+                    raise PromptQueueConflict("prompt is not claimed")
+                entries.append(item.evolve(
+                    status="interrupted", version=item.version + 1, updated_at=at,
+                    started_run_id=run_id or item.started_run_id,
+                ))
+            if not found:
+                raise PromptQueueError("queued prompt not found")
+            state["entries"] = entries
+            if state.get("running_prompt_id") == prompt_id:
+                state["running_prompt_id"] = None
+            self._save(session_id, state)
+            return self._public(state)
+
+    def retry(
+        self, session_id: str, prompt_id: str, *, expected_version: int,
+        now: float | None = None,
+    ) -> tuple[QueuedPrompt, dict[str, object]]:
+        """Create a fresh identity for an explicitly retried interrupted prompt."""
+        with self._lock:
+            state, _changed = self._load(session_id, now=now)
+            index, prompt = self._mutable(
+                state, prompt_id, expected_version, statuses={"interrupted"}
+            )
+            at = time.time() if now is None else float(now)
+            retried = prompt.evolve(
+                prompt_id=uuid4().hex,
+                status="queued",
+                version=1,
+                created_at=at,
+                updated_at=at,
+                expires_at=at + self.ttl_seconds,
+                started_run_id=None,
+            )
+            state["entries"][index] = retried
+            self._save(session_id, state)
+            return retried, self._public(state)
+
     def _editable(self, state: dict[str, Any], prompt_id: str, expected_version: int) -> tuple[int, QueuedPrompt]:
+        return self._mutable(state, prompt_id, expected_version, statuses={"queued"})
+
+    @staticmethod
+    def _mutable(
+        state: dict[str, Any], prompt_id: str, expected_version: int, *, statuses: set[str]
+    ) -> tuple[int, QueuedPrompt]:
         for index, prompt in enumerate(state["entries"]):
             if prompt.prompt_id != prompt_id:
                 continue
-            if prompt.status != "queued":
-                raise PromptQueueConflict("only queued prompts may be changed")
+            if prompt.status not in statuses:
+                allowed = " or ".join(sorted(statuses))
+                raise PromptQueueConflict(f"only {allowed} prompts may be changed")
             if prompt.version != int(expected_version):
                 raise PromptQueueConflict("queue changed; reload before editing")
             return index, prompt
@@ -292,7 +357,7 @@ class PromptQueueStore:
         changed = False
         entries = []
         for item in state["entries"]:
-            if item.status == "queued" and item.expires_at <= now:
+            if item.status in {"queued", "interrupted"} and item.expires_at <= now:
                 entries.append(item.evolve(status="expired", version=item.version + 1, updated_at=now))
                 changed = True
             else:
@@ -322,7 +387,10 @@ class PromptQueueStore:
     @staticmethod
     def _public(state: dict[str, Any]) -> dict[str, object]:
         entries = sorted(
-            (item for item in state["entries"] if item.status in {"queued", "draining"}),
+            (
+                item for item in state["entries"]
+                if item.status in {"queued", "draining", "interrupted"}
+            ),
             key=lambda item: (item.position, item.prompt_id),
         )
         return {

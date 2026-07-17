@@ -7,7 +7,9 @@ from typing import Any, Literal
 
 
 PromptIntent = Literal["next_turn", "interjection"]
-PromptStatus = Literal["queued", "draining", "started", "completed", "cancelled", "expired"]
+PromptStatus = Literal[
+    "queued", "draining", "interrupted", "started", "completed", "cancelled", "expired"
+]
 
 
 class PromptQueueError(RuntimeError):
@@ -67,7 +69,9 @@ class QueuedPrompt:
         status = str(value.get("status") or "queued")
         if intent not in {"next_turn", "interjection"}:
             raise PromptQueueError("invalid queued prompt intent")
-        if status not in {"queued", "draining", "started", "completed", "cancelled", "expired"}:
+        if status not in {
+            "queued", "draining", "interrupted", "started", "completed", "cancelled", "expired"
+        }:
             raise PromptQueueError("invalid queued prompt status")
         request = value.get("request")
         if not isinstance(request, dict):

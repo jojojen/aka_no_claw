@@ -79,7 +79,8 @@ _CHAT_TOOL_PLAN_PROMPT_TEMPLATE = (
     '- 問「建立工作流：查東京天氣，用女僕口吻以日文報告」→ '
     '{{"tool":"__create_workflow__","query":"查東京天氣，用女僕口吻以日文報告","reason_summary":"要求建立可重複使用的工作流程"}}\n'
     "當 tool=__no_tool__ 時，answer 必須是給使用者看的最終答案，"
-    "用繁體中文自然回答。\n"
+    "用繁體中文自然回答。對話紀錄按時間由舊到新排列；較早的助理回答只是先前說法，"
+    "不是權威事實。使用者後來補充、更正或否定的內容優先，不能繼續沿用已被更正的前提。\n"
     "當使用者是明確要求「建立/新增/設定一個工作流程」這件事本身（例如訊息以"
     "「建立工作流：」、「幫我建立一個工作流」開頭），要用 __create_workflow__，"
     "不要用 __goal__——工作流是要保存起來、之後可以重複執行的流程定義，"
@@ -115,6 +116,8 @@ class PlannerDeps(Protocol):
     def _conversation_key(self, req: WebCommandRequest) -> str: ...
 
     def _chat_tool_ledger_entries(self, req: WebCommandRequest) -> list[dict]: ...
+
+    def _trusted_context_checkpoint(self, req: WebCommandRequest) -> str: ...
 
     def _local_judgment_model(self) -> str: ...
 
@@ -193,7 +196,12 @@ class ChatToolPlanner:
     def build_plan_prompt(
         self, req: WebCommandRequest, observation: str | None = None
     ) -> str:
-        lines = [self._deps._chat_tool_plan_system_prompt(), "", "對話紀錄："]
+        lines = [self._deps._chat_tool_plan_system_prompt()]
+        checkpoint_reader = getattr(self._deps, "_trusted_context_checkpoint", None)
+        trusted_context = checkpoint_reader(req) if callable(checkpoint_reader) else ""
+        if trusted_context:
+            lines += ["", "伺服器保存的較早對話脈絡：", trusted_context]
+        lines += ["", "對話紀錄（由舊到新）："]
         for turn in req.history:
             label = _CHAT_ROLE_LABELS.get(turn.role, turn.role)
             lines.append(f"{label}：{turn.content}")

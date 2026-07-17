@@ -27,15 +27,33 @@ def test_projection_is_deterministic_and_terminal_state_cannot_regress():
     assert projection.to_dict() == project_session(events).to_dict()
 
 
+def test_projection_preserves_message_mode_and_legacy_chat_route():
+    projection = project_session([
+        _event(1, "user.message", {"text": "new", "mode": "chat"}, run_id="new"),
+        _event(2, "run.accepted", {"mode": "chat"}, run_id="new"),
+        _event(3, "user.message", {"text": "legacy"}, run_id="old"),
+        _event(4, "run.accepted", run_id="old"),
+        _event(5, "planner.completed", {"route": "stream_chat"}, run_id="old"),
+    ])
+
+    assert projection.messages[0]["mode"] == "chat"
+    assert projection.runs["new"]["mode"] == "chat"
+    assert projection.runs["old"]["route"] == "stream_chat"
+
+
 def test_legacy_snapshot_migration_is_stable_and_projects_visible_messages():
     legacy = {
         "updated_at": 123.0, "mode": "chat", "chat_backend": "local",
-        "messages": [{"role": "user", "text": "hello"}, {"role": "assistant", "text": "world"}],
+        "messages": [
+            {"role": "user", "text": "hello", "modeLabel": "Chat"},
+            {"role": "assistant", "text": "world", "mode": "chat"},
+        ],
     }
     events = migrate_legacy_snapshot(legacy)
     projection = project_session(events)
     assert events == migrate_legacy_snapshot(legacy)
     assert [message["text"] for message in projection.messages] == ["hello", "world"]
+    assert [message["mode"] for message in projection.messages] == ["chat", "chat"]
     assert projection.display_preferences == {"mode": "chat", "chat_backend": "local"}
 
 
@@ -48,3 +66,23 @@ def test_queue_snapshot_projects_without_creating_an_active_run():
     ])
     assert projection.to_dict()["prompt_queue"]["running_prompt_id"] == "p1"
     assert projection.active_run_ids == []
+
+
+def test_session_clear_resets_messages_runs_queue_and_preferences():
+    projection = project_session([
+        _event(1, "session.created", {"display_preferences": {"mode": "chat"}}),
+        _event(2, "user.message", {"text": "old"}),
+        _event(3, "run.accepted"),
+        _event(4, "queue.changed", {
+            "running_prompt_id": None,
+            "entries": [{"prompt_id": "p1", "text": "later"}],
+        }, run_id="queue"),
+        _event(5, "context.checkpoint", {"clear": True}, run_id="session"),
+        _event(6, "tool.progress", {"stage": "research", "label": "late"}),
+        _event(7, "assistant.message", {"text": "late answer"}),
+    ])
+
+    assert projection.messages == []
+    assert projection.runs == {}
+    assert projection.prompt_queue == {"running_prompt_id": None, "entries": []}
+    assert projection.display_preferences == {}

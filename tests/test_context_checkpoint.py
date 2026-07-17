@@ -6,9 +6,9 @@ from openclaw_adapter.command_bridge import CommandBridge
 from openclaw_adapter.session_events import SessionRunEvent
 
 
-def _event(seq: int, kind: str, text: str) -> SessionRunEvent:
+def _event(seq: int, kind: str, text: str, *, run_id: str = "r1") -> SessionRunEvent:
     return SessionRunEvent(
-        event_version=1, event_id=f"event-{seq}", session_id="s1", run_id="r1", seq=seq,
+        event_version=1, event_id=f"event-{seq}", session_id="s1", run_id=run_id, seq=seq,
         occurred_at=float(seq), type=kind, visibility="user", payload={"text": text},
     )
 
@@ -49,6 +49,25 @@ def test_clear_removes_only_checkpoint_store(tmp_path) -> None:
     assert removed is not None
     assert compactor.latest("s1") is None
     assert len(events) == 4
+
+
+def test_compaction_never_reimports_messages_before_session_clear(tmp_path) -> None:
+    compactor = ContextCompactor(ContextCheckpointStore(str(tmp_path)), recent_turns=2)
+    events = [
+        _event(1, "run.accepted", ""),
+        _event(2, "user.message", "must be forgotten"),
+        _event(3, "assistant.message", "old answer"),
+        SessionRunEvent(
+            event_version=1, event_id="event-4", session_id="s1", run_id="session",
+            seq=4, occurred_at=4.0, type="context.checkpoint", visibility="internal",
+            payload={"clear": True},
+        ),
+        _event(5, "assistant.message", "late old answer"),
+        _event(6, "user.message", "new question", run_id="run-new"),
+        _event(7, "assistant.message", "new answer", run_id="run-new"),
+    ]
+
+    assert compactor.build("s1", events) is None
 
 
 def test_chained_checkpoint_keeps_previous_summary_and_extends_range(tmp_path) -> None:

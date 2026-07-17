@@ -235,6 +235,62 @@ def test_build_chat_prompt_with_history_includes_turns():
     assert "她還有哪些經典歌曲" in prompt
 
 
+def test_build_chat_prompt_includes_trusted_older_context():
+    prompt = build_chat_prompt(
+        "現在呢",
+        (ChatTurn(role="assistant", content="最近一則回答"),),
+        trusted_context="較早的使用者限制",
+    )
+    assert "伺服器保存的較早對話脈絡" in prompt
+    assert "較早的使用者限制" in prompt
+
+
+def test_chat_history_is_hydrated_from_durable_session_after_bridge_restart(tmp_path, monkeypatch):
+    settings = _tool_settings()
+    settings.openclaw_web_memory_dir = str(tmp_path / "memory")
+    settings.openclaw_web_event_dir = str(tmp_path / "events")
+    first = CommandBridge(settings=settings)
+    monkeypatch.setattr(
+        first,
+        "_stream_chat",
+        lambda req: iter([{"type": "done", "message": "先前回答"}]),
+    )
+    list(first.stream(parse_request({
+        "mode": "chat", "input": "先前問題", "session_id": "browser-session",
+    }), "rid-history"))
+
+    restarted = CommandBridge(settings=settings)
+    hydrated = restarted._hydrate_chat_history(parse_request({
+        "mode": "chat", "input": "接著呢", "session_id": "browser-session", "history": [],
+    }))
+
+    assert [(turn.role, turn.content) for turn in hydrated.history] == [
+        ("user", "先前問題"), ("assistant", "先前回答"),
+    ]
+
+
+def test_chat_history_hydration_recovers_pre_mode_journal_entries(tmp_path):
+    settings = _tool_settings()
+    settings.openclaw_web_memory_dir = str(tmp_path / "memory")
+    settings.openclaw_web_event_dir = str(tmp_path / "events")
+    first = CommandBridge(settings=settings)
+    recorder = first._event_sessions().recorder("legacy-browser-session")
+    recorder.accepted("舊版問題")
+    recorder.started()
+    recorder.planner_completed("stream_chat")
+    recorder.assistant_message("舊版回答")
+    recorder.terminal("completed")
+
+    restarted = CommandBridge(settings=settings)
+    hydrated = restarted._hydrate_chat_history(parse_request({
+        "mode": "chat", "input": "接著呢", "session_id": "legacy-browser-session",
+    }))
+
+    assert [(turn.role, turn.content) for turn in hydrated.history] == [
+        ("user", "舊版問題"), ("assistant", "舊版回答"),
+    ]
+
+
 # --- translation routing --------------------------------------------------
 def test_translation_text_routes_to_zh(bridge):
     req = parse_request({"mode": "translation", "submode": "text_translation",
@@ -1676,6 +1732,57 @@ def test_stream_goal_loop_disconnect_recovers_answer_via_job(monkeypatch):
     snap = _wait_job(b, job_id, "done")
     assert snap["job_status"] == "done"
     assert "建議購買並送鑑定" in snap["message"]
+
+
+def test_stream_chat_research_disconnect_restores_same_session_job(tmp_path, monkeypatch):
+    settings = _tool_settings()
+    settings.openclaw_web_memory_dir = str(tmp_path / "memory")
+    settings.openclaw_web_event_dir = str(tmp_path / "events")
+    settings.openclaw_web_jobs_dir = str(tmp_path / "jobs")
+    b = CommandBridge(settings=settings)
+    release = threading.Event()
+
+    def _plan(req):
+        if False:
+            yield {}
+        return ChatToolPlan(
+            tool=CHAT_TOOL_RESEARCH,
+            query="https://jp.mercari.com/item/m123 question",
+            reason_summary="商品研究",
+        ), None
+
+    monkeypatch.setattr(b, "_stream_chat_tool_plan", _plan)
+
+    def _research(req, plan):
+        release.wait(timeout=5.0)
+        return ChatToolResult(answer="持久研究完成")
+
+    monkeypatch.setattr(b, "_run_chat_tool", _research)
+    monkeypatch.setattr(b, "_maybe_upgrade_tool_result_to_goal_loop", lambda *a, **k: None)
+    req = parse_request({
+        "mode": "chat", "input": "研究這張卡", "session_id": "browser-session",
+    })
+    stream = b.stream(req, "rid-chat-research")
+    job_id = None
+    for event in stream:
+        if event["type"] == "job":
+            job_id = event["job_id"]
+            break
+    assert job_id
+
+    stream.close()
+    restored_running = b.load_session("browser-session")["session"]
+    assert restored_running["active_job_id"] == job_id
+    assert restored_running["messages"][-1]["jobId"] == job_id
+
+    release.set()
+    assert _wait_job(b, job_id, "done")["message"] == "持久研究完成"
+    restored_done = b.load_session("browser-session")["session"]
+    assert restored_done["active_job_id"] is None
+    assert [message["text"] for message in restored_done["messages"]] == [
+        "研究這張卡", "持久研究完成",
+    ]
+    assert restored_done["messages"][-1]["jobId"] == job_id
 
 
 def test_stream_goal_loop_final_answer_excludes_live_narration(monkeypatch):

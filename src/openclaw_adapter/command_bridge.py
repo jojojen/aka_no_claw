@@ -40,6 +40,7 @@ from .job_store import JobStore
 from .session_memory import SessionMemoryStore, SessionWriteError, empty_session
 from .session_event_service import SessionEventService
 from .session_event_journal import CursorExpiredError
+from .session_events import TERMINAL_EVENT_TYPES
 from .run_recorder import RunRecorder
 from .context_checkpoint import ContextCheckpointStore, ContextCompactor, estimate_tokens
 from .action_risk import (
@@ -123,6 +124,7 @@ from .command_bridge_models import (
     _image_temp_suffix,
     _is_supported_image,
     _seed_variable_name_for_tool,
+    _sanitize_history,
     _tool_calling_notice,
     build_chat_prompt,
     make_chat_tool_request,
@@ -826,7 +828,11 @@ class CommandBridge:
     def handle(self, req: WebCommandRequest) -> WebCommandResponse:
         session_id = getattr(req, "session_id", None)
         recorder = self._event_sessions().recorder(session_id)
-        recorder.accepted((req.input or "").strip(), source_prompt_id=req.source_prompt_id)
+        if req.mode == MODE_CHAT:
+            req = self._hydrate_chat_history(req)
+        recorder.accepted(
+            (req.input or "").strip(), source_prompt_id=req.source_prompt_id, mode=req.mode
+        )
         self._maybe_auto_compact_context(session_id)
         recorder.started()
         token = self._active_run_recorder.set(recorder)
@@ -890,8 +896,11 @@ class CommandBridge:
             except Exception as exc:  # noqa: BLE001
                 yield stream_error(f"後端處理失敗：{exc}")
             return
+        req = self._hydrate_chat_history(req)
         recorder = self._event_sessions().recorder(req.session_id)
-        recorder.accepted((req.input or "").strip(), source_prompt_id=req.source_prompt_id)
+        recorder.accepted(
+            (req.input or "").strip(), source_prompt_id=req.source_prompt_id, mode=req.mode
+        )
         self._maybe_auto_compact_context(req.session_id)
         recorder.started()
         token = self._active_run_recorder.set(recorder)
@@ -912,7 +921,8 @@ class CommandBridge:
                     message = event.get("message")
                     recorder.planner_completed("stream_chat")
                     recorder.judge_completed(satisfied=True, reason_code="stream_done")
-                    recorder.assistant_message(str(message or "".join(deltas)))
+                    if event.get("_durable_job") is not True:
+                        recorder.assistant_message(str(message or "".join(deltas)))
                     recorder.terminal("completed")
                     terminal = True
                 elif event_type == "error":
@@ -920,7 +930,9 @@ class CommandBridge:
                     recorder.assistant_message(message)
                     recorder.terminal("failed", message=message)
                     terminal = True
-                yield event
+                public_event = dict(event)
+                public_event.pop("_durable_job", None)
+                yield public_event
         except Exception as exc:  # noqa: BLE001
             logger.exception("command bridge stream failed mode=%s", req.mode)
             recorder.assistant_message(f"後端處理失敗：{exc}")
@@ -966,7 +978,9 @@ class CommandBridge:
         direct = self._maybe_voice_direct_action(req)
         if direct is not None:
             return direct
-        prompt = build_chat_prompt(req.input, req.history)
+        prompt = build_chat_prompt(
+            req.input, req.history, trusted_context=self._trusted_context_checkpoint(req)
+        )
         plan, metadata = self._select_chat_tool_plan(req)
         if plan is not None and plan.tool == CHAT_TOOL_CREATE_WORKFLOW:
             # No streaming connection to carry a "redirect" event here, so run
@@ -1064,7 +1078,9 @@ class CommandBridge:
                 observation = obs_result
                 yield stream_process(f"🔍 圖片觀察：{observation}")
 
-        prompt = build_chat_prompt(req.input, req.history)
+        prompt = build_chat_prompt(
+            req.input, req.history, trusted_context=self._trusted_context_checkpoint(req)
+        )
         # The observation also reaches the router-failed fallback prompt below.
         if observation:
             prompt = f"【圖片觀察】\n{observation}\n\n{prompt}"
@@ -1091,6 +1107,9 @@ class CommandBridge:
                     clarification=clarification.to_dict(),
                 )
                 return
+            if plan.tool == CHAT_TOOL_RESEARCH:
+                yield from self._stream_chat_research_job(req, plan)
+                return
             yield from self._stream_chat_tool(req, plan)
             return
         if plan is not None and plan.tool == CHAT_TOOL_NO_TOOL:
@@ -1104,6 +1123,65 @@ class CommandBridge:
             yield from self._stream_chat_response(
                 prompt, req.chat_backend, conversation_key=self._conversation_key(req)
             )
+
+    def _stream_chat_research_job(
+        self, req: WebCommandRequest, plan: ChatToolPlan
+    ) -> Iterator[dict]:
+        """Run Chat-routed /research independently of the NDJSON connection."""
+        yield stream_delta(_tool_calling_notice(plan.tool, self._tool_display_name(plan.tool)))
+        parent_recorder = self._active_run_recorder.get()
+
+        def _runner(job: _Job) -> tuple[str, list[dict]]:
+            notifier = _JobNotifier(self._jobs, job.id, self._get_job_store())
+            with self._live_progress(notifier.send), self._cancel_scope(job.cancel_event.is_set):
+                tool_result = self._run_chat_tool(req, plan)
+                upgraded = self._maybe_upgrade_tool_result_to_goal_loop(
+                    req,
+                    plan,
+                    tool_result,
+                    planner_metadata=None,
+                    narrator=notifier.send,
+                )
+            if upgraded is not None:
+                return upgraded.message, [action.to_dict() for action in upgraded.actions]
+            return tool_result.answer, []
+
+        started = self._launch_research_job(
+            text=plan.query,
+            session_id=req.session_id,
+            runner=_runner,
+            record_user=False,
+            mode=MODE_CHAT,
+            parent_recorder=parent_recorder,
+        )
+        if started.get("status") != "accepted":
+            yield stream_error(str(started.get("message") or "無法建立研究任務。"))
+            return
+        job_id = str(started["job_id"])
+        yield stream_job(job_id)
+        progress_count = 0
+        last_beat = time.time()
+        while True:
+            snapshot = self.poll_job(job_id)
+            progress = snapshot.get("progress") or []
+            if isinstance(progress, list):
+                for line in progress[progress_count:]:
+                    yield stream_delta(f"{line}\n")
+                progress_count = len(progress)
+            status = snapshot.get("job_status")
+            if status == JOB_RUNNING:
+                if time.time() - last_beat >= _HEARTBEAT_SECONDS:
+                    yield stream_heartbeat()
+                    last_beat = time.time()
+                time.sleep(0.25)
+                continue
+            if status in {JOB_DONE, JOB_INTERRUPTED}:
+                event = stream_done(str(snapshot.get("message") or "").strip())
+                event["_durable_job"] = True
+                yield event
+                return
+            yield stream_error(str(snapshot.get("error") or snapshot.get("message") or "研究失敗。"))
+            return
 
     # --- bounded music plan (#50) --------------------------------------------
     def _exec_music_intent(
@@ -3119,6 +3197,42 @@ class CommandBridge:
                 )
         return "\n".join(lines)
 
+    def _trusted_context_checkpoint(self, req: WebCommandRequest) -> str:
+        """Return only a validated, server-derived checkpoint for model input."""
+        checkpoint = self._context_compactor().latest(req.session_id or "web-default")
+        if checkpoint is None or checkpoint.validation_status != "valid":
+            return ""
+        return checkpoint.summary
+
+    def _hydrate_chat_history(self, req: WebCommandRequest) -> WebCommandRequest:
+        """Replace browser-supplied history with the durable session projection.
+
+        The event journal is authoritative.  This prevents reloads, stale React
+        state, or a missing presentation label from silently making a continuing
+        conversation stateless.  The same generic sanitizer still applies the
+        model-input bounds and rejects non-user/assistant entries.
+        """
+        if req.mode != MODE_CHAT or not req.session_id:
+            return req
+        try:
+            messages = self._event_sessions().projection(req.session_id).get("messages", [])
+        except Exception:  # noqa: BLE001 - availability beats optional hydration
+            logger.warning(
+                "chat history hydration failed session=%s; using request history",
+                req.session_id,
+                exc_info=True,
+            )
+            return req
+        raw_history = [
+            {"role": item.get("role"), "content": item.get("text")}
+            for item in messages
+            if isinstance(item, dict) and item.get("mode") == MODE_CHAT
+        ]
+        authoritative = _sanitize_history(raw_history)
+        if not authoritative:
+            return req
+        return dataclasses.replace(req, history=authoritative)
+
     def _legacy_chat_tool_result_satisfies_intent(
         self,
         req: WebCommandRequest,
@@ -3386,24 +3500,24 @@ class CommandBridge:
                     self._job_store_inst = JobStore(dir_path)
         return self._job_store_inst
 
-    def start_async(self, req: WebCommandRequest) -> dict:
-        """Kick off a long command in a background thread and return a job id
-        immediately. Only investment deep research is async for the MVP; the
-        client then polls :meth:`poll_job` for staged progress + final report,
-        which survives mobile screen-locks and connection drops."""
-        if req.mode != MODE_INVESTMENT or req.submode not in (
-            None, SUBMODE_DEEP_PRODUCT_RESEARCH
-        ):
-            return {"status": STATUS_ERROR,
-                    "message": "非同步任務目前僅支援商品深入研究。"}
-        text = (req.input or "").strip()
-        if not text:
-            return {"status": STATUS_ERROR, "message": "請貼上商品 URL 或輸入商品名稱。"}
+    def _launch_research_job(
+        self,
+        *,
+        text: str,
+        session_id: str | None,
+        runner: Callable[[_Job], tuple[str, list[dict]]],
+        record_user: bool,
+        mode: str,
+        parent_recorder: RunRecorder | None = None,
+    ) -> dict:
+        """Launch one durable research worker shared by Investment and Chat."""
         job = self._jobs.create()
-        session_id = getattr(req, "session_id", None)
         recorder = self._event_sessions().recorder(session_id)
-        recorder.accepted(text)
+        recorder.accepted(text if record_user else "", mode=mode)
         recorder.started()
+        recorder.job_attached(job.id)
+        if parent_recorder is not None:
+            parent_recorder.job_attached(job.id)
         job.run_id = recorder.run_id
         job.session_id = session_id
         job.recorder = recorder
@@ -3462,12 +3576,10 @@ class CommandBridge:
 
         def _worker() -> None:
             try:
-                message, markup = self._run_command_raw(
-                    "/research", text, chat_id=job.id
-                )
+                message, actions = runner(job)
                 _persist_terminal(
                     status=JOB_DONE, message=message,
-                    actions=self._markup_to_actions(markup), error=None,
+                    actions=actions, error=None,
                 )
             except Exception as exc:  # noqa: BLE001
                 if job.cancel_event.is_set():
@@ -3480,6 +3592,29 @@ class CommandBridge:
 
         threading.Thread(target=_worker, daemon=True).start()
         return {"status": "accepted", "job_id": job.id}
+
+    def start_async(self, req: WebCommandRequest) -> dict:
+        """Kick off Investment research as a durable background job."""
+        if req.mode != MODE_INVESTMENT or req.submode not in (
+            None, SUBMODE_DEEP_PRODUCT_RESEARCH
+        ):
+            return {"status": STATUS_ERROR,
+                    "message": "非同步任務目前僅支援商品深入研究。"}
+        text = (req.input or "").strip()
+        if not text:
+            return {"status": STATUS_ERROR, "message": "請貼上商品 URL 或輸入商品名稱。"}
+
+        def _runner(job: _Job) -> tuple[str, list[dict]]:
+            message, markup = self._run_command_raw("/research", text, chat_id=job.id)
+            return message, self._markup_to_actions(markup)
+
+        return self._launch_research_job(
+            text=text,
+            session_id=getattr(req, "session_id", None),
+            runner=_runner,
+            record_user=True,
+            mode=MODE_INVESTMENT,
+        )
 
     def poll_job(self, job_id: str) -> dict:
         """Snapshot a job: status, staged progress, final report, follow-up actions.
@@ -4640,10 +4775,26 @@ class CommandBridge:
         """Return labelled context usage; journal history is never mutated here."""
         resolved = session_id or "web-default"
         events = self._event_sessions().ensure(resolved).events()
+        clear_seq = max(
+            (
+                event.seq for event in events
+                if event.type == "context.checkpoint" and event.payload.get("clear") is True
+            ),
+            default=0,
+        )
+        cleared_run_ids = {
+            event.run_id for event in events
+            if event.seq <= clear_seq and event.type in {"run.accepted", "run.started"}
+        }
         checkpoint = self._context_compactor().latest(resolved)
+        if checkpoint is not None and checkpoint.source_seq_end <= clear_seq:
+            checkpoint = None
         visible = "\n".join(
             str(event.payload.get("text", "")) for event in events
-            if event.type in {"user.message", "assistant.message"} and event.visibility == "user"
+            if event.seq > clear_seq
+            and event.run_id not in cleared_run_ids
+            and event.type in {"user.message", "assistant.message"}
+            and event.visibility == "user"
             and (checkpoint is None or event.seq > checkpoint.source_seq_end)
         )
         window = max(1, int(getattr(self.settings, "openclaw_web_context_window_tokens", 32768)))
@@ -4706,10 +4857,13 @@ class CommandBridge:
             )
         return {"status": STATUS_OK, "session_id": resolved, "cleared": removed is not None}
 
-    def load_session(self) -> dict:
+    def load_session(self, session_id: str | None = None) -> dict:
         """GET — journal projection with the historical snapshot wire shape."""
         try:
-            return {"status": STATUS_OK, "session": self._event_sessions().projection()}
+            return {
+                "status": STATUS_OK,
+                "session": self._event_sessions().projection(session_id),
+            }
         except Exception as exc:  # noqa: BLE001 — must never crash the API
             logger.exception("session memory: load failed")
             return {"status": STATUS_ERROR, "message": f"讀取 session 失敗：{exc}",
@@ -4871,6 +5025,24 @@ class CommandBridge:
         except PromptQueueError as exc:
             return {"status": STATUS_ERROR, "message": str(exc)}
 
+    def retry_prompt_queue_entry(self, prompt_id: str, payload: dict) -> dict:
+        try:
+            resolved = str(payload.get("session_id") or "web-default")
+            expected_version = int(payload.get("expected_version"))
+            self._reconcile_prompt_queue_once(resolved)
+            prompt, snapshot = self._prompt_queue().retry(
+                resolved, prompt_id, expected_version=expected_version
+            )
+            self._queue_changed(resolved, snapshot)
+            self._maybe_drain_prompt_queue(resolved)
+            return {"status": STATUS_OK, "entry": prompt.public(), **snapshot}
+        except (TypeError, ValueError):
+            return {"status": STATUS_ERROR, "message": "expected_version must be an integer"}
+        except PromptQueueConflict as exc:
+            return {"status": "conflict", "message": str(exc)}
+        except PromptQueueError as exc:
+            return {"status": STATUS_ERROR, "message": str(exc)}
+
     def reorder_prompt_queue(self, payload: dict) -> dict:
         try:
             session_id = str(payload.get("session_id") or "web-default")
@@ -4911,6 +5083,26 @@ class CommandBridge:
                 self._queue_changed(resolved, snapshot)
                 if prompt is None:
                     return
+                prior_status, prior_run_id = self._queued_prompt_prior_run(
+                    resolved, prompt.prompt_id
+                )
+                if prior_status == "completed":
+                    completed_snapshot = self._prompt_queue().complete(
+                        resolved, prompt.prompt_id, run_id=prior_run_id
+                    )
+                    self._queue_changed(resolved, completed_snapshot)
+                    completed = True
+                    return
+                if prior_status == "interrupted":
+                    # A prior worker accepted this durable prompt but vanished
+                    # before a terminal event.  Do not repeat possible side
+                    # effects automatically; expose an explicit recovery state
+                    # so the operator decides whether to retry or cancel.
+                    interrupted = self._prompt_queue().interrupt(
+                        resolved, prompt.prompt_id, run_id=prior_run_id
+                    )
+                    self._queue_changed(resolved, interrupted)
+                    return
                 request = parse_request({**prompt.request, "source_prompt_id": prompt.prompt_id})
                 if request.mode == MODE_CHAT:
                     for _event in self.stream(request, f"queued-{prompt.prompt_id}"):
@@ -4924,8 +5116,8 @@ class CommandBridge:
                 logger.exception("prompt queue drain failed session=%s", resolved)
                 if prompt is not None:
                     try:
-                        released = self._prompt_queue().release(resolved, prompt.prompt_id)
-                        self._queue_changed(resolved, released)
+                        interrupted = self._prompt_queue().interrupt(resolved, prompt.prompt_id)
+                        self._queue_changed(resolved, interrupted)
                     except PromptQueueError:
                         logger.exception("prompt queue release failed session=%s", resolved)
             finally:
@@ -4936,6 +5128,35 @@ class CommandBridge:
                     self._maybe_drain_prompt_queue(resolved)
 
         threading.Thread(target=_worker, daemon=True, name=f"prompt-drain-{resolved}").start()
+
+    def _queued_prompt_prior_run(self, session_id: str, prompt_id: str) -> tuple[str | None, str | None]:
+        """Return the durable outcome of an earlier attempt for one prompt.
+
+        A queue claim is persisted before request execution.  After a process
+        restart, the claim may be recovered as queued, but the journal can
+        already contain ``run.accepted``.  Replaying that prompt would duplicate
+        network/device/file side effects, so only a never-accepted prompt may
+        start automatically.
+        """
+        events = self._event_sessions().ensure(session_id).events()
+        attempts = [
+            event for event in events
+            if event.type == "run.accepted"
+            and event.payload.get("source_prompt_id") == prompt_id
+        ]
+        if not attempts:
+            return None, None
+        latest_run_id = attempts[-1].run_id
+        terminal = next(
+            (
+                event for event in reversed(events)
+                if event.run_id == latest_run_id and event.type in TERMINAL_EVENT_TYPES
+            ),
+            None,
+        )
+        if terminal is not None and terminal.type == "run.completed":
+            return "completed", terminal.run_id
+        return "interrupted", latest_run_id
 
     def _register_active_goal_run(self, session_id: str | None, run_id: str) -> str:
         resolved = session_id or "web-default"
@@ -4972,11 +5193,11 @@ class CommandBridge:
             recorder.emit("interjection.accepted", {"prompt_id": prompt.prompt_id})
             accepted.append(prompt.text)
 
-    def save_session(self, snapshot: object) -> dict:
+    def save_session(self, snapshot: object, session_id: str | None = None) -> dict:
         """POST — preserve legacy compatibility without overwriting event history."""
         try:
             stored = self._sessions().save(snapshot)
-            self._event_sessions().save_compat_snapshot(snapshot)
+            self._event_sessions().save_compat_snapshot(snapshot, session_id)
         except SessionWriteError as exc:
             return {"status": STATUS_ERROR, "message": f"儲存 session 失敗：{exc}"}
         except Exception as exc:  # noqa: BLE001
@@ -4984,17 +5205,19 @@ class CommandBridge:
             return {"status": STATUS_ERROR, "message": f"儲存 session 失敗：{exc}"}
         return {"status": STATUS_OK, "updated_at": stored.get("updated_at")}
 
-    def clear_session(self) -> dict:
+    def clear_session(self, session_id: str | None = None) -> dict:
         """DELETE — clear projection through an event, then remove fallback state."""
+        resolved = session_id or "web-default"
         try:
-            self._event_sessions().clear()
+            self._event_sessions().clear(resolved)
+            self._context_compactor().clear(resolved)
             self._sessions().clear()
             if self._queue_enabled():
-                self._prompt_queue().clear("web-default")
+                self._prompt_queue().clear(resolved)
         except Exception as exc:  # noqa: BLE001
             logger.exception("session memory: clear failed")
             return {"status": STATUS_ERROR, "message": f"清除 session 失敗：{exc}"}
-        return {"status": STATUS_OK}
+        return {"status": STATUS_OK, "session_id": resolved}
 
     def restart_all(self) -> dict:
         """Schedule a detached full local restart. The current HTTP request must

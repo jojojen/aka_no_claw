@@ -14,17 +14,36 @@ class RunRecorder:
     def __init__(self, journal: SessionEventJournal, *, run_id: str | None = None) -> None:
         self.journal = journal
         self.run_id = run_id or uuid4().hex
+        self._mode: str | None = None
         self._terminal = False
         self._planner_recorded = False
         self._last_progress: dict[str, float] = {}
 
-    def accepted(self, text: str, *, source_prompt_id: str | None = None) -> None:
+    def accepted(
+        self,
+        text: str,
+        *,
+        source_prompt_id: str | None = None,
+        mode: str | None = None,
+    ) -> None:
+        self._mode = mode
+        message_payload: dict[str, object] = {"text": text}
+        if mode:
+            message_payload["mode"] = mode
         if text:
-            self.emit("user.message", {"text": text})
-        self.emit("run.accepted", {"source_prompt_id": source_prompt_id} if source_prompt_id else {})
+            self.emit("user.message", message_payload)
+        accepted_payload: dict[str, object] = {}
+        if source_prompt_id:
+            accepted_payload["source_prompt_id"] = source_prompt_id
+        if mode:
+            accepted_payload["mode"] = mode
+        self.emit("run.accepted", accepted_payload)
 
     def started(self) -> None:
         self.emit("run.started", {})
+
+    def job_attached(self, job_id: str) -> None:
+        self.emit("job.attached", {"job_id": job_id})
 
     def planner_completed(self, route: str) -> None:
         if self._planner_recorded:
@@ -50,7 +69,10 @@ class RunRecorder:
 
     def assistant_message(self, text: str, *, partial: bool = False) -> None:
         if text:
-            self.emit("assistant.message", {"text": text, "partial": partial})
+            payload: dict[str, object] = {"text": text, "partial": partial}
+            if self._mode:
+                payload["mode"] = self._mode
+            self.emit("assistant.message", payload)
 
     def terminal(self, status: str, *, message: str = "") -> None:
         if self._terminal:

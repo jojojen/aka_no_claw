@@ -87,6 +87,14 @@ class _FakeBridge:
         self.queue_reorder = payload
         return {"status": STATUS_OK, "entries": self.queue_entries, "running_prompt_id": None}
 
+    def retry_prompt_queue_entry(self, prompt_id, payload):
+        self.queue_retry = (prompt_id, payload)
+        return {"status": STATUS_OK, "entries": self.queue_entries, "running_prompt_id": None}
+
+    def load_session(self, session_id=None):
+        self.loaded_session_id = session_id
+        return {"status": STATUS_OK, "session": {"messages": []}}
+
     def context_status(self, session_id):
         return {"status": STATUS_OK, "session_id": session_id or "web-default", "usage_percent": 12, "checkpoint": None}
 
@@ -237,6 +245,16 @@ def test_queue_routes_relay_versioned_mutations(server):
     with urllib.request.urlopen(delete, timeout=5):
         pass
     assert bridge.queue_cancel == ("p1", "s1", 1)
+    with _post(base, "/api/command/queue/p1/retry", {"session_id": "s1", "expected_version": 2}):
+        pass
+    assert bridge.queue_retry == ("p1", {"session_id": "s1", "expected_version": 2})
+
+
+def test_session_load_relays_browser_session_identity(server):
+    base, bridge = server
+    with urllib.request.urlopen(base + "/api/command/session?session_id=browser-1", timeout=5):
+        pass
+    assert bridge.loaded_session_id == "browser-1"
 
 
 def test_context_routes_keep_checkpoint_separate_from_session(server):

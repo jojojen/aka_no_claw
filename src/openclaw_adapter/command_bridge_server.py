@@ -224,6 +224,8 @@ def _build_handler(
                 self._handle_queue_create()
             elif path == "/api/command/queue/reorder":
                 self._handle_queue_reorder()
+            elif path.startswith("/api/command/queue/") and path.endswith("/retry"):
+                self._handle_queue_retry(path)
             elif path == "/api/command/context/compact":
                 self._handle_context_compact()
             elif path == "/api/command/schedulehome":
@@ -258,7 +260,10 @@ def _build_handler(
                     return
                 self._write_json(bridge.poll_job(job_ids[0]))
             elif split.path == "/api/command/session":
-                self._write_json(bridge.load_session())
+                session_id = (parse_qs(split.query).get("session_id") or [None])[0]
+                self._write_json(
+                    bridge.load_session(session_id) if session_id else bridge.load_session()
+                )
             elif split.path == "/api/command/events":
                 params = parse_qs(split.query)
                 session_id = (params.get("session_id") or [None])[0]
@@ -304,7 +309,10 @@ def _build_handler(
                 return
             split = urlsplit(self.path)
             if split.path == "/api/command/session":
-                self._write_json(bridge.clear_session())
+                session_id = (parse_qs(split.query).get("session_id") or [None])[0]
+                self._write_json(
+                    bridge.clear_session(session_id) if session_id else bridge.clear_session()
+                )
             elif split.path == "/api/command/context/checkpoint":
                 session_id = (parse_qs(split.query).get("session_id") or [None])[0]
                 self._write_json(bridge.clear_context_checkpoint(session_id))
@@ -376,6 +384,21 @@ def _build_handler(
                 result = bridge.reorder_prompt_queue(self._read_json_object())
             except (ValueError, UnicodeDecodeError) as exc:
                 self._write_json({"status": "error", "message": f"無效的請求：{exc}"}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self._write_json(result, status=self._queue_status(result))
+
+        def _handle_queue_retry(self, path: str) -> None:
+            prompt_id = path.removeprefix("/api/command/queue/").removesuffix("/retry")
+            if not prompt_id or "/" in prompt_id:
+                self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+                return
+            try:
+                result = bridge.retry_prompt_queue_entry(prompt_id, self._read_json_object())
+            except (ValueError, UnicodeDecodeError) as exc:
+                self._write_json(
+                    {"status": "error", "message": f"無效的請求：{exc}"},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
                 return
             self._write_json(result, status=self._queue_status(result))
 
@@ -771,7 +794,11 @@ def _build_handler(
                 self._write_json({"status": "error", "message": f"無效的請求：{exc}"},
                                  status=HTTPStatus.BAD_REQUEST)
                 return
-            self._write_json(bridge.save_session(data))
+            split = urlsplit(self.path)
+            session_id = (parse_qs(split.query).get("session_id") or [None])[0]
+            self._write_json(
+                bridge.save_session(data, session_id) if session_id else bridge.save_session(data)
+            )
 
         def _handle_blocking(self) -> None:
             try:
