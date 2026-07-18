@@ -289,9 +289,24 @@ broadlink_preflight() {{
 # Kill ORPHAN copies of a launchd-managed worker (aka_no_claw#40). `kickstart -k`
 # only ever touches launchd's own instance; a duplicate started by hand / left
 # over from an earlier kill+nohup keeps running the same command line and burns
-# ~100% CPU alongside the supervised one. We find launchd's current PID for the
-# label and kill every OTHER process matching the command pattern. If launchd's
-# PID can't be read we skip (never risk killing the live supervised instance).
+# ~100% CPU alongside the supervised one. launchd may own a shell wrapper whose
+# descendants are the real worker and log rotator, so preserve the whole launchd
+# process tree and kill only matching processes outside it. If launchd's PID
+# can't be read we skip (never risk killing the live supervised instance).
+is_descendant_of() {{
+  local child="$1"
+  local ancestor="$2"
+  local parent
+  while [ -n "$child" ] && [ "$child" -gt 1 ] 2>/dev/null; do
+    [ "$child" = "$ancestor" ] && return 0
+    parent="$(ps -o ppid= -p "$child" 2>/dev/null | tr -d ' ')"
+    [ -z "$parent" ] && return 1
+    [ "$parent" = "$child" ] && return 1
+    child="$parent"
+  done
+  return 1
+}}
+
 reap_orphans() {{
   local label="$1"
   local pattern="$2"
@@ -309,7 +324,7 @@ reap_orphans() {{
   killed=""
   for pid in $pids; do
     [ "$pid" = "$$" ] && continue
-    [ "$pid" = "$keep" ] && continue
+    is_descendant_of "$pid" "$keep" && continue
     killed="$killed $pid"
     kill "$pid" 2>/dev/null || true
   done
@@ -432,8 +447,8 @@ kickstart_service "chat_web"
 
 # Give launchd a moment to relaunch + register the new PIDs, then kill any
 # ORPHAN duplicates of the managed workers (aka_no_claw#40): kickstart only
-# replaces launchd's own instance, so a hand-started copy keeps running and
-# pegs the CPU. reap_orphans keeps just the launchd PID per service.
+# replaces launchd's own process tree, so a hand-started copy keeps running and
+# pegs the CPU. reap_orphans keeps the wrapper and all of its descendants.
 sleep 2
 reap_orphans "price_monitor" "openclaw_adapter price-monitor-service"
 reap_orphans "sns_monitor" "openclaw_adapter sns-monitor-service"

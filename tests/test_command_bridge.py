@@ -5694,7 +5694,27 @@ def test_run_chat_tool_records_success_and_failure_in_ledger(monkeypatch):
     assert "research backend down" in entries[1]["summary"]
 
 
-def test_router_prompt_includes_prior_tool_ledger_per_conversation(monkeypatch):
+def test_web_session_id_is_the_conversation_state_boundary():
+    b = CommandBridge(settings=_tool_settings())
+    first = parse_request({
+        "mode": "chat", "input": "first", "session_id": "browser-1",
+        "conversation_id": "default",
+    })
+    second = parse_request({
+        "mode": "chat", "input": "second", "session_id": "browser-2",
+        "conversation_id": "default",
+    })
+
+    b._record_chat_tool_run(
+        first, "/research", "item", status="ok", summary="browser one evidence"
+    )
+
+    assert b._conversation_key(first) == "browser-1"
+    assert b._conversation_key(second) == "browser-2"
+    assert b._chat_tool_ledger_entries(second) == []
+
+
+def test_router_prompt_does_not_inject_out_of_band_tool_ledger(monkeypatch):
     b = CommandBridge(settings=_tool_settings())
     monkeypatch.setattr(
         b,
@@ -5722,15 +5742,12 @@ def test_router_prompt_includes_prior_tool_ledger_per_conversation(monkeypatch):
     )
 
     prompt = b._build_chat_tool_plan_prompt(req_c1)
-    assert "先前已執行過的工具紀錄" in prompt
-    assert "/visionlook" in prompt
-    assert "卡面外觀中上" in prompt
-    assert "失敗" in prompt
-    assert "research 執行失敗" in prompt
-    assert "不要為同樣的需求重複執行同一個工具" in prompt
-
     other = b._build_chat_tool_plan_prompt(req_c2)
-    assert "先前已執行過的工具紀錄" not in other
+
+    assert "卡面外觀中上" not in prompt
+    assert "research 執行失敗" not in prompt
+    assert "使用者最新訊息：你剛才做了什麼？" in prompt
+    assert prompt == other
 
 
 def test_no_tool_router_decision_uses_separate_answer_call(monkeypatch):
@@ -5761,39 +5778,31 @@ def test_no_tool_router_decision_uses_separate_answer_call(monkeypatch):
     assert "助理先前說法（未驗證）：先前猜測" in calls[1][1]
 
 
-def test_normal_chat_answer_repairs_numbers_missing_from_typed_evidence(monkeypatch):
+def test_normal_chat_returns_single_model_answer_without_global_numeric_gate(monkeypatch):
     b = CommandBridge(settings=_tool_settings())
     prompt = build_chat_prompt(
-        "均價1萬1怎麼可能鑑定後一樣一萬",
-        evidence_context=(
-            "- [ev-1] source_type=tool_result status=ok tool=/research query='item'\n"
-            "  content=現價 ¥9,500；已售均價 ¥10,574；樣本 3 筆。"
-        ),
+        "解釋這是什麼意思\n"
+        "This is double LARP. If you actually go to the gym you know exactly "
+        "when it's busy and if you actually code you wouldn't want a rolling "
+        "24h count for this type of data"
     )
-    responses = [
-        "建議低於均價20%入手，大約¥7,000–¥8,000；鑑定8級或9級。",
-        "工具資料只有現價、已售均價與樣本數；沒有鑑定後成交價與鑑定成本，無法據此決定入手價。",
-    ]
     calls: list[str] = []
 
-    def _raw(raw_prompt, _backend, *, conversation_key=None):
+    def _generate(raw_prompt):
         calls.append(raw_prompt)
-        return responses.pop(0), None
+        return "這句話在批評兩種裝懂：沒實際健身，卻假裝不了解尖峰時段；沒實際寫程式，卻提出不合需求的統計方式。"
 
-    monkeypatch.setattr(b, "_generate_chat_response_raw_blocking", _raw)
+    monkeypatch.setattr(b, "_ollama_generate_blocking", _generate)
 
     answer, _metadata = b._generate_chat_response_blocking(
         prompt, CHAT_BACKEND_LOCAL
     )
 
-    assert len(calls) == 2
-    assert "¥7,000" in calls[1]
-    assert "鑑定8級" in calls[1]
-    assert "¥7,000" not in answer
-    assert "沒有鑑定後成交價" in answer
+    assert calls == [prompt]
+    assert answer.startswith("這句話在批評兩種裝懂")
 
 
-def test_router_reuses_existing_research_for_plain_followup(monkeypatch):
+def test_router_honors_validated_tool_plan_despite_prior_same_tool_run(monkeypatch):
     b = CommandBridge(settings=_tool_settings())
     req = parse_request({
         "mode": "chat",
@@ -5812,35 +5821,6 @@ def test_router_reuses_existing_research_for_plain_followup(monkeypatch):
         "_generate_chat_tool_plan_with_chat_backend",
         lambda *args, **kwargs: (
             '{"tool":"/research","query":"same item","reason_summary":"product follow-up"}',
-            None,
-        ),
-    )
-
-    plan, _metadata = b._select_chat_tool_plan(req)
-
-    assert plan is not None
-    assert plan.tool == CHAT_TOOL_NO_TOOL
-
-
-def test_router_allows_explicit_research_refresh(monkeypatch):
-    b = CommandBridge(settings=_tool_settings())
-    req = parse_request({
-        "mode": "chat",
-        "input": "請重新查最新價格",
-        "conversation_id": "refresh-research",
-    })
-    b._record_chat_tool_run(
-        req,
-        CHAT_TOOL_RESEARCH,
-        "old item query",
-        status="ok",
-        summary="舊結果",
-    )
-    monkeypatch.setattr(
-        b,
-        "_generate_chat_tool_plan_with_chat_backend",
-        lambda *args, **kwargs: (
-            '{"tool":"/research","query":"latest item price","reason_summary":"explicit refresh"}',
             None,
         ),
     )
@@ -5875,13 +5855,11 @@ def test_tool_evidence_is_durable_across_bridge_restart(tmp_path):
 
     restarted = CommandBridge(settings=settings)
     entries = restarted._chat_tool_ledger_entries(req)
-    evidence_prompt = restarted._trusted_evidence_context(req)
 
     assert len(entries) == 1
     assert entries[0]["source_type"] == "tool_result"
     assert entries[0]["evidence_id"] == entries[0]["tool_call_id"]
-    assert "成交均價 ¥11,110" in evidence_prompt
-    assert "source_type=tool_result" in evidence_prompt
+    assert "成交均價 ¥11,110" in entries[0]["content"]
 
 
 def test_async_research_job_persists_typed_evidence_across_restart(tmp_path, monkeypatch):
@@ -5943,14 +5921,11 @@ def test_goal_context_keeps_user_and_tool_evidence_but_excludes_assistant_claims
     )
 
     context = b._conversation_context_block(req)
-    evidence = b._trusted_evidence_context(req)
 
     assert "起標價是八千" in context
     assert "鑑定費大約¥1,000" not in context
     assert "source_type=tool_result" in context
     assert "source_type=derived_answer" in context
-    assert "source_type=tool_result" in evidence
-    assert "source_type=derived_answer" in evidence
 
 
 def test_unsatisfied_upgrade_passes_tool_answer_as_seed(monkeypatch):

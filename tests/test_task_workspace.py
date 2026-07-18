@@ -639,20 +639,8 @@ def test_llm_transform_prompt_embeds_all_input_variables():
     assert "[user_name]" in prompt
 
 
-def test_llm_transform_repairs_numeric_claim_missing_from_evidence():
-    class SequentialLLM:
-        def __init__(self) -> None:
-            self.responses = [
-                "建議再加上鑑定費¥1,000 後計算。",
-                "現有證據沒有鑑定費用，無法完成利潤計算。",
-            ]
-            self.prompts: list[str] = []
-
-        def generate(self, prompt: str, *, temperature: float = 0.0) -> str:
-            self.prompts.append(prompt)
-            return self.responses.pop(0)
-
-    llm = SequentialLLM()
+def test_llm_transform_uses_typed_evidence_in_one_model_call():
+    llm = FakeLLMClient("現有證據沒有必要資訊，無法完成計算。")
     ex, runner = _make_runner()
     runner.llm_client = llm
     store = VariableStore()
@@ -675,39 +663,9 @@ def test_llm_transform_repairs_numeric_claim_missing_from_evidence():
 
     assert step_trace.status == "ok"
     assert var_name == "answer"
-    assert len(llm.prompts) == 2
-    assert "¥1,000" in llm.prompts[1]
-    assert "¥1,000" not in store.resolve("answer")
-    assert "沒有鑑定費用" in store.resolve("answer")
-
-
-def test_llm_transform_falls_back_when_numeric_repair_still_invents():
-    llm = FakeLLMClient("估計成本¥1,000。")
-    ex, runner = _make_runner()
-    runner.llm_client = llm
-    store = VariableStore()
-    store.bind(
-        "facts",
-        "成交價¥8,100。",
-        "s0",
-        "tool",
-        type_=VARIABLE_TYPE_EVIDENCE,
-    )
-    step = WorkflowStep(
-        id="s1",
-        kind="llm_transform",
-        inputs=["facts"],
-        instructions="計算結果",
-        output="answer",
-    )
-
-    step_trace, _ = runner._run_llm_transform(step, store)
-
-    assert step_trace.status == "ok"
-    assert len(llm.prompts) == 2
-    assert store.resolve("answer").startswith("現有輸入不足")
-    assert "¥1,000" not in store.resolve("answer")
-    assert "¥8,100" in store.resolve("answer")
+    assert len(llm.prompts) == 1
+    assert "type=evidence trust=grounding_source" in llm.prompts[0]
+    assert "現有證據沒有必要資訊" in store.resolve("answer")
 
 
 def test_llm_transform_no_client_fails():

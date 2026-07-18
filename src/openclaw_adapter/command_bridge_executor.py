@@ -202,6 +202,10 @@ class ChatToolExecutor:
             ledger = self._ledgers.get(self._deps._conversation_key(req))
             return list(ledger) if ledger else []
 
+    def clear(self, conversation_key: str) -> None:
+        with self._ledger_lock:
+            self._ledgers.pop(conversation_key, None)
+
     def run(self, req: WebCommandRequest, plan: ChatToolPlan) -> ChatToolResult:
         policy_map: dict[str, tuple[ChatToolPolicy, Callable]] = {
             CHAT_TOOL_SEARCH: (_SEARCH_TOOL_POLICY, self._deps._exec_grounded_search),

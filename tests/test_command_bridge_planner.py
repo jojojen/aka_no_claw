@@ -122,11 +122,11 @@ def test_plan_prompt_forbids_state_gating_of_requested_actions():
     assert "使用者最新訊息：音樂停止" in prompt
 
 
-def test_plan_prompt_ledger_repeat_rule_excludes_new_action_requests():
+def test_plan_prompt_does_not_inject_out_of_band_ledger():
     ledger = [
         {"tool": "/music", "query": "resume", "status": "partial",
          "summary": "工具回覆表示無可繼續播放的音樂"},
     ]
     prompt = _planner(_PromptDeps(ledger)).build_plan_prompt(_req("音樂停止"))
-    assert "不是重複，要照常執行" in prompt
-    assert "無可繼續播放的音樂" in prompt  # ledger still present, but bounded
+    assert "無可繼續播放的音樂" not in prompt
+    assert "使用者最新訊息：音樂停止" in prompt

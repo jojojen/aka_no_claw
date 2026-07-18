@@ -315,6 +315,10 @@ class ProviderRouter:
         with self._pins_lock:
             self._pins[conversation_key] = provider
 
+    def clear_pin(self, conversation_key: str) -> None:
+        with self._pins_lock:
+            self._pins.pop(conversation_key, None)
+
     # --- pool chains --------------------------------------------------------
     def cloud_pool_chain(self) -> list[tuple[str, str, object, object]]:
         """Return ordered list of (provider_label, model_name, build_fn, is_configured_fn)."""

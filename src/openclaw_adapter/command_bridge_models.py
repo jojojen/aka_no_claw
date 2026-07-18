@@ -773,28 +773,18 @@ def build_chat_prompt(
     history: tuple[ChatTurn, ...] = (),
     *,
     trusted_context: str = "",
-    evidence_context: str = "",
 ) -> str:
     """Assemble the chat prompt from recent history + the current input.
 
     The dedicated answer stage always receives its role/evidence contract,
-    including on the first turn. History and evidence are optional typed
-    sections in the same prompt shape, which works for local and cloud
-    backends. Server-side trimming/sanitization already happened in
+    including on the first turn. History and the server checkpoint use the
+    same prompt shape for local and cloud backends. Server-side sanitization happened in
     parse_request; this only formats."""
     user_input = (user_input or "").strip()
     trusted_context = (trusted_context or "").strip()
-    evidence_context = (evidence_context or "").strip()
     lines = [_CHAT_SYSTEM_PROMPT]
     if trusted_context:
         lines += ["", "伺服器保存的較早對話脈絡：", trusted_context]
-    if evidence_context:
-        lines += [
-            "",
-            "執行紀錄（每筆都有 evidence_id；只有 source_type=tool_result 的內容可作為工具依據，"
-            "derived_answer 仍是未驗證助理說法）：",
-            evidence_context,
-        ]
     lines += ["", "對話紀錄："]
     for turn in history:
         label = (

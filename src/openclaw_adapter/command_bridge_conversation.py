@@ -86,3 +86,13 @@ class ConversationState:
         self.goal_pending_lock = threading.Lock()
         self.goal_completed_workflows: dict[str, object] = {}
         self.goal_completed_lock = threading.Lock()
+
+    def clear(self, conversation_key: str) -> None:
+        for values, lock in (
+            (self.music_continuations, self.music_lock),
+            (self.goal_continuations, self.goal_lock),
+            (self.goal_pending_confirms, self.goal_pending_lock),
+            (self.goal_completed_workflows, self.goal_completed_lock),
+        ):
+            with lock:
+                values.pop(conversation_key, None)

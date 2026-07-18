@@ -127,7 +127,6 @@ from .command_bridge_models import (
     _sanitize_history,
     _tool_calling_notice,
     build_chat_prompt,
-    make_chat_tool_request,
     markup_to_actions,
     parse_request,
     stream_delta,
@@ -140,16 +139,7 @@ from .command_bridge_models import (
     stream_start,
 )
 from .command_bridge_planner import ChatToolPlanner
-from .command_bridge_executor import (
-    ChatToolExecutor,
-    _BLUETOOTH_TOOL_POLICY,
-    _IR_TOOL_POLICY,
-    _MUSIC_TOOL_POLICY,
-    _MUSICQUEUE_TOOL_POLICY,
-    _RESEARCH_TOOL_POLICY,
-    _SEARCH_TOOL_POLICY,
-    _VISION_TOOL_POLICY,
-)
+from .command_bridge_executor import ChatToolExecutor
 from .command_bridge_providers import (
     ProviderRouter,
     _GeminiRequestError,
@@ -252,43 +242,6 @@ _SELLER_UNSUPPORTED_MSG = "賣家信譽快照目前尚未由本地 command bridg
 # Used to extract a workflow_id from a free-text schedule phrase.
 _WF_SLUG_RE = re.compile(r"\b([a-z][a-z0-9_\-]{2,})\b")
 
-_CHAT_TOOL_SATISFACTION_PROMPT = """你要判斷「工具回覆」是否已真正完成「使用者原始需求」。
-
-規則：
-1. 只看是否已完成原始需求，不要看工具有沒有被成功呼叫。
-2. 使用者的最新需求可能是接續對話的追問，要先用「對話脈絡」還原完整意圖再判斷：
-   若完整意圖是把新資訊與先前的結果整合成結論或建議，而工具回覆只提供了新資訊、
-   沒有整合出對應的結論或建議，請判定 satisfied=false。
-3. 如果工具回覆表示找不到、缺少必要資訊、只完成部分需求、或沒有回答到原始需求，請判定 satisfied=false。
-4. 如果工具回覆已直接完成完整意圖，才判定 satisfied=true。
-5. 若原始需求是「改變狀態的動作」（例如開關某裝置、調整某設定），只要工具回覆已回報
-   該動作執行成功、或回報狀態已在極限無法再改變，就算達成，請判定 satisfied=true；
-   不要因為回覆沒有附加額外資訊而判定未達成。
-6. 另外判斷 environment_blocked：若工具回覆顯示失敗原因是執行環境本身的障礙
-   （例如目標裝置或服務無法連線、硬體離線、網路／VPN／防火牆／權限阻擋），
-   換一種做法或拆成多步驟流程也無法立刻繞過，請判定 environment_blocked=true；
-   若只是內容面的不足（資料不完整、方向錯誤、可改用其他工具或來源補救），
-   請判定 environment_blocked=false。satisfied=true 時一律輸出 false。
-7. 只能輸出 JSON，不要加任何其他文字。
-
-請輸出：
-{{"satisfied": true 或 false, "environment_blocked": true 或 false, "reason": "一句極短理由"}}
-
-對話脈絡（用來還原追問的完整意圖；可能為空）：
-{context}
-
-使用者原始需求：
-{user_input}
-
-工具類型：
-{tool_name}
-
-工具查詢：
-{tool_query}
-
-工具回覆：
-{tool_answer}
-"""
 _GOAL_RESULT_SATISFACTION_PROMPT = """你要判斷「執行結果」是否已真正達成「任務目標」。
 
 規則：
@@ -1001,7 +954,6 @@ class CommandBridge:
             req.input,
             req.history,
             trusted_context=self._trusted_context_checkpoint(req),
-            evidence_context=self._trusted_evidence_context(req),
         )
         plan, metadata = self._select_chat_tool_plan(req)
         if plan is not None and plan.tool == CHAT_TOOL_CREATE_WORKFLOW:
@@ -1112,7 +1064,6 @@ class CommandBridge:
             req.input,
             req.history,
             trusted_context=self._trusted_context_checkpoint(req),
-            evidence_context=self._trusted_evidence_context(req),
         )
         # The observation also reaches the router-failed fallback prompt below.
         if observation:
@@ -1433,7 +1384,7 @@ class CommandBridge:
 
     @staticmethod
     def _conversation_key(req: WebCommandRequest) -> str:
-        return req.conversation_id or req.session_id or "_default"
+        return req.session_id or req.conversation_id or "_default"
 
     # --- chat tool ledger --------------------------------------------------
     def _record_chat_tool_run(
@@ -2793,144 +2744,6 @@ class CommandBridge:
             prompt, pool_rotation=pool_rotation, conversation_key=conversation_key
         )
 
-    def _legacy_run_chat_tool(self, req: WebCommandRequest, plan: ChatToolPlan) -> ChatToolResult:
-        """Dispatch a trusted plan to the appropriate tool executor via the registry."""
-        policy_map: dict[str, tuple[ChatToolPolicy, object]] = {
-            CHAT_TOOL_SEARCH: (_SEARCH_TOOL_POLICY, self._exec_grounded_search),
-            CHAT_TOOL_RESEARCH: (_RESEARCH_TOOL_POLICY, self._exec_registered_command_chat_tool),
-            CHAT_TOOL_MUSIC: (_MUSIC_TOOL_POLICY, self._exec_registered_command_chat_tool),
-            CHAT_TOOL_MUSICQUEUE: (
-                _MUSICQUEUE_TOOL_POLICY,
-                self._exec_registered_command_chat_tool,
-            ),
-            CHAT_TOOL_BLUETOOTH: (
-                _BLUETOOTH_TOOL_POLICY,
-                self._exec_registered_command_chat_tool,
-            ),
-            CHAT_TOOL_IR: (_IR_TOOL_POLICY, self._exec_registered_command_chat_tool),
-            CHAT_TOOL_VISION: (_VISION_TOOL_POLICY, self._exec_vision_chat_tool),
-        }
-        entry = policy_map.get(plan.tool)
-        if entry is None:
-            raise ValueError(f"unknown chat tool: {plan.tool!r}")
-        policy, executor = entry
-        display_name = self._tool_display_name(plan.tool)
-        if display_name != plan.tool:
-            policy = dataclasses.replace(policy, display_name=display_name)
-        tool_req = make_chat_tool_request(
-            tool=plan.tool,
-            raw_query=plan.query,
-            user_question=req.input or "",
-            policy=policy,
-        )
-        try:
-            tool_result: ChatToolResult = executor(req, tool_req)  # type: ignore[operator]
-        except Exception as exc:
-            # Failures go into the ledger too: the next turn's router must know
-            # this was attempted and failed instead of silently redoing it.
-            self._record_chat_tool_run(
-                req, plan.tool, plan.query, status="error", summary=str(exc)
-            )
-            raise
-        self._record_chat_tool_run(
-            req, plan.tool, plan.query, status="ok", summary=tool_result.answer
-        )
-        return tool_result
-
-    def _legacy_stream_chat_tool(
-        self, req: WebCommandRequest, plan: ChatToolPlan
-    ) -> Iterator[dict]:
-        """Run the tool off-thread, surfacing a live "正在調用…工具中" notice up
-        front (so the user can see a tool is being invoked) and heartbeats while
-        it works (so the connection stays alive), then deliver the grounded
-        answer as the ``done`` event. The finished answer still carries its own
-        persistent "已使用工具" banner from the executor.
-
-        If the client disconnects (GeneratorExit) before the worker finishes,
-        the completed result is pushed into server-side session memory so it
-        appears automatically when the user reconnects."""
-        yield stream_delta(_tool_calling_notice(plan.tool, self._tool_display_name(plan.tool)))
-        result: dict[str, object] = {}
-        done = threading.Event()
-        abandoned = threading.Event()
-        narration_queue: queue.Queue[str] = queue.Queue()
-
-        def _worker() -> None:
-            try:
-                # Staged tool milestones (e.g. /research 進度) surface live on
-                # this stream for the whole run, including a goal-loop upgrade.
-                with self._live_progress(narration_queue.put):
-                    tool_result: ChatToolResult = self._run_chat_tool(req, plan)
-                    logger.info(
-                        "[chat-tool] tool=%s sources=%d summary=%r",
-                        plan.tool, tool_result.source_count, tool_result.result_summary,
-                    )
-                    upgraded = self._maybe_upgrade_tool_result_to_goal_loop(
-                        req,
-                        plan,
-                        tool_result,
-                        planner_metadata=None,
-                        narrator=narration_queue.put,
-                    )
-                if upgraded is not None:
-                    result["response"] = upgraded
-                    return
-                result["text"] = tool_result.answer
-                result["model_metadata"] = tool_result.model_metadata
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("chat tool failed tool=%s", plan.tool)
-                result["error"] = str(exc)
-            finally:
-                done.set()
-                if abandoned.is_set():
-                    orphan = result.get("text")
-                    response = result.get("response")
-                    if orphan is None and isinstance(response, WebCommandResponse):
-                        orphan = response.message
-                    if orphan is not None:
-                        try:
-                            self._push_orphaned_result(str(orphan))
-                        except Exception:  # noqa: BLE001
-                            logger.exception("command bridge: failed to push orphaned tool result")
-
-        threading.Thread(target=_worker, daemon=True).start()
-        # Drain goal-loop narration live (an unsatisfied tool result upgrades
-        # to a goal loop mid-worker); heartbeat only while nothing arrives.
-        last_beat = time.time()
-        try:
-            while not done.is_set() or not narration_queue.empty():
-                try:
-                    line = narration_queue.get(timeout=0.5)
-                except queue.Empty:
-                    if time.time() - last_beat >= _HEARTBEAT_SECONDS:
-                        yield stream_heartbeat()
-                        last_beat = time.time()
-                    continue
-                yield stream_delta(f"{line}\n")
-                last_beat = time.time()
-        except GeneratorExit:
-            abandoned.set()
-            raise
-        if "error" in result:
-            yield stream_error(f"工具執行失敗：{result['error']}")
-            return
-        response = result.get("response")
-        if isinstance(response, WebCommandResponse):
-            if response.status == STATUS_ERROR:
-                yield stream_error(response.message)
-                return
-            yield stream_done(
-                response.message,
-                model_metadata=response.model_metadata,
-                actions=self._stream_actions(response),
-            )
-            return
-        metadata = result.get("model_metadata")
-        yield stream_done(
-            str(result.get("text") or "").strip(),
-            model_metadata=metadata if isinstance(metadata, ModelMetadata) else None,
-        )
-
     def _push_orphaned_result(self, text: str) -> None:
         """Push a completed assistant message into session memory when the
         streaming client disconnected before delivery. The user sees it on
@@ -2953,7 +2766,7 @@ class CommandBridge:
         tool call is traceable to code."""
         from .web_search import DEFAULT_WEB_SEARCH_LIMIT, web_search
 
-        query = tool_req.query  # already sanitized + budget-enforced by make_chat_tool_request
+        query = tool_req.query  # already sanitized and budget-enforced by the executor
         logger.info(
             "[chat-tool] tool=%s fn=openclaw_adapter.web_search.web_search query=%r",
             tool_req.tool, query,
@@ -3313,29 +3126,6 @@ class CommandBridge:
             return ""
         return checkpoint.summary
 
-    def _trusted_evidence_context(self, req: WebCommandRequest) -> str:
-        """Render typed tool observations without mixing them into assistant history."""
-        lines: list[str] = []
-        total = 0
-        for entry in self._chat_tool_ledger_entries(req):
-            evidence_id = str(entry.get("evidence_id") or "legacy")
-            status = str(entry.get("status") or "unknown")
-            tool = str(entry.get("tool") or "unknown")
-            source_type = str(entry.get("source_type") or "legacy_untyped")
-            query = _clip(str(entry.get("query") or ""), 300)
-            content = _clip(
-                str(entry.get("content") or entry.get("summary") or ""), 2000
-            )
-            line = (
-                f"- [{evidence_id}] source_type={source_type} status={status} "
-                f"tool={tool} query={query!r}\n  content={content}"
-            )
-            if lines and total + len(line) > 12_000:
-                break
-            lines.append(line)
-            total += len(line)
-        return "\n".join(lines)
-
     def _hydrate_chat_history(self, req: WebCommandRequest) -> WebCommandRequest:
         """Replace browser-supplied history with the durable session projection.
 
@@ -3378,87 +3168,6 @@ class CommandBridge:
         if not authoritative:
             return req
         return dataclasses.replace(req, history=authoritative)
-
-    def _legacy_chat_tool_result_satisfies_intent(
-        self,
-        req: WebCommandRequest,
-        plan: ChatToolPlan,
-        tool_result: ChatToolResult,
-    ) -> dict[str, object]:
-        context = self._conversation_context_block(req) or "（無）"
-        prompt = _CHAT_TOOL_SATISFACTION_PROMPT.format(
-            context=context,
-            user_input=json.dumps((req.input or "").strip(), ensure_ascii=False),
-            tool_name=json.dumps(plan.tool, ensure_ascii=False),
-            tool_query=json.dumps(plan.query, ensure_ascii=False),
-            tool_answer=json.dumps(tool_result.answer.strip(), ensure_ascii=False),
-        )
-        raw = self._generate_chat_tool_satisfaction_text(req.chat_backend, prompt).strip()
-        parsed = self._parse_chat_tool_satisfaction(raw)
-        logger.info(
-            "[chat-tool] satisfaction tool=%s satisfied=%s environment_blocked=%s reason=%r",
-            plan.tool,
-            parsed.get("satisfied"),
-            parsed.get("environment_blocked"),
-            parsed.get("reason"),
-        )
-        return parsed
-
-    def _legacy_generate_chat_tool_satisfaction_text(
-        self,
-        chat_backend: str,
-        prompt: str,
-        *,
-        pool_rotation: "CloudPoolRotation | None" = None,
-    ) -> str:
-        backends = [chat_backend]
-        if chat_backend != CHAT_BACKEND_LOCAL:
-            backends.append(CHAT_BACKEND_LOCAL)
-        last_exc: Exception | None = None
-        for backend in backends:
-            try:
-                text, _metadata = self._generate_chat_tool_plan_with_chat_backend(
-                    backend, prompt, pool_rotation=pool_rotation
-                )
-                logger.info("[chat-tool] satisfaction backend=%s ok", backend)
-                return text
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "[chat-tool] satisfaction backend=%s failed: %s",
-                    backend,
-                    exc,
-                )
-                last_exc = exc
-        if last_exc is not None:
-            raise last_exc
-        raise RuntimeError("no available backend for chat tool satisfaction check")
-
-    @staticmethod
-    def _legacy_parse_chat_tool_satisfaction(raw: str) -> dict[str, object]:
-        text = (raw or "").strip()
-        if not text:
-            raise ValueError("empty chat tool satisfaction response")
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", text, re.DOTALL)
-            if not match:
-                raise
-            data = json.loads(match.group(0))
-        if not isinstance(data, dict):
-            raise ValueError("chat tool satisfaction response must be a JSON object")
-        satisfied = data.get("satisfied")
-        if not isinstance(satisfied, bool):
-            raise ValueError("chat tool satisfaction response missing boolean satisfied")
-        reason = str(data.get("reason", "")).strip()
-        environment_blocked = data.get("environment_blocked")
-        if not isinstance(environment_blocked, bool):
-            environment_blocked = False
-        return {
-            "satisfied": satisfied,
-            "environment_blocked": environment_blocked and not satisfied,
-            "reason": reason,
-        }
 
     # R1.3b compatibility delegates.  The executor calls back through these
     # exact bridge names, preserving existing instance monkeypatch seams.
@@ -4216,29 +3925,6 @@ class CommandBridge:
         (path re-validation under the music root) is enforced identically."""
         return self._music.run_action(callback_data)
 
-    def _legacy_run_music_action(self, callback_data: str) -> dict:
-        prefix, _, payload = (callback_data or "").partition(":")
-        if prefix == "music":
-            handler = self._callbacks().get("music")
-            if handler is None:
-                return {"status": STATUS_ERROR, "message": "音樂功能尚未啟用。", "actions": []}
-            try:
-                result = handler(payload, "", _BRIDGE_CHAT_ID)
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("music action failed cb=%s", callback_data)
-                return {"status": STATUS_ERROR, "message": f"動作執行失敗：{exc}", "actions": []}
-            toast, new_text, markup = (list(result) + [None, None, None])[:3] \
-                if isinstance(result, tuple) else (result, None, None)
-            message = new_text if new_text else toast
-            return {
-                "status": STATUS_OK,
-                "message": str(message) if message is not None else "",
-                "actions": self._markup_to_actions(markup),
-            }
-        if prefix in ("pg", "del", "close"):
-            return self._run_list_action(prefix, payload)
-        return {"status": STATUS_ERROR, "message": f"未知的音樂動作：{callback_data}", "actions": []}
-
     def now_playing(self) -> dict:
         """Name of the song OpenClaw is currently playing (``null`` when idle),
         so the web 生活 mode can show a small now-playing strip and hide it when
@@ -4454,52 +4140,6 @@ class CommandBridge:
             self._workflow_capability = capability
         return capability
 
-    def _legacy_run_workflow_command(self, text: str, *, chat_backend: str | None = None) -> dict:
-        handler, editor = self._workflow_surface()
-        raw = (text or "").strip()
-
-        # Escape hatch (mirrors the Telegram path): a slash command is never
-        # swallowed by capture mode, so /workflow cancel (or any command to start
-        # over) always reaches the dispatcher instead of being eaten as field text.
-        if editor.is_capturing(_WF_WEB_CHAT_ID) and not raw.startswith("/"):
-            try:
-                captured = editor.handle_text_capture(raw, _WF_WEB_CHAT_ID)
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("workflow capture failed text=%r", raw)
-                return {"status": STATUS_ERROR, "message": f"工作流欄位輸入失敗：{exc}", "actions": []}
-            if captured is not None:
-                message, markup = captured
-                return {
-                    "status": STATUS_OK,
-                    "message": str(message) if message is not None else "",
-                    "actions": self._markup_to_actions(markup),
-                }
-
-        remainder = raw
-        if remainder.startswith("/workflow"):
-            remainder = remainder[len("/workflow"):].strip()
-        create_arg = self._workflow_create_arg(remainder)
-        if chat_backend and create_arg is not None and not create_arg.lstrip().startswith("{"):
-            return self._run_workflow_create_with_chat_backend(
-                create_arg,
-                chat_backend=chat_backend,
-            )
-        try:
-            result = handler(remainder, _WF_WEB_CHAT_ID)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("workflow command failed text=%r", text)
-            return {"status": STATUS_ERROR, "message": f"工作流指令失敗：{exc}", "actions": []}
-        if isinstance(result, tuple):
-            message = result[0]
-            markup = result[1] if len(result) > 1 else None
-        else:
-            message, markup = result, None
-        return {
-            "status": STATUS_OK,
-            "message": str(message) if message is not None else "",
-            "actions": self._markup_to_actions(markup),
-        }
-
     @staticmethod
     def _workflow_create_arg(remainder: str) -> str | None:
         parts = (remainder or "").strip().split(maxsplit=1)
@@ -4615,29 +4255,6 @@ class CommandBridge:
         (reorder / delete / save / cancel a draft step). The same editor handler
         the Telegram bot dispatches, so step validation on save is identical."""
         return self._workflow_capability_for_compat().run_action(callback_data)
-
-    def _legacy_run_workflow_action(self, callback_data: str) -> dict:
-        _, editor = self._workflow_surface()
-        prefix, _, payload = (callback_data or "").partition(":")
-        if prefix != "wfe":
-            return {"status": STATUS_ERROR,
-                    "message": f"未知的工作流動作：{callback_data}", "actions": []}
-        handler = editor.callback_handlers().get("wfe")
-        if handler is None:
-            return {"status": STATUS_ERROR, "message": "工作流編輯器尚未啟用。", "actions": []}
-        try:
-            result = handler(payload, "", _WF_WEB_CHAT_ID)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("workflow action failed cb=%s", callback_data)
-            return {"status": STATUS_ERROR, "message": f"動作執行失敗：{exc}", "actions": []}
-        toast, new_text, markup = (list(result) + [None, None, None])[:3] \
-            if isinstance(result, tuple) else (result, None, None)
-        message = new_text if new_text else toast
-        return {
-            "status": STATUS_OK,
-            "message": str(message) if message is not None else "",
-            "actions": self._markup_to_actions(markup),
-        }
 
     # --- schedule surface (web#9) -------------------------------------------
     def _schedulehome_surface(self) -> tuple[object, object, object]:
@@ -5384,6 +5001,13 @@ class CommandBridge:
             self._event_sessions().clear(resolved)
             self._context_compactor().clear(resolved)
             self._sessions().clear()
+            self._executor.clear(resolved)
+            self._providers.clear_pin(resolved)
+            self._conversation_state.clear(resolved)
+            with self._active_goal_runs_lock:
+                self._active_goal_runs.pop(resolved, None)
+            with self._queue_drain_lock:
+                self._queue_reconciled_sessions.discard(resolved)
             if self._queue_enabled():
                 self._prompt_queue().clear(resolved)
         except Exception as exc:  # noqa: BLE001
@@ -5564,66 +5188,7 @@ class CommandBridge:
             fallback_reason=fallback_reason,
         )
 
-    @staticmethod
-    def _chat_grounding_sources(prompt: str) -> str:
-        """Extract only user statements and typed tool results from an answer prompt."""
-        sources: list[str] = []
-        trusted_tool_entry = False
-        for line in prompt.splitlines():
-            stripped = line.strip()
-            if line.startswith("使用者："):
-                sources.append(line.removeprefix("使用者：").strip())
-                trusted_tool_entry = False
-            elif stripped.startswith("- 使用者陳述／更正") or stripped.startswith("- 工具證據"):
-                sources.append(stripped)
-                trusted_tool_entry = False
-            elif stripped.startswith("- ["):
-                trusted_tool_entry = (
-                    "source_type=tool_result" in stripped
-                    and "status=error" not in stripped
-                )
-            elif trusted_tool_entry and stripped.startswith("content="):
-                sources.append(stripped.removeprefix("content="))
-                trusted_tool_entry = False
-        return "\n".join(source for source in sources if source)
-
     def _generate_chat_response_blocking(
-        self, prompt: str, chat_backend: str, *, conversation_key: str | None = None
-    ) -> tuple[str, ModelMetadata]:
-        from .task_workspace import unsupported_numeric_atoms
-
-        draft, metadata = self._generate_chat_response_raw_blocking(
-            prompt, chat_backend, conversation_key=conversation_key
-        )
-        grounding = self._chat_grounding_sources(prompt)
-        unsupported = unsupported_numeric_atoms(draft, grounding)
-        if not unsupported:
-            return draft, metadata
-        repair_prompt = (
-            f"可作為事實依據的資料：\n{grounding or '（無）'}\n\n"
-            f"未審核草稿：\n{draft}\n\n"
-            "請重寫草稿。只有上方依據可支持事實或數字主張；"
-            f"下列數字在依據中找不到：{unsupported}。"
-            "刪除它們，或明確說明缺少哪些證據才能下結論。"
-            "不可新增任何事實、數字、一般行情或時間估計。只輸出修正後回答。"
-        )
-        try:
-            repaired, repaired_metadata = self._generate_chat_response_raw_blocking(
-                repair_prompt, chat_backend, conversation_key=conversation_key
-            )
-        except Exception:  # noqa: BLE001 - structural fallback remains available
-            logger.exception("chat answer grounding repair failed")
-            repaired = ""
-            repaired_metadata = metadata
-        if repaired and not unsupported_numeric_atoms(repaired, grounding):
-            return repaired, repaired_metadata
-        return (
-            "現有證據不足以支持草稿中的新數字或進一步結論。\n\n"
-            f"目前可確認的資料：\n{_clip(grounding, 2400) or '（無可用工具證據）'}",
-            metadata,
-        )
-
-    def _generate_chat_response_raw_blocking(
         self, prompt: str, chat_backend: str, *, conversation_key: str | None = None
     ) -> tuple[str, ModelMetadata]:
         if chat_backend == CHAT_BACKEND_CLOUD_PICKLE:

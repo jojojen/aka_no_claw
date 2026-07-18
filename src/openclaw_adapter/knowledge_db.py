@@ -982,22 +982,24 @@ def format_codegen_knowledge_block(rows: list[CodegenKnowledge], *, max_chars: i
 # seed time so their stale text stops being retrieved on already-populated DBs.
 DEPRECATED_CODEGEN_SEED: tuple[tuple[str, str], ...] = (
     ("output_contract", "可變參數放腳本頂端，不要散落在程式碼中間"),
+    ("validation", "高風險數字建議要通過證據與硬限制檢查"),
 )
 
 
 CODEGEN_SEED: tuple[dict, ...] = (
     {
-        "category": "validation",
-        "title": "高風險數字建議要通過證據與硬限制檢查",
+        "category": "architecture",
+        "title": "安全驗證要綁定有型別的能力邊界，不能套在所有聊天上",
         "technique": (
-            "模型產生投資、醫療、法律或其他高風險數字時，不能把低溫或結構化輸出當作正確性保證。"
-            "輸出前要比對可追溯證據，禁止新增無來源的金額、機率與報酬；再檢查領域硬限制，例如建議買價"
-            "不得低於不可協商的起標價卻仍宣稱可成交。若經濟上限低於市場下限，結論必須收斂為不執行，"
-            "不能用道歉文字包裝矛盾。資料不足時明列缺口並停止估值。測試應包含模型流暢但數字矛盾的反例。"
+            "需要證據、風險或一致性驗證時，把驗證器放在具有明確輸入／輸出 schema 的工具或能力邊界，"
+            "並只讀取同一 run 的結構化欄位。不要從渲染後的 prompt 反向解析事實，也不要用數字 regex、"
+            "關鍵字或舊 ledger 對所有一般聊天做第二次生成；這會把解釋、翻譯與新主題誤判成領域任務，"
+            "同時倍增延遲。一般聊天只保留 thread-scoped 訊息；工具證據以 tool message/event 留在原 turn。"
+            "測試應覆蓋跨 thread 隔離、清除後無殘留、新主題不注入舊證據，以及一般回答只呼叫模型一次。"
         ),
         "keywords": [
-            "*", "validation", "high stakes", "numeric grounding", "hard constraint",
-            "financial advice", "evidence", "hallucination", "consistency gate",
+            "*", "architecture", "typed boundary", "tool message", "thread scope",
+            "evidence", "guardrail", "prompt parsing", "latency", "session isolation",
         ],
         "confidence": 0.99,
     },
@@ -1142,6 +1144,22 @@ CODEGEN_SEED: tuple[dict, ...] = (
         ),
         "keywords": ["*", "process", "health-check", "supervisor", "worker", "restart"],
         "confidence": 0.95,
+    },
+    {
+        "category": "operations",
+        "title": "清理重複服務時要保留 supervisor 擁有的完整程序樹",
+        "technique": (
+            "supervisor 回報的權威 PID 可能是 shell wrapper，真正 worker、logger 或 pipe consumer 是其"
+            "子孫程序。清理重複 instance 時不能只保留權威 PID、再按 command pattern 殺掉其他命中者；"
+            "這會殺死合法 child，造成 readiness 暫時為零並觸發延遲重啟。應由權威 PID 沿 PPID 建立"
+            "受保護程序樹，只刪除樹外的同類 worker。回歸測試要同時放入 wrapper、合法 child 與真正"
+            "orphan，證明只刪除 orphan。"
+        ),
+        "keywords": [
+            "*", "process tree", "supervisor", "wrapper", "child", "orphan",
+            "ppid", "restart", "readiness",
+        ],
+        "confidence": 0.98,
     },
     {
         "category": "architecture",

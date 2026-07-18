@@ -19,6 +19,7 @@ import pytest
 
 from openclaw_adapter import command_bridge_server as srv
 from openclaw_adapter.command_bridge import CommandBridge
+from openclaw_adapter.command_bridge_models import parse_request
 from openclaw_adapter.session_memory import (
     MAX_MESSAGES,
     MAX_SCALAR_LEN,
@@ -232,6 +233,25 @@ def test_bridge_clear_targets_selected_session_and_resets_context_usage(tmp_path
     assert loaded["session"]["messages"][0]["text"] == "hi"
     assert b.clear_session()["status"] == "ok"
     assert b.load_session()["session"]["messages"] == []
+
+
+def test_bridge_clear_removes_in_process_conversation_state(tmp_path):
+    b = _bridge(tmp_path)
+    req = parse_request({
+        "mode": "chat", "input": "remember", "session_id": "browser-1",
+        "conversation_id": "default",
+    })
+    b._record_chat_tool_run(
+        req, "/research", "item", status="ok", summary="stale evidence"
+    )
+    b._providers.record_pin("browser-1", "gemini")
+    b._conversation_state.music_continuations["browser-1"] = {"state": {}}
+
+    assert b.clear_session("browser-1")["status"] == "ok"
+
+    assert b._chat_tool_ledger_entries(req) == []
+    assert b._providers.pinned_provider("browser-1") is None
+    assert "browser-1" not in b._conversation_state.music_continuations
 
 
 def test_bridge_save_non_object_is_error(tmp_path):

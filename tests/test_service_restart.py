@@ -191,9 +191,10 @@ def test_orphan_launchd_workers_are_reaped() -> None:
     for label, pattern in reaped.items():
         assert f'reap_orphans "{label}" "{pattern}"' in script
 
-    # reap_orphans keeps launchd's PID and kills the rest; it must run AFTER the
-    # kickstart that (re)establishes that PID.
+    # reap_orphans keeps launchd's process tree and kills the rest; it must run
+    # AFTER the kickstart that (re)establishes the root PID.
     assert "launchctl list" in script
+    assert 'is_descendant_of "$pid" "$keep"' in script
     assert script.index('kickstart_service "price_monitor"') < script.index(
         'reap_orphans "price_monitor"'
     )
@@ -264,6 +265,46 @@ def test_restart_readiness_excludes_launchd_shell_wrapper(tmp_path) -> None:
     )
     assert result.returncode == 0
     assert "price_monitor ready (one worker)" in result.stdout
+
+
+def test_reap_orphans_preserves_launchd_wrapper_descendants(tmp_path) -> None:
+    script = _build_restart_script(
+        workspace_dir=Path("/tmp/workspace"),
+        claw_dir=Path("/tmp/workspace/aka_no_claw"),
+        source="test",
+    )
+    descendant_func = _extract_func(script, "is_descendant_of")
+    reap_func = _extract_func(script, "reap_orphans")
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    (fakebin / "launchctl").write_text(
+        "#!/bin/bash\n"
+        'echo "111 0 local.openclaw.price_monitor"\n'
+    )
+    (fakebin / "pgrep").write_text("#!/bin/bash\necho '222 333'\n")
+    (fakebin / "ps").write_text(
+        "#!/bin/bash\n"
+        'case "$*" in\n'
+        '  *"-p 222"*) echo "111" ;;\n'
+        '  *"-p 333"*) echo "1" ;;\n'
+        '  *"-p 111"*) echo "1" ;;\n'
+        "esac\n"
+    )
+    for name in ("launchctl", "pgrep", "ps"):
+        path = fakebin / name
+        path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+    harness = descendant_func + "\n" + reap_func + (
+        '\nreap_orphans "price_monitor" "openclaw_adapter price-monitor-service"\n'
+    )
+    env = dict(os.environ, PATH=f"{fakebin}:{os.environ['PATH']}")
+    result = subprocess.run(
+        ["/bin/bash", "-c", harness], capture_output=True, text=True, env=env
+    )
+
+    assert result.returncode == 0
+    assert "launchd keeps 111; killed orphans 333" in result.stdout
+    assert "killed orphans 222" not in result.stdout
 
 
 def test_count_service_excludes_tmux_launcher(tmp_path) -> None:

@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -76,44 +75,6 @@ _TRUSTED_FACT_TYPES = frozenset({
     VARIABLE_TYPE_USER_CONTEXT,
     VARIABLE_TYPE_COMMAND_RESULT,
 })
-_NUMERIC_ATOM_RE = re.compile(
-    r"(?<![\w])(?:[¥$€£]\s*)?\d[\d,]*(?:\.\d+)?%?(?![\w])"
-)
-
-
-def _normalise_numeric_atom(value: str) -> str:
-    return re.sub(r"[\s,]", "", value).lower()
-
-
-def unsupported_numeric_atoms(answer: str, trusted_inputs: str) -> list[str]:
-    """Return material numeric claims absent from factual/user evidence.
-
-    Small bare integers are commonly list numbering, so only currency,
-    percentages, decimals, or magnitudes >= 100 are gated.  This is a generic
-    provenance check: no product, price, marketplace, or grading vocabulary is
-    involved.
-    """
-    allowed = {
-        _normalise_numeric_atom(atom)
-        for atom in _NUMERIC_ATOM_RE.findall(trusted_inputs)
-    }
-    unsupported: list[str] = []
-    for match in _NUMERIC_ATOM_RE.finditer(answer):
-        atom = match.group(0)
-        normalized = _normalise_numeric_atom(atom)
-        digits = re.sub(r"\D", "", normalized)
-        line_prefix = answer[answer.rfind("\n", 0, match.start()) + 1 : match.start()]
-        suffix = answer[match.end() : match.end() + 1]
-        is_list_marker = not line_prefix.strip() and suffix in {".", "、", ")", "）"}
-        material = (
-            any(symbol in atom for symbol in "¥$€£%")
-            or "." in atom
-            or (digits.isdigit() and int(digits) >= 100)
-            or not is_list_marker
-        )
-        if material and normalized not in allowed and atom not in unsupported:
-            unsupported.append(atom)
-    return unsupported
 
 # Accepted input variable types per command sink.
 # None means any text type is accepted (generic text-input commands).
@@ -870,7 +831,6 @@ class WorkflowRunner:
         # and earlier model prose may clarify intent, but only user/tool/command
         # observations may ground factual claims.
         input_blocks: list[str] = []
-        trusted_values: list[str] = []
         for var_name in step.inputs:
             try:
                 value = store.resolve(var_name)
@@ -886,7 +846,6 @@ class WorkflowRunner:
             variable_type = variable.type if variable is not None else "text"
             if variable_type in _TRUSTED_FACT_TYPES:
                 trust = "grounding_source"
-                trusted_values.append(value)
             elif variable_type == VARIABLE_TYPE_REQUIREMENT:
                 trust = "requirement_only"
             else:
@@ -922,34 +881,6 @@ class WorkflowRunner:
                 ),
                 None,
             )
-
-        trusted_text = "\n".join(trusted_values)
-        unsupported = unsupported_numeric_atoms(result, trusted_text)
-        if unsupported:
-            repair_prompt = (
-                f"Grounding sources:\n{trusted_text}\n\n"
-                f"Draft answer:\n{result}\n\n"
-                "Rewrite the draft using only the grounding sources. The following material "
-                f"numeric claims have no matching source value: {unsupported}. "
-                "Remove them, or replace the affected conclusion with a clear statement of "
-                "what evidence is missing. Do not add any new facts or numbers. Output only "
-                "the corrected answer."
-            )
-            try:
-                repaired = self.llm_client.generate(repair_prompt, temperature=0.2)
-            except Exception:  # noqa: BLE001 - retain the structural safe fallback below
-                logger.exception(
-                    "task_workspace: numeric grounding repair failed step=%s", step.id
-                )
-                repaired = ""
-            if repaired and not unsupported_numeric_atoms(repaired, trusted_text):
-                result = repaired
-            else:
-                excerpts = "\n\n".join(value[:1600] for value in trusted_values if value.strip())
-                result = (
-                    "現有輸入不足以支持包含新數字的結論；以下是目前可確認的資料：\n\n"
-                    f"{excerpts or '（沒有可用的事實證據）'}"
-                )
 
         provenance = f"llm_transform(inputs={step.inputs})"
         var = store.bind(

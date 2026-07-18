@@ -1,5 +1,18 @@
 # Project Constitution
 
+## 0. First Principle — General Correctness
+
+1. **Correctness first means general correctness, not correctness for one case.**
+   Never make the current example pass with hardcoded keywords, values, output
+   text, or exception branches. Prefer a structural solution that removes
+   special cases; a sound fix should normally reduce total code and branch
+   count. If a proposed fix adds case-specific code, stop and redesign it.
+
+2. **Research uncertainty before coding.** When the correct general solution
+   is unclear, consult current primary sources and proven implementations before
+   changing code. Use that evidence to define a general contract or design;
+   never replace uncertainty with a case-specific hardcode.
+
 Last updated: 2026-04-14
 
 This file is the project constitution for this repository. Before starting any substantial work, read this file first, then read the relevant local docs such as `README.md` and `OPENCLAW_TCG_MONITOR_PLAN.md`.

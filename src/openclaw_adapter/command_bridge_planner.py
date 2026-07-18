@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-import re
 from typing import TYPE_CHECKING, Protocol
 
 from .command_bridge_models import (
@@ -64,13 +63,6 @@ logger = logging.getLogger(__name__)
 # one strict-JSON response, whether a dedicated answer stage or an allowlisted
 # tool should run.  The router never writes user-visible prose.
 _ROUTER_TIMEOUT_CAP_SECONDS = 30
-_EVIDENCE_TOOLS = frozenset({CHAT_TOOL_SEARCH, CHAT_TOOL_RESEARCH, CHAT_TOOL_VISION})
-_EXPLICIT_REFRESH_RE = re.compile(
-    r"(?:再|重新|幫我|請)?(?:查|查詢|查查|搜尋|搜索|找資料|驗證|核實)"
-    r"|(?:search|look\s*up|check|verify|refresh|update)\b",
-    re.IGNORECASE,
-)
-_URL_RE = re.compile(r"https?://", re.IGNORECASE)
 _CHAT_TOOL_PLAN_PROMPT_TEMPLATE = (
     "你是 aka_no_claw 聊天助理。請根據對話決定："
     "交給一般回答階段，或使用一個工具處理『最新訊息』。\n"
@@ -123,8 +115,6 @@ class PlannerDeps(Protocol):
     def _handlers(self): ...
 
     def _conversation_key(self, req: WebCommandRequest) -> str: ...
-
-    def _chat_tool_ledger_entries(self, req: WebCommandRequest) -> list[dict]: ...
 
     def _trusted_context_checkpoint(self, req: WebCommandRequest) -> str: ...
 
@@ -197,11 +187,6 @@ class ChatToolPlanner:
             # Rolling compatibility: older models may still emit the obsolete
             # answer field.  Never let router prose cross the decision boundary.
             plan = dataclasses.replace(plan, answer="")
-        elif self._should_reuse_existing_evidence(req, plan, observation):
-            plan = ChatToolPlan(
-                tool=CHAT_TOOL_NO_TOOL,
-                reason_summary="reuse existing typed evidence for follow-up",
-            )
         logger.info(
             "[chat-tool-plan] tool=%s query=%r direct_answer=%s reason=%s",
             plan.tool,
@@ -210,36 +195,6 @@ class ChatToolPlanner:
             plan.reason_summary,
         )
         return plan, metadata
-
-    def _should_reuse_existing_evidence(
-        self,
-        req: WebCommandRequest,
-        plan: ChatToolPlan,
-        observation: str | None,
-    ) -> bool:
-        """Prevent an elliptical follow-up from re-running the same read tool.
-
-        A new URL/image or an explicit request to search/refresh remains
-        authorized. Otherwise an existing successful typed result is reused;
-        the answer stage can state that more evidence is needed instead of
-        silently spending another long tool run.
-        """
-        if plan.tool not in _EVIDENCE_TOOLS:
-            return False
-        latest = (req.input or "").strip()
-        if observation or req.has_image_attachment or _URL_RE.search(latest):
-            return False
-        if _EXPLICIT_REFRESH_RE.search(latest):
-            return False
-        ledger_reader = getattr(self._deps, "_chat_tool_ledger_entries", None)
-        if not callable(ledger_reader):
-            return False
-        return any(
-            str(entry.get("tool")) == plan.tool
-            and str(entry.get("status")) in {"ok", "partial"}
-            and str(entry.get("source_type") or "tool_result") == "tool_result"
-            for entry in ledger_reader(req)
-        )
 
     def build_plan_prompt(
         self, req: WebCommandRequest, observation: str | None = None
@@ -253,28 +208,6 @@ class ChatToolPlanner:
         for turn in req.history:
             label = _CHAT_ROLE_LABELS.get(turn.role, turn.role)
             lines.append(f"{label}：{turn.content}")
-        ledger = self._deps._chat_tool_ledger_entries(req)
-        if ledger:
-            lines += ["", "本次對話先前已執行過的工具紀錄（由舊到新）："]
-            for entry in ledger:
-                status_label = {"ok": "成功", "partial": "部分完成"}.get(
-                    str(entry.get("status")), "失敗"
-                )
-                lines.append(
-                    f"- {entry.get('tool')}（參數：{entry.get('query')}）→ "
-                    f"{status_label}｜{entry.get('summary')}"
-                )
-            lines.append(
-                "以上是已完成（或已失敗）的工作，不要為同樣的需求重複執行同一個工具："
-                "若既有結果足以回答（包括使用者在問你做過什麼），直接用 no_tool 統整回答；"
-                "若先前失敗，優先改用其他工具或利用已有資訊，而不是原樣重試。"
-                "「同樣的需求」只指使用者重複要求同一件事；"
-                "使用者提出新的動作要求（例如先前是播放、現在要停止）不是重複，要照常執行。"
-            )
-            lines.append(
-                "若最新訊息只是質疑、更正或追問先前結果，且沒有新 URL／圖片，"
-                "也沒有明確要求重新查詢，必須用 no_tool 重用現有證據。"
-            )
         if observation:
             lines += [
                 "",
