@@ -18,6 +18,15 @@ description: Install and verify AivisSpeech on the Mac mini so quiz vocab audio 
    changing code. Use that evidence to define a general contract or design;
    never replace uncertainty with a case-specific hardcode.
 
+3. **Use ASD-STE100 as the language principle for comments and documentation.**
+   During development, write code comments, technical notes, and user-facing
+   project documentation in ASD Simplified Technical English style: short direct
+   sentences, active voice, one instruction per sentence where practical,
+   consistent terms for the same concept, and concrete nouns instead of vague
+   references. Avoid idioms, rhetorical phrasing, hidden assumptions, and
+   unnecessary adjectives. When exact ASD-STE100 compliance is impractical,
+   prefer clarity, consistency, and unambiguous technical meaning.
+
 Use this skill when the goal is to make `/quiz vocab` audio playback generate `--aivis.wav` files on macOS.
 
 ## Proven Path
