@@ -32,6 +32,21 @@ from .task_workspace import (
     WorkflowStore,
 )
 
+
+class _WorkflowTransformClient:
+    """Use the configured cloud pool for workflow transform steps."""
+
+    def __init__(self, settings) -> None:
+        self._settings = settings
+
+    def generate(self, prompt: str, *, temperature: float = 0.7) -> str:
+        if self._settings is None:
+            raise RuntimeError("workflow llm_transform: settings are unavailable")
+        from .command_bridge_providers import generate_via_cloud_pool
+
+        return generate_via_cloud_pool(self._settings, prompt)
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -666,10 +681,9 @@ def _cmd_run(
             return str(result[0] if isinstance(result, tuple) else result)
         dispatcher["/music"] = _music
 
-    # Use the runner's main LLM client for llm_transform steps (Big Pickle /
-    # Mistral / local, whichever is active).  executor.client may not exist on
-    # test fakes, so guard with getattr.
-    llm_client = getattr(executor, "client", None)
+    # Use the configured cloud pool for every transform step.
+    # The shared pool owns provider order and fallback behavior.
+    llm_client = _WorkflowTransformClient(settings)
 
     wf_runner = WorkflowRunner(
         executor=executor,

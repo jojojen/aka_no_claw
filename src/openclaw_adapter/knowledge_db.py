@@ -1162,6 +1162,22 @@ CODEGEN_SEED: tuple[dict, ...] = (
         "confidence": 0.98,
     },
     {
+        "category": "operations",
+        "title": "子 shell 必須收到完整命令，不能依賴父 shell 的函式",
+        "technique": (
+            "新的 shell 不會自動取得父 shell 的函式。launchctl、systemd 或 subprocess "
+            "啟動的命令若使用父 shell 才有的 helper，服務會在啟動後立即失敗。請在命令中"
+            "使用可執行檔的明確路徑。請明確傳入必要的環境變數。不要把父 shell 的函式名稱"
+            "放進子 shell 命令。bash -n 只能檢查語法。測試也必須確認子 shell 可解析每個"
+            "執行檔。"
+        ),
+        "keywords": [
+            "*", "shell", "subprocess", "launchctl", "systemd", "function",
+            "environment", "service", "restart",
+        ],
+        "confidence": 0.98,
+    },
+    {
         "category": "architecture",
         "title": "相容入口應導向唯一的正式 UI，避免重啟後回到過期頁面",
         "technique": (

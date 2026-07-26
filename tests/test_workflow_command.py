@@ -4,6 +4,7 @@ import json
 from types import SimpleNamespace
 import pytest
 
+from openclaw_adapter import home_schedule
 from openclaw_adapter.task_workspace import Workflow, WorkflowStep, WorkflowStore
 from openclaw_adapter.workflow_command import (
     _build_nl_workflow_prompt,
@@ -702,6 +703,135 @@ def test_cmd_traces_limits_to_five(tmp_path):
     reply = _cmd_traces("wf-test", store)
     assert "7 回" in reply           # total count shown
     assert reply.count("[") <= 5    # only 5 entries rendered
+
+
+# ── E2E: llm_transform cloud-pool routing ────────────────────────────────────
+
+def test_home_schedule_llm_transform_uses_cloud_pool(tmp_path):
+    """A scheduled workflow uses the configured cloud pool."""
+    spoken: list[str] = []
+
+    def saynow_raw(text, chat_id=None):
+        spoken.append(text)
+        return "🔊 OK"
+
+    store = _make_store(tmp_path)
+    wf = Workflow(id="wf-e2e-cloud", goal="e2e cloud", steps=[
+        WorkflowStep(id="s1", kind="tool_call", tool="t", output="weather"),
+        WorkflowStep(id="s2", kind="llm_transform", inputs=["weather"],
+                     instructions="用女僕口吻說日文", output="greeting"),
+        WorkflowStep(id="s3", kind="command_sink", command="/saynow",
+                     input="greeting", output="out"),
+    ])
+    store.save(wf)
+    executor = FakeExecutor(tmp_path, {"t": (True, "東京：晴れ 33°C")})
+
+    import types
+    fake_settings = types.SimpleNamespace(
+        openclaw_local_text_endpoint="http://127.0.0.1:11434",
+        openclaw_local_text_model="qwen3:4b",
+        openclaw_local_text_timeout_seconds=45,
+        openclaw_opencode_base_url="https://opencode.ai/zen/v1",
+        openclaw_opencode_model="big-pickle",
+        openclaw_opencode_api_key=None,
+    )
+
+    import unittest.mock as mock
+    cloud_response = "ご主人様、今日の東京は晴れで33°Cでございます！"
+
+    with mock.patch(
+        "openclaw_adapter.command_bridge_providers.generate_via_cloud_pool",
+        return_value=cloud_response,
+    ) as mock_cloud:
+        handlers = {
+            "/workflow": SimpleNamespace(
+                handler=lambda remainder, chat_id: _cmd_run(
+                    remainder.removeprefix("run ").strip(),
+                    chat_id,
+                    store,
+                    executor,
+                    saynow_raw,
+                    fake_settings,
+                )
+            )
+        }
+        run_command = home_schedule.make_run_slash_command(handlers)
+        schedule_store = home_schedule.HomeScheduleStore(
+            str(tmp_path / "home_schedules.json")
+        )
+        entry = schedule_store.add(
+            time="18:00",
+            days=["mon"],
+            commands=["/workflow run wf-e2e-cloud"],
+        )
+        scheduler = home_schedule.HomeScheduleScheduler(
+            store=schedule_store,
+            run_command=run_command,
+            chat_id="chat-1",
+        )
+        results = scheduler.run_now(entry)
+
+    assert len(results) == 1
+    assert "✅" in results[0]
+    mock_cloud.assert_called_once_with(fake_settings, mock.ANY)
+    assert spoken == [cloud_response]
+    traces = store.list_traces("wf-e2e-cloud")
+    assert len(traces) == 1
+    assert traces[0].ok
+
+
+def test_cmd_run_llm_transform_does_not_bypass_cloud_pool(tmp_path):
+    """A pool failure must not use the code-generation client."""
+    spoken: list[str] = []
+
+    def saynow_raw(text, chat_id=None):
+        spoken.append(text)
+        return "🔊 OK"
+
+    store = _make_store(tmp_path)
+    wf = Workflow(id="wf-e2e-fb", goal="e2e fallback", steps=[
+        WorkflowStep(id="s1", kind="tool_call", tool="t", output="weather"),
+        WorkflowStep(id="s2", kind="llm_transform", inputs=["weather"],
+                     instructions="用女僕口吻說日文", output="greeting"),
+        WorkflowStep(id="s3", kind="command_sink", command="/saynow",
+                     input="greeting", output="out"),
+    ])
+    store.save(wf)
+    executor = FakeExecutor(tmp_path, {"t": (True, "東京：晴れ 33°C")})
+
+    class _LocalClient:
+        def __init__(self):
+            self.prompts = []
+        def generate(self, prompt, *, temperature=0.7):
+            self.prompts.append(prompt)
+            return "must not be used"
+
+    local_client = _LocalClient()
+    executor.client = local_client
+
+    import types
+    fake_settings = types.SimpleNamespace(
+        openclaw_local_text_endpoint="http://127.0.0.1:11434",
+        openclaw_local_text_model="qwen3:4b",
+        openclaw_local_text_timeout_seconds=45,
+    )
+
+    import unittest.mock as mock
+
+    with mock.patch(
+        "openclaw_adapter.command_bridge_providers.generate_via_cloud_pool",
+        side_effect=ConnectionError("cloud pool unavailable"),
+    ) as mock_cloud:
+        reply = _cmd_run("wf-e2e-fb", "chat-1", store, executor, saynow_raw, fake_settings)
+
+    assert "❌" in reply
+    assert "cloud pool unavailable" in reply
+    mock_cloud.assert_called_once()
+    assert spoken == []
+    assert local_client.prompts == []
+    traces = store.list_traces("wf-e2e-fb")
+    assert len(traces) == 1
+    assert not traces[0].ok
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

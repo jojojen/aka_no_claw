@@ -39,18 +39,28 @@ def test_restart_script_covers_core_services() -> None:
     assert "openclaw_adapter.scrape_worker" in script
 
 
-def test_launchd_services_use_kickstart_not_nohup_except_telegram() -> None:
-    # The duplicate-poller bug: kill+nohup of a launchd KeepAlive service runs a
-    # copy alongside the one launchd respawns. launchd-managed services must be
-    # restarted via `kickstart -k` (single instance), never nohup-started.
+def test_launchd_services_use_kickstart_or_resubmit_not_nohup() -> None:
+    # The duplicate-poller bug: kill+nohup of a launchd service runs a
+    # copy alongside the one launchd respawns. Persistent launchd services
+    # (chat_web) use `kickstart -k`. Transient services (price_monitor,
+    # sns_monitor, opportunity) started with `launchctl submit -l` must be
+    # re-submitted, not kickstarted.
     script = _build_restart_script(
         workspace_dir=Path("/tmp/workspace"),
         claw_dir=Path("/tmp/workspace/aka_no_claw"),
         source="test",
     )
 
-    for label in ("price_monitor", "sns_monitor", "opportunity", "chat_web"):
-        assert f'kickstart_service "{label}"' in script
+    # chat_web is a persistent launchd service — kickstart is correct.
+    assert 'kickstart_service "chat_web"' in script
+
+    # Transient services use submit_transient_service, not kickstart.
+    for label in ("price_monitor", "sns_monitor", "opportunity"):
+        assert f'submit_transient_service "local.openclaw.{label}"' in script
+        assert f'kickstart_service "{label}"' not in script
+    assert 'launchctl remove "$label"' in script
+    assert "scripts/log_rotator.py" in script
+    assert "| rotator_cmd " not in script
 
     # Telegram needs local-network access for BroadLink RM4 Mini. On macOS,
     # launchctl-submitted daemon jobs fail ARP/route warm-up even when the same
@@ -71,11 +81,12 @@ def test_launchd_services_use_kickstart_not_nohup_except_telegram() -> None:
     assert "-m openclaw_adapter telegram-poll" in wrapper
     assert "sleep 30" in wrapper  # > Telegram's ~20s getUpdates slot hold (409 guard)
 
-    # These must NOT be nohup-started (that was the duplicate source).
-    assert "-m openclaw_adapter price-monitor-service" not in script
-    assert "-m openclaw_adapter sns-monitor-service" not in script
-    assert "-m openclaw_adapter opportunity-agent" not in script
-    assert "-m openclaw_adapter chat-web" not in script
+    # These must NOT be nohup-started directly (that was the duplicate source).
+    # They are started via submit_transient_service with the command string.
+    assert 'nohup bash -c.*price-monitor-service' not in script
+    assert 'nohup bash -c.*sns-monitor-service' not in script
+    assert 'nohup bash -c.*opportunity-agent' not in script
+    assert 'nohup bash -c.*chat-web' not in script
 
     # The nohup chat-web "squatter" on :8780 is still stopped so launchd can bind.
     assert 'stop_pattern "chat web (nohup squatter)"' in script
@@ -192,11 +203,12 @@ def test_orphan_launchd_workers_are_reaped() -> None:
         assert f'reap_orphans "{label}" "{pattern}"' in script
 
     # reap_orphans keeps launchd's process tree and kills the rest; it must run
-    # AFTER the kickstart that (re)establishes the root PID.
+    # AFTER the service start that (re)establishes the root PID.
     assert "launchctl list" in script
     assert 'is_descendant_of "$pid" "$keep"' in script
-    assert script.index('kickstart_service "price_monitor"') < script.index(
-        'reap_orphans "price_monitor"'
+    # chat_web uses kickstart, transient services use submit_transient_service.
+    assert script.index('kickstart_service "chat_web"') < script.index(
+        'reap_orphans "chat_web"'
     )
     # Before/after snapshots + per-service final counts land in the restart log.
     assert 'snapshot "before"' in script
@@ -225,6 +237,15 @@ def test_successful_restart_sends_a_telegram_confirmation() -> None:
     assert 'source "$CLAW/run/mac-mini-stack.env"' in script
     assert 'telegram-send-test --message "$message"' in script
     assert 'restartall incomplete; Telegram success notification not sent' in script
+    for label in (
+        "price_monitor",
+        "sns_monitor",
+        "opportunity",
+        "telegram",
+        "chat_web",
+        "command bridge",
+    ):
+        assert f'wait_for_single_service "{label}"' in script
     assert script.rindex('wait_for_single_service "telegram"') < script.rindex(
         "notify_restart_success"
     )

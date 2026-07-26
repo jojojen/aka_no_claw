@@ -51,6 +51,21 @@ def test_codegen_seed_for_supervisor_process_tree_is_always_retrievable(db):
     assert "orphan" in rule.technique
 
 
+def test_codegen_seed_for_child_shell_commands_is_always_retrievable(db):
+    db.seed_codegen_knowledge()
+
+    rows = db.retrieve_codegen_knowledge("任意程式需求", k=100)
+    rule = next(
+        row for row in rows
+        if row.title == "子 shell 必須收到完整命令，不能依賴父 shell 的函式"
+    )
+
+    assert rule.category == "operations"
+    assert "*" in rule.keywords
+    assert "明確路徑" in rule.technique
+    assert "bash -n" in rule.technique
+
+
 def test_codegen_seed_for_durable_queue_restart_is_always_retrievable(db):
     db.seed_codegen_knowledge()
 

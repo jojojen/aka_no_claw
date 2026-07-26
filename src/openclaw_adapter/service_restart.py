@@ -105,6 +105,18 @@ kickstart_service() {{
     || echo "[$(date '+%H:%M:%S')] kickstart $label failed (not loaded?)"
 }}
 
+# Transient services started with `launchctl submit -l` cannot be kickstarted;
+# they must be removed and re-submitted.  This is the correct restart path for
+# price_monitor, sns_monitor, and opportunity.
+submit_transient_service() {{
+  local label="$1"
+  local command="$2"
+  echo "[$(date '+%H:%M:%S')] resubmit $label"
+  launchctl remove "$label" 2>/dev/null || true
+  launchctl submit -l "$label" -- /bin/bash -lc "$command" 2>/dev/null \\
+    || echo "[$(date '+%H:%M:%S')] resubmit $label failed"
+}}
+
 stop_pattern() {{
   local label="$1"
   local pattern="$2"
@@ -440,10 +452,41 @@ force_pattern "playwright drivers" "related_to_claw/.*/playwright/driver/package
 free_port "chat web" 8780
 
 # launchd-managed services: one clean instance each via kickstart (NOT nohup).
-kickstart_service "price_monitor"
-kickstart_service "sns_monitor"
-kickstart_service "opportunity"
 kickstart_service "chat_web"
+
+# Transient services started with `launchctl submit -l` must be re-submitted,
+# not kickstarted. The command must match the original start script exactly.
+AKA_VENV="$CLAW/.venv"
+AKA_DIR="$CLAW"
+RUNTIME_ENV="$CLAW/run/mac-mini-stack.env"
+LOG_DIR_VAL="$LOG_DIR"
+ROTATOR="$CLAW/scripts/log_rotator.py"
+submit_transient_service "local.openclaw.price_monitor" \
+  "source '$RUNTIME_ENV'; cd '$AKA_DIR'; export PYTHONPATH='.:src'; '$AKA_VENV/bin/python' -m openclaw_adapter price-monitor-service 2>&1 | ROTATE_BYTES=52428800 ROTATE_KEEP=5 '$AKA_VENV/bin/python' '$ROTATOR' '$LOG_DIR_VAL/openclaw_price_monitor.log'"
+submit_transient_service "local.openclaw.sns_monitor" \
+  "source '$RUNTIME_ENV'; cd '$AKA_DIR'; export PYTHONPATH='.:src'; '$AKA_VENV/bin/python' -m openclaw_adapter sns-monitor-service 2>&1 | ROTATE_BYTES=52428800 ROTATE_KEEP=5 '$AKA_VENV/bin/python' '$ROTATOR' '$LOG_DIR_VAL/openclaw_sns_monitor.log'"
+submit_transient_service "local.openclaw.opportunity" \
+  "source '$RUNTIME_ENV'; cd '$AKA_DIR'; export PYTHONPATH='.:src'; '$AKA_VENV/bin/python' -m openclaw_adapter opportunity-agent 2>&1 | ROTATE_BYTES=52428800 ROTATE_KEEP=5 '$AKA_VENV/bin/python' '$ROTATOR' '$LOG_DIR_VAL/opportunity_agent.log'"
+
+# Ensure Ollama is running; it's needed by the local LLM fallback chain.
+if command -v ollama >/dev/null 2>&1; then
+  if ! curl -fsS -m 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+    echo "[$(date '+%H:%M:%S')] starting Ollama"
+    launchctl remove "local.openclaw.ollama" 2>/dev/null || true
+    launchctl submit -l "local.openclaw.ollama" -- /bin/bash -lc "ollama serve 2>&1 | ROTATE_BYTES=52428800 ROTATE_KEEP=5 '$AKA_VENV/bin/python' '$ROTATOR' '$LOG_DIR_VAL/ollama.log'"
+    for _ in $(seq 1 10); do
+      if curl -fsS -m 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+        echo "[$(date '+%H:%M:%S')] Ollama ready"
+        break
+      fi
+      sleep 1
+    done
+  else
+    echo "[$(date '+%H:%M:%S')] Ollama already running"
+  fi
+else
+  echo "[$(date '+%H:%M:%S')] Ollama not installed; skipping"
+fi
 
 # Give launchd a moment to relaunch + register the new PIDs, then kill any
 # ORPHAN duplicates of the managed workers (aka_no_claw#40): kickstart only
@@ -501,6 +544,7 @@ count_service "opportunity" "openclaw_adapter opportunity-agent"
 count_service "telegram" "python.*openclaw_adapter telegram-poll"
 count_service "chat_web" "openclaw_adapter chat-web"
 count_service "command bridge" "python.*openclaw_adapter command-bridge --lan --port 8781"
+
 if wait_for_single_service "price_monitor" "openclaw_adapter price-monitor-service" \\
   && wait_for_single_service "sns_monitor" "openclaw_adapter sns-monitor-service" \\
   && wait_for_single_service "opportunity" "openclaw_adapter opportunity-agent" \\
