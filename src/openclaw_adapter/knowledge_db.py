@@ -27,12 +27,13 @@ import logging
 import math
 import re
 import sqlite3
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from hashlib import sha1
 from pathlib import Path
-from typing import Iterator, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from .domain_registry import build_domain_id, get_domain
 from .url_canonicalize import canonicalize_url, is_traceable_source, source_domain
@@ -163,7 +164,7 @@ _CODEGEN_SEMANTIC_MIN_SIM = 0.5
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    return datetime.now(UTC).replace(microsecond=0).isoformat()
 
 
 def _vec_to_array(vec: list[float] | None) -> array.array | None:
@@ -193,7 +194,7 @@ def _normalize_canonical(name: str) -> str:
 
 
 def build_entry_id(*, entity_canonical: str, entity_type: str) -> str:
-    return sha1(f"{entity_canonical}|{entity_type}".encode("utf-8")).hexdigest()
+    return sha1(f"{entity_canonical}|{entity_type}".encode()).hexdigest()
 
 
 def _resolve_domain_id(domain: str | None) -> str | None:
@@ -237,7 +238,7 @@ CODEGEN_ORIGINS: tuple[str, ...] = ("seed", "distilled")
 
 
 def build_codegen_knowledge_id(*, category: str, title: str) -> str:
-    return sha1(f"{category}|{title}".encode("utf-8")).hexdigest()
+    return sha1(f"{category}|{title}".encode()).hexdigest()
 
 
 @dataclass(frozen=True)

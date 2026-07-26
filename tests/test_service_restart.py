@@ -282,7 +282,7 @@ def test_restart_readiness_excludes_launchd_shell_wrapper(tmp_path) -> None:
     )
     env = dict(os.environ, PATH=f"{fakebin}:{os.environ['PATH']}")
     result = subprocess.run(
-        ["/bin/bash", "-c", harness], capture_output=True, text=True, env=env
+        ["/bin/bash", "-c", harness], capture_output=True, text=True, env=env, check=False
     )
     assert result.returncode == 0
     assert "price_monitor ready (one worker)" in result.stdout
@@ -320,7 +320,7 @@ def test_reap_orphans_preserves_launchd_wrapper_descendants(tmp_path) -> None:
     )
     env = dict(os.environ, PATH=f"{fakebin}:{os.environ['PATH']}")
     result = subprocess.run(
-        ["/bin/bash", "-c", harness], capture_output=True, text=True, env=env
+        ["/bin/bash", "-c", harness], capture_output=True, text=True, env=env, check=False
     )
 
     assert result.returncode == 0
@@ -362,7 +362,7 @@ def test_count_service_excludes_tmux_launcher(tmp_path) -> None:
     )
     env = dict(os.environ, PATH=f"{fakebin}:{os.environ['PATH']}")
     out = subprocess.run(
-        ["/bin/bash", "-c", harness], capture_output=True, text=True, env=env
+        ["/bin/bash", "-c", harness], capture_output=True, text=True, env=env, check=False
     ).stdout
     assert "final count telegram: 1" in out
 

@@ -2,11 +2,12 @@
 
 import json
 from types import SimpleNamespace
-import pytest
+from unittest import mock
 
 from openclaw_adapter import home_schedule
 from openclaw_adapter.task_workspace import Workflow, WorkflowStep, WorkflowStore
 from openclaw_adapter.workflow_command import (
+    _COMMAND_USAGE,
     _build_nl_workflow_prompt,
     _cmd_create,
     _cmd_delete,
@@ -15,13 +16,11 @@ from openclaw_adapter.workflow_command import (
     _cmd_show,
     _cmd_traces,
     _command_usage,
-    _COMMAND_USAGE,
     _extract_json_object,
     _generate_workflow_from_nl,
     _help,
     build_workflow_handler,
 )
-
 
 # ── Fakes for NL-draft generation ─────────────────────────────────────────────
 
@@ -373,8 +372,6 @@ def test_cmd_create_json_path_still_saves_directly(tmp_path):
 
 # ── NL prompt grounding (literal + command usage) ─────────────────────────────
 
-import types
-
 
 def test_nl_prompt_exposes_literal_field_and_rule():
     """The prompt must teach the LLM that command_sink can carry a static
@@ -388,8 +385,8 @@ def test_nl_prompt_exposes_literal_field_and_rule():
 
 def test_nl_prompt_renders_command_usage_from_registry():
     registry = {
-        "/music": types.SimpleNamespace(usage="playbest=播放最愛清單"),
-        "/ir": types.SimpleNamespace(usage="send <裝置> <按鍵名>，如 send ceiling_light power"),
+        "/music": SimpleNamespace(usage="playbest=播放最愛清單"),
+        "/ir": SimpleNamespace(usage="send <裝置> <按鍵名>，如 send ceiling_light power"),
     }
     prompt = _build_nl_workflow_prompt("開燈播音樂", catalog=None, command_registry=registry)
     assert "playbest" in prompt
@@ -404,7 +401,7 @@ def test_nl_prompt_falls_back_to_local_usage_map_without_registry():
 
 
 def test_command_usage_prefers_registry_over_local_map():
-    registry = {"/music": types.SimpleNamespace(usage="REGISTRY-USAGE")}
+    registry = {"/music": SimpleNamespace(usage="REGISTRY-USAGE")}
     assert _command_usage("/music", registry) == "REGISTRY-USAGE"
     # unknown-in-registry → local map
     assert "send ceiling_light power" in _command_usage("/ir", registry)
@@ -589,12 +586,10 @@ class _FakeEditor:
 def _make_handler(tmp_path, editor=None):
     executor = FakeExecutor(tmp_path)
     # Patch out voice import by giving settings a noop saynow
-    import types
-    settings = types.SimpleNamespace(
+    settings = SimpleNamespace(
         openclaw_voice_enabled=False,
     )
     # build_workflow_handler imports voice lazily; provide a minimal stub
-    import openclaw_adapter.workflow_command as wc
     original = None
     try:
         from openclaw_adapter import voice_command as _vc
@@ -726,8 +721,7 @@ def test_home_schedule_llm_transform_uses_cloud_pool(tmp_path):
     store.save(wf)
     executor = FakeExecutor(tmp_path, {"t": (True, "東京：晴れ 33°C")})
 
-    import types
-    fake_settings = types.SimpleNamespace(
+    fake_settings = SimpleNamespace(
         openclaw_local_text_endpoint="http://127.0.0.1:11434",
         openclaw_local_text_model="qwen3:4b",
         openclaw_local_text_timeout_seconds=45,
@@ -736,7 +730,6 @@ def test_home_schedule_llm_transform_uses_cloud_pool(tmp_path):
         openclaw_opencode_api_key=None,
     )
 
-    import unittest.mock as mock
     cloud_response = "ご主人様、今日の東京は晴れで33°Cでございます！"
 
     with mock.patch(
@@ -809,14 +802,11 @@ def test_cmd_run_llm_transform_does_not_bypass_cloud_pool(tmp_path):
     local_client = _LocalClient()
     executor.client = local_client
 
-    import types
-    fake_settings = types.SimpleNamespace(
+    fake_settings = SimpleNamespace(
         openclaw_local_text_endpoint="http://127.0.0.1:11434",
         openclaw_local_text_model="qwen3:4b",
         openclaw_local_text_timeout_seconds=45,
     )
-
-    import unittest.mock as mock
 
     with mock.patch(
         "openclaw_adapter.command_bridge_providers.generate_via_cloud_pool",

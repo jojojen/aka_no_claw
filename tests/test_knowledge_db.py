@@ -6,12 +6,12 @@ import pytest
 
 from openclaw_adapter.knowledge_db import (
     ENTITY_TYPES,
-    KnowledgeDatabase,
-    KnowledgeEntry,
     NO_DATA_SUMMARY,
     OBSERVATION_MARKER,
     OBSERVATION_SUMMARY_CAP,
     ORIGINS,
+    KnowledgeDatabase,
+    KnowledgeEntry,
     format_knowledge_block,
     is_insufficient_entry,
     is_operational_cache_entry,

@@ -16,20 +16,20 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 from .goal_planner import (
-    build_goal_workflow_prompt as _shared_build_goal_workflow_prompt,
-    extract_json_object as _shared_extract_json_object,
-    generate_workflow_from_goal as _shared_generate_workflow_from_goal,
-    resolve_goal_draft_client as _shared_resolve_goal_draft_client,
+    build_goal_workflow_prompt,
+    extract_json_object,
+    generate_workflow_from_goal,
+    resolve_goal_draft_client,
 )
 from .task_workspace import (
-    is_command_sink_allowed,
     Workflow,
     WorkflowRunner,
     WorkflowStore,
+    is_command_sink_allowed,
 )
 
 
@@ -404,7 +404,7 @@ def build_workflow_handler(
     try:
         from .music_command import build_music_handler as _build_music
         _music_raw = _build_music(settings)
-    except Exception:
+    except AttributeError:
         _music_raw = None
     _catalog = getattr(runner, "catalog", None)
 
@@ -602,14 +602,14 @@ def _cmd_create_json(arg: str, store: WorkflowStore, *, command_registry=None) -
 
 
 def _resolve_draft_client(settings, runner) -> tuple[object, object, str | None, str | None]:
-    return _shared_resolve_goal_draft_client(settings, runner)
+    return resolve_goal_draft_client(settings, runner)
 
 
 def _generate_workflow_from_nl(
     description: str, llm_client, catalog, *,
     command_registry=None, fallback_client=None,
 ):
-    return _shared_generate_workflow_from_goal(
+    return generate_workflow_from_goal(
         description,
         llm_client,
         catalog,
@@ -622,7 +622,7 @@ def _generate_workflow_from_nl(
 
 
 def _build_nl_workflow_prompt(description: str, catalog, *, command_registry=None) -> str:
-    return _shared_build_goal_workflow_prompt(
+    return build_goal_workflow_prompt(
         description,
         catalog,
         command_registry=command_registry,
@@ -632,7 +632,7 @@ def _build_nl_workflow_prompt(description: str, catalog, *, command_registry=Non
 
 
 def _extract_json_object(text: str) -> dict | None:
-    return _shared_extract_json_object(text)
+    return extract_json_object(text)
 
 
 def _cmd_run(
@@ -699,7 +699,7 @@ def _cmd_run(
 
     try:
         store.save_trace(trace)
-    except Exception:
+    except OSError:
         logger.warning("workflow_command: failed to save trace for %s", workflow_id)
 
     if trace.ok:
