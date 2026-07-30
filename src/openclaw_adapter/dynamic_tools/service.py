@@ -106,6 +106,11 @@ _OPENCODE_BROWSER_UA = (
 
 _REQUIRES_RE = re.compile(r"^#\s*requires:\s*(.+)$", re.MULTILINE)
 _MODULE_NOT_FOUND_RE = re.compile(r"ModuleNotFoundError: No module named ['\"]([\w\.]+)['\"]")
+_TRANSIENT_NETWORK_ERROR_RE = re.compile(
+    r"timeout|timed out|connection reset|connection aborted|remote end closed|"
+    r"unexpected eof|temporary failure|temporarily unavailable",
+    re.IGNORECASE,
+)
 # Knowledge rules cite formula/definition pages as `參考: <url>` instead of
 # hardcoding domain formulas in the DB; the pages are fetched and distilled
 # per-request (_ground_references).
@@ -1123,9 +1128,10 @@ class DynamicToolRunner:
         ``(ok, result_text)``; result_text is the answer on success or an error
         description on failure.
 
-        Retries _install_and_execute up to 2 extra times on failure (unconditional —
-        a code bug wastes two retries, which is acceptable). Sleep delays are
-        injected via _RETRY_SLEEP so tests can monkeypatch without side effects."""
+        Retries _install_and_execute up to 2 extra times on failure. A transient
+        network failure that exhausts those attempts gets one validated self-heal
+        from the tool's original request. Sleep delays are injected through
+        _RETRY_SLEEP so tests can monkeypatch without side effects."""
         entry = self.catalog.get(slug)
         if entry is None:
             return False, f"工具 '{slug}' 不在 catalog 中"
@@ -1151,17 +1157,43 @@ class DynamicToolRunner:
         if result.ok:
             self._record_catalog_outcome(slug, True, None)
             return True, result.answer
-        self._record_catalog_outcome(slug, False, "workspace tool step failed")
         raw_error = result.error or result.answer or "工具執行失敗"
-        if "Traceback (most recent call last)" in raw_error:
-            logger.warning("dynamic_tools: run_tool_step slug=%s full error:\n%s", slug, raw_error)
-            last_line = next(
-                (ln for ln in reversed(raw_error.splitlines()) if ln.strip()),
-                raw_error,
+        if self._is_transient_network_failure(raw_error) and not entry.metrics.get(
+            "consecutive_failures", 0
+        ):
+            logger.warning(
+                "dynamic_tools: run_tool_step slug=%s exhausted retries; self-healing",
+                slug,
             )
-            n_retries = len(_retry_delays)
-            return False, f"工具執行失敗（已重試 {n_retries} 次）：{last_line}"
-        return False, raw_error
+            healed = self._generate_with_repair(
+                entry.example_request,
+                failure_context=raw_error,
+            )
+            if healed.ok:
+                self._record_catalog_outcome(slug, True, None)
+                return True, healed.answer
+            logger.warning(
+                "dynamic_tools: run_tool_step slug=%s self-heal failed: %s",
+                slug,
+                _tail(healed.error, 200),
+            )
+        self._record_catalog_outcome(slug, False, "workspace tool step failed")
+        return False, self._summarize_tool_step_failure(raw_error, len(_retry_delays))
+
+    @staticmethod
+    def _is_transient_network_failure(error: str) -> bool:
+        return bool(_TRANSIENT_NETWORK_ERROR_RE.search(error or ""))
+
+    @staticmethod
+    def _summarize_tool_step_failure(error: str, retries: int) -> str:
+        lines = [line.strip() for line in (error or "").splitlines() if line.strip()]
+        last_line = lines[-1] if lines else "工具執行失敗"
+        has_exception = "traceback" in (error or "").lower() or bool(
+            re.search(r"(?:error|exception):", last_line, re.IGNORECASE)
+        )
+        if has_exception:
+            return f"工具執行失敗（已重試 {retries} 次）：{last_line}"
+        return error or "工具執行失敗"
 
     def _catalog_tool_type(self, slug: str | None) -> str | None:
         """tool_type of a generated tool, for the user-visible reuse trace.
@@ -1295,7 +1327,12 @@ class DynamicToolRunner:
 
     # ── generation + self-repair ────────────────────────────────────────────
 
-    def _generate_with_repair(self, request: str) -> DynamicToolResult:
+    def _generate_with_repair(
+        self,
+        request: str,
+        *,
+        failure_context: str | None = None,
+    ) -> DynamicToolResult:
         # #51: structured trace of the troubleshoot-reflect-continue loop. Built
         # alongside the existing control flow and attached to the result; it never
         # alters a decision. generations_limit is the TOTAL across the cascade
@@ -1414,6 +1451,7 @@ class DynamicToolRunner:
         prior_code: str | None = (
             tool_path.read_text(encoding="utf-8") if tool_path.exists() else None
         )
+        repair_existing_code = prior_code if failure_context and prior_code else None
         validated_new = False
 
         generations = 0
@@ -1457,9 +1495,21 @@ class DynamicToolRunner:
                     # extend the HTTP timeout to 1200s.
                     self.client.num_predict = None
                     self.client.timeout_seconds = max(self.client.timeout_seconds, 1200)
-                code = self._generate_code(request, knowledge_rows, think=think,
-                                           api_structure=api_structure,
-                                           references=references)
+                if repair_existing_code is not None:
+                    code = self._repair_code(
+                        request,
+                        repair_existing_code,
+                        failure_context or "",
+                        knowledge_rows,
+                        think=think,
+                        api_structure=api_structure,
+                        references=references,
+                    )
+                    repair_existing_code = None
+                else:
+                    code = self._generate_code(request, knowledge_rows, think=think,
+                                               api_structure=api_structure,
+                                               references=references)
                 code = self._pass_syntax_gate(request, code, knowledge_rows,
                                               think=think, api_structure=api_structure,
                                               references=references)

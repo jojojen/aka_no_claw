@@ -6,7 +6,6 @@ The Ollama client and the venv python are faked so these run fast and offline.
 from __future__ import annotations
 
 import json
-import os
 import sys
 import time
 from datetime import date
@@ -1427,37 +1426,12 @@ def test_probe_ollama_strips_generate_suffix() -> None:
     assert probe_ollama("http://127.0.0.1:19999/api/generate") is False
 
 
-def test_ollama_generate_retries_on_5xx_then_succeeds(tmp_path) -> None:
-    import time as _time
-    calls = [0]
-    slept: list[float] = []
-
-    class _FakeClient:
-        model = "q"
-        timeout_seconds = 30
-        num_predict = None
-        num_ctx = None
-
-        def generate(self, prompt, *, temperature=0.0, think=False):
-            calls[0] += 1
-            if calls[0] < 3:
-                raise RuntimeError("Ollama HTTP 503")
-            return f'===ANSWER===\nok\n===END==='
-
-    runner = DynamicToolRunner(
-        client=_FakeClient(),
-        tools_dir=tmp_path,
-        fast_model="q",
-        strong_model="q",
-    )
+def test_ollama_generate_retries_on_5xx_then_succeeds() -> None:
     # The retry is inside OllamaTextClient.generate; test it directly.
     import urllib.error
-    attempt = [0]
     slept_vals: list[float] = []
 
     client = OllamaTextClient(endpoint="http://localhost:11434", model="q", timeout_seconds=5)
-
-    original_sleep = __import__("time").sleep
 
     def _fake_sleep(s):
         slept_vals.append(s)
@@ -2192,6 +2166,9 @@ def test_run_tool_step_exhausted_retries_traceback_compressed(tmp_path, monkeypa
         return DynamicToolResult(ok=False, slug=s, error=tb_error)
 
     runner._install_and_execute = fake_install
+    runner._generate_with_repair = lambda request, **kwargs: DynamicToolResult(  # type: ignore[assignment]
+        ok=False, slug=slug, error="self-heal failed"
+    )
 
     ok, text = runner.run_tool_step(slug, {})
     assert not ok
@@ -2199,6 +2176,54 @@ def test_run_tool_step_exhausted_retries_traceback_compressed(tmp_path, monkeypa
     assert "urllib.error.URLError" in text
     assert "Connection reset by peer" in text
     assert "已重試" in text
+
+
+def test_run_tool_step_self_heals_exhausted_transient_network_failure(tmp_path, monkeypatch):
+    import openclaw_adapter.dynamic_tools as dt_module
+
+    monkeypatch.setattr(dt_module, "_RETRY_SLEEP", lambda s: None)
+    runner = _make_runner(tmp_path, FakeClient(code_responses=[]))
+    slug = "weather_step"
+    _setup_tool_step(runner, slug)
+    timeout_error = "TimeoutError: The read operation timed out"
+    runner._install_and_execute = lambda s, tp, code: DynamicToolResult(  # type: ignore[assignment]
+        ok=False, slug=s, error=timeout_error
+    )
+    requests: list[str] = []
+
+    def heal(request: str, **kwargs) -> DynamicToolResult:
+        requests.append(request)
+        assert kwargs["failure_context"] == timeout_error
+        return DynamicToolResult(ok=True, slug=slug, answer="東京 28°C")
+
+    runner._generate_with_repair = heal  # type: ignore[assignment]
+
+    ok, text = runner.run_tool_step(slug, {})
+
+    assert ok
+    assert text == "東京 28°C"
+    assert requests == [slug]
+
+
+def test_run_tool_step_compacts_truncated_traceback(tmp_path, monkeypatch):
+    import openclaw_adapter.dynamic_tools as dt_module
+
+    monkeypatch.setattr(dt_module, "_RETRY_SLEEP", lambda s: None)
+    runner = _make_runner(tmp_path, FakeClient(code_responses=[]))
+    slug = "weather_step"
+    _setup_tool_step(runner, slug)
+    truncated = "… socket.py line 720\nTimeoutError: The read operation timed out"
+    runner._install_and_execute = lambda s, tp, code: DynamicToolResult(  # type: ignore[assignment]
+        ok=False, slug=s, error=truncated
+    )
+    runner._generate_with_repair = lambda request, **kwargs: DynamicToolResult(  # type: ignore[assignment]
+        ok=False, slug=slug, error="self-heal failed"
+    )
+
+    ok, text = runner.run_tool_step(slug, {})
+
+    assert not ok
+    assert text == "工具執行失敗（已重試 2 次）：TimeoutError: The read operation timed out"
 
 
 def test_run_tool_step_non_traceback_error_passes_through(tmp_path, monkeypatch):

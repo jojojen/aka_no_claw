@@ -36,6 +36,18 @@ def test_codegen_seed_for_restart_health_checks_is_always_retrievable(db):
     assert "port" in rule.technique
 
 
+def test_codegen_seed_for_network_source_repair_is_always_retrievable(db):
+    db.seed_codegen_knowledge()
+
+    rows = db.retrieve_codegen_knowledge("HTTP timeout retry fallback source", k=100)
+    rule = next(row for row in rows if row.title == "重試耗盡後要修復資料來源，不要重複執行同一個失敗端點")
+
+    assert rule.category == "data_fetch"
+    assert "*" in rule.keywords
+    assert "來源" in rule.technique
+    assert "保留原工具" in rule.technique
+
+
 def test_codegen_seed_for_supervisor_process_tree_is_always_retrievable(db):
     db.seed_codegen_knowledge()
 

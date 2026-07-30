@@ -1893,6 +1893,22 @@ CODEGEN_SEED: tuple[dict, ...] = (
         "confidence": 0.95,
     },
     {
+        "category": "data_fetch",
+        "title": "重試耗盡後要修復資料來源，不要重複執行同一個失敗端點",
+        "technique": (
+            "網路工具已對同一個端點完成有限次重試，但仍收到 timeout、連線重置或暫時"
+            "不可用時，不要再用相同 URL 做更多重複請求。保留原始需求、參數與錯誤，"
+            "重建工具並選擇能提供相同資料語意的公開來源。新工具必須先實際執行並驗證"
+            "輸出後才取代舊版本；若新來源也不可用，保留原工具並清楚回報資料暫時無法"
+            "取得。錯誤呈現只傳遞終端例外行，不要把完整 traceback 送給使用者。"
+        ),
+        "keywords": [
+            "*", "network", "timeout", "retry", "self-heal", "repair", "fallback",
+            "source", "traceback", "urlopen", "requests", "transient",
+        ],
+        "confidence": 0.95,
+    },
+    {
         "category": "concurrency",
         "title": "延遲初始化的單例互相呼叫時，非重入鎖會自我死鎖",
         "technique": (
