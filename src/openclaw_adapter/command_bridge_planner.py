@@ -51,7 +51,6 @@ from .command_bridge_providers import (
     _MODEL_STATUS_OK,
     _is_gemini_fallback_status,
     _pin_provider_chain,
-    _walk_cloud_pool_chain,
 )
 
 if TYPE_CHECKING:
@@ -421,7 +420,7 @@ class ChatToolPlanner:
             chain = _pin_provider_chain(chain, pinned)
         elif pool_rotation is not None:
             chain = pool_rotation.rotate(chain)
-        text, provider, model_name, attempts = _walk_cloud_pool_chain(
+        text, provider, model_name, attempts = self._providers.walk_cloud_pool_chain(
             chain, prompt, temperature=0.2
         )
         if text is None:

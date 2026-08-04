@@ -42,6 +42,10 @@ class RunRecorder:
     def started(self) -> None:
         self.emit("run.started", {})
 
+    def resume(self, *, mode: str | None = None) -> None:
+        """Restore recorder context without writing duplicate lifecycle events."""
+        self._mode = mode
+
     def job_attached(self, job_id: str) -> None:
         self.emit("job.attached", {"job_id": job_id})
 
@@ -78,7 +82,13 @@ class RunRecorder:
                 payload["mode"] = self._mode
             self.emit("assistant.message", payload)
 
-    def terminal(self, status: str, *, message: str = "") -> None:
+    def terminal(
+        self,
+        status: str,
+        *,
+        message: str = "",
+        model_metadata: dict[str, object] | None = None,
+    ) -> None:
         if self._terminal:
             return
         if any(
@@ -91,7 +101,12 @@ class RunRecorder:
             "completed": "run.completed", "failed": "run.failed",
             "cancelled": "run.cancelled", "interrupted": "run.interrupted",
         }[status]
-        self.emit(event_type, {"message": message} if message else {})
+        payload: dict[str, object] = {}
+        if message:
+            payload["message"] = message
+        if model_metadata is not None:
+            payload["model_metadata"] = model_metadata
+        self.emit(event_type, payload)
         self._terminal = True
 
     def emit(self, event_type: str, payload: dict[str, object], *, visibility: str = "user") -> None:

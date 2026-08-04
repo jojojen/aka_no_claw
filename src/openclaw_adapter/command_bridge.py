@@ -97,7 +97,6 @@ from .command_bridge_models import (
     CHAT_TOOL_NO_TOOL,
     CHAT_TOOL_RESEARCH,
     CHAT_TOOL_SEARCH,
-    CHAT_TOOL_VISION,
     MUSIC_ACTION_PLAN,
     ChatToolPlan,
     ChatToolPolicy,
@@ -148,7 +147,6 @@ from .command_bridge_providers import (
     _MODEL_STATUS_NOT_CONFIGURED,
     _MODEL_STATUS_OK,
     _pin_provider_chain,
-    _walk_cloud_pool_chain,
 )
 from .continuation_policy import (
     ContinuationAction,
@@ -335,6 +333,8 @@ class _Job:
         self.message: str = ""
         self.actions: list[dict] = []
         self.error: str | None = None
+        self.model_metadata: dict[str, object] | None = None
+        self.request_payload: dict[str, object] | None = None
         self.created_at = time.monotonic()   # monotonic for GC comparisons
         self.wall_created_at = time.time()   # wall clock for persisted snapshots
         self.lock = threading.Lock()
@@ -360,6 +360,22 @@ class _JobManager:
     def get(self, job_id: str) -> _Job | None:
         with self._lock:
             return self._jobs.get(job_id)
+
+    def restore(self, snapshot: dict[str, object]) -> tuple[_Job, bool]:
+        """Restore one persisted running job once across concurrent polls."""
+        job_id = str(snapshot.get("job_id") or "")
+        with self._lock:
+            existing = self._jobs.get(job_id)
+            if existing is not None:
+                return existing, False
+            job = _Job(job_id)
+            job.progress = list(snapshot.get("progress") or [])
+            job.wall_created_at = float(snapshot.get("created_at") or time.time())
+            request_payload = snapshot.get("request")
+            if isinstance(request_payload, dict):
+                job.request_payload = dict(request_payload)
+            self._jobs[job.id] = job
+            return job, True
 
     def append_progress(self, job_id: str, text: str) -> None:
         job = self.get(job_id)
@@ -422,6 +438,8 @@ class _JobNotifier:
             "message": "",
             "actions": [],
             "error": None,
+            "model_metadata": job.model_metadata,
+            "request": job.request_payload,
             "created_at": wall_created_at,
             "updated_at": time.time(),
         })
@@ -1121,7 +1139,7 @@ class CommandBridge:
         yield stream_delta(_tool_calling_notice(plan.tool, self._tool_display_name(plan.tool)))
         parent_recorder = self._active_run_recorder.get()
 
-        def _runner(job: _Job) -> tuple[str, list[dict]]:
+        def _runner(job: _Job) -> tuple[str, list[dict], ModelMetadata | None]:
             notifier = _JobNotifier(self._jobs, job.id, self._get_job_store())
             with self._live_progress(notifier.send), self._cancel_scope(job.cancel_event.is_set):
                 tool_result = self._run_chat_tool(req, plan)
@@ -1133,12 +1151,16 @@ class CommandBridge:
                     narrator=notifier.send,
                 )
             if upgraded is not None:
-                return upgraded.message, [action.to_dict() for action in upgraded.actions]
-            return tool_result.answer, []
+                return (
+                    upgraded.message,
+                    [action.to_dict() for action in upgraded.actions],
+                    None,
+                )
+            return tool_result.answer, [], None
 
-        started = self._launch_research_job(
+        started = self._launch_background_job(
             text=plan.query,
-            session_id=req.session_id,
+            session_id=getattr(req, "session_id", None),
             runner=_runner,
             record_user=False,
             mode=MODE_CHAT,
@@ -2123,7 +2145,7 @@ class CommandBridge:
             "run_id": job.run_id,
             "session_id": job.session_id,
             "status": JOB_RUNNING,
-            "progress": [],
+            "progress": list(job.progress),
             "message": "",
             "actions": [],
             "error": None,
@@ -2384,7 +2406,7 @@ class CommandBridge:
                     chain = bridge._cloud_pool_chain()
                     if pool_rotation is not None:
                         chain = pool_rotation.rotate(chain)
-                    text, _provider, _model, _attempts = _walk_cloud_pool_chain(
+                    text, _provider, _model, _attempts = bridge._providers.walk_cloud_pool_chain(
                         chain, prompt, temperature=temperature
                     )
                     if text is not None:
@@ -3355,27 +3377,35 @@ class CommandBridge:
                     self._job_store_inst = JobStore(dir_path)
         return self._job_store_inst
 
-    def _launch_research_job(
+    def _launch_background_job(
         self,
         *,
         text: str,
         session_id: str | None,
-        runner: Callable[[_Job], tuple[str, list[dict]]],
+        runner: Callable[[_Job], tuple[str, list[dict], ModelMetadata | None]],
         record_user: bool,
         mode: str,
         parent_recorder: RunRecorder | None = None,
+        request_payload: dict[str, object] | None = None,
+        restored_job: _Job | None = None,
+        restored_recorder: RunRecorder | None = None,
     ) -> dict:
-        """Launch one durable research worker shared by Investment and Chat."""
-        job = self._jobs.create()
-        recorder = self._event_sessions().recorder(session_id)
-        recorder.accepted(text if record_user else "", mode=mode)
-        recorder.started()
-        recorder.job_attached(job.id)
-        if parent_recorder is not None:
-            parent_recorder.job_attached(job.id)
+        """Launch or resume one durable background command."""
+        job = restored_job or self._jobs.create()
+        recorder = restored_recorder or self._event_sessions().recorder(session_id)
+        if restored_job is None:
+            recorder.accepted(text if record_user else "", mode=mode)
+            recorder.started()
+            recorder.job_attached(job.id)
+            recorder.assistant_message("任務處理中…", partial=True)
+            if parent_recorder is not None:
+                parent_recorder.job_attached(job.id)
+        else:
+            recorder.resume(mode=mode)
         job.run_id = recorder.run_id
         job.session_id = session_id
         job.recorder = recorder
+        job.request_payload = request_payload
         store = self._get_job_store()
         store.save({
             "job_id": job.id,
@@ -3386,13 +3416,21 @@ class CommandBridge:
             "message": "",
             "actions": [],
             "error": None,
+            "model_metadata": job.model_metadata,
+            "request": job.request_payload,
             "created_at": job.wall_created_at,
             "updated_at": job.wall_created_at,
         })
         store.purge_expired()
 
-        def _persist_terminal(*, status: str, message: str,
-                              actions: list[dict], error: str | None) -> None:
+        def _persist_terminal(
+            *,
+            status: str,
+            message: str,
+            actions: list[dict],
+            error: str | None,
+            model_metadata: ModelMetadata | None = None,
+        ) -> None:
             # Explicit cancel wins over whatever the worker produced: once the
             # user asked to stop, a late-finishing run must not resurrect a
             # "done" (or "error") over the interrupted terminal state (#81).
@@ -3401,7 +3439,11 @@ class CommandBridge:
                     status, message, actions, error = (
                         JOB_INTERRUPTED, "任務已取消。", [], None
                     )
+                    model_metadata = None
                 progress_snapshot = list(job.progress)
+                metadata_payload = (
+                    model_metadata.to_dict() if model_metadata is not None else None
+                )
                 # This is the sole terminal compare-and-set. Keep the job in
                 # ``running`` until its snapshot and event history are both
                 # durable, so poll cannot observe a finished job without the
@@ -3415,33 +3457,42 @@ class CommandBridge:
                     "message": message,
                     "actions": list(actions),
                     "error": error,
+                    "model_metadata": metadata_payload,
+                    "request": job.request_payload,
                     "created_at": job.wall_created_at,
                     "updated_at": time.time(),
                 })
+                recorder.planner_completed(mode)
+                recorder.judge_completed(
+                    satisfied=status == JOB_DONE,
+                    reason_code="response_ok" if status == JOB_DONE else status,
+                )
                 if message:
                     recorder.assistant_message(message)
                 recorder.terminal(
                     "cancelled" if status == JOB_INTERRUPTED else ("completed" if status == JOB_DONE else "failed"),
                     message=message or (error or ""),
+                    model_metadata=metadata_payload,
                 )
                 job.status = status
                 job.message = message
                 job.actions = actions
                 job.error = error
+                job.model_metadata = metadata_payload
 
         def _worker() -> None:
             recorder_token = self._active_run_recorder.set(recorder)
             try:
-                message, actions = runner(job)
+                message, actions, model_metadata = runner(job)
                 _persist_terminal(
                     status=JOB_DONE, message=message,
-                    actions=actions, error=None,
+                    actions=actions, error=None, model_metadata=model_metadata,
                 )
             except Exception as exc:  # noqa: BLE001
                 if job.cancel_event.is_set():
-                    logger.info("async research cancelled job=%s", job.id)
+                    logger.info("async job cancelled job=%s", job.id)
                 else:
-                    logger.exception("async research failed job=%s", job.id)
+                    logger.exception("async job failed job=%s", job.id)
                 _persist_terminal(
                     status=JOB_ERROR, message="", actions=[], error=str(exc),
                 )
@@ -3451,28 +3502,64 @@ class CommandBridge:
         threading.Thread(target=_worker, daemon=True).start()
         return {"status": "accepted", "job_id": job.id}
 
-    def start_async(self, req: WebCommandRequest) -> dict:
-        """Kick off Investment research as a durable background job."""
-        if req.mode != MODE_INVESTMENT or req.submode not in (
-            None, SUBMODE_DEEP_PRODUCT_RESEARCH
-        ):
-            return {"status": STATUS_ERROR,
-                    "message": "非同步任務目前僅支援商品深入研究。"}
+    def _launch_async_request(
+        self,
+        req: WebCommandRequest,
+        *,
+        restored_job: _Job | None = None,
+        restored_recorder: RunRecorder | None = None,
+    ) -> dict:
+        """Build a restart-safe background command from a validated request."""
         text = (req.input or "").strip()
         if not text:
-            return {"status": STATUS_ERROR, "message": "請貼上商品 URL 或輸入商品名稱。"}
+            message = (
+                "請輸入要翻譯的文字。"
+                if req.mode == MODE_TRANSLATION
+                else "請貼上商品 URL 或輸入商品名稱。"
+            )
+            return {"status": STATUS_ERROR, "message": message}
 
-        def _runner(job: _Job) -> tuple[str, list[dict]]:
-            message, markup = self._run_command_raw("/research", text, chat_id=job.id)
-            return message, self._markup_to_actions(markup)
+        try:
+            request_payload = self._queue_request_payload(req)
+        except PromptQueueError as exc:
+            return {"status": STATUS_ERROR, "message": str(exc)}
 
-        return self._launch_research_job(
+        if req.mode == MODE_TRANSLATION and req.submode in (
+            None, SUBMODE_TEXT_TRANSLATION
+        ):
+            def _runner(job: _Job) -> tuple[str, list[dict], ModelMetadata | None]:
+                del job
+                message, metadata = self._translate_text_with_backend(
+                    text, req.chat_backend
+                )
+                return message, [], metadata
+
+        elif req.mode == MODE_INVESTMENT and req.submode in (
+            None, SUBMODE_DEEP_PRODUCT_RESEARCH
+        ):
+            def _runner(job: _Job) -> tuple[str, list[dict], ModelMetadata | None]:
+                message, markup = self._run_command_raw("/research", text, chat_id=job.id)
+                return message, self._markup_to_actions(markup), None
+        else:
+            return {
+                "status": STATUS_ERROR,
+                "message": "此命令不支援可恢復的背景執行。",
+            }
+
+        return self._launch_background_job(
             text=text,
             session_id=getattr(req, "session_id", None),
             runner=_runner,
-            record_user=True,
-            mode=MODE_INVESTMENT,
+            record_user=restored_job is None,
+            mode=req.mode,
+            request_payload=request_payload,
+            restored_job=restored_job,
+            restored_recorder=restored_recorder,
         )
+
+    def start_async(self, req: WebCommandRequest) -> dict:
+        """Start a durable text translation or product research command."""
+        return self._launch_async_request(req)
 
     def poll_job(self, job_id: str) -> dict:
         """Snapshot a job: status, staged progress, final report, follow-up actions.
@@ -3492,6 +3579,7 @@ class CommandBridge:
                     "message": job.message,
                     "actions": list(job.actions),
                     "error": job.error,
+                    "model_metadata": job.model_metadata,
                 }
 
         # In-memory job is gone — check the persisted snapshot.
@@ -3508,6 +3596,7 @@ class CommandBridge:
                 "message": persisted.get("message") or "",
                 "actions": persisted.get("actions") or [],
                 "error": None,
+                "model_metadata": persisted.get("model_metadata"),
             }
         if status == JOB_ERROR:
             return {
@@ -3517,17 +3606,47 @@ class CommandBridge:
                 "message": "",
                 "actions": [],
                 "error": persisted.get("error") or "任務失敗",
+                "model_metadata": persisted.get("model_metadata"),
             }
-        # status == running but in-memory worker gone: bridge was restarted.
+        # Resume a persisted read-only command after a bridge restart.
         run_id = persisted.get("run_id")
         session_id = persisted.get("session_id")
+        request_payload = persisted.get("request")
+        if isinstance(run_id, str) and isinstance(request_payload, dict):
+            job, created = self._jobs.restore(persisted)
+            if created:
+                try:
+                    req = parse_request(request_payload)
+                    recorder = RunRecorder(
+                        self._event_sessions().ensure(session_id), run_id=run_id
+                    )
+                    started = self._launch_async_request(
+                        req,
+                        restored_job=job,
+                        restored_recorder=recorder,
+                    )
+                    if started.get("status") != "accepted":
+                        raise RuntimeError(str(started.get("message") or "無法恢復任務"))
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("failed to resume async job=%s", job_id)
+                    with job.lock:
+                        job.status = JOB_ERROR
+                        job.error = str(exc)
+                    self._get_job_store().save({
+                        **persisted,
+                        "status": JOB_ERROR,
+                        "error": str(exc),
+                        "updated_at": time.time(),
+                    })
+            return self.poll_job(job_id)
+
         if isinstance(run_id, str):
             recorder = RunRecorder(self._event_sessions().ensure(session_id), run_id=run_id)
             recorder.terminal("interrupted", message="bridge_restart")
         return {
             "job_status": JOB_INTERRUPTED,
             "run_id": run_id,
-            "message": "研究任務因系統重啟而中斷，請重新執行 /research。",
+            "message": "舊版任務缺少可恢復的請求資料，請重新送出。",
             "progress": persisted.get("progress") or [],
             "actions": [],
             "error": None,
@@ -4711,23 +4830,28 @@ class CommandBridge:
 
     @staticmethod
     def _queue_request_payload(req: WebCommandRequest) -> dict:
-        if req.attachments:
+        if getattr(req, "attachments", ()):
             raise PromptQueueError("attachments cannot be queued yet; send this turn after the active run")
         payload: dict[str, object] = {
             "mode": req.mode, "input": req.input, "submode": req.submode,
             "chat_backend": req.chat_backend, "source": req.source,
-            "history": [{"role": turn.role, "content": turn.content} for turn in req.history],
-            "session_id": req.session_id, "conversation_id": req.conversation_id,
-            "source_prompt_id": req.source_prompt_id,
-            "input_source": req.input_source,
+            "history": [
+                {"role": turn.role, "content": turn.content}
+                for turn in getattr(req, "history", ())
+            ],
+            "session_id": getattr(req, "session_id", None),
+            "conversation_id": getattr(req, "conversation_id", None),
+            "source_prompt_id": getattr(req, "source_prompt_id", None),
+            "input_source": getattr(req, "input_source", "text"),
         }
-        if req.voice is not None:
+        voice = getattr(req, "voice", None)
+        if voice is not None:
             payload["voice"] = {
-                "utterance_id": req.voice.utterance_id,
-                "duration_ms": req.voice.duration_ms,
-                "stt_language": req.voice.stt_language,
-                "stt_language_probability": req.voice.stt_language_probability,
-                "clarification_declined": req.voice.clarification_declined,
+                "utterance_id": voice.utterance_id,
+                "duration_ms": voice.duration_ms,
+                "stt_language": voice.stt_language,
+                "stt_language_probability": voice.stt_language_probability,
+                "clarification_declined": voice.clarification_declined,
             }
         return payload
 

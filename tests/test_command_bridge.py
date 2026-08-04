@@ -41,6 +41,8 @@ from openclaw_adapter.command_bridge_models import (
     ChatToolResult,
     ChatTurn,
     MODE_CHAT,
+    ModelAttempt,
+    ModelMetadata,
     MusicIntent,
     STATUS_ERROR,
     STATUS_OK,
@@ -2389,6 +2391,101 @@ def test_async_research_handler_error_becomes_error_job(bridge, monkeypatch):
     snap = _wait_job(bridge, bridge.start_async(req)["job_id"], "error")
     assert snap["job_status"] == "error"
     assert "scrape exploded" in (snap["error"] or "")
+
+
+def test_async_translation_persists_result_and_model_metadata(
+    monkeypatch, tmp_path
+):
+    settings = _tool_settings()
+    settings.openclaw_web_jobs_dir = str(tmp_path / "jobs")
+    settings.openclaw_web_event_dir = str(tmp_path / "events")
+    bridge = CommandBridge(settings=settings)
+    metadata = ModelMetadata(
+        requested_provider="opencode",
+        requested_model="first",
+        attempted_models=(
+            ModelAttempt("opencode", "first", "error", "timeout"),
+            ModelAttempt("nvidia", "second", "ok"),
+        ),
+        final_provider="nvidia",
+        final_model="second",
+        fallback_occurred=True,
+    )
+    monkeypatch.setattr(
+        bridge,
+        "_translate_text_with_backend",
+        lambda text, backend: (f"譯文:{text}", metadata),
+    )
+    request = parse_request({
+        "mode": "translation",
+        "submode": "text_translation",
+        "input": "hello",
+        "chat_backend": "cloud_pool",
+        "session_id": "translation-session",
+    })
+
+    started = bridge.start_async(request)
+    snapshot = _wait_job(bridge, started["job_id"], "done")
+
+    assert snapshot["message"] == "譯文:hello"
+    assert snapshot["model_metadata"]["final_provider"] == "nvidia"
+    persisted = bridge._get_job_store().load(started["job_id"])
+    assert persisted["request"]["session_id"] == "translation-session"
+    assert persisted["model_metadata"]["attempted_models"][0]["status"] == "error"
+
+
+def test_poll_resumes_persisted_translation_after_bridge_restart(
+    monkeypatch, tmp_path
+):
+    from openclaw_adapter.job_store import JobStore
+
+    job_id = "a" * 32
+    run_id = "b" * 32
+    jobs_dir = tmp_path / "jobs"
+    request = {
+        "mode": "translation",
+        "submode": "text_translation",
+        "input": "restart me",
+        "chat_backend": "cloud_pool",
+        "source": "test",
+        "session_id": "restart-session",
+    }
+    JobStore(str(jobs_dir)).save({
+        "job_id": job_id,
+        "run_id": run_id,
+        "session_id": "restart-session",
+        "status": "running",
+        "progress": ["queued"],
+        "message": "",
+        "actions": [],
+        "error": None,
+        "request": request,
+        "created_at": time.time(),
+        "updated_at": time.time(),
+    })
+    settings = _tool_settings()
+    settings.openclaw_web_jobs_dir = str(jobs_dir)
+    settings.openclaw_web_event_dir = str(tmp_path / "events")
+    bridge = CommandBridge(settings=settings)
+    metadata = ModelMetadata(
+        requested_provider="nvidia",
+        requested_model="model",
+        attempted_models=(ModelAttempt("nvidia", "model", "ok"),),
+        final_provider="nvidia",
+        final_model="model",
+    )
+    monkeypatch.setattr(
+        bridge,
+        "_translate_text_with_backend",
+        lambda text, backend: ("recovered result", metadata),
+    )
+
+    bridge.poll_job(job_id)
+    snapshot = _wait_job(bridge, job_id, "done")
+
+    assert snapshot["message"] == "recovered result"
+    assert snapshot["progress"] == ["queued"]
+    assert snapshot["model_metadata"]["final_provider"] == "nvidia"
 
 
 # --- research follow-up buttons (龍蝦 inline_keyboard → web actions) -------

@@ -1326,6 +1326,22 @@ CODEGEN_SEED: tuple[dict, ...] = (
     },
     {
         "category": "architecture",
+        "title": "可恢復任務必須持久化輸入、結果與供應商證據",
+        "technique": (
+            "任何可能比客戶端連線存活更久的工作，都必須在接受工作時持久化穩定的 session_id、"
+            "完整可重播請求、job_id 與畫面佔位。每次進度與終態必須原子寫入結果、錯誤及模型"
+            "供應商嘗試紀錄。重新整理時從事件與任務儲存區重建畫面。服務重啟時用同一個 job_id "
+            "重播安全的唯讀請求。不要依賴程序記憶體或原 HTTP 回應保存唯一結果。驗證必須涵蓋"
+            "客戶端斷線、頁面重載及 worker 重啟後仍取得同一個終態。"
+        ),
+        "keywords": [
+            "*", "async", "session", "job", "restart", "recovery",
+            "provider", "metadata", "durable", "replay",
+        ],
+        "confidence": 0.95,
+    },
+    {
+        "category": "architecture",
         "title": "昂貴操作的去重要靠結構化 key 在執行邊界強制，不要只靠提示或評審模型",
         "technique": (
             "當一個多步驟迴圈可能重跑昂貴且不可逆或高成本的操作（例如一次網路研究、一次付費 "

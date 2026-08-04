@@ -94,7 +94,12 @@ def test_async_completion_injects_one_terminal_message_into_durable_history(tmp_
     events = bridge.read_session_events(after=0)["events"]
     messages = [event for event in events if event["type"] == "assistant.message"]
     terminals = [event for event in events if event["type"] == "run.completed"]
-    assert [event["payload"]["text"] for event in messages] == ["research complete"], events
+    assert [event["payload"]["text"] for event in messages] == [
+        "任務處理中…",
+        "research complete",
+    ], events
+    assert messages[0]["payload"]["partial"] is True
+    assert messages[1]["payload"]["partial"] is False
     assert len(terminals) == 1
 
 

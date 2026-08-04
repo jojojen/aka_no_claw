@@ -1,10 +1,10 @@
-"""Persistent job snapshots for web async research reconnect (aka_no_claw #37).
+"""Persistent job snapshots for Web background command recovery.
 
 Each web async job is atomically written to .openclaw_tmp/web_jobs/<job_id>.json
 at creation, and again when the job finishes (done/error). poll_job() checks
 this store when the in-memory job is missing (browser reload or bridge restart)
-and returns the correct terminal state — or "interrupted" when the persisted
-status is still "running" but the in-memory worker no longer exists.
+and returns the correct terminal state. A restart-safe read-only command also
+stores its request so a new worker can resume the same job after a restart.
 
 Retention: purge_expired() deletes snapshots older than MAX_AGE_SECONDS by
 updated_at. It is called on every new job creation (GC-on-write), so unbounded

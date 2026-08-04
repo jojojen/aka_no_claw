@@ -77,6 +77,12 @@ class AssistantSettings:
     openclaw_opencode_model: str = "big-pickle"
     openclaw_opencode_api_key: str | None = None
     openclaw_opencode_timeout_seconds: int = 900
+    # Limit one cloud-pool provider attempt. A slow provider must not block
+    # the remaining providers for its full standalone timeout.
+    openclaw_cloud_pool_attempt_timeout_seconds: int = 30
+    # Skip a provider briefly after one failed pool attempt. This keeps later
+    # requests away from a known unhealthy endpoint while it recovers.
+    openclaw_cloud_pool_failure_cooldown_seconds: int = 300
     openclaw_mistral_api_key: str | None = None
     openclaw_mistral_model: str = "mistral-large-latest"
     openclaw_nvidia_api_key: str | None = None
@@ -385,6 +391,14 @@ def get_settings() -> AssistantSettings:
         openclaw_opencode_timeout_seconds=_as_int(
             os.getenv("OPENCLAW_OPENCODE_TIMEOUT_SECONDS"),
             default=900,
+        ),
+        openclaw_cloud_pool_attempt_timeout_seconds=_as_int(
+            os.getenv("OPENCLAW_CLOUD_POOL_ATTEMPT_TIMEOUT_SECONDS"),
+            default=30,
+        ),
+        openclaw_cloud_pool_failure_cooldown_seconds=_as_int(
+            os.getenv("OPENCLAW_CLOUD_POOL_FAILURE_COOLDOWN_SECONDS"),
+            default=300,
         ),
         openclaw_mistral_api_key=_none_if_empty(
             _getenv_any("MISTRAL_API_KEY", "MISTRAL_KEY")

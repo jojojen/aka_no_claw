@@ -43,6 +43,7 @@ from .llm_pool_settings import (
 _MODEL_STATUS_OK = "ok"
 _MODEL_STATUS_ERROR = "error"
 _MODEL_STATUS_NOT_CONFIGURED = "not_configured"
+_MODEL_STATUS_COOLDOWN = "cooldown"
 _MODEL_STATUS_QUOTA_EXHAUSTED = "quota_exhausted"
 _MODEL_STATUS_RATE_LIMITED = "rate_limited"
 _GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
@@ -266,6 +267,8 @@ class ProviderRouter:
         self._deps = deps
         self._pins: dict[str, str] = {}
         self._pins_lock = threading.Lock()
+        self._failure_cooldowns: dict[str, float] = {}
+        self._failure_cooldowns_lock = threading.Lock()
 
     @property
     def settings(self):
@@ -319,32 +322,99 @@ class ProviderRouter:
         with self._pins_lock:
             self._pins.pop(conversation_key, None)
 
+    def walk_cloud_pool_chain(
+        self,
+        chain: list[tuple[str, str, object, object]],
+        prompt: str,
+        *,
+        temperature: float,
+    ) -> tuple[str | None, str | None, str | None, tuple[ModelAttempt, ...]]:
+        """Run the pool and skip providers with a recent failed attempt."""
+        cooldown_seconds = max(
+            0,
+            int(getattr(
+                self.settings,
+                "openclaw_cloud_pool_failure_cooldown_seconds",
+                300,
+            )),
+        )
+        attempts: list[ModelAttempt] = []
+        for entry in chain:
+            provider, model_name = entry[0], entry[1]
+            now = time.monotonic()
+            with self._failure_cooldowns_lock:
+                remaining = self._failure_cooldowns.get(provider, 0.0) - now
+                if remaining <= 0:
+                    self._failure_cooldowns.pop(provider, None)
+            if remaining > 0:
+                attempts.append(ModelAttempt(
+                    provider,
+                    model_name,
+                    _MODEL_STATUS_COOLDOWN,
+                    f"provider cooldown has {remaining:.0f}s remaining",
+                ))
+                continue
+
+            text, final_provider, final_model, current = _walk_cloud_pool_chain(
+                [entry], prompt, temperature=temperature
+            )
+            attempts.extend(current)
+            with self._failure_cooldowns_lock:
+                for attempt in current:
+                    if attempt.status == _MODEL_STATUS_OK:
+                        self._failure_cooldowns.pop(attempt.provider, None)
+                    elif (
+                        attempt.status != _MODEL_STATUS_NOT_CONFIGURED
+                        and cooldown_seconds
+                    ):
+                        self._failure_cooldowns[attempt.provider] = (
+                            time.monotonic() + cooldown_seconds
+                        )
+            if text is not None:
+                return text, final_provider, final_model, tuple(attempts)
+        return None, None, None, tuple(attempts)
+
     # --- pool chains --------------------------------------------------------
+    def _pool_client(self, client):
+        """Apply the pool attempt deadline to a new provider client."""
+        if client is not None and hasattr(client, "timeout_seconds"):
+            client.timeout_seconds = max(
+                1,
+                int(getattr(
+                    self.settings,
+                    "openclaw_cloud_pool_attempt_timeout_seconds",
+                    30,
+                )),
+            )
+        return client
+
     def cloud_pool_chain(self) -> list[tuple[str, str, object, object]]:
         """Return ordered list of (provider_label, model_name, build_fn, is_configured_fn)."""
         raw_entries = {
             LLM_PROVIDER_GEMINI: (
                 "gemini",
                 self.gemini_primary_model(),
-                self._deps._build_gemini_chat_client,
+                lambda model: self._pool_client(
+                    self._deps._build_gemini_chat_client(model)
+                ),
                 lambda: chat_backend_configured(self.settings, CHAT_BACKEND_GEMINI),
             ),
             LLM_PROVIDER_MISTRAL: (
                 "mistral",
                 self.mistral_model(),
-                self._deps._build_mistral_chat_client,
+                lambda: self._pool_client(self._deps._build_mistral_chat_client()),
                 lambda: chat_backend_configured(self.settings, CHAT_BACKEND_CLOUD_MISTRAL),
             ),
             LLM_PROVIDER_BIG_PICKLE: (
                 "opencode",
                 self.big_pickle_model(),
-                self._deps._build_cloud_chat_client,
+                lambda: self._pool_client(self._deps._build_cloud_chat_client()),
                 lambda: chat_backend_configured(self.settings, CHAT_BACKEND_CLOUD_PICKLE),
             ),
             LLM_PROVIDER_NVIDIA: (
                 "nvidia",
                 self.nvidia_model(),
-                self._deps._build_nvidia_chat_client,
+                lambda: self._pool_client(self._deps._build_nvidia_chat_client()),
                 lambda: chat_backend_configured(self.settings, CHAT_BACKEND_CLOUD_NVIDIA),
             ),
         }
@@ -418,7 +488,7 @@ class ProviderRouter:
             rotated = pool_rotation.rotate(chain)
         else:
             rotated = chain
-        text, provider, model_name, attempts = _walk_cloud_pool_chain(
+        text, provider, model_name, attempts = self.walk_cloud_pool_chain(
             rotated, prompt, temperature=0.7
         )
         if text is not None:
