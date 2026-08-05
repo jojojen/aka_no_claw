@@ -3,8 +3,8 @@
 These tests assert the bridge's routing contract: chat goes to the selected
 backend (local Ollama vs cloud big-pickle), Translation reuses the existing
 ``/zh`` handler (text) and the shared OCR+繁中翻譯 pipeline (image, #43), deep
-product research reuses ``/research``, while seller snapshot returns structured
-``unsupported`` (allowed for MVP). Streaming emits the documented event
+product research reuses ``/research``, while seller snapshot publishes its
+PDF and preview through the shared artifact contract. Streaming emits the documented event
 sequence. The real handlers/models are stubbed so the routing — not the
 network — is what's under test.
 """
@@ -20,6 +20,8 @@ from types import SimpleNamespace
 import pytest
 
 from openclaw_adapter.command_bridge import CommandBridge, _WorkflowShimRunner, build_chat_prompt
+from openclaw_adapter.artifact_store import ArtifactStore
+from openclaw_adapter.artifact_store import ArtifactRef
 from openclaw_adapter.command_bridge_models import (
     CHAT_BACKEND_GEMINI,
     CHAT_BACKEND_CLOUD_POOL,
@@ -112,6 +114,28 @@ def test_parse_request_defaults():
     assert req.chat_backend == CHAT_BACKEND_LOCAL
     assert req.source == "aka_no_claw_web"
     assert req.attachments == ()
+
+
+def test_response_and_stream_done_serialize_artifacts():
+    from openclaw_adapter.command_bridge_models import stream_done
+
+    artifact = ArtifactRef(
+        artifact_id="artifact-1",
+        filename="report.pdf",
+        content_type="application/pdf",
+        kind="document",
+        size_bytes=42,
+        sha256="a" * 64,
+        download_url="/api/command/artifacts/artifact-1/report.pdf?session_id=session-1",
+    )
+
+    response = WebCommandResponse(
+        status=STATUS_OK, message="done", artifacts=(artifact,)
+    )
+    assert response.to_dict()["artifacts"] == [artifact.to_dict()]
+    assert stream_done("done", artifacts=[artifact.to_dict()])["artifacts"] == [
+        artifact.to_dict()
+    ]
 
 
 def test_parse_request_accepts_gemini_backend():
@@ -570,13 +594,117 @@ def test_investment_research_routes_to_research(bridge):
     assert bridge._calls["/research"] == [("https://jp.mercari.com/item/x", "web-bridge")]
 
 
-def test_investment_seller_snapshot_is_unsupported(bridge):
+def test_investment_seller_snapshot_publishes_artifacts(
+    bridge, monkeypatch, tmp_path
+):
+    pdf = tmp_path / "seller.pdf"
+    png = tmp_path / "seller.png"
+    pdf.write_bytes(b"%PDF-1.7\n")
+    png.write_bytes(b"\x89PNG\r\n\x1a\n")
+    delivery = SimpleNamespace(
+        summary_text="snapshot ready",
+        attachments=(
+            SimpleNamespace(path=pdf),
+            SimpleNamespace(path=png),
+        ),
+        cleanup_paths=(pdf, png),
+    )
+    monkeypatch.setattr(
+        "openclaw_adapter.reputation_render.default_reputation_renderer",
+        lambda settings: lambda query: delivery,
+    )
+    bridge._artifact_store_inst = ArtifactStore(tmp_path / "artifacts")
     req = parse_request({"mode": "investment", "submode": "seller_reputation_snapshot",
-                         "input": "seller-1"})
+                         "input": "https://example.test/seller", "session_id": "session-1"})
     resp = bridge.handle(req)
-    assert resp.status == STATUS_UNSUPPORTED
+    assert resp.status == STATUS_OK
     assert resp.submode == SUBMODE_SELLER_REPUTATION_SNAPSHOT
+    assert [artifact.content_type for artifact in resp.artifacts] == [
+        "application/pdf", "image/png"
+    ]
+    assert all("session_id=session-1" in artifact.download_url for artifact in resp.artifacts)
+    assert not pdf.exists()
+    assert not png.exists()
     assert bridge._calls["/research"] == []
+
+
+def test_seller_snapshot_background_job_persists_artifacts(
+    bridge, monkeypatch
+):
+    artifact = ArtifactRef(
+        artifact_id="artifact-1",
+        filename="report.pdf",
+        content_type="application/pdf",
+        kind="document",
+        size_bytes=12,
+        sha256="a" * 64,
+        download_url=(
+            "/api/command/artifacts/artifact-1/report.pdf?session_id=session-1"
+        ),
+    )
+    monkeypatch.setattr(
+        bridge,
+        "_handle_seller_reputation_snapshot",
+        lambda req: WebCommandResponse(
+            status=STATUS_OK,
+            message="ready",
+            mode=req.mode,
+            submode=req.submode,
+            artifacts=(artifact,),
+        ),
+    )
+    request = parse_request(
+        {
+            "mode": "investment",
+            "submode": "seller_reputation_snapshot",
+            "input": "https://example.test/seller",
+            "session_id": "session-1",
+        }
+    )
+
+    started = bridge.start_async(request)
+    snapshot = _wait_job(bridge, started["job_id"], "done")
+
+    assert snapshot["artifacts"] == [artifact.to_dict()]
+    persisted = bridge._get_job_store().load(started["job_id"])
+    assert persisted is not None
+    assert persisted["artifacts"] == [artifact.to_dict()]
+
+
+def test_seller_snapshot_rolls_back_partial_artifact_publication(
+    bridge, monkeypatch, tmp_path
+):
+    pdf = tmp_path / "seller.pdf"
+    unsupported = tmp_path / "seller.bin"
+    pdf.write_bytes(b"%PDF-1.7\n")
+    unsupported.write_bytes(b"data")
+    delivery = SimpleNamespace(
+        summary_text="snapshot ready",
+        attachments=(SimpleNamespace(path=pdf), SimpleNamespace(path=unsupported)),
+        cleanup_paths=(pdf, unsupported),
+    )
+    monkeypatch.setattr(
+        "openclaw_adapter.reputation_render.default_reputation_renderer",
+        lambda settings: lambda query: delivery,
+    )
+    artifact_root = tmp_path / "artifacts"
+    bridge._artifact_store_inst = ArtifactStore(artifact_root)
+    request = parse_request(
+        {
+            "mode": "investment",
+            "submode": "seller_reputation_snapshot",
+            "input": "https://example.test/seller",
+            "session_id": "session-1",
+        }
+    )
+
+    response = bridge.handle(request)
+
+    assert response.status == STATUS_ERROR
+    session_root = artifact_root / "session-1"
+    assert not session_root.exists() or not list(session_root.iterdir())
+    assert not pdf.exists()
+    assert not unsupported.exists()
 
 
 def test_investment_no_submode_defaults_to_research(bridge):
@@ -2925,6 +3053,46 @@ def test_options_preflight_allows_direct_bridge_streaming():
     assert " 204 " in raw
     assert "Access-Control-Allow-Methods: GET, POST, PATCH, DELETE, OPTIONS" in raw
     assert "Access-Control-Allow-Headers: Content-Type" in raw
+
+
+def test_artifact_download_is_session_bound_and_uses_safe_headers(tmp_path):
+    from http.server import BaseHTTPRequestHandler
+
+    from openclaw_adapter import command_bridge_server as srv
+    from openclaw_adapter.artifact_store import ArtifactStore
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    ref = store.publish_bytes(
+        "session-1",
+        "# 報告\n".encode(),
+        filename="報告.md",
+        content_type="text/markdown",
+    )
+
+    class _FakeBridge:
+        def open_artifact(self, *, session_id, artifact_id):
+            return store.open(session_id, artifact_id)
+
+    handler_cls = srv._build_handler(_FakeBridge(), lan_enabled=False)
+    h = handler_cls.__new__(handler_cls)
+    h.headers = {}
+    h.rfile = io.BytesIO()
+    h.wfile = io.BytesIO()
+    h.request_version = "HTTP/1.1"
+    h.protocol_version = "HTTP/1.0"
+    h.requestline = f"GET {ref.download_url} HTTP/1.1"
+    h.responses = BaseHTTPRequestHandler.responses
+    h.client_address = ("127.0.0.1", 12345)
+    h.path = ref.download_url
+
+    h.do_GET()
+
+    headers, body = h.wfile.getvalue().split(b"\r\n\r\n", 1)
+    assert b" 200 " in headers
+    assert b"Content-Type: text/markdown" in headers
+    assert b"X-Content-Type-Options: nosniff" in headers
+    assert b"Content-Disposition: attachment; filename*=UTF-8''" in headers
+    assert body == "# 報告\n".encode()
 
 
 def _multipart_body(parts, *, boundary="----BrowserFormBoundary"):

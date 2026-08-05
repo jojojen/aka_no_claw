@@ -6,11 +6,9 @@ reimplements command logic and never drifts from the Telegram bot:
 
 * Chat       → local Ollama model or cloud big-pickle, pure chat (Phase 1, no
                tool calls), with a streaming path for long output.
-* Translation→ the existing ``/zh`` handler (text). Image translation is
-               reported as a structured ``unsupported`` until the bridge grows a
-               multipart file route (doc-allowed for MVP).
+* Translation→ the existing text and image translation handlers.
 * Investment → ``商品深入研究`` reuses the existing ``/research`` handler. Seller
-               reputation snapshot is ``unsupported`` for MVP.
+               reputation snapshots publish durable PDF and image artifacts.
 
 Handlers are pulled from :func:`telegram_bot._build_registries` (the same
 registry the bot uses) so there is one source of truth.
@@ -36,6 +34,7 @@ from uuid import uuid4
 
 from assistant_runtime import AssistantSettings, build_ssl_context
 
+from .artifact_store import ArtifactRef, ArtifactStore, StoredArtifact
 from .job_store import JobStore
 from .session_memory import SessionMemoryStore, SessionWriteError, empty_session
 from .session_event_service import SessionEventService
@@ -234,8 +233,6 @@ _GOAL_READ_ONLY_COMMANDS = frozenset({
 })
 _GOAL_SEARCH_GRANT = 5
 
-_SELLER_UNSUPPORTED_MSG = "賣家信譽快照目前尚未由本地 command bridge 支援。"
-
 # Match slug-like words (lowercase + digits + underscore) containing an underscore.
 # Used to extract a workflow_id from a free-text schedule phrase.
 _WF_SLUG_RE = re.compile(r"\b([a-z][a-z0-9_\-]{2,})\b")
@@ -321,6 +318,14 @@ JOB_ERROR = "error"
 JOB_INTERRUPTED = "interrupted"  # persisted running job whose in-memory worker is gone
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class _JobResult:
+    message: str
+    actions: list[dict]
+    model_metadata: ModelMetadata | None = None
+    artifacts: tuple[ArtifactRef, ...] = ()
+
+
 class _Job:
     """A long-running command (e.g. ``/research``) decoupled from any HTTP
     connection. Staged ``notifier.send`` milestones accumulate in ``progress``
@@ -332,6 +337,7 @@ class _Job:
         self.progress: list[str] = []
         self.message: str = ""
         self.actions: list[dict] = []
+        self.artifacts: list[dict[str, object]] = []
         self.error: str | None = None
         self.model_metadata: dict[str, object] | None = None
         self.request_payload: dict[str, object] | None = None
@@ -437,6 +443,7 @@ class _JobNotifier:
             "progress": progress_snapshot,
             "message": "",
             "actions": [],
+            "artifacts": [],
             "error": None,
             "model_metadata": job.model_metadata,
             "request": job.request_payload,
@@ -568,6 +575,8 @@ class CommandBridge:
         self._session_store: SessionMemoryStore | None = None
         self._event_sessions_inst: SessionEventService | None = None
         self._event_sessions_lock = threading.Lock()
+        self._artifact_store_inst: ArtifactStore | None = None
+        self._artifact_store_lock = threading.Lock()
         self._context_compactor_inst: ContextCompactor | None = None
         self._context_compactor_lock = threading.Lock()
         self._approval_service_inst: ApprovalService | None = None
@@ -833,7 +842,9 @@ class CommandBridge:
                 satisfied=response.status != STATUS_ERROR,
                 reason_code="response_ok" if response.status != STATUS_ERROR else "response_error",
             )
-            recorder.assistant_message(response.message)
+            recorder.assistant_message(
+                response.message, artifacts=getattr(response, "artifacts", ())
+            )
             recorder.terminal("completed" if response.status != STATUS_ERROR else "failed", message=response.message)
             self._maybe_drain_prompt_queue(session_id)
             return response
@@ -882,7 +893,14 @@ class CommandBridge:
                 if response.status == STATUS_ERROR:
                     yield stream_error(response.message)
                 else:
-                    yield stream_done(response.message, model_metadata=response.model_metadata)
+                    yield stream_done(
+                        response.message,
+                        model_metadata=response.model_metadata,
+                        artifacts=[
+                            artifact.to_dict()
+                            for artifact in getattr(response, "artifacts", ())
+                        ],
+                    )
             except Exception as exc:  # noqa: BLE001
                 yield stream_error(f"後端處理失敗：{exc}")
             return
@@ -1139,7 +1157,7 @@ class CommandBridge:
         yield stream_delta(_tool_calling_notice(plan.tool, self._tool_display_name(plan.tool)))
         parent_recorder = self._active_run_recorder.get()
 
-        def _runner(job: _Job) -> tuple[str, list[dict], ModelMetadata | None]:
+        def _runner(job: _Job) -> _JobResult:
             notifier = _JobNotifier(self._jobs, job.id, self._get_job_store())
             with self._live_progress(notifier.send), self._cancel_scope(job.cancel_event.is_set):
                 tool_result = self._run_chat_tool(req, plan)
@@ -1151,12 +1169,11 @@ class CommandBridge:
                     narrator=notifier.send,
                 )
             if upgraded is not None:
-                return (
+                return _JobResult(
                     upgraded.message,
                     [action.to_dict() for action in upgraded.actions],
-                    None,
                 )
-            return tool_result.answer, [], None
+            return _JobResult(tool_result.answer, [])
 
         started = self._launch_background_job(
             text=plan.query,
@@ -1188,7 +1205,10 @@ class CommandBridge:
                 time.sleep(0.25)
                 continue
             if status in {JOB_DONE, JOB_INTERRUPTED}:
-                event = stream_done(str(snapshot.get("message") or "").strip())
+                event = stream_done(
+                    str(snapshot.get("message") or "").strip(),
+                    artifacts=list(snapshot.get("artifacts") or []),
+                )
                 event["_durable_job"] = True
                 yield event
                 return
@@ -3382,7 +3402,7 @@ class CommandBridge:
         *,
         text: str,
         session_id: str | None,
-        runner: Callable[[_Job], tuple[str, list[dict], ModelMetadata | None]],
+        runner: Callable[[_Job], _JobResult],
         record_user: bool,
         mode: str,
         parent_recorder: RunRecorder | None = None,
@@ -3415,6 +3435,7 @@ class CommandBridge:
             "progress": [],
             "message": "",
             "actions": [],
+            "artifacts": [],
             "error": None,
             "model_metadata": job.model_metadata,
             "request": job.request_payload,
@@ -3428,6 +3449,7 @@ class CommandBridge:
             status: str,
             message: str,
             actions: list[dict],
+            artifacts: tuple[ArtifactRef, ...],
             error: str | None,
             model_metadata: ModelMetadata | None = None,
         ) -> None:
@@ -3436,8 +3458,8 @@ class CommandBridge:
             # "done" (or "error") over the interrupted terminal state (#81).
             with job.lock:
                 if job.cancel_event.is_set():
-                    status, message, actions, error = (
-                        JOB_INTERRUPTED, "任務已取消。", [], None
+                    status, message, actions, artifacts, error = (
+                        JOB_INTERRUPTED, "任務已取消。", [], (), None
                     )
                     model_metadata = None
                 progress_snapshot = list(job.progress)
@@ -3456,6 +3478,7 @@ class CommandBridge:
                     "progress": progress_snapshot,
                     "message": message,
                     "actions": list(actions),
+                    "artifacts": [artifact.to_dict() for artifact in artifacts],
                     "error": error,
                     "model_metadata": metadata_payload,
                     "request": job.request_payload,
@@ -3468,7 +3491,7 @@ class CommandBridge:
                     reason_code="response_ok" if status == JOB_DONE else status,
                 )
                 if message:
-                    recorder.assistant_message(message)
+                    recorder.assistant_message(message, artifacts=artifacts)
                 recorder.terminal(
                     "cancelled" if status == JOB_INTERRUPTED else ("completed" if status == JOB_DONE else "failed"),
                     message=message or (error or ""),
@@ -3477,16 +3500,21 @@ class CommandBridge:
                 job.status = status
                 job.message = message
                 job.actions = actions
+                job.artifacts = [artifact.to_dict() for artifact in artifacts]
                 job.error = error
                 job.model_metadata = metadata_payload
 
         def _worker() -> None:
             recorder_token = self._active_run_recorder.set(recorder)
             try:
-                message, actions, model_metadata = runner(job)
+                result = runner(job)
                 _persist_terminal(
-                    status=JOB_DONE, message=message,
-                    actions=actions, error=None, model_metadata=model_metadata,
+                    status=JOB_DONE,
+                    message=result.message,
+                    actions=result.actions,
+                    artifacts=result.artifacts,
+                    error=None,
+                    model_metadata=result.model_metadata,
                 )
             except Exception as exc:  # noqa: BLE001
                 if job.cancel_event.is_set():
@@ -3494,7 +3522,7 @@ class CommandBridge:
                 else:
                     logger.exception("async job failed job=%s", job.id)
                 _persist_terminal(
-                    status=JOB_ERROR, message="", actions=[], error=str(exc),
+                    status=JOB_ERROR, message="", actions=[], artifacts=(), error=str(exc),
                 )
             finally:
                 self._active_run_recorder.reset(recorder_token)
@@ -3527,19 +3555,29 @@ class CommandBridge:
         if req.mode == MODE_TRANSLATION and req.submode in (
             None, SUBMODE_TEXT_TRANSLATION
         ):
-            def _runner(job: _Job) -> tuple[str, list[dict], ModelMetadata | None]:
+            def _runner(job: _Job) -> _JobResult:
                 del job
                 message, metadata = self._translate_text_with_backend(
                     text, req.chat_backend
                 )
-                return message, [], metadata
+                return _JobResult(message, [], metadata)
 
         elif req.mode == MODE_INVESTMENT and req.submode in (
             None, SUBMODE_DEEP_PRODUCT_RESEARCH
         ):
-            def _runner(job: _Job) -> tuple[str, list[dict], ModelMetadata | None]:
+            def _runner(job: _Job) -> _JobResult:
                 message, markup = self._run_command_raw("/research", text, chat_id=job.id)
-                return message, self._markup_to_actions(markup), None
+                return _JobResult(message, self._markup_to_actions(markup))
+        elif (
+            req.mode == MODE_INVESTMENT
+            and req.submode == SUBMODE_SELLER_REPUTATION_SNAPSHOT
+        ):
+            def _runner(job: _Job) -> _JobResult:
+                del job
+                response = self._handle_seller_reputation_snapshot(req)
+                if response.status != STATUS_OK:
+                    raise RuntimeError(response.message)
+                return _JobResult(response.message, [], artifacts=response.artifacts)
         else:
             return {
                 "status": STATUS_ERROR,
@@ -3558,7 +3596,7 @@ class CommandBridge:
         )
 
     def start_async(self, req: WebCommandRequest) -> dict:
-        """Start a durable text translation or product research command."""
+        """Start a durable translation or investment command."""
         return self._launch_async_request(req)
 
     def poll_job(self, job_id: str) -> dict:
@@ -3578,6 +3616,7 @@ class CommandBridge:
                     "progress": list(job.progress),
                     "message": job.message,
                     "actions": list(job.actions),
+                    "artifacts": list(job.artifacts),
                     "error": job.error,
                     "model_metadata": job.model_metadata,
                 }
@@ -3595,6 +3634,7 @@ class CommandBridge:
                 "progress": persisted.get("progress") or [],
                 "message": persisted.get("message") or "",
                 "actions": persisted.get("actions") or [],
+                "artifacts": persisted.get("artifacts") or [],
                 "error": None,
                 "model_metadata": persisted.get("model_metadata"),
             }
@@ -3605,6 +3645,7 @@ class CommandBridge:
                 "progress": persisted.get("progress") or [],
                 "message": "",
                 "actions": [],
+                "artifacts": [],
                 "error": persisted.get("error") or "任務失敗",
                 "model_metadata": persisted.get("model_metadata"),
             }
@@ -3649,6 +3690,7 @@ class CommandBridge:
             "message": "舊版任務缺少可恢復的請求資料，請重新送出。",
             "progress": persisted.get("progress") or [],
             "actions": [],
+            "artifacts": [],
             "error": None,
         }
 
@@ -4642,6 +4684,47 @@ class CommandBridge:
                     self._event_sessions_inst = SessionEventService(self.settings, self._sessions)
         return self._event_sessions_inst
 
+    def _artifact_store(self) -> ArtifactStore:
+        if self._artifact_store_inst is None:
+            with self._artifact_store_lock:
+                if self._artifact_store_inst is None:
+                    root = getattr(
+                        self.settings,
+                        "openclaw_web_artifact_dir",
+                        ".openclaw_tmp/web_artifacts",
+                    )
+                    self._artifact_store_inst = ArtifactStore(
+                        root,
+                        max_file_bytes=int(
+                            getattr(
+                                self.settings,
+                                "openclaw_web_artifact_max_bytes",
+                                20 * 1024 * 1024,
+                            )
+                        ),
+                    )
+        return self._artifact_store_inst
+
+    def publish_artifact(
+        self,
+        *,
+        session_id: str | None,
+        path: str | Path,
+        filename: str | None = None,
+        content_type: str,
+    ) -> ArtifactRef:
+        """Publish one producer-owned file through the shared output contract."""
+        return self._artifact_store().publish_file(
+            session_id or "web-default",
+            path,
+            filename=filename,
+            content_type=content_type,
+        )
+
+    def open_artifact(self, *, session_id: str, artifact_id: str) -> StoredArtifact:
+        """Resolve a session-bound artifact for the private download endpoint."""
+        return self._artifact_store().open(session_id, artifact_id)
+
     def _context_compactor(self) -> ContextCompactor:
         if self._context_compactor_inst is None:
             with self._context_compactor_lock:
@@ -5123,6 +5206,7 @@ class CommandBridge:
         resolved = session_id or "web-default"
         try:
             self._event_sessions().clear(resolved)
+            self._artifact_store().clear_session(resolved)
             self._context_compactor().clear(resolved)
             self._sessions().clear()
             self._executor.clear(resolved)
@@ -6038,12 +6122,7 @@ class CommandBridge:
     # --- investment ------------------------------------------------------
     def _handle_investment(self, req: WebCommandRequest) -> WebCommandResponse:
         if req.submode == SUBMODE_SELLER_REPUTATION_SNAPSHOT:
-            return WebCommandResponse(
-                status=STATUS_UNSUPPORTED,
-                message=_SELLER_UNSUPPORTED_MSG,
-                mode=MODE_INVESTMENT,
-                submode=SUBMODE_SELLER_REPUTATION_SNAPSHOT,
-            )
+            return self._handle_seller_reputation_snapshot(req)
         if req.submode in (None, SUBMODE_DEEP_PRODUCT_RESEARCH):
             text = (req.input or "").strip()
             if not text:
@@ -6065,4 +6144,54 @@ class CommandBridge:
             message=f"投資研究子模式尚未支援：{req.submode}",
             mode=MODE_INVESTMENT,
             submode=req.submode,
+        )
+
+    def _handle_seller_reputation_snapshot(
+        self, req: WebCommandRequest
+    ) -> WebCommandResponse:
+        text = (req.input or "").strip()
+        if not text:
+            return WebCommandResponse(
+                status=STATUS_ERROR,
+                message="請貼上賣家 URL。",
+                mode=MODE_INVESTMENT,
+                submode=SUBMODE_SELLER_REPUTATION_SNAPSHOT,
+            )
+        from price_monitor_bot.bot import TelegramReputationQuery
+
+        from .reputation_render import default_reputation_renderer
+
+        delivery = default_reputation_renderer(self.settings)(
+            TelegramReputationQuery(query_url=text)
+        )
+        content_types = {
+            ".pdf": "application/pdf",
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+        }
+        published: list[ArtifactRef] = []
+        try:
+            for attachment in delivery.attachments:
+                published.append(self.publish_artifact(
+                    session_id=req.session_id,
+                    path=attachment.path,
+                    content_type=content_types.get(
+                        attachment.path.suffix.lower(), ""
+                    ),
+                ))
+        except Exception:
+            for artifact in published:
+                self._artifact_store().discard(req.session_id, artifact.artifact_id)
+            raise
+        finally:
+            for path in delivery.cleanup_paths:
+                path.unlink(missing_ok=True)
+        artifacts = tuple(published)
+        return WebCommandResponse(
+            status=STATUS_OK,
+            message=delivery.summary_text,
+            mode=MODE_INVESTMENT,
+            submode=SUBMODE_SELLER_REPUTATION_SNAPSHOT,
+            artifacts=artifacts,
         )

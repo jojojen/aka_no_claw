@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from uuid import uuid4
 
+from .artifact_store import ArtifactRef
 from .session_event_journal import SessionEventJournal
 
 
@@ -75,11 +76,19 @@ class RunRecorder:
     def judge_completed(self, *, satisfied: bool, reason_code: str) -> None:
         self.emit("judge.completed", {"satisfied": satisfied, "reason_code": reason_code})
 
-    def assistant_message(self, text: str, *, partial: bool = False) -> None:
+    def assistant_message(
+        self,
+        text: str,
+        *,
+        partial: bool = False,
+        artifacts: tuple[ArtifactRef, ...] = (),
+    ) -> None:
         if text:
             payload: dict[str, object] = {"text": text, "partial": partial}
             if self._mode:
                 payload["mode"] = self._mode
+            if artifacts:
+                payload["artifacts"] = [artifact.to_dict() for artifact in artifacts]
             self.emit("assistant.message", payload)
 
     def terminal(

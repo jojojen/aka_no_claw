@@ -29,6 +29,8 @@ The OpenClaw adapter also owns the Web command bridge's transport-compatible
 event runtime. `session_event_journal.py` is the append-only authority,
 `session_projection.py` rebuilds the Web view, and `command_bridge.py` records
 blocking, streaming, and background-job lifecycles through `RunRecorder`.
+`artifact_store.py` owns bounded session-scoped output files. Responses, jobs,
+and events carry `ArtifactRef` metadata instead of file bytes.
 
 ## Main Runtime Flow
 
@@ -228,6 +230,7 @@ Runtime paths are resolved through `assistant_runtime.settings`; keep docs gener
 | Quiz DB | `data/quiz.sqlite3` | Quiz state and review material. |
 | Web session event journals | `.openclaw_tmp/web_sessions/<session_id>/` | Command bridge authority: bounded JSONL events plus sequence metadata; rebuildable projections and compatibility snapshots must not overwrite it. |
 | Web prompt queues | `.openclaw_tmp/web_prompt_queue/<session_id>.json` | Opt-in #86 bounded per-session request snapshots. Atomic claim/version mutations; event journal receives public `queue.changed` snapshots. |
+| Web output artifacts | `.openclaw_tmp/web_artifacts/<session_id>/<artifact_id>/` | Validated Markdown, CSV, PDF, PNG, and JPEG output. Metadata includes size and SHA-256. Session clearing removes these files. |
 
 ## High-Risk Boundaries
 
@@ -237,3 +240,4 @@ Runtime paths are resolved through `assistant_runtime.settings`; keep docs gener
 - TCG-specific matching belongs in sibling package `tcg_tracker`, not `market_monitor`.
 - Generic source and price aggregation behavior belongs in sibling package `market_monitor`, not Telegram handlers.
 - Web clients must recover durable history with `/api/command/events`; they must not treat mutable poll/session snapshots or an NDJSON page cursor as the authoritative journal head.
+- Web artifact downloads must remain session-bound. Do not put file bytes or arbitrary local paths in response JSON.

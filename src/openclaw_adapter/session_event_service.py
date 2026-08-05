@@ -95,6 +95,9 @@ class SessionEventService:
             item = {
                 "id": message["event_id"], "role": message["role"], "text": message["text"],
             }
+            artifacts = message.get("artifacts")
+            if isinstance(artifacts, list):
+                item["artifacts"] = artifacts
             run = runs.get(message["run_id"], {})
             mode = message.get("mode")
             if not isinstance(mode, str) and isinstance(run, dict):

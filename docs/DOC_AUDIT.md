@@ -50,6 +50,7 @@ for which question each one answers.
 | `WEB_DYNAMIC_TOOL_APPROVAL_IMPLEMENTATION_PLAN.md` | Current | dynamic-tools / command-bridge safety | Shipped #85 manifest-bound approval contract and staged live-proof record; depends on the #84 event spine. |
 | `WEB_PROMPT_QUEUE_IMPLEMENTATION_PLAN.md` | Current | command-bridge / conversation-runtime | Canonical #86 prompt queue and safe interjection implementation record; supported-restart proof complete. Depends on #84 and the Web consumer plan. |
 | `WEB_CONVERSATION_COMPACTION_IMPLEMENTATION_PLAN.md` | Current | command-bridge / model-context | Canonical #87 grounded deterministic compaction/checkpoint implementation record; depends on #84 and the Web consumer plan. |
+| `WEB_ARTIFACT_DELIVERY_IMPLEMENTATION_PLAN.md` | Current | command-bridge / conversation-runtime | Keep as the canonical output-artifact contract for producers, storage, transport, recovery, and Web rendering. |
 | `TELEGRAM_NL_OWNERSHIP_REFACTOR_ISSUE.md` | Planned | telegram | Draft issue; keep until the cross-repo NL ownership refactor is filed/resolved. |
 | `TELEGRAM_CORE_EXTRACTION_PLAN.md` | Current | telegram | Extraction shipped (phases P0–P4, all 3 repos' suites green); kept in place (not archived) as the `telegram_core` hook/registry contract reference. |
 | `VOICE_CONTROL_PERSONALIZATION_DESIGN.md` | Planned | voice / command-bridge / web | Canonical #82 design for local-only voice-control personalization, pre-tool safety gate, and registry-derived action clarification; keep as the implementation source until shipped. |

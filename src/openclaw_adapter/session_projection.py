@@ -141,6 +141,11 @@ def _apply(projection: SessionProjection, event: SessionRunEvent) -> None:
             mode = event.payload.get("mode")
             if isinstance(mode, str):
                 message["mode"] = mode
+            artifacts = event.payload.get("artifacts")
+            if isinstance(artifacts, list):
+                message["artifacts"] = [
+                    dict(artifact) for artifact in artifacts if isinstance(artifact, dict)
+                ]
             projection.messages.append(message)
         return
     run = projection.runs.setdefault(event.run_id, {"status": "accepted", "last_seq": event.seq})

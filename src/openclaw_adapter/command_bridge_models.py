@@ -17,6 +17,8 @@ import json
 import re
 from dataclasses import asdict, dataclass
 
+from .artifact_store import ArtifactRef
+
 # --- Modes ----------------------------------------------------------------
 MODE_CHAT = "chat"
 MODE_TRANSLATION = "translation"
@@ -267,6 +269,7 @@ class WebCommandResponse:
     actions: tuple[Action, ...] = ()
     warnings: tuple[str, ...] = ()
     sources: tuple[Source, ...] = ()
+    artifacts: tuple[ArtifactRef, ...] = ()
     model_metadata: ModelMetadata | None = None
     # Voice clarification card (#82): serialized VoiceClarification contract
     # (kind/transcript/reason_code/candidates/fallback). Kept as a plain dict
@@ -288,6 +291,8 @@ class WebCommandResponse:
             out["warnings"] = list(self.warnings)
         if self.sources:
             out["sources"] = [s.to_dict() for s in self.sources]
+        if self.artifacts:
+            out["artifacts"] = [artifact.to_dict() for artifact in self.artifacts]
         if self.model_metadata is not None:
             out["model_metadata"] = self.model_metadata.to_dict()
         if self.clarification is not None:
@@ -560,6 +565,7 @@ def stream_done(
     *,
     model_metadata: ModelMetadata | None = None,
     actions: list[dict[str, object]] | None = None,
+    artifacts: list[dict[str, object]] | None = None,
     clarification: dict[str, object] | None = None,
     direct_action: dict[str, object] | None = None,
 ) -> dict[str, object]:
@@ -568,6 +574,8 @@ def stream_done(
         ev["model_metadata"] = model_metadata.to_dict()
     if actions:
         ev["actions"] = list(actions)
+    if artifacts:
+        ev["artifacts"] = list(artifacts)
     if clarification is not None:
         ev["clarification"] = clarification
     if direct_action is not None:

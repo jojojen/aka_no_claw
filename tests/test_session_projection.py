@@ -45,6 +45,23 @@ def test_projection_preserves_message_mode_and_legacy_chat_route():
     assert projection.runs["old"]["route"] == "stream_chat"
 
 
+def test_projection_preserves_artifact_references_without_file_bytes():
+    artifact = {
+        "artifact_id": "artifact-1",
+        "filename": "report.pdf",
+        "content_type": "application/pdf",
+        "kind": "document",
+        "size_bytes": 123,
+        "sha256": "a" * 64,
+        "download_url": "/api/command/artifacts/artifact-1/report.pdf?session_id=web-default",
+    }
+    projection = project_session([
+        _event(1, "assistant.message", {"text": "done", "artifacts": [artifact]}),
+    ])
+
+    assert projection.messages[0]["artifacts"] == [artifact]
+
+
 def test_projection_marks_interrupted_partial_as_non_authoritative_but_keeps_it_visible():
     projection = project_session([
         _event(1, "user.message", {"text": "question", "mode": "chat"}),

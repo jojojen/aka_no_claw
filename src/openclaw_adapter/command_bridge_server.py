@@ -19,15 +19,17 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
+import shutil
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 from uuid import uuid4
 
 from assistant_runtime import AssistantSettings
 from multipart import MultipartError, ParserLimitReached, parse_form_data
 
 from .command_bridge import CommandBridge
+from .artifact_store import ArtifactError, ArtifactNotFoundError
 from .command_bridge_models import RequestValidationError, parse_request
 from .local_stt import (
     LocalWhisperTranscriber,
@@ -300,8 +302,46 @@ def _build_handler(
                 self._write_json(
                     {"status": "ok", **voice_metrics.METRICS.snapshot()}
                 )
+            elif split.path.startswith("/api/command/artifacts/"):
+                self._handle_artifact_download(split)
             else:
                 self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+
+        def _handle_artifact_download(self, split) -> None:
+            relative = split.path.removeprefix("/api/command/artifacts/")
+            parts = relative.split("/", 1)
+            session_id = (parse_qs(split.query).get("session_id") or [""])[0]
+            if len(parts) != 2 or not session_id:
+                self.send_error(HTTPStatus.NOT_FOUND, "Artifact not found")
+                return
+            artifact_id, requested_filename = map(unquote, parts)
+            try:
+                stored = bridge.open_artifact(
+                    session_id=session_id,
+                    artifact_id=artifact_id,
+                )
+            except (ArtifactNotFoundError, ArtifactError, ValueError):
+                self.send_error(HTTPStatus.NOT_FOUND, "Artifact not found")
+                return
+            if requested_filename != stored.ref.filename:
+                self.send_error(HTTPStatus.NOT_FOUND, "Artifact not found")
+                return
+
+            disposition = "inline" if stored.ref.kind == "image" else "attachment"
+            encoded_name = quote(stored.ref.filename, safe="")
+            self.send_response(HTTPStatus.OK)
+            self._send_cors_headers()
+            self.send_header("Content-Type", stored.ref.content_type)
+            self.send_header("Content-Length", str(stored.ref.size_bytes))
+            self.send_header("Cache-Control", "private, no-store, max-age=0")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header(
+                "Content-Disposition",
+                f"{disposition}; filename*=UTF-8''{encoded_name}",
+            )
+            self.end_headers()
+            with stored.path.open("rb") as handle:
+                shutil.copyfileobj(handle, self.wfile, length=1024 * 1024)
 
         def do_DELETE(self) -> None:  # noqa: N802
             if not self._is_allowed():

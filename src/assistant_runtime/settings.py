@@ -216,6 +216,9 @@ class AssistantSettings:
     openclaw_web_event_max_bytes: int = 25 * 1024 * 1024
     openclaw_web_event_max_age_days: int = 30
     openclaw_web_event_max_payload_bytes: int = 64 * 1024
+    # Session-scoped output files. Event payloads keep only bounded references.
+    openclaw_web_artifact_dir: str = ".openclaw_tmp/web_artifacts"
+    openclaw_web_artifact_max_bytes: int = 20 * 1024 * 1024
     # Grounded model-input checkpoints (#87).  They are kept separate from the
     # append-only event journal and may be cleared without clearing chat.
     openclaw_web_context_window_tokens: int = 32768
@@ -625,6 +628,12 @@ def get_settings() -> AssistantSettings:
         ),
         openclaw_web_event_max_payload_bytes=_as_int(
             os.getenv("OPENCLAW_WEB_EVENT_MAX_PAYLOAD_BYTES"), default=64 * 1024
+        ),
+        openclaw_web_artifact_dir=_resolve_runtime_path(
+            os.getenv("OPENCLAW_WEB_ARTIFACT_DIR", ".openclaw_tmp/web_artifacts")
+        ),
+        openclaw_web_artifact_max_bytes=_as_int(
+            os.getenv("OPENCLAW_WEB_ARTIFACT_MAX_BYTES"), default=20 * 1024 * 1024
         ),
         openclaw_web_context_window_tokens=_as_int(
             os.getenv("OPENCLAW_WEB_CONTEXT_WINDOW_TOKENS"), default=32768
