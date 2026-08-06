@@ -72,12 +72,21 @@ _CHAT_TOOL_PLAN_PROMPT_TEMPLATE = (
     '{{"tool":"__no_tool__","reason_summary":"..."}}\n'
     "或\n"
     '{{"tool":"{tool_choices}","query":"...","reason_summary":"..."}}\n'
+    "若使用者明確要求把最終結果回傳為 Markdown 或 HTML 檔案，請在同一個物件加入："
+    '{{"output_artifact":{{"format":"markdown"}}}} 或 '
+    '{{"output_artifact":{{"format":"html"}}}}。這個欄位不會改變工具選擇。'
+    "若使用者只要求在聊天中顯示內容，不要加入 output_artifact。\n"
+    "加入 output_artifact 時，query 仍須保留使用者指定的資料範圍、欄位、內容結構、"
+    "資料日期與來源要求；檔案編碼與副檔名只交給 output_artifact 表示。\n"
     "例如：\n"
     '- 問「米津玄師是誰」→ {{"tool":"__no_tool__","reason_summary":"一般知識"}}\n'
     '- 問「今天東京天氣」→ {{"tool":"/search","query":"東京 今天天氣","reason_summary":"需要最新資訊"}}\n'
     '- 問「先幫我查一下東京天氣，再用日文念出來」→ {{"tool":"__goal__","query":"查東京天氣後用日文念出來","reason_summary":"想現在就完成的多步驟任務"}}\n'
     '- 問「建立工作流：查東京天氣，用女僕口吻以日文報告」→ '
     '{{"tool":"__create_workflow__","query":"查東京天氣，用女僕口吻以日文報告","reason_summary":"要求建立可重複使用的工作流程"}}\n'
+    "- 問「查最新交通統計，整理成 Markdown 表格並以檔案回傳」→ "
+    '{{"tool":"/search","query":"查最新交通統計並整理成 Markdown 表格","reason_summary":"一次搜尋可完成；檔案包裝不是額外步驟",'
+    '"output_artifact":{{"format":"markdown"}}}}\n'
     "當 tool=__no_tool__ 時，不要輸出 answer；後續會由獨立回答階段處理。"
     "對話紀錄按時間由舊到新排列；較早的助理回答只是先前說法，"
     "不是權威事實。使用者後來補充、更正或否定的內容優先，不能繼續沿用已被更正的前提。\n"
@@ -88,6 +97,9 @@ _CHAT_TOOL_PLAN_PROMPT_TEMPLATE = (
     "當 tool=__goal__ 時，代表使用者是在描述一個想要『現在就完成』的多步驟"
     "任務或目標（不是要求建立一個之後可重複執行的工作流程本身），"
     "query 必須是使用者想完成的多步驟目標描述，不要回答成最終執行結果。\n"
+    "輸出 Markdown 或 HTML 檔案只改變交付方式，不算一個任務步驟。"
+    "若一個搜尋工具可取得資料並整理答案，使用 /search，"
+    "不要因為要輸出檔案而改用 __goal__。\n"
     "當 tool 是真實工具時，query 必須是該工具可直接執行的參數；"
     "若使用者用代名詞（她／它／這個），請用對話紀錄把主詞補回 query。"
 )

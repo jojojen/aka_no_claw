@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 import time
 import io
@@ -66,6 +67,27 @@ def test_cursor_pages_are_replayable_without_duplicates(tmp_path, monkeypatch):
     assert sequences == sorted(set(sequences))
     assert first["latest_cursor"] == second["latest_cursor"] == sequences[-1]
     assert second["has_more"] is False
+
+
+def test_concurrent_session_bootstrap_imports_initial_sequence_once(tmp_path, monkeypatch):
+    bridge = _bridge(tmp_path)
+    service = bridge._event_sessions()
+    original = service._legacy_store().load
+    calls = 0
+
+    def slow_load():
+        nonlocal calls
+        calls += 1
+        time.sleep(0.03)
+        return original()
+
+    monkeypatch.setattr(service._legacy_store(), "load", slow_load)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        journals = list(pool.map(lambda _: service.ensure(), range(4)))
+
+    assert calls == 1
+    assert all(journal.events()[0].seq == 1 for journal in journals)
+    assert len(journals[0].events()) == 1
 
 
 def test_snapshot_post_only_imports_messages_once_and_clear_is_journal_aware(tmp_path):

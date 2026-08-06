@@ -280,6 +280,30 @@ def test_fetch_page_text_browser_fallback_skips_useful_static_text() -> None:
     assert "article body text" in text
 
 
+def test_browser_fetch_expands_structural_disclosures_without_name_lists() -> None:
+    class Page:
+        def __init__(self) -> None:
+            self.script = ""
+            self.waited = False
+
+        def evaluate(self, script: str) -> int:
+            self.script = script
+            return 1
+
+        def wait_for_timeout(self, _milliseconds: int) -> None:
+            self.waited = True
+
+    page = Page()
+
+    ws._expand_read_only_page_content(page)
+
+    assert "aria-expanded='false'" in page.script
+    assert "hasRepeatedRows" in page.script
+    assert "show-more" not in page.script
+    assert "morebtn" not in page.script.lower()
+    assert page.waited is True
+
+
 def test_build_web_research_answer_fetch_feeds_page_content_to_summarizer() -> None:
     seen: dict[str, object] = {}
 

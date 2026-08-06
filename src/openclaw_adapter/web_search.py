@@ -826,9 +826,60 @@ def _fetch_url_with_browser(
                 pass
             page.wait_for_timeout(1200)
             bs.humanize(page)
+            _expand_read_only_page_content(page)
             return page.content()
         finally:
             browser.close()
+
+
+def _expand_read_only_page_content(page: object) -> None:
+    """Open bounded disclosure controls next to repeated data regions."""
+    try:
+        page.evaluate(
+            """() => {
+                const visible = (element) => {
+                    const style = getComputedStyle(element);
+                    const box = element.getBoundingClientRect();
+                    return style.display !== "none" && style.visibility !== "hidden"
+                        && box.width > 0 && box.height > 0;
+                };
+                const hasRepeatedRows = (root) => {
+                    for (const node of root.querySelectorAll("*")) {
+                        const children = Array.from(node.children);
+                        if (children.length < 3) continue;
+                        const counts = new Map();
+                        for (const child of children) {
+                            const signature = `${child.tagName}:${child.className}`;
+                            counts.set(signature, (counts.get(signature) || 0) + 1);
+                        }
+                        if (Math.max(...counts.values()) >= 3) return true;
+                    }
+                    return false;
+                };
+                const standard = Array.from(document.querySelectorAll(
+                    "details:not([open]) > summary, [aria-expanded='false']"
+                ));
+                const structural = Array.from(document.querySelectorAll("body *")).filter(
+                    (element) => {
+                        if (!visible(element) || element.closest("form, a")) return false;
+                        const style = getComputedStyle(element);
+                        const previous = element.previousElementSibling;
+                        return style.cursor === "pointer" && previous !== null
+                            && hasRepeatedRows(previous);
+                    }
+                );
+                let clicked = 0;
+                for (const element of new Set([...standard, ...structural])) {
+                    if (clicked >= 8) break;
+                    element.click();
+                    clicked += 1;
+                }
+                return clicked;
+            }"""
+        )
+        page.wait_for_timeout(500)
+    except Exception:
+        logger.debug("browser fetch could not expand page content", exc_info=True)
 
 
 def _looks_like_low_value_page_text(text: str, *, min_chars: int) -> bool:

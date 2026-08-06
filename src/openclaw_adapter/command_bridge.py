@@ -34,6 +34,11 @@ from uuid import uuid4
 
 from assistant_runtime import AssistantSettings, build_ssl_context
 
+from .artifact_output import (
+    output_artifact_content_type,
+    render_text_artifact,
+    semantic_content_instruction,
+)
 from .artifact_store import ArtifactRef, ArtifactStore, StoredArtifact
 from .job_store import JobStore
 from .session_memory import SessionMemoryStore, SessionWriteError, empty_session
@@ -97,6 +102,7 @@ from .command_bridge_models import (
     CHAT_TOOL_RESEARCH,
     CHAT_TOOL_SEARCH,
     MUSIC_ACTION_PLAN,
+    ArtifactOutputRequest,
     ChatToolPlan,
     ChatToolPolicy,
     ChatToolRequest,
@@ -117,6 +123,7 @@ from .command_bridge_models import (
     WebCommandRequest,
     WebCommandResponse,
     RequestValidationError,
+    _loads_first_json_object,
     _clip,
     _encode_image_attachment,
     _image_temp_suffix,
@@ -202,6 +209,9 @@ class _WorkflowApprovalContext:
 
 _WORKFLOW_APPROVAL_CONTEXT: ContextVar[_WorkflowApprovalContext | None] = ContextVar(
     "workflow_approval_context", default=None
+)
+_REQUESTED_OUTPUT_ARTIFACT: ContextVar[ArtifactOutputRequest | None] = ContextVar(
+    "requested_output_artifact", default=None
 )
 
 # Chat-tool ledger: how many recent executions to keep per conversation and how
@@ -289,7 +299,9 @@ _SEARCH_SYNTHESIS_PROMPT = (
     "1. 只根據提供的來源作答，不要編造來源裡沒有的事實。\n"
     "2. 若來源不足以回答，請誠實說明，不要硬掰。\n"
     "3. 引用具體資訊時可標註對應的來源編號 [n]。\n"
-    "4. 回答精簡自然，不要整段照抄摘要。"
+    "4. 回答精簡自然，不要整段照抄摘要。\n"
+    "5. 若使用者指定官方或第一方資料，核心事實只能採用提供的第一方來源；不要用第二手來源代替。\n"
+    "6. 使用 Markdown 表達標題、表格、清單與連結。檔案輸出層會轉換成使用者要求的格式。"
 )
 # Tool-usage indicators the user sees directly in the chat (#45). Two layers:
 #  - a LIVE "正在調用…工具中" notice streamed before the tool runs, so the user
@@ -307,7 +319,8 @@ _TOOL_USED_PREFIX = "🔧 已使用工具："
 # always carries the full URL.
 _SOURCE_PACK_TITLE_CAP = 200
 _SOURCE_PACK_SNIPPET_CAP = 500
-_SOURCE_PACK_TOTAL_CAP = 4000
+_SOURCE_PACK_CONTENT_CAP = 6000
+_SOURCE_PACK_TOTAL_CAP = 12000
 
 _NO_IMAGE_MSG = "請附上要翻譯的圖片。"
 _BAD_IMAGE_TYPE_MSG = "不支援的檔案類型，請改用 JPG / PNG / WEBP / GIF 等圖片格式。"
@@ -835,8 +848,10 @@ class CommandBridge:
         self._maybe_auto_compact_context(session_id)
         recorder.started()
         token = self._active_run_recorder.set(recorder)
+        output_token = _REQUESTED_OUTPUT_ARTIFACT.set(None)
         try:
             response = self._handle_unrecorded(req)
+            response = self._attach_requested_output_artifact(req, response)
             recorder.planner_completed("command_bridge" if req.mode == MODE_CHAT else req.mode)
             recorder.judge_completed(
                 satisfied=response.status != STATUS_ERROR,
@@ -861,6 +876,7 @@ class CommandBridge:
             self._maybe_drain_prompt_queue(session_id)
             return response
         finally:
+            _REQUESTED_OUTPUT_ARTIFACT.reset(output_token)
             self._active_run_recorder.reset(token)
 
     def _handle_unrecorded(self, req: WebCommandRequest) -> WebCommandResponse:
@@ -930,7 +946,10 @@ class CommandBridge:
                     recorder.planner_completed("stream_chat")
                     recorder.judge_completed(satisfied=True, reason_code="stream_done")
                     if event.get("_durable_job") is not True:
-                        recorder.assistant_message(str(message or "".join(deltas)))
+                        recorder.assistant_message(
+                            str(message or "".join(deltas)),
+                            artifacts=self._artifact_refs_from_event(event),
+                        )
                     recorder.terminal("completed")
                     terminal = True
                 elif event_type == "error":
@@ -992,6 +1011,9 @@ class CommandBridge:
             trusted_context=self._trusted_context_checkpoint(req),
         )
         plan, metadata = self._select_chat_tool_plan(req)
+        _REQUESTED_OUTPUT_ARTIFACT.set(plan.output_artifact if plan is not None else None)
+        if plan is not None and plan.output_artifact is not None:
+            prompt = "\n\n".join((prompt, semantic_content_instruction(plan.output_artifact.format)))
         if plan is not None and plan.tool == CHAT_TOOL_CREATE_WORKFLOW:
             # No streaming connection to carry a "redirect" event here, so run
             # the same dedicated workflow-creation entrypoint the frontend
@@ -1005,7 +1027,12 @@ class CommandBridge:
                 mode=MODE_CHAT,
             )
         if plan is not None and plan.tool == CHAT_TOOL_GOAL:
-            return self._run_goal_loop_blocking(req, plan.query, planner_metadata=metadata)
+            return self._run_goal_loop_blocking(
+                req,
+                plan.query,
+                planner_metadata=metadata,
+                output_artifact=plan.output_artifact,
+            )
         if plan is not None and plan.tool != CHAT_TOOL_NO_TOOL:
             # #82 PR1 voice guard: must run BEFORE the tool executes so a
             # misrecognized control utterance never triggers /search.
@@ -1109,14 +1136,20 @@ class CommandBridge:
             plan, metadata = yield from self._stream_chat_tool_plan(req, observation)
         else:
             plan, metadata = yield from self._stream_chat_tool_plan(req)
+        if plan is not None and plan.output_artifact is not None:
+            prompt = "\n\n".join((prompt, semantic_content_instruction(plan.output_artifact.format)))
         if plan is not None and plan.tool == CHAT_TOOL_CREATE_WORKFLOW:
             yield stream_redirect("create_workflow", plan.query)
             return
         if plan is not None and plan.tool == CHAT_TOOL_GOAL:
             goal_seeds = {"image_observation": observation} if observation else None
-            yield from self._stream_goal_loop(
-                req, plan.query, planner_metadata=metadata, seed_variables=goal_seeds
-            )
+            goal_kwargs = {
+                "planner_metadata": metadata,
+                "seed_variables": goal_seeds,
+            }
+            if plan.output_artifact is not None:
+                goal_kwargs["output_artifact"] = plan.output_artifact
+            yield from self._stream_goal_loop(req, plan.query, **goal_kwargs)
             return
         if plan is not None and plan.tool != CHAT_TOOL_NO_TOOL:
             # #82 PR1 voice guard (streaming twin of the blocking path).
@@ -1130,17 +1163,27 @@ class CommandBridge:
             if plan.tool == CHAT_TOOL_RESEARCH:
                 yield from self._stream_chat_research_job(req, plan)
                 return
-            yield from self._stream_chat_tool(req, plan)
+            yield from self._stream_with_requested_output(req, plan.output_artifact, self._stream_chat_tool(req, plan))
             return
         if plan is not None and plan.tool == CHAT_TOOL_NO_TOOL:
             if plan.answer:
                 # Same compatibility seam as the blocking path; the real
                 # planner strips obsolete router prose before this point.
                 yield stream_delta(plan.answer)
-                yield stream_done(plan.answer, model_metadata=metadata)
+                yield from self._stream_with_requested_output(
+                    req,
+                    plan.output_artifact,
+                    iter((stream_done(plan.answer, model_metadata=metadata),)),
+                )
             else:
-                yield from self._stream_chat_response(
-                    prompt, req.chat_backend, conversation_key=self._conversation_key(req)
+                yield from self._stream_with_requested_output(
+                    req,
+                    plan.output_artifact,
+                    self._stream_chat_response(
+                        prompt,
+                        req.chat_backend,
+                        conversation_key=self._conversation_key(req),
+                    ),
                 )
         else:
             # plan is None only when the router failed or emitted untrusted
@@ -1169,11 +1212,17 @@ class CommandBridge:
                     narrator=notifier.send,
                 )
             if upgraded is not None:
+                artifacts = self._publish_requested_output(req, plan.output_artifact, upgraded.message)
                 return _JobResult(
                     upgraded.message,
                     [action.to_dict() for action in upgraded.actions],
+                    artifacts=artifacts,
                 )
-            return _JobResult(tool_result.answer, [])
+            return _JobResult(
+                tool_result.answer,
+                [],
+                artifacts=self._publish_requested_output(req, plan.output_artifact, tool_result.answer),
+            )
 
         started = self._launch_background_job(
             text=plan.query,
@@ -2071,6 +2120,7 @@ class CommandBridge:
         narrator: Callable[[str], None] | None = None,
         seed_variables: dict[str, str] | None = None,
         seed_operations: dict[str, str] | None = None,
+        output_artifact: ArtifactOutputRequest | None = None,
     ) -> WebCommandResponse:
         recorder = self._active_run_recorder.get()
         goal_session_id = self._register_active_goal_run(
@@ -2083,6 +2133,11 @@ class CommandBridge:
                 narrator=narrator,
                 seed_variables=seed_variables,
                 seed_operations=seed_operations,
+                result_contract=(
+                    semantic_content_instruction(output_artifact.format)
+                    if output_artifact is not None
+                    else ""
+                ),
                 cancel_check=self._cancel_probe(_BRIDGE_CHAT_ID),
                 safe_boundary=(
                     (lambda boundary: self._consume_goal_interjections(goal_session_id, recorder.run_id, recorder, boundary))
@@ -2141,6 +2196,7 @@ class CommandBridge:
         *,
         planner_metadata: ModelMetadata | None,
         seed_variables: dict[str, str] | None = None,
+        output_artifact: ArtifactOutputRequest | None = None,
     ) -> Iterator[dict]:
         result: dict[str, object] = {}
         done = threading.Event()
@@ -2168,6 +2224,7 @@ class CommandBridge:
             "progress": list(job.progress),
             "message": "",
             "actions": [],
+            "artifacts": [],
             "error": None,
             "created_at": job.wall_created_at,
             "updated_at": job.wall_created_at,
@@ -2177,10 +2234,17 @@ class CommandBridge:
             narration_queue.put(line)
             self._jobs.append_progress(job.id, line)
 
-        def _persist_job(*, status: str, message: str, error: str | None) -> None:
+        def _persist_job(
+            *,
+            status: str,
+            message: str,
+            artifacts: tuple[ArtifactRef, ...] = (),
+            error: str | None,
+        ) -> None:
             with job.lock:
                 job.status = status
                 job.message = message
+                job.artifacts = [artifact.to_dict() for artifact in artifacts]
                 job.error = error
                 progress_snapshot = list(job.progress)
             store.save({
@@ -2191,6 +2255,7 @@ class CommandBridge:
                 "progress": progress_snapshot,
                 "message": message,
                 "actions": [],
+                "artifacts": list(job.artifacts),
                 "error": error,
                 "created_at": job.wall_created_at,
                 "updated_at": time.time(),
@@ -2199,7 +2264,7 @@ class CommandBridge:
             # snapshot. A later reconnect sees one final message and one
             # terminal state even if no stream stayed open.
             if message:
-                recorder.assistant_message(message)
+                recorder.assistant_message(message, artifacts=artifacts)
             recorder.terminal(
                 "cancelled" if status == JOB_INTERRUPTED else ("completed" if status == JOB_DONE else "failed"),
                 message=message or (error or ""),
@@ -2220,6 +2285,11 @@ class CommandBridge:
                         narrator=_emit,
                         seed_variables=seed_variables,
                         cancel_check=job.cancel_event.is_set,
+                        result_contract=(
+                            semantic_content_instruction(output_artifact.format)
+                            if output_artifact is not None
+                            else ""
+                        ),
                         safe_boundary=lambda boundary: self._consume_goal_interjections(
                             goal_session_id, job.run_id, recorder, boundary
                         ),
@@ -2228,7 +2298,6 @@ class CommandBridge:
                 result["error"] = str(exc)
             finally:
                 self._unregister_active_goal_run(goal_session_id, job.run_id)
-                done.set()
                 report = result.get("report")
                 # Persist the terminal outcome to the job unconditionally so a
                 # reconnecting/polling client recovers it deterministically.
@@ -2247,9 +2316,11 @@ class CommandBridge:
                             error=None,
                         )
                     elif isinstance(report, GoalLoopReport):
+                        message = self._format_goal_loop_final_answer(report)
                         _persist_job(
                             status=JOB_DONE,
-                            message=self._format_goal_loop_final_answer(report),
+                            message=message,
+                            artifacts=self._publish_requested_output(req, output_artifact, message),
                             error=None,
                         )
                     elif "error" in result:
@@ -2257,8 +2328,17 @@ class CommandBridge:
                             status=JOB_ERROR, message="",
                             error=f"目標執行失敗：{result['error']}",
                         )
-                except Exception:  # noqa: BLE001
+                except Exception as exc:  # noqa: BLE001
                     logger.exception("command bridge: failed to persist goal job result")
+                    result["error"] = f"無法儲存任務結果：{exc}"
+                    try:
+                        _persist_job(
+                            status=JOB_ERROR,
+                            message="",
+                            error=str(result["error"]),
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.exception("command bridge: failed to persist goal job error")
                 # Client gone (page closed / phone locked): the run still
                 # finished, so persist the continuation for the next page load.
                 # The final answer itself is recovered via the job poll above,
@@ -2274,6 +2354,7 @@ class CommandBridge:
                         logger.exception(
                             "command bridge: failed to persist abandoned goal result"
                         )
+                done.set()
 
         threading.Thread(target=_worker, daemon=True).start()
         # Announce the recovery job id before the long work so the client has
@@ -2312,6 +2393,7 @@ class CommandBridge:
             self._format_goal_loop_final_answer(report),
             model_metadata=None,
             actions=actions or None,
+            artifacts=list(job.artifacts),
         )
 
     def _execute_goal_loop(
@@ -2323,6 +2405,7 @@ class CommandBridge:
         narrator: Callable[[str], None] | None = None,
         seed_variables: dict[str, str] | None = None,
         seed_operations: dict[str, str] | None = None,
+        result_contract: str = "",
         cancel_check: Callable[[], bool] | None = None,
         safe_boundary: Callable[[str], tuple[str, ...]] | None = None,
     ):
@@ -2360,6 +2443,7 @@ class CommandBridge:
             replan_limit=_GOAL_REPLAN_LIMIT,
             narrator=narrator,
             result_judge=result_judge,
+            result_contract=result_contract,
             seed_variables=seed_variables,
             seed_operations=seed_operations,
             conservative_synthesizer=self._goal_conservative_synthesizer(
@@ -2786,16 +2870,33 @@ class CommandBridge:
             prompt, pool_rotation=pool_rotation, conversation_key=conversation_key
         )
 
-    def _push_orphaned_result(self, text: str) -> None:
+    def _push_orphaned_result(
+        self,
+        req: WebCommandRequest,
+        text: str,
+        artifacts: tuple[ArtifactRef, ...] = (),
+    ) -> None:
         """Push a completed assistant message into session memory when the
         streaming client disconnected before delivery. The user sees it on
         the next reconnect/session load."""
-        self._conversation_sessions().append_orphaned_result(text)
-        self._event_sessions().ensure().append(
-            "assistant.message", run_id="orphaned-result", payload={"text": text, "orphaned": True}
+        session_id = req.session_id or "web-default"
+        if session_id == "web-default":
+            self._conversation_sessions().append_orphaned_result(text)
+        self._event_sessions().ensure(session_id).append(
+            "assistant.message",
+            run_id="orphaned-result",
+            payload={
+                "text": text,
+                "orphaned": True,
+                "mode": req.mode,
+                "artifacts": [artifact.to_dict() for artifact in artifacts],
+            },
         )
         logger.info(
-            "command bridge: pushed orphaned tool result to session memory (%d chars)", len(text)
+            "command bridge: pushed orphaned tool result to session=%s (%d chars, %d artifacts)",
+            session_id,
+            len(text),
+            len(artifacts),
         )
 
     def _exec_grounded_search(
@@ -2806,7 +2907,12 @@ class CommandBridge:
         ``ChatToolResult``; the ``answer`` field carries the user-visible text
         (banner + synthesis + source block). Logs the backing function so every
         tool call is traceable to code."""
-        from .web_search import DEFAULT_WEB_SEARCH_LIMIT, web_search
+        from .web_search import (
+            WebSearchResult,
+            build_web_research_answer,
+            fetch_page_text,
+            web_search,
+        )
 
         query = tool_req.query  # already sanitized and budget-enforced by the executor
         logger.info(
@@ -2814,9 +2920,60 @@ class CommandBridge:
             tool_req.tool, query,
         )
         banner = f"{_TOOL_USED_PREFIX}網路搜尋（{tool_req.tool}）｜查詢：{query}"
-        results = web_search(
-            query, max_results=DEFAULT_WEB_SEARCH_LIMIT, reuse_browser=False
+        synthesis: dict[str, object] = {}
+
+        def _search(question: str, limit: int):
+            return web_search(question, max_results=limit, reuse_browser=False)
+
+        def _summarize(
+            question: str, sources: tuple[WebSearchResult, ...]
+        ) -> str:
+            source_pack = self._format_search_source_pack(
+                sources, tool_req.policy
+            )
+            prompt = "\n".join([
+                _SEARCH_SYNTHESIS_PROMPT,
+                *(
+                    ("", semantic_content_instruction(tool_req.output_artifact.format))
+                    if tool_req.output_artifact is not None
+                    else ()
+                ),
+                "",
+                f"使用者問題：{tool_req.user_question}",
+                f"搜尋查詢：{question}",
+                "",
+                "搜尋結果與頁面內容：",
+                source_pack,
+                "",
+                "回答：",
+            ])
+            answer, model_label, model_metadata = self._synthesize_with_chat_backend(
+                req.chat_backend, prompt
+            )
+            synthesis.update(
+                answer=answer,
+                model_label=model_label,
+                model_metadata=model_metadata,
+            )
+            return answer
+
+        research = build_web_research_answer(
+            query,
+            max_results=3,
+            search_fn=_search,
+            relevance_fn=lambda q, sources: self._select_relevant_search_sources(
+                req, q, sources
+            ),
+            fetch_page_fn=lambda url: fetch_page_text(
+                url,
+                max_chars=8_000,
+                enable_browser_fallback=True,
+                browser_fallback_min_chars=2_000,
+            ),
+            fetch_page_count=3,
+            summarize_fn=_summarize,
         )
+        results = research.sources
         if not results:
             return ChatToolResult(
                 answer=(
@@ -2827,16 +2984,9 @@ class CommandBridge:
                 source_count=0,
                 result_summary="no results",
             )
-        source_pack = self._format_search_source_pack(results, tool_req.policy)
-        prompt = "\n".join([
-            _SEARCH_SYNTHESIS_PROMPT, "",
-            f"使用者問題：{tool_req.user_question}",
-            f"搜尋查詢：{query}", "",
-            "搜尋結果：", source_pack, "", "回答：",
-        ])
-        answer, model_label, model_metadata = self._synthesize_with_chat_backend(
-            req.chat_backend, prompt
-        )
+        answer = str(synthesis.get("answer") or research.summary)
+        model_label = str(synthesis.get("model_label") or "unknown")
+        model_metadata = synthesis.get("model_metadata")
         message = (
             f"{banner}\n\n{answer.strip()}\n\n"
             f"{self._format_search_sources_block(results)}"
@@ -2846,9 +2996,59 @@ class CommandBridge:
         return ChatToolResult(
             answer=message,
             source_count=len(results),
-            result_summary=f"query={query!r} sources={len(results)} model={model_label}",
-            model_metadata=model_metadata,
+            result_summary=(
+                f"query={query!r} sources={len(results)} model={model_label}"
+            ),
+            model_metadata=(
+                model_metadata if isinstance(model_metadata, ModelMetadata) else None
+            ),
         )
+
+    def _select_relevant_search_sources(self, req, query, sources):
+        if len(sources) <= 3:
+            return sources
+        candidates = [
+            {
+                "index": index,
+                "title": source.title,
+                "url": source.url,
+                "snippet": _clip(source.snippet, 300),
+            }
+            for index, source in enumerate(sources, 1)
+        ]
+        prompt = (
+            "Select up to three web sources that are most likely to contain the "
+            "complete facts needed to answer the question. Prefer primary sources "
+            "when the question requests an official source. Return JSON only as "
+            '{"indices":[1,2,3]}. Keep the best source first.\n\n'
+            f"Question: {query}\nCandidates: "
+            f"{json.dumps(candidates, ensure_ascii=False)}"
+        )
+        try:
+            raw, _metadata = self._generate_chat_tool_plan_with_chat_backend(
+                req.chat_backend,
+                prompt,
+                conversation_key=self._conversation_key(req),
+            )
+            data = _loads_first_json_object(raw)
+            indices = data.get("indices") if isinstance(data, dict) else None
+            if not isinstance(indices, list):
+                return sources
+            selected = []
+            seen: set[int] = set()
+            for value in indices:
+                if (
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and 1 <= value <= len(sources)
+                    and value not in seen
+                ):
+                    seen.add(value)
+                    selected.append(sources[value - 1])
+            return tuple(selected) if selected else sources
+        except Exception:  # noqa: BLE001 - relevance improves quality only
+            logger.warning("search source relevance selection failed", exc_info=True)
+            return sources
 
     def _exec_vision_chat_tool(
         self, req: WebCommandRequest, tool_req: ChatToolRequest
@@ -3039,6 +3239,7 @@ class CommandBridge:
                 narrator=narrator,
                 seed_variables=seeds,
                 seed_operations=seed_operations,
+                output_artifact=plan.output_artifact,
             )
         finally:
             self._goal_read_only_scope.reset(scope_token)
@@ -3256,11 +3457,24 @@ class CommandBridge:
     def _format_search_source_pack(results, policy: ChatToolPolicy) -> str:
         lines: list[str] = []
         total = 0
+        result_count = max(1, len(results))
+        content_budget = min(
+            _SOURCE_PACK_CONTENT_CAP,
+            max(500, (policy.max_source_pack_chars // result_count) - 300),
+        )
         for i, r in enumerate(results, 1):
             title = _clip(r.title, _SOURCE_PACK_TITLE_CAP)
             url = (r.url or "").strip()
-            snippet = _clip(r.snippet, policy.max_source_field_chars)
-            entry = f"[{i}] 標題：{title}\n    網址：{url}\n    摘要：{snippet}"
+            content = str(getattr(r, "content", "") or "").strip()
+            evidence = _clip(
+                content or r.snippet,
+                min(
+                    policy.max_source_field_chars,
+                    content_budget if content else _SOURCE_PACK_SNIPPET_CAP,
+                ),
+            )
+            evidence_label = "頁面內容" if content else "摘要"
+            entry = f"[{i}] 標題：{title}\n    網址：{url}\n    {evidence_label}：{evidence}"
             # Keep at least the first source even if it alone busts the budget.
             if lines and total + len(entry) > policy.max_source_pack_chars:
                 break
@@ -3272,7 +3486,8 @@ class CommandBridge:
     def _format_search_sources_block(results) -> str:
         lines = ["資料來源："]
         for i, r in enumerate(results, 1):
-            lines.append(f"[{i}] {r.title} — {r.url}")
+            label = str(r.title or r.url).replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+            lines.append(f"{i}. [{label}](<{r.url}>)")
         return "\n".join(lines)
 
     def _synthesize_with_chat_backend(
@@ -4704,6 +4919,85 @@ class CommandBridge:
                         ),
                     )
         return self._artifact_store_inst
+
+    def _publish_requested_output(
+        self,
+        req: WebCommandRequest,
+        output: ArtifactOutputRequest | None,
+        message: str,
+    ) -> tuple[ArtifactRef, ...]:
+        """Publish the complete final answer when the planner requests a file."""
+        if output is None:
+            return ()
+        rendered = render_text_artifact(output.format, message)
+        artifact = self._artifact_store().publish_bytes(
+            req.session_id or "web-default",
+            rendered.content.encode("utf-8"),
+            filename=rendered.filename,
+            content_type=rendered.content_type,
+        )
+        return (artifact,)
+
+    def _attach_requested_output_artifact(
+        self,
+        req: WebCommandRequest,
+        response: WebCommandResponse,
+    ) -> WebCommandResponse:
+        output = _REQUESTED_OUTPUT_ARTIFACT.get()
+        if (
+            req.mode != MODE_CHAT
+            or output is None
+            or response.status != STATUS_OK
+            or response.clarification is not None
+            or response.direct_action is not None
+        ):
+            return response
+        artifacts = self._publish_requested_output(req, output, response.message)
+        return dataclasses.replace(response, artifacts=tuple(response.artifacts) + artifacts)
+
+    @staticmethod
+    def _artifact_refs_from_event(event: dict) -> tuple[ArtifactRef, ...]:
+        values = event.get("artifacts")
+        if not isinstance(values, list):
+            return ()
+        refs: list[ArtifactRef] = []
+        for value in values:
+            try:
+                refs.append(ArtifactRef.from_dict(value))
+            except Exception:  # noqa: BLE001 - ignore an invalid optional reference
+                logger.warning("stream contained an invalid artifact reference")
+        return tuple(refs)
+
+    def _stream_with_requested_output(
+        self,
+        req: WebCommandRequest,
+        output: ArtifactOutputRequest | None,
+        events: Iterator[dict],
+    ) -> Iterator[dict]:
+        for event in events:
+            if (
+                output is not None
+                and event.get("type") == "done"
+                and event.get("clarification") is None
+                and event.get("direct_action") is None
+            ):
+                message = str(event.get("message") or "")
+                existing = event.get("artifacts")
+                artifact_values = list(existing) if isinstance(existing, list) else []
+                expected_content_type = output_artifact_content_type(output.format)
+                already_published = any(
+                    isinstance(value, dict)
+                    and value.get("content_type") == expected_content_type
+                    for value in artifact_values
+                )
+                if not already_published:
+                    artifact_values.extend(
+                        artifact.to_dict()
+                        for artifact in self._publish_requested_output(req, output, message)
+                    )
+                event = dict(event)
+                event["artifacts"] = artifact_values
+            yield event
 
     def publish_artifact(
         self,

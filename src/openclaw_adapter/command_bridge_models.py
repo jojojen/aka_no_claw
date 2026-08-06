@@ -472,11 +472,33 @@ def _normalize_router_query(query: str) -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class ArtifactOutputRequest:
+    """A validated request to publish the final answer as a file."""
+
+    format: str
+
+
+ARTIFACT_OUTPUT_FORMATS = frozenset({"markdown", "html"})
+
+
+@dataclass(frozen=True, slots=True)
 class ChatToolPlan:
     tool: str
     query: str = ""
     answer: str = ""
     reason_summary: str = ""
+    output_artifact: ArtifactOutputRequest | None = None
+
+
+def _parse_artifact_output_request(value: object) -> ArtifactOutputRequest | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"format"}:
+        raise ValueError("output_artifact must contain only format")
+    output_format = value.get("format")
+    if output_format not in ARTIFACT_OUTPUT_FORMATS:
+        raise ValueError("unsupported output artifact format")
+    return ArtifactOutputRequest(format=output_format)
 
 
 def _loads_first_json_object(text: str) -> object:
@@ -520,6 +542,10 @@ def parse_chat_tool_plan(raw: object) -> ChatToolPlan | None:
         return None
     tool = data.get("tool")
     reason = _opt_str(data.get("reason_summary")) or ""
+    try:
+        output_artifact = _parse_artifact_output_request(data.get("output_artifact"))
+    except ValueError:
+        return None
     if tool == CHAT_TOOL_NO_TOOL:
         # ``answer`` is accepted for rolling compatibility with an old router,
         # but the planner strips it before returning the decision.  Final prose
@@ -527,7 +553,12 @@ def parse_chat_tool_plan(raw: object) -> ChatToolPlan | None:
         answer = _opt_str(data.get("answer")) or ""
         if "answer" in data and not answer:
             return None
-        return ChatToolPlan(tool=CHAT_TOOL_NO_TOOL, answer=answer, reason_summary=reason)
+        return ChatToolPlan(
+            tool=CHAT_TOOL_NO_TOOL,
+            answer=answer,
+            reason_summary=reason,
+            output_artifact=output_artifact,
+        )
     if tool in (CHAT_TOOL_GOAL, CHAT_TOOL_CREATE_WORKFLOW):
         query = data.get("query")
         if not isinstance(query, str):
@@ -535,7 +566,12 @@ def parse_chat_tool_plan(raw: object) -> ChatToolPlan | None:
         query = _normalize_router_query(query)
         if not query:
             return None
-        return ChatToolPlan(tool=tool, query=query, reason_summary=reason)
+        return ChatToolPlan(
+            tool=tool,
+            query=query,
+            reason_summary=reason,
+            output_artifact=output_artifact,
+        )
     if tool not in CHAT_TOOLS:
         return None
     query = data.get("query")
@@ -544,7 +580,12 @@ def parse_chat_tool_plan(raw: object) -> ChatToolPlan | None:
     query = _normalize_router_query(query)
     if not query:
         return None
-    return ChatToolPlan(tool=tool, query=query, reason_summary=reason)
+    return ChatToolPlan(
+        tool=tool,
+        query=query,
+        reason_summary=reason,
+        output_artifact=output_artifact,
+    )
 
 
 # --- Streaming event constructors ----------------------------------------
@@ -664,6 +705,7 @@ class ChatToolRequest:
     query: str          # sanitized, length-capped by policy.max_query_chars
     user_question: str  # original user text (for synthesis prompts)
     policy: ChatToolPolicy
+    output_artifact: ArtifactOutputRequest | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -707,6 +749,7 @@ def make_chat_tool_request(
     raw_query: str,
     user_question: str,
     policy: ChatToolPolicy,
+    output_artifact: ArtifactOutputRequest | None = None,
 ) -> ChatToolRequest:
     """Validate and budget-enforce a raw router query into a ChatToolRequest.
 
@@ -723,6 +766,7 @@ def make_chat_tool_request(
         query=cleaned,
         user_question=(user_question or "").strip(),
         policy=policy,
+        output_artifact=output_artifact,
     )
 
 

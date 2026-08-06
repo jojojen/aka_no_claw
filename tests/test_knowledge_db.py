@@ -36,6 +36,42 @@ def test_codegen_seed_for_restart_health_checks_is_always_retrievable(db):
     assert "port" in rule.technique
 
 
+def test_codegen_seed_for_format_rendering_is_always_retrievable(db):
+    db.seed_codegen_knowledge()
+
+    rows = db.retrieve_codegen_knowledge("任意程式需求", k=100)
+    rule = next(row for row in rows if row.title == "先保存語義內容，再由格式渲染器產生下載檔")
+
+    assert rule.category == "output_contract"
+    assert "*" in rule.keywords
+    assert "表格" in rule.technique
+    assert "主動內容" in rule.technique
+
+
+def test_codegen_seed_for_atomic_initialization_is_always_retrievable(db):
+    db.seed_codegen_knowledge()
+
+    rows = db.retrieve_codegen_knowledge("任意程式需求", k=100)
+    rule = next(row for row in rows if row.title == "初始化檢查與首次寫入必須共用同一個鎖")
+
+    assert rule.category == "concurrency"
+    assert "*" in rule.keywords
+    assert "首次寫入" in rule.technique
+    assert "並行測試" in rule.technique
+
+
+def test_codegen_seed_for_pretransport_persistence_is_always_retrievable(db):
+    db.seed_codegen_knowledge()
+
+    rows = db.retrieve_codegen_knowledge("任意程式需求", k=100)
+    rule = next(row for row in rows if row.title == "先持久化完整結果，再交給可中斷的傳輸層")
+
+    assert rule.category == "reliability"
+    assert "*" in rule.keywords
+    assert "原工作階段" in rule.technique
+    assert "實際開啟附件" in rule.technique
+
+
 def test_codegen_seed_for_network_source_repair_is_always_retrievable(db):
     db.seed_codegen_knowledge()
 

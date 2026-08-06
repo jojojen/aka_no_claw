@@ -20,6 +20,7 @@ from .session_events import validate_identifier
 DEFAULT_MAX_ARTIFACT_BYTES = 20 * 1024 * 1024
 _MIME_RULES = {
     "text/markdown": ("document", frozenset({".md", ".markdown"})),
+    "text/html": ("document", frozenset({".html", ".htm"})),
     "text/csv": ("document", frozenset({".csv"})),
     "application/pdf": ("document", frozenset({".pdf"})),
     "image/png": ("image", frozenset({".png"})),

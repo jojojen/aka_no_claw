@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import tempfile
+import threading
 import time
 from typing import Callable
 
@@ -36,6 +37,7 @@ class SessionEventService:
         self._max_bytes = int(getattr(settings, "openclaw_web_event_max_bytes", 25 * 1024 * 1024))
         self._max_payload_bytes = int(getattr(settings, "openclaw_web_event_max_payload_bytes", 64 * 1024))
         self._journals: dict[str, SessionEventJournal] = {}
+        self._ensure_lock = threading.RLock()
 
     def journal(self, session_id: str | None = None) -> SessionEventJournal:
         session_id = session_id or DEFAULT_SESSION_ID
@@ -47,30 +49,33 @@ class SessionEventService:
         return self._journals[session_id]
 
     def ensure(self, session_id: str | None = None, *, legacy_snapshot: dict | None = None) -> SessionEventJournal:
-        journal = self.journal(session_id)
-        max_age_days = int(getattr(self._settings, "openclaw_web_event_max_age_days", 30))
-        if max_age_days > 0:
-            journal.expire_complete_runs_before(time.time() - max_age_days * 24 * 60 * 60)
-        if journal.events():
-            return journal
-        if legacy_snapshot is not None:
-            snapshot = legacy_snapshot
-        elif journal.session_id != DEFAULT_SESSION_ID:
-            # The legacy store is a single global browser snapshot. Importing
-            # it into every newly named session cross-contaminates otherwise
-            # independent conversations. Named sessions only migrate a
-            # snapshot when the compatibility POST supplies it explicitly.
-            snapshot = {}
-        else:
-            try:
-                snapshot = self._legacy_store().load()
-            except RuntimeError:
-                # Narrow unit-test and command-only settings do not configure
-                # the optional legacy snapshot; an empty migration is valid.
+        # Keep the empty check and legacy import in one transaction. Concurrent
+        # requests can otherwise import the same initial sequence more than once.
+        with self._ensure_lock:
+            journal = self.journal(session_id)
+            max_age_days = int(getattr(self._settings, "openclaw_web_event_max_age_days", 30))
+            if max_age_days > 0:
+                journal.expire_complete_runs_before(time.time() - max_age_days * 24 * 60 * 60)
+            if journal.events():
+                return journal
+            if legacy_snapshot is not None:
+                snapshot = legacy_snapshot
+            elif journal.session_id != DEFAULT_SESSION_ID:
+                # The legacy store is a single global browser snapshot. Importing
+                # it into every newly named session cross-contaminates otherwise
+                # independent conversations. Named sessions only migrate a
+                # snapshot when the compatibility POST supplies it explicitly.
                 snapshot = {}
-        for event in migrate_legacy_snapshot(snapshot, session_id=journal.session_id):
-            journal.append_existing(event)
-        return journal
+            else:
+                try:
+                    snapshot = self._legacy_store().load()
+                except RuntimeError:
+                    # Narrow unit-test and command-only settings do not configure
+                    # the optional legacy snapshot; an empty migration is valid.
+                    snapshot = {}
+            for event in migrate_legacy_snapshot(snapshot, session_id=journal.session_id):
+                journal.append_existing(event)
+            return journal
 
     def recorder(self, session_id: str | None = None) -> RunRecorder:
         return RunRecorder(self.ensure(session_id))

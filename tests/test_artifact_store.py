@@ -37,6 +37,7 @@ def test_publish_and_open_markdown_artifact(tmp_path: Path) -> None:
     ("filename", "content_type", "data", "kind"),
     [
         ("report.markdown", "text/markdown", b"# report\n", "document"),
+        ("report.html", "text/html", b"<!doctype html><p>report</p>", "document"),
         ("data.csv", "text/csv", b"name,value\na,1\n", "document"),
         ("report.pdf", "application/pdf", b"%PDF-1.7\n", "document"),
         ("preview.png", "image/png", b"\x89PNG\r\n\x1a\n", "image"),

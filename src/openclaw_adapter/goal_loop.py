@@ -103,6 +103,7 @@ class GoalLoop:
         replan_limit: int = 2,
         narrator: Callable[[str], None] | None = None,
         result_judge: Callable[[str, str], tuple[bool, str]] | None = None,
+        result_contract: str = "",
         seed_variables: dict[str, str] | None = None,
         seed_operations: dict[str, str] | None = None,
         conservative_synthesizer: Callable[[str, dict[str, str], str], str] | None = None,
@@ -120,6 +121,7 @@ class GoalLoop:
         self.replan_limit = replan_limit
         self.narrator = narrator
         self.result_judge = result_judge
+        self.result_contract = result_contract.strip()
         # Optional best-effort answer builder used ONLY when the loop exhausts
         # its replan budget with the goal still unmet. Given the goal, the
         # evidence gathered so far, and the last judge reason, it returns a
@@ -152,6 +154,11 @@ class GoalLoop:
         # phase. WorkflowRunner never receives one mid-step, so a generated
         # tool or external command cannot be modified while executing (#86).
         self.safe_boundary = safe_boundary
+
+    def _execution_goal(self) -> str:
+        if not self.result_contract:
+            return self.goal
+        return f"{self.goal}\n\n結果契約：\n{self.result_contract}"
 
     def run(self, resume: GoalLoopContinuation | None = None) -> GoalLoopReport:
         scratch = {
@@ -567,7 +574,7 @@ class GoalLoop:
 
     def _planner_draft(self, scratch: dict):
         seeds = dict(scratch.get("seeds") or {})
-        return self.planner.draft(self.goal, seed_variables=seeds)
+        return self.planner.draft(self._execution_goal(), seed_variables=seeds)
 
     def _consume_safe_boundary(self, scratch: dict, boundary: str) -> None:
         if self.safe_boundary is None:
@@ -587,7 +594,7 @@ class GoalLoop:
 
     def _planner_replan(self, scratch: dict, workflow: Workflow, trace: WorkflowTrace):
         seeds = dict(scratch.get("seeds") or {})
-        return self.planner.replan(self.goal, workflow, trace, seed_variables=seeds)
+        return self.planner.replan(self._execution_goal(), workflow, trace, seed_variables=seeds)
 
     def _build_runner(
         self,
@@ -622,7 +629,7 @@ class GoalLoop:
             return True, ""
         self._narrate(scratch, "檢查結果是否達成目標…")
         try:
-            achieved, reason = self.result_judge(self.goal, final_result)
+            achieved, reason = self.result_judge(self._execution_goal(), final_result)
         except Exception as exc:  # noqa: BLE001
             logger.exception("goal_loop: result judge failed")
             self._narrate(scratch, f"結果檢查不可用（{exc}），視為完成")
@@ -645,7 +652,7 @@ class GoalLoop:
         self._narrate(scratch, "以現有證據合成保守結論…")
         try:
             answer = self.conservative_synthesizer(
-                self.goal, seeds, str(scratch.get("last_reason") or "")
+                self._execution_goal(), seeds, str(scratch.get("last_reason") or "")
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("goal_loop: conservative synthesizer failed")

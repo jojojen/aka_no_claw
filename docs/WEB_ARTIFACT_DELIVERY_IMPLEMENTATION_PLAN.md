@@ -2,7 +2,7 @@
 
 Status: Current
 Owner area: command-bridge / conversation-runtime
-Last reviewed: 2026-08-05
+Last reviewed: 2026-08-06
 
 ## 1. Read This First
 
@@ -18,6 +18,7 @@ If the correct general design is unclear, inspect current primary documentation 
 An ordinary task can return text and zero or more files. The first supported file classes are:
 
 - UTF-8 Markdown
+- UTF-8 HTML
 - UTF-8 CSV
 - PDF
 - PNG
@@ -74,7 +75,8 @@ The source temporary file remains owned by the producer. The producer must delet
 - A filename cannot contain a path component or control character.
 - The MIME type must match the filename extension.
 - PDF, PNG, and JPEG files must have the expected file signature.
-- Markdown and CSV files must be valid UTF-8.
+- Markdown, HTML, and CSV files must be valid UTF-8.
+- HTML files download as attachments. The renderer removes active content.
 - Retrieval checks the stored size and SHA-256 digest.
 - A download requires both the artifact identifier and its session identifier.
 - The route sends `X-Content-Type-Options: nosniff` and `Cache-Control: private, no-store`.
@@ -118,7 +120,21 @@ The Web consumer must:
 
 The Web consumer must not infer a file type from a user-controlled filename alone.
 
-## 8. Failure Semantics
+## 8. Natural-Language Text Output
+
+The chat planner can add this independent delivery intent to any validated plan:
+
+```json
+{"output_artifact":{"format":"markdown"}}
+```
+
+The format can be `markdown` or `html`. The planner adds this field only when the user explicitly requests a supported text file. The field does not select a tool. It does not make a single-tool task a multi-step goal.
+
+The bridge publishes the complete terminal answer as `result.md` or `result.html`. The HTML renderer converts Markdown structure to a complete document and sanitizes active content. This behavior applies to a blocking response, a normal stream, a research job, and a durable goal job. The worker publishes the artifact before the transport emits its terminal event. If the stream disconnects, the worker writes the text and artifact reference to the original session. The session event stores the same artifact reference.
+
+The parser accepts only the closed format contract. Do not detect a topic, product name, URL, or example phrase in bridge code. Add a new format to the typed contract and its materializer when a general producer is ready.
+
+## 9. Failure Semantics
 
 Publication is fail-closed. An invalid or oversized artifact makes the producer fail. The bridge does not return a reference to a file that failed validation.
 
@@ -126,14 +142,14 @@ Retrieval returns `404` for a missing file, a wrong session, a wrong filename, i
 
 A text answer can still exist without artifacts. A producer decides whether missing file output makes its whole result fail or become a text-only partial result. Record that choice in the producer's own contract.
 
-## 9. Configuration
+## 10. Configuration
 
 | Variable | Default | Meaning |
 |---|---:|---|
 | `OPENCLAW_WEB_ARTIFACT_DIR` | `.openclaw_tmp/web_artifacts` | Artifact storage root. |
 | `OPENCLAW_WEB_ARTIFACT_MAX_BYTES` | `20971520` | Maximum bytes per file. |
 
-## 10. Verification
+## 11. Verification
 
 Backend tests must cover:
 
@@ -143,6 +159,10 @@ Backend tests must cover:
 - response, stream, job, event, and session reference propagation;
 - safe HTTP headers and filename handling;
 - producer temporary-file cleanup.
+- planner output intent parsing and rejection;
+- topic-independent Markdown publication;
+- Markdown propagation through blocking, streaming, and durable jobs;
+- detailed search page extraction when short snippets cannot satisfy the request.
 
 Frontend tests must cover:
 
@@ -154,7 +174,7 @@ Frontend tests must cover:
 
 Run the repository verification matrix after focused tests pass. Then restart the stack through the supported restart control and perform a live Web check.
 
-## 11. Rollout Status
+## 12. Rollout Status
 
 - [x] Add the bounded session artifact store.
 - [x] Add `ArtifactRef` to response and event contracts.
@@ -163,11 +183,13 @@ Run the repository verification matrix after focused tests pass. Then restart th
 - [x] Add Web reference validation and artifact cards.
 - [x] Use durable background execution for seller reputation output.
 - [x] Publish the existing seller reputation PDF and PNG.
-- [ ] Add Markdown and CSV producers when a task needs those outputs.
+- [x] Add planner-driven Markdown output for general chat tasks.
+- [x] Add planner-driven HTML output through the same text artifact renderer.
+- [ ] Add a planner-driven CSV producer when its typed formatting contract is ready.
 - [ ] Add a retention policy that is independent from explicit session clearing.
 - [ ] Add an object-store adapter if the bridge moves off one host.
 
-## 12. Cross-Repository Files
+## 13. Cross-Repository Files
 
 Backend owner files:
 
@@ -185,4 +207,3 @@ Web consumer files:
 - `frontend/src/components/ArtifactList.tsx`
 - `frontend/src/components/MessageBubble.tsx`
 - `frontend/src/App.tsx`
-

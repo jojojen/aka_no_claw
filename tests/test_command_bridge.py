@@ -38,6 +38,7 @@ from openclaw_adapter.command_bridge_models import (
     MAX_HISTORY_TURNS,
     MAX_ROUTER_QUERY_LEN,
     MUSIC_ACTION_PLAN,
+    ArtifactOutputRequest,
     ChatToolPlan,
     ChatToolPolicy,
     ChatToolResult,
@@ -886,6 +887,43 @@ def test_parse_chat_tool_plan_research_tool():
     )
 
 
+def test_parse_chat_tool_plan_keeps_output_intent_separate_from_tool_choice():
+    plan = parse_chat_tool_plan(
+        '{"tool":"/search","query":"latest transit statistics",'
+        '"reason_summary":"needs current data",'
+        '"output_artifact":{"format":"markdown"}}'
+    )
+
+    assert plan == ChatToolPlan(
+        tool=CHAT_TOOL_SEARCH,
+        query="latest transit statistics",
+        reason_summary="needs current data",
+        output_artifact=ArtifactOutputRequest(format="markdown"),
+    )
+
+
+def test_parse_chat_tool_plan_accepts_html_output_intent():
+    plan = parse_chat_tool_plan('{"tool":"__no_tool__","output_artifact":{"format":"html"}}')
+
+    assert plan == ChatToolPlan(
+        tool=CHAT_TOOL_NO_TOOL,
+        output_artifact=ArtifactOutputRequest(format="html"),
+    )
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        '{"format":"pdf"}',
+        '{"format":"markdown","filename":"report.md"}',
+        '"markdown"',
+    ],
+)
+def test_parse_chat_tool_plan_rejects_untrusted_output_contract(output):
+    raw = '{"tool":"__no_tool__","output_artifact":' + output + "}"
+    assert parse_chat_tool_plan(raw) is None
+
+
 def test_parse_chat_tool_plan_music_tool():
     plan = parse_chat_tool_plan(
         '{"tool":"/music","query":"stop","reason_summary":"音樂控制"}'
@@ -1134,7 +1172,10 @@ def test_chat_tool_unsatisfied_upgrades_to_goal_loop_run(monkeypatch):
     )
     seen_goals: list[str] = []
 
-    def _fake_run(req, goal, planner_metadata=None, narrator=None, seed_variables=None, seed_operations=None):
+    def _fake_run(
+        req, goal, planner_metadata=None, narrator=None, seed_variables=None,
+        seed_operations=None, output_artifact=None,
+    ):
         seen_goals.append(goal)
         return WebCommandResponse(
             status=STATUS_OK,
@@ -1230,7 +1271,10 @@ def test_stream_chat_tool_unsatisfied_upgrades_to_goal_loop_run(monkeypatch):
         lambda req, plan, tool_result: {"satisfied": False, "environment_blocked": False},
     )
 
-    def _fake_run(req, goal, planner_metadata=None, narrator=None, seed_variables=None, seed_operations=None):
+    def _fake_run(
+        req, goal, planner_metadata=None, narrator=None, seed_variables=None,
+        seed_operations=None, output_artifact=None,
+    ):
         # the real goal loop pushes narration through this callback live
         for line in (
             "已理解目標為：播放米津玄師的熱門歌曲",
@@ -1539,6 +1583,7 @@ def test_synthesis_prompt_includes_source_fields(monkeypatch):
     assert "標題A" in seen["prompt"]
     assert "https://a.example" in seen["prompt"]
     assert "摘要片段A" in seen["prompt"]
+    assert "核心事實只能採用提供的第一方來源" in seen["prompt"]
 
 
 def test_synthesis_source_pack_truncates_long_fields_but_keeps_url(monkeypatch):
@@ -1579,44 +1624,57 @@ def test_synthesis_source_pack_truncates_long_fields_but_keeps_url(monkeypatch):
     assert url in resp.message
 
 
-def test_synthesis_source_pack_total_budget_drops_overflow(monkeypatch):
-    from openclaw_adapter.command_bridge import (
-        _SOURCE_PACK_SNIPPET_CAP,
-        _SOURCE_PACK_TOTAL_CAP,
-    )
+def test_synthesis_source_pack_total_budget_drops_overflow():
+    from openclaw_adapter.command_bridge import _SOURCE_PACK_TOTAL_CAP
+    from openclaw_adapter.web_search import WebSearchResult
 
     b = CommandBridge(settings=_tool_settings())
-    monkeypatch.setattr(
-        b,
-        "_select_chat_tool_plan",
-        lambda req: (ChatToolPlan(tool=CHAT_TOOL_SEARCH, query="q"), None),
-    )
-    # Many max-snippet sources: their cumulative pack size exceeds the total cap,
-    # so the later sources are dropped from the synthesis prompt. Sized so the
-    # first source survives and the last one is dropped.
-    snippet = "x" * _SOURCE_PACK_SNIPPET_CAP
-    n = (_SOURCE_PACK_TOTAL_CAP // _SOURCE_PACK_SNIPPET_CAP) + 3
     results = tuple(
-        _result(f"來源{i}", f"https://src{i}.example", snippet) for i in range(n)
+        WebSearchResult(
+            title=f"來源{i}",
+            url=f"https://src{i}.example",
+            content="x" * 6000,
+        )
+        for i in range(30)
     )
-    monkeypatch.setattr(
-        "openclaw_adapter.web_search.web_search",
-        lambda q, *, max_results, reuse_browser: results,
-    )
-    seen = {}
-    monkeypatch.setattr(
-        b, "_ollama_generate_blocking",
-        lambda prompt: seen.setdefault("prompt", prompt) and "答案",
-    )
-    resp = b.handle(parse_request({"mode": "chat", "input": "問題", "chat_backend": "local"}))
+    pack = b._format_search_source_pack(results, _make_policy())
 
-    # First source survives in the prompt; an overflowing later source is dropped.
-    assert "https://src0.example" in seen["prompt"]
-    assert f"https://src{n - 1}.example" not in seen["prompt"]
-    assert len(seen["prompt"]) < _SOURCE_PACK_TOTAL_CAP + 2000
-    # But the visible sources block still lists every retrieved source.
-    assert "https://src0.example" in resp.message
-    assert f"https://src{n - 1}.example" in resp.message
+    assert "https://src0.example" in pack
+    assert "https://src29.example" not in pack
+    assert len(pack) <= _SOURCE_PACK_TOTAL_CAP
+
+
+def test_source_pack_gives_each_detailed_page_a_fair_budget():
+    from openclaw_adapter.web_search import WebSearchResult
+
+    sources = tuple(
+        WebSearchResult(
+            title=f"Source {index}",
+            url=f"https://source{index}.example",
+            content=(str(index) * 3000) + f"END-{index}",
+        )
+        for index in range(3)
+    )
+    policy = ChatToolPolicy(
+        display_name="search",
+        max_source_field_chars=6000,
+        max_source_pack_chars=12000,
+    )
+
+    packed = CommandBridge._format_search_source_pack(sources, policy)
+
+    assert all(f"END-{index}" in packed for index in range(3))
+    assert len(packed) <= 12000
+
+
+def test_search_source_block_uses_markdown_links_that_html_can_preserve():
+    from openclaw_adapter.web_search import WebSearchResult
+
+    block = CommandBridge._format_search_sources_block(
+        (WebSearchResult(title="Official [data]", url="https://example.com/report?q=1"),)
+    )
+
+    assert block == "資料來源：\n1. [Official \\[data\\]](<https://example.com/report?q=1>)"
 
 
 def test_chat_tool_uses_chosen_cloud_backend_for_synthesis(monkeypatch):
@@ -1821,7 +1879,8 @@ def test_chat_goal_plan_runs_goal_loop_directly(monkeypatch):
     monkeypatch.setattr(
         b,
         "_run_goal_loop_blocking",
-        lambda req, goal, planner_metadata=None, seed_variables=None: SimpleNamespace(
+        lambda req, goal, planner_metadata=None, seed_variables=None,
+        output_artifact=None: SimpleNamespace(
             status=STATUS_OK,
             message=f"run:{goal}",
             mode=MODE_CHAT,
@@ -1885,6 +1944,54 @@ def test_stream_goal_loop_emits_job_event_and_poll_recovers_answer(monkeypatch):
     snap = _wait_job(b, job_ev["job_id"], "done")
     assert snap["job_status"] == "done"
     assert "今天東京晴" in snap["message"]
+
+
+def test_stream_goal_output_artifact_is_durable(monkeypatch, tmp_path):
+    settings = _tool_settings()
+    settings.openclaw_web_artifact_dir = str(tmp_path / "artifacts")
+    settings.openclaw_web_jobs_dir = str(tmp_path / "jobs")
+    b = CommandBridge(settings=settings)
+
+    def _plan(_req):
+        if False:
+            yield {}
+        return ChatToolPlan(
+            tool=CHAT_TOOL_GOAL,
+            query="查最新交通資料並整理表格",
+            output_artifact=ArtifactOutputRequest(format="markdown"),
+        ), None
+
+    monkeypatch.setattr(b, "_stream_chat_tool_plan", _plan)
+    execution: dict[str, object] = {}
+
+    def execute_goal(**kwargs):
+        execution.update(kwargs)
+        return GoalLoopReport(
+            done=True,
+            final_result="# Report\n\n| Route | Riders |\n|---|---:|\n| A | 20 |",
+            workflow=None,
+            trace=None,
+            continuation=None,
+            replans_used=0,
+            narration=(),
+        )
+
+    monkeypatch.setattr(b, "_execute_goal_loop", execute_goal)
+    req = parse_request({"mode": "chat", "input": "查資料並回傳 Markdown 檔", "session_id": "goal-artifact"})
+
+    events = list(b.stream(req, "goal-artifact-run"))
+    job_id = next(event["job_id"] for event in events if event["type"] == "job")
+    artifact = ArtifactRef.from_dict(events[-1]["artifacts"][0])
+    snapshot = _wait_job(b, job_id, "done")
+
+    assert snapshot["artifacts"] == [artifact.to_dict()]
+    assert "不要輸出完整檔案原始碼" in str(execution["result_contract"])
+    assert (
+        b._artifact_store()
+        .open("goal-artifact", artifact.artifact_id)
+        .path.read_text(encoding="utf-8")
+        .startswith("# Report")
+    )
 
 
 def test_stream_goal_loop_disconnect_recovers_answer_via_job(monkeypatch):
@@ -2677,7 +2784,11 @@ def test_disconnected_stream_pushes_orphaned_result_to_session(monkeypatch, tmp_
     monkeypatch.setattr(
         "openclaw_adapter.command_bridge._HEARTBEAT_SECONDS", 0.02, raising=False
     )
-    b = CommandBridge(settings=_tool_settings())
+    settings = _tool_settings()
+    settings.openclaw_web_memory_dir = str(tmp_path / "memory")
+    settings.openclaw_web_event_dir = str(tmp_path / "events")
+    settings.openclaw_web_artifact_dir = str(tmp_path / "artifacts")
+    b = CommandBridge(settings=settings)
     b._session_store = SessionMemoryStore(str(tmp_path))
     release = threading.Event()
     pushed = threading.Event()
@@ -2685,7 +2796,12 @@ def test_disconnected_stream_pushes_orphaned_result_to_session(monkeypatch, tmp_
     def _plan(req):
         if False:
             yield {}
-        return ChatToolPlan(tool=CHAT_TOOL_SEARCH, query="東京 天氣", reason_summary="查詢"), None
+        return ChatToolPlan(
+            tool=CHAT_TOOL_SEARCH,
+            query="東京 天氣",
+            reason_summary="查詢",
+            output_artifact=ArtifactOutputRequest(format="html"),
+        ), None
 
     started = threading.Event()
 
@@ -2702,10 +2818,16 @@ def test_disconnected_stream_pushes_orphaned_result_to_session(monkeypatch, tmp_
     orig_push = b._push_orphaned_result
     monkeypatch.setattr(
         b, "_push_orphaned_result",
-        lambda text: (orig_push(text), pushed.set()) and None,
+        lambda req, text, artifacts=(): (
+            orig_push(req, text, artifacts), pushed.set()
+        ) and None,
     )
 
-    gen = b.stream(parse_request({"mode": "chat", "input": "東京天氣"}), "rid-orphan")
+    session_id = "browser-session"
+    gen = b.stream(
+        parse_request({"mode": "chat", "input": "東京天氣", "session_id": session_id}),
+        "rid-orphan",
+    )
     for ev in gen:
         # Consume past the tool-calling notice until the drain loop is live
         # (worker started) — closing earlier would cancel before the worker
@@ -2716,11 +2838,15 @@ def test_disconnected_stream_pushes_orphaned_result_to_session(monkeypatch, tmp_
     release.set()  # the tool completes anyway
     assert pushed.wait(2.0), "orphaned result was never pushed to session memory"
 
-    messages = (b.load_session().get("session") or {}).get("messages") or []
-    assert any(
-        m.get("role") == "assistant" and "東京明天晴" in (m.get("text") or "")
-        for m in messages
+    messages = (b.load_session(session_id).get("session") or {}).get("messages") or []
+    message = next(
+        m for m in messages
+        if m.get("role") == "assistant" and "東京明天晴" in (m.get("text") or "")
     )
+    artifact = ArtifactRef.from_dict(message["artifacts"][0])
+    assert artifact.filename == "result.html"
+    stored = b._artifact_store().open(session_id, artifact.artifact_id)
+    assert "東京明天晴" in stored.path.read_text(encoding="utf-8")
 
 
 # --- cooperative cancellation (#81 stop button, backend half) --------------
@@ -4044,6 +4170,77 @@ def test_exec_grounded_search_source_count(monkeypatch):
     assert "sources=2" in result.result_summary
 
 
+def test_grounded_search_visible_sources_match_relevance_selection(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    candidates = tuple(
+        _result(title, f"https://{title.lower()}.example", f"{title} evidence")
+        for title in ("Alpha", "Beta", "Gamma", "Delta")
+    )
+    monkeypatch.setattr(
+        "openclaw_adapter.web_search.web_search",
+        lambda q, *, max_results, reuse_browser: candidates,
+    )
+    monkeypatch.setattr(
+        "openclaw_adapter.web_search.fetch_page_text",
+        lambda *_args, **_kwargs: "",
+    )
+    monkeypatch.setattr(
+        b,
+        "_select_relevant_search_sources",
+        lambda _req, _query, sources: (sources[3], sources[1]),
+    )
+    monkeypatch.setattr(
+        b,
+        "_synthesize_with_chat_backend",
+        lambda _backend, _prompt: ("Answer with [1] and [2].", "cloud", None),
+    )
+
+    result = b._exec_grounded_search(
+        parse_request({"mode": "chat", "input": "question"}),
+        make_chat_tool_request("/search", "question", "question", _make_policy()),
+    )
+
+    assert result.source_count == 2
+    assert "1. [Delta]" in result.answer
+    assert "2. [Beta]" in result.answer
+    assert "[Alpha]" not in result.answer
+    assert "[Gamma]" not in result.answer
+
+
+def test_grounded_search_requests_semantic_content_before_html_rendering(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    monkeypatch.setattr(
+        "openclaw_adapter.web_search.web_search",
+        lambda q, *, max_results, reuse_browser: (
+            _result("Official data", "https://x.example", "Current values"),
+        ),
+    )
+    captured: dict[str, str] = {}
+
+    def synthesize(_backend, prompt):
+        captured["prompt"] = prompt
+        return "# Report", "cloud", None
+
+    monkeypatch.setattr(b, "_synthesize_with_chat_backend", synthesize)
+    policy = _make_policy()
+    tool_req = make_chat_tool_request(
+        "/search",
+        "current public data",
+        "Return the current public data as an HTML file",
+        policy,
+        output_artifact=ArtifactOutputRequest(format="html"),
+    )
+
+    b._exec_grounded_search(
+        parse_request({"mode": "chat", "input": tool_req.user_question}),
+        tool_req,
+    )
+
+    assert "不要輸出完整檔案原始碼" in captured["prompt"]
+    assert "不要把答案包在程式碼區塊" in captured["prompt"]
+    assert "輸出層會把這份內容渲染為 html 檔案" in captured["prompt"]
+
+
 # --- /music chat tool routing -----------------------------------------------
 
 def test_stream_chat_music_tool_emits_done(monkeypatch):
@@ -4514,6 +4711,113 @@ def _assert_router_answer(events: list, expected: str = "模型回答") -> None:
     assert not any(e.get("type") == "redirect" for e in events), events
     assert events[-1]["type"] == "done"
     assert events[-1]["message"] == expected
+
+
+def test_stream_publishes_markdown_for_planner_output_intent(monkeypatch, tmp_path):
+    b = CommandBridge(settings=_tool_settings())
+    b._artifact_store_inst = ArtifactStore(tmp_path / "artifacts")
+    monkeypatch.setattr(
+        b,
+        "_select_chat_tool_plan",
+        lambda _req: (
+            ChatToolPlan(
+                tool=CHAT_TOOL_NO_TOOL,
+                answer="# Transit report\n\n| Route | Riders |\n|---|---:|\n| A | 20 |",
+                output_artifact=ArtifactOutputRequest(format="markdown"),
+            ),
+            None,
+        ),
+    )
+    req = parse_request({"mode": "chat", "input": "Create a downloadable report", "session_id": "artifact-session"})
+
+    events = list(b.stream(req, "artifact-request"))
+
+    artifact = ArtifactRef.from_dict(events[-1]["artifacts"][0])
+    assert artifact.filename == "result.md"
+    assert (
+        b._artifact_store_inst.open("artifact-session", artifact.artifact_id)
+        .path.read_text(encoding="utf-8")
+        .startswith("# Transit report")
+    )
+
+
+def test_stream_publishes_structured_html_for_planner_output_intent(monkeypatch, tmp_path):
+    b = CommandBridge(settings=_tool_settings())
+    b._artifact_store_inst = ArtifactStore(tmp_path / "artifacts")
+    monkeypatch.setattr(
+        b,
+        "_select_chat_tool_plan",
+        lambda _req: (
+            ChatToolPlan(
+                tool=CHAT_TOOL_NO_TOOL,
+                answer="# Report\n\n| Item | Value |\n|---|---:|\n| A | 2 |",
+                output_artifact=ArtifactOutputRequest(format="html"),
+            ),
+            None,
+        ),
+    )
+    req = parse_request({"mode": "chat", "input": "Create a downloadable page", "session_id": "html-session"})
+
+    events = list(b.stream(req, "html-request"))
+
+    artifact = ArtifactRef.from_dict(events[-1]["artifacts"][0])
+    stored = b._artifact_store_inst.open("html-session", artifact.artifact_id)
+    assert artifact.filename == "result.html"
+    assert artifact.content_type == "text/html"
+    assert "<table>" in stored.path.read_text(encoding="utf-8")
+
+
+def test_stream_does_not_infer_artifact_from_subject_words(monkeypatch, tmp_path):
+    b = CommandBridge(settings=_tool_settings())
+    b._artifact_store_inst = ArtifactStore(tmp_path / "artifacts")
+    monkeypatch.setattr(
+        b,
+        "_select_chat_tool_plan",
+        lambda _req: (ChatToolPlan(tool=CHAT_TOOL_NO_TOOL, answer="plain answer"), None),
+    )
+    req = parse_request(
+        {
+            "mode": "chat",
+            "input": "請整理最近的市區交通統計成 Markdown 表格",
+            "session_id": "no-output-intent",
+        }
+    )
+
+    events = list(b.stream(req, "no-output-request"))
+
+    assert "artifacts" not in events[-1]
+
+
+def test_blocking_chat_publishes_planner_requested_markdown(monkeypatch, tmp_path):
+    settings = _tool_settings()
+    settings.openclaw_web_artifact_dir = str(tmp_path / "artifacts")
+    settings.openclaw_web_memory_dir = str(tmp_path / "memory")
+    settings.openclaw_web_event_dir = str(tmp_path / "events")
+    b = CommandBridge(settings=settings)
+    monkeypatch.setattr(
+        b,
+        "_select_chat_tool_plan",
+        lambda _req: (
+            ChatToolPlan(
+                tool=CHAT_TOOL_NO_TOOL,
+                answer="# Downloadable answer",
+                output_artifact=ArtifactOutputRequest(format="markdown"),
+            ),
+            None,
+        ),
+    )
+    req = parse_request({"mode": "chat", "input": "Return this as a file", "session_id": "blocking-artifact"})
+
+    response = b.handle(req)
+
+    assert response.status == STATUS_OK
+    assert len(response.artifacts) == 1
+    assert (
+        b._artifact_store()
+        .open("blocking-artifact", response.artifacts[0].artifact_id)
+        .path.read_text(encoding="utf-8")
+        == "# Downloadable answer"
+    )
 
 
 def test_stream_chat_workflow_text_uses_model_router_not_fast_path(monkeypatch):
@@ -6218,7 +6522,10 @@ def test_unsatisfied_upgrade_passes_tool_answer_as_seed(monkeypatch):
     )
     seen: dict = {}
 
-    def _fake_run(req, goal, planner_metadata=None, narrator=None, seed_variables=None, seed_operations=None):
+    def _fake_run(
+        req, goal, planner_metadata=None, narrator=None, seed_variables=None,
+        seed_operations=None, output_artifact=None,
+    ):
         seen["seeds"] = seed_variables
         seen["ops"] = seed_operations
         seen["read_only_scope"] = b._goal_read_only_scope.get()
@@ -6439,6 +6746,33 @@ def test_satisfaction_prompt_includes_conversation_context(monkeypatch):
     assert "還原完整意圖" in prompt
 
 
+def test_satisfaction_prompt_defers_requested_file_to_output_layer(monkeypatch):
+    b = CommandBridge(settings=_tool_settings())
+    req = parse_request({"mode": "chat", "input": "整理資料並回傳 HTML 檔案"})
+    plan = ChatToolPlan(
+        tool=CHAT_TOOL_SEARCH,
+        query="整理資料",
+        output_artifact=ArtifactOutputRequest(format="html"),
+    )
+    captured: dict[str, str] = {}
+
+    def _fake_generate(_backend, prompt, **_kw):
+        captured["prompt"] = prompt
+        return '{"satisfied": true, "environment_blocked": false, "reason": "內容完整"}'
+
+    monkeypatch.setattr(b, "_generate_chat_tool_satisfaction_text", _fake_generate)
+
+    verdict = b._chat_tool_result_satisfies_intent(
+        req, plan, ChatToolResult(answer="# 完整資料")
+    )
+
+    assert verdict["satisfied"] is True
+    assert "整理資料並回傳 HTML 檔案" not in captured["prompt"]
+    assert '語義需求（檔案交付格式已分離）：\n"整理資料"' in captured["prompt"]
+    assert "將由輸出層渲染為 html 檔案" in captured["prompt"]
+    assert "不要因工具回覆尚未包含檔案" in captured["prompt"]
+
+
 def test_unsatisfied_upgrade_seeds_conversation_context(monkeypatch):
     from openclaw_adapter.command_bridge import _seed_variable_name_for_tool
 
@@ -6460,7 +6794,10 @@ def test_unsatisfied_upgrade_seeds_conversation_context(monkeypatch):
     )
     seen: dict = {}
 
-    def _fake_run(req_, goal, planner_metadata=None, narrator=None, seed_variables=None, seed_operations=None):
+    def _fake_run(
+        req_, goal, planner_metadata=None, narrator=None, seed_variables=None,
+        seed_operations=None, output_artifact=None,
+    ):
         seen["seeds"] = seed_variables
         return WebCommandResponse(status=STATUS_OK, mode=MODE_CHAT, message="工作流完成：ok")
 

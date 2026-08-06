@@ -99,6 +99,29 @@ def test_goal_loop_runs_draft_then_workflow_to_completion():
     assert "草稿完成" in "\n".join(report.narration)
 
 
+def test_goal_loop_applies_result_contract_without_exposing_it_in_narration():
+    workflow = _workflow_with_tool("real_tool", wf_id="wf-contract")
+    planner = _FakePlanner(drafts=[(workflow, None, False)])
+    executor = _FakeExecutor({"real_tool": (True, "done")})
+    judged: list[str] = []
+    loop = GoalLoop(
+        goal="完成任務",
+        planner=planner,
+        executor=executor,
+        command_registry={},
+        result_contract="只輸出語義內容。",
+        result_judge=lambda goal, _result: judged.append(goal) or (True, "完整"),
+    )
+
+    report = loop.run()
+
+    expected = "完成任務\n\n結果契約：\n只輸出語義內容。"
+    assert planner.draft_calls == [expected]
+    assert judged == [expected]
+    assert report.narration[0] == "已理解目標為：完成任務"
+    assert "結果契約" not in report.narration[0]
+
+
 def test_goal_loop_only_consumes_interjection_at_declared_safe_boundary():
     workflow = _workflow_with_tool("real_tool", wf_id="wf-safe-boundary")
     planner = _FakePlanner(drafts=[(workflow, None, False)])

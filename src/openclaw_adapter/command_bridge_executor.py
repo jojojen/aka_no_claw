@@ -48,6 +48,7 @@ from .command_bridge_models import (
 )
 
 if TYPE_CHECKING:
+    from .artifact_store import ArtifactRef
     from .llm_pool_settings import CloudPoolRotation
 
 logger = logging.getLogger(__name__)
@@ -59,8 +60,8 @@ _CHAT_TOOL_LEDGER_SUMMARY_CHARS = 400
 _SEARCH_TOOL_POLICY = ChatToolPolicy(
     display_name="網路搜尋",
     max_query_chars=256,
-    max_source_field_chars=500,
-    max_source_pack_chars=4000,
+    max_source_field_chars=6000,
+    max_source_pack_chars=12000,
 )
 _RESEARCH_TOOL_POLICY = ChatToolPolicy(display_name="商品研究", max_query_chars=512)
 _MUSIC_TOOL_POLICY = ChatToolPolicy(display_name="音樂控制", max_query_chars=128)
@@ -69,7 +70,7 @@ _BLUETOOTH_TOOL_POLICY = ChatToolPolicy(display_name="藍牙控制", max_query_c
 _IR_TOOL_POLICY = ChatToolPolicy(display_name="紅外線控制", max_query_chars=128)
 _VISION_TOOL_POLICY = ChatToolPolicy(display_name="圖片查看", max_query_chars=512)
 
-_CHAT_TOOL_SATISFACTION_PROMPT = """你要判斷「工具回覆」是否已真正完成「使用者原始需求」。
+_CHAT_TOOL_SATISFACTION_PROMPT = """你要判斷「工具回覆」是否已真正完成「語義需求」。
 
 規則：
 1. 只看是否已完成原始需求，不要看工具有沒有被成功呼叫。
@@ -86,7 +87,9 @@ _CHAT_TOOL_SATISFACTION_PROMPT = """你要判斷「工具回覆」是否已真�
    換一種做法或拆成多步驟流程也無法立刻繞過，請判定 environment_blocked=true；
    若只是內容面的不足（資料不完整、方向錯誤、可改用其他工具或來源補救），
    請判定 environment_blocked=false。satisfied=true 時一律輸出 false。
-7. 只能輸出 JSON，不要加任何其他文字。
+7. 若「成果交付合約」表示已要求檔案，檔案渲染會在本判斷之後執行。此時只判斷工具回覆的
+   內容與結構是否完整，不要因工具回覆尚未包含檔案或下載連結而判定未完成。
+8. 只能輸出 JSON，不要加任何其他文字。
 
 請輸出：
 {{"satisfied": true 或 false, "environment_blocked": true 或 false, "reason": "一句極短理由"}}
@@ -94,7 +97,7 @@ _CHAT_TOOL_SATISFACTION_PROMPT = """你要判斷「工具回覆」是否已真�
 對話脈絡（用來還原追問的完整意圖；可能為空）：
 {context}
 
-使用者原始需求：
+語義需求（檔案交付格式已分離）：
 {user_input}
 
 工具類型：
@@ -102,6 +105,9 @@ _CHAT_TOOL_SATISFACTION_PROMPT = """你要判斷「工具回覆」是否已真�
 
 工具查詢：
 {tool_query}
+
+成果交付合約：
+{artifact_delivery}
 
 工具回覆：
 {tool_answer}
@@ -146,7 +152,16 @@ class ExecutorDeps(Protocol):
         narrator: Callable[[str], None] | None = None,
     ) -> WebCommandResponse | None: ...
 
-    def _push_orphaned_result(self, text: str) -> None: ...
+    def _publish_requested_output(
+        self, req: WebCommandRequest, output, message: str
+    ) -> tuple["ArtifactRef", ...]: ...
+
+    def _push_orphaned_result(
+        self,
+        req: WebCommandRequest,
+        text: str,
+        artifacts: tuple["ArtifactRef", ...] = (),
+    ) -> None: ...
 
     def _conversation_context_block(self, req: WebCommandRequest) -> str: ...
 
@@ -228,6 +243,7 @@ class ChatToolExecutor:
             raw_query=plan.query,
             user_question=req.input or "",
             policy=policy,
+            output_artifact=plan.output_artifact,
         )
         try:
             result = executor(req, tool_req)
@@ -260,10 +276,19 @@ class ChatToolExecutor:
                         req, plan, tool_result, planner_metadata=None, narrator=narration_queue.put
                     )
                 if upgraded is not None:
-                    result["response"] = upgraded
+                    artifacts = self._deps._publish_requested_output(
+                        req, plan.output_artifact, upgraded.message
+                    )
+                    result["response"] = dataclasses.replace(
+                        upgraded,
+                        artifacts=tuple(upgraded.artifacts) + artifacts,
+                    )
                 else:
                     result["text"] = tool_result.answer
                     result["model_metadata"] = tool_result.model_metadata
+                    result["artifacts"] = self._deps._publish_requested_output(
+                        req, plan.output_artifact, tool_result.answer
+                    )
             except Exception as exc:  # noqa: BLE001
                 logger.exception("chat tool failed tool=%s", plan.tool)
                 result["error"] = str(exc)
@@ -276,7 +301,12 @@ class ChatToolExecutor:
                         orphan = response.message
                     if orphan is not None:
                         try:
-                            self._deps._push_orphaned_result(str(orphan))
+                            artifacts = (
+                                tuple(response.artifacts)
+                                if isinstance(response, WebCommandResponse)
+                                else tuple(result.get("artifacts") or ())
+                            )
+                            self._deps._push_orphaned_result(req, str(orphan), artifacts)
                         except Exception:  # noqa: BLE001
                             logger.exception("command bridge: failed to push orphaned tool result")
 
@@ -305,20 +335,33 @@ class ChatToolExecutor:
                 yield stream_error(response.message)
                 return
             yield stream_done(response.message, model_metadata=response.model_metadata,
-                              actions=[a.to_dict() for a in response.actions] or None)
+                              actions=[a.to_dict() for a in response.actions] or None,
+                              artifacts=[a.to_dict() for a in response.artifacts] or None)
             return
         metadata = result.get("model_metadata")
         yield stream_done(str(result.get("text") or "").strip(),
-                          model_metadata=metadata if isinstance(metadata, ModelMetadata) else None)
+                          model_metadata=metadata if isinstance(metadata, ModelMetadata) else None,
+                          artifacts=[a.to_dict() for a in tuple(result.get("artifacts") or ())] or None)
 
     def result_satisfies_intent(
         self, req: WebCommandRequest, plan: ChatToolPlan, tool_result: ChatToolResult
     ) -> dict[str, object]:
+        semantic_request = (
+            plan.query
+            if plan.output_artifact is not None
+            else (req.input or "").strip()
+        )
+        artifact_delivery = (
+            f"將由輸出層渲染為 {plan.output_artifact.format} 檔案"
+            if plan.output_artifact is not None
+            else "未要求檔案"
+        )
         prompt = _CHAT_TOOL_SATISFACTION_PROMPT.format(
             context=self._deps._conversation_context_block(req) or "（無）",
-            user_input=json.dumps((req.input or "").strip(), ensure_ascii=False),
+            user_input=json.dumps(semantic_request, ensure_ascii=False),
             tool_name=json.dumps(plan.tool, ensure_ascii=False),
             tool_query=json.dumps(plan.query, ensure_ascii=False),
+            artifact_delivery=json.dumps(artifact_delivery, ensure_ascii=False),
             tool_answer=json.dumps(tool_result.answer.strip(), ensure_ascii=False),
         )
         # Call back through the bridge compatibility seam.  Tests and
